@@ -284,7 +284,7 @@ void metricsDrawOverlay(const char* status)
 
 	// \x1b[1;1H homes the cursor instead of clearing, which would flicker.
 	printf("\x1b[1;1H");
-	printf("BLOCKSMITH  phase 4             \n");
+	printf("BLOCKSMITH  phase 5             \n");
 	printf("--------------------------------\n");
 	printf("fps    %6.2f  frame %6.2f ms   \n", fps, s_now.frame_ms);
 	printf("cpu    %6.2f ms  (C3D process) \n", s_now.cpu_ms);
