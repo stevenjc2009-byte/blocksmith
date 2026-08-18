@@ -29,14 +29,47 @@
 // measured 4.31 blocks/s crosses a column boundary every 3.7 s) and it buys a design with
 // no locking on any per-frame path.
 //
-// ── Why core 0 ───────────────────────────────────────────────────────────────────────
+// ── Which core, and the cache review that had to happen first ────────────────────────
 //
-// The worker runs on the application core at one priority step *below* the main thread, so
-// it can never delay a frame: it only gets the CPU when the main thread blocks, which it
-// does for ~15.7 ms of every 16.71 ms frame inside C3D_FrameBegin(C3D_FRAME_SYNCDRAW).
-// Core 1 is the system core and needs APT_SetAppCpuTimeLimit, which is step 6.3 — and
-// moving there is not just a parameter change: two threads on one core share a data cache,
-// two threads on two cores do not, so the staging handoff would need a cache review first.
+// Step 6.3 was written to move the worker to **core 1**, the system core, which needs
+// APT_SetAppCpuTimeLimit. The code to do that is here, behind BS_WORKER_CORE, and the
+// default is **0 — core 0**, because the measurement said so. Frames taken for the world to
+// fill from cold, Azahar, everything else identical:
+//
+//   core 0, no CPU time limit ......  127 frames   (worker wall time 1842 ms)
+//   core 1, APT limit 30 ...........  316 frames   (worker wall time 5251 ms)
+//   core 1, APT limit 80 ...........  127 frames   (worker wall time 1973 ms)
+//
+// APT_SetAppCpuTimeLimit is a **ceiling on the application, not a floor**: 30 means the
+// worker gets at most 30% of core 1, where on core 0 it already gets the ~94% of every
+// frame the main thread spends blocked. That is the whole of the 2.5x. Raising the limit to
+// 80 recovers the loss and buys nothing on top of it — the main thread's own CPU time is
+// 0.62-0.65 ms of a 16.71 ms frame, so there is no second thread's worth of work to overlap
+// with — while taking 80% of the system core away from the OS services that share it, which
+// is a hardware risk no emulator can measure. So the request is implemented, measured, and
+// off. Set -DBS_WORKER_CORE=1 to turn it back on; workerCore() reports where it landed.
+//
+// It falls back to core 0 if either the APT call or the thread creation is refused, and
+// workerCore() reports where it actually landed — a silent fallback would leave every
+// measurement afterwards labelled with a core it never ran on.
+//
+// Either way it runs one priority step *below* the main thread (higher number = lower
+// priority on this console), so on core 0 it can never delay a frame: it only gets the CPU
+// when the main thread blocks, which it does for ~15.7 ms of every 16.71 ms frame inside
+// C3D_FrameBegin(C3D_FRAME_SYNCDRAW).
+//
+// The cache review this move needed, done rather than assumed. Two threads on one core
+// share an L1 data cache and two threads on two cores do not, so the staging handoff is
+// only safe if the primitives around it issue real memory barriers. Disassembling
+// devkitPro's libctru.a: LightLock_Unlock opens with `mcr p15, 0, r3, c7, c10, 5`, which
+// is the ARM11 Data Memory Barrier, before its ldrex/strex pair; LightLock_Lock,
+// LightEvent_Signal and LightEvent_WaitTimeout each contain two of the same instruction.
+// Every byte the worker writes into the staging world is published by a LightLock_Unlock
+// and read after a LightLock_Lock, so the barriers sit on exactly the edges that matter.
+//
+// The handshake itself does the rest: the main thread only touches the staging world while
+// s_ready is set and the worker is parked in LightEvent_Wait, so the two never write the
+// same memory at the same time on either core.
 #pragma once
 
 #include <stdbool.h>
@@ -72,3 +105,10 @@ int   workerDropped(void);          // submissions refused because the ring was 
 int   workerQueued(void);           // jobs still waiting to be picked up
 float workerBusyMs(void);           // wall time the worker spent inside the generator
 float workerInstallMs(void);        // wall time the main thread spent copying columns
+
+// Which CPU core the worker actually ended up on, not which one it asked for: 1 only if
+// APT_SetAppCpuTimeLimit and the thread creation both succeeded, 0 otherwise, -1 before
+// workerStart. Reported rather than assumed, because the second core is a request the
+// system is allowed to refuse and a silent fallback would make every measurement taken
+// afterwards mean something other than what it says.
+int workerCore(void);

@@ -11,8 +11,22 @@
 // would be one page of heap.
 #define WORKER_STACK_BYTES (32 * 1024)
 
+// Step 6.3, and the answer is a measurement rather than the one the plan expected. Set to 1
+// to ask for the system core; see the table in worker.h for why the default is 0.
+#ifndef BS_WORKER_CORE
+#define BS_WORKER_CORE 0
+#endif
+
+// Percentage of the *system* core the application may use, and only consulted when
+// BS_WORKER_CORE is 1. 30 is the number every libctru example asks for and the number the
+// plan names; measured, it is also the number that makes the world fill 2.5x slower, because
+// it is a ceiling on the worker and not a floor. 80 measures the same as core 0 but takes
+// that share from the OS services sharing the core, which cannot be tested on an emulator.
+#define WORKER_CPU_TIME_LIMIT 80
+
 static Thread     s_thread;
 static bool       s_started;
+static int        s_core = -1;   // where the worker actually ended up; see workerCore()
 
 // Everything below is shared between the two threads and only ever touched under s_lock.
 // s_work is the worker's wake-up: signalled when a job is submitted, when the staging
@@ -115,7 +129,25 @@ bool workerStart(const WorldGen* g)
 	svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
 	if (prio + 1 <= 0x3F) prio += 1;
 
-	s_thread = threadCreate(workerMain, NULL, WORKER_STACK_BYTES, prio, 0, false);
+	// Step 6.3. The second core is a request, not a guarantee: APT_SetAppCpuTimeLimit can
+	// fail (it is refused outright under some launch paths), and threadCreate on core 1
+	// fails without it. Both are checked and the result is recorded, because a silent
+	// fall back to core 0 would leave every measurement afterwards labelled "core 1" and
+	// meaning nothing of the sort.
+	//
+	// Falling back is the right failure, and — measured — so is not asking. Core 0 at one
+	// priority step below the main thread is the step 5.5 arrangement and it works: the
+	// worker gets the CPU while the main thread is blocked on the GPU, which is ~15.7 ms of
+	// every 16.71 ms frame. Refusing to start would turn "no second core" into "no world".
+	s_thread = NULL;
+	if (BS_WORKER_CORE && R_SUCCEEDED(APT_SetAppCpuTimeLimit(WORKER_CPU_TIME_LIMIT))) {
+		s_thread = threadCreate(workerMain, NULL, WORKER_STACK_BYTES, prio, 1, false);
+		if (s_thread) s_core = 1;
+	}
+	if (!s_thread) {
+		s_thread = threadCreate(workerMain, NULL, WORKER_STACK_BYTES, prio, 0, false);
+		if (s_thread) s_core = 0;
+	}
 	if (!s_thread) {
 		worldExit(&s_staging);
 		return false;
@@ -124,6 +156,8 @@ bool workerStart(const WorldGen* g)
 	s_started = true;
 	return true;
 }
+
+int workerCore(void) { return s_core; }
 
 void workerStop(void)
 {

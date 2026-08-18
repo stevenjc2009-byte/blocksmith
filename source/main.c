@@ -395,6 +395,7 @@ typedef struct {
 	float worst_stream_ms;    // install + mesh drain, per frame
 	float worst_recenter_ms;  // genFollow, which is ~0 except on the frame that crosses
 	int   worst_built;        // most chunks meshed in one frame
+	int   fill_frames;        // frames before the world was first complete — step 6.3
 } GenResult;
 
 // Updated across frames as columns arrive, so it is a file static rather than a local:
@@ -792,6 +793,7 @@ static void worldReportDraw(int refused, bool built,
 		// most chunks meshed in one frame. Read `strm` against the 16.71 ms frame.
 		printf("strm %5.2f rc %5.2f qp%3d n%d  \n", gen->worst_stream_ms,
 		       gen->worst_recenter_ms, jobqPeak(&s_meshq), gen->worst_built);
+		printf("fill %4d frames  core %d      \n", gen->fill_frames, workerCore());
 #endif
 	}
 
@@ -1097,6 +1099,12 @@ int main(void)
 			report_final = true;
 			worldReportDraw(refused, WORLD_INTACT(), selftest, &stress, &dig, &s_genr);
 		}
+		// Frames the world took to fill, and step 6.3's whole criterion. The main thread
+		// gives the worker its CPU by *blocking* on the GPU, so "did moving the worker to
+		// the second core help?" cannot be answered by the main thread's own cpu ms — that
+		// number is already 0.65 ms and has nowhere to go. How many frames the twenty-five
+		// boot columns take to arrive can be.
+		if (!report_final) s_genr.fill_frames++;
 
 #if BS_REPORT_ONLY
 		// Verification build: the overlay is suppressed so the whole report fits in
