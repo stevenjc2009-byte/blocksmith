@@ -134,6 +134,12 @@ bool     chunkRenderCaveRan(void);
 // chunk would cull plausibly and wrongly.
 void     chunkRenderCamera(float* x, float* y, float* z);
 
+// Step 7.5's evidence: what the alpha-tested second pass actually submitted on the last
+// chunkRenderDraw. Both zero means the pass drew nothing — which looks identical on screen
+// to "there are no leaves in view", and only one of those is a bug.
+uint32_t chunkRenderAlphaTris(void);
+int      chunkRenderAlphaDraws(void);
+
 // Average microseconds step 7.3's flood fill added to a chunk build. Separate from
 // chunkRenderProfile's two buckets on purpose — new cost on a path with an existing budget
 // has to be visible on its own, not hidden inside a number that was already there.

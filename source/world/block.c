@@ -38,11 +38,19 @@ static const BlockInfo kBlocks[BLOCK_COUNT] = {
 		.name = "leaves",
 		.tex  = { BTEX_LEAVES, BTEX_LEAVES, BTEX_LEAVES,
 		          BTEX_LEAVES, BTEX_LEAVES, BTEX_LEAVES },
-		// Opaque, not transparent. A cutout canopy needs a sorted second draw pass,
-		// which is step 7.5; marking it transparent here would make the mesher emit
-		// every interior leaf face for a pass that does not exist yet, and spend
-		// triangles in the phase that is meant to be measuring generation.
-		.solid = true, .transparent = false, .liquid = false,
+		// Transparent since step 7.5: the atlas tile now carries real alpha-0 holes and
+		// the canopy is drawn in a second, alpha-tested pass after the opaque one.
+		//
+		// Still `solid`, because the two flags answer different questions. `solid` is
+		// "does this fill its cell" — it drives collision, the raycast, ambient occlusion
+		// and the mesher's face test, and all four should go on treating a leaf as a
+		// block. `transparent` is "does this hide what is behind it", which is now no: the
+		// sight walk in world/visgraph.c can see through a canopy, and the renderer knows
+		// to defer these faces to the second pass.
+		//
+		// Leaf-against-leaf faces stay culled, because that test reads `solid`. That is
+		// the cheap canopy — sky through the holes, not the inside of a hollow shell.
+		.solid = true, .transparent = true, .liquid = false,
 	},
 };
 

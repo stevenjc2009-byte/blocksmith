@@ -28,6 +28,20 @@ typedef struct {
 	uint32_t    vert_count;
 	uint32_t    index_count;
 	uint32_t    faces;       // quads emitted
+
+	// Step 7.5. The index buffer holds two runs back to back: opaque faces in
+	// [0, opaque_index_count) and transparent ones in [opaque_index_count, index_count).
+	// The renderer draws them as two calls with different GPU state, the second with an
+	// alpha test on, after everything opaque in the frame.
+	//
+	// One buffer with two runs rather than two buffers. The slot pool is 64 fixed-size
+	// linear-heap allocations claimed once at init (see scene/chunk_render.h); a second
+	// pool sized for the worst case would claim another 5.5 MB of a heap that cannot be
+	// defragmented, to hold geometry that is a few percent of the total. Two runs cost
+	// one extra draw call per chunk that has any, and no memory at all.
+	uint32_t    opaque_index_count;
+	uint32_t    opaque_faces;
+
 	bool        overflow;    // ran out of room: the mesh is incomplete, not corrupt
 } MeshOut;
 

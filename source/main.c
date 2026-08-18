@@ -771,6 +771,12 @@ static void worldReportDraw(int refused, bool built,
 	printf("cam %6.2f %6.2f %6.2f %s\n", wx, wy, wz,
 	       (fabsf(wx - cam->x) < 0.02f && fabsf(wy - cam->y) < 0.02f &&
 	        fabsf(wz - cam->z) < 0.02f) ? "MATCH" : "WRONG");
+	// Step 7.5. What the alpha-tested second pass actually submitted. Both zero looks
+	// identical on screen to "there is no canopy in view", and only one of those is a bug —
+	// the split is inside the mesher, so a wrong boundary would draw every leaf face in the
+	// opaque pass and the world would still look almost right.
+	printf("alpha %2d draws %5lu tris        \n", chunkRenderAlphaDraws(),
+	       (unsigned long)chunkRenderAlphaTris());
 	printf("vbo pool %5.2f MB  refused %2d  \n", chunkRenderBytes() / mb,
 	       chunkRenderRefusals());
 	printf("startup mesh refused %2d        \n", gen->mesh_refused);

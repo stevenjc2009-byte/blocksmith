@@ -254,6 +254,101 @@ static bool fillChunk(int cx, int cy, int cz, BlockId id)
 	return true;
 }
 
+// Step 7.5's split. The mesher now writes two runs into one index buffer — opaque faces
+// first, then the ones the alpha-tested pass draws — and the renderer trusts the boundary
+// absolutely: it draws [0, opaque_index_count) with one GPU state and the rest with another.
+// A boundary that is off by one quad puts six leaf indices into the opaque pass, where they
+// draw as solid green squares, or six stone indices into the alpha pass, where they draw
+// fine and mislead every count that follows.
+//
+// None of that is visible on a screenshot of a forest, which is why it is checked here.
+static void testMesherTransparentSplit(void)
+{
+	MeshOut out = {0};
+	out.vert_cap  = MESH_MAX_VERTS;
+	out.index_cap = MESH_MAX_INDICES;
+	out.verts     = (MeshVertex*)malloc(sizeof(MeshVertex) * out.vert_cap);
+	out.indices   = (uint16_t*)malloc(sizeof(uint16_t) * out.index_cap);
+	CHECK(out.verts != NULL && out.indices != NULL);
+	if (!out.verts || !out.indices) { free(out.verts); free(out.indices); return; }
+
+	// The premise the split rests on. If either of these ever stops holding, every count
+	// below is measuring something else.
+	CHECK(blockIsSolid(BLOCK_LEAVES));
+	CHECK(blockInfo(BLOCK_LEAVES)->transparent);
+	CHECK(!blockInfo(BLOCK_STONE)->transparent);
+
+	// --- All stone: everything opaque, the transparent run is empty.
+	worldInit(&s_world);
+	CHECK(fillChunk(1, 1, 1, BLOCK_STONE));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.faces == 6 * CHUNK_DIM * CHUNK_DIM);
+	CHECK(out.opaque_faces == out.faces);
+	CHECK(out.opaque_index_count == out.index_count);
+
+	// --- All leaves: everything deferred, the opaque run is empty. Same face count as the
+	// stone chunk, because leaf-against-leaf is still culled — that is the cheap canopy,
+	// and if `solid` were dropped this number would jump to 24,576 instead.
+	worldExit(&s_world);
+	worldInit(&s_world);
+	CHECK(fillChunk(1, 1, 1, BLOCK_LEAVES));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.faces == 6 * CHUNK_DIM * CHUNK_DIM);
+	CHECK(out.opaque_faces == 0);
+	CHECK(out.opaque_index_count == 0);
+
+	// --- Mixed: one leaf block sitting alone above a floor of stone. The two runs must
+	// account for every face between them, with nothing lost and nothing double-counted.
+	worldExit(&s_world);
+	worldInit(&s_world);
+	for (int z = 0; z < CHUNK_DIM; z++)
+		for (int x = 0; x < CHUNK_DIM; x++)
+			CHECK_QUIET(worldSet(&s_world, CHUNK_DIM + x, CHUNK_DIM, CHUNK_DIM + z, BLOCK_STONE));
+	CHECK(worldSet(&s_world, CHUNK_DIM + 4, CHUNK_DIM + 6, CHUNK_DIM + 4, BLOCK_LEAVES));
+
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+
+	CHECK(out.opaque_faces + 6 == out.faces);                   // the lone leaf, six faces
+	CHECK(out.opaque_index_count + 6 * 6 == out.index_count);
+	CHECK(out.opaque_index_count == out.opaque_faces * 6);
+	CHECK(out.opaque_faces > 0);                                // the stone floor is there
+
+	// The runs must not overlap and must not leave a gap: every index in the buffer belongs
+	// to exactly one of them, and the transparent one starts where the opaque one stops.
+	CHECK(out.opaque_index_count <= out.index_count);
+
+	// The deferred run really is the leaf. Its vertices are the last four the mesher wrote,
+	// and they must carry the leaf tile rather than stone's.
+	const AtlasRect leaf  = atlasRect(blockFaceTex(BLOCK_LEAVES, FACE_TOP));
+	const AtlasRect stone = atlasRect(blockFaceTex(BLOCK_STONE, FACE_TOP));
+	CHECK(leaf.u0 != stone.u0 || leaf.v0 != stone.v0);   // else the check below proves nothing
+
+	bool all_leaf_tile = true;
+	for (uint32_t i = out.opaque_index_count; i < out.index_count; i++) {
+		const MeshVertex* v = &out.verts[out.indices[i]];
+		const bool in_tile = (v->u >= leaf.u0 && v->u <= leaf.u1 &&
+		                      v->v >= leaf.v0 && v->v <= leaf.v1);
+		if (!in_tile) all_leaf_tile = false;
+	}
+	CHECK(all_leaf_tile);
+
+	// And the opaque run must contain none of it.
+	bool any_leaf_in_opaque = false;
+	for (uint32_t i = 0; i < out.opaque_index_count; i++) {
+		const MeshVertex* v = &out.verts[out.indices[i]];
+		if (v->u >= leaf.u0 && v->u <= leaf.u1 && v->v >= leaf.v0 && v->v <= leaf.v1)
+			any_leaf_in_opaque = true;
+	}
+	CHECK(!any_leaf_in_opaque);
+
+	worldExit(&s_world);
+	free(out.verts);
+	free(out.indices);
+}
+
 // The mesher, step 3.1. The counts here are the whole point of the step: a solid
 // chunk with solid neighbours must emit *nothing*, and a lone block must emit exactly
 // six faces. Both are invisible on screen — a chunk meshed with its interior included
@@ -2555,12 +2650,15 @@ static void testVisConnectivity(void)
 	CHECK(visConnected(joined, FACE_EAST, FACE_TOP));
 	CHECK(visConnected(joined, FACE_WEST, FACE_BOTTOM));
 
-	// Leaves are opaque today (block.c says so, and step 7.5 is where that changes), so a
-	// canopy blocks sight exactly like stone. When 7.5 flips the flag this check flips with
-	// it, which is the point of writing the fill against solid && !transparent rather than
-	// against solid.
+	// Step 7.5 made leaves transparent, and this check flipped with it: it used to assert 0,
+	// on the grounds that an opaque canopy blocks sight exactly like stone, and now asserts
+	// fully connected because sight passes through one. That the same line could flip by
+	// changing one field in the block registry is the point of writing the fill against
+	// solid && !transparent rather than against solid — leaves are still solid, and still
+	// stop the player walking through them.
 	chunkClear(&s_vis_chunk, BLOCK_LEAVES);
-	CHECK(visChunkConnectivity(&s_vis_chunk, &s_vis_scratch) == 0);
+	CHECK(visChunkConnectivity(&s_vis_chunk, &s_vis_scratch) == 0x7FFF);
+	CHECK(blockIsSolid(BLOCK_LEAVES));
 }
 
 // Fills a walk box of nx x 1 x 1 chunks, every cell drawable, and returns how many the walk
@@ -2710,6 +2808,7 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testScratch26();
 	testScratchFloor();
 	testMesher();
+	testMesherTransparentSplit();
 	testMesherAO();
 	testRemeshList();
 	testIncrementalRemesh();

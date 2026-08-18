@@ -53,6 +53,13 @@ typedef struct {
 	int      cx, cy, cz;
 	uint32_t vert_count;
 	uint32_t index_count;
+
+	// Step 7.5. Where the opaque run ends and the transparent one begins inside the same
+	// index buffer. Faces in [0, opaque_index_count) are drawn in the first pass and the
+	// rest in the second, alpha-tested one. Equal to index_count when the chunk has no
+	// transparent geometry, which is most of them.
+	uint32_t opaque_index_count;
+
 	bool     used;         // owns a chunk (even if that chunk meshed to nothing)
 
 	// Step 7.3. Which of this chunk's six faces sight can pass between, computed once when
@@ -115,7 +122,17 @@ static MeshSlot s_slots[MESH_SLOTS];
 static int      s_culled;        // chunks the frustum rejected on the last draw
 static int      s_sort_moved;    // step 7.2: chunks the sort took out of slot order
 static bool     s_sort_ok;       // ...and whether the emitted order really is near-to-far
-static int      s_cave_culled;   // step 7.3: chunks no sight line reached
+static int      s_cave_culled;
+
+// Step 7.5's evidence. Reported rather than inferred, for the same reason the cave-cull
+// count is: "the canopy looks see-through" and "the second pass ran" are different claims,
+// and a pass that silently drew nothing would look exactly like a chunk with no leaves in it.
+static uint32_t s_alpha_tris;
+static int      s_alpha_draws;
+
+// The alpha test threshold for the transparent pass. See the draw loop for why it is the
+// midpoint and not 0.
+#define ALPHA_CUTOFF  127   // step 7.3: chunks no sight line reached
 static bool     s_cave_ran;      // ...and whether the walk ran at all this frame
 static int      s_refusals;
 static size_t   s_bytes;
@@ -204,6 +221,12 @@ static void pipelineBind(void)
 
 	C3D_DepthTest(true, GPU_GREATER, GPU_WRITE_ALL);
 	C3D_CullFace(GPU_CULL_BACK_CCW);
+
+	// Off here and turned on only for step 7.5's second pass. Global GPU state again, so
+	// leaving it on would alpha-test the opaque world against an alpha channel that is 255
+	// everywhere — harmless today, and exactly the kind of thing that stops being harmless
+	// the moment another tile grows a hole.
+	C3D_AlphaTest(false, GPU_ALWAYS, 0);
 
 	// Fog, re-established per frame for the same reason everything else here is: this is
 	// global GPU state, not per-program state, and the moment a second pass touches it there
@@ -304,7 +327,7 @@ bool chunkRenderBuild(const World* w, int cx, int cy, int cz)
 	const Chunk* chunk = worldChunk(w, cx, cy, cz);
 	if (!chunk || chunkIsAllAir(chunk)) {
 		s->cx = cx; s->cy = cy; s->cz = cz;
-		s->vert_count = s->index_count = 0;
+		s->vert_count = s->index_count = s->opaque_index_count = 0;
 		s->used = true;
 
 		// Nothing to draw, but sight still has to get through it — an all-air chunk joins
@@ -344,13 +367,14 @@ bool chunkRenderBuild(const World* w, int cx, int cy, int cz)
 	if (out.overflow) {
 		s_refusals++;
 		s->used = false;      // a half-mesh is worse than no mesh
-		s->vert_count = s->index_count = 0;
+		s->vert_count = s->index_count = s->opaque_index_count = 0;
 		return false;
 	}
 
 	s->cx = cx; s->cy = cy; s->cz = cz;
 	s->vert_count  = out.vert_count;
 	s->index_count = out.index_count;
+	s->opaque_index_count = out.opaque_index_count;
 
 	// Claimed even when the chunk meshed to nothing. This used to be `out.faces > 0` — an
 	// all-air chunk handed its slot straight back — and that was a bug you could reach by
@@ -378,7 +402,7 @@ int chunkRenderReleaseColumn(int cx, int cz)
 		dirtyqClear(&s_dirty, i);
 
 		s->used = false;
-		s->vert_count = s->index_count = 0;
+		s->vert_count = s->index_count = s->opaque_index_count = 0;
 		released++;
 	}
 	return released;
@@ -526,6 +550,30 @@ static void caveWalk(const C3D_Mtx* view)
 }
 #endif
 
+// One run of one chunk's index buffer. Step 7.5 draws each chunk in up to two runs — the
+// opaque faces and then the alpha-tested ones — and both need the same model matrix and the
+// same vertex buffer, so the only thing that differs is where in the indices to start.
+static void drawRun(const C3D_Mtx* view, const MeshSlot* s, uint32_t first, uint32_t count)
+{
+	if (!count) return;
+
+	// Vertices are chunk-local 0..16, so the chunk is placed with a matrix rather than by
+	// baking world coordinates into bytes that could not hold them anyway.
+	C3D_Mtx model, mv;
+	Mtx_Identity(&model);
+	Mtx_Translate(&model, (float)(s->cx * CHUNK_DIM), (float)(s->cy * CHUNK_DIM),
+	              (float)(s->cz * CHUNK_DIM), true);
+	Mtx_Multiply(&mv, view, &model);
+	C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_uloc_modelview, &mv);
+
+	C3D_BufInfo* buf = C3D_GetBufInfo();
+	BufInfo_Init(buf);
+	BufInfo_Add(buf, s->verts, sizeof(MeshVertex), 2, 0x10);
+
+	C3D_DrawElements(GPU_TRIANGLES, (int)count, C3D_UNSIGNED_SHORT, s->indices + first);
+	metricsCountDraw(count / 3);
+}
+
 void chunkRenderDraw(const C3D_Mtx* view)
 {
 	pipelineBind();   // see pipelineBind: the highlight leaves the GPU set up for itself
@@ -622,26 +670,40 @@ void chunkRenderDraw(const C3D_Mtx* view)
 		if (k > 0 && visible[k] < visible[k - 1]) s_sort_moved++;
 	}
 
+	// Step 7.5, pass 1: the opaque run of every visible chunk, nearest first, which is the
+	// order step 7.2 just put them in.
 	for (int k = 0; k < n; k++) {
 		const MeshSlot* s = &s_slots[visible[k]];
-
-		// Vertices are chunk-local 0..16, so the chunk is placed with a matrix
-		// rather than by baking world coordinates into bytes that could not hold
-		// them anyway.
-		C3D_Mtx model, mv;
-		Mtx_Identity(&model);
-		Mtx_Translate(&model, (float)(s->cx * CHUNK_DIM), (float)(s->cy * CHUNK_DIM),
-		              (float)(s->cz * CHUNK_DIM), true);
-		Mtx_Multiply(&mv, view, &model);
-		C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_uloc_modelview, &mv);
-
-		C3D_BufInfo* buf = C3D_GetBufInfo();
-		BufInfo_Init(buf);
-		BufInfo_Add(buf, s->verts, sizeof(MeshVertex), 2, 0x10);
-
-		C3D_DrawElements(GPU_TRIANGLES, (int)s->index_count, C3D_UNSIGNED_SHORT, s->indices);
-		metricsCountDraw(s->index_count / 3);
+		drawRun(view, s, 0, s->opaque_index_count);
 	}
+
+	// Pass 2: the transparent run, farthest first and with the alpha test on.
+	//
+	// Farthest first, i.e. backwards through the same array, because this pass draws
+	// geometry the depth buffer cannot sort for it. With a cutout canopy and depth writes
+	// still on, order happens not to matter — a discarded fragment writes nothing and a
+	// kept one is fully opaque — but the moment anything here is genuinely translucent it
+	// does, and an ordering that is only correct by accident is not one to leave in.
+	//
+	// GPU_GREATER against 127 rather than "not zero": the atlas is authored with alpha at 0
+	// or 255 and nothing between (see tools/make_atlas.py), so the midpoint is the widest
+	// possible margin against a filtered sample landing just off the extreme.
+	s_alpha_tris = 0;
+	s_alpha_draws = 0;
+	C3D_AlphaTest(true, GPU_GREATER, ALPHA_CUTOFF);
+	for (int k = n - 1; k >= 0; k--) {
+		const MeshSlot* s = &s_slots[visible[k]];
+		const uint32_t  count = s->index_count - s->opaque_index_count;
+		if (!count) continue;
+
+		drawRun(view, s, s->opaque_index_count, count);
+		s_alpha_tris += count / 3;
+		s_alpha_draws++;
+	}
+
+	// Left off for whatever draws next. This is global GPU state, not per-program state,
+	// and the highlight pass in scene/highlight.c never sets it.
+	C3D_AlphaTest(false, GPU_ALWAYS, 0);
 }
 
 int chunkRenderMeshes(void)
@@ -732,3 +794,9 @@ float chunkRenderVisUs(void)
 }
 int    chunkRenderRefusals(void) { return s_refusals; }
 size_t chunkRenderBytes(void)    { return s_bytes; }
+
+// Step 7.5. Triangles and draw calls the alpha-tested pass actually submitted on the last
+// chunkRenderDraw. Zero for both means the second pass drew nothing at all, which is a
+// different situation from "the canopy is off screen" only in that the first is a bug.
+uint32_t chunkRenderAlphaTris(void)  { return s_alpha_tris; }
+int      chunkRenderAlphaDraws(void) { return s_alpha_draws; }

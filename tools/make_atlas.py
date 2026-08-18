@@ -166,24 +166,43 @@ def tile_wood_top(rng):
 
 
 def tile_leaves(rng):
-    """Dense canopy. Opaque on purpose: a cutout leaf needs a transparent draw
-    pass, which is step 7.5, and a half-finished one would cost sorting work in
-    the phase that is meant to be measuring generation."""
+    """Cutout canopy — step 7.5. Returns RGBA, and the holes are real alpha 0
+    rather than dark pixels, so the transparent pass has something to key on.
+
+    Alpha is 0 or 255 and never in between: the draw uses an alpha *test*, not
+    blending, so a half-transparent pixel would not come out half-visible — it
+    would land on one side of the threshold and look like a mistake.
+    """
     leaf = [(38, 82, 52), (46, 96, 60), (30, 68, 44), (54, 110, 68)]
-    img = speckle(rng, TILE_PX, leaf, weights=[4, 3, 3, 2])
+    img = speckle(rng, TILE_PX, leaf, weights=[4, 3, 3, 2]).convert("RGBA")
     px = img.load()
     # Clumps: a 2x2 of one shade, which is what stops the tile reading as static.
     for _ in range(12):
         x = rng.randrange(TILE_PX - 1)
         y = rng.randrange(TILE_PX - 1)
-        shade = rng.choice(leaf)
+        shade = rng.choice(leaf) + (255,)
         for dy in range(2):
             for dx in range(2):
                 px[x + dx, y + dy] = shade
-    # A handful of gaps, dark rather than transparent — the shadow inside the
-    # canopy, and the only depth cue an opaque leaf tile can carry.
-    for _ in range(10):
-        px[rng.randrange(TILE_PX), rng.randrange(TILE_PX)] = (20, 44, 30)
+    # Gaps. Singles scattered through, plus a few 2x1 tears, so the canopy breaks
+    # up at more than one scale — a field of isolated single pixels reads as noise
+    # on a 240p screen rather than as foliage.
+    hole = (0, 0, 0, 0)
+    for _ in range(24):
+        px[rng.randrange(TILE_PX), rng.randrange(TILE_PX)] = hole
+    for _ in range(6):
+        x = rng.randrange(TILE_PX - 1)
+        y = rng.randrange(TILE_PX)
+        px[x, y] = hole
+        px[x + 1, y] = hole
+    # The tile's own border stays opaque. place() edge-extends the tile into its
+    # 2px padding, so a transparent edge pixel would be smeared outward and could
+    # put a hole into a neighbouring tile's sample at a grazing angle — which is
+    # the exact bug the padding exists to prevent.
+    for i in range(TILE_PX):
+        for x, y in ((i, 0), (i, TILE_PX - 1), (0, i), (TILE_PX - 1, i)):
+            r, g, b, a = px[x, y]
+            px[x, y] = (rng.choice(leaf) + (255,)) if a == 0 else (r, g, b, 255)
     return img
 
 
@@ -246,9 +265,13 @@ def main() -> None:
     # silently changes the art and any texture comparison becomes meaningless.
     rng = random.Random(20260817)
 
-    atlas = Image.new("RGB", (ATLAS_PX, ATLAS_PX), (24, 20, 28))
+    # RGBA since step 7.5. atlas.t3s was already asking tex3ds for rgba8888, so the
+    # alpha channel has been going to the GPU all along — it was simply 255 everywhere
+    # because every painter returned RGB. Only the leaves tile puts anything else in it;
+    # the rest are converted and come out fully opaque, unchanged pixel for pixel.
+    atlas = Image.new("RGBA", (ATLAS_PX, ATLAS_PX), (24, 20, 28, 255))
     for index, name in enumerate(TILES):
-        place(atlas, PAINTERS[name](rng), index)
+        place(atlas, PAINTERS[name](rng).convert("RGBA"), index)
 
     atlas.save(out_png)
     print(f"{out_png}  {ATLAS_PX}x{ATLAS_PX}  {len(TILES)} tiles  cell {CELL_PX}px  grid {GRID}x{GRID}")

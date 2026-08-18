@@ -77,6 +77,12 @@ static uint8_t  s_cell_solid[SCRATCH_BLOCKS];
 
 static FacePlan s_plan[BLOCK_FACES];
 static uint8_t  s_solid[256];                       // indexed by a raw BlockId byte
+
+// Step 7.5: does this block's geometry belong in the transparent pass? Solid *and*
+// transparent — air is transparent and never drawn, so both flags have to be read.
+// A byte table for the same reason s_solid is one: the alternative is a call into
+// block.c per cell, and there is no link-time optimisation in this build.
+static uint8_t  s_deferred[256];
 static AtlasRect s_rect[BLOCK_COUNT][BLOCK_FACES];
 static bool     s_ready;
 
@@ -86,8 +92,11 @@ static void planBuild(void)
 {
 	// A raw id, not a validated one. blockInfo() already maps an unknown id to air, so
 	// this table answers for all 256 byte values and the mesher never bounds-checks.
-	for (int i = 0; i < 256; i++)
-		s_solid[i] = (uint8_t)blockIsSolid((BlockId)i);
+	for (int i = 0; i < 256; i++) {
+		const BlockInfo* info = blockInfo((BlockId)i);
+		s_solid[i]    = (uint8_t)info->solid;
+		s_deferred[i] = (uint8_t)(info->solid && info->transparent);
+	}
 
 	for (int id = 0; id < BLOCK_COUNT; id++)
 		for (int face = 0; face < BLOCK_FACES; face++)
@@ -195,6 +204,49 @@ static void emitFace(MeshOut* o, int si, int lx, int ly, int lz,
 	o->faces++;
 }
 
+// One geometry pass over the chunk. `deferred` selects which half of the blocks it emits:
+// false for the opaque ones, true for the ones step 7.5 defers to the alpha-tested pass.
+//
+// Two passes over the same 4,096 cells rather than one pass writing into two buffers. The
+// second pass costs one byte test per cell — s_deferred is a table, and the cells it skips
+// cost nothing else — while a single pass would have to keep two index cursors and then
+// splice the runs together, for geometry that is a few percent of a chunk.
+static void meshPass(MeshOut* out, const MeshScratch* s, bool deferred)
+{
+	// y outer, x inner: x is the contiguous axis in both the chunk and the scratch, so
+	// this walks memory forwards. The scratch index rides along with the x loop rather
+	// than being recomputed per cell — 4,096 multiplies a chunk that buy nothing.
+	for (int ly = 0; ly < CHUNK_DIM; ly++) {
+		for (int lz = 0; lz < CHUNK_DIM; lz++) {
+			int si = scratchIndex(1, ly + 1, lz + 1);
+
+			for (int lx = 0; lx < CHUNK_DIM; lx++, si++) {
+				if (!s_cell_solid[si]) continue;
+				const BlockId id = s->blocks[si];
+				if ((bool)s_deferred[id] != deferred) continue;
+
+				// Solid implies a real registry row, since s_solid says no for every id
+				// past the registry — so s_rect is safe to index without a check.
+				const AtlasRect* rects = s_rect[id];
+
+				for (int face = 0; face < BLOCK_FACES; face++) {
+					// A face exists only where solid meets non-solid. This single test
+					// is what removes 22 of every 24 faces in solid rock — and it reads
+					// the border of the scratch, so chunk seams are culled against the
+					// real neighbour instead of guessing air.
+					//
+					// It reads `solid`, not `transparent`, which is what keeps a canopy
+					// cheap: leaf against leaf is still culled, so the second pass draws
+					// the shell of a tree and not every leaf inside it.
+					if (s_cell_solid[si + s_plan[face].neighbour]) continue;
+
+					emitFace(out, si, lx, ly, lz, face, &rects[face]);
+				}
+			}
+		}
+	}
+}
+
 void meshChunk(MeshOut* out, const MeshScratch* s)
 {
 	out->vert_count  = 0;
@@ -207,31 +259,14 @@ void meshChunk(MeshOut* out, const MeshScratch* s)
 	for (int i = 0; i < SCRATCH_BLOCKS; i++)
 		s_cell_solid[i] = s_solid[s->blocks[i]];
 
-	// y outer, x inner: x is the contiguous axis in both the chunk and the scratch, so
-	// this walks memory forwards. The scratch index rides along with the x loop rather
-	// than being recomputed per cell — 4,096 multiplies a chunk that buy nothing.
-	for (int ly = 0; ly < CHUNK_DIM; ly++) {
-		for (int lz = 0; lz < CHUNK_DIM; lz++) {
-			int si = scratchIndex(1, ly + 1, lz + 1);
+	meshPass(out, s, false);
 
-			for (int lx = 0; lx < CHUNK_DIM; lx++, si++) {
-				if (!s_cell_solid[si]) continue;
-				const BlockId id = s->blocks[si];
+	// The boundary between the two runs, taken before the second pass writes anything.
+	// Recorded even when the second pass turns out to be empty, so the renderer never has
+	// to special-case "this chunk has no transparent geometry" — it draws a zero-length
+	// second run, which it already skips.
+	out->opaque_index_count = out->index_count;
+	out->opaque_faces       = out->faces;
 
-				// Solid implies a real registry row, since s_solid says no for every id
-				// past the registry — so s_rect is safe to index without a check.
-				const AtlasRect* rects = s_rect[id];
-
-				for (int face = 0; face < BLOCK_FACES; face++) {
-					// A face exists only where solid meets non-solid. This single test
-					// is what removes 22 of every 24 faces in solid rock — and it reads
-					// the border of the scratch, so chunk seams are culled against the
-					// real neighbour instead of guessing air.
-					if (s_cell_solid[si + s_plan[face].neighbour]) continue;
-
-					emitFace(out, si, lx, ly, lz, face, &rects[face]);
-				}
-			}
-		}
-	}
+	meshPass(out, s, true);
 }
