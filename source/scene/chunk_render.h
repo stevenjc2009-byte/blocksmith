@@ -21,6 +21,15 @@
 #define MESH_SLOT_INDICES  (MESH_SLOT_FACES * 6)
 #define MESH_SLOTS         64
 
+// The sky colour, in one place because step 6.4's fog has to be the same colour as the
+// background it fades into. Fog that does not match the clear colour reads as a grey sheet
+// hung in front of the sky instead of as distance, and one constant living in two files is
+// exactly how that drifts apart. Two byte orders because the two registers disagree:
+// C3D_RenderTargetClear takes RGBA8 and the PICA's fog colour register is 0x00BBGGRR.
+// Change one, change the other.
+#define SKY_CLEAR_RGBA8  0x102A33FF
+#define SKY_FOG_BGR      0x00332A10
+
 // Loads the shader, the atlas and the buffer pool. False if any of it failed.
 bool chunkRenderInit(void);
 void chunkRenderExit(void);

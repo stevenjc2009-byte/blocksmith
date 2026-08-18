@@ -33,7 +33,10 @@
 #include "world/world_test.h"
 #include "world/worldgen.h"
 
-#define CLEAR_COLOR 0x102A33FF   // dark teal — deliberately not the bottom screen's blue
+// Dark teal — deliberately not the bottom screen's blue. It moved into
+// scene/chunk_render.h at step 6.4 because the fog has to fade to exactly this colour, and
+// two copies of one constant in two files is how they end up different.
+#define CLEAR_COLOR SKY_CLEAR_RGBA8
 
 // The research page's worst case for an Old 3DS: 17x17 columns of fully populated
 // block data, ~9.25 MB. Claiming it here, once, is what turns the budget from an

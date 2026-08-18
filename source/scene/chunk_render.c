@@ -39,6 +39,49 @@ static int             s_uloc_projection;
 static int             s_uloc_modelview;
 static int             s_uloc_faceshade;
 
+// Clip planes, named rather than written inline because step 6.4's fog LUT has to be built
+// with the *same* two numbers the projection uses. FogLut_Exp maps a LUT entry to a view
+// distance with far*near/(i/128*(far-near)+near); feed it a different near or far and the
+// fog lands at distances the depth buffer never produces.
+#define VIEW_NEAR  0.1f
+#define VIEW_FAR   200.0f
+
+// Step 6.4. Fog is free on this GPU — a fixed-function stage after the TEV, no fragment
+// shader involved, since the PICA200 has not got one — and it is what makes a small mesh
+// ring liveable: terrain fades into the sky instead of the load boundary popping in.
+//
+// The two numbers are chosen against where the hardware can actually *put* a knot, which is
+// the whole trick. The fog LUT is 128 entries indexed by 1/w, so entry i sits at view
+// distance far*near/(i/128*(far-near)+near) — hyperbolic, and with near 0.1 that is:
+//
+//   entry 0 -> 200.00 blocks    entry 3 -> 4.18
+//   entry 1 ->  12.03           entry 4 -> 3.15
+//   entry 2 ->   6.21           entry 8 -> 1.59
+//
+// Everything between 12 blocks and the far plane is ONE linear segment. So there is no
+// point asking for a curve that fades out at, say, 30 blocks: the hardware would draw a
+// straight line through it. Instead the curve is set to reach opaque *at entry 1* — density
+// 0.1646, gradient 2.44 gives 0.5% visibility at 12.03 blocks — which makes everything from
+// 12 blocks outward uniformly sky-coloured, with real knots at 6.2, 4.2, 3.2 and 2.1 doing
+// the near ramp. Measured off the curve: 4% fogged at 2.1 blocks, 33% at 4.2, 65% at 6.2.
+//
+// Matched to render distance, as the step asks: GEN_MESH_RADIUS is 1, so three columns of
+// 16 blocks are meshed and the load boundary is never closer than 16 blocks from the player
+// (worst case, standing exactly on a column edge). Opaque at 12 is inside that with room to
+// spare, so the boundary cannot be seen at any position. When step 7.7 makes render distance
+// a setting, these two constants are what moves with it.
+//
+// Overridable so the check can go red: -DFOG_DENSITY=0.0f makes every LUT entry
+// exp(-0) = 1, which is "no fog" through this exact code path rather than a different one.
+#ifndef FOG_DENSITY
+#define FOG_DENSITY   0.1646f
+#endif
+#ifndef FOG_GRADIENT
+#define FOG_GRADIENT  2.44f
+#endif
+
+static C3D_FogLut s_fog_lut;
+
 static C3D_Mtx  s_projection;
 static MeshSlot s_slots[MESH_SLOTS];
 static int      s_refusals;
@@ -116,6 +159,16 @@ static void pipelineBind(void)
 	C3D_DepthTest(true, GPU_GREATER, GPU_WRITE_ALL);
 	C3D_CullFace(GPU_CULL_BACK_CCW);
 
+	// Fog, re-established per frame for the same reason everything else here is: this is
+	// global GPU state, not per-program state, and the moment a second pass touches it there
+	// is no owner. The gas mode argument is only read when the fog mode is GPU_GAS, and the
+	// zFlip argument is false because Mtx_PerspTilt is fed the same near/far the LUT was
+	// built from — flipping it would run the curve backwards, fogging the player's hands and
+	// leaving the horizon sharp, which is what this was checked against.
+	C3D_FogGasMode(GPU_FOG, GPU_PLAIN_DENSITY, false);
+	C3D_FogColor(SKY_FOG_BGR);
+	C3D_FogLutBind(&s_fog_lut);
+
 	for (int f = 0; f < BLOCK_FACES; f++) {
 		const float s = kFaceShade[f];
 		C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uloc_faceshade + f, s, s, s, 1.0f);
@@ -152,7 +205,11 @@ bool chunkRenderInit(void)
 		return false;
 
 	Mtx_PerspTilt(&s_projection, C3D_AngleFromDegrees(65.0f), 400.0f / 240.0f,
-	              0.1f, 200.0f, false);
+	              VIEW_NEAR, VIEW_FAR, false);
+
+	// Built once — it is 512 bytes of exponentials and nothing about it changes per frame.
+	// Only the three register writes that point the GPU at it are repeated, in pipelineBind.
+	FogLut_Exp(&s_fog_lut, FOG_DENSITY, FOG_GRADIENT, VIEW_NEAR, VIEW_FAR);
 
 	pipelineBind();
 	return true;
