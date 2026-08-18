@@ -743,8 +743,8 @@ static void worldReportDraw(int refused, bool built,
 	printf("blocks %5.2f MB of %5.2f MB cap \n", worldBytes(&s_world) / mb,
 	       budgetCap() / mb);
 	printf("peak   %5.2f MB  refused %4d   \n", budgetPeak() / mb, refused);
-	printf("meshes %4d  tris %6lu       \n", chunkRenderMeshes(),
-	       (unsigned long)chunkRenderTris());
+	printf("meshes %4d  tris %6lu cull %2d\n", chunkRenderMeshes(),
+	       (unsigned long)chunkRenderTris(), chunkRenderCulled());
 	printf("vbo pool %5.2f MB  refused %2d  \n", chunkRenderBytes() / mb,
 	       chunkRenderRefusals());
 	printf("startup mesh refused %2d        \n", gen->mesh_refused);

@@ -106,6 +106,11 @@ const C3D_Mtx* chunkRenderProjection(void);
 int      chunkRenderMeshes(void);     // slots holding geometry
 uint32_t chunkRenderTris(void);       // triangles across all of them
 
+// Chunks the step 7.1 frustum test rejected on the most recent chunkRenderDraw. Reported
+// rather than inferred: "draws went down" could equally mean a column failed to mesh, and
+// the two have very different causes.
+int      chunkRenderCulled(void);
+
 // Hash of every vertex byte in the pool, independent of slot order. Comparing an
 // incrementally remeshed pool against a fully rebuilt one is the only check that can
 // see a missed neighbour: the usual symptom is lost AO, which leaves the triangle
