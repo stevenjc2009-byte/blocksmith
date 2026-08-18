@@ -111,6 +111,14 @@ uint32_t chunkRenderTris(void);       // triangles across all of them
 // the two have very different causes.
 int      chunkRenderCulled(void);
 
+// Step 7.2's evidence. The front-to-back sort is invisible by design — opaque geometry
+// behind a depth test draws the same picture in any order — so "it works" and "it is a
+// no-op" cannot be told apart on screen. chunkRenderSortMoved() counts how many chunks the
+// sort actually took out of slot order on the last draw, and chunkRenderSortOk() says
+// whether the sequence it emitted really was non-decreasing in distance.
+int      chunkRenderSortMoved(void);
+bool     chunkRenderSortOk(void);
+
 // Hash of every vertex byte in the pool, independent of slot order. Comparing an
 // incrementally remeshed pool against a fully rebuilt one is the only check that can
 // see a missed neighbour: the usual symptom is lost AO, which leaves the triangle

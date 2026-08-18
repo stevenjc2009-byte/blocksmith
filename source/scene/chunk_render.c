@@ -17,6 +17,13 @@
 #define BS_FRUSTUM 1
 #endif
 
+// Step 7.2, same idea: -DBS_SORT=0 draws in slot order. The frame must be identical either
+// way — this is opaque geometry behind a depth test — so the thing that has to differ
+// between the two builds is chunkRenderSortMoved(), not the pixels.
+#ifndef BS_SORT
+#define BS_SORT 1
+#endif
+
 // Baked per-face brightness, the values Phase 1 proved on the single cube: a high sun
 // leaning south-east, no two faces sharing a value, so a wrong normal index shows up as
 // an obviously wrong wall instead of a subtle one. Written by name so the face order in
@@ -92,6 +99,8 @@ static C3D_FogLut s_fog_lut;
 static C3D_Mtx  s_projection;
 static MeshSlot s_slots[MESH_SLOTS];
 static int      s_culled;        // chunks the frustum rejected on the last draw
+static int      s_sort_moved;    // step 7.2: chunks the sort took out of slot order
+static bool     s_sort_ok;       // ...and whether the emitted order really is near-to-far
 static int      s_refusals;
 static size_t   s_bytes;
 
@@ -425,23 +434,74 @@ void chunkRenderDraw(const C3D_Mtx* view)
 	frustumFromMatrix(&frustum, &vp);
 	s_culled = 0;
 
+	// Visible slots, gathered before anything is drawn so step 7.2 can order them.
+	int   visible[MESH_SLOTS];
+	float depth[MESH_SLOTS];
+	int   n = 0;
+
 	for (int i = 0; i < MESH_SLOTS; i++) {
 		const MeshSlot* s = &s_slots[i];
 		if (!s->used || s->index_count == 0) continue;
 
-#if BS_FRUSTUM
 		// The chunk's world-space box. Exactly CHUNK_DIM on a side: the mesher never emits
 		// a vertex outside the chunk it was asked for, so there is no skin to add here, and
 		// adding one "to be safe" would keep chunks that are genuinely off-screen.
 		const float bx = (float)(s->cx * CHUNK_DIM);
 		const float by = (float)(s->cy * CHUNK_DIM);
 		const float bz = (float)(s->cz * CHUNK_DIM);
+
+#if BS_FRUSTUM
 		if (!frustumTestAABB(&frustum, bx, by, bz, bx + (float)CHUNK_DIM,
 		                     by + (float)CHUNK_DIM, bz + (float)CHUNK_DIM)) {
 			s_culled++;
 			continue;
 		}
 #endif
+
+		// Step 7.2's sort key: the chunk centre's clip-space w, which for this projection
+		// is exactly its distance in front of the camera. Row 3 of the same view-projection
+		// the frustum came from, so there is no second copy of the camera to keep in step —
+		// one dot product, no square root, no camera position threaded through the API.
+		const float h = (float)CHUNK_DIM * 0.5f;
+		depth[n] = vp.r[3].x * (bx + h) + vp.r[3].y * (by + h) +
+		           vp.r[3].z * (bz + h) + vp.r[3].w;
+		visible[n] = i;
+		n++;
+	}
+
+#if BS_SORT
+	// Insertion sort, nearest first. Insertion rather than anything cleverer because n is
+	// at most MESH_SLOTS (64) and in practice around a dozen after the frustum has run, and
+	// because the order barely changes between frames — a nearly-sorted input is the case
+	// insertion sort is linear on, which is exactly what walking through a world produces.
+	for (int i = 1; i < n; i++) {
+		const float d = depth[i];
+		const int   v = visible[i];
+		int j = i - 1;
+		while (j >= 0 && depth[j] > d) {
+			depth[j + 1]   = depth[j];
+			visible[j + 1] = visible[j];
+			j--;
+		}
+		depth[j + 1]   = d;
+		visible[j + 1] = v;
+	}
+#endif
+
+	// Proof that the order is what it claims to be, cheap enough to leave in: how many
+	// chunks the sort actually moved out of slot order, and whether the emitted sequence is
+	// really non-decreasing in depth. Without the first number, "the sort works" and "the
+	// sort is a no-op" look identical on screen — the frame is meant to be unchanged either
+	// way, since this is opaque geometry behind a depth test.
+	s_sort_moved = 0;
+	s_sort_ok    = true;
+	for (int k = 0; k < n; k++) {
+		if (k > 0 && depth[k] < depth[k - 1]) s_sort_ok = false;
+		if (k > 0 && visible[k] < visible[k - 1]) s_sort_moved++;
+	}
+
+	for (int k = 0; k < n; k++) {
+		const MeshSlot* s = &s_slots[visible[k]];
 
 		// Vertices are chunk-local 0..16, so the chunk is placed with a matrix
 		// rather than by baking world coordinates into bytes that could not hold
@@ -529,6 +589,8 @@ void chunkRenderProfile(float* scratch_us, float* mesh_us, int* builds)
 	if (builds)     *builds     = s_build_count;
 }
 
-int    chunkRenderCulled(void)   { return s_culled; }
+int    chunkRenderCulled(void)     { return s_culled; }
+int    chunkRenderSortMoved(void)  { return s_sort_moved; }
+bool   chunkRenderSortOk(void)     { return s_sort_ok; }
 int    chunkRenderRefusals(void) { return s_refusals; }
 size_t chunkRenderBytes(void)    { return s_bytes; }
