@@ -36,6 +36,14 @@ TILES = [
     "stone",
     "sand",
     "sentinel",
+    # Step 5.3's trees. Appended after the sentinel rather than next to sand,
+    # because the order above is the contract with the C side and inserting
+    # would silently re-texture every tile after the insertion point. The
+    # sentinel is still adjacent to real art on both sides, so it goes on
+    # doing its job.
+    "wood_side",
+    "wood_top",
+    "leaves",
 ]
 
 
@@ -111,6 +119,74 @@ def tile_sand(rng):
     return speckle(rng, TILE_PX, sands, weights=[4, 3, 2, 2])
 
 
+def tile_wood_side(rng):
+    """Bark: vertical grain, greyer and darker than dirt so a trunk reads as a
+    trunk against the soil it stands in rather than as a column of it."""
+    barks = [(92, 66, 44), (80, 57, 38), (104, 76, 52), (70, 50, 34)]
+    img = Image.new("RGB", (TILE_PX, TILE_PX))
+    px = img.load()
+    # Grain runs in columns, each column keeping one shade for a few pixels at a
+    # time — a per-pixel speckle would read as noise, not bark.
+    for x in range(TILE_PX):
+        y = 0
+        while y < TILE_PX:
+            shade = rng.choices(barks, weights=[4, 3, 2, 2])[0]
+            run = 2 + rng.randrange(5)
+            for dy in range(run):
+                if y + dy < TILE_PX:
+                    px[x, y + dy] = shade
+            y += run
+    # Two deep grooves, full height, one pixel wide, so the cylinder reads at a
+    # distance where the grain itself has blurred away.
+    for x in (rng.randrange(2, 7), rng.randrange(9, 14)):
+        for y in range(TILE_PX):
+            px[x, y] = (58, 41, 28)
+    return img
+
+
+def tile_wood_top(rng):
+    """The cut end: rings around an off-centre heart."""
+    pale = (150, 116, 80)
+    ring = (112, 84, 56)
+    dark = (86, 62, 42)
+    img = Image.new("RGB", (TILE_PX, TILE_PX))
+    px = img.load()
+    cx = 7.5 + rng.uniform(-1.2, 1.2)
+    cy = 7.5 + rng.uniform(-1.2, 1.2)
+    for y in range(TILE_PX):
+        for x in range(TILE_PX):
+            d = ((x - cx) ** 2 + (y - cy) ** 2) ** 0.5
+            # Concentric bands two pixels apart, jittered so they are not perfect
+            # circles — a clean bullseye looks machined.
+            band = int(d + rng.uniform(-0.35, 0.35)) // 2
+            px[x, y] = ring if band % 2 else pale
+            if d > 7.4:
+                px[x, y] = dark          # bark seen edge-on, framing the cut
+    return img
+
+
+def tile_leaves(rng):
+    """Dense canopy. Opaque on purpose: a cutout leaf needs a transparent draw
+    pass, which is step 7.5, and a half-finished one would cost sorting work in
+    the phase that is meant to be measuring generation."""
+    leaf = [(38, 82, 52), (46, 96, 60), (30, 68, 44), (54, 110, 68)]
+    img = speckle(rng, TILE_PX, leaf, weights=[4, 3, 3, 2])
+    px = img.load()
+    # Clumps: a 2x2 of one shade, which is what stops the tile reading as static.
+    for _ in range(12):
+        x = rng.randrange(TILE_PX - 1)
+        y = rng.randrange(TILE_PX - 1)
+        shade = rng.choice(leaf)
+        for dy in range(2):
+            for dx in range(2):
+                px[x + dx, y + dy] = shade
+    # A handful of gaps, dark rather than transparent — the shadow inside the
+    # canopy, and the only depth cue an opaque leaf tile can carry.
+    for _ in range(10):
+        px[rng.randrange(TILE_PX), rng.randrange(TILE_PX)] = (20, 44, 30)
+    return img
+
+
 def tile_sentinel(_rng):
     """Not art — a bleed alarm.
 
@@ -133,6 +209,9 @@ PAINTERS = {
     "stone": tile_stone,
     "sand": tile_sand,
     "sentinel": tile_sentinel,
+    "wood_side": tile_wood_side,
+    "wood_top": tile_wood_top,
+    "leaves": tile_leaves,
 }
 
 

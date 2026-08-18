@@ -18,3 +18,7 @@ _Static_assert((int)BTEX_GRASS_SIDE == (int)TILE_GRASS_SIDE, "atlas tile order c
 _Static_assert((int)BTEX_DIRT       == (int)TILE_DIRT,       "atlas tile order changed - update world/block.h");
 _Static_assert((int)BTEX_STONE      == (int)TILE_STONE,      "atlas tile order changed - update world/block.h");
 _Static_assert((int)BTEX_SAND       == (int)TILE_SAND,       "atlas tile order changed - update world/block.h");
+_Static_assert((int)BTEX_SENTINEL   == (int)TILE_SENTINEL,   "atlas tile order changed - update world/block.h");
+_Static_assert((int)BTEX_WOOD_SIDE  == (int)TILE_WOOD_SIDE,  "atlas tile order changed - update world/block.h");
+_Static_assert((int)BTEX_WOOD_TOP   == (int)TILE_WOOD_TOP,   "atlas tile order changed - update world/block.h");
+_Static_assert((int)BTEX_LEAVES     == (int)TILE_LEAVES,     "atlas tile order changed - update world/block.h");

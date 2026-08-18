@@ -25,6 +25,9 @@ enum {
 	TILE_STONE,
 	TILE_SAND,
 	TILE_SENTINEL,   // magenta checker — a bleed alarm, never used on real blocks
+	TILE_WOOD_SIDE,  // step 5.3's trees, appended after the sentinel rather than
+	TILE_WOOD_TOP,   // beside sand, because inserting would re-texture everything
+	TILE_LEAVES,     // after the insertion point
 };
 
 // Uploads the atlas to the GPU and binds it to texture unit 0. Returns false if

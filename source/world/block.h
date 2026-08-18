@@ -20,6 +20,8 @@ enum {
 	BLOCK_DIRT,
 	BLOCK_STONE,
 	BLOCK_SAND,
+	BLOCK_WOOD,
+	BLOCK_LEAVES,
 	BLOCK_COUNT
 };
 
@@ -33,6 +35,10 @@ enum {
 	BTEX_DIRT,
 	BTEX_STONE,
 	BTEX_SAND,
+	BTEX_SENTINEL,
+	BTEX_WOOD_SIDE,
+	BTEX_WOOD_TOP,
+	BTEX_LEAVES,
 };
 
 // Face order. This is a contract, not a convenience: the registry's tex[] below is

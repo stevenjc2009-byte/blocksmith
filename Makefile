@@ -223,6 +223,30 @@ $(OUTPUT).elf	:	$(OFILES)
 	$(SILENTMSG) $(notdir $<)
 	$(bin2o)
 
+#---------------------------------------------------------------------------------
+# gfx/atlas.t3s names gfx/atlas.png, and nothing in the build knows it.
+#
+# The texture is built by the %.t3x rule in $(DEVKITARM)/3ds_rules, whose only prerequisite
+# is the .t3s. tex3ds does write a dep file naming the .png — but it writes it as $*.d, so
+# for this project it is build/atlas.d, which is also where the C compiler writes the deps
+# for source/gfx/atlas.c. Both stems are "atlas". The compiler always runs second, so the
+# dep file that names the .png is destroyed on every single build and never survives to be
+# read back by the -include below.
+#
+# The effect is that editing the atlas does not rebuild the texture. The .t3s is untouched,
+# make has nothing to do, and the console goes on rendering the previous atlas while the
+# .png on disk shows the new one — which looks like a rendering bug, not a build one.
+# Found the hard way when step 5.3 added wood and leaves: the trees drew solid black,
+# because their UVs pointed at atlas cells that existed only in the .png. build/atlas.t3x
+# was 1,957 bytes dated 11:28 against a gfx/atlas.png of 3,636 bytes dated 11:35.
+#
+# Stated as an explicit prerequisite rather than by overriding the pattern rule with a
+# renamed dep file: this is one atlas built from one image, and a line that says so plainly
+# cannot be defeated by whichever rule happens to win. atlas.png is found through VPATH,
+# which already covers $(GRAPHICS).
+#---------------------------------------------------------------------------------
+atlas.t3x: atlas.png
+
 -include $(DEPSDIR)/*.d
 
 #---------------------------------------------------------------------------------------

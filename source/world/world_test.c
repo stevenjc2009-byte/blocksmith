@@ -1810,27 +1810,47 @@ static void testWorldgenTerrain(void)
 	CHECK(worldgenColumn(&g, &s_world, -1, -1));
 
 	// Layering, checked on every one of the 256 columns of chunk (0,0) rather than a
-	// sample: grass on top, GEN_DIRT_DEPTH of dirt under it, stone below that, air above.
+	// sample: the surface cap on top, stone below it, and only air or a tree above.
+	//
+	// Since step 5.3 the cap is not always grass — a sandy column is sand all the way
+	// through the cap, not sand over dirt, because a one-block lid reads as dirt with a
+	// skin on it the moment you dig. The expected material comes from worldgenIsSandy
+	// rather than from a copy of the threshold, so the test cannot drift from the rule.
 	for (int lz = 0; lz < CHUNK_DIM; lz++) {
 		for (int lx = 0; lx < CHUNK_DIM; lx++) {
-			const int h = worldgenHeight(&g, lx, lz);
-			CHECK_QUIET(worldGet(&s_world, lx, h,     lz) == BLOCK_AIR);
-			CHECK_QUIET(worldGet(&s_world, lx, h + 1, lz) == BLOCK_AIR);
-			CHECK_QUIET(worldGet(&s_world, lx, h - 1, lz) == BLOCK_GRASS);
+			const int  h     = worldgenHeight(&g, lx, lz);
+			const bool sandy = worldgenIsSandy(&g, lx, lz);
+			const BlockId cap = sandy ? BLOCK_SAND : BLOCK_GRASS;
+			const BlockId sub = sandy ? BLOCK_SAND : BLOCK_DIRT;
+
+			CHECK_QUIET(worldGet(&s_world, lx, h - 1, lz) == cap);
 			for (int d = 1; d <= GEN_DIRT_DEPTH; d++)
-				CHECK_QUIET(worldGet(&s_world, lx, h - 1 - d, lz) == BLOCK_DIRT);
+				CHECK_QUIET(worldGet(&s_world, lx, h - 1 - d, lz) == sub);
 			CHECK_QUIET(worldGet(&s_world, lx, h - 2 - GEN_DIRT_DEPTH, lz) == BLOCK_STONE);
 			CHECK_QUIET(worldGet(&s_world, lx, 0, lz) == BLOCK_STONE);
+
+			// Above the ground is air or a tree, never terrain material. This is the check
+			// that would catch a decoration pass writing dirt or stone into the sky, and it
+			// is deliberately not "must be air" any more — that assertion is what broke
+			// when trees landed, and weakening it to nothing would have hidden the next bug.
+			const BlockId over = worldGet(&s_world, lx, h, lz);
+			CHECK_QUIET(over == BLOCK_AIR || over == BLOCK_WOOD || over == BLOCK_LEAVES);
 		}
 	}
 
 	// The generated blocks must agree with worldgenHeight, which is what spawn-finding
 	// and the tests above rely on. Checked by walking down from the sky to the first
 	// solid block, so a fill loop that was off by one is caught rather than assumed.
+	// Trees are stepped over: worldgenHeight is the GROUND, and standing on a canopy is a
+	// collision question, not a heightmap one.
 	for (int lz = 0; lz < CHUNK_DIM; lz += 3) {
 		for (int lx = 0; lx < CHUNK_DIM; lx += 3) {
 			int y = WORLD_HEIGHT - 1;
-			while (y > 0 && worldGet(&s_world, lx, y, lz) == BLOCK_AIR) y--;
+			while (y > 0) {
+				const BlockId b = worldGet(&s_world, lx, y, lz);
+				if (b != BLOCK_AIR && b != BLOCK_WOOD && b != BLOCK_LEAVES) break;
+				y--;
+			}
 			CHECK_QUIET(y + 1 == worldgenHeight(&g, lx, lz));
 		}
 	}
@@ -1843,7 +1863,8 @@ static void testWorldgenTerrain(void)
 		const int a = worldgenHeight(&g, 15, lz);
 		const int b = worldgenHeight(&g, 16, lz);
 		CHECK_QUIET(a - b <= 1 && b - a <= 1);
-		CHECK_QUIET(worldGet(&s_world, 16, b - 1, lz) == BLOCK_GRASS);
+		const BlockId cap = worldgenIsSandy(&g, 16, lz) ? BLOCK_SAND : BLOCK_GRASS;
+		CHECK_QUIET(worldGet(&s_world, 16, b - 1, lz) == cap);
 	}
 
 	// Sky chunks are left unallocated rather than filled with air: a world of mostly sky
@@ -1910,13 +1931,229 @@ static void testWorldgenDeterminism(void)
 
 	// A different seed must give a different world — otherwise the seed is decoration.
 	// Compared on the surface layer, where a heightmap difference actually shows.
+	//
+	// Over an area rather than a single row, and at 60 % rather than the 83 % this used
+	// before step 5.3. Not a weakened test — a corrected one: with the biome pass, a region
+	// that lands in a flat biome under both seeds has every column compressed toward the
+	// centre of the band, so a lot of them collide on the same integer height without the
+	// two worlds being remotely alike. Measured: this seed pair differs on 71.9 % of a
+	// 48x48 area (one row of it happened to give 29/48 = 60.4 %, which is why a row is not
+	// a big enough sample), and the worst of 24 adjacent seed pairs was 74.6 %.
 	WorldGen g2;
 	worldgenInit(&g2, 0xBEEFu + 1);
 	int height_differs = 0;
+	for (int z = 0; z < 48; z++)
+		for (int x = 0; x < 48; x++)
+			if (worldgenHeight(&g, x, z) != worldgenHeight(&g2, x, z))
+				height_differs++;
+	CHECK(height_differs >= 48 * 48 * 60 / 100);
+
+	worldExit(&s_world);
+}
+
+// --- Step 5.3: biome variation --------------------------------------------------------
+//
+// The claim being tested is not "there is a second noise" — it is the two things that
+// second noise was added to produce: somewhere is flatter than somewhere else, and both
+// kinds of ground exist close enough together to walk between.
+static void testWorldgenBiome(void)
+{
+	WorldGen g;
+	worldgenInit(&g, 12345u);
+
+	// The field is a normalised noise value. Anything outside [0, FX_ONE] means the octave
+	// weights no longer sum to one, and every threshold derived from it silently moves.
+	for (int z = -300; z <= 300; z += 11)
+		for (int x = -300; x <= 300; x += 11) {
+			const fx b = worldgenBiome(&g, x, z);
+			CHECK_QUIET(b >= 0 && b <= FX_ONE);
+		}
+
+	// Both biomes within walking distance. A 192x192 neighbourhood is about what a player
+	// covers in a minute at the measured 4.3122 blocks/s; a world that is all one biome at
+	// that scale is a world with no variation in it, whatever the global average says.
+	// Three seeds, because one seed proving it proves nothing about the next world.
+	const uint32_t seeds[3] = { 12345u, 0xBEEFu, 7919u };
+	for (int s = 0; s < 3; s++) {
+		WorldGen gs;
+		worldgenInit(&gs, seeds[s]);
+		int sandy = 0, cols = 0;
+		for (int z = -96; z < 96; z += 3)
+			for (int x = -96; x < 96; x += 3) {
+				cols++;
+				if (worldgenIsSandy(&gs, x, z)) sandy++;
+			}
+		CHECK_QUIET(sandy * 100 > cols * 2);          // at least 2 % sand
+		CHECK_QUIET(sandy * 100 < cols * 98);         // at least 2 % not sand
+	}
+
+	// Amplitude really is modulated. Every column's height must sit inside the envelope its
+	// own biome value allows, so a low-biome column cannot be as tall as a high-biome one.
+	// This is the check that goes red if the modulation is dropped and every column reverts
+	// to the full range — a flat biome would immediately overshoot its own envelope.
+	const int centre = GEN_SURFACE_MIN + GEN_SURFACE_RANGE / 2;
+	int flattest = GEN_SURFACE_RANGE;
+	for (int z = -200; z <= 200; z += 7) {
+		for (int x = -200; x <= 200; x += 7) {
+			const fx b = worldgenBiome(&g, x, z);
+			const int64_t amp = (int64_t)GEN_SURFACE_RANGE *
+			                    (FX_ONE / GEN_FLAT_FRACTION +
+			                     (int64_t)b * (GEN_FLAT_FRACTION - 1) / GEN_FLAT_FRACTION);
+			const int max_off = (int)((amp / 2) >> FX_SHIFT) + 1;
+			const int h = worldgenHeight(&g, x, z);
+			CHECK_QUIET(h - centre <= max_off && centre - h <= max_off);
+			if (max_off < flattest) flattest = max_off;
+		}
+	}
+	// ...and the envelope has to actually bind somewhere, or the bound above is satisfied
+	// by any terrain at all and proves nothing.
+	CHECK(flattest <= 6);
+}
+
+// --- Step 5.3: trees ------------------------------------------------------------------
+//
+// FNV-1a over one column, used to compare a column generated on its own against the same
+// column generated with its neighbours around it.
+static uint32_t colHash(int32_t cx, int32_t cz)
+{
+	uint32_t h = 2166136261u;
+	for (int lx = 0; lx < CHUNK_DIM; lx++)
+		for (int y = 0; y < WORLD_HEIGHT; y++)
+			for (int lz = 0; lz < CHUNK_DIM; lz++) {
+				h ^= worldGet(&s_world, cx * CHUNK_DIM + lx, y, cz * CHUNK_DIM + lz);
+				h *= 16777619u;
+			}
+	return h;
+}
+
+static void testWorldgenTrees(void)
+{
+	// Seed picked by measurement, not by trying one: the 48x48 region below has to contain
+	// both biomes or its layering check silently only ever tests one of the two rules. Of
+	// 60 candidate seeds, 1616 splits this region 47.7 % sand to 52.3 % grass — the most
+	// even of them, so both halves get real coverage and there is still ground for trees.
+	WorldGen g;
+	worldgenInit(&g, 1616u);
+
+	worldInit(&s_world);
+	for (int cz = 0; cz < 3; cz++)
+		for (int cx = 0; cx < 3; cx++)
+			CHECK_QUIET(worldgenColumn(&g, &s_world, cx, cz));
+
+	// There are trees at all. GEN_TREE_CHANCE is 96/256 over 8x8 cells, so a 48x48 area has
+	// 36 cells and should carry roughly a dozen trees; a generator that placed none would
+	// pass every "no bad blocks" check below.
+	int wood = 0, leaves = 0;
 	for (int x = 0; x < 48; x++)
-		if (worldgenHeight(&g, x, 0) != worldgenHeight(&g2, x, 0))
-			height_differs++;
-	CHECK(height_differs >= 40);
+		for (int y = 0; y < WORLD_HEIGHT; y++)
+			for (int z = 0; z < 48; z++) {
+				const BlockId b = worldGet(&s_world, x, y, z);
+				if (b == BLOCK_WOOD)   wood++;
+				if (b == BLOCK_LEAVES) leaves++;
+			}
+	CHECK(wood >= 20);
+	CHECK(leaves >= 100);
+
+	// Every trunk stands on the ground it was placed against — not floating, not buried —
+	// and never on sand, which is the rule worldgenIsSandy is supposed to enforce. Checked
+	// by finding the lowest wood block in each (x, z) and comparing with worldgenHeight.
+	int trunks = 0;
+	for (int x = 0; x < 48; x++) {
+		for (int z = 0; z < 48; z++) {
+			int lowest = -1;
+			for (int y = 0; y < WORLD_HEIGHT; y++)
+				if (worldGet(&s_world, x, y, z) == BLOCK_WOOD) { lowest = y; break; }
+			if (lowest < 0) continue;
+			trunks++;
+			CHECK_QUIET(lowest == worldgenHeight(&g, x, z));
+			CHECK_QUIET(worldGet(&s_world, x, lowest - 1, z) == BLOCK_GRASS);
+			CHECK_QUIET(!worldgenIsSandy(&g, x, z));
+
+			// The trunk is unbroken from the ground to its top...
+			int highest = lowest;
+			while (worldGet(&s_world, x, highest + 1, z) == BLOCK_WOOD) highest++;
+			for (int y = lowest; y <= highest; y++)
+				CHECK_QUIET(worldGet(&s_world, x, y, z) == BLOCK_WOOD);
+			CHECK_QUIET(highest - lowest + 1 >= GEN_TREE_MIN_H);
+			CHECK_QUIET(highest - lowest + 1 <= GEN_TREE_MAX_H);
+
+			// ...and its top is INSIDE the canopy, not below it. The two widest canopy
+			// layers sit at the top two blocks of the trunk, so the trunk's own leaves
+			// would replace them if they were written over anything but air — the tree
+			// would keep its height and lose two blocks off the top of the visible trunk,
+			// which no count of wood or leaves notices. Measured at seed 1616: dropping
+			// the air guard turns 20 wood blocks into leaves, all of them trunk tops.
+			// At the top wood block the canopy has radius 2, so both horizontal
+			// neighbours are leaves; if the trunk had been eaten they would be air.
+			// Skipped on the outermost columns, where the neighbour is outside the
+			// generated region and reads as air for a reason that is not a bug.
+			if (x >= 1 && x <= 46) {
+				CHECK_QUIET(worldGet(&s_world, x - 1, highest, z) == BLOCK_LEAVES);
+				CHECK_QUIET(worldGet(&s_world, x + 1, highest, z) == BLOCK_LEAVES);
+			}
+		}
+	}
+	CHECK(trunks >= 4);
+
+	// **Decoration must never touch the ground.** Every one of the 2,304 columns still has
+	// its full terrain stack: the right cap block on top and the right material under it.
+	// A canopy overhanging a rise can land exactly on a neighbour's top block — the ground
+	// two blocks away can be two blocks higher, which is where the lowest canopy layer sits
+	// — so the "only into air" guard on leaves is load-bearing, not decorative, and this is
+	// the check that notices when it is dropped.
+	for (int x = 0; x < 48; x++) {
+		for (int z = 0; z < 48; z++) {
+			const int  h     = worldgenHeight(&g, x, z);
+			const bool sandy = worldgenIsSandy(&g, x, z);
+			CHECK_QUIET(worldGet(&s_world, x, h - 1, z) == (sandy ? BLOCK_SAND : BLOCK_GRASS));
+			for (int d = 1; d <= GEN_DIRT_DEPTH; d++)
+				CHECK_QUIET(worldGet(&s_world, x, h - 1 - d, z) ==
+				            (sandy ? BLOCK_SAND : BLOCK_DIRT));
+			for (int y = 0; y < h; y++)
+				CHECK_QUIET(worldGet(&s_world, x, y, z) != BLOCK_LEAVES);
+		}
+	}
+
+	// The region must contain both biomes, or the layering check above only ever tested one
+	// of the two rules and the seed is doing the test's job badly.
+	int sandy_cols = 0;
+	for (int x = 0; x < 48; x++)
+		for (int z = 0; z < 48; z++)
+			if (worldgenIsSandy(&g, x, z)) sandy_cols++;
+	CHECK(sandy_cols > 40 && sandy_cols < 48 * 48 - 40);
+
+	const uint32_t centre_with_neighbours = colHash(1, 1);
+	worldExit(&s_world);
+
+	// **The cross-column property.** A tree whose trunk stands in one column can reach into
+	// the next, and columns are generated in whatever order the player walks. Generating the
+	// middle column entirely on its own must produce exactly the blocks it has when its
+	// eight neighbours were generated first — every canopy that overhangs it present, and
+	// nothing of its own lost. A decoration pass that wrote into its neighbours directly
+	// would fail this in both directions at once.
+	worldInit(&s_world);
+	CHECK(worldgenColumn(&g, &s_world, 1, 1));
+	CHECK(colHash(1, 1) == centre_with_neighbours);
+
+	// And it must have touched nothing else. A tree that wrote its far side straight into
+	// the neighbouring column would allocate chunks outside the loaded ring — memory spent
+	// on ground the player is nowhere near, in a game with a 12 MB block budget — and would
+	// have that half of itself erased the moment that column was generated for real, since
+	// worldgenColumn clears before it fills.
+	CHECK(s_world.columns == 1);
+
+	// The comparison has teeth only if the isolated column actually contains overhang. A
+	// column with no tree blocks in it would match trivially.
+	int lone_leaves = 0;
+	for (int x = 16; x < 32; x++)
+		for (int y = 0; y < WORLD_HEIGHT; y++)
+			for (int z = 16; z < 32; z++)
+				if (worldGet(&s_world, x, y, z) == BLOCK_LEAVES) lone_leaves++;
+	CHECK(lone_leaves >= 20);
+
+	// And the hash can see a one-block difference, so the match above is not vacuous.
+	CHECK(worldSet(&s_world, 20, 100, 20, BLOCK_LEAVES));
+	CHECK(colHash(1, 1) != centre_with_neighbours);
 
 	worldExit(&s_world);
 }
@@ -1952,6 +2189,8 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testNoiseDeterminism();
 	testWorldgenTerrain();
 	testWorldgenDeterminism();
+	testWorldgenBiome();
+	testWorldgenTrees();
 	testRaycast();
 	testBodyBlocked();
 	testCeilingCollision();
