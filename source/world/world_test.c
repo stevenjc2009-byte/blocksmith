@@ -8,6 +8,7 @@
 #include "world/budget.h"
 #include "world/dirtyq.h"
 #include "world/handbuilt.h"
+#include "world/jobq.h"
 #include "world/mesher.h"
 #include "world/noise.h"
 #include "world/physics.h"
@@ -2278,6 +2279,110 @@ static void testWorldgenCaves(void)
 	CHECK(floor_caves == 0);           // nothing below the floor, ever
 }
 
+// Step 5.5's job ring. Same treatment as the dirty queue: the accounting is checked after
+// every operation, because a queue whose count drifts from its contents is the exact bug
+// Phase 4 shipped and could not see.
+static void testJobQueue(void)
+{
+	JobQueue q;
+	jobqInit(&q);
+	CHECK(jobqConsistent(&q));
+	CHECK(jobqCount(&q) == 0);
+	CHECK(jobqPeak(&q) == 0);
+	CHECK(jobqPushed(&q) == 0);
+	CHECK(jobqDropped(&q) == 0);
+
+	// Popping an empty queue must not touch the caller's job. The worker loop reads `out`
+	// only when the pop succeeded, so a pop that scribbles on failure would be invisible
+	// there and would surface as a phantom job the first time that changes.
+	Job sentinel = {JOB_SAVE, 111, 222, 3};
+	Job out = sentinel;
+	CHECK(!jobqPop(&q, &out));
+	CHECK(out.type == sentinel.type);
+	CHECK(out.cx == sentinel.cx);
+	CHECK(out.cz == sentinel.cz);
+	CHECK(out.cy == sentinel.cy);
+
+	// FIFO, and the payload survives the trip.
+	for (int i = 0; i < 3; i++) {
+		const Job j = {JOB_GENERATE, i, -i, 0};
+		CHECK(jobqPush(&q, j));
+	}
+	CHECK(jobqCount(&q) == 3);
+	CHECK(jobqPeak(&q) == 3);
+	CHECK(jobqConsistent(&q));
+	for (int i = 0; i < 3; i++) {
+		CHECK(jobqPop(&q, &out));
+		CHECK(out.type == JOB_GENERATE && out.cx == i && out.cz == -i);
+	}
+	CHECK(jobqCount(&q) == 0);
+	CHECK(jobqPeak(&q) == 3);            // the peak is a high-water mark, not the live count
+	CHECK(jobqConsistent(&q));
+
+	// ...and it has to survive a later, *smaller* burst. Draining to zero and reading the
+	// peak above does not prove that, because nothing writes the peak on a pop: only a push
+	// taken while the count is below the mark can tell `peak = count` apart from
+	// `peak = max`. Written after a mutation run where breaking jobqPush that exact way
+	// left the whole suite green. The number matters — step 6.2 sizes the per-frame job
+	// budget from the peak, and a peak that tracked the live count would read lowest
+	// exactly after a spike had drained.
+	const Job small = {JOB_GENERATE, 42, -42, 1};
+	CHECK(jobqPush(&q, small));
+	CHECK(jobqCount(&q) == 1);
+	CHECK(jobqPeak(&q) == 3);
+	CHECK(jobqPop(&q, &out));
+	CHECK(out.cx == 42 && out.cz == -42);
+	CHECK(jobqCount(&q) == 0);
+	CHECK(jobqPeak(&q) == 3);
+	CHECK(jobqConsistent(&q));
+
+	// Wrap-around. 5 in flight at a time for 500 rounds is four full laps of a 128-slot
+	// ring, so head and tail each pass zero several times while the queue is non-empty —
+	// the case a push/pop pair that only moves one index gets away with when the ring is
+	// drained to zero between operations.
+	int wrap_bad = 0;
+	for (int i = 0; i < 5; i++) {
+		const Job j = {JOB_MESH, i, i, i & 7};
+		CHECK_QUIET(jobqPush(&q, j));
+	}
+	for (int i = 5; i < 500; i++) {
+		CHECK_QUIET(jobqPop(&q, &out));
+		if (out.cx != i - 5 || out.cy != ((i - 5) & 7) || out.type != JOB_MESH) wrap_bad++;
+		const Job j = {JOB_MESH, i, i, i & 7};
+		CHECK_QUIET(jobqPush(&q, j));
+		CHECK_QUIET(jobqConsistent(&q));
+	}
+	CHECK(wrap_bad == 0);
+	CHECK(jobqCount(&q) == 5);
+	CHECK(jobqConsistent(&q));
+
+	// Full. The ring refuses rather than overwriting, and says how many it refused.
+	jobqInit(&q);
+	int accepted = 0;
+	for (int i = 0; i < JOBQ_CAP + 10; i++) {
+		const Job j = {JOB_LOAD, i, 0, 0};
+		if (jobqPush(&q, j)) accepted++;
+	}
+	CHECK(accepted == JOBQ_CAP);
+	CHECK(jobqCount(&q) == JOBQ_CAP);
+	CHECK(jobqDropped(&q) == 10);
+	CHECK(jobqPushed(&q) == JOBQ_CAP);
+	CHECK(jobqPeak(&q) == JOBQ_CAP);
+	CHECK(jobqConsistent(&q));
+
+	// And the ten it refused are the ten that are missing — the survivors are the first
+	// JOBQ_CAP pushed, in order, not a scrambled ring.
+	int order_bad = 0;
+	for (int i = 0; i < JOBQ_CAP; i++) {
+		CHECK_QUIET(jobqPop(&q, &out));
+		if (out.type != JOB_LOAD || out.cx != i) order_bad++;
+	}
+	CHECK(order_bad == 0);
+	CHECK(jobqCount(&q) == 0);
+	CHECK(!jobqPop(&q, &out));
+	CHECK(jobqConsistent(&q));
+}
+
 int worldTestRun(char* summary, size_t cap, int* checks_out)
 {
 	s_checks = 0;
@@ -2299,6 +2404,7 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testRemeshList();
 	testIncrementalRemesh();
 	testDirtyQueue();
+	testJobQueue();
 	testHandbuiltHeight();
 	testHandbuiltFillShape();
 	testHandbuiltWalkable();

@@ -23,7 +23,7 @@ include $(DEVKITARM)/3ds_rules
 #---------------------------------------------------------------------------------
 TARGET		:=	blocksmith
 BUILD		:=	build
-SOURCES		:=	source source/gfx source/debug source/scene source/shaders source/world
+SOURCES		:=	source source/app source/gfx source/debug source/scene source/shaders source/world
 DATA		:=	data
 INCLUDES	:=	source
 GRAPHICS	:=	gfx

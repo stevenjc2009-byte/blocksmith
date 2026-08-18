@@ -15,7 +15,9 @@
 #include <3ds.h>
 #include <citro3d.h>
 #include <stdio.h>
+#include <string.h>
 
+#include "app/worker.h"
 #include "debug/metrics.h"
 #include "gfx/screen.h"
 #include "scene/camera.h"
@@ -25,6 +27,7 @@
 #include "scene/player.h"
 #include "world/budget.h"
 #include "world/handbuilt.h"
+#include "world/jobq.h"
 #include "world/mesh_vertex.h"
 #include "world/world.h"
 #include "world/world_test.h"
@@ -333,46 +336,187 @@ static DigOutResult digOutCheck(bool run)
 #define GEN_MESH_RADIUS  1                        // 3x3 columns = 48x48 blocks
 #define GEN_AREA_RADIUS  (GEN_MESH_RADIUS + 1)    // 5x5 columns generated
 
-static WorldGen s_gen;
+// Milliseconds per frame allowed to meshing newly generated chunks. Separate from
+// DRAIN_BUDGET_MS, which is the *edit* backlog: a player breaking blocks and a world
+// streaming in are two different backlogs, and lumping them into one budget would let a
+// 25-column boot starve the response to a button press. Both always complete at least one
+// chunk, for the reason in chunk_render.h — a budget that can never make progress freezes
+// the world's appearance with no visible cause.
+#define GEN_MESH_BUDGET_MS  4.0f
+
+// Chunks waiting to be meshed into the GPU pool. Kept on the main thread: a mesh writes
+// GPU-visible linear memory through the citro3d context, which belongs to the thread that
+// created it. Generation is the half that moves (app/worker.h).
+static JobQueue s_meshq;
 
 typedef struct {
 	bool ran;
 	int  columns_failed;   // budget or column table refused a column — a hole in the world
+	int  columns_in;       // columns installed into the live world so far
+	int  submit_failed;    // the job ring refused a column — also a hole in the world
 	int  meshed;           // chunks that got a mesh slot
 	int  mesh_refused;
 } GenResult;
 
-static GenResult genBuild(void)
+// Updated across frames as columns arrive, so it is a file static rather than a local:
+// worldReportDraw takes a pointer to it and is called again once the world is complete.
+static GenResult s_genr;
+
+// The whole streaming path is generated-world only. The hand-built world is filled and
+// meshed in one call and has no generator to move off the main thread, so under
+// BS_WORLD_GEN=0 none of this is compiled in rather than sitting there unreachable.
+#if BS_WORLD_GEN
+
+static WorldGen s_gen;
+
+// Which of the meshed columns have already had their chunks queued. Meshing a column needs
+// all eight of its neighbours present — the mesher reads an absent column as air and walls
+// the chunk in, and the AO pass reads the diagonals too — so a column cannot be queued the
+// moment it lands. It is queued when its ring completes, which may be when a *later*
+// column arrives.
+#define GEN_MESH_SPAN (2 * GEN_MESH_RADIUS + 1)
+#define GEN_AREA_SPAN (2 * GEN_AREA_RADIUS + 1)
+static bool s_col_queued[GEN_MESH_SPAN][GEN_MESH_SPAN];
+
+// ...and which have actually been generated and installed.
+//
+// This is tracked here rather than asked of the world, and that is not redundancy:
+// worldReportBuild claims a 17x17 grid of columns before anything is generated and never
+// gives it back, so worldColumn() returns non-NULL for columns 0..16 from the first
+// moment — including three of the five this area covers. Testing the world would call
+// their ring complete before a single block had been generated and mesh them against
+// air. It did, and it cost 32,358 triangles where the same world meshed after full
+// generation is 29,754.
+static bool s_col_in[GEN_AREA_SPAN][GEN_AREA_SPAN];
+
+static bool genColumnInstalled(int32_t cx, int32_t cz)
 {
-	GenResult r = {0};
-	r.ran = true;
+	if (cx < -GEN_AREA_RADIUS || cx > GEN_AREA_RADIUS) return false;
+	if (cz < -GEN_AREA_RADIUS || cz > GEN_AREA_RADIUS) return false;
+	return s_col_in[cz + GEN_AREA_RADIUS][cx + GEN_AREA_RADIUS];
+}
 
-	worldgenInit(&s_gen, BS_WORLD_SEED);
-	r.columns_failed = worldgenArea(&s_gen, &s_world, 0, 0, GEN_AREA_RADIUS);
+static bool genColumnRingComplete(int32_t cx, int32_t cz)
+{
+	for (int dz = -1; dz <= 1; dz++)
+		for (int dx = -1; dx <= 1; dx++)
+			if (!genColumnInstalled(cx + dx, cz + dz)) return false;
+	return true;
+}
 
-	const int refused_before = chunkRenderRefusals();
-	for (int cz = -GEN_MESH_RADIUS; cz <= GEN_MESH_RADIUS; cz++)
-		for (int cx = -GEN_MESH_RADIUS; cx <= GEN_MESH_RADIUS; cx++)
+// Queues every column inside the meshed radius whose ring is now complete and that has not
+// been queued already.
+static void genQueueReadyColumns(void)
+{
+	for (int32_t cz = -GEN_MESH_RADIUS; cz <= GEN_MESH_RADIUS; cz++) {
+		for (int32_t cx = -GEN_MESH_RADIUS; cx <= GEN_MESH_RADIUS; cx++) {
+			bool* queued = &s_col_queued[cz + GEN_MESH_RADIUS][cx + GEN_MESH_RADIUS];
+			if (*queued || !genColumnRingComplete(cx, cz)) continue;
+			*queued = true;
+
 			for (int cy = 0; cy < COLUMN_CHUNKS; cy++) {
 				// Skipped rather than left to chunkRenderBuild's own all-air early-out,
 				// which claims a slot for the empty chunk it finds. That is right for a
 				// chunk the player dug out — it has to stay queueable — and wrong here,
 				// where three or four sky chunks per column would eat the pool before the
-				// ground was meshed. worldReportBuild has already allocated every chunk in
-				// this area, so "not allocated" is not available as the test.
+				// ground was meshed.
 				const Chunk* c = worldChunk(&s_world, cx, cy, cz);
 				if (!c || chunkIsAllAir(c)) continue;
-				if (chunkRenderBuild(&s_world, cx, cy, cz)) r.meshed++;
-			}
-	r.mesh_refused = chunkRenderRefusals() - refused_before;
 
-	return r;
+				const Job j = {JOB_MESH, cx, cz, cy};
+				if (!jobqPush(&s_meshq, j)) s_genr.mesh_refused++;
+			}
+		}
+	}
 }
+
+// Starts the worker and queues the whole area. The spawn column goes first because the
+// ring is FIFO, so it is the first one back and the player has ground under them before
+// the loop starts.
+static bool genStart(void)
+{
+	worldgenInit(&s_gen, BS_WORLD_SEED);
+	jobqInit(&s_meshq);
+	memset(s_col_queued, 0, sizeof(s_col_queued));
+	memset(s_col_in, 0, sizeof(s_col_in));
+	s_genr = (GenResult){0};
+	s_genr.ran = true;
+
+	if (!workerStart(&s_gen))
+		return false;
+
+	if (!workerSubmitColumn(0, 0)) s_genr.submit_failed++;
+	for (int32_t cz = -GEN_AREA_RADIUS; cz <= GEN_AREA_RADIUS; cz++)
+		for (int32_t cx = -GEN_AREA_RADIUS; cx <= GEN_AREA_RADIUS; cx++)
+			if ((cx || cz) && !workerSubmitColumn(cx, cz)) s_genr.submit_failed++;
+
+	return true;
+}
+
+// One column per call, which is all the handshake in app/worker.h can deliver. False when
+// nothing was waiting.
+static bool genInstallOne(void)
+{
+	int32_t cx = 0, cz = 0;
+	bool ok = false;
+	if (!workerInstall(&s_world, &cx, &cz, &ok))
+		return false;
+
+	s_genr.columns_in++;
+	if (!ok) s_genr.columns_failed++;
+
+	// Marked before the ring is tested, so the column that completes a ring counts towards
+	// it. A partial column (ok == false) is still marked: it is a hole either way, it is
+	// already counted in columns_failed, and leaving it unmarked would stall its four
+	// neighbours forever instead of meshing what did arrive.
+	if (cx >= -GEN_AREA_RADIUS && cx <= GEN_AREA_RADIUS &&
+	    cz >= -GEN_AREA_RADIUS && cz <= GEN_AREA_RADIUS)
+		s_col_in[cz + GEN_AREA_RADIUS][cx + GEN_AREA_RADIUS] = true;
+
+	genQueueReadyColumns();
+	return true;
+}
+
+// Meshes queued chunks until the budget is spent or the queue runs dry. Returns how many
+// it built.
+static int genDrainMesh(float budget_ms)
+{
+	if (jobqCount(&s_meshq) == 0)
+		return 0;
+
+	const u64 t0 = svcGetSystemTick();
+	int built = 0;
+	Job j;
+	while (jobqPop(&s_meshq, &j)) {
+		if (chunkRenderBuild(&s_world, j.cx, j.cy, j.cz)) s_genr.meshed++;
+		else                                              s_genr.mesh_refused++;
+		built++;
+
+		const float spent = (float)((double)(svcGetSystemTick() - t0) / CPU_TICKS_PER_MSEC);
+		if (spent >= budget_ms) break;
+	}
+	return built;
+}
+
+// Blocks until the column the player spawns in has been installed, or until the worker has
+// run out of work to give. Only that one column: the other twenty-four arrive over the
+// first frames, which is the whole point of the step. Without this the player would spawn
+// above nothing and fall to the world floor before the ground under them existed.
+static void genWaitSpawnColumn(void)
+{
+	while (!genColumnInstalled(0, 0)) {
+		if (genInstallOne()) continue;
+		if (!workerBusy()) break;      // nothing more is coming; do not spin forever
+		svcSleepThread(1000000);       // 1 ms
+	}
+}
+
+#endif   // BS_WORLD_GEN
 
 // `built` and `mesh_refused` are startup facts, so they belong in the report drawn once
 // rather than on the per-frame status line: the console is 32 columns and the status line
 // needs all of them for the aim, edit and queue counters that change every frame.
-static void worldReportDraw(int refused, bool built, int mesh_refused,
+static void worldReportDraw(int refused, bool built,
                             const char* selftest, const StressResult* st,
                             const DigOutResult* dig, const GenResult* gen)
 {
@@ -390,7 +534,7 @@ static void worldReportDraw(int refused, bool built, int mesh_refused,
 	       (unsigned long)chunkRenderTris());
 	printf("vbo pool %5.2f MB  refused %2d  \n", chunkRenderBytes() / mb,
 	       chunkRenderRefusals());
-	printf("startup mesh refused %2d        \n", mesh_refused);
+	printf("startup mesh refused %2d        \n", gen->mesh_refused);
 
 	// The two equalities are the whole point: same free bytes after a thousand
 	// remeshes, and an incrementally remeshed pool identical to a fully rebuilt one.
@@ -408,13 +552,24 @@ static void worldReportDraw(int refused, bool built, int mesh_refused,
 		       st->sum_incremental == st->sum_full ? "SAME" : "DRIFT");
 		printf("per chunk %5.0f fill %5.0f mesh us\n", st->scratch_us, st->mesh_us);
 	}
-	// `fail` is columns the budget or the column table refused, so a non-zero there is a
-	// hole in the ground rather than a slow boot; `mesh` is how much of the 64-slot pool
-	// the generated area actually needed, which is the number that decides how far
-	// GEN_MESH_RADIUS can grow before Phase 6's eviction exists.
-	if (gen->ran)
-		printf("gen s%-5lu fail %d mesh %3d\n", (unsigned long)BS_WORLD_SEED,
-		       gen->columns_failed, gen->meshed);
+	// `in` is columns installed into the live world and `fail` is those the budget, the
+	// column table or the job ring refused, so a non-zero there is a hole in the ground
+	// rather than a slow boot; `mesh` is how much of the 64-slot pool the generated area
+	// actually needed, which is the number that decides how far GEN_MESH_RADIUS can grow
+	// before Phase 6's eviction exists.
+	//
+	// The second line is step 5.5's whole claim in two numbers. `wk` is wall time the
+	// worker spent inside the generator and `in` the time the main thread spent copying
+	// finished columns across: the first is the cost that used to sit in front of the
+	// first frame, the second is all that is left of it on the frame path. Read them
+	// against `worst` and `drop` on the overlay — a large `wk` with `drop 0` is the
+	// measurement, and a `q` that never reaches 0 would mean the worker is not keeping up.
+	if (gen->ran) {
+		printf("gen s%-5lu in %2d fail %d mesh %3d\n", (unsigned long)BS_WORLD_SEED,
+		       gen->columns_in, gen->columns_failed + gen->submit_failed, gen->meshed);
+		printf("wk %6.0f inst %5.1f ms q%-2d d%d \n", workerBusyMs(), workerInstallMs(),
+		       workerQueued(), workerDropped());
+	}
 
 	if (dig->ran)
 		printf("digout q%d>%d t%lu>%lu %s\n", dig->queued_before, dig->queued_after,
@@ -453,16 +608,18 @@ int main(void)
 
 	const int refused = worldReportBuild();
 
-	// The world, and the meshes for it. Both happen once, before the loop: chunk
-	// streaming is Phase 6, so nothing here is meshed on the fly.
+	// The world. Since step 5.5 the generated one is not built here: the worker is started
+	// and the whole area queued, and only the column the player stands in is waited for.
+	// The other twenty-four arrive during the first frames, one per frame, while the game
+	// is already drawing. The hand-built world has no generator to move off the main
+	// thread and is still filled and meshed in one go.
 #if BS_WORLD_GEN
-	const GenResult gen = genBuild();
-	const bool built = (gen.columns_failed == 0);
-	const int  mesh_refused = gen.mesh_refused;
+	const bool worker_ok = genStart();
+	genWaitSpawnColumn();
 #else
-	const GenResult gen = {0};
-	const bool built = handbuiltFill(&s_world);
-	const int  mesh_refused = meshHandbuilt();
+	s_genr = (GenResult){0};
+	const bool handbuilt_ok = handbuiltFill(&s_world);
+	s_genr.mesh_refused = meshHandbuilt();
 #endif
 
 	// Runs once, before the first frame, so the numbers on screen are a completed
@@ -522,9 +679,22 @@ int main(void)
 	Interact it;
 	interactInit(&it);
 
-	// Static report — nothing in it changes, so it is drawn once rather than every
-	// frame, and the metrics overlay above it never touches these rows.
-	worldReportDraw(refused, built, mesh_refused, selftest, &stress, &dig, &gen);
+	// "Did the world come out whole?" — the meaning differs between the two paths. The
+	// hand-built world is filled in one call that either worked or did not; the generated
+	// one is whole only if nothing refused a column on the way in, which is not known
+	// until the last one lands, so this is recomputed for the redraw below.
+#if BS_WORLD_GEN
+	#define WORLD_INTACT() (worker_ok && s_genr.columns_failed == 0 && \
+	                        s_genr.submit_failed == 0)
+#else
+	#define WORLD_INTACT() (handbuilt_ok)
+#endif
+
+	// Drawn once here with the spawn column in, and once more when the world is complete —
+	// the counters on it move for the first twenty-five frames now, and a report frozen at
+	// "1 column in" would read as a failed boot.
+	worldReportDraw(refused, WORLD_INTACT(), selftest, &stress, &dig, &s_genr);
+	bool report_final = false;
 
 	// The queue's peak is only meaningful from the first real frame onwards: the startup
 	// build above went through chunkRenderBuild, not the queue, but the step 3.6 corner
@@ -546,6 +716,15 @@ int main(void)
 		hidScanInput();
 		u32 down = hidKeysDown();
 		if (down & KEY_START) break;
+
+#if BS_WORLD_GEN
+		// Take delivery of at most one generated column and mesh what that made ready,
+		// before anything reads the world this frame. One column is all the worker can
+		// hand over per install (app/worker.h), and the mesh budget is what keeps the
+		// arrival of a column off the frame time.
+		genInstallOne();
+		genDrainMesh(GEN_MESH_BUDGET_MS);
+#endif
 
 		C3D_Mtx view;
 #if BS_FLY
@@ -604,10 +783,19 @@ int main(void)
 
 		metricsFrameEnd();
 
+		// One redraw when the world is finally complete: worker idle, nothing left to
+		// install, nothing left to mesh. Once, not every frame — the console text render
+		// is expensive enough that drawing it per frame would become the thing being
+		// measured, which is why metricsDrawOverlay rate-limits itself.
+		if (!report_final && !workerBusy() && jobqCount(&s_meshq) == 0) {
+			report_final = true;
+			worldReportDraw(refused, WORLD_INTACT(), selftest, &stress, &dig, &s_genr);
+		}
+
 #if BS_REPORT_ONLY
 		// Verification build: the overlay is suppressed so the whole report fits in
 		// a short emulator window. Redrawn each frame because nothing else is.
-		worldReportDraw(refused, built, mesh_refused, selftest, &stress, &dig, &gen);
+		worldReportDraw(refused, WORLD_INTACT(), selftest, &stress, &dig, &s_genr);
 #else
 		// Phase 4's status line. Every field answers a question a screenshot would
 		// otherwise leave open: whether the ray found anything (`aim` block and face),
@@ -632,6 +820,10 @@ int main(void)
 		metricsDrawOverlay(highlight_ok ? status : "HIGHLIGHT INIT FAILED");
 #endif
 	}
+
+	// Before worldExit: the worker holds a staging world of its own and must be joined
+	// before anything it could still be writing into is freed.
+	workerStop();
 
 	worldExit(&s_world);
 	highlightExit();
