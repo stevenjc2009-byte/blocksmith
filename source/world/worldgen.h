@@ -76,6 +76,47 @@
 // three-quarters-to-full everywhere and the contrast was invisible.
 #define GEN_FLAT_FRACTION 8
 
+// Step 5.4's caves. Two independent 3D fBms; a block is hollowed out where BOTH of them
+// sit inside a narrow band around their median.
+//
+// **Why a band and not a threshold.** One field below a threshold gives blobs — a swiss
+// cheese of disconnected bubbles the player can never walk through and would never find.
+// A narrow band around a value is a thickened iso-SURFACE, a sheet; two independent sheets
+// intersect in a curve, and a thickened curve is a tunnel. That is the whole trick, and it
+// is why there are two salts rather than one field with a wider band.
+//
+// **The centre is the measured median, not 0.5.** Over a 1,032,192-sample box the cave-scale
+// fBm ran 0.029..0.958 with mean 0.483 and p50 0.469 — much more symmetric than the 2D
+// heightmap fBm (0.075..0.936, median 0.68), which is exactly why it had to be measured
+// again rather than reused.
+//
+// **The half-width is the connectivity knee.** Carved fraction and the share of carved
+// volume sitting in systems bigger than 100 blocks, 6-connected flood fill over a 96x64x96
+// box: 0.03 -> 1.99 % carved / 96.8 % connected; 0.04 -> 3.50 % / 97.9 %; 0.05 -> 5.44 % /
+// 99.2 %; 0.06 -> 7.81 % / 99.6 %. Below 0.03 it falls apart (0.02 gives 167 components
+// and only 64.9 % in anything walkable). 0.05 is the first width where every seed tried
+// (1337, 1616, 4242, 7, 99999, 20260818) put at least 98.9 % of its carved volume into
+// walkable systems, at 3.97..8.23 % of the underground — and every extra percent is
+// triangles, which is the cost this step was warned about.
+#define GEN_CAVE_SHIFT_XZ  5            // 32-block horizontal features
+#define GEN_CAVE_SHIFT_Y   4            // 16-block vertical: squashed, so tunnels run flat
+#define GEN_CAVE_OCTAVES   2
+#define GEN_CAVE_CENTRE    0x00007800   // 0.469, the measured median
+#define GEN_CAVE_HALF      0x00000CCD   // 0.05
+
+// No cave may come within this many blocks of the surface, and none may touch y = 0.
+//
+// **This is a deliberate design decision, not a safety hack.** Five blocks is grass, the
+// three dirt blocks, and one of stone, so a cave can never leave a grass block floating on
+// nothing, can never open under the player's feet at spawn, and can never break the rule
+// the rest of the world depends on — that the first solid block walking down from the sky
+// is at worldgenHeight() - 1. The price is that this step generates no cave ENTRANCES: the
+// way in is to dig, which is the mechanic the game already has. Surface openings and
+// ravines would need spawn-finding to search for solid ground rather than trust the
+// heightmap, and that is not in this step.
+#define GEN_CAVE_MIN_DEPTH 5
+#define GEN_CAVE_FLOOR     1
+
 // Trees. One per 8x8 cell at most, so two trunks can never be closer than a couple of
 // blocks and the decoration pass has a bounded neighbourhood to scan.
 #define GEN_TREE_CELL     8
@@ -108,6 +149,18 @@ fx worldgenBiome(const WorldGen* g, int32_t x, int32_t z);
 // place: the column fill and the tree pass both ask this rather than each comparing
 // against GEN_SAND_BELOW and drifting apart.
 bool worldgenIsSandy(const WorldGen* g, int32_t x, int32_t z);
+
+// The raw cave field at a block: true where the two 3D fBms agree that this is hollow.
+//
+// **It does not know how deep the block is**, and deliberately so — the fill loop already
+// has the surface height in a local and would otherwise pay for a second heightmap
+// evaluation per block. GEN_CAVE_MIN_DEPTH is applied by the caller. What that means for
+// the tests is that the depth rule is checked against the generated world (no air within
+// five blocks of the surface) rather than against this function, which is the invariant
+// that actually matters anyway.
+//
+// Always false below GEN_CAVE_FLOOR, so the bottom of the world is solid.
+bool worldgenIsCave(const WorldGen* g, int32_t x, int y, int32_t z);
 
 // Generates one column (all 8 chunks at cx, cz) into the world. False if the block
 // budget or the column table refused an allocation — a real condition the caller must

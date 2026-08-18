@@ -2158,6 +2158,126 @@ static void testWorldgenTrees(void)
 	worldExit(&s_world);
 }
 
+// Columns each way for the cave test: 5x5, the same area main.c generates around the
+// player. Named rather than written as 2 in four places because the test's measured bounds
+// are bounds for THIS area — shrink it and they stop meaning anything (see below).
+#define GEN_CAVE_TEST_R 2
+
+static void testWorldgenCaves(void)
+{
+	// The shipped seed and the shipped generation radius, so this test is about the world
+	// the player actually gets. **The area matters as much as the seed here.** The first
+	// version of this test used the 3x3 columns the tree test uses, and the mutation that
+	// collapses the two cave fields into one PASSED it: over 16 seeds the hollow share of a
+	// 3x3 region ranges 2.26 % .. 11.32 %, which overlaps what the broken generator produces
+	// (13.34 % .. 28.42 %). Over the 5x5 area the same seeds sit at 4.15 % .. 8.40 % against
+	// a mutant 21.91 %, and the two stop overlapping. A small sample did not make the test
+	// weaker in an obvious way — it made a real defect invisible.
+	WorldGen g;
+	worldgenInit(&g, 1337u);
+
+	worldInit(&s_world);
+	for (int cz = -GEN_CAVE_TEST_R; cz <= GEN_CAVE_TEST_R; cz++)
+		for (int cx = -GEN_CAVE_TEST_R; cx <= GEN_CAVE_TEST_R; cx++)
+			CHECK_QUIET(worldgenColumn(&g, &s_world, cx, cz));
+
+	long underground = 0, hollow = 0, deep_hollow = 0, lonely = 0;
+	int  shallowest = WORLD_HEIGHT;
+	for (int32_t x = -GEN_CAVE_TEST_R * CHUNK_DIM;
+	     x < (GEN_CAVE_TEST_R + 1) * CHUNK_DIM; x++) {
+		for (int32_t z = -GEN_CAVE_TEST_R * CHUNK_DIM;
+		     z < (GEN_CAVE_TEST_R + 1) * CHUNK_DIM; z++) {
+			const int h = worldgenHeight(&g, x, z);
+
+			// **The cap is never breached.** Grass, the three dirt blocks and one of stone
+			// stay solid whatever the cave field says, so no grass block is left floating on
+			// nothing, the spawn point cannot open under the player's feet, and the rule the
+			// rest of the world relies on — the first solid block walking down from the sky
+			// is at worldgenHeight() - 1 — still holds with caves in.
+			for (int d = 0; d < GEN_CAVE_MIN_DEPTH; d++)
+				CHECK_QUIET(worldGet(&s_world, x, h - 1 - d, z) != BLOCK_AIR);
+
+			// And the bottom of the world is floor, not a hole into nothing.
+			CHECK_QUIET(worldGet(&s_world, x, 0, z) != BLOCK_AIR);
+
+			for (int y = 0; y < h; y++) {
+				underground++;
+				if (worldGet(&s_world, x, y, z) != BLOCK_AIR)
+					continue;
+				hollow++;
+				if (y < 24) deep_hollow++;
+				const int depth = h - 1 - y;
+				if (depth < shallowest) shallowest = depth;
+
+				// A hollow block with no hollow neighbour is a one-block bubble rather than
+				// a passage. Counted in the same pass because the pass is 800,000 blocks and
+				// this test runs on the console at boot as well as on the PC.
+				const bool touched =
+					worldGet(&s_world, x + 1, y, z) == BLOCK_AIR ||
+					worldGet(&s_world, x - 1, y, z) == BLOCK_AIR ||
+					worldGet(&s_world, x, y + 1, z) == BLOCK_AIR ||
+					worldGet(&s_world, x, y - 1, z) == BLOCK_AIR ||
+					worldGet(&s_world, x, y, z + 1) == BLOCK_AIR ||
+					worldGet(&s_world, x, y, z - 1) == BLOCK_AIR;
+				if (!touched) lonely++;
+			}
+		}
+	}
+
+	// **There are caves at all, and not so many that the ground is a sponge.** Measured over
+	// six seeds (1337, 1616, 0xBEEF, 4242, 7, 20260818) the hollow share of this area ran
+	// 4.15 % .. 8.40 %, and 6.99 % on the shipped one. The bounds sit wide of that on both
+	// sides because they are here to catch a generator that stopped carving or started
+	// carving everything, not to pin the figure. The upper bound is what notices the two
+	// noise fields being collapsed into one: a single band of this width takes 21.91 %.
+	CHECK(hollow * 100 > underground * 2);
+	CHECK(hollow * 100 < underground * 12);
+
+	// The deep chunks are carved too. They are filled by a different branch of
+	// worldgenColumn — one memset of stone, then the cave pass — and it would be entirely
+	// possible to carve the surface-adjacent chunks correctly and leave that branch solid.
+	CHECK(deep_hollow > 100);
+
+	// The depth guard binds rather than merely being satisfied: the shallowest cave in the
+	// area sits exactly at GEN_CAVE_MIN_DEPTH, so the checks above and this one are
+	// measuring a rule that is actually doing work.
+	CHECK(shallowest == GEN_CAVE_MIN_DEPTH);
+
+	// **Caves are passages, not speckle.** Measured across the same six seeds the lonely
+	// share ran 0.03 % .. 0.23 %, so 2 % is a wide bound that a field sampled at one block
+	// per lattice cell fails instantly (65.81 % lonely). This stands in for the flood fill
+	// that picked the constants — 0.05 puts 98.9 %+ of carved volume into systems bigger
+	// than 100 blocks — because an 80x80x128 visited map would be shipped .bss in the
+	// console binary, and the fill therefore lives in the probe instead.
+	CHECK(lonely * 100 <= hollow * 2);
+
+	worldExit(&s_world);
+
+	// The field itself: same seed same answer, different seed different caves. Two separate
+	// WorldGens rather than the same one twice, so this catches a generator that cached
+	// state instead of hashing a position — which is the thing that would break the moment
+	// Phase 6 regenerates a column in a different order.
+	WorldGen same, other;
+	worldgenInit(&same, 1337u);
+	worldgenInit(&other, 1338u);
+
+	int agree = 0, differs = 0, caves = 0, floor_caves = 0;
+	for (int i = 0; i < 4000; i++) {
+		const int32_t x = i * 7 - 14000;
+		const int32_t z = i * 13 - 26000;
+		const int     y = GEN_CAVE_FLOOR + i % 40;
+		const bool    a = worldgenIsCave(&g, x, y, z);
+		if (a == worldgenIsCave(&same,  x, y, z)) agree++;
+		if (a != worldgenIsCave(&other, x, y, z)) differs++;
+		if (a) caves++;
+		if (worldgenIsCave(&g, x, GEN_CAVE_FLOOR - 1, z)) floor_caves++;
+	}
+	CHECK(agree == 4000);
+	CHECK(caves > 4000 / 50);          // the sample contains caves, so `agree` means something
+	CHECK(differs > caves / 2);        // and the seed moves them
+	CHECK(floor_caves == 0);           // nothing below the floor, ever
+}
+
 int worldTestRun(char* summary, size_t cap, int* checks_out)
 {
 	s_checks = 0;
@@ -2191,6 +2311,7 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testWorldgenDeterminism();
 	testWorldgenBiome();
 	testWorldgenTrees();
+	testWorldgenCaves();
 	testRaycast();
 	testBodyBlocked();
 	testCeilingCollision();

@@ -23,11 +23,25 @@ static inline fx biomeCoord(int32_t block)
 	return (fx)((int64_t)block << (FX_SHIFT - GEN_BIOME_SHIFT));
 }
 
+// Caves sample a stretched lattice: wide in x/z, squashed in y. Same shift trick, and the
+// squash is what makes tunnels run along the ground instead of standing on end.
+static inline fx caveCoordXZ(int32_t block)
+{
+	return (fx)((int64_t)block << (FX_SHIFT - GEN_CAVE_SHIFT_XZ));
+}
+
+static inline fx caveCoordY(int32_t block)
+{
+	return (fx)((int64_t)block << (FX_SHIFT - GEN_CAVE_SHIFT_Y));
+}
+
 // Salts. Each derived field gets its own seed rather than sharing the heightmap's: two
 // fBms on the same seed at different scales are visibly the same shape, so a biome map
 // sharing the terrain seed would put every desert in the same place as a valley.
 #define SALT_BIOME  0x42494F4DU   // 'BIOM'
 #define SALT_TREE   0x54524545U   // 'TREE'
+#define SALT_CAVE   0x43415645U   // 'CAVE'
+#define SALT_CAVE2  0x43415632U   // 'CAV2'
 
 void worldgenInit(WorldGen* g, uint32_t seed)
 {
@@ -46,6 +60,28 @@ fx worldgenBiome(const WorldGen* g, int32_t x, int32_t z)
 bool worldgenIsSandy(const WorldGen* g, int32_t x, int32_t z)
 {
 	return worldgenBiome(g, x, z) < GEN_SAND_BELOW;
+}
+
+static inline bool inCaveBand(fx v)
+{
+	return v >= GEN_CAVE_CENTRE - GEN_CAVE_HALF && v <= GEN_CAVE_CENTRE + GEN_CAVE_HALF;
+}
+
+bool worldgenIsCave(const WorldGen* g, int32_t x, int y, int32_t z)
+{
+	if (y < GEN_CAVE_FLOOR)
+		return false;
+
+	const fx cx = caveCoordXZ(x), cy = caveCoordY(y), cz = caveCoordXZ(z);
+
+	// The first field is evaluated for every underground block and the second only for the
+	// ~22 % that survive it. Ordering the test this way is worth about a third of the whole
+	// pass, and it is free: the two fields are independent, so either order gives the same
+	// answer for the same block.
+	if (!inCaveBand(noiseFbm3(rngMix(g->seed ^ SALT_CAVE), cx, cy, cz, GEN_CAVE_OCTAVES)))
+		return false;
+
+	return inCaveBand(noiseFbm3(rngMix(g->seed ^ SALT_CAVE2), cx, cy, cz, GEN_CAVE_OCTAVES));
 }
 
 int worldgenHeight(const WorldGen* g, int32_t x, int32_t z)
@@ -237,25 +273,41 @@ bool worldgenColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 		if (!c)
 			return false;
 
-		// Entirely below the lowest ground: solid stone, written with one memset instead
-		// of 4,096 stores. Worth the special case because at these surface heights it is
-		// the common chunk — two or three of every column's eight.
-		if (y0 + CHUNK_DIM <= min_h - GEN_DIRT_DEPTH - 1) {
+		// Entirely below the lowest ground AND deep enough that every block in it is
+		// carvable: solid stone in one memset, then the cave pass. The bound is
+		// GEN_CAVE_MIN_DEPTH rather than the old GEN_DIRT_DEPTH + 1 so that this branch
+		// does not have to think about depth at all — one constant governs both the
+		// layering (5 > 3, so it is all stone) and the carve.
+		if (y0 + CHUNK_DIM <= min_h - GEN_CAVE_MIN_DEPTH) {
 			chunkClear(c, BLOCK_STONE);
+			for (int lz = 0; lz < CHUNK_DIM; lz++)
+				for (int lx = 0; lx < CHUNK_DIM; lx++)
+					for (int ly = 0; ly < CHUNK_DIM; ly++)
+						if (worldgenIsCave(g, cx * CHUNK_DIM + lx, y0 + ly,
+						                   cz * CHUNK_DIM + lz))
+							c->blocks[chunkIndex(lx, ly, lz)] = BLOCK_AIR;
 			continue;
 		}
 
 		chunkClear(c, BLOCK_AIR);
 		for (int lz = 0; lz < CHUNK_DIM; lz++) {
 			for (int lx = 0; lx < CHUNK_DIM; lx++) {
+				const int32_t x = cx * CHUNK_DIM + lx, z = cz * CHUNK_DIM + lz;
 				const int h = height[lz][lx];
 				// Only the part of this chunk that is underground gets written; the loop
 				// stops at the surface rather than testing every one of the 16 cells.
 				int top = h - 1 - y0;                    // local y of the top solid block
 				if (top > CHUNK_DIM - 1) top = CHUNK_DIM - 1;
-				for (int ly = 0; ly <= top; ly++)
-					c->blocks[chunkIndex(lx, ly, lz)] =
-						blockAtDepth(h - 1 - (y0 + ly), sandy[lz][lx]);
+				for (int ly = 0; ly <= top; ly++) {
+					const int depth = h - 1 - (y0 + ly);
+					// The chunk is already air, so a carved block is simply not written.
+					// The depth guard comes first because it is a compare against a local
+					// and the cave test is two fBms.
+					if (depth >= GEN_CAVE_MIN_DEPTH &&
+					    worldgenIsCave(g, x, y0 + ly, z))
+						continue;
+					c->blocks[chunkIndex(lx, ly, lz)] = blockAtDepth(depth, sandy[lz][lx]);
+				}
 			}
 		}
 	}
