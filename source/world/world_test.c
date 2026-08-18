@@ -9,7 +9,9 @@
 #include "world/dirtyq.h"
 #include "world/handbuilt.h"
 #include "world/mesher.h"
+#include "world/noise.h"
 #include "world/physics.h"
+#include "world/rng.h"
 #include "world/raycast.h"
 #include "world/remesh.h"
 #include "world/scratch.h"
@@ -26,6 +28,18 @@ static char s_first[96];
 #define CHECK(cond) do {                                                        \
 		s_checks++;                                                             \
 		if (!(cond)) {                                                          \
+			s_fails++;                                                          \
+			if (!s_first[0])                                                    \
+				snprintf(s_first, sizeof(s_first), "L%d %s", __LINE__, #cond);  \
+		}                                                                       \
+	} while (0)
+
+// CHECK for the inside of a long loop. A passing iteration costs nothing; only failures
+// are counted and reported. Without this a 4,000-iteration range check would add 4,000 to
+// the suite total and turn "2074 checks" into a number that says nothing about coverage.
+#define CHECK_QUIET(cond) do {                                                  \
+		if (!(cond)) {                                                          \
+			s_checks++;                                                         \
 			s_fails++;                                                          \
 			if (!s_first[0])                                                    \
 				snprintf(s_first, sizeof(s_first), "L%d %s", __LINE__, #cond);  \
@@ -1572,6 +1586,183 @@ static void testAllAirMeshesToNothing(void)
 	free(out.indices);
 }
 
+// --- Step 5.1: seeded PRNG and value noise -----------------------------------------
+//
+// The step's stated criterion is "same seed produces byte-identical chunks across runs".
+// A single process cannot literally re-run itself, so that is tested as the property the
+// criterion is really about: **the noise is a pure function of (seed, position) and of
+// nothing else** — not of call order, not of how many samples came before, not of which
+// chunk asked. That is the property a walk-east-then-north world needs, and it is what
+// would actually be broken by generating from a running stream instead of a hash.
+static void testNoiseDeterminism(void)
+{
+	const uint32_t seed = 0xC0FFEEu;
+
+	// Same input, same output, however many other samples happen in between. The
+	// interleaved decoy sample is the point: a generator carrying hidden state passes a
+	// naive repeat test and fails this one.
+	for (int i = 0; i < 64; i++) {
+		const fx x = fxFromInt(i * 7) + (FX_ONE / 3);
+		const fx z = fxFromInt(i * 13) - (FX_ONE / 7);
+
+		const fx a = noiseFbm2(seed, x, z, 4);
+		(void)noiseFbm2(seed ^ 0x5A5A5A5Au, x + FX_ONE, z - FX_ONE, 6);
+		const fx b = noiseFbm2(seed, x, z, 4);
+		CHECK(a == b);
+	}
+
+	// Sampling a region forwards and then backwards must give the same values in the
+	// same places — the order-independence a chunk generator relies on.
+	fx forward[32], backward[32];
+	for (int i = 0; i < 32; i++)
+		forward[i] = noiseFbm2(seed, fxFromInt(i), fxFromInt(100 - i), 5);
+	for (int i = 31; i >= 0; i--)
+		backward[i] = noiseFbm2(seed, fxFromInt(i), fxFromInt(100 - i), 5);
+	int same = 0;
+	for (int i = 0; i < 32; i++)
+		if (forward[i] == backward[i]) same++;
+	CHECK(same == 32);
+
+	// A different seed must actually change the world. Equality on a handful of samples
+	// would be chance; equality on all 32 means the seed is being ignored.
+	int differing = 0;
+	for (int i = 0; i < 32; i++)
+		if (noiseFbm2(seed, fxFromInt(i), fxFromInt(i * 3), 5)
+		    != noiseFbm2(seed + 1, fxFromInt(i), fxFromInt(i * 3), 5))
+			differing++;
+	CHECK(differing >= 30);
+
+	// Range. Everything downstream scales this to a block height, so an out-of-range
+	// value is terrain outside the world rather than a wrong-looking hill.
+	fx lo = FX_ONE * 2, hi = -1;
+	for (int i = 0; i < 400; i++) {
+		const fx v = noiseFbm2(seed, fxFromInt(i) + (FX_ONE >> 2), fxFromInt(i * 5), 4);
+		if (v < lo) lo = v;
+		if (v > hi) hi = v;
+		CHECK_QUIET(v >= 0 && v <= FX_ONE);
+	}
+	// And it must use its range: a generator stuck near the middle makes flat terrain.
+	CHECK(lo < FX_ONE / 3);
+	CHECK(hi > (FX_ONE * 2) / 3);
+
+	// Negative coordinates are a real region of the world, not an edge case: the lattice
+	// floor has to keep flooring, or x = 0 gets a mirror seam through it.
+	const fx neg = noiseFbm2(seed, fxFromInt(-40), fxFromInt(-40), 4);
+	const fx pos = noiseFbm2(seed, fxFromInt(40), fxFromInt(40), 4);
+	CHECK(neg != pos);
+	for (int i = 1; i <= 16; i++)
+		CHECK_QUIET(noiseValue2(seed, fxFromInt(-i), 0) != noiseValue2(seed, fxFromInt(i), 0));
+
+	// The above is not enough on its own, and finding that out is the reason this block
+	// exists: at *integer* positions an arithmetic shift and a truncating divide agree
+	// exactly, so replacing the lattice floor with `/ FX_ONE` passed the whole suite. It
+	// only shows up at fractional negative positions, where truncation collapses cell -1
+	// onto cell 0 and mirrors the noise about the origin. So sample there.
+	CHECK(noiseValue2(seed, -(FX_ONE / 2), 0) != noiseValue2(seed, FX_ONE / 2, 0));
+	CHECK(noiseValue2(seed, 0, -(FX_ONE / 2)) != noiseValue2(seed, 0, FX_ONE / 2));
+
+	// And the crossing itself must be smooth. Under truncation the value jumps as the
+	// sample passes zero; under a correct floor it walks continuously through it.
+	{
+		fx last = noiseValue2(seed, -(FX_ONE / 2), FX_ONE / 4);
+		for (int i = -7; i <= 8; i++) {
+			const fx v = noiseValue2(seed, (fx)(i * (FX_ONE / 16)), FX_ONE / 4);
+			const fx d = v > last ? v - last : last - v;
+			CHECK_QUIET(d < FX_ONE / 4);
+			last = v;
+		}
+	}
+
+	// Continuity: neighbouring blocks must not jump. Sampled at 1/16 of a lattice cell,
+	// which is the scale a heightmap actually walks, the step must stay small — a value
+	// noise cell can cross its whole range in one cell, so the bound is a quarter of the
+	// range per sixteenth of a cell, and a discontinuity blows straight through it.
+	fx prev = noiseValue2(seed, 0, 0);
+	for (int i = 1; i <= 256; i++) {
+		const fx v = noiseValue2(seed, (fx)(i * (FX_ONE / 16)), 0);
+		const fx d = v > prev ? v - prev : prev - v;
+		CHECK_QUIET(d < FX_ONE / 4);
+		prev = v;
+	}
+
+	// 3D, for the caves in 5.4: pure in three coordinates, and in range.
+	for (int i = 0; i < 32; i++) {
+		const fx x = fxFromInt(i), y = fxFromInt(i * 2 - 30), z = fxFromInt(-i);
+		const fx a = noiseFbm3(seed, x, y, z, 3);
+		(void)noiseFbm3(seed, x + 1, y, z, 3);
+		CHECK_QUIET(a == noiseFbm3(seed, x, y, z, 3));
+		CHECK_QUIET(a >= 0 && a <= FX_ONE);
+	}
+	// y must be a real axis, not ignored — a cave generator that ignores y digs shafts.
+	CHECK(noiseFbm3(seed, 0, 0, 0, 3) != noiseFbm3(seed, 0, fxFromInt(9), 0, 3));
+
+	// Octave count is clamped, not trusted, and the clamp is at the documented bounds.
+	CHECK(noiseFbm2(seed, FX_ONE, FX_ONE, 0)   == noiseFbm2(seed, FX_ONE, FX_ONE, 1));
+	CHECK(noiseFbm2(seed, FX_ONE, FX_ONE, 999) == noiseFbm2(seed, FX_ONE, FX_ONE, 8));
+}
+
+static void testRng(void)
+{
+	// Positional hashes: pure, and distinct for distinct inputs. 4,096 coordinates into a
+	// 32-bit space should collide essentially never; allowing a couple keeps the test
+	// about the mixer rather than about luck.
+	uint32_t seen[4096];
+	int n = 0;
+	for (int x = 0; x < 64; x++)
+		for (int z = 0; z < 64; z++)
+			seen[n++] = rngHash2(0x1234u, x, z);
+	int collisions = 0;
+	for (int i = 0; i < n; i++)
+		for (int j = i + 1; j < n; j++)
+			if (seen[i] == seen[j]) collisions++;
+	CHECK(collisions <= 2);
+
+	// Neighbouring coordinates must not give neighbouring hashes — that is the failure
+	// that shows up as a visible grid in the terrain rather than as a wrong number.
+	int well_mixed = 0;
+	for (int x = 0; x < 64; x++) {
+		const uint32_t a = rngHash2(7u, x, 0), b = rngHash2(7u, x + 1, 0);
+		const uint32_t d = a ^ b;
+		int bits = 0;
+		for (int i = 0; i < 32; i++) bits += (d >> i) & 1u;
+		if (bits >= 8) well_mixed++;   // ~16 expected from a good mixer
+	}
+	CHECK(well_mixed >= 60);
+
+	// Swapping the coordinates must change the answer, or the world is diagonally
+	// symmetric.
+	CHECK(rngHash2(7u, 3, 9) != rngHash2(7u, 9, 3));
+	CHECK(rngHash3(7u, 1, 2, 3) != rngHash3(7u, 3, 2, 1));
+	CHECK(rngHash3(7u, 1, 2, 3) != rngHash3(7u, 1, 5, 3));   // y is not ignored
+
+	// The stream: reproducible from a seed, and never stuck. Zero is a fixed point of
+	// xorshift, so seeding with it must be caught rather than silently produce a constant.
+	Rng a, b;
+	rngSeed(&a, 0);
+	rngSeed(&b, 0);
+	CHECK(a.state != 0);
+	int matched = 0, nonzero = 0;
+	for (int i = 0; i < 256; i++) {
+		const uint32_t va = rngNext(&a), vb = rngNext(&b);
+		if (va == vb) matched++;
+		if (va != 0) nonzero++;
+	}
+	CHECK(matched == 256);
+	CHECK(nonzero == 256);
+
+	// rngBelow must stay in range and actually spread across it.
+	Rng r;
+	rngSeed(&r, 99);
+	int buckets[8] = {0};
+	for (int i = 0; i < 4000; i++) {
+		const uint32_t v = rngBelow(&r, 8);
+		CHECK_QUIET(v < 8);
+		buckets[v]++;
+	}
+	for (int i = 0; i < 8; i++)
+		CHECK_QUIET(buckets[i] > 350 && buckets[i] < 650);   // 500 expected
+}
+
 int worldTestRun(char* summary, size_t cap, int* checks_out)
 {
 	s_checks = 0;
@@ -1599,6 +1790,8 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testEditPersistence();
 	testControlFeel();
 	testAllAirMeshesToNothing();
+	testRng();
+	testNoiseDeterminism();
 	testRaycast();
 	testBodyBlocked();
 	testCeilingCollision();

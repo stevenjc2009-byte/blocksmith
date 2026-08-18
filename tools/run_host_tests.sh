@@ -20,6 +20,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/world/world.c \
 	source/world/scratch.c \
 	source/world/mesher.c \
+	source/world/noise.c \
 	source/world/raycast.c \
 	source/world/physics.c \
 	source/world/remesh.c \
