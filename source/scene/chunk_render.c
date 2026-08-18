@@ -295,7 +295,7 @@ int chunkRenderTouch(const World* w, int x, int y, int z)
 	return queued;
 }
 
-int chunkRenderDrainDirty(const World* w, float budget_ms)
+int chunkRenderDrainDirty(const World* w, float budget_ms, int max_chunks)
 {
 	// <= 0 rather than == 0. The count cannot go negative now that dirtyqClear owns it,
 	// but an exact-equality early-out is what turned last night's miscount from a wrong
@@ -329,6 +329,13 @@ int chunkRenderDrainDirty(const World* w, float budget_ms)
 		// subsequent chunk in this call is genuinely optional against the budget.
 		const u64 elapsed = svcGetSystemTick() - t0;
 		if (elapsed >= budget_ticks) break;
+
+		// The count cap, checked in the same place and for the same reason. A clock can
+		// only stop the loop once a chunk has already overrun; the count stops it before
+		// the *next* one starts, which is what makes the worst case a number that can be
+		// written down (max_chunks x ~1.5 ms) rather than one that depends on how long a
+		// chunk happened to take.
+		if (completed >= max_chunks) break;
 
 		if (dirtyqCount(&s_dirty) <= 0) break;
 	}

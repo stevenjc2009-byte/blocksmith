@@ -79,13 +79,23 @@ static int worldReportBuild(void)
 #define BS_GPU_STRESS 0
 #endif
 
-// How much of each frame may be spent remeshing what an edit dirtied. The frame is
-// 16.71 ms at 59.83 Hz and steady-state CPU work measured 0.24 ms with a 0.37 ms submit,
-// so 4 ms is a quarter of the frame handed to the queue and still leaves three quarters
-// of it unaccounted for. At ~1.47 ms a chunk that clears two or three chunks a frame, so
-// the worst single edit — a chunk corner, eight chunks — lands over three frames instead
-// of stalling one for 11.8 ms.
-#define DRAIN_BUDGET_MS  4.0f
+// How much of each frame may be spent meshing, and how many chunks that is allowed to be.
+//
+// One budget for *all* meshing, not one each for edits and for streaming. Until step 6.2
+// they were separate — 4 ms for the edit backlog and 4 ms for the streaming backlog — on
+// the argument that a boot must not starve the response to a button press. The argument
+// was right and the implementation was wrong: two independent 4 ms budgets, each of which
+// can only stop *after* a chunk has overrun it, is a measured worst case of 5.56 ms each,
+// so a player breaking blocks while walking could hand ~11 ms of a 16.71 ms frame to
+// meshing alone. Priority, not separate wallets, is what protects the button press: the
+// edit queue drains first and the streaming queue gets what is left.
+//
+// The frame is 16.71 ms at 59.83 Hz, steady-state CPU work measured 0.62 ms with a 0.37 ms
+// submit, and a chunk costs ~1.47 ms. 4 ms and 3 chunks is a quarter of the frame with a
+// worst case that can be written down: 3 chunks, plus the one chunk each drain is always
+// allowed to complete, is ~5.9 ms and cannot grow.
+#define DRAIN_BUDGET_MS   4.0f
+#define DRAIN_MAX_CHUNKS  3
 
 // Phase 4 cannot be verified by pressing buttons: no keyboard key reaches the emulated
 // console (every button in the emulator's config is bound to an SDL pad), which is the
@@ -118,6 +128,16 @@ static int worldReportBuild(void)
 // probe that is not exactly what a player would produce.
 #ifndef BS_WALK_STRESS
 #define BS_WALK_STRESS 0
+#endif
+
+// BS_WALK_EDIT=1 makes the walk probe also edit, which is step 6.2's check. Walking alone
+// only ever fills one of the two mesh queues, and a shared budget cannot be told apart from
+// two separate ones until both are full at the same time. It edits a *chunk corner* rather
+// than a convenient nearby block because that is the edit that dirties eight chunks
+// (world/remesh.h), so the edit queue stays permanently backed up and the streaming queue
+// has to live on whatever is left.
+#ifndef BS_WALK_EDIT
+#define BS_WALK_EDIT 0
 #endif
 
 // Fly mode keeps the Phase 3 free-fly camera reachable, because it is how the world gets
@@ -204,11 +224,11 @@ static StressResult remeshStress(int edits)
 		// number on screen would silently become meaningless.
 		worldSet(&s_world, x, y, z, now);
 		r.rebuilt += chunkRenderTouch(&s_world, x, y, z);
-		chunkRenderDrainDirty(&s_world, 1000.0f);
+		chunkRenderDrainDirty(&s_world, 1000.0f, MESH_SLOTS);
 
 		worldSet(&s_world, x, y, z, was);
 		r.rebuilt += chunkRenderTouch(&s_world, x, y, z);
-		chunkRenderDrainDirty(&s_world, 1000.0f);
+		chunkRenderDrainDirty(&s_world, 1000.0f, MESH_SLOTS);
 	}
 
 	r.ms         = (float)(svcGetSystemTick() - t0) / (float)(SYSCLOCK_ARM11 / 1000);
@@ -224,7 +244,7 @@ static StressResult remeshStress(int edits)
 
 	worldSet(&s_world, bx, by, bz, BLOCK_STONE);
 	chunkRenderTouch(&s_world, bx, by, bz);
-	chunkRenderDrainDirty(&s_world, 1000.0f);   // a straggler would make the two hashes
+	chunkRenderDrainDirty(&s_world, 1000.0f, MESH_SLOTS);   // a straggler would make the two hashes
 	r.sum_incremental = chunkRenderChecksum();  // disagree for a reason that is not a bug
 
 	meshHandbuilt();
@@ -234,7 +254,7 @@ static StressResult remeshStress(int edits)
 	// touch list to undo itself: what the report says must not depend on the thing the
 	// report is testing.
 	worldSet(&s_world, bx, by, bz, BLOCK_AIR);
-	chunkRenderDrainDirty(&s_world, 1000.0f);
+	chunkRenderDrainDirty(&s_world, 1000.0f, MESH_SLOTS);
 	meshHandbuilt();
 
 	return r;
@@ -281,7 +301,7 @@ static DigOutResult digOutCheck(bool run)
 
 	// Baseline: this chunk is queueable right now.
 	r.queued_before = chunkRenderTouch(&s_world, tx, ty, tz);
-	chunkRenderDrainDirty(&s_world, 1000.0f);
+	chunkRenderDrainDirty(&s_world, 1000.0f, MESH_SLOTS);
 
 	// Dig the whole chunk out, then remesh it through the real path.
 	for (int y = 0; y < CHUNK_DIM; y++)
@@ -290,14 +310,14 @@ static DigOutResult digOutCheck(bool run)
 				worldSet(&s_world, cx * CHUNK_DIM + x, cy * CHUNK_DIM + y,
 				         cz * CHUNK_DIM + z, BLOCK_AIR);
 	chunkRenderTouch(&s_world, tx, ty, tz);
-	chunkRenderDrainDirty(&s_world, 1000.0f);
+	chunkRenderDrainDirty(&s_world, 1000.0f, MESH_SLOTS);
 	r.tris_empty = chunkRenderTris();
 
 	// Put one block back in the middle of the emptied chunk. All six of its neighbours
 	// are air, so if it is meshed at all the triangle count must rise by twelve.
 	worldSet(&s_world, tx, 5, tz, BLOCK_STONE);
 	r.queued_after = chunkRenderTouch(&s_world, tx, 5, tz);
-	chunkRenderDrainDirty(&s_world, 1000.0f);
+	chunkRenderDrainDirty(&s_world, 1000.0f, MESH_SLOTS);
 	r.tris_back = chunkRenderTris();
 
 	r.pass = (r.queued_before > 0) && (r.queued_after > 0) && (r.tris_back > r.tris_empty);
@@ -351,13 +371,9 @@ static DigOutResult digOutCheck(bool run)
 #define GEN_MESH_RADIUS  1                        // 3x3 columns = 48x48 blocks
 #define GEN_AREA_RADIUS  (GEN_MESH_RADIUS + 1)    // 5x5 columns generated
 
-// Milliseconds per frame allowed to meshing newly generated chunks. Separate from
-// DRAIN_BUDGET_MS, which is the *edit* backlog: a player breaking blocks and a world
-// streaming in are two different backlogs, and lumping them into one budget would let a
-// 25-column boot starve the response to a button press. Both always complete at least one
-// chunk, for the reason in chunk_render.h — a budget that can never make progress freezes
-// the world's appearance with no visible cause.
-#define GEN_MESH_BUDGET_MS  4.0f
+// Streaming shares DRAIN_BUDGET_MS / DRAIN_MAX_CHUNKS with the edit queue and takes
+// whatever the edit queue leaves; see the comment there for why that replaced a second
+// budget of its own in step 6.2.
 
 // Chunks waiting to be meshed into the GPU pool. Kept on the main thread: a mesh writes
 // GPU-visible linear memory through the citro3d context, which belongs to the thread that
@@ -371,6 +387,14 @@ typedef struct {
 	int  submit_failed;    // the job ring refused a column — also a hole in the world
 	int  meshed;           // chunks that got a mesh slot
 	int  mesh_refused;
+
+	// Step 6.2's measurement. The frame is 16.71 ms and the streaming path is the only
+	// thing on it whose cost is not bounded by a constant, so these are what say whether a
+	// budget is needed and, afterwards, whether it worked. Worst rather than average: a
+	// stall is by definition the outlier, and an average over six thousand frames hides it.
+	float worst_stream_ms;    // install + mesh drain, per frame
+	float worst_recenter_ms;  // genFollow, which is ~0 except on the frame that crosses
+	int   worst_built;        // most chunks meshed in one frame
 } GenResult;
 
 // Updated across frames as columns arrive, so it is a file static rather than a local:
@@ -634,9 +658,15 @@ static bool genInstallOne(void)
 	return true;
 }
 
-// Meshes queued chunks until the budget is spent or the queue runs dry. Returns how many
-// it built.
-static int genDrainMesh(float budget_ms)
+// Meshes queued chunks until the budget is spent, max_chunks have been built, or the queue
+// runs dry. Returns how many it built.
+//
+// Same two limits as chunkRenderDrainDirty, for the same reason: the clock can only stop
+// this after a chunk has already overrun, so the count is what makes the worst case a
+// number that can be written down. Also the same guarantee — at least one chunk whenever
+// the queue is non-empty, whatever the limits say, or newly generated terrain could stay
+// invisible indefinitely while the world underneath it is perfectly real.
+static int genDrainMesh(float budget_ms, int max_chunks)
 {
 	if (jobqCount(&s_meshq) == 0)
 		return 0;
@@ -648,6 +678,8 @@ static int genDrainMesh(float budget_ms)
 		if (chunkRenderBuild(&s_world, j.cx, j.cy, j.cz)) s_genr.meshed++;
 		else                                              s_genr.mesh_refused++;
 		built++;
+
+		if (built >= max_chunks) break;
 
 		const float spent = (float)((double)(svcGetSystemTick() - t0) / CPU_TICKS_PER_MSEC);
 		if (spent >= budget_ms) break;
@@ -753,6 +785,13 @@ static void worldReportDraw(int refused, bool built,
 		// arrival, and a large number there means the ring is moving faster than the worker.
 		printf("ring at %+3ld %+3ld unl %3d stale %d\n", (long)s_center_cx, (long)s_center_cz,
 		       s_col_unloaded, s_col_dropped);
+
+		// Step 6.2's line, and the only per-frame costs the streaming path adds. `strm` is
+		// install + mesh drain on the worst frame, `rc` the recentre on the frame that
+		// crossed a column boundary, `qp` the deepest the mesh queue ever got and `n` the
+		// most chunks meshed in one frame. Read `strm` against the 16.71 ms frame.
+		printf("strm %5.2f rc %5.2f qp%3d n%d  \n", gen->worst_stream_ms,
+		       gen->worst_recenter_ms, jobqPeak(&s_meshq), gen->worst_built);
 #endif
 	}
 
@@ -905,12 +944,16 @@ int main(void)
 		if (down & KEY_START) break;
 
 #if BS_WORLD_GEN
-		// Take delivery of at most one generated column and mesh what that made ready,
-		// before anything reads the world this frame. One column is all the worker can
-		// hand over per install (app/worker.h), and the mesh budget is what keeps the
-		// arrival of a column off the frame time.
+		// Take delivery of at most one generated column, before anything reads the world
+		// this frame. One column is all the worker can hand over per install
+		// (app/worker.h). Meshing what that made ready happens further down, with the
+		// edit queue, so the two share one budget rather than one each — see
+		// DRAIN_BUDGET_MS. Install stays here because it is what puts ground under the
+		// player, and it is a memcpy, not a mesh: 15.3 ms over 125 columns, 0.12 ms each.
+		const u64 t_install = svcGetSystemTick();
 		genInstallOne();
-		genDrainMesh(GEN_MESH_BUDGET_MS);
+		const float install_ms =
+			(float)((double)(svcGetSystemTick() - t_install) / CPU_TICKS_PER_MSEC);
 #endif
 
 		C3D_Mtx view;
@@ -923,7 +966,14 @@ int main(void)
 		// Clear the startup frame's stall out of `worst` first, for the same reason
 		// BS_EDIT_STRESS does: it stands for the whole run otherwise, and the streaming
 		// cost this probe exists to measure could not be told apart from it.
-		if (frame == DEMO_START_FRAME) metricsWorstReset();
+		if (frame == DEMO_START_FRAME) {
+			metricsWorstReset();
+			// Same argument for the streaming worsts: the boot meshes twenty-five columns
+			// in a burst that no walk reproduces, and it would stand for the whole run.
+			s_genr.worst_stream_ms   = 0.0f;
+			s_genr.worst_recenter_ms = 0.0f;
+			s_genr.worst_built       = 0;
+		}
 
 		if (frame > DEMO_START_FRAME && frame <= DEMO_START_FRAME + BS_WALK_STRESS) {
 			// The same clamp playerUpdate applies (its MAX_TICK), so a long frame moves the
@@ -941,6 +991,19 @@ int main(void)
 			player.cam.x = player.body.x;
 			player.cam.y = player.body.y + PLAYER_EYE;
 			player.cam.z = player.body.z;
+
+#if BS_WALK_EDIT && BS_WORLD_GEN
+			// The corner of the chunk the player is standing in, one block above the
+			// surface — found by scanning down rather than assumed, because the terrain
+			// under a walking player is generated and its height is not a constant.
+			const int bx = (int)genColumnOf(player.body.x) * CHUNK_DIM;
+			const int bz = (int)genColumnOf(player.body.z) * CHUNK_DIM;
+			int by = WORLD_HEIGHT - 2;
+			while (by > 0 && worldGet(&s_world, bx, by, bz) == BLOCK_AIR) by--;
+
+			worldSet(&s_world, bx, by + 1, bz, (frame & 1) ? BLOCK_STONE : BLOCK_AIR);
+			chunkRenderTouch(&s_world, bx, by + 1, bz);
+#endif
 		}
 #endif
 
@@ -951,7 +1014,10 @@ int main(void)
 		// where they were last frame — one frame of lag here is one frame of the player
 		// standing on a column that has just been unloaded. Before the aim and the edit,
 		// so nothing this frame reads a column the recentre is about to free.
+		const u64 t_rc = svcGetSystemTick();
 		genFollow(player.body.x, player.body.z);
+		const float rc_ms = (float)((double)(svcGetSystemTick() - t_rc) / CPU_TICKS_PER_MSEC);
+		if (rc_ms > s_genr.worst_recenter_ms) s_genr.worst_recenter_ms = rc_ms;
 #endif
 
 		// Aim first, then edit, so the highlight and the edit in the same frame cannot
@@ -981,7 +1047,27 @@ int main(void)
 		}
 #endif
 
-		chunkRenderDrainDirty(&s_world, DRAIN_BUDGET_MS);
+		// All of this frame's meshing, under one budget. Edits first: a broken block that
+		// takes two frames to disappear is felt, and a chunk of scenery that takes two
+		// frames to arrive at the edge of the render distance is not.
+		const u64 t_work = svcGetSystemTick();
+		const int edit_built = chunkRenderDrainDirty(&s_world, DRAIN_BUDGET_MS,
+		                                             DRAIN_MAX_CHUNKS);
+		const float edit_ms =
+			(float)((double)(svcGetSystemTick() - t_work) / CPU_TICKS_PER_MSEC);
+
+#if BS_WORLD_GEN
+		// Whatever is left of both limits. Negative time and a zero count are handled the
+		// same way at the far end — one chunk still completes — so no clamping here.
+		const int stream_built = genDrainMesh(DRAIN_BUDGET_MS - edit_ms,
+		                                      DRAIN_MAX_CHUNKS - edit_built);
+		const float work_ms =
+			(float)((double)(svcGetSystemTick() - t_work) / CPU_TICKS_PER_MSEC) + install_ms;
+
+		if (work_ms > s_genr.worst_stream_ms) s_genr.worst_stream_ms = work_ms;
+		if (edit_built + stream_built > s_genr.worst_built)
+			s_genr.worst_built = edit_built + stream_built;
+#endif
 
 		metricsSyncBegin();
 		C3D_FrameBegin(C3D_FRAME_SYNCDRAW);

@@ -58,20 +58,27 @@ int chunkRenderReleaseColumn(int cx, int cz);
 // that cost over as many frames as it takes.
 int chunkRenderTouch(const World* w, int x, int y, int z);
 
-// Remeshes queued chunks until budget_ms of wall clock has been spent or the queue runs
-// dry, and returns how many it completed. Call once per frame. At ~1.47 ms a chunk, a
-// 4 ms budget typically clears two or three, so the worst case of eight queued chunks
-// (a corner edit) drains over two or three frames instead of stalling one frame for
+// Remeshes queued chunks until budget_ms of wall clock has been spent, max_chunks have been
+// completed, or the queue runs dry, and returns how many it completed. Call once per frame.
+// At ~1.47 ms a chunk, a 4 ms budget clears two or three, so the worst case of eight queued
+// chunks (a corner edit) drains over two or three frames instead of stalling one frame for
 // 11.8 ms.
 //
-// Always remeshes at least one chunk when the queue is non-empty, even if budget_ms is
-// already spent, zero, or negative: a budget that can never make progress would freeze
-// the world's on-screen appearance forever with no visible cause, which is worse than
-// one over-budget frame. To force the queue empty in a single call — chunkRenderChecksum()
-// needs this, since it compares an incrementally remeshed pool against a fully rebuilt one
-// and a straggling dirty chunk would make them disagree for a reason that has nothing to
-// do with a real bug — call with a large budget, e.g. 1000.0f.
-int chunkRenderDrainDirty(const World* w, float budget_ms);
+// Two limits rather than one, because they fail differently. The clock can only stop the
+// loop *after* a chunk has already overrun it — so on its own the worst case is
+// "budget plus however long one chunk took", which is not a number anyone can plan a frame
+// around. The count stops the loop before the next chunk starts, which makes the worst case
+// max_chunks x ~1.5 ms and lets step 6.2 share one budget across the edit queue and the
+// streaming queue without either of them being able to eat the frame.
+//
+// Always remeshes at least one chunk when the queue is non-empty, whatever budget_ms and
+// max_chunks say: a budget that can never make progress would freeze the world's on-screen
+// appearance forever with no visible cause, which is worse than one over-budget frame. To
+// force the queue empty in a single call — chunkRenderChecksum() needs this, since it
+// compares an incrementally remeshed pool against a fully rebuilt one and a straggling dirty
+// chunk would make them disagree for a reason that has nothing to do with a real bug — call
+// with a large budget and MESH_SLOTS, which is every slot the pool has.
+int chunkRenderDrainDirty(const World* w, float budget_ms, int max_chunks);
 
 int  chunkRenderDirtyCount(void);      // chunks still waiting to be remeshed
 int  chunkRenderDirtyPeak(void);       // high-water mark since the last reset, for the overlay
