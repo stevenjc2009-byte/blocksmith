@@ -191,6 +191,21 @@ bool chunkRenderBuild(const World* w, int cx, int cy, int cz)
 	// went negative and the drain's early-out latched on. dirtyqClear is now idempotent,
 	// so a repeat of that mistake costs nothing — but queueing is still the drain's
 	// business and this function only meshes.
+	// An all-air chunk cannot produce geometry: meshChunk emits faces only for solid cells
+	// inside the chunk, and reads the neighbours purely for occlusion. So the 27-chunk
+	// scratch fill and the 4,096-cell mesher walk are both pure waste here, and skipping
+	// them is exact rather than an approximation. This became worth doing the moment a
+	// dug-out chunk started keeping its slot: those chunks are now queued and remeshed
+	// like any other, and every one of them was paying ~335 us to produce nothing. A chunk
+	// with no storage at all is air by definition and takes the same path.
+	const Chunk* chunk = worldChunk(w, cx, cy, cz);
+	if (!chunk || chunkIsAllAir(chunk)) {
+		s->cx = cx; s->cy = cy; s->cz = cz;
+		s->vert_count = s->index_count = 0;
+		s->used = true;
+		return true;
+	}
+
 	const u64 t0 = svcGetSystemTick();
 	scratchFill(&s_scratch, w, cx, cy, cz);
 	const u64 t1 = svcGetSystemTick();

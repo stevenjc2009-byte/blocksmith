@@ -1511,6 +1511,67 @@ static void testControlFeel(void)
 	worldExit(&s_world);
 }
 
+// The invariant scene/chunk_render.c's all-air early-out rests on: a chunk containing no
+// solid block meshes to nothing *no matter what surrounds it*. If that were ever false —
+// if the mesher grew a rule that emitted geometry for a neighbour's block, a water
+// surface say, or a chunk-boundary skirt — the early-out would silently stop drawing it,
+// and the symptom would be missing geometry in exactly the chunks nobody looks at.
+//
+// Deliberately tested against the worst case rather than an empty world: the air chunk is
+// surrounded on all 26 sides by solid stone, which is the arrangement that would produce
+// the most geometry if the rule ever changed. chunkIsAllAir is checked on the same chunks
+// so the predicate and the thing it predicts cannot drift apart.
+static void testAllAirMeshesToNothing(void)
+{
+	MeshOut out = {0};
+	out.vert_cap  = MESH_MAX_VERTS;
+	out.index_cap = MESH_MAX_INDICES;
+	out.verts     = (MeshVertex*)malloc(sizeof(MeshVertex) * out.vert_cap);
+	out.indices   = (uint16_t*)malloc(sizeof(uint16_t) * out.index_cap);
+	CHECK(out.verts != NULL && out.indices != NULL);
+	if (!out.verts || !out.indices) { free(out.verts); free(out.indices); return; }
+
+	worldInit(&s_world);
+
+	bool built = true;
+	for (int dy = 0; dy <= 2; dy++)
+		for (int dz = 0; dz <= 2; dz++)
+			for (int dx = 0; dx <= 2; dx++)
+				if (dx != 1 || dy != 1 || dz != 1)
+					built = fillChunk(dx, dy, dz, BLOCK_STONE) && built;
+	CHECK(built);
+	CHECK(worldChunkCreate(&s_world, 1, 1, 1) != NULL);   // exists, and is all air
+
+	const Chunk* middle = worldChunk(&s_world, 1, 1, 1);
+	CHECK(middle != NULL);
+	CHECK(chunkIsAllAir(middle));
+
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.faces == 0);
+	CHECK(out.vert_count == 0);
+	CHECK(out.index_count == 0);
+
+	// And the predicate is not simply always true: one block turns it off, and that block
+	// is exactly what the mesher then draws — six faces against the surrounding air gap...
+	// except there is no gap here, so the neighbours occlude nothing that matters. Placed
+	// at the chunk's centre, well clear of the borders, so all six of its faces meet air
+	// inside this same chunk and the count is unambiguous.
+	CHECK(worldSet(&s_world, 16 + 8, 16 + 8, 16 + 8, BLOCK_STONE));
+	CHECK(!chunkIsAllAir(worldChunk(&s_world, 1, 1, 1)));
+
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.faces == 6);
+
+	// A chunk with no storage at all is air too, and takes the same early-out path.
+	CHECK(worldChunk(&s_world, 40, 2, 40) == NULL);
+
+	worldExit(&s_world);
+	free(out.verts);
+	free(out.indices);
+}
+
 int worldTestRun(char* summary, size_t cap, int* checks_out)
 {
 	s_checks = 0;
@@ -1537,6 +1598,7 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testHandbuiltWalkable();
 	testEditPersistence();
 	testControlFeel();
+	testAllAirMeshesToNothing();
 	testRaycast();
 	testBodyBlocked();
 	testCeilingCollision();
