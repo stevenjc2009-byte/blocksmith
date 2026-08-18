@@ -1,0 +1,4 @@
+# Never translate line endings. The build runs under devkitPro MSYS2 bash and picasso,
+# tex3ds and run_host_tests.sh all read these files as-is; a checkout that rewrote LF to
+# CRLF would change files the build depends on for no reason.
+* -text

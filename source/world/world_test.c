@@ -1,0 +1,1560 @@
+#include "world/world_test.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "world/atlas_uv.h"
+#include "world/budget.h"
+#include "world/dirtyq.h"
+#include "world/handbuilt.h"
+#include "world/mesher.h"
+#include "world/physics.h"
+#include "world/raycast.h"
+#include "world/remesh.h"
+#include "world/scratch.h"
+#include "world/world.h"
+
+// Big enough to matter on a 32 KB console stack, and only ever one of each.
+static World       s_world;
+static MeshScratch s_scratch;
+
+static int  s_checks;
+static int  s_fails;
+static char s_first[96];
+
+#define CHECK(cond) do {                                                        \
+		s_checks++;                                                             \
+		if (!(cond)) {                                                          \
+			s_fails++;                                                          \
+			if (!s_first[0])                                                    \
+				snprintf(s_first, sizeof(s_first), "L%d %s", __LINE__, #cond);  \
+		}                                                                       \
+	} while (0)
+
+static void testBlockRegistry(void)
+{
+	CHECK(!blockIsSolid(BLOCK_AIR));
+	CHECK(blockIsAir(BLOCK_AIR));
+	CHECK(blockIsSolid(BLOCK_GRASS));
+	CHECK(blockIsSolid(BLOCK_STONE));
+
+	// Face order is east, west, top, bottom, south, north.
+	CHECK(blockFaceTex(BLOCK_GRASS, 2) == BTEX_GRASS_TOP);
+	CHECK(blockFaceTex(BLOCK_GRASS, 3) == BTEX_DIRT);
+	CHECK(blockFaceTex(BLOCK_GRASS, 0) == BTEX_GRASS_SIDE);
+	CHECK(blockFaceTex(BLOCK_STONE, 4) == BTEX_STONE);
+
+	// An unknown id must read back as air rather than walk off the table.
+	CHECK(blockInfo(200)->solid == false);
+	CHECK(strcmp(blockInfo(200)->name, "air") == 0);
+}
+
+static void testChunkIndex(void)
+{
+	static uint8_t seen[CHUNK_BLOCKS];
+	memset(seen, 0, sizeof(seen));
+
+	int duplicates = 0;
+	int out_of_range = 0;
+	for (int y = 0; y < CHUNK_DIM; y++)
+		for (int z = 0; z < CHUNK_DIM; z++)
+			for (int x = 0; x < CHUNK_DIM; x++) {
+				const int i = chunkIndex(x, y, z);
+				if (i < 0 || i >= CHUNK_BLOCKS) { out_of_range++; continue; }
+				if (seen[i]++) duplicates++;
+			}
+
+	CHECK(duplicates == 0);
+	CHECK(out_of_range == 0);
+
+	// x must be the contiguous axis — the scratch fill memcpys runs of it.
+	CHECK(chunkIndex(1, 0, 0) - chunkIndex(0, 0, 0) == 1);
+	CHECK(sizeof(Chunk) == CHUNK_BLOCKS);
+}
+
+static void testWorldAccess(void)
+{
+	worldInit(&s_world);
+
+	CHECK(worldGet(&s_world, 0, 0, 0) == BLOCK_AIR);
+	CHECK(worldGet(&s_world, 0, -1, 0) == WORLD_FLOOR_BLOCK);
+	CHECK(worldGet(&s_world, 0, WORLD_HEIGHT, 0) == BLOCK_AIR);
+	CHECK(worldSet(&s_world, 0, -1, 0, BLOCK_STONE) == false);
+	CHECK(worldSet(&s_world, 0, WORLD_HEIGHT, 0, BLOCK_STONE) == false);
+
+	// Storing air into nothing must not allocate.
+	CHECK(worldSet(&s_world, 4, 4, 4, BLOCK_AIR) == true);
+	CHECK(s_world.chunks == 0);
+
+	CHECK(worldSet(&s_world, 4, 4, 4, BLOCK_GRASS) == true);
+	CHECK(worldGet(&s_world, 4, 4, 4) == BLOCK_GRASS);
+	CHECK(s_world.columns == 1);
+	CHECK(s_world.chunks == 1);
+
+	// Across a chunk boundary: 15 and 16 are different chunks, same column.
+	CHECK(worldSet(&s_world, 16, 4, 4, BLOCK_SAND) == true);
+	CHECK(worldGet(&s_world, 16, 4, 4) == BLOCK_SAND);
+	CHECK(worldGet(&s_world, 15, 4, 4) == BLOCK_AIR);
+	CHECK(s_world.columns == 2);
+
+	// Up a column: same column, next chunk.
+	CHECK(worldSet(&s_world, 4, 20, 4, BLOCK_DIRT) == true);
+	CHECK(worldGet(&s_world, 4, 20, 4) == BLOCK_DIRT);
+	CHECK(s_world.columns == 2);
+	CHECK(s_world.chunks == 3);
+
+	// Negative coordinates: block -1 belongs to chunk -1, local 15. Plain division
+	// would round toward zero here and put it in chunk 0.
+	CHECK(worldSet(&s_world, -1, 5, -1, BLOCK_STONE) == true);
+	CHECK(worldGet(&s_world, -1, 5, -1) == BLOCK_STONE);
+	CHECK(worldColumn(&s_world, -1, -1) != NULL);
+	CHECK(worldChunk(&s_world, -1, 0, -1) != NULL);
+	CHECK(worldGet(&s_world, -17, 5, -17) == BLOCK_AIR);
+
+	// Out-of-range vertical chunk requests are refused, not clamped.
+	CHECK(worldChunkCreate(&s_world, 0, COLUMN_CHUNKS, 0) == NULL);
+	CHECK(worldChunk(&s_world, 0, COLUMN_CHUNKS, 0) == NULL);
+
+	// Same coordinates twice must not double-allocate.
+	const int before = s_world.chunks;
+	CHECK(worldChunkCreate(&s_world, 0, 0, 0) != NULL);
+	CHECK(s_world.chunks == before);
+
+	worldExit(&s_world);
+	CHECK(s_world.columns == 0);
+	CHECK(s_world.chunks == 0);
+}
+
+// The reason the padded scratch exists: every one of the 26 neighbours has to
+// arrive in the right border cell, including the eight corner diagonals that
+// ambient occlusion reads.
+static void testScratch26(void)
+{
+	worldInit(&s_world);
+
+	// Centre chunk (1,1,1) so no neighbour lands outside the world.
+	const int cx = 1, cy = 1, cz = 1;
+	const int base = CHUNK_DIM;   // world coordinate of the centre chunk's origin
+
+	// Interior first: a block inside the chunk must land at its local coordinate.
+	CHECK(worldSet(&s_world, base + 3, base + 5, base + 7, BLOCK_GRASS) == true);
+	scratchFill(&s_scratch, &s_world, cx, cy, cz);
+	CHECK(scratchAt(&s_scratch, 3, 5, 7) == BLOCK_GRASS);
+	CHECK(scratchAt(&s_scratch, 3, 5, 6) == BLOCK_AIR);
+
+	// Unloaded neighbours read as air, not as garbage.
+	CHECK(scratchAt(&s_scratch, -1, -1, -1) == BLOCK_AIR);
+	CHECK(scratchAt(&s_scratch, 16, 16, 16) == BLOCK_AIR);
+
+	int wrong = 0;
+	int corners = 0;
+	for (int dy = -1; dy <= 1; dy++)
+		for (int dz = -1; dz <= 1; dz++)
+			for (int dx = -1; dx <= 1; dx++) {
+				if (!dx && !dy && !dz) continue;
+
+				// The cell immediately outside the centre chunk in this direction:
+				// -1 -> local -1, 0 -> local 0, +1 -> local 16.
+				const int lx = (dx < 0) ? -1 : (dx > 0 ? CHUNK_DIM : 0);
+				const int ly = (dy < 0) ? -1 : (dy > 0 ? CHUNK_DIM : 0);
+				const int lz = (dz < 0) ? -1 : (dz > 0 ? CHUNK_DIM : 0);
+
+				if (!worldSet(&s_world, base + lx, base + ly, base + lz, BLOCK_SAND)) {
+					wrong++;
+					continue;
+				}
+
+				scratchFill(&s_scratch, &s_world, cx, cy, cz);
+				if (scratchAt(&s_scratch, lx, ly, lz) != BLOCK_SAND) wrong++;
+				if (dx && dy && dz) corners++;
+
+				worldSet(&s_world, base + lx, base + ly, base + lz, BLOCK_AIR);
+			}
+
+	CHECK(wrong == 0);
+	CHECK(corners == 8);   // all eight diagonals were actually exercised
+
+	worldExit(&s_world);
+}
+
+static void testScratchFloor(void)
+{
+	worldInit(&s_world);
+
+	// The chunk sitting on the world floor: the row below it must read solid, or the
+	// mesher would emit the underside of the world as a visible face.
+	CHECK(worldSet(&s_world, 5, 0, 5, BLOCK_STONE) == true);
+	scratchFill(&s_scratch, &s_world, 0, 0, 0);
+	CHECK(scratchAt(&s_scratch, 5, -1, 5) == WORLD_FLOOR_BLOCK);
+	CHECK(scratchAt(&s_scratch, 5, 0, 5) == BLOCK_STONE);
+	CHECK(worldGet(&s_world, 5, -1, 5) == WORLD_FLOOR_BLOCK);   // and worldGet agrees
+
+	// A chunk one up has an ordinary air border below it, not a floor.
+	scratchFill(&s_scratch, &s_world, 0, 1, 0);
+	CHECK(scratchAt(&s_scratch, 5, -1, 5) == BLOCK_AIR);
+
+	worldExit(&s_world);
+}
+
+static void testBudget(void)
+{
+	budgetReset();
+
+	CHECK(budgetUsed() == 0);
+	CHECK(budgetCap() == WORLD_BUDGET_BYTES);
+	CHECK(budgetClaim(1024) == true);
+	CHECK(budgetUsed() == 1024);
+	budgetRelease(1024);
+	CHECK(budgetUsed() == 0);
+
+	// Releasing more than was claimed must clamp, not wrap to 4 GB.
+	budgetRelease(4096);
+	CHECK(budgetUsed() == 0);
+
+	// Over-budget is refused loudly and reserves nothing.
+	const int refusals = budgetRefusals();
+	CHECK(budgetClaim(WORLD_BUDGET_BYTES + 1) == false);
+	CHECK(budgetRefusals() == refusals + 1);
+	CHECK(budgetUsed() == 0);
+
+	CHECK(budgetClaim(WORLD_BUDGET_BYTES) == true);
+	CHECK(budgetClaim(1) == false);
+	budgetRelease(WORLD_BUDGET_BYTES);
+	CHECK(budgetPeak() == WORLD_BUDGET_BYTES);
+
+	budgetReset();
+}
+
+// Fills a whole chunk with one block id, straight into its storage. Returns false if
+// the chunk could not be allocated, which the caller must check — a silently missing
+// chunk would make a mesher test pass for the wrong reason.
+static bool fillChunk(int cx, int cy, int cz, BlockId id)
+{
+	Chunk* c = worldChunkCreate(&s_world, cx, cy, cz);
+	if (!c) return false;
+	memset(c->blocks, id, CHUNK_BLOCKS);
+	return true;
+}
+
+// The mesher, step 3.1. The counts here are the whole point of the step: a solid
+// chunk with solid neighbours must emit *nothing*, and a lone block must emit exactly
+// six faces. Both are invisible on screen — a chunk meshed with its interior included
+// looks identical and just runs slower — so they are checked here instead.
+static void testMesher(void)
+{
+	MeshOut out = {0};
+	out.vert_cap  = MESH_MAX_VERTS;
+	out.index_cap = MESH_MAX_INDICES;
+	out.verts     = (MeshVertex*)malloc(sizeof(MeshVertex) * out.vert_cap);
+	out.indices   = (uint16_t*)malloc(sizeof(uint16_t) * out.index_cap);
+	CHECK(out.verts != NULL && out.indices != NULL);
+	if (!out.verts || !out.indices) { free(out.verts); free(out.indices); return; }
+
+	worldInit(&s_world);
+
+	// --- A solid chunk with solid neighbours on all 26 sides: zero faces.
+	bool built = true;
+	for (int dy = 0; dy <= 2; dy++)
+		for (int dz = 0; dz <= 2; dz++)
+			for (int dx = 0; dx <= 2; dx++)
+				built = fillChunk(dx, dy, dz, BLOCK_STONE) && built;
+	CHECK(built);
+
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.faces == 0);
+	CHECK(out.vert_count == 0);
+	CHECK(out.index_count == 0);
+	CHECK(out.overflow == false);
+
+	// --- The same chunk with air around it: the surface only, 6 x 16 x 16 faces.
+	worldExit(&s_world);
+	worldInit(&s_world);
+	CHECK(fillChunk(1, 1, 1, BLOCK_STONE));
+
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.faces == 6 * CHUNK_DIM * CHUNK_DIM);   // 1536, not 24576
+	CHECK(out.vert_count == out.faces * 4);
+	CHECK(out.index_count == out.faces * 6);
+	CHECK(out.overflow == false);
+
+	// Every vertex must sit inside the chunk's own 0..16 box, or the chunk will not
+	// line up with its neighbour once a model matrix places it.
+	int out_of_box = 0;
+	for (uint32_t i = 0; i < out.vert_count; i++) {
+		const MeshVertex* v = &out.verts[i];
+		if (v->x < 0 || v->x > CHUNK_DIM) out_of_box++;
+		if (v->y < 0 || v->y > CHUNK_DIM) out_of_box++;
+		if (v->z < 0 || v->z > CHUNK_DIM) out_of_box++;
+	}
+	CHECK(out_of_box == 0);
+
+	// --- The floor rule: the lowest chunk's bottom faces are culled, because below
+	// the world reads as stone. Five sides, not six.
+	worldExit(&s_world);
+	worldInit(&s_world);
+	CHECK(fillChunk(0, 0, 0, BLOCK_STONE));
+	scratchFill(&s_scratch, &s_world, 0, 0, 0);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.faces == 5 * CHUNK_DIM * CHUNK_DIM);   // 1280
+
+	// --- One floating block: exactly six faces, four vertices each, and the right
+	// tile on each face straight out of the registry.
+	worldExit(&s_world);
+	worldInit(&s_world);
+	CHECK(worldSet(&s_world, 20, 40, 20, BLOCK_GRASS));
+	scratchFill(&s_scratch, &s_world, 1, 2, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.faces == 6);
+	CHECK(out.vert_count == 24);
+	CHECK(out.index_count == 36);
+
+	int per_face[BLOCK_FACES] = {0};
+	int wrong_tile = 0;
+	for (uint32_t i = 0; i < out.vert_count; i++) {
+		const MeshVertex* v = &out.verts[i];
+		if (v->nrm < BLOCK_FACES) per_face[v->nrm]++;
+		const AtlasRect r = atlasRect(blockFaceTex(BLOCK_GRASS, v->nrm));
+		if ((v->u != r.u0 && v->u != r.u1) || (v->v != r.v0 && v->v != r.v1)) wrong_tile++;
+	}
+	CHECK(wrong_tile == 0);
+	int faces_with_four = 0;
+	for (int f = 0; f < BLOCK_FACES; f++) if (per_face[f] == 4) faces_with_four++;
+	CHECK(faces_with_four == BLOCK_FACES);
+
+	// Grass is the block that proves per-face tiles work at all: three different
+	// tiles on one cube. Top face vertices must carry the grass top tile.
+	const AtlasRect top = atlasRect(BTEX_GRASS_TOP);
+	int top_verts = 0;
+	for (uint32_t i = 0; i < out.vert_count; i++)
+		if (out.verts[i].nrm == 2 && (out.verts[i].u == top.u0 || out.verts[i].u == top.u1))
+			top_verts++;
+	CHECK(top_verts == 4);
+
+	// --- Overflow: a buffer too small must stop, flag it, and write nothing past the
+	// end. A mesher that overruns here corrupts the linear heap on the console.
+	MeshOut small = out;
+	small.vert_cap  = 6;    // room for one quad, not two
+	small.index_cap = MESH_MAX_INDICES;
+	meshChunk(&small, &s_scratch);
+	CHECK(small.overflow == true);
+	CHECK(small.vert_count == 4);
+	CHECK(small.faces == 1);
+
+	worldExit(&s_world);
+	free(out.verts);
+	free(out.indices);
+}
+
+// Baked AO, step 3.5. The rule is three neighbours per corner, and the two cases that
+// matter are the ones no screenshot can measure: an unoccluded face must stay at 3
+// everywhere, and a corner with both flanks solid must go to 0 rather than 1.
+static void testMesherAO(void)
+{
+	MeshOut out = {0};
+	out.vert_cap  = MESH_MAX_VERTS;
+	out.index_cap = MESH_MAX_INDICES;
+	out.verts     = (MeshVertex*)malloc(sizeof(MeshVertex) * out.vert_cap);
+	out.indices   = (uint16_t*)malloc(sizeof(uint16_t) * out.index_cap);
+	CHECK(out.verts != NULL && out.indices != NULL);
+	if (!out.verts || !out.indices) { free(out.verts); free(out.indices); return; }
+
+	// --- A single floating block is occluded by nothing: every vertex at 3.
+	worldInit(&s_world);
+	CHECK(worldSet(&s_world, 20, 40, 20, BLOCK_STONE));
+	scratchFill(&s_scratch, &s_world, 1, 2, 1);
+	meshChunk(&out, &s_scratch);
+
+	int not_three = 0;
+	for (uint32_t i = 0; i < out.vert_count; i++)
+		if (out.verts[i].ao != 3) not_three++;
+	CHECK(not_three == 0);
+
+	// --- Occlude the top face. A neighbour at the *same* height cannot darken a top
+	// face — every block AO reads for a top face sits in the layer above it — so the
+	// occluder goes east and one up, at local (5,9,4). The block's own top face is the
+	// only nrm==2 quad at y == 9, which is how it is picked out below; the occluder's
+	// own top face is at y == 10.
+	CHECK(worldSet(&s_world, 21, 41, 20, BLOCK_STONE));
+	scratchFill(&s_scratch, &s_world, 1, 2, 1);
+	meshChunk(&out, &s_scratch);
+
+	int top_at_2 = 0, top_at_3 = 0, darker_than_2 = 0;
+	for (uint32_t i = 0; i < out.vert_count; i++) {
+		const MeshVertex* v = &out.verts[i];
+		if (v->nrm != 2 || v->y != 9) continue;      // the first block's own top face
+		if (v->ao == 2) top_at_2++;
+		if (v->ao == 3) top_at_3++;
+		if (v->ao < 2)  darker_than_2++;
+	}
+	CHECK(top_at_2 == 2);           // the two corners on the occluder's side
+	CHECK(top_at_3 == 2);           // the far pair are untouched
+	CHECK(darker_than_2 == 0);      // one flank is not a crevice
+
+	// --- An inside corner: a second occluder to the south, also one up, so one corner
+	// of the top face now has both flanks solid. That corner must read 0, not the 1 the
+	// naive `3 - (s1 + s2 + c)` formula would give.
+	CHECK(worldSet(&s_world, 20, 41, 21, BLOCK_STONE));
+	scratchFill(&s_scratch, &s_world, 1, 2, 1);
+	meshChunk(&out, &s_scratch);
+
+	int zero_ao = 0, one_ao = 0;
+	for (uint32_t i = 0; i < out.vert_count; i++) {
+		const MeshVertex* v = &out.verts[i];
+		if (v->nrm != 2 || v->y != 9) continue;
+		if (v->ao == 0) zero_ao++;
+		if (v->ao == 1) one_ao++;
+	}
+	CHECK(zero_ao == 1);
+	CHECK(one_ao == 0);
+
+	// --- AO must not change how many faces exist, only how dark they are. The three
+	// blocks only touch diagonally, so nothing is hidden and all 18 faces survive.
+	CHECK(out.faces == 3 * 6);
+
+	worldExit(&s_world);
+	free(out.verts);
+	free(out.indices);
+}
+
+// Which chunks a block edit dirties, step 3.6.
+static void testRemeshList(void)
+{
+	ChunkCoord list[REMESH_MAX];
+
+	// Middle of a chunk: itself only.
+	CHECK(remeshList(24, 40, 24, list) == 1);
+	CHECK(list[0].cx == 1 && list[0].cy == 2 && list[0].cz == 1);
+
+	// One face border: two chunks.
+	CHECK(remeshList(16, 40, 24, list) == 2);
+	// An edge: four.
+	CHECK(remeshList(16, 40, 32, list) == 4);
+	// A corner: all eight, diagonals included — this is the one AO needs.
+	CHECK(remeshList(16, 32, 16, list) == 8);
+
+	int diagonal = 0;
+	for (int i = 0; i < 8; i++)
+		if (list[i].cx == 0 && list[i].cy == 1 && list[i].cz == 0) diagonal++;
+	CHECK(diagonal == 1);
+
+	// No duplicates, or a chunk gets meshed twice for nothing.
+	int duplicates = 0;
+	for (int i = 0; i < 8; i++)
+		for (int j = i + 1; j < 8; j++)
+			if (list[i].cx == list[j].cx && list[i].cy == list[j].cy &&
+			    list[i].cz == list[j].cz) duplicates++;
+	CHECK(duplicates == 0);
+
+	// At the world floor the chunk below does not exist, so a corner edit there
+	// touches four, not eight.
+	CHECK(remeshList(16, 0, 16, list) == 4);
+	CHECK(remeshList(16, -1, 16, list) == 0);
+	CHECK(remeshList(16, WORLD_HEIGHT, 16, list) == 0);
+}
+
+// A mesh's identity, cheap enough to run a few hundred times: every byte the GPU would
+// read. Two meshes with the same checksum have the same geometry, tiles and AO.
+static uint32_t meshChecksum(const MeshOut* o)
+{
+	uint32_t h = 2166136261u;
+	for (uint32_t i = 0; i < o->vert_count; i++) {
+		const MeshVertex* v = &o->verts[i];
+		const uint8_t bytes[7] = { (uint8_t)v->x, (uint8_t)v->y, (uint8_t)v->z,
+		                           v->u, v->v, v->nrm, v->ao };
+		for (int b = 0; b < 7; b++) { h ^= bytes[b]; h *= 16777619u; }
+	}
+	return h ^ o->index_count;
+}
+
+// Incremental remeshing, step 3.6: after a run of random edits, remeshing only what
+// remeshList() nominates must leave every chunk byte-identical to remeshing the lot.
+// A missed neighbour shows up here as a mismatch — on screen it would be a seam or a
+// band of shadow that stops at a chunk edge, which is exactly what this replaces.
+#define EDIT_SPAN_X   2
+#define EDIT_SPAN_Z   2
+#define EDIT_SPAN_Y   1
+#define EDIT_COUNT    32
+
+static void testIncrementalRemesh(void)
+{
+	MeshOut out = {0};
+	out.vert_cap  = MESH_MAX_VERTS;
+	out.index_cap = MESH_MAX_INDICES;
+	out.verts     = (MeshVertex*)malloc(sizeof(MeshVertex) * out.vert_cap);
+	out.indices   = (uint16_t*)malloc(sizeof(uint16_t) * out.index_cap);
+	CHECK(out.verts != NULL && out.indices != NULL);
+	if (!out.verts || !out.indices) { free(out.verts); free(out.indices); return; }
+
+	static uint32_t incremental[EDIT_SPAN_X][EDIT_SPAN_Y][EDIT_SPAN_Z];
+	static uint32_t fresh[EDIT_SPAN_X][EDIT_SPAN_Y][EDIT_SPAN_Z];
+	static uint32_t before[EDIT_SPAN_X][EDIT_SPAN_Y][EDIT_SPAN_Z];
+
+	worldInit(&s_world);
+	CHECK(handbuiltFill(&s_world));
+
+	for (int cx = 0; cx < EDIT_SPAN_X; cx++)
+		for (int cy = 0; cy < EDIT_SPAN_Y; cy++)
+			for (int cz = 0; cz < EDIT_SPAN_Z; cz++) {
+				scratchFill(&s_scratch, &s_world, cx, cy, cz);
+				meshChunk(&out, &s_scratch);
+				incremental[cx][cy][cz] = meshChecksum(&out);
+				before[cx][cy][cz]      = incremental[cx][cy][cz];
+			}
+
+	// Deterministic edits, so a failure is reproducible. Chunk borders are where the
+	// bug lives, so every fourth edit is aimed straight at x = 16 or z = 16.
+	uint32_t rng = 0x1D3B5C7u;
+	for (int e = 0; e < EDIT_COUNT; e++) {
+		rng = rng * 1664525u + 1013904223u;
+		int x = (int)((rng >> 8) % (EDIT_SPAN_X * CHUNK_DIM));
+		int z = (int)((rng >> 16) % (EDIT_SPAN_Z * CHUNK_DIM));
+		int y = (int)((rng >> 4) % (EDIT_SPAN_Y * CHUNK_DIM));
+		const BlockId id = ((rng >> 24) & 1) ? BLOCK_AIR : BLOCK_SAND;
+
+		if ((e & 3) == 0) { x = CHUNK_DIM - ((e >> 2) & 1); z = CHUNK_DIM; }
+
+		CHECK(worldSet(&s_world, x, y, z, id));
+
+		ChunkCoord dirty[REMESH_MAX];
+		const int n = remeshList(x, y, z, dirty);
+		for (int i = 0; i < n; i++) {
+			if (dirty[i].cx < 0 || dirty[i].cx >= EDIT_SPAN_X) continue;
+			if (dirty[i].cy < 0 || dirty[i].cy >= EDIT_SPAN_Y) continue;
+			if (dirty[i].cz < 0 || dirty[i].cz >= EDIT_SPAN_Z) continue;
+
+			scratchFill(&s_scratch, &s_world, dirty[i].cx, dirty[i].cy, dirty[i].cz);
+			meshChunk(&out, &s_scratch);
+			incremental[dirty[i].cx][dirty[i].cy][dirty[i].cz] = meshChecksum(&out);
+		}
+	}
+
+	int mismatches = 0;
+	for (int cx = 0; cx < EDIT_SPAN_X; cx++)
+		for (int cy = 0; cy < EDIT_SPAN_Y; cy++)
+			for (int cz = 0; cz < EDIT_SPAN_Z; cz++) {
+				scratchFill(&s_scratch, &s_world, cx, cy, cz);
+				meshChunk(&out, &s_scratch);
+				fresh[cx][cy][cz] = meshChecksum(&out);
+				if (fresh[cx][cy][cz] != incremental[cx][cy][cz]) mismatches++;
+			}
+	CHECK(mismatches == 0);
+
+	// And the edits must actually have changed the geometry, or the comparison above
+	// is two copies of an untouched world agreeing with each other. Every chunk in the
+	// span is expected to move: the border edits alone reach all four.
+	int changed = 0;
+	for (int cx = 0; cx < EDIT_SPAN_X; cx++)
+		for (int cy = 0; cy < EDIT_SPAN_Y; cy++)
+			for (int cz = 0; cz < EDIT_SPAN_Z; cz++)
+				if (fresh[cx][cy][cz] != before[cx][cy][cz]) changed++;
+	CHECK(changed == EDIT_SPAN_X * EDIT_SPAN_Y * EDIT_SPAN_Z);
+
+	worldExit(&s_world);
+	free(out.verts);
+	free(out.indices);
+}
+
+// 4.1 — the DDA raycast. Every case here is one that a naive implementation gets
+// wrong, which is the only reason to write a test rather than aim at a block and look.
+static void testRaycast(void)
+{
+	worldInit(&s_world);
+
+	// A single block at (4,4,4), nothing else. Rays are fired from cell centres so
+	// there is no argument about which cell the origin is in.
+	CHECK(worldSet(&s_world, 4, 4, 4, BLOCK_STONE));
+
+	// Straight down the +X axis from x=0.5: enters through the block's WEST face, and
+	// the place position is the empty cell it came from.
+	RayHit h = worldRaycast(&s_world, 0.5f, 4.5f, 4.5f, 1.0f, 0.0f, 0.0f, 16.0f);
+	CHECK(h.hit);
+	CHECK(h.x == 4 && h.y == 4 && h.z == 4);
+	CHECK(h.face == FACE_WEST);
+	CHECK(h.px == 3 && h.py == 4 && h.pz == 4);
+
+	// The opposite direction must give the EAST face, not the same one. Getting the
+	// sign of the step backwards is the classic bug and it is invisible until you
+	// try to place a block.
+	h = worldRaycast(&s_world, 8.5f, 4.5f, 4.5f, -1.0f, 0.0f, 0.0f, 16.0f);
+	CHECK(h.hit && h.face == FACE_EAST);
+	CHECK(h.px == 5 && h.py == 4 && h.pz == 4);
+
+	// From above: TOP face, and the place cell is one higher.
+	h = worldRaycast(&s_world, 4.5f, 9.0f, 4.5f, 0.0f, -1.0f, 0.0f, 16.0f);
+	CHECK(h.hit && h.face == FACE_TOP);
+	CHECK(h.py == 5);
+
+	// From below: BOTTOM face. The world floor is solid, so this ray has to start
+	// above it and still reach the block.
+	h = worldRaycast(&s_world, 4.5f, 1.5f, 4.5f, 0.0f, 1.0f, 0.0f, 16.0f);
+	CHECK(h.hit && h.face == FACE_BOTTOM && h.y == 4);
+
+	// Both Z faces, for completeness — all six get exercised or the face table is
+	// only half tested.
+	h = worldRaycast(&s_world, 4.5f, 4.5f, 0.5f, 0.0f, 0.0f, 1.0f, 16.0f);
+	CHECK(h.hit && h.face == FACE_NORTH);
+	h = worldRaycast(&s_world, 4.5f, 4.5f, 8.5f, 0.0f, 0.0f, -1.0f, 16.0f);
+	CHECK(h.hit && h.face == FACE_SOUTH);
+
+	// Distance is in blocks and measured to the surface, not to the centre.
+	h = worldRaycast(&s_world, 0.5f, 4.5f, 4.5f, 1.0f, 0.0f, 0.0f, 16.0f);
+	CHECK(h.distance > 3.4f && h.distance < 3.6f);
+
+	// Reach is respected: the same ray with 2 blocks of reach must miss.
+	h = worldRaycast(&s_world, 0.5f, 4.5f, 4.5f, 1.0f, 0.0f, 0.0f, 2.0f);
+	CHECK(!h.hit);
+
+	// A miss down an empty row returns hit == false, not a garbage cell.
+	h = worldRaycast(&s_world, 0.5f, 40.5f, 40.5f, 1.0f, 0.0f, 0.0f, 16.0f);
+	CHECK(!h.hit);
+
+	// A diagonal ray must not tunnel through the corner between two blocks. This is
+	// the case a naive "step along the vector" raycast fails: it samples past the
+	// shared edge and hits neither.
+	CHECK(worldSet(&s_world, 6, 4, 4, BLOCK_STONE));
+	CHECK(worldSet(&s_world, 5, 4, 5, BLOCK_STONE));
+	h = worldRaycast(&s_world, 4.5f, 4.5f, 6.5f, 1.0f, 0.0f, -1.0f, 16.0f);
+	CHECK(h.hit);
+
+	// The direction is normalised internally, so a long vector must not change the
+	// answer — only the distance units.
+	const RayHit unit  = worldRaycast(&s_world, 0.5f, 4.5f, 4.5f, 1.0f, 0.0f, 0.0f, 16.0f);
+	const RayHit scale = worldRaycast(&s_world, 0.5f, 4.5f, 4.5f, 9.0f, 0.0f, 0.0f, 16.0f);
+	CHECK(scale.hit == unit.hit && scale.x == unit.x && scale.face == unit.face);
+	CHECK(scale.distance > unit.distance - 0.01f && scale.distance < unit.distance + 0.01f);
+
+	// A zero-length direction cannot hit anything, and must not divide by zero.
+	h = worldRaycast(&s_world, 0.5f, 4.5f, 4.5f, 0.0f, 0.0f, 0.0f, 16.0f);
+	CHECK(!h.hit);
+
+	// Negative coordinates: chunk lookup uses an arithmetic shift, and so must the
+	// ray's cell arithmetic. Truncation towards zero puts the ray in the wrong cell
+	// for exactly half the world.
+	CHECK(worldSet(&s_world, -4, 4, -4, BLOCK_STONE));
+	h = worldRaycast(&s_world, -8.5f, 4.5f, -3.5f, 1.0f, 0.0f, 0.0f, 16.0f);
+	CHECK(h.hit && h.x == -4 && h.y == 4 && h.z == -4 && h.face == FACE_WEST);
+	CHECK(h.px == -5);
+
+	// Starting inside a solid block is a real situation (the camera clipping into
+	// terrain), and it reports the block with no face rather than lying about one.
+	h = worldRaycast(&s_world, 4.5f, 4.5f, 4.5f, 1.0f, 0.0f, 0.0f, 16.0f);
+	CHECK(h.hit && h.x == 4 && h.y == 4 && h.z == 4);
+	CHECK(h.face == RAY_FACE_NONE);
+
+	// Straight up out of the world: the ceiling is air, so nothing is hit and the
+	// loop has to terminate on reach rather than run off the top.
+	h = worldRaycast(&s_world, 4.5f, (float)WORLD_HEIGHT - 2.5f, 4.5f,
+	                 0.0f, 1.0f, 0.0f, 32.0f);
+	CHECK(!h.hit);
+
+	// Straight down out of the world: below the floor is solid, so a ray aimed at it
+	// must hit rather than fall through forever. The hit is at y == -1, not y == 0 —
+	// worldGet reports WORLD_FLOOR_BLOCK only for y < 0, and nothing was ever placed in
+	// this column, so y == 0 is ordinary air. Breaking the floor cell is then refused by
+	// worldSet, which is correct, and placing against it lands at y == 0, which is legal.
+	h = worldRaycast(&s_world, 40.5f, 1.5f, 40.5f, 0.0f, -1.0f, 0.0f, 8.0f);
+	CHECK(h.hit && h.y == -1);
+	CHECK(h.face == FACE_TOP && h.py == 0);
+
+	worldExit(&s_world);
+}
+
+// 4.4 — the player box against the blocks. Each group resets the world, matching the
+// style testMesher() uses, so a stray block from one case cannot leak into the next.
+static void testPhysics(void)
+{
+	// --- Falling onto a floor, landing exactly on it, and not sinking in on the
+	// ticks after. The exact-integer landing y is the whole point of resolveY's
+	// analytic snap rather than an iterative one: a bisected stop would leave a
+	// tiny residual gap or overlap instead of y == 11.0f on the nose.
+	{
+		worldInit(&s_world);
+		for (int x = 0; x < 12; x++)
+			for (int z = 0; z < 12; z++)
+				CHECK(worldSet(&s_world, x, 10, z, BLOCK_STONE));   // floor top at y=11
+
+		Body body;
+		bodyInit(&body, 5.0f, 20.0f, 5.0f);
+		CHECK(body.on_ground == false);   // nothing under a freshly dropped body
+
+		bool landed = false;
+		for (int i = 0; i < 400 && !landed; i++) {
+			bodyStep(&body, &s_world, 1.0f / 60.0f);
+			if (body.on_ground) landed = true;
+		}
+		CHECK(landed);
+		CHECK(body.y == 11.0f);          // exactly on the surface, not into it
+		CHECK(body.vy == 0.0f);
+
+		// A few more ticks standing still must not drift the feet at all.
+		for (int i = 0; i < 10; i++) bodyStep(&body, &s_world, 1.0f / 60.0f);
+		CHECK(body.y == 11.0f);
+		CHECK(body.on_ground == true);
+
+		worldExit(&s_world);
+	}
+
+	// --- Jumping: rises immediately, leaves on_ground, then comes back down onto
+	// the same floor. This is the on_ground transition true -> false -> true.
+	{
+		worldInit(&s_world);
+		for (int x = 0; x < 12; x++)
+			for (int z = 0; z < 12; z++)
+				CHECK(worldSet(&s_world, x, 10, z, BLOCK_STONE));
+
+		Body body;
+		bodyInit(&body, 5.0f, 11.0f, 5.0f);
+		body.on_ground = true;   // resting on the floor already, as if it had landed
+
+		body.vy = PLAYER_JUMP_SPEED;
+		bodyStep(&body, &s_world, 1.0f / 60.0f);
+		CHECK(body.on_ground == false);   // left the ground the instant it jumped
+		CHECK(body.y > 11.0f);            // and actually rose
+
+		float peak = body.y;
+		bool back = false;
+		for (int i = 0; i < 400 && !back; i++) {
+			bodyStep(&body, &s_world, 1.0f / 60.0f);
+			if (body.y > peak) peak = body.y;
+			if (body.on_ground) back = true;
+		}
+		CHECK(back);
+		CHECK(body.y == 11.0f);       // landed back on the same surface, exactly
+		CHECK(peak > 11.0f);          // and it did actually arc, not just twitch
+
+		worldExit(&s_world);
+	}
+
+	// --- Airborne body walking into a one-block wall: it must stop, and the step-up
+	// must NOT fire, because on_ground is false the whole time. This is the case that
+	// is easy to get backwards: a step-up bug that ignores on_ground would let a body
+	// flying past at head height "step" onto a wall it never touched feet-first.
+	{
+		worldInit(&s_world);
+		CHECK(worldSet(&s_world, 8, 5, 5, BLOCK_STONE));   // a single floating block
+
+		Body body;
+		bodyInit(&body, 5.0f, 5.0f, 5.0f);   // on_ground is false from bodyInit
+		CHECK(body.on_ground == false);
+
+		int blocked = bodyMove(&body, &s_world, 3.0f, 0.0f, 0.0f);
+		CHECK(blocked & BLOCKED_X);
+		CHECK(body.x > 7.69f && body.x < 7.71f);   // flush against the wall: 8 - 0.3
+		CHECK(body.y == 5.0f);                     // never lifted
+		CHECK(body.on_ground == false);            // step-up never touched this
+
+		worldExit(&s_world);
+	}
+
+	// --- The same wall, at a delta far bigger than one block, must still stop at the
+	// wall face rather than skip clean through it. Without substep subdivision a
+	// single 200-block jump would test only the start (clear) and the end (also clear,
+	// on the far side of a one-block-thick wall) and never notice the wall between.
+	{
+		worldInit(&s_world);
+		CHECK(worldSet(&s_world, 8, 5, 5, BLOCK_STONE));
+
+		Body body;
+		bodyInit(&body, 5.0f, 5.0f, 5.0f);
+
+		int blocked = bodyMove(&body, &s_world, 200.0f, 0.0f, 0.0f);
+		CHECK(blocked & BLOCKED_X);
+		CHECK(body.x > 7.69f && body.x < 7.71f);   // stopped at the same face as above,
+		                                           // not somewhere past x=9
+
+		worldExit(&s_world);
+	}
+
+	// --- Stepping up a single block while grounded: the obstruction is exactly one
+	// block on top of the same floor the body is already walking on, with clear air
+	// above it, so the headroom probe finds nothing and the whole horizontal move
+	// completes rather than stopping.
+	{
+		worldInit(&s_world);
+		for (int x = 0; x < 16; x++)
+			for (int z = 0; z < 12; z++)
+				CHECK(worldSet(&s_world, x, 10, z, BLOCK_STONE));   // floor, top at y=11
+		CHECK(worldSet(&s_world, 8, 11, 5, BLOCK_STONE));           // one block, top at y=12
+
+		Body body;
+		bodyInit(&body, 5.0f, 11.0f, 5.0f);
+		body.on_ground = true;
+
+		int blocked = bodyMove(&body, &s_world, 4.0f, 0.0f, 0.0f);
+		CHECK(!(blocked & BLOCKED_X));   // completed, not stopped
+		CHECK(body.x > 8.9f);            // actually made it past the step's column
+		CHECK(body.y == 12.0f);          // standing on top of it, exactly
+		CHECK(body.on_ground == true);   // still grounded, just higher up
+
+		worldExit(&s_world);
+	}
+
+	// --- A two-block wall on the same kind of floor must refuse the climb. The
+	// headroom probe this time finds the second block still occupying the space the
+	// body would rise into, so the step is refused and the ordinary blocked-and-
+	// stopped result stands. That probe is what enforces "single block only", not a
+	// numeric height comparison.
+	{
+		worldInit(&s_world);
+		for (int x = 0; x < 16; x++)
+			for (int z = 0; z < 12; z++)
+				CHECK(worldSet(&s_world, x, 10, z, BLOCK_STONE));
+		CHECK(worldSet(&s_world, 8, 11, 5, BLOCK_STONE));
+		CHECK(worldSet(&s_world, 8, 12, 5, BLOCK_STONE));   // second block, top at y=13
+
+		Body body;
+		bodyInit(&body, 5.0f, 11.0f, 5.0f);
+		body.on_ground = true;
+
+		int blocked = bodyMove(&body, &s_world, 4.0f, 0.0f, 0.0f);
+		CHECK(blocked & BLOCKED_X);
+		CHECK(body.x > 7.69f && body.x < 7.71f);   // stopped flush against it
+		CHECK(body.y == 11.0f);                    // never rose at all
+		CHECK(body.on_ground == true);             // still on the original floor
+
+		worldExit(&s_world);
+	}
+
+	// --- A one-block-wide gap in the floor is not a wall: crossing the column it
+	// occupies must not produce any horizontal block. Whether the body falls into the
+	// gap depends on where its 0.6-wide box sits over it, which is a placement
+	// question, not a collision-code one — this only checks that missing floor is
+	// never mistaken for a solid obstruction sideways.
+	{
+		worldInit(&s_world);
+		for (int x = 0; x < 12; x++)
+			for (int z = 0; z < 12; z++)
+				if (x != 6)   // x == 6 is the gap: no floor block placed there
+					CHECK(worldSet(&s_world, x, 10, z, BLOCK_STONE));
+
+		Body body;
+		bodyInit(&body, 3.0f, 11.0f, 5.0f);
+		body.on_ground = true;
+
+		int blocked = bodyMove(&body, &s_world, 6.0f, 0.0f, 0.0f);
+		CHECK(!(blocked & BLOCKED_X));   // the gap never blocked the crossing
+		CHECK(body.x > 8.9f);            // and the body actually reached the far side
+
+		worldExit(&s_world);
+	}
+
+	// --- The plan's second stated Phase 4.4 criterion, literally: "cannot fall
+	// through the floor after 5 minutes". Five minutes at 60 Hz is 18,000 ticks, and
+	// the failure it is looking for is drift — a resting body that loses a fraction of
+	// a block per tick sinks out of the world long before the player notices, and no
+	// short test can see it. Exact equality is the assertion on purpose: a resting
+	// body must not move by even one bit of float.
+	{
+		worldInit(&s_world);
+		for (int x = 0; x < 12; x++)
+			for (int z = 0; z < 12; z++)
+				CHECK(worldSet(&s_world, x, 10, z, BLOCK_STONE));
+
+		Body body;
+		bodyInit(&body, 5.0f, 11.0f, 5.0f);
+
+		for (int i = 0; i < 18000; i++)
+			bodyStep(&body, &s_world, 1.0f / 60.0f);
+
+		CHECK(body.y == 11.0f);
+		CHECK(body.on_ground == true);
+		CHECK(worldGet(&s_world, 5, 10, 5) == BLOCK_STONE);   // the floor is still there
+
+		worldExit(&s_world);
+	}
+
+	// --- No more than one block of step-up per substep, however many axes are blocked.
+	// X and Z each get their own step-up attempt, and succeeding at one does not clear
+	// on_ground, so a diagonal move used to be able to fire both and rise two blocks out
+	// of a single substep. That lets the body climb a wall the two-block-wall test above
+	// proves is unclimbable, just by brushing a one-block step beside it.
+	//
+	// The configuration matters and was found by probing, not by reasoning: a symmetric
+	// one-block corner does NOT trigger it (the X rise lifts the body clear of the Z
+	// block, so Z is no longer blocked when it is resolved), and a symmetric two-block
+	// corner does not either (both headroom probes refuse). The case that breaks is
+	// asymmetric — a one-block step on the axis resolved first, a two-block wall on the
+	// second — measured at rise=2.0 before this was fixed.
+	{
+		worldInit(&s_world);
+		for (int x = 0; x < 12; x++)
+			for (int z = 0; z < 12; z++)
+				CHECK(worldSet(&s_world, x, 10, z, BLOCK_STONE));   // floor top at y=11
+
+		CHECK(worldSet(&s_world, 6, 11, 5, BLOCK_STONE));   // +x: one block, climbable
+		CHECK(worldSet(&s_world, 5, 11, 6, BLOCK_STONE));   // +z: two blocks, must not be
+		CHECK(worldSet(&s_world, 5, 12, 6, BLOCK_STONE));
+
+		Body body;
+		bodyInit(&body, 5.5f, 11.0f, 5.5f);
+		body.on_ground = true;
+
+		// 0.3 on each axis is under MAX_SUBSTEP, so this is one pass through the
+		// resolve/step-up pair rather than a sequence of them.
+		const int blocked = bodyMove(&body, &s_world, 0.3f, 0.0f, 0.3f);
+
+		CHECK(body.y == 12.0f);          // the climbable step only: exactly one block
+		CHECK(blocked & BLOCKED_Z);      // and the two-block wall still stopped it
+		CHECK(body.on_ground == true);
+
+		worldExit(&s_world);
+	}
+
+	// --- Velocity is zeroed on a blocked axis, and only on that axis. This was an
+	// unstated judgement call inside bodyMove; pinning it means changing it later has
+	// to be deliberate. Walking into a two-block wall must kill vx and leave vz alone.
+	{
+		worldInit(&s_world);
+		for (int x = 0; x < 16; x++)
+			for (int z = 0; z < 12; z++)
+				CHECK(worldSet(&s_world, x, 10, z, BLOCK_STONE));
+		CHECK(worldSet(&s_world, 8, 11, 5, BLOCK_STONE));
+		CHECK(worldSet(&s_world, 8, 12, 5, BLOCK_STONE));   // two tall: unclimbable
+
+		Body body;
+		bodyInit(&body, 5.0f, 11.0f, 5.0f);
+		body.on_ground = true;
+		body.vx = PLAYER_WALK_SPEED;
+		body.vz = 1.25f;
+
+		const int blocked = bodyMove(&body, &s_world, 4.0f, 0.0f, 0.0f);
+
+		CHECK(blocked & BLOCKED_X);
+		CHECK(body.vx == 0.0f);      // the blocked axis stops
+		CHECK(body.vz == 1.25f);     // the free axis is untouched
+
+		worldExit(&s_world);
+	}
+
+	// --- A step-up that succeeds must NOT zero the velocity it succeeded with: it is a
+	// completed move, not a stop. Otherwise stairs stutter to a halt on every tread.
+	{
+		worldInit(&s_world);
+		for (int x = 0; x < 16; x++)
+			for (int z = 0; z < 12; z++)
+				CHECK(worldSet(&s_world, x, 10, z, BLOCK_STONE));
+		CHECK(worldSet(&s_world, 8, 11, 5, BLOCK_STONE));   // one block: climbable
+
+		// x=7.6 puts the box's right face at 7.9, so a 0.3 move actually reaches the
+		// block at x=8. Starting at 7.0 does not touch it at all and the test passes
+		// vacuously — which is how it was written first.
+		Body body;
+		bodyInit(&body, 7.6f, 11.0f, 5.0f);
+		body.on_ground = true;
+		body.vx = PLAYER_WALK_SPEED;
+
+		bodyMove(&body, &s_world, 0.3f, 0.0f, 0.0f);
+
+		CHECK(body.y == 12.0f);                     // climbed it
+		CHECK(body.vx == PLAYER_WALK_SPEED);        // and kept its speed
+
+		worldExit(&s_world);
+	}
+}
+
+// blockFaceTex()'s documented fallback: an out-of-range face index returns the
+// block's first tile rather than reading off the end of the tex[] array.
+static void testBlockFaceTexFallback(void)
+{
+	CHECK(blockFaceTex(BLOCK_GRASS, -1) == blockFaceTex(BLOCK_GRASS, 0));
+	CHECK(blockFaceTex(BLOCK_GRASS, BLOCK_FACES) == blockFaceTex(BLOCK_GRASS, 0));
+	CHECK(blockFaceTex(BLOCK_GRASS, 200) == blockFaceTex(BLOCK_GRASS, 0));
+
+	// Grass specifically: its first tile (east, the side texture) differs from its
+	// top and bottom tiles, so a fallback that silently returned some other tile
+	// index would still pass a test written against a block with only one tile.
+	CHECK(blockFaceTex(BLOCK_GRASS, -1) == BTEX_GRASS_SIDE);
+}
+
+// worldBytes(): the number the bottom-screen budget report is built from. Nothing
+// asserted it before this, so a formula bug here would silently misreport memory
+// while every other test stayed green.
+static void testWorldBytes(void)
+{
+	worldInit(&s_world);
+
+	CHECK(worldBytes(&s_world) == 0);          // nothing loaded yet
+	CHECK(worldBytes(&s_world) == budgetUsed());
+
+	CHECK(worldSet(&s_world, 4, 4, 4, BLOCK_STONE));   // allocates a column and a chunk
+	CHECK(worldBytes(&s_world) > 0);
+	CHECK(worldBytes(&s_world) == budgetUsed());
+
+	// A second chunk in the same column: bytes must grow again, by a chunk's worth,
+	// not a column's worth -- the column already exists.
+	const size_t before = worldBytes(&s_world);
+	CHECK(worldSet(&s_world, 4, 20, 4, BLOCK_STONE));
+	CHECK(worldBytes(&s_world) > before);
+	CHECK(worldBytes(&s_world) == budgetUsed());
+
+	worldExit(&s_world);
+	CHECK(worldBytes(&s_world) == 0);
+}
+
+// worldColumnCreate()'s "table full" refusal, world.h's other documented NULL path
+// besides the budget one. WORLD_MAP_SLOTS is 1024 and slotFor() probes every slot
+// before giving up, so the only honest way to reach this branch is to actually fill
+// all 1024 of them.
+static void testColumnTableFull(void)
+{
+	worldInit(&s_world);
+
+	int created = 0;
+	for (int i = 0; i < WORLD_MAP_SLOTS; i++)
+		if (worldColumnCreate(&s_world, i, 0)) created++;
+	CHECK(created == WORLD_MAP_SLOTS);
+	CHECK(s_world.columns == WORLD_MAP_SLOTS);
+
+	// One more, guaranteed distinct from all 1024 already in the table: a clean
+	// NULL, not a crash.
+	CHECK(worldColumnCreate(&s_world, WORLD_MAP_SLOTS, 0) == NULL);
+	CHECK(s_world.columns == WORLD_MAP_SLOTS);   // the refusal did not sneak one in
+
+	// The 1024 columns already there must still all be exactly what was put in --
+	// a refusal that corrupted a slot on its way out would show up as a lookup
+	// miss here.
+	int missing = 0;
+	for (int i = 0; i < WORLD_MAP_SLOTS; i++)
+		if (!worldColumn(&s_world, i, 0)) missing++;
+	CHECK(missing == 0);
+
+	worldExit(&s_world);
+}
+
+// budgetClaim() refusing in isolation is tested in testBudget(); this is the path
+// that actually matters in play -- a real worldSet running into an exhausted budget
+// after other allocations already succeeded, and leaving the world exactly as it
+// was rather than half-updated.
+static void testWorldSetBudgetExhausted(void)
+{
+	worldInit(&s_world);
+
+	// One real block first, so there is a column and a chunk already on the books
+	// to check for damage afterwards.
+	CHECK(worldSet(&s_world, 4, 4, 4, BLOCK_STONE));
+	const int    columns_before = s_world.columns;
+	const int    chunks_before  = s_world.chunks;
+	const size_t bytes_before   = worldBytes(&s_world);
+
+	// Consume the rest of the budget directly, leaving less than one chunk's worth.
+	// The column for the next write already exists, so this reaches worldChunkCreate's
+	// own budgetClaim refusal specifically, not the column one testColumnTableFull and
+	// testBudget already cover.
+	const size_t remaining = budgetCap() - budgetUsed();
+	CHECK(budgetClaim(remaining - 1) == true);
+
+	// Same column (cx=0, cz=0) as the block above; a chunk one up that does not
+	// exist yet.
+	CHECK(worldSet(&s_world, 4, 20, 4, BLOCK_STONE) == false);
+
+	// Nothing moved: no new chunk, no budget quietly taken, and the block placed
+	// before the exhaustion is still exactly what it was.
+	CHECK(s_world.columns == columns_before);
+	CHECK(s_world.chunks == chunks_before);
+	CHECK(worldBytes(&s_world) == bytes_before);
+	CHECK(worldChunk(&s_world, 0, 1, 0) == NULL);   // the refused chunk was not half-made
+	CHECK(worldGet(&s_world, 4, 4, 4) == BLOCK_STONE);
+
+	budgetRelease(remaining - 1);
+	worldExit(&s_world);
+}
+
+// handbuiltHeight()'s contract, stated as an assertion rather than left implicit:
+// it returns the y of the first AIR block above the ground, so the block directly
+// below it must be solid -- a body with its feet at that y is standing on the
+// surface, not floating over it or sunk into it. Checked at one point from each
+// distinct shape handbuilt.c draws: flat ground, a plateau top, inside the pit, and
+// partway up the stepped pyramid.
+static void testHandbuiltHeight(void)
+{
+	worldInit(&s_world);
+	CHECK(handbuiltFill(&s_world));
+
+	static const int xs[] = { 0, 8, 8, 26 };
+	static const int zs[] = { 0, 0, 8, 26 };
+	for (int i = 0; i < 4; i++) {
+		const int h = handbuiltHeight(xs[i], zs[i]);
+		CHECK(blockIsAir(worldGet(&s_world, xs[i], h, zs[i])));
+		CHECK(blockIsSolid(worldGet(&s_world, xs[i], h - 1, zs[i])));
+	}
+
+	worldExit(&s_world);
+}
+
+// handbuiltFill()'s shape, in the constants handbuilt.c is actually built from: the
+// checkerboard's period and step, the pyramid's one ring of rise per block, and the
+// pit's exact depth. Only handbuiltFill()'s bool return was ever checked before
+// this, which proves nothing about whether the world it built looks anything like
+// the area handbuilt.h's header comment describes.
+//
+// These mirror handbuilt.c's own private #defines (GROUND_Y, PLATEAU_STEP,
+// PIT_DEPTH, and the pyramid range) -- read from that file, not guessed, and kept
+// in one place here so a change to either side shows up as a diff, not a silent
+// drift.
+#define HB_GROUND_Y      12
+#define HB_PLATEAU_STEP  1
+#define HB_PYRAMID_X0    20
+#define HB_PIT_DEPTH     3
+#define HB_PIT_X0        1
+#define HB_PIT_X1        7    // exclusive
+#define HB_PIT_MID       3    // a column on the pit floor, PIT_DEPTH down
+#define HB_PIT_FLAT_Z    16   // flat ground sharing HB_PIT_MID's checker parity
+
+static void testHandbuiltFillShape(void)
+{
+	worldInit(&s_world);
+	CHECK(handbuiltFill(&s_world));
+
+	// The checker: an 8-block period, one PLATEAU_STEP high. (0,0) and (16,0) are a
+	// full period apart and land back on the same parity; (8,0) is half a period
+	// away, on the other one.
+	CHECK(worldGet(&s_world, 0, HB_GROUND_Y - 1, 0) != BLOCK_AIR);
+	CHECK(worldGet(&s_world, 0, HB_GROUND_Y, 0) == BLOCK_AIR);
+	CHECK(worldGet(&s_world, 8, HB_GROUND_Y + HB_PLATEAU_STEP - 1, 0) != BLOCK_AIR);
+	CHECK(worldGet(&s_world, 8, HB_GROUND_Y + HB_PLATEAU_STEP, 0) == BLOCK_AIR);
+	CHECK(worldGet(&s_world, 16, HB_GROUND_Y - 1, 0) != BLOCK_AIR);
+	CHECK(worldGet(&s_world, 16, HB_GROUND_Y, 0) == BLOCK_AIR);
+
+	// The pyramid: moving one block toward the centre on one axis, with the other
+	// axis pinned at the pyramid's own edge, raises the surface by exactly one
+	// block -- a ring per block, not some other slope.
+	const int base = handbuiltHeight(HB_PYRAMID_X0, 26);
+	const int step = handbuiltHeight(HB_PYRAMID_X0 + 1, 26);
+	CHECK(step - base == 1);
+	CHECK(worldGet(&s_world, HB_PYRAMID_X0 + 1, step - 1, 26) != BLOCK_AIR);
+	CHECK(worldGet(&s_world, HB_PYRAMID_X0 + 1, step, 26) == BLOCK_AIR);
+
+	// The pit: exactly PIT_DEPTH below the flat ground it is cut into, not some
+	// other depth. (8,24) is flat ground and (8,8) is inside the pit; both share
+	// the checker's parity, so the only thing that can account for a height
+	// difference between them is the pit.
+	const int pit_floor = handbuiltHeight(HB_PIT_MID, HB_PIT_MID);
+	CHECK(handbuiltHeight(HB_PIT_MID, HB_PIT_FLAT_Z) - pit_floor == HB_PIT_DEPTH);
+	CHECK(worldGet(&s_world, HB_PIT_MID, pit_floor - 1, HB_PIT_MID) != BLOCK_AIR);
+	CHECK(worldGet(&s_world, HB_PIT_MID, pit_floor, HB_PIT_MID) == BLOCK_AIR);
+
+	// The pit's walls step one block per ring rather than dropping sheer, so the floor
+	// can be walked out of: the rim ring is one block down, not PIT_DEPTH down. Without
+	// the intermediate rings these two would be equal.
+	CHECK(handbuiltHeight(HB_PIT_X0, HB_PIT_MID) == HB_GROUND_Y - 1);
+	CHECK(handbuiltHeight(HB_PIT_X1 - 1, HB_PIT_MID) == HB_GROUND_Y - 1);
+
+	worldExit(&s_world);
+}
+
+// The one property that decides whether the hand-built area can actually be walked
+// around: no two horizontally adjacent columns may differ in surface height by more
+// than one block.
+//
+// One block is the exact limit the player can manage. Auto-step rises exactly one, and
+// a jump reaches PLAYER_JUMP_SPEED^2 / (2 * -PLAYER_GRAVITY) = 8.5^2 / 56 = 1.29
+// blocks, so a two-block rise cannot be climbed by any means. Anywhere this invariant
+// breaks is a one-way drop: reachable, and then not leavable.
+//
+// This is written as a sweep of the whole area rather than as spot checks because the
+// failures that matter are at the seams between features -- where the checkerboard's
+// parity flips inside the pyramid, or where the pit's rim crosses a plateau boundary --
+// and those are exactly the places nobody thinks to spot-check. It fails on the
+// terrain as it stood before 2026-08-18: PLATEAU_STEP was 2, so every checker edge was
+// a two-block wall, and the pit dropped 3 sheer.
+static void testHandbuiltWalkable(void)
+{
+	int worst = 0;
+	int worst_x = -1, worst_z = -1;
+
+	for (int z = 0; z < HANDBUILT_BLOCKS_Z; z++) {
+		for (int x = 0; x < HANDBUILT_BLOCKS_X; x++) {
+			const int h = handbuiltHeight(x, z);
+
+			if (x + 1 < HANDBUILT_BLOCKS_X) {
+				const int d = handbuiltHeight(x + 1, z) - h;
+				const int a = d < 0 ? -d : d;
+				if (a > worst) { worst = a; worst_x = x; worst_z = z; }
+			}
+			if (z + 1 < HANDBUILT_BLOCKS_Z) {
+				const int d = handbuiltHeight(x, z + 1) - h;
+				const int a = d < 0 ? -d : d;
+				if (a > worst) { worst = a; worst_x = x; worst_z = z; }
+			}
+		}
+	}
+
+	// Reported rather than just asserted: if this ever goes red, the coordinates are
+	// what turn "the world is not walkable" into a place to look.
+	if (worst > 1)
+		printf("  worst adjacent step %d at x=%d z=%d\n", worst, worst_x, worst_z);
+
+	CHECK(worst <= 1);
+}
+
+// bodyBlocked() itself, step 4.4's foundation: every resolve*/tryStepUp call in this
+// file trusts this one predicate, so a bug in it would be invisible in the physics
+// tests above -- they would just all be subtly wrong together. The one thing worth
+// singling out on its own is BOX_EPS: a box whose far edge sits exactly on a grid
+// line must read as belonging to the cell *below* that line, not the one it is
+// only just touching.
+static void testBodyBlocked(void)
+{
+	worldInit(&s_world);
+	CHECK(worldSet(&s_world, 6, 5, 5, BLOCK_STONE));
+
+	// Overlapping the block: true.
+	CHECK(bodyBlocked(&s_world, 6.5f, 5.0f, 5.5f));
+
+	// Clear air, nowhere near it: false.
+	CHECK(!bodyBlocked(&s_world, 40.5f, 40.0f, 40.5f));
+
+	// The box's east edge sits exactly on x=6, the block's near face. Half-open
+	// means that edge belongs to the cell below it (x=5), not x=6, so this must
+	// read clear even though the box is touching the plane the block starts on.
+	CHECK(!bodyBlocked(&s_world, 5.7f, 5.0f, 5.5f));
+
+	// One hundredth of a block further in and the same edge is unambiguously
+	// inside x=6: this one must read blocked. The two positions are otherwise
+	// identical, so only the epsilon boundary can account for the difference.
+	CHECK(bodyBlocked(&s_world, 5.71f, 5.0f, 5.5f));
+
+	worldExit(&s_world);
+}
+
+// Ceiling collision: a positive dy is the only path into resolveY's "moving up"
+// branch, and nothing above exercises it -- every landing in testPhysics() comes
+// from falling. A block placed above the player's head must stop the head at its
+// near face exactly, for the same reason a landing stop is exact rather than
+// approximate (see the comment above resolveY in physics.c).
+static void testCeilingCollision(void)
+{
+	worldInit(&s_world);
+	CHECK(worldSet(&s_world, 5, 8, 5, BLOCK_STONE));   // ceiling, near face at y=8
+
+	Body body;
+	bodyInit(&body, 5.5f, 5.0f, 5.5f);
+	body.on_ground = true;   // moving up must clear this regardless of where it started
+	body.vy = 3.0f;          // nonzero, so a zeroed vy below is provably resolveY's doing
+
+	const int blocked = bodyMove(&body, &s_world, 0.0f, 10.0f, 0.0f);
+
+	CHECK(blocked & BLOCKED_Y);
+	CHECK(body.vy == 0.0f);
+	CHECK(body.on_ground == false);
+	CHECK(body.y == 8.0f - PLAYER_HEIGHT);   // head flush against the ceiling, exactly
+
+	worldExit(&s_world);
+}
+
+// The remesh backlog's accounting. Written after it shipped broken: chunk_render.c
+// cleared the flag in two places, the count went negative, and once a later edit brought
+// it back to exactly 0 the drain latched off and the world stopped re-meshing. None of
+// that was testable while the count lived in a file that includes <3ds.h>.
+static void testDirtyQueue(void)
+{
+	DirtyQ q;
+
+	CHECK(dirtyqInit(&q, 8));
+	CHECK(dirtyqCount(&q) == 0);
+	CHECK(dirtyqPeak(&q) == 0);
+	CHECK(dirtyqConsistent(&q));
+
+	// Marking is idempotent and only the first call counts, which is what makes
+	// touching the same chunk repeatedly in one frame free.
+	CHECK(dirtyqMark(&q, 3) == true);
+	CHECK(dirtyqMark(&q, 3) == false);
+	CHECK(dirtyqMark(&q, 3) == false);
+	CHECK(dirtyqCount(&q) == 1);
+	CHECK(dirtyqIsMarked(&q, 3));
+	CHECK(!dirtyqIsMarked(&q, 4));
+	CHECK(dirtyqConsistent(&q));
+
+	// Out of range is refused, not clamped: marking slot 0 instead would quietly
+	// schedule a remesh of a chunk nobody asked about.
+	CHECK(dirtyqMark(&q, 8) == false);
+	CHECK(dirtyqMark(&q, -1) == false);
+	CHECK(dirtyqClear(&q, 8) == false);
+	CHECK(dirtyqCount(&q) == 1);
+	CHECK(dirtyqConsistent(&q));
+
+	CHECK(dirtyqMark(&q, 0));
+	CHECK(dirtyqMark(&q, 7));
+	CHECK(dirtyqCount(&q) == 3);
+	CHECK(dirtyqPeak(&q) == 3);
+
+	// THE REGRESSION. Every slot cleared twice, exactly as it happened when
+	// chunkRenderBuild cleared a flag chunkRenderDrainDirty was about to clear. The
+	// second clear must be a no-op, not a decrement.
+	for (int i = 0; i < 8; i++) {
+		const bool first  = dirtyqClear(&q, i);
+		const bool second = dirtyqClear(&q, i);
+		CHECK(second == false);
+		if (i == 0 || i == 3 || i == 7) CHECK(first == true);
+		else                            CHECK(first == false);
+	}
+	CHECK(dirtyqCount(&q) == 0);      // this read -3 with the shipped bug
+	CHECK(dirtyqConsistent(&q));
+
+	// And the consequence that made the bug invisible: after the double-clear the queue
+	// still has to accept work and still has to report it. With the old accounting the
+	// count came back up to exactly 0 here and the drain's == 0 early-out returned
+	// immediately, forever.
+	CHECK(dirtyqMark(&q, 1));
+	CHECK(dirtyqMark(&q, 2));
+	CHECK(dirtyqMark(&q, 5));
+	CHECK(dirtyqCount(&q) == 3);
+	CHECK(dirtyqCount(&q) > 0);
+	CHECK(dirtyqConsistent(&q));
+
+	// The peak survives the queue draining, and resets to the live count rather than to
+	// zero — a backlog can be non-empty at the moment of reset.
+	CHECK(dirtyqPeak(&q) == 3);
+	CHECK(dirtyqClear(&q, 1));
+	dirtyqResetPeak(&q);
+	CHECK(dirtyqPeak(&q) == 2);
+	CHECK(dirtyqCount(&q) == 2);
+	CHECK(dirtyqConsistent(&q));
+
+	// A pool bigger than the flag array is refused at init, so it fails at startup
+	// instead of writing past the array the first time a high slot is edited.
+	DirtyQ big;
+	CHECK(dirtyqInit(&big, DIRTYQ_MAX) == true);
+	CHECK(dirtyqInit(&big, DIRTYQ_MAX + 1) == false);
+	CHECK(dirtyqCount(&big) == 0);
+	CHECK(dirtyqMark(&big, 0) == false);   // capacity 0 after a refused init
+	CHECK(dirtyqConsistent(&big));
+
+	// A full queue: every slot marked, then drained the way chunkRenderDrainDirty does.
+	CHECK(dirtyqInit(&q, DIRTYQ_MAX));
+	for (int i = 0; i < DIRTYQ_MAX; i++) CHECK(dirtyqMark(&q, i));
+	CHECK(dirtyqCount(&q) == DIRTYQ_MAX);
+
+	int drained = 0;
+	for (int i = 0; i < DIRTYQ_MAX; i++) {
+		if (!dirtyqIsMarked(&q, i)) continue;
+		dirtyqClear(&q, i);
+		drained++;
+	}
+	CHECK(drained == DIRTYQ_MAX);
+	CHECK(dirtyqCount(&q) == 0);
+	CHECK(dirtyqPeak(&q) == DIRTYQ_MAX);
+	CHECK(dirtyqConsistent(&q));
+}
+
+// Step 4.3's acceptance criterion, as a permanent test rather than the throwaway probe
+// it was: "place a block, travel 200 blocks away and back, it persists".
+//
+// ⚠ READ THIS BEFORE TRUSTING IT. Nothing evicts chunks yet — streaming is Phase 5 — so
+// the literal criterion cannot fail today for the reason it exists, and a version of this
+// test that only walked away and back would be a check that could not go red. What it
+// tests instead is every part of the mechanism that *is* reachable now and that a
+// streaming bug would break:
+//
+//   * reads far outside the built world must not allocate anything (a read that quietly
+//     creates a column is how a walk turns into an out-of-memory later),
+//   * an edit in a chunk that did not exist must create it and survive,
+//   * edits must survive the chunk table being driven to its 1024-column limit, which is
+//     the closest thing to eviction pressure this build can produce.
+//
+// **Re-run the real criterion at step 5.5**, against actual load/unload. Until then the
+// gap is: a bug that loses blocks *on unload* would pass everything below.
+static void testEditPersistence(void)
+{
+	worldInit(&s_world);
+	CHECK(handbuiltFill(&s_world));
+
+	// Three edits, deliberately different in kind: mid-chunk, on a chunk boundary, and
+	// one in a sky chunk that does not exist yet and has to be created.
+	const int mid_y   = handbuiltHeight(18, 18);
+	const int edge_y  = handbuiltHeight(16, 16);
+	const int sky_y   = 100;
+
+	CHECK(worldGet(&s_world, 18, mid_y, 18) == BLOCK_AIR);
+	CHECK(worldChunk(&s_world, 1, sky_y / CHUNK_DIM, 1) == NULL);   // nothing up there yet
+
+	CHECK(worldSet(&s_world, 18, mid_y, 18, BLOCK_STONE));
+	CHECK(worldSet(&s_world, 16, edge_y, 16, BLOCK_SAND));
+	CHECK(worldSet(&s_world, 18, sky_y, 18, BLOCK_DIRT));
+
+	CHECK(worldChunk(&s_world, 1, sky_y / CHUNK_DIM, 1) != NULL);   // the edit made it
+
+	const int    columns_after_edit = s_world.columns;
+	const int    chunks_after_edit  = s_world.chunks;
+	const size_t bytes_after_edit   = worldBytes(&s_world);
+
+	// Walk 200 blocks out and 200 back, reading at every step the way the player's
+	// raycast and physics do. The built area is only 64x64, so everything past x=63 is
+	// unloaded world.
+	int reads = 0;
+	for (int x = 18; x <= 218; x++) { (void)worldGet(&s_world, x, mid_y, 18); reads++; }
+	for (int x = 218; x >= 18; x--) { (void)worldGet(&s_world, x, mid_y, 18); reads++; }
+	for (int y = 0; y < WORLD_HEIGHT; y += 8) { (void)worldGet(&s_world, 218, y, 18); reads++; }
+	CHECK(reads == 402 + 16);
+
+	// The point of the walk: 418 reads outside the built world allocated NOTHING.
+	CHECK(s_world.columns == columns_after_edit);
+	CHECK(s_world.chunks  == chunks_after_edit);
+	CHECK(worldBytes(&s_world) == bytes_after_edit);
+
+	CHECK(worldGet(&s_world, 18, mid_y, 18) == BLOCK_STONE);
+	CHECK(worldGet(&s_world, 16, edge_y, 16) == BLOCK_SAND);
+	CHECK(worldGet(&s_world, 18, sky_y, 18) == BLOCK_DIRT);
+
+	// Now the pressure case: fill the column table to its 1024-column limit with far-away
+	// columns, so any further allocation is refused. This is as close as this build gets
+	// to the memory pressure streaming will really apply.
+	int created = 0;
+	for (int i = 1; i < WORLD_MAP_SLOTS && s_world.columns < WORLD_MAP_SLOTS; i++)
+		if (worldColumnCreate(&s_world, 1000 + i, 1000)) created++;
+	CHECK(created > 0);
+	CHECK(s_world.columns == WORLD_MAP_SLOTS);
+	CHECK(worldColumnCreate(&s_world, 9999, 9999) == NULL);   // genuinely full
+
+	// The three edits are still exactly what was written, and the terrain around them
+	// is untouched.
+	CHECK(worldGet(&s_world, 18, mid_y, 18) == BLOCK_STONE);
+	CHECK(worldGet(&s_world, 16, edge_y, 16) == BLOCK_SAND);
+	CHECK(worldGet(&s_world, 18, sky_y, 18) == BLOCK_DIRT);
+	CHECK(worldGet(&s_world, 18, mid_y - 1, 18) == BLOCK_GRASS);
+	CHECK(worldGet(&s_world, 18, sky_y - 1, 18) == BLOCK_AIR);
+
+	worldExit(&s_world);
+}
+
+// The numbers a player actually feels, measured by running the real simulation at the
+// real frame rate rather than read off the constants.
+//
+// This exists because "control feel" was the one Phase 4 item with nothing behind it at
+// all: PLAYER_WALK_SPEED is 4.3 and PLAYER_JUMP_SPEED is 8.5, but what reaches the player
+// is those constants after gravity, substepping and a 59.83 Hz tick, and none of that was
+// ever measured. The point is not to decide whether 4.3 blocks/s feels right — that is
+// his to judge — it is that when he says "too slow" or "the jump is floaty" there is a
+// number to change instead of a guess, and that a later edit to the physics cannot alter
+// how it feels without turning a check red.
+//
+// Measured 2026-08-18 at the real 59.83 Hz tick. These are the figures the bands below
+// are drawn around — not targets, just what the game currently does:
+//
+//     walk        4.3122 blocks in one second
+//     jump apex   1.2197 blocks above the feet (the analytic ceiling is 1.29)
+//     airtime     36 ticks, 0.602 s
+//     jump reach  2.5873 blocks travelled while airborne at full walk speed
+//
+// ⚠ Not covered here, because it lives in `source/scene/` behind `<3ds.h>` and cannot be
+// linked into a host build: which way the D-pad and circle pad actually point. That is
+// verified separately on the emulator.
+#define TICK_HZ  59.83f   // measured 3DS VBlank rate, not the nominal 60
+
+static void testControlFeel(void)
+{
+	const float dt = 1.0f / TICK_HZ;
+
+	worldInit(&s_world);
+	for (int x = 0; x < 12; x++)
+		for (int z = 0; z < 12; z++)
+			CHECK(worldSet(&s_world, x, 10, z, BLOCK_STONE));   // floor top at y=11
+
+	// --- Walking. One second of ticks at full stick, on the flat.
+	{
+		Body body;
+		bodyInit(&body, 5.0f, 11.0f, 5.0f);
+		body.on_ground = true;
+
+		const float x0 = body.x;
+		for (int i = 0; i < 60; i++) {
+			body.vx = PLAYER_WALK_SPEED;   // as playerUpdate sets it every frame
+			bodyStep(&body, &s_world, dt);
+		}
+		const float travelled = body.x - x0;
+
+		// 4.3 blocks/s over 60 ticks of 1/59.83 s is 4.312 blocks. Anything outside
+		// this band means the substepping is losing or gaining distance.
+		CHECK(travelled > 4.28f && travelled < 4.35f);
+	}
+
+	// --- Jumping. Apex above the feet's resting height, and how long it lasts.
+	{
+		Body body;
+		bodyInit(&body, 5.0f, 11.0f, 5.0f);
+		body.on_ground = true;
+		body.vy = PLAYER_JUMP_SPEED;
+
+		float peak   = body.y;
+		int   ticks  = 0;
+		bool  landed = false;
+		for (int i = 0; i < 400 && !landed; i++) {
+			bodyStep(&body, &s_world, dt);
+			ticks++;
+			if (body.y > peak) peak = body.y;
+			if (body.on_ground) landed = true;
+		}
+		CHECK(landed);
+
+		const float apex = peak - 11.0f;
+
+		// The analytic apex is PLAYER_JUMP_SPEED^2 / (2 * -PLAYER_GRAVITY) = 8.5^2/56
+		// = 1.29 blocks. A discretely sampled arc peaks a little under that, and this
+		// asserts it stays there: below 1.0 and a one-block hop stops clearing, which
+		// is the difference between a walkable world and a set of pens.
+		CHECK(apex > 1.20f && apex < 1.25f);
+		CHECK(apex > 1.0f);   // stated separately because THIS is the load-bearing one
+
+		// Airtime: about 0.6 s up and down at 28 blocks/s^2. Long enough to be a jump,
+		// short enough not to feel like the moon.
+		CHECK(ticks >= 33 && ticks <= 39);
+
+		// How far a running jump carries, which is the number that decides whether a
+		// one-block gap is crossable: walk speed times airtime.
+		const float jump_reach = PLAYER_WALK_SPEED * (float)ticks * dt;
+		CHECK(jump_reach > 2.4f && jump_reach < 2.9f);
+	}
+
+	worldExit(&s_world);
+}
+
+int worldTestRun(char* summary, size_t cap, int* checks_out)
+{
+	s_checks = 0;
+	s_fails = 0;
+	s_first[0] = '\0';
+	budgetReset();
+
+	testBlockRegistry();
+	testBlockFaceTexFallback();
+	testChunkIndex();
+	testWorldAccess();
+	testWorldBytes();
+	testColumnTableFull();
+	testWorldSetBudgetExhausted();
+	testScratch26();
+	testScratchFloor();
+	testMesher();
+	testMesherAO();
+	testRemeshList();
+	testIncrementalRemesh();
+	testDirtyQueue();
+	testHandbuiltHeight();
+	testHandbuiltFillShape();
+	testHandbuiltWalkable();
+	testEditPersistence();
+	testControlFeel();
+	testRaycast();
+	testBodyBlocked();
+	testCeilingCollision();
+	testPhysics();
+
+	// Every allocation the world made must have been given back.
+	CHECK(budgetUsed() == 0);
+
+	testBudget();
+
+	if (summary && cap) {
+		if (s_fails == 0)
+			snprintf(summary, cap, "PASS  %d checks", s_checks);
+		else
+			snprintf(summary, cap, "FAIL %d/%d  %s", s_fails, s_checks, s_first);
+	}
+	if (checks_out) *checks_out = s_checks;
+
+	budgetReset();
+	return s_fails;
+}

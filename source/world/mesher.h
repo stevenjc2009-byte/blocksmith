@@ -1,0 +1,45 @@
+// Chunk -> triangles. Phase 3, step 3.1.
+//
+// A face is emitted only where a solid block meets a non-solid one, which is the
+// whole optimisation: a 16x16x16 chunk of stone has 4,096 blocks and 24,576 faces,
+// of which 1,536 are visible. Everything inside is never built, never uploaded and
+// never drawn.
+//
+// Deliberately *not* greedy meshing. Merging coplanar faces into big quads is a
+// measured decision deferred to Phase 7 — it complicates AO and per-face textures,
+// and this hardware may well be bound by something else first. See
+// code-vault/wiki/blocksmith/blocksmith-plan.md.
+//
+// No <3ds.h> here: the mesher is the piece most likely to be wrong in a way a
+// screenshot cannot show, so it runs under the PC test suite too.
+#pragma once
+
+#include "world/mesh_vertex.h"
+#include "world/scratch.h"
+
+// Where a mesh is written. The caller owns the memory — on the console that is the
+// linear heap, in the tests it is an ordinary array.
+typedef struct {
+	MeshVertex* verts;
+	uint16_t*   indices;
+	uint32_t    vert_cap;    // in vertices
+	uint32_t    index_cap;   // in indices
+
+	uint32_t    vert_count;
+	uint32_t    index_count;
+	uint32_t    faces;       // quads emitted
+	bool        overflow;    // ran out of room: the mesh is incomplete, not corrupt
+} MeshOut;
+
+// Meshes the chunk sitting in the middle of `s`. Positions come out chunk-local,
+// 0..16 in block units, so the caller places the chunk with a model matrix.
+//
+// Indices are 16-bit: a worst-case chunk needs 6,144 vertices, well past a u8 but
+// nowhere near a u16.
+void meshChunk(MeshOut* out, const MeshScratch* s);
+
+// The worst case a single chunk can produce, for sizing buffers: a 3D checkerboard,
+// where every solid block has six exposed faces.
+#define MESH_MAX_FACES    (CHUNK_BLOCKS / 2 * BLOCK_FACES)   // 12288
+#define MESH_MAX_VERTS    (MESH_MAX_FACES * 4)
+#define MESH_MAX_INDICES  (MESH_MAX_FACES * 6)
