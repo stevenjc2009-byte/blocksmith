@@ -16,6 +16,7 @@
 #include "world/raycast.h"
 #include "world/remesh.h"
 #include "world/scratch.h"
+#include "scene/render_dist.h"
 #include "world/visgraph.h"
 #include "world/world.h"
 #include "world/worldgen.h"
@@ -2790,6 +2791,89 @@ static void testVisWalkNeverHidesOpenSky(void)
 	CHECK(reached < 4 * VIS_BOX_MAX_Y * 4);
 }
 
+// Step 7.7. The render distance setting is arithmetic — a radius in, a near plane, a fog
+// density and a slot count out — and arithmetic is exactly what can be checked here rather
+// than by looking at the console and deciding the fog "seems about right".
+static void testRenderDist(void)
+{
+	// The ends of the range hold, and out-of-range clamps instead of returning nonsense: this
+	// is a setting a player nudges with a shoulder button, and one that silently produced a
+	// radius of 0 at the bottom would blank the world.
+	CHECK(renderDistFor(RENDER_DIST_MIN).radius == RENDER_DIST_MIN);
+	CHECK(renderDistFor(RENDER_DIST_MAX).radius == RENDER_DIST_MAX);
+	CHECK(renderDistFor(0).radius == RENDER_DIST_MIN);
+	CHECK(renderDistFor(-5).radius == RENDER_DIST_MIN);
+	CHECK(renderDistFor(99).radius == RENDER_DIST_MAX);
+
+	// Defaults differ by console, which is the whole point of the step's second half.
+	CHECK(renderDistDefault(false) == RENDER_DIST_MIN);
+	CHECK(renderDistDefault(true) == RENDER_DIST_MAX);
+
+	const RenderDist lo = renderDistFor(RENDER_DIST_MIN);
+	const RenderDist hi = renderDistFor(RENDER_DIST_MAX);
+
+	// The generated ring is always one column wider than the meshed one. main.c depends on
+	// this to keep the mesher from reading an unloaded neighbour as air.
+	CHECK(lo.area_radius == lo.radius + 1);
+	CHECK(hi.area_radius == hi.radius + 1);
+
+	// Slots: 9 columns and 25 columns at six chunks each. The pool is claimed for the maximum
+	// at boot, so this number is what decides whether the setting is affordable at all.
+	CHECK(lo.slots == 9 * RENDER_DIST_SLOTS_PER_COLUMN);
+	CHECK(hi.slots == 25 * RENDER_DIST_SLOTS_PER_COLUMN);
+	CHECK(hi.slots > lo.slots);
+
+	// Radius 1 keeps the near plane it has always had, so raising the setting is the only
+	// thing that can change the view near the camera.
+	CHECK(lo.near_plane > 0.0999f && lo.near_plane < 0.1001f);
+
+	// The near plane's corner must stay closer than the player's half-width, or a player
+	// pressed to a wall sees through it. 1.5917 is sqrt(1 + tan^2(fovy/2) + tan^2(fovx/2)) at
+	// 65 degrees and 400/240. This is the check that stops the near plane being raised further
+	// to buy more fog range.
+	CHECK(hi.near_plane <= RENDER_DIST_NEAR_MAX);
+	CHECK(RENDER_DIST_NEAR_MAX * 1.5917f < 0.3f);
+
+	// The load boundary is radius x 16 blocks in the worst case, and the fog must reach the
+	// target by then at every setting. This is the criterion step 6.4 established and it has
+	// to survive the setting becoming variable.
+	CHECK(lo.boundary > 15.9f && lo.boundary < 16.1f);
+	CHECK(hi.boundary > 31.9f && hi.boundary < 32.1f);
+	CHECK(lo.fog_hides);
+	CHECK(hi.fog_hides);
+	CHECK(renderDistVisibility(&lo, lo.boundary) <= RENDER_DIST_TARGET_VIS * 1.01f);
+	CHECK(renderDistVisibility(&hi, hi.boundary) <= RENDER_DIST_TARGET_VIS * 1.01f);
+
+	// The knot the whole design turns on: with near 0.1 the first LUT sample past the far
+	// plane is at 12.03 blocks, and raising near moves it out. If this ever stops being true
+	// the fog constants are being solved against a curve the hardware is not drawing.
+	CHECK(lo.first_knot > 12.0f && lo.first_knot < 12.1f);
+	CHECK(hi.first_knot > lo.first_knot);
+	CHECK(renderDistLutZ(0.0f, 0.1f, 200.0f) > 199.9f);        // entry 0 is the far plane
+	CHECK(renderDistLutZ(1.0f, 0.1f, 200.0f) < 0.1001f);       // entry 128 is the near plane
+
+	// Fog is monotone: nearer is always clearer, at both settings. A LUT built from a curve
+	// that folded back on itself would read as a bright ring at a fixed distance.
+	for (float z = 1.0f; z < 40.0f; z += 0.5f) {
+		CHECK_QUIET(renderDistVisibility(&lo, z) >= renderDistVisibility(&lo, z + 0.5f) - 1e-6f);
+		CHECK_QUIET(renderDistVisibility(&hi, z) >= renderDistVisibility(&hi, z + 0.5f) - 1e-6f);
+	}
+
+	// And the payoff, such as it is: a wider ring does let the player see further, because
+	// `near` moved with it. Sublinear by a long way — the ring doubles and the half-fade
+	// distance goes up by about half — which is the LUT's shape, not a bug, and is why
+	// RENDER_DIST_MAX is 2 rather than 4.
+	CHECK(hi.half_vis > lo.half_vis * 1.2f);
+	CHECK(hi.half_vis < hi.boundary);
+	CHECK(lo.half_vis < lo.boundary);
+
+	// Zero density is "no fog" through this same code path, which is what makes the
+	// -DFOG_DENSITY=0.0f check able to go red rather than merely different.
+	RenderDist off = lo;
+	off.fog_density = 0.0f;
+	CHECK(renderDistVisibility(&off, 100.0f) > 0.999f);
+}
+
 int worldTestRun(char* summary, size_t cap, int* checks_out)
 {
 	s_checks = 0;
@@ -2835,6 +2919,7 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testVisConnectivity();
 	testVisWalk();
 	testVisWalkNeverHidesOpenSky();
+	testRenderDist();
 
 	// Every allocation the world made must have been given back.
 	CHECK(budgetUsed() == 0);

@@ -10,6 +10,7 @@
 #include <3ds.h>
 #include <citro3d.h>
 
+#include "scene/render_dist.h"
 #include "world/world.h"
 
 // Per-slot capacity. A pathological 16³ checkerboard would need 12,288 faces, which
@@ -19,7 +20,15 @@
 #define MESH_SLOT_FACES    2048
 #define MESH_SLOT_VERTS    (MESH_SLOT_FACES * 4)
 #define MESH_SLOT_INDICES  (MESH_SLOT_FACES * 6)
-#define MESH_SLOTS         64
+
+// Step 7.7. The pool is sized for the *largest* render distance the setting allows, not for
+// the current one, and it is claimed once at boot. That is not laziness about resizing: the
+// linear heap is the only GPU-visible memory on this console and it cannot be defragmented,
+// so a pool that grew when the player raised the setting would be exactly the
+// allocate-and-free churn the pool exists to avoid. The cost is that an Old 3DS left on the
+// default distance carries slots it never fills — 96 of 150, about 8.2 MB — and the benefit is
+// that the setting can move at any moment, on any model, without an allocation that can fail.
+#define MESH_SLOTS         (RENDER_DIST_MAX_SLOTS)
 
 // The sky colour, in one place because step 6.4's fog has to be the same colour as the
 // background it fades into. Fog that does not match the clear colour reads as a grey sheet
@@ -30,9 +39,21 @@
 #define SKY_CLEAR_RGBA8  0x102A33FF
 #define SKY_FOG_BGR      0x00332A10
 
-// Loads the shader, the atlas and the buffer pool. False if any of it failed.
+// Loads the shader, the atlas and the buffer pool. False if any of it failed. Leaves the
+// renderer at RENDER_DIST_MIN; main.c sets the console's default straight after.
 bool chunkRenderInit(void);
 void chunkRenderExit(void);
+
+// Step 7.7. Sets the render distance, in columns, and rebuilds the two things that are
+// functions of it: the fog LUT and the projection. Clamped into range by renderDistFor.
+//
+// This does NOT resize the mesh pool (it is claimed for RENDER_DIST_MAX at boot) and it does
+// not touch the streaming ring — main.c owns that half, because the ring is where columns are
+// generated, unloaded and queued, and a distance change has to re-seed it.
+void chunkRenderSetDistance(int radius);
+
+// The numbers currently in force, for the report and for main.c's ring loops. Never NULL.
+const RenderDist* chunkRenderDistance(void);
 
 // Meshes one chunk out of the world into its slot, reusing the slot it already owns
 // if it has one. A chunk that meshes to nothing KEEPS its slot: releasing it made that

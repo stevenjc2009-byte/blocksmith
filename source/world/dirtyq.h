@@ -23,11 +23,12 @@
 
 #include <stdbool.h>
 
-// One flag per mesh slot. Sized from MESH_SLOTS in scene/chunk_render.h, which is 64;
-// kept as its own constant rather than including that header because this file must stay
-// free of anything that drags in <3ds.h>. dirtyqInit rejects a capacity above this, so a
-// pool that outgrows it fails at startup rather than writing past the array.
-#define DIRTYQ_MAX 64
+// One flag per mesh slot. Sized from MESH_SLOTS in scene/chunk_render.h, which since step 7.7
+// is 150 — the pool for the widest render distance the setting allows; kept as its own
+// constant rather than including that header because this file must stay free of anything that
+// drags in <3ds.h>. dirtyqInit rejects a capacity above this, so a pool that outgrows it fails
+// at startup rather than writing past the array.
+#define DIRTYQ_MAX 150
 
 typedef struct {
 	bool marked[DIRTYQ_MAX];

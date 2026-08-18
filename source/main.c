@@ -376,8 +376,14 @@ static DigOutResult digOutCheck(bool run)
 // on all four sides. Without that ring the mesher reads unloaded chunks as air (world.h)
 // and walls the whole area in with faces that are not there — and worse, it bakes AO
 // against nothing along every border.
-#define GEN_MESH_RADIUS  1                        // 3x3 columns = 48x48 blocks
-#define GEN_AREA_RADIUS  (GEN_MESH_RADIUS + 1)    // 5x5 columns generated
+// Step 7.7 made both of these a runtime setting rather than a constant. The bound above is
+// what the arrays and the mesh pool are sized for; the current value is what the loops use.
+// See scene/render_dist.h for why RENDER_DIST_MAX is 2 and what else moves with it.
+#define GEN_MESH_RADIUS_MAX  RENDER_DIST_MAX
+#define GEN_AREA_RADIUS_MAX  (GEN_MESH_RADIUS_MAX + 1)
+
+static int s_mesh_radius = RENDER_DIST_MIN;                   // 3x3 columns = 48x48 blocks
+static int s_area_radius = RENDER_DIST_MIN + 1;               // 5x5 columns generated
 
 // Streaming shares DRAIN_BUDGET_MS / DRAIN_MAX_CHUNKS with the edit queue and takes
 // whatever the edit queue leaves; see the comment there for why that replaced a second
@@ -422,8 +428,8 @@ static WorldGen s_gen;
 // the chunk in, and the AO pass reads the diagonals too — so a column cannot be queued the
 // moment it lands. It is queued when its ring completes, which may be when a *later*
 // column arrives.
-#define GEN_MESH_SPAN (2 * GEN_MESH_RADIUS + 1)
-#define GEN_AREA_SPAN (2 * GEN_AREA_RADIUS + 1)
+#define GEN_MESH_SPAN (2 * GEN_MESH_RADIUS_MAX + 1)
+#define GEN_AREA_SPAN (2 * GEN_AREA_RADIUS_MAX + 1)
 // The ring follows the player, so these are sliding windows, not grids anchored at the
 // origin. Both are indexed modulo their span — a torus — and both store the column
 // coordinate the slot currently describes.
@@ -492,15 +498,15 @@ static void genSlotClear(ColSlot* grid, int span, int32_t cx, int32_t cz)
 static bool genInArea(int32_t cx, int32_t cz)
 {
 	const int32_t dx = cx - s_center_cx, dz = cz - s_center_cz;
-	return dx >= -GEN_AREA_RADIUS && dx <= GEN_AREA_RADIUS &&
-	       dz >= -GEN_AREA_RADIUS && dz <= GEN_AREA_RADIUS;
+	return dx >= -s_area_radius && dx <= s_area_radius &&
+	       dz >= -s_area_radius && dz <= s_area_radius;
 }
 
 static bool genInMesh(int32_t cx, int32_t cz)
 {
 	const int32_t dx = cx - s_center_cx, dz = cz - s_center_cz;
-	return dx >= -GEN_MESH_RADIUS && dx <= GEN_MESH_RADIUS &&
-	       dz >= -GEN_MESH_RADIUS && dz <= GEN_MESH_RADIUS;
+	return dx >= -s_mesh_radius && dx <= s_mesh_radius &&
+	       dz >= -s_mesh_radius && dz <= s_mesh_radius;
 }
 
 static bool genColumnInstalled(int32_t cx, int32_t cz)
@@ -520,8 +526,8 @@ static bool genColumnRingComplete(int32_t cx, int32_t cz)
 // been queued already.
 static void genQueueReadyColumns(void)
 {
-	for (int32_t dz = -GEN_MESH_RADIUS; dz <= GEN_MESH_RADIUS; dz++) {
-		for (int32_t dx = -GEN_MESH_RADIUS; dx <= GEN_MESH_RADIUS; dx++) {
+	for (int32_t dz = -s_mesh_radius; dz <= s_mesh_radius; dz++) {
+		for (int32_t dx = -s_mesh_radius; dx <= s_mesh_radius; dx++) {
 			const int32_t cx = s_center_cx + dx, cz = s_center_cz + dz;
 			if (genSlotHas(&s_col_queued[0][0], GEN_MESH_SPAN, cx, cz)) continue;
 			if (!genColumnRingComplete(cx, cz)) continue;
@@ -546,8 +552,8 @@ static void genQueueReadyColumns(void)
 // Submits every column of the current area that has neither arrived nor been asked for.
 static void genRequestArea(void)
 {
-	for (int32_t dz = -GEN_AREA_RADIUS; dz <= GEN_AREA_RADIUS; dz++) {
-		for (int32_t dx = -GEN_AREA_RADIUS; dx <= GEN_AREA_RADIUS; dx++) {
+	for (int32_t dz = -s_area_radius; dz <= s_area_radius; dz++) {
+		for (int32_t dx = -s_area_radius; dx <= s_area_radius; dx++) {
 			const int32_t cx = s_center_cx + dx, cz = s_center_cz + dz;
 			if (genSlotHas(&s_col_in[0][0], GEN_AREA_SPAN, cx, cz)) continue;
 			if (genSlotHas(&s_col_asked[0][0], GEN_AREA_SPAN, cx, cz)) continue;
@@ -585,8 +591,8 @@ static void genRecenter(int32_t cx, int32_t cz)
 	s_center_cz = cz;
 
 	// Only the old area needs sweeping: nothing outside it was ever loaded.
-	for (int32_t dz = -GEN_AREA_RADIUS; dz <= GEN_AREA_RADIUS; dz++)
-		for (int32_t dx = -GEN_AREA_RADIUS; dx <= GEN_AREA_RADIUS; dx++) {
+	for (int32_t dz = -s_area_radius; dz <= s_area_radius; dz++)
+		for (int32_t dx = -s_area_radius; dx <= s_area_radius; dx++) {
 			const int32_t ox = old_cx + dx, oz = old_cz + dz;
 			if (!genInArea(ox, oz)) genUnloadColumn(ox, oz);
 		}
@@ -595,13 +601,71 @@ static void genRecenter(int32_t cx, int32_t cz)
 	// blocks and loses its geometry: it is now one of the neighbours the mesher reads, not
 	// something drawn. Without this its meshes would stay on screen past the render
 	// distance and the pool would fill.
-	for (int32_t dz = -GEN_MESH_RADIUS; dz <= GEN_MESH_RADIUS; dz++)
-		for (int32_t dx = -GEN_MESH_RADIUS; dx <= GEN_MESH_RADIUS; dx++) {
+	for (int32_t dz = -s_mesh_radius; dz <= s_mesh_radius; dz++)
+		for (int32_t dx = -s_mesh_radius; dx <= s_mesh_radius; dx++) {
 			const int32_t ox = old_cx + dx, oz = old_cz + dz;
 			if (genInMesh(ox, oz)) continue;
 			chunkRenderReleaseColumn(ox, oz);
 			genSlotClear(&s_col_queued[0][0], GEN_MESH_SPAN, ox, oz);
 		}
+
+	genRequestArea();
+	genQueueReadyColumns();
+}
+
+// Step 7.7. The distance the world boots at. Separate from genSetRadius below because at boot
+// there is nothing to unload and no worker to ask for anything yet: this only has to be called
+// before genStart, which then requests the right shape first time.
+static void genInitRadius(int radius)
+{
+	if (radius < RENDER_DIST_MIN) radius = RENDER_DIST_MIN;
+	if (radius > RENDER_DIST_MAX) radius = RENDER_DIST_MAX;
+	s_mesh_radius = radius;
+	s_area_radius = radius + 1;
+	chunkRenderSetDistance(radius);
+}
+
+// Step 7.7. Changes the render distance, which is the same problem genRecenter solves — a ring
+// whose shape changed under it — with the centre standing still instead of the radius.
+//
+// Deliberately the same three moves in the same order, and for the same reason: drop the
+// columns that are now outside the generated ring, drop the *geometry* of columns that are
+// still generated but no longer drawn, then ask for whatever the new shape is missing. Doing
+// it this way means lowering the distance frees memory immediately rather than at the next
+// column boundary, and raising it does not have to wait for the player to walk anywhere.
+//
+// Nothing is regenerated that already exists: raising the distance keeps every loaded column
+// and only requests the new outer rings, so the visible cost of a change is the new columns'
+// generation, not a rebuild of the world.
+static void genSetRadius(int radius)
+{
+	if (radius < RENDER_DIST_MIN) radius = RENDER_DIST_MIN;
+	if (radius > RENDER_DIST_MAX) radius = RENDER_DIST_MAX;
+	if (radius == s_mesh_radius) return;
+
+	const int old_area = s_area_radius, old_mesh = s_mesh_radius;
+	s_mesh_radius = radius;
+	s_area_radius = radius + 1;
+
+	// Sweep the OLD rings, because those are the columns that exist. Sweeping the new ones
+	// would miss everything that just fell outside, which is the whole point when shrinking.
+	for (int32_t dz = -old_area; dz <= old_area; dz++)
+		for (int32_t dx = -old_area; dx <= old_area; dx++) {
+			const int32_t ox = s_center_cx + dx, oz = s_center_cz + dz;
+			if (!genInArea(ox, oz)) genUnloadColumn(ox, oz);
+		}
+
+	for (int32_t dz = -old_mesh; dz <= old_mesh; dz++)
+		for (int32_t dx = -old_mesh; dx <= old_mesh; dx++) {
+			const int32_t ox = s_center_cx + dx, oz = s_center_cz + dz;
+			if (genInMesh(ox, oz)) continue;
+			chunkRenderReleaseColumn(ox, oz);
+			genSlotClear(&s_col_queued[0][0], GEN_MESH_SPAN, ox, oz);
+		}
+
+	// The fog and the near plane are functions of the distance and are changed here, together
+	// with the ring, so there is never a frame drawn with one of the two out of step.
+	chunkRenderSetDistance(radius);
 
 	genRequestArea();
 	genQueueReadyColumns();
@@ -808,6 +872,13 @@ static void worldReportDraw(int refused, bool built,
 	// opaque pass and the world would still look almost right.
 	printf("alpha %2d draws %5lu tris        \n", chunkRenderAlphaDraws(),
 	       (unsigned long)chunkRenderAlphaTris());
+	// Step 7.7. The setting, and the two numbers derived from it that decide whether it works:
+	// how far the fade lets you see, and whether it finishes before the load boundary. `hides`
+	// reading NO is the one failure mode that looks like scenery — chunks appearing out of
+	// clear air at a fixed distance — so it is stated rather than left to be noticed.
+	const RenderDist* rd = chunkRenderDistance();
+	printf("dist %d  see %4.1f  edge %4.1f %s\n", rd->radius, rd->half_vis, rd->boundary,
+	       rd->fog_hides ? "hid" : "NO!");
 	printf("vbo pool %5.2f MB  refused %2d  \n", chunkRenderBytes() / mb,
 	       chunkRenderRefusals());
 	printf("startup mesh refused %2d        \n", gen->mesh_refused);
@@ -831,7 +902,7 @@ static void worldReportDraw(int refused, bool built,
 	// `in` is columns installed into the live world and `fail` is those the budget, the
 	// column table or the job ring refused, so a non-zero there is a hole in the ground
 	// rather than a slow boot; `mesh` is how much of the 64-slot pool the generated area
-	// actually needed, which is the number that decides how far GEN_MESH_RADIUS can grow
+	// actually needed, which is the number that decides how far s_mesh_radius can grow
 	// before Phase 6's eviction exists.
 	//
 	// The second line is step 5.5's whole claim in two numbers. `wk` is wall time the
@@ -906,6 +977,18 @@ int main(void)
 	// is already drawing. The hand-built world has no generator to move off the main
 	// thread and is still filled and meshed in one go.
 #if BS_WORLD_GEN
+	// Step 7.7. The console's default render distance, before the first column is asked for,
+	// so the boot fills the ring the player is actually going to have rather than filling the
+	// small one and then widening it a frame later.
+	//
+	// APT_CheckNew3DS is asked here and nowhere else: render_dist.c is deliberately free of
+	// <3ds.h> so its arithmetic can be tested on the host, which means the one genuinely
+	// console-shaped question in the whole setting — which machine is this — has to be
+	// answered by the caller.
+	bool new_3ds = false;
+	APT_CheckNew3DS(&new_3ds);
+	genInitRadius(renderDistDefault(new_3ds));
+
 	// Centred on the spawn column, which is (0, 0) — the same column playerInit puts the
 	// feet in below. From here on the ring follows the player (genFollow).
 	const bool worker_ok = genStart(0, 0);
@@ -1020,6 +1103,17 @@ int main(void)
 			s_stereo = !s_stereo;
 			gfxSet3D(s_stereo);
 		}
+
+#if BS_WORLD_GEN && !BS_FLY
+		// Step 7.7. L and R change the render distance. They are free in walking mode — only
+		// the free-fly camera uses them, for up and down — and this is the one control the
+		// setting can have until step 8.4 gives the game an options screen to hold it. It is
+		// wired up rather than left for 8.4 because a setting that cannot be changed cannot be
+		// verified: the two distances have to be reachable in one run for the fog and the ring
+		// to be judged against each other.
+		if (down & KEY_L) genSetRadius(s_mesh_radius - 1);
+		if (down & KEY_R) genSetRadius(s_mesh_radius + 1);
+#endif
 
 #if BS_WORLD_GEN
 		// Take delivery of at most one generated column, before anything reads the world

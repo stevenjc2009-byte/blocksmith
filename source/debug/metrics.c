@@ -332,12 +332,12 @@ void metricsDrawOverlay(const char* status)
 	printf("3d %s sl%4.2f free%4luK eye%3luK\n", s_stereo ? "on " : "off", s_slider,
 	       (unsigned long)(s_vram_free / 1024), (unsigned long)(s_right_eye_bytes / 1024));
 	printf("%-32s\n", status ? status : "");
-	// Walking-mode controls, which is what a playtest build boots into. The free-fly
-	// camera's L/R up-down is a developer knob (main.c, BS_FLY) and is left off the
-	// legend rather than listed as something that does nothing.
+	// Walking-mode controls, which is what a playtest build boots into. L and R are the
+	// render distance in this mode; in a BS_FLY build they are the camera's up and down
+	// instead, which is a developer knob and is why the legend does not mention it.
 	printf("pad look  D-pad walk  A jump   \n");
 	printf("X break  Y place  SELECT 3D    \n");
-	printf("START exit                     \n");
+	printf("L/R render dist  START exit    \n");
 }
 
 void metricsWorstReset(void)
