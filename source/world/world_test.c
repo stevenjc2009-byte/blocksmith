@@ -6,6 +6,7 @@
 
 #include "world/atlas_uv.h"
 #include "world/budget.h"
+#include "world/chunk_codec.h"
 #include "world/dirtyq.h"
 #include "world/handbuilt.h"
 #include "world/jobq.h"
@@ -1712,6 +1713,42 @@ static void testDirtyQueue(void)
 //
 // **Re-run the real criterion at step 5.5**, against actual load/unload. Until then the
 // gap is: a bug that loses blocks *on unload* would pass everything below.
+// Step 8.1. The dirty flag decides which columns reach the SD card, so the thing worth
+// checking is not that it can be set — it is that generating a column does NOT set it. If it
+// did, every column in the world would be written on the way out and the save file would grow
+// by the whole world instead of by the parts of it the player changed.
+static void testColumnDirtyFlag(void)
+{
+	worldInit(&s_world);
+
+	// A column filled the way the generator fills one: straight through worldSet, which is
+	// the shared path and therefore the tempting place to have put the flag.
+	for (int y = 0; y < 20; y++) worldSet(&s_world, 3, y, 3, BLOCK_STONE);
+
+	const Column* col = worldColumn(&s_world, 0, 0);
+	CHECK(col != NULL);
+	CHECK(col && !col->dirty);
+
+	// And the edit path does set it, for the column containing the block.
+	worldSet(&s_world, 3, 21, 3, BLOCK_WOOD);
+	worldMarkDirty(&s_world, 3, 3);
+	CHECK(col && col->dirty);
+
+	// Negative coordinates land in column -1, not column 0: the shift has to floor. Getting
+	// this wrong would mark the wrong column and lose the edited one on unload.
+	worldSet(&s_world, -1, 21, -1, BLOCK_WOOD);
+	worldMarkDirty(&s_world, -1, -1);
+	const Column* west = worldColumn(&s_world, -1, -1);
+	CHECK(west != NULL);
+	CHECK(west && west->dirty);
+	CHECK(west != col);
+
+	// A column that is not loaded is not an error and must not fault.
+	worldMarkDirty(&s_world, 4096, 4096);
+
+	worldExit(&s_world);
+}
+
 static void testEditPersistence(void)
 {
 	worldInit(&s_world);
@@ -3090,6 +3127,398 @@ static void testRenderDist(void)
 	CHECK(renderDistVisibility(&off, 100.0f) > 0.999f);
 }
 
+// ── Step 8.1, the save format ─────────────────────────────────────────────────────────
+//
+// The codec half runs everywhere. The region-file half is host-only, and deliberately: it
+// writes real files, and the one thing this project has already been bitten by is a test
+// build sharing a directory with a real save. On the console these tests would run at boot,
+// every boot, against the same card the player's world is on.
+
+// Fills a chunk with a shape and returns it, so each codec case reads as one line.
+static void codecFill(Chunk* c, int mode)
+{
+	for (int y = 0; y < CHUNK_DIM; y++)
+		for (int z = 0; z < CHUNK_DIM; z++)
+			for (int x = 0; x < CHUNK_DIM; x++) {
+				const int i = chunkIndex(x, y, z);
+				switch (mode) {
+				case 0: c->blocks[i] = BLOCK_AIR; break;                       // uniform
+				case 1: c->blocks[i] = y < 4 ? BLOCK_STONE                     // layered
+				                     : y < 7 ? BLOCK_DIRT
+				                     : y < 8 ? BLOCK_GRASS : BLOCK_AIR; break;
+				default: c->blocks[i] = ((x + y + z) & 1)                      // checkerboard
+				                      ? BLOCK_STONE : BLOCK_AIR; break;
+				}
+			}
+}
+
+static void testChunkCodec(void)
+{
+	static Chunk    a, b;
+	static uint8_t  buf[CHUNK_CODEC_MAX];
+
+	// Uniform: two bytes, whatever the block is. Half a 128-tall column is sky, so this is
+	// the case that decides what a world costs on the card.
+	codecFill(&a, 0);
+	size_t n = chunkEncode(&a, buf, sizeof(buf));
+	CHECK(n == 2);
+	CHECK(buf[0] == CODEC_UNIFORM);
+	memset(&b, 0xEE, sizeof(b));
+	CHECK(chunkDecode(&b, buf, n));
+	CHECK(memcmp(a.blocks, b.blocks, CHUNK_BLOCKS) == 0);
+
+	// Layered terrain: the shape RLE exists for. Must beat raw by a long way, not merely
+	// beat it — if this ever creeps up towards 4,098 the encoder has stopped working and
+	// the only symptom would be a bigger save file.
+	codecFill(&a, 1);
+	n = chunkEncode(&a, buf, sizeof(buf));
+	CHECK(buf[0] == CODEC_RLE);
+	CHECK(n < 64);
+	memset(&b, 0xEE, sizeof(b));
+	CHECK(chunkDecode(&b, buf, n));
+	CHECK(memcmp(a.blocks, b.blocks, CHUNK_BLOCKS) == 0);
+
+	// Checkerboard: RLE's worst case, twice the size of the blocks it describes. The encoder
+	// must notice and fall back, because a player can build this.
+	codecFill(&a, 2);
+	n = chunkEncode(&a, buf, sizeof(buf));
+	CHECK(buf[0] == CODEC_RAW);
+	CHECK(n == CHUNK_BLOCKS + 2);
+	memset(&b, 0xEE, sizeof(b));
+	CHECK(chunkDecode(&b, buf, n));
+	CHECK(memcmp(a.blocks, b.blocks, CHUNK_BLOCKS) == 0);
+
+	// Malformed input. Every one of these is a shape a power cut can produce, and the
+	// contract is that the caller's chunk is left alone rather than half-written — so each
+	// case checks the rejection AND that b still holds what it held.
+	codecFill(&a, 1);
+	n = chunkEncode(&a, buf, sizeof(buf));
+	codecFill(&b, 0);
+
+	CHECK(!chunkDecode(&b, buf, 0));
+	CHECK(!chunkDecode(&b, buf, 1));
+	CHECK(!chunkDecode(&b, buf, n - 2));           // run table short
+	CHECK(!chunkDecode(&b, buf, n - 1));           // cut between a run's length and index
+
+	uint8_t bad[CHUNK_CODEC_MAX];
+	memcpy(bad, buf, n);
+	bad[0] = 99;                                    // unknown tag
+	CHECK(!chunkDecode(&b, bad, n));
+
+	memcpy(bad, buf, n);
+	bad[n - 1] = 200;                               // palette index past the palette
+	CHECK(!chunkDecode(&b, bad, n));
+
+	// One run too many, so the run table adds up past the end of the chunk. Appending is
+	// the way to build this case rather than lengthening the last run: every run in a
+	// layered chunk is already the 256 maximum, so there is no run left to grow.
+	memcpy(bad, buf, n);
+	bad[n]     = 255;                               // a further 256 blocks
+	bad[n + 1] = 0;
+	CHECK(!chunkDecode(&b, bad, n + 2));
+
+	// b must still be the uniform-air chunk it was filled with.
+	for (int i = 0; i < CHUNK_BLOCKS; i++) CHECK_QUIET(b.blocks[i] == BLOCK_AIR);
+
+	// A buffer too small to hold even the raw form is a 0, not an overrun.
+	codecFill(&a, 2);
+	CHECK(chunkEncode(&a, buf, 8) == 0);
+}
+
+#ifndef __3DS__
+
+#include <sys/stat.h>
+
+#include "world/region.h"
+
+#define TEST_WORLD_DIR "build-host/testworld"
+
+// MinGW's <sys/stat.h> declares the one-argument MSVC mkdir; POSIX takes a mode. Only the
+// host tests create directories — the game's save path is made by app/save.c with the
+// libctru devoptab, which is POSIX — so this wrapper stays here rather than in the game.
+static void testMkdir(const char* path)
+{
+#if defined(_WIN32)
+	mkdir(path);
+#else
+	mkdir(path, 0777);
+#endif
+}
+
+static void regionTestDir(void)
+{
+	testMkdir("build-host");
+	testMkdir(TEST_WORLD_DIR);
+}
+
+static void regionTestClean(int32_t rx, int32_t rz)
+{
+	char p[256];
+	snprintf(p, sizeof(p), "%s/r.%ld.%ld.bsr", TEST_WORLD_DIR, (long)rx, (long)rz);
+	remove(p);
+	snprintf(p, sizeof(p), "%s/r.%ld.%ld.tmp", TEST_WORLD_DIR, (long)rx, (long)rz);
+	remove(p);
+}
+
+// Builds a recognisable column at (cx, cz): terrain in the low chunks and one marker block
+// whose id depends on `tag`, so a loaded world can be told apart from a stale one.
+static void regionTestBuild(World* w, int32_t cx, int32_t cz, BlockId tag)
+{
+	for (int y = 0; y < 40; y++)
+		for (int z = 0; z < CHUNK_DIM; z++)
+			for (int x = 0; x < CHUNK_DIM; x++)
+				worldSet(w, cx * CHUNK_DIM + x, y, cz * CHUNK_DIM + z,
+				         y < 32 ? BLOCK_STONE : BLOCK_DIRT);
+
+	worldSet(w, cx * CHUNK_DIM + 3, 41, cz * CHUNK_DIM + 5, tag);
+}
+
+static void testRegionRoundTrip(void)
+{
+	static uint8_t buf[REGION_COL_MAX];
+
+	regionTestDir();
+	regionTestClean(0, 0);
+
+	worldInit(&s_world);
+	regionTestBuild(&s_world, 2, 3, BLOCK_WOOD);
+
+	const Column* col = worldColumn(&s_world, 2, 3);
+	CHECK(col != NULL);
+
+	const uint32_t n = regionEncodeColumn(col, buf, sizeof(buf));
+	CHECK(n > 0);
+	CHECK(regionWriteColumn(TEST_WORLD_DIR, 2, 3, buf, n));
+	worldExit(&s_world);
+
+	// Read it back into a world that has never seen it.
+	static uint8_t back[REGION_COL_MAX];
+	const uint32_t got = regionReadColumn(TEST_WORLD_DIR, 2, 3, back, sizeof(back));
+	CHECK(got == n);
+	CHECK(memcmp(buf, back, n) == 0);
+
+	worldInit(&s_world);
+	CHECK(regionDecodeColumn(&s_world, 2, 3, back, got));
+	CHECK(worldGet(&s_world, 2 * CHUNK_DIM + 3, 41, 3 * CHUNK_DIM + 5) == BLOCK_WOOD);
+	CHECK(worldGet(&s_world, 2 * CHUNK_DIM + 0, 10, 3 * CHUNK_DIM + 0) == BLOCK_STONE);
+	CHECK(worldGet(&s_world, 2 * CHUNK_DIM + 0, 35, 3 * CHUNK_DIM + 0) == BLOCK_DIRT);
+	worldExit(&s_world);
+
+	// A column that was never saved reads as 0, not as an error and not as somebody else's
+	// bytes. Slot arithmetic that masked wrongly would show up right here.
+	CHECK(regionReadColumn(TEST_WORLD_DIR, 5, 7, back, sizeof(back)) == 0);
+
+	// Negative coordinates land in their own region and their own slot. -1 and 15 both mask
+	// to slot 15, so they must differ by region file or one would overwrite the other.
+	CHECK(regionOf(-1) == -1);
+	CHECK(regionOf(-16) == -1);
+	CHECK(regionOf(-17) == -2);
+
+	regionTestClean(0, 0);
+}
+
+// Copies `src` to `dst`, keeping only the first `keep` bytes. Standing in for the console
+// losing power part-way through a write.
+static bool truncCopy(const char* src, const char* dst, long keep)
+{
+	FILE* a = fopen(src, "rb");
+	if (!a) return false;
+	FILE* b = fopen(dst, "wb");
+	if (!b) { fclose(a); return false; }
+
+	for (long i = 0; i < keep; i++) {
+		const int ch = fgetc(a);
+		if (ch == EOF) break;
+		fputc(ch, b);
+	}
+	fclose(a);
+	fclose(b);
+	return true;
+}
+
+static long fileBytes(const char* path)
+{
+	FILE* f = fopen(path, "rb");
+	if (!f) return -1;
+	fseek(f, 0, SEEK_END);
+	const long n = ftell(f);
+	fclose(f);
+	return n;
+}
+
+// **The step 8.1 criterion.** Save a column, save a different version of it, then cut the
+// file at every byte offset and load it. Every single cut must produce one of exactly three
+// outcomes: the old column, the new column, or nothing at all. Never a mixture, never a
+// decode of garbage, never a crash.
+//
+// That is what the double-buffered directory and the append-only arena are for, and it is
+// the only way to check them — an emulator run cannot pull the power at byte 4,073.
+static void testRegionPowerCut(void)
+{
+	static uint8_t old_bytes[REGION_COL_MAX];
+	static uint8_t new_bytes[REGION_COL_MAX];
+	static uint8_t got[REGION_COL_MAX];
+
+	regionTestDir();
+	regionTestClean(0, 0);
+
+	// State A.
+	worldInit(&s_world);
+	regionTestBuild(&s_world, 1, 1, BLOCK_WOOD);
+	const uint32_t old_n = regionEncodeColumn(worldColumn(&s_world, 1, 1),
+	                                          old_bytes, sizeof(old_bytes));
+	worldExit(&s_world);
+	CHECK(old_n > 0);
+	CHECK(regionWriteColumn(TEST_WORLD_DIR, 1, 1, old_bytes, old_n));
+
+	// State B: same column, one block different, so the two encodings are the same length
+	// and only the payload contents and the directory tell them apart.
+	worldInit(&s_world);
+	regionTestBuild(&s_world, 1, 1, BLOCK_SAND);
+	const uint32_t new_n = regionEncodeColumn(worldColumn(&s_world, 1, 1),
+	                                          new_bytes, sizeof(new_bytes));
+	worldExit(&s_world);
+	CHECK(new_n > 0);
+	CHECK(regionWriteColumn(TEST_WORLD_DIR, 1, 1, new_bytes, new_n));
+
+	const char* whole  = TEST_WORLD_DIR "/r.0.0.bsr";
+	const char* cutdir = TEST_WORLD_DIR "/cutworld";
+	const char* cut    = TEST_WORLD_DIR "/cutworld/r.0.0.bsr";
+	testMkdir(cutdir);
+
+	const long total = fileBytes(whole);
+	CHECK(total > (long)REGION_ARENA_OFF);
+
+	int saw_old = 0, saw_new = 0, saw_none = 0, saw_bad = 0;
+
+	for (long keep = 0; keep <= total; keep++) {
+		if (!truncCopy(whole, cut, keep)) { saw_bad++; break; }
+
+		const uint32_t n = regionReadColumn(cutdir, 1, 1, got, sizeof(got));
+		if (n == 0) { saw_none++; continue; }
+
+		// Whatever came back must decode cleanly AND be byte-identical to one of the two
+		// states. "Decodes but is neither" is the failure this whole design exists to
+		// prevent, and it would mean a player's world silently changing under them.
+		worldInit(&s_world);
+		const bool ok = regionDecodeColumn(&s_world, 1, 1, got, n);
+		worldExit(&s_world);
+
+		if (!ok)                                                     saw_bad++;
+		else if (n == old_n && memcmp(got, old_bytes, n) == 0)        saw_old++;
+		else if (n == new_n && memcmp(got, new_bytes, n) == 0)        saw_new++;
+		else                                                         saw_bad++;
+	}
+
+	// No cut may produce anything other than one of the two whole states.
+	CHECK(saw_bad == 0);
+
+	// And the sweep has to have actually exercised both outcomes, or it proved nothing: a
+	// file that read as "nothing" at every offset would pass saw_bad == 0 trivially.
+	CHECK(saw_old > 0);
+	CHECK(saw_new > 0);
+	CHECK(saw_none > 0);
+
+	// ── The other failure mode: a whole file with a scrambled sector ──────────────────
+	//
+	// Truncation is only half of what a power cut does. An SD card writes in blocks, and an
+	// interrupted write can leave a block that was *partly* updated — right length, wrong
+	// contents — sitting in the middle of a file that is otherwise complete. The length
+	// checks above cannot see that; only the checksums can, which is what makes this sweep
+	// the one that proves the CRCs are load-bearing rather than decorative.
+	saw_old = saw_new = saw_none = saw_bad = 0;
+
+	for (long at = 0; at < total; at += 64) {
+		if (!truncCopy(whole, cut, total)) { saw_bad++; break; }
+
+		FILE* f = fopen(cut, "r+b");
+		if (!f) { saw_bad++; break; }
+		uint8_t junk[64];
+		memset(junk, 0x5A, sizeof(junk));
+		fseek(f, at, SEEK_SET);
+		fwrite(junk, 1, sizeof(junk), f);
+		fclose(f);
+
+		const uint32_t n = regionReadColumn(cutdir, 1, 1, got, sizeof(got));
+		if (n == 0) { saw_none++; continue; }
+
+		worldInit(&s_world);
+		const bool ok = regionDecodeColumn(&s_world, 1, 1, got, n);
+		worldExit(&s_world);
+
+		if (!ok)                                              saw_bad++;
+		else if (n == old_n && memcmp(got, old_bytes, n) == 0) saw_old++;
+		else if (n == new_n && memcmp(got, new_bytes, n) == 0) saw_new++;
+		else                                                  saw_bad++;
+	}
+
+	CHECK(saw_bad == 0);
+	CHECK(saw_old > 0);      // scrambling the new payload must fall back to the old one
+	CHECK(saw_new > 0);      // scrambling dead arena space must change nothing
+
+	remove(cut);
+	regionTestClean(0, 0);
+}
+
+// The other half of the crash story: not a short file, but a *complete* file with one
+// directory copy scribbled over. The loader must fall through to the good copy.
+static void testRegionTornDirectory(void)
+{
+	static uint8_t bytes[REGION_COL_MAX];
+	static uint8_t got[REGION_COL_MAX];
+
+	regionTestDir();
+	regionTestClean(0, 0);
+
+	worldInit(&s_world);
+	regionTestBuild(&s_world, 4, 4, BLOCK_WOOD);
+	const uint32_t n = regionEncodeColumn(worldColumn(&s_world, 4, 4), bytes, sizeof(bytes));
+	worldExit(&s_world);
+	CHECK(regionWriteColumn(TEST_WORLD_DIR, 4, 4, bytes, n));
+
+	char path[256];
+	snprintf(path, sizeof(path), "%s/r.0.0.bsr", TEST_WORLD_DIR);
+
+	// Scribble over directory copy A, which is the live one after a single write.
+	FILE* f = fopen(path, "r+b");
+	CHECK(f != NULL);
+	if (f) {
+		uint8_t junk[64];
+		memset(junk, 0xA5, sizeof(junk));
+		fseek(f, 0, SEEK_SET);
+		fwrite(junk, 1, sizeof(junk), f);
+		fclose(f);
+	}
+
+	// One write means copy B has never been written, so there is no older good copy — the
+	// right answer here is "nothing", not a decode of a corrupt directory.
+	CHECK(regionReadColumn(TEST_WORLD_DIR, 4, 4, got, sizeof(got)) == 0);
+
+	// Now the case that matters: two writes, so both copies are live, and destroying the
+	// newer one must leave the older one serving the previous state rather than failing.
+	regionTestClean(0, 0);
+	CHECK(regionWriteColumn(TEST_WORLD_DIR, 4, 4, bytes, n));    // seq 1 -> copy A
+	CHECK(regionWriteColumn(TEST_WORLD_DIR, 4, 4, bytes, n));    // seq 2 -> copy B
+
+	f = fopen(path, "r+b");
+	CHECK(f != NULL);
+	if (f) {
+		uint8_t junk[64];
+		memset(junk, 0xA5, sizeof(junk));
+		fseek(f, (long)REGION_DIR_BYTES, SEEK_SET);              // copy B
+		fwrite(junk, 1, sizeof(junk), f);
+		fclose(f);
+	}
+
+	const uint32_t back = regionReadColumn(TEST_WORLD_DIR, 4, 4, got, sizeof(got));
+	CHECK(back == n);
+	CHECK(memcmp(got, bytes, n) == 0);
+
+	regionTestClean(0, 0);
+}
+
+#endif  // !__3DS__
+
 int worldTestRun(char* summary, size_t cap, int* checks_out)
 {
 	s_checks = 0;
@@ -3119,6 +3548,7 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testHandbuiltHeight();
 	testHandbuiltFillShape();
 	testHandbuiltWalkable();
+	testColumnDirtyFlag();
 	testEditPersistence();
 	testControlFeel();
 	testAllAirMeshesToNothing();
@@ -3139,6 +3569,12 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testVisWalk();
 	testVisWalkNeverHidesOpenSky();
 	testRenderDist();
+	testChunkCodec();
+#ifndef __3DS__
+	testRegionRoundTrip();
+	testRegionPowerCut();
+	testRegionTornDirectory();
+#endif
 
 	// Every allocation the world made must have been given back.
 	CHECK(budgetUsed() == 0);

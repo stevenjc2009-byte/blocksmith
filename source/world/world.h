@@ -31,6 +31,17 @@
 typedef struct {
 	int32_t cx, cz;
 	Chunk*  chunks[COLUMN_CHUNKS];
+
+	// Step 8.1. Set when the *player* has changed a block in this column, and the only
+	// thing that decides whether the column is written to the SD card when it unloads.
+	//
+	// Deliberately not set by worldSet, even though that is the one function every block
+	// change goes through: worldgenColumn goes through it too, so marking there would make
+	// every column in the world dirty the instant it was generated and turn walking around
+	// into a continuous stream of SD writes of terrain that the seed already reproduces
+	// exactly. The flag means "the disk does not know about this", so it is raised at the
+	// edit site (scene/interact.c) and nowhere else.
+	bool dirty;
 } Column;
 
 typedef struct {
@@ -59,6 +70,11 @@ Chunk*  worldChunkCreate(World* w, int cx, int cy, int cz);
 // column that unloads and comes back is regenerated from the seed and any blocks the
 // player put there are lost. That is the known state of the game, not a bug in here.
 bool worldColumnRemove(World* w, int cx, int cz);
+
+// Step 8.1. Flags the column containing world block (x, z) as needing a save. Silently does
+// nothing when that column is not loaded, which is the honest answer: there is nothing in
+// memory to write, so there is nothing the disk is missing.
+void worldMarkDirty(World* w, int x, int z);
 
 // World block coordinates. worldGet never fails: unloaded is air, below the floor
 // is WORLD_FLOOR_BLOCK, above the ceiling is air.

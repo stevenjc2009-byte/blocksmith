@@ -156,6 +156,12 @@ bool worldColumnRemove(World* w, int cx, int cz)
 	return true;
 }
 
+void worldMarkDirty(World* w, int x, int z)
+{
+	Column* col = worldColumn(w, x >> 4, z >> 4);
+	if (col) col->dirty = true;
+}
+
 BlockId worldGet(const World* w, int x, int y, int z)
 {
 	if (y < 0) return WORLD_FLOOR_BLOCK;

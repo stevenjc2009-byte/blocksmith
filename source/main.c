@@ -17,6 +17,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "app/worker.h"
 #include "debug/metrics.h"
@@ -30,6 +31,7 @@
 #include "world/handbuilt.h"
 #include "world/jobq.h"
 #include "world/mesh_vertex.h"
+#include "world/region.h"
 #include "world/world.h"
 #include "world/world_test.h"
 #include "world/worldgen.h"
@@ -574,6 +576,16 @@ static void genUnloadColumn(int32_t cx, int32_t cz)
 	chunkRenderReleaseColumn(cx, cz);
 	genSlotClear(&s_col_queued[0][0], GEN_MESH_SPAN, cx, cz);
 
+	// Step 8.1. The last moment this column's blocks exist. Only columns the player edited
+	// are written — everything else the seed reproduces exactly, and saving it would turn
+	// walking in a straight line into a stream of pointless SD writes.
+	//
+	// Before worldColumnRemove and not after, for the obvious reason, and the encode happens
+	// here on the main thread because this thread owns the World; only the bytes cross to
+	// the worker. See app/worker.h.
+	const Column* col = worldColumn(&s_world, cx, cz);
+	if (col && col->dirty) workerSubmitSave(col);
+
 	if (worldColumnRemove(&s_world, cx, cz)) s_col_unloaded++;
 	genSlotClear(&s_col_in[0][0], GEN_AREA_SPAN, cx, cz);
 	genSlotClear(&s_col_asked[0][0], GEN_AREA_SPAN, cx, cz);
@@ -671,6 +683,43 @@ static void genSetRadius(int radius)
 	genQueueReadyColumns();
 }
 
+// Step 8.1. Makes sure sdmc:/blocksmith/worlds/<name> exists and returns it, or NULL if the
+// card would not take it — a locked or absent SD card, which is a real state on this console
+// and must leave the game playable rather than refusing to boot. NULL turns saving off for
+// the session: the world still generates, edits still work, they just do not survive a quit.
+//
+// The world name is fixed here. Step 8.4's world select is a listing of this directory, so
+// it changes which name is passed in and nothing else.
+#define SAVE_WORLD_NAME "default"
+
+static const char* saveWorldDir(void)
+{
+	static char dir[128];
+
+	// Each level in turn: mkdir does not create parents, and the two above the world are
+	// shared with the metrics CSV and the server address file, so either may already exist.
+	// EEXIST is the expected answer and is not distinguished — the only thing that matters
+	// is whether the final directory is usable, which the probe below actually tests rather
+	// than infers from a return code.
+	mkdir("sdmc:/blocksmith", 0777);
+	mkdir(REGION_ROOT, 0777);
+	snprintf(dir, sizeof(dir), "%s/%s", REGION_ROOT, SAVE_WORLD_NAME);
+	mkdir(dir, 0777);
+
+	// Written to and removed again, because mkdir returning -1/EEXIST proves nothing about
+	// whether the card is writable — a read-only SD reports the directory as already there.
+	// Finding out now costs one file; finding out at the first unload costs the player's
+	// building with no warning.
+	char probe[160];
+	snprintf(probe, sizeof(probe), "%s/.wtest", dir);
+	FILE* f = fopen(probe, "wb");
+	if (!f) return NULL;
+	const bool wrote = fwrite("bs", 1, 2, f) == 2;
+	fclose(f);
+	remove(probe);
+	return wrote ? dir : NULL;
+}
+
 // Starts the worker and queues the whole area. The spawn column goes first because the
 // ring is FIFO, so it is the first one back and the player has ground under them before
 // the loop starts.
@@ -686,6 +735,10 @@ static bool genStart(int32_t cx, int32_t cz)
 	s_center_cx = cx;
 	s_center_cz = cz;
 	s_col_unloaded = s_col_dropped = 0;
+
+	// Before workerStart, which is where the worker copies it: the worker reads the card on
+	// its very first job, so a directory set afterwards would miss the spawn column.
+	workerSetWorldDir(saveWorldDir());
 
 	if (!workerStart(&s_gen))
 		return false;
@@ -791,6 +844,151 @@ static int32_t genColumnOf(float v)
 static void genFollow(float x, float z)
 {
 	genRecenter(genColumnOf(x), genColumnOf(z));
+}
+
+// ── Step 8.1's verification probe ─────────────────────────────────────────────────────
+//
+// The plan's criterion for the save format is a behaviour, not a format: "break a block,
+// walk away until the column unloads, walk back — the block is still broken; quit, relaunch
+// — it is still broken". Both halves need the real card, the real region file, the real
+// streaming ring and the real worker, so neither can be checked in the host suite, which is
+// why this lives here next to digOutCheck rather than in world_test.c.
+//
+// It runs in two parts across two launches, and the second part is the one that matters:
+//
+//   RUN 1 — edit a block, force the column out of the ring (which saves it), force it back
+//           in (which loads it), and check the edit survived. Then write down where the
+//           edit was, so run 2 knows what to look for.
+//   RUN 2 — read that note, and check the block is *still* air in a world that has just
+//           been generated from cold. Nothing in memory carries over between launches, so
+//           the only way the block can be air is if it came off the card.
+//
+// Off by default:  make EXTRA_CFLAGS="-DBS_SAVE_CHECK=1"
+#ifndef BS_SAVE_CHECK
+#define BS_SAVE_CHECK 0
+#endif
+
+#define SAVE_CHECK_NOTE "sdmc:/blocksmith/savecheck.txt"
+
+typedef struct {
+	bool ran;
+	int  run;             // 1 = wrote the note this launch, 2 = read one from a previous one
+	int  x, y, z;         // the block that was broken
+	int  before;          // what the generator had put there
+	int  after_reload;    // what it read back after the unload/load round trip (run 1)
+	int  at_boot;         // what it was at boot, before any edit (run 2)
+	bool pass;
+} SaveCheckResult;
+
+// Highest solid block in the column, or -1 if the whole stack is air. Scanned from the top
+// so the answer is the surface rather than the first thing above the floor.
+static int saveCheckSurfaceY(int x, int z)
+{
+	for (int y = WORLD_HEIGHT - 1; y >= 0; y--)
+		if (worldGet(&s_world, x, y, z) != BLOCK_AIR) return y;
+	return -1;
+}
+
+static SaveCheckResult saveCheck(bool run)
+{
+	SaveCheckResult r = {0};
+	if (!run) return r;
+	r.ran = true;
+
+	// The spawn column, which genWaitSpawnColumn has already guaranteed is installed. Any
+	// other column would be a race against the ring still filling.
+	const int x = 5, z = 5;
+
+	// ── Run 2 first: is there a note from a previous launch? ─────────────────────────
+	FILE* f = fopen(SAVE_CHECK_NOTE, "rb");
+	if (f) {
+		int nx = 0, ny = 0, nz = 0, nbefore = 0;
+		const int got = fscanf(f, "%d %d %d %d", &nx, &ny, &nz, &nbefore);
+		fclose(f);
+
+		if (got == 4) {
+			r.run    = 2;
+			r.x      = nx;
+			r.y      = ny;
+			r.z      = nz;
+			r.before = nbefore;
+			r.at_boot = worldGet(&s_world, nx, ny, nz);
+
+			// The block must be air now, and the note must say it was NOT air before —
+			// otherwise "it is air" proves nothing, because it always was. That second
+			// clause is what stops this passing on a world where the surface moved.
+			r.pass = (r.at_boot == BLOCK_AIR) && (r.before != BLOCK_AIR);
+
+			// Removed either way, so the next launch starts the cycle again rather than
+			// re-reading a note about a block that has since been overwritten.
+			remove(SAVE_CHECK_NOTE);
+			return r;
+		}
+		remove(SAVE_CHECK_NOTE);
+	}
+
+	// ── Run 1: edit, unload, reload, and check in-session ────────────────────────────
+	r.run = 1;
+	r.y   = saveCheckSurfaceY(x, z);
+	r.x   = x;
+	r.z   = z;
+	if (r.y < 0) return r;                       // no ground here: nothing to test with
+
+	r.before = worldGet(&s_world, x, r.y, z);
+	worldSet(&s_world, x, r.y, z, BLOCK_AIR);
+	worldMarkDirty(&s_world, x, z);
+
+	// Straight through the real unload path, so the save goes out the way it would if the
+	// player had walked away — including the dirty test, which is the part most likely to be
+	// wrong. Then wait for the card, because the reload below must not race the write.
+	genUnloadColumn(x >> 4, z >> 4);
+	workerFlushSaves();
+
+	// And back in through the real request path, which is where load-before-generate lives.
+	if (workerSubmitColumn(x >> 4, z >> 4)) {
+		genSlotSet(&s_col_asked[0][0], GEN_AREA_SPAN, x >> 4, z >> 4);
+		while (!genColumnInstalled(x >> 4, z >> 4)) {
+			if (genInstallOne()) continue;
+			if (!workerBusy()) break;
+			svcSleepThread(1000000);
+		}
+	}
+
+	r.after_reload = worldGet(&s_world, x, r.y, z);
+	r.pass = (r.after_reload == BLOCK_AIR) && (r.before != BLOCK_AIR);
+
+	// The note for run 2. Written last, so a run that failed its own in-session check still
+	// leaves the file — the relaunch half is worth running even when this half is red, and
+	// the two results together say which side of the write/read pair is broken.
+	f = fopen(SAVE_CHECK_NOTE, "wb");
+	if (f) {
+		fprintf(f, "%d %d %d %d\n", r.x, r.y, r.z, r.before);
+		fclose(f);
+	}
+	return r;
+}
+
+// The probe's result, onto the card as well as onto the screen. A file rather than only a
+// screenshot because the numbers are what decide pass or fail, and reading them off a 240p
+// top screen is a transcription step this does not need — and because the two launches have
+// to be compared, which a file makes trivial and a pair of screenshots does not.
+//
+// Appended, so run 1 and run 2 end up in the same file in order.
+static void saveCheckReport(const SaveCheckResult* r)
+{
+	if (!r->ran) return;
+
+	char line[192];
+	snprintf(line, sizeof(line),
+	         "run%d %s at (%d,%d,%d) before=%d reload=%d boot=%d loaded=%d saved=%d fail=%d\n",
+	         r->run, r->pass ? "PASS" : "FAIL", r->x, r->y, r->z,
+	         r->before, r->after_reload, r->at_boot,
+	         workerLoaded(), workerSaved(), workerSaveFailed());
+
+	printf("savecheck: %s", line);
+
+	FILE* f = fopen("sdmc:/blocksmith/savecheck_result.txt", "ab");
+	if (f) { fputs(line, f); fclose(f); }
 }
 
 #endif   // BS_WORLD_GEN
@@ -955,6 +1153,18 @@ static void worldReportDraw(int refused, bool built,
 	printf("selftest %-22s\n", selftest);
 }
 
+// Step 8.1. Hands every dirty column still in memory to the worker and waits for the card.
+// Called on the way out; a no-op when the worker was never started (the hand-built world) or
+// when no world directory could be created.
+static void saveDirtyColumns(void)
+{
+	for (int i = 0; i < WORLD_MAP_SLOTS; i++) {
+		const Column* col = s_world.slots[i];
+		if (col && col->dirty) workerSubmitSave(col);
+	}
+	workerFlushSaves();
+}
+
 int main(void)
 {
 	screenInit();
@@ -1007,6 +1217,14 @@ int main(void)
 	// feet in below. From here on the ring follows the player (genFollow).
 	const bool worker_ok = genStart(0, 0);
 	genWaitSpawnColumn();
+
+	// Step 8.1's proof. After the spawn column is guaranteed installed and before the player
+	// exists, so it can unload and reload the column the player would otherwise be standing
+	// in. Compiled out entirely unless BS_SAVE_CHECK is set.
+	{
+		const SaveCheckResult sc = saveCheck(BS_SAVE_CHECK);
+		saveCheckReport(&sc);
+	}
 #else
 	s_genr = (GenResult){0};
 	const bool handbuilt_ok = handbuiltFill(&s_world);
@@ -1326,6 +1544,16 @@ int main(void)
 		metricsDrawOverlay(highlight_ok ? status : "HIGHLIGHT INIT FAILED");
 #endif
 	}
+
+	// Step 8.1. Everything still in memory that the disk does not know about, written before
+	// the world is torn down. Without this, quitting would lose every edit inside the ring —
+	// which is all of them, since the player is standing in the ring — and the save file
+	// would only ever contain the columns they had happened to walk away from.
+	//
+	// The whole slot table is walked rather than the ring, because the ring is a shape and
+	// this is a list of what actually exists. A column can outlive the ring by a frame or
+	// two when the radius changes, and one that did would be missed by a ring walk.
+	saveDirtyColumns();
 
 	// Before worldExit: the worker holds a staging world of its own and must be joined
 	// before anything it could still be writing into is freed.

@@ -1,9 +1,11 @@
 #include "app/worker.h"
 
 #include <3ds.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "world/jobq.h"
+#include "world/region.h"
 
 // 32 KB. worldgenColumn's frame is about 1.3 KB (the 16x16 height and sandy tables) and
 // nothing below it recurses, so this is mostly margin: a stack overflow on this console
@@ -48,6 +50,82 @@ static const WorldGen* s_gen;
 
 static u64 s_busy_ticks, s_install_ticks;
 
+// ── Step 8.1: the save ring ───────────────────────────────────────────────────────────
+//
+// Two slots, not one, so the common case of a couple of edited columns leaving the ring
+// together does not make the main thread wait for the card; and not more, because each slot
+// is a worst-case column and 32 KB of .bss each is real memory spent on a queue that is
+// empty almost all of the time. A third slot would buy the case where three edited columns
+// unload in the same frame, which needs the player to have built in three columns and then
+// crossed a boundary diagonally — rare enough to pay one SD write of latency for.
+#define SAVE_SLOTS 2
+
+typedef struct {
+	int32_t  cx, cz;
+	uint32_t len;
+	uint8_t  bytes[REGION_COL_MAX];
+} SaveSlot;
+
+static SaveSlot s_save[SAVE_SLOTS];
+static int      s_save_head;        // next slot the main thread fills
+static int      s_save_tail;        // next slot the worker writes
+static int      s_save_count;       // slots full; guarded by s_lock
+static int      s_saved, s_save_failed, s_loaded;
+
+// Empty means "no save file": every column is generated and nothing is written. Sized for a
+// path under REGION_ROOT plus a world name.
+static char s_world_dir[128];
+
+// Read buffer for the load-before-generate path. Worker-owned, never touched by the main
+// thread, and static rather than on the worker's 32 KB stack — which it would exactly fill.
+static uint8_t s_load_buf[REGION_COL_MAX];
+
+// Step 8.1. Fills the staging column from the region file, and says whether it managed it.
+// False is the ordinary answer, not an error: it means the card has never heard of this
+// column, which is true of all of them the first time a world is played.
+//
+// A failed decode leaves the chunks it had already allocated behind — region.h documents
+// that the caller must treat the column as absent — so the half-built column is removed
+// before the generator is allowed to run over the top of it. Skipping that would blend a
+// corrupt saved column into freshly generated terrain, which is exactly the "neither state"
+// outcome the save format is built to make impossible.
+static bool workerLoadColumn(int32_t cx, int32_t cz)
+{
+	if (!s_world_dir[0]) return false;
+
+	const uint32_t n = regionReadColumn(s_world_dir, cx, cz, s_load_buf, sizeof(s_load_buf));
+	if (n == 0) return false;
+
+	if (!regionDecodeColumn(&s_staging, cx, cz, s_load_buf, n)) {
+		worldColumnRemove(&s_staging, cx, cz);
+		return false;
+	}
+
+	// A saved column with no allocated chunks encodes to a one-byte mask and decodes without
+	// creating anything, which workerInstall would read as a failed generate. Cannot happen
+	// today — a column only becomes dirty by an edit, and an edit always leaves a chunk
+	// allocated — but the install path assumes the column exists, so make it so rather than
+	// leave a one-line assumption between two files.
+	if (!worldColumnCreate(&s_staging, cx, cz)) return false;
+
+	s_loaded++;
+	return true;
+}
+
+// Writes one full save slot. Worker thread only; the slot's bytes are not touched by the
+// main thread while it is counted full, so this needs no lock of its own.
+static void workerWriteSave(int slot)
+{
+	const SaveSlot* s = &s_save[slot];
+	if (regionWriteColumn(s_world_dir, s->cx, s->cz, s->bytes, s->len)) s_saved++;
+	else                                                                s_save_failed++;
+
+	LightLock_Lock(&s_lock);
+	s_save_tail = (s_save_tail + 1) % SAVE_SLOTS;
+	s_save_count--;
+	LightLock_Unlock(&s_lock);
+}
+
 static void workerMain(void* arg)
 {
 	(void)arg;
@@ -60,17 +138,30 @@ static void workerMain(void* arg)
 
 		Job job = {JOB_NONE, 0, 0, 0};
 		bool got = false, quit = false;
+		int  save_slot = -1;
 
 		LightLock_Lock(&s_lock);
-		quit = s_quit;
+		// Saves come first and are drained even while quitting, so workerStop cannot strand
+		// a column the player edited on the way out. workerFlushSaves is still the right
+		// thing for the caller to do — it waits for the card — but the ordering here means
+		// forgetting it costs nothing.
+		if (s_save_count > 0) save_slot = s_save_tail;
+		quit = s_quit && save_slot < 0;
 		// Nothing is taken while a finished column is still waiting: there is one staging
 		// world, so the previous result would be overwritten before it was installed.
-		if (!quit && !s_ready)
+		if (!quit && save_slot < 0 && !s_ready)
 			got = jobqPop(&s_queue, &job);
 		if (got) s_in_flight = true;
 		LightLock_Unlock(&s_lock);
 
 		if (quit) break;
+
+		if (save_slot >= 0) {
+			const u64 ts = svcGetSystemTick();
+			workerWriteSave(save_slot);
+			s_busy_ticks += svcGetSystemTick() - ts;
+			continue;
+		}
 
 		if (!got) {
 			LightEvent_Wait(&s_work);
@@ -81,12 +172,19 @@ static void workerMain(void* arg)
 		const u64 t0 = svcGetSystemTick();
 		switch (job.type) {
 		case JOB_GENERATE:
-			ok = worldgenColumn(s_gen, &s_staging, job.cx, job.cz);
+			// Step 8.1. The card first: a column the player changed must come back changed,
+			// and regenerating it from the seed would quietly undo their work. Generation is
+			// the fallback for everything the card does not have, which on a fresh world is
+			// every column.
+			ok = workerLoadColumn(job.cx, job.cz);
+			if (!ok) ok = worldgenColumn(s_gen, &s_staging, job.cx, job.cz);
 			break;
 		// JOB_MESH is the main thread's — it writes GPU-visible memory, which belongs to
-		// the thread that owns the citro3d context. JOB_LOAD and JOB_SAVE are Phase 8 and
-		// have no SD-card format to read or write yet. All three are listed so that adding
-		// one is a compile error here rather than a job that silently vanishes.
+		// the thread that owns the citro3d context. JOB_LOAD and JOB_SAVE exist as job
+		// types but are not routed through the queue: loading is folded into JOB_GENERATE
+		// above, and saving has its own ring because it carries bytes, not coordinates.
+		// All three are listed so that adding one is a compile error here rather than a
+		// job that silently vanishes.
 		case JOB_MESH:
 		case JOB_LOAD:
 		case JOB_SAVE:
@@ -107,6 +205,17 @@ static void workerMain(void* arg)
 	threadExit(0);
 }
 
+void workerSetWorldDir(const char* dir)
+{
+	if (!dir || !dir[0]) { s_world_dir[0] = '\0'; return; }
+
+	// Truncated rather than refused, and then checked: a path that does not fit is a
+	// programming error in the caller, and silently saving into a *different* directory —
+	// which is what a truncated path would do — is the one outcome worse than not saving.
+	snprintf(s_world_dir, sizeof(s_world_dir), "%s", dir);
+	if (strlen(dir) >= sizeof(s_world_dir)) s_world_dir[0] = '\0';
+}
+
 bool workerStart(const WorldGen* g)
 {
 	if (s_started) return true;
@@ -116,6 +225,8 @@ bool workerStart(const WorldGen* g)
 	worldInit(&s_staging);
 	s_quit = s_in_flight = s_ready = s_ready_ok = false;
 	s_busy_ticks = s_install_ticks = 0;
+	s_save_head = s_save_tail = s_save_count = 0;
+	s_saved = s_save_failed = s_loaded = 0;
 
 	LightLock_Init(&s_lock);
 	// Sticky rather than one-shot: the worker clears it itself before each check, so a
@@ -192,6 +303,59 @@ bool workerSubmitColumn(int32_t cx, int32_t cz)
 	if (ok) LightEvent_Signal(&s_work);
 	return ok;
 }
+
+bool workerSubmitSave(const Column* col)
+{
+	if (!s_started || !s_world_dir[0] || !col) return true;
+
+	// Wait for a slot. Sleeping rather than spinning, because the thread being waited on is
+	// one priority step *below* this one: a spin here would keep the worker off the CPU
+	// altogether on core 0 and the wait would never end. 1 ms is far below the SD write it
+	// is waiting for, so the granularity costs nothing.
+	for (;;) {
+		LightLock_Lock(&s_lock);
+		const bool room = s_save_count < SAVE_SLOTS;
+		LightLock_Unlock(&s_lock);
+		if (room) break;
+		svcSleepThread(1000000ULL);
+	}
+
+	SaveSlot* s = &s_save[s_save_head];
+	s->cx  = col->cx;
+	s->cz  = col->cz;
+	s->len = regionEncodeColumn(col, s->bytes, sizeof(s->bytes));
+	if (s->len == 0) {
+		s_save_failed++;
+		return false;
+	}
+
+	// Published only once the bytes are in: the worker takes any slot the count says is
+	// full, so incrementing first would hand it a half-written buffer.
+	LightLock_Lock(&s_lock);
+	s_save_head = (s_save_head + 1) % SAVE_SLOTS;
+	s_save_count++;
+	LightLock_Unlock(&s_lock);
+	LightEvent_Signal(&s_work);
+	return true;
+}
+
+void workerFlushSaves(void)
+{
+	if (!s_started) return;
+
+	for (;;) {
+		LightLock_Lock(&s_lock);
+		const int n = s_save_count;
+		LightLock_Unlock(&s_lock);
+		if (n == 0) return;
+		LightEvent_Signal(&s_work);
+		svcSleepThread(1000000ULL);
+	}
+}
+
+int workerLoaded(void)     { return s_loaded; }
+int workerSaved(void)      { return s_saved; }
+int workerSaveFailed(void) { return s_save_failed; }
 
 bool workerInstall(World* w, int32_t* cx, int32_t* cz, bool* ok)
 {

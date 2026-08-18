@@ -75,6 +75,8 @@ int interactEdit(Interact* it, World* w, const Body* body, u32 keys_down)
 		// worldSet refuses y outside the world, which is exactly what should happen when
 		// the ray hit the solid floor below y == 0 — that is not a block anyone owns.
 		if (worldSet(w, t->x, t->y, t->z, BLOCK_AIR)) {
+			// Step 8.1. Only edits mark a column for saving — see the note on Column.dirty.
+			worldMarkDirty(w, t->x, t->z);
 			queued += chunkRenderTouch(w, t->x, t->y, t->z);
 			it->broke++;
 		} else {
@@ -106,6 +108,7 @@ int interactEdit(Interact* it, World* w, const Body* body, u32 keys_down)
 		}
 
 		if (worldSet(w, t->px, t->py, t->pz, it->holding)) {
+			worldMarkDirty(w, t->px, t->pz);
 			queued += chunkRenderTouch(w, t->px, t->py, t->pz);
 			it->placed++;
 		} else {

@@ -21,6 +21,9 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	tests/host_test.c \
 	source/world/block.c \
 	source/world/chunk.c \
+	source/world/chunk_codec.c \
+	source/world/crc32.c \
+	source/world/region.c \
 	source/world/world.c \
 	source/world/scratch.c \
 	source/world/mesher.c \

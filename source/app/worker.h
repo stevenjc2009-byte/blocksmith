@@ -78,6 +78,30 @@
 #include "world/world.h"
 #include "world/worldgen.h"
 
+// ── Step 8.1: why the save file is the worker's job too ───────────────────────────────
+//
+// Every byte that goes to or comes from the SD card is read and written on this thread, and
+// on no other. That is not about frame time — though it is worth 5-20 ms a write on a real
+// card, which is a dropped frame — it is about the card itself: libctru reaches the SD
+// through one FS service session shared by the whole process, and two threads inside it at
+// once is not a race this project wants to reason about. One thread, one file at a time,
+// and the question never comes up.
+//
+// The main thread's half is the part that needs the World, which it owns: it encodes a
+// column into a save slot and hands the *bytes* over. The worker never looks at a live
+// column, and the main thread never touches a file.
+//
+// Loading works the same way in reverse and needs no new job type: a JOB_GENERATE first
+// asks the region file for the column, and only generates when the card has nothing (or has
+// something that fails its checksum). So a column the player edited comes back as they left
+// it, and a column they never touched costs no read at all beyond the directory.
+
+// Points the worker at a world directory on the SD card, e.g.
+// "sdmc:/blocksmith/worlds/default". Must be called before workerStart; the string is
+// copied. NULL or "" — the default — means no save file at all: every column is generated
+// and none is ever written, which is what the hand-built world and the host tests want.
+void workerSetWorldDir(const char* dir);
+
 // Starts the thread. `g` must outlive the worker — it is read, never written, and the
 // worker keeps the pointer. False if the thread or its staging world could not be created.
 bool workerStart(const WorldGen* g);
@@ -101,6 +125,27 @@ bool workerInstall(World* w, int32_t* cx, int32_t* cz, bool* ok);
 // final report.
 bool workerBusy(void);
 
+// MAIN THREAD ONLY. Encodes `col` into a free save slot and hands it to the worker to write.
+// Returns false only when the column could not be encoded — a corrupt column, which is not a
+// condition this game has a way to produce — so a false here is a bug report, not a retry.
+//
+// **It blocks when every slot is full**, rather than dropping the save or writing the file
+// itself. Dropping would silently lose the player's building, and writing it here would put
+// a second thread inside the FS session. Blocking costs at most one SD write of latency, and
+// only when more dirty columns leave the ring at once than there are slots — which needs the
+// player to have edited several columns and then walked far enough for all of them to unload
+// in the same frame.
+//
+// Does nothing and returns true when no world directory is set.
+bool workerSubmitSave(const Column* col);
+
+// Blocks until every submitted save has reached the card. Called before the world is torn
+// down, so "I quit the game" and "I walked away from it" save the same way.
+void workerFlushSaves(void);
+
+int   workerLoaded(void);           // columns read back from the card instead of generated
+int   workerSaved(void);            // columns written to the card
+int   workerSaveFailed(void);       // columns whose write was refused by the card
 int   workerDropped(void);          // submissions refused because the ring was full
 int   workerQueued(void);           // jobs still waiting to be picked up
 float workerBusyMs(void);           // wall time the worker spent inside the generator
