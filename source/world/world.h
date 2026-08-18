@@ -51,6 +51,15 @@ Chunk*  worldChunk(const World* w, int cx, int cy, int cz);
 Column* worldColumnCreate(World* w, int cx, int cz);
 Chunk*  worldChunkCreate(World* w, int cx, int cy, int cz);
 
+// Frees a column and every chunk in it, returning the memory to the budget. False when
+// the column was not loaded, which is not an error — the streaming ring asks for columns
+// it may already have dropped.
+//
+// ⚠ Whatever was in the column is gone. There is no save format until step 8.1, so a
+// column that unloads and comes back is regenerated from the seed and any blocks the
+// player put there are lost. That is the known state of the game, not a bug in here.
+bool worldColumnRemove(World* w, int cx, int cz);
+
 // World block coordinates. worldGet never fails: unloaded is air, below the floor
 // is WORLD_FLOOR_BLOCK, above the ceiling is air.
 BlockId worldGet(const World* w, int x, int y, int z);

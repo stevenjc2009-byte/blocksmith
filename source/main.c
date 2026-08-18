@@ -105,6 +105,21 @@ static int worldReportBuild(void)
 #define BS_EDIT_STRESS 0
 #endif
 
+// BS_WALK_STRESS=N walks the player due east for N frames, which is step 6.1's check.
+// A ring that only ever loads is indistinguishable from a ring that streams correctly
+// until something walks out of the area it started in, and no key on this machine reaches
+// the emulated console (the same reason BS_INTERACT_DEMO exists).
+//
+// It drives the body rather than faking a button, because playerUpdate reads hidKeysHeld()
+// itself: one extra bodyStep per frame with the walk speed in vx, through the same
+// collision and auto-step the player uses. playerUpdate's own step ran with vx = 0, so the
+// speed is PLAYER_WALK_SPEED, not double it. The second step re-applies gravity for the
+// same tick, which on ground is resolved away by the floor and is the one thing about this
+// probe that is not exactly what a player would produce.
+#ifndef BS_WALK_STRESS
+#define BS_WALK_STRESS 0
+#endif
+
 // Fly mode keeps the Phase 3 free-fly camera reachable, because it is how the world gets
 // inspected from outside and it is what camera.c's BS_ORBIT drives. Walking is the
 // default: it is the thing Phase 4 is judged on.
@@ -376,24 +391,88 @@ static WorldGen s_gen;
 // column arrives.
 #define GEN_MESH_SPAN (2 * GEN_MESH_RADIUS + 1)
 #define GEN_AREA_SPAN (2 * GEN_AREA_RADIUS + 1)
-static bool s_col_queued[GEN_MESH_SPAN][GEN_MESH_SPAN];
-
-// ...and which have actually been generated and installed.
+// The ring follows the player, so these are sliding windows, not grids anchored at the
+// origin. Both are indexed modulo their span — a torus — and both store the column
+// coordinate the slot currently describes.
 //
-// This is tracked here rather than asked of the world, and that is not redundancy:
-// worldReportBuild claims a 17x17 grid of columns before anything is generated and never
-// gives it back, so worldColumn() returns non-NULL for columns 0..16 from the first
-// moment — including three of the five this area covers. Testing the world would call
-// their ring complete before a single block had been generated and mesh them against
-// air. It did, and it cost 32,358 triangles where the same world meshed after full
-// generation is 29,754.
-static bool s_col_in[GEN_AREA_SPAN][GEN_AREA_SPAN];
+// Storing the coordinate is what makes the wrap safe. When the centre moves one column, the
+// column leaving the far edge and the column entering the near edge land in the *same* slot,
+// because the window is exactly as wide as the ring. A slot that only held a flag would need
+// the caller to clear it in exactly the right order; a slot that names its own column cannot
+// be misread whatever the order, and a stale entry is simply a coordinate mismatch.
+//
+// The `installed` flag is tracked here rather than asked of the World, and that is not
+// redundancy: worldReportBuild claims a 17x17 grid of columns before anything is generated
+// and never gives it back, so worldColumn() returns non-NULL for columns 0..16 from the
+// first moment. Testing the world called their ring complete before a single block had been
+// generated and meshed them against air — 32,358 triangles where the same world meshed after
+// full generation is 29,754.
+typedef struct {
+	int32_t cx, cz;
+	bool    set;
+} ColSlot;
+
+static ColSlot s_col_in[GEN_AREA_SPAN][GEN_AREA_SPAN];      // generated and installed
+static ColSlot s_col_queued[GEN_MESH_SPAN][GEN_MESH_SPAN];  // chunks pushed to the mesh queue
+static ColSlot s_col_asked[GEN_AREA_SPAN][GEN_AREA_SPAN];   // submitted to the worker
+
+// The column the ring is centred on, and the streaming counters the overlay reports.
+static int32_t s_center_cx, s_center_cz;
+static int s_col_unloaded;      // columns freed because they left the ring
+static int s_col_dropped;       // columns generated for a ring position that had already moved
+
+// Floor-mod, so a negative column maps into the window rather than off the front of it.
+// Both spans are compile-time constants, which matters on ARM11: it has no integer divide
+// instruction, and the compiler turns a constant modulus into a multiply and a shift.
+static int genWrap(int32_t c, int span)
+{
+	const int m = (int)(c % span);
+	return m < 0 ? m + span : m;
+}
+
+// The two windows have different spans, so they are addressed as flat arrays with the span
+// passed in. `ColSlot[span][span]` is contiguous, so row * span + col is the same element
+// the two-index form would reach.
+static ColSlot* genSlot(ColSlot* grid, int span, int32_t cx, int32_t cz)
+{
+	return &grid[genWrap(cz, span) * span + genWrap(cx, span)];
+}
+
+static bool genSlotHas(ColSlot* grid, int span, int32_t cx, int32_t cz)
+{
+	const ColSlot* s = genSlot(grid, span, cx, cz);
+	return s->set && s->cx == cx && s->cz == cz;
+}
+
+static void genSlotSet(ColSlot* grid, int span, int32_t cx, int32_t cz)
+{
+	ColSlot* s = genSlot(grid, span, cx, cz);
+	s->cx = cx; s->cz = cz; s->set = true;
+}
+
+static void genSlotClear(ColSlot* grid, int span, int32_t cx, int32_t cz)
+{
+	ColSlot* s = genSlot(grid, span, cx, cz);
+	if (s->cx == cx && s->cz == cz) s->set = false;
+}
+
+static bool genInArea(int32_t cx, int32_t cz)
+{
+	const int32_t dx = cx - s_center_cx, dz = cz - s_center_cz;
+	return dx >= -GEN_AREA_RADIUS && dx <= GEN_AREA_RADIUS &&
+	       dz >= -GEN_AREA_RADIUS && dz <= GEN_AREA_RADIUS;
+}
+
+static bool genInMesh(int32_t cx, int32_t cz)
+{
+	const int32_t dx = cx - s_center_cx, dz = cz - s_center_cz;
+	return dx >= -GEN_MESH_RADIUS && dx <= GEN_MESH_RADIUS &&
+	       dz >= -GEN_MESH_RADIUS && dz <= GEN_MESH_RADIUS;
+}
 
 static bool genColumnInstalled(int32_t cx, int32_t cz)
 {
-	if (cx < -GEN_AREA_RADIUS || cx > GEN_AREA_RADIUS) return false;
-	if (cz < -GEN_AREA_RADIUS || cz > GEN_AREA_RADIUS) return false;
-	return s_col_in[cz + GEN_AREA_RADIUS][cx + GEN_AREA_RADIUS];
+	return genInArea(cx, cz) && genSlotHas(&s_col_in[0][0], GEN_AREA_SPAN, cx, cz);
 }
 
 static bool genColumnRingComplete(int32_t cx, int32_t cz)
@@ -408,11 +487,12 @@ static bool genColumnRingComplete(int32_t cx, int32_t cz)
 // been queued already.
 static void genQueueReadyColumns(void)
 {
-	for (int32_t cz = -GEN_MESH_RADIUS; cz <= GEN_MESH_RADIUS; cz++) {
-		for (int32_t cx = -GEN_MESH_RADIUS; cx <= GEN_MESH_RADIUS; cx++) {
-			bool* queued = &s_col_queued[cz + GEN_MESH_RADIUS][cx + GEN_MESH_RADIUS];
-			if (*queued || !genColumnRingComplete(cx, cz)) continue;
-			*queued = true;
+	for (int32_t dz = -GEN_MESH_RADIUS; dz <= GEN_MESH_RADIUS; dz++) {
+		for (int32_t dx = -GEN_MESH_RADIUS; dx <= GEN_MESH_RADIUS; dx++) {
+			const int32_t cx = s_center_cx + dx, cz = s_center_cz + dz;
+			if (genSlotHas(&s_col_queued[0][0], GEN_MESH_SPAN, cx, cz)) continue;
+			if (!genColumnRingComplete(cx, cz)) continue;
+			genSlotSet(&s_col_queued[0][0], GEN_MESH_SPAN, cx, cz);
 
 			for (int cy = 0; cy < COLUMN_CHUNKS; cy++) {
 				// Skipped rather than left to chunkRenderBuild's own all-air early-out,
@@ -430,25 +510,92 @@ static void genQueueReadyColumns(void)
 	}
 }
 
+// Submits every column of the current area that has neither arrived nor been asked for.
+static void genRequestArea(void)
+{
+	for (int32_t dz = -GEN_AREA_RADIUS; dz <= GEN_AREA_RADIUS; dz++) {
+		for (int32_t dx = -GEN_AREA_RADIUS; dx <= GEN_AREA_RADIUS; dx++) {
+			const int32_t cx = s_center_cx + dx, cz = s_center_cz + dz;
+			if (genSlotHas(&s_col_in[0][0], GEN_AREA_SPAN, cx, cz)) continue;
+			if (genSlotHas(&s_col_asked[0][0], GEN_AREA_SPAN, cx, cz)) continue;
+
+			if (workerSubmitColumn(cx, cz)) genSlotSet(&s_col_asked[0][0], GEN_AREA_SPAN, cx, cz);
+			else                            s_genr.submit_failed++;
+		}
+	}
+}
+
+// Frees a column and everything drawn from it. Safe to call for a column that was only
+// asked for and never arrived.
+static void genUnloadColumn(int32_t cx, int32_t cz)
+{
+	// Meshes first. A slot outliving its chunks would keep drawing terrain that is not
+	// there, and would still match in chunkRenderTouch — so an edit near the boundary
+	// would queue a remesh of a chunk that now reads as air and blank a neighbour.
+	chunkRenderReleaseColumn(cx, cz);
+	genSlotClear(&s_col_queued[0][0], GEN_MESH_SPAN, cx, cz);
+
+	if (worldColumnRemove(&s_world, cx, cz)) s_col_unloaded++;
+	genSlotClear(&s_col_in[0][0], GEN_AREA_SPAN, cx, cz);
+	genSlotClear(&s_col_asked[0][0], GEN_AREA_SPAN, cx, cz);
+}
+
+// Moves the ring to a new centre column: drop what fell outside it, then ask for what is
+// newly inside. Dropping first is not cosmetic — the windows are exactly as wide as the
+// ring, so the column leaving and the column entering share a slot.
+static void genRecenter(int32_t cx, int32_t cz)
+{
+	if (cx == s_center_cx && cz == s_center_cz) return;
+
+	const int32_t old_cx = s_center_cx, old_cz = s_center_cz;
+	s_center_cx = cx;
+	s_center_cz = cz;
+
+	// Only the old area needs sweeping: nothing outside it was ever loaded.
+	for (int32_t dz = -GEN_AREA_RADIUS; dz <= GEN_AREA_RADIUS; dz++)
+		for (int32_t dx = -GEN_AREA_RADIUS; dx <= GEN_AREA_RADIUS; dx++) {
+			const int32_t ox = old_cx + dx, oz = old_cz + dz;
+			if (!genInArea(ox, oz)) genUnloadColumn(ox, oz);
+		}
+
+	// A column that left the *mesh* ring but is still inside the generated ring keeps its
+	// blocks and loses its geometry: it is now one of the neighbours the mesher reads, not
+	// something drawn. Without this its meshes would stay on screen past the render
+	// distance and the pool would fill.
+	for (int32_t dz = -GEN_MESH_RADIUS; dz <= GEN_MESH_RADIUS; dz++)
+		for (int32_t dx = -GEN_MESH_RADIUS; dx <= GEN_MESH_RADIUS; dx++) {
+			const int32_t ox = old_cx + dx, oz = old_cz + dz;
+			if (genInMesh(ox, oz)) continue;
+			chunkRenderReleaseColumn(ox, oz);
+			genSlotClear(&s_col_queued[0][0], GEN_MESH_SPAN, ox, oz);
+		}
+
+	genRequestArea();
+	genQueueReadyColumns();
+}
+
 // Starts the worker and queues the whole area. The spawn column goes first because the
 // ring is FIFO, so it is the first one back and the player has ground under them before
 // the loop starts.
-static bool genStart(void)
+static bool genStart(int32_t cx, int32_t cz)
 {
 	worldgenInit(&s_gen, BS_WORLD_SEED);
 	jobqInit(&s_meshq);
 	memset(s_col_queued, 0, sizeof(s_col_queued));
 	memset(s_col_in, 0, sizeof(s_col_in));
+	memset(s_col_asked, 0, sizeof(s_col_asked));
 	s_genr = (GenResult){0};
 	s_genr.ran = true;
+	s_center_cx = cx;
+	s_center_cz = cz;
+	s_col_unloaded = s_col_dropped = 0;
 
 	if (!workerStart(&s_gen))
 		return false;
 
-	if (!workerSubmitColumn(0, 0)) s_genr.submit_failed++;
-	for (int32_t cz = -GEN_AREA_RADIUS; cz <= GEN_AREA_RADIUS; cz++)
-		for (int32_t cx = -GEN_AREA_RADIUS; cx <= GEN_AREA_RADIUS; cx++)
-			if ((cx || cz) && !workerSubmitColumn(cx, cz)) s_genr.submit_failed++;
+	if (workerSubmitColumn(cx, cz)) genSlotSet(&s_col_asked[0][0], GEN_AREA_SPAN, cx, cz);
+	else                            s_genr.submit_failed++;
+	genRequestArea();
 
 	return true;
 }
@@ -465,13 +612,23 @@ static bool genInstallOne(void)
 	s_genr.columns_in++;
 	if (!ok) s_genr.columns_failed++;
 
+	// The ring can have moved while this column was being generated, and the worker has no
+	// idea: it took the job before the player crossed the boundary. Installing it anyway
+	// would leak a column that no unload sweep will ever visit again, because every sweep
+	// only walks the ring.
+	if (!genInArea(cx, cz)) {
+		worldColumnRemove(&s_world, cx, cz);
+		genSlotClear(&s_col_asked[0][0], GEN_AREA_SPAN, cx, cz);
+		s_col_dropped++;
+		return true;
+	}
+
 	// Marked before the ring is tested, so the column that completes a ring counts towards
 	// it. A partial column (ok == false) is still marked: it is a hole either way, it is
 	// already counted in columns_failed, and leaving it unmarked would stall its four
 	// neighbours forever instead of meshing what did arrive.
-	if (cx >= -GEN_AREA_RADIUS && cx <= GEN_AREA_RADIUS &&
-	    cz >= -GEN_AREA_RADIUS && cz <= GEN_AREA_RADIUS)
-		s_col_in[cz + GEN_AREA_RADIUS][cx + GEN_AREA_RADIUS] = true;
+	genSlotSet(&s_col_in[0][0], GEN_AREA_SPAN, cx, cz);
+	genSlotClear(&s_col_asked[0][0], GEN_AREA_SPAN, cx, cz);
 
 	genQueueReadyColumns();
 	return true;
@@ -504,11 +661,31 @@ static int genDrainMesh(float budget_ms)
 // above nothing and fall to the world floor before the ground under them existed.
 static void genWaitSpawnColumn(void)
 {
-	while (!genColumnInstalled(0, 0)) {
+	while (!genColumnInstalled(s_center_cx, s_center_cz)) {
 		if (genInstallOne()) continue;
 		if (!workerBusy()) break;      // nothing more is coming; do not spin forever
 		svcSleepThread(1000000);       // 1 ms
 	}
+}
+
+// Called every frame with the player's feet. Cheap when nothing has changed, which is the
+// normal case: at the measured 4.31 blocks/s a column boundary comes round every 3.7 s, so
+// this is 221 comparisons for every one recentre.
+static int32_t genColumnOf(float v)
+{
+	// Two flooring steps, and neither is optional. A cast truncates *towards zero*, so
+	// (int)-0.5f is 0 where the block at -0.5 is block -1; and the block-to-chunk step is
+	// an arithmetic shift rather than a divide for the same reason — -1 / 16 is 0, -1 >> 4
+	// is -1. Getting either wrong puts the ring one column off on the negative side only,
+	// which reads as "the world streams fine until you walk west".
+	int b = (int)v;
+	if (v < 0.0f && (float)b != v) b--;
+	return (int32_t)(b >> 4);
+}
+
+static void genFollow(float x, float z)
+{
+	genRecenter(genColumnOf(x), genColumnOf(z));
 }
 
 #endif   // BS_WORLD_GEN
@@ -569,6 +746,14 @@ static void worldReportDraw(int refused, bool built,
 		       gen->columns_in, gen->columns_failed + gen->submit_failed, gen->meshed);
 		printf("wk %6.0f inst %5.1f ms q%-2d d%d \n", workerBusyMs(), workerInstallMs(),
 		       workerQueued(), workerDropped());
+#if BS_WORLD_GEN
+		// Step 6.1's line. `at` is the column the ring is centred on, `unl` the columns
+		// freed because they left it, and `stale` the columns that finished generating for
+		// a ring position the player had already walked out of — those are thrown away on
+		// arrival, and a large number there means the ring is moving faster than the worker.
+		printf("ring at %+3ld %+3ld unl %3d stale %d\n", (long)s_center_cx, (long)s_center_cz,
+		       s_col_unloaded, s_col_dropped);
+#endif
 	}
 
 	if (dig->ran)
@@ -614,7 +799,9 @@ int main(void)
 	// is already drawing. The hand-built world has no generator to move off the main
 	// thread and is still filled and meshed in one go.
 #if BS_WORLD_GEN
-	const bool worker_ok = genStart();
+	// Centred on the spawn column, which is (0, 0) — the same column playerInit puts the
+	// feet in below. From here on the ring follows the player (genFollow).
+	const bool worker_ok = genStart(0, 0);
 	genWaitSpawnColumn();
 #else
 	s_genr = (GenResult){0};
@@ -703,13 +890,13 @@ int main(void)
 	chunkRenderDirtyResetPeak();
 
 	// Only the two scripted knobs read this, so a playtest build does not carry it.
-#if BS_INTERACT_DEMO || BS_EDIT_STRESS
+#if BS_INTERACT_DEMO || BS_EDIT_STRESS || BS_WALK_STRESS
 	int frame = 0;
 #endif
 
 	while (aptMainLoop()) {
 		metricsFrameBegin();
-#if BS_INTERACT_DEMO || BS_EDIT_STRESS
+#if BS_INTERACT_DEMO || BS_EDIT_STRESS || BS_WALK_STRESS
 		frame++;
 #endif
 
@@ -732,7 +919,40 @@ int main(void)
 #else
 		playerUpdate(&player, &s_world, metricsFrameMs());
 #endif
+#if BS_WALK_STRESS
+		// Clear the startup frame's stall out of `worst` first, for the same reason
+		// BS_EDIT_STRESS does: it stands for the whole run otherwise, and the streaming
+		// cost this probe exists to measure could not be told apart from it.
+		if (frame == DEMO_START_FRAME) metricsWorstReset();
+
+		if (frame > DEMO_START_FRAME && frame <= DEMO_START_FRAME + BS_WALK_STRESS) {
+			// The same clamp playerUpdate applies (its MAX_TICK), so a long frame moves the
+			// player the distance a real one would instead of teleporting them across a
+			// ring boundary and skipping the recentre being measured.
+			float dt = metricsFrameMs() * 0.001f;
+			if (dt > 0.05f) dt = 0.05f;
+
+			player.body.vx = PLAYER_WALK_SPEED;
+			player.body.vz = 0.0f;
+			bodyStep(&player.body, &s_world, dt);
+
+			// playerUpdate does this after its own step; the camera would otherwise sit a
+			// frame behind the body, and genFollow below would centre on the old column.
+			player.cam.x = player.body.x;
+			player.cam.y = player.body.y + PLAYER_EYE;
+			player.cam.z = player.body.z;
+		}
+#endif
+
 		cameraView(&player.cam, &view);
+
+#if BS_WORLD_GEN
+		// After the move, so the ring is centred on where the player is now rather than
+		// where they were last frame — one frame of lag here is one frame of the player
+		// standing on a column that has just been unloaded. Before the aim and the edit,
+		// so nothing this frame reads a column the recentre is about to free.
+		genFollow(player.body.x, player.body.z);
+#endif
 
 		// Aim first, then edit, so the highlight and the edit in the same frame cannot
 		// disagree about which block was being pointed at.

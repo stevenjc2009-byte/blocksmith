@@ -246,6 +246,26 @@ bool chunkRenderBuild(const World* w, int cx, int cy, int cz)
 	return true;
 }
 
+int chunkRenderReleaseColumn(int cx, int cz)
+{
+	int released = 0;
+	for (int i = 0; i < MESH_SLOTS; i++) {
+		MeshSlot* s = &s_slots[i];
+		if (!s->used || s->cx != cx || s->cz != cz) continue;
+
+		// The dirty flag goes with the slot. A flag left set on a released slot would send
+		// the next drain to chunkRenderBuild with this slot's stale coordinates, which is
+		// exactly the "meshes a chunk that is no longer in the world" case above — and it
+		// would also consume the drain's budget doing it.
+		dirtyqClear(&s_dirty, i);
+
+		s->used = false;
+		s->vert_count = s->index_count = 0;
+		released++;
+	}
+	return released;
+}
+
 int chunkRenderTouch(const World* w, int x, int y, int z)
 {
 	// w is not needed to queue a chunk — only to mesh one — but the signature is kept

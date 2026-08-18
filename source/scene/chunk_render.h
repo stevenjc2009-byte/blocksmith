@@ -33,6 +33,17 @@ void chunkRenderExit(void);
 // pool is otherwise full. False means the pool was full or the mesh did not fit.
 bool chunkRenderBuild(const World* w, int cx, int cy, int cz);
 
+// Hands back every slot belonging to a column that has just been unloaded, and returns how
+// many. Call it *after* the column is gone from the World: a slot whose chunk no longer
+// exists would otherwise keep drawing terrain that is not there, and — worse — would still
+// match in chunkRenderTouch, so an edit near the world edge would queue a remesh of a chunk
+// that reads as air and quietly blank a neighbour.
+//
+// This is the one place a used slot is released without meshing. The "an empty chunk keeps
+// its slot" rule exists so a dug-out chunk stays queueable; a chunk that has left the world
+// entirely has nothing to stay queueable for.
+int chunkRenderReleaseColumn(int cx, int cz);
+
 // One block changed: marks what that can have altered as needing a remesh and returns
 // immediately — it does no meshing itself. Not just the owning chunk — see world/remesh.h
 // for why a corner edit reaches eight. Chunks with no mesh yet are left alone, so this

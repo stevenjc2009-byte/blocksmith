@@ -1040,6 +1040,81 @@ static void testColumnTableFull(void)
 	worldExit(&s_world);
 }
 
+// Unloading a column (step 6.1). The interesting half is not the free() -- it is that
+// this table is open-addressed with linear probing and NO tombstones, so emptying a slot
+// in the middle of a probe chain cuts every column behind it out of the world while its
+// memory is still claimed. That failure is invisible from the outside: the column count
+// is right, the budget is right, and a lookup just says "not loaded", which the streaming
+// ring answers by generating the column again on top of the one that is still there.
+static void testColumnRemove(void)
+{
+	worldInit(&s_world);
+	budgetReset();
+
+	// The plain case, with the accounting checked on both sides.
+	CHECK(worldChunkCreate(&s_world, 3, 0, 4) != NULL);
+	CHECK(worldChunkCreate(&s_world, 3, 5, 4) != NULL);
+	CHECK(s_world.columns == 1 && s_world.chunks == 2);
+	const size_t used_one = budgetUsed();
+	CHECK(used_one == sizeof(Column) + 2 * sizeof(Chunk));
+
+	CHECK(worldColumnRemove(&s_world, 3, 4));
+	CHECK(worldColumn(&s_world, 3, 4) == NULL);
+	CHECK(worldChunk(&s_world, 3, 0, 4) == NULL);
+	CHECK(s_world.columns == 0 && s_world.chunks == 0);
+	CHECK(budgetUsed() == 0);                 // every byte given back, not just the column
+
+	// Removing what is not there is a no-op that reports it, because the ring asks for
+	// columns it may already have dropped.
+	CHECK(!worldColumnRemove(&s_world, 3, 4));
+	CHECK(!worldColumnRemove(&s_world, -99, -99));
+	CHECK(s_world.columns == 0);
+	CHECK(budgetUsed() == 0);
+
+	// The probe-chain case. 700 columns in a 1024-slot table is a load factor of 0.68,
+	// which guarantees long chains; removing every other one and then looking up all 350
+	// survivors is what a NULL-the-slot-and-walk-away deletion cannot survive.
+	worldExit(&s_world);
+	worldInit(&s_world);
+	budgetReset();
+
+	int made = 0;
+	for (int i = 0; i < 700; i++)
+		if (worldColumnCreate(&s_world, i, -i)) made++;
+	CHECK(made == 700);
+
+	int removed = 0;
+	for (int i = 0; i < 700; i += 2)
+		if (worldColumnRemove(&s_world, i, -i)) removed++;
+	CHECK(removed == 350);
+	CHECK(s_world.columns == 350);
+
+	int lost = 0, ghost = 0, wrong = 0;
+	for (int i = 0; i < 700; i++) {
+		const Column* c = worldColumn(&s_world, i, -i);
+		if (i & 1) {
+			if (!c) lost++;
+			else if (c->cx != i || c->cz != -i) wrong++;
+		} else if (c) {
+			ghost++;
+		}
+	}
+	CHECK(lost == 0);      // a survivor stranded behind the hole
+	CHECK(ghost == 0);     // a removed column still answering
+	CHECK(wrong == 0);     // a slot holding the wrong column after the shuffle
+
+	// And the table is still usable afterwards: the 350 holes take 350 new columns.
+	int refilled = 0;
+	for (int i = 0; i < 700; i += 2)
+		if (worldColumnCreate(&s_world, i, -i)) refilled++;
+	CHECK(refilled == 350);
+	CHECK(s_world.columns == 700);
+
+	worldExit(&s_world);
+	CHECK(budgetUsed() == 0);
+	budgetReset();
+}
+
 // budgetClaim() refusing in isolation is tested in testBudget(); this is the path
 // that actually matters in play -- a real worldSet running into an exhausted budget
 // after other allocations already succeeded, and leaving the world exactly as it
@@ -2396,6 +2471,7 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testWorldAccess();
 	testWorldBytes();
 	testColumnTableFull();
+	testColumnRemove();
 	testWorldSetBudgetExhausted();
 	testScratch26();
 	testScratchFloor();
