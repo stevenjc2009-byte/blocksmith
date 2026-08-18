@@ -78,3 +78,7 @@ void metricsSetStereo(bool on, float slider, size_t vram_free, size_t right_eye_
 
 // Most recent per-frame figures, for callers that want to react to them.
 float metricsFrameMs(void);
+
+// Frames submitted since launch, as the denominator for the cumulative counters elsewhere:
+// step 9.3's cull and sight-walk runs only mean anything as a ratio against this.
+u32   metricsFrames(void);

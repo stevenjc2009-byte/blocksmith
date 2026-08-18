@@ -1,5 +1,6 @@
 #include "scene/chunk_render.h"
 
+#include <math.h>
 #include <string.h>
 
 #include "debug/metrics.h"
@@ -34,6 +35,22 @@
 #define BS_CAVECULL 1
 #endif
 
+// Step 9.2, face-direction buckets. -DBS_FACEMASK=0 draws each chunk's whole opaque run as
+// one call, which is what shipped before. Same rule as the three above: the two builds must
+// produce a pixel-identical frame. They must NOT produce the same triangle count — that is
+// the point of the step, and a build where `tris` did not move would mean the mask is
+// selecting everything and the optimisation is not running.
+#ifndef BS_FACEMASK
+#define BS_FACEMASK 1
+#endif
+
+// Step 9.3, cull once per frame instead of once per eye. -DBS_CULLCACHE=0 re-culls on every
+// chunkRenderDraw, i.e. twice in a 3D frame. Identical frame either way; the difference is
+// chunkRenderCullRuns(), which is 1 in a 3D frame with this on and 2 with it off.
+#ifndef BS_CULLCACHE
+#define BS_CULLCACHE 1
+#endif
+
 // Baked per-face brightness, the values Phase 1 proved on the single cube: a high sun
 // leaning south-east, no two faces sharing a value, so a wrong normal index shows up as
 // an obviously wrong wall instead of a subtle one. Written by name so the face order in
@@ -60,6 +77,11 @@ typedef struct {
 	// rest in the second, alpha-tested one. Equal to index_count when the chunk has no
 	// transparent geometry, which is most of them.
 	uint32_t opaque_index_count;
+
+	// Step 9.2. The mesher's face_start, carried through unchanged: where each of the six
+	// face directions starts inside the opaque run, plus a closing entry equal to
+	// opaque_index_count. See mesher.h for the layout and drawOpaque for what reads it.
+	uint32_t face_start[BLOCK_FACES + 1];
 
 	bool     used;         // owns a chunk (even if that chunk meshed to nothing)
 
@@ -135,6 +157,13 @@ static RenderDist s_dist;
 static C3D_FogLut s_fog_lut;
 
 static C3D_Mtx  s_projection;
+
+// Step 9.3. The mono projection, kept alongside the per-eye one. The cull runs from this and
+// never from s_projection, so a 3D frame culls once against a shape both eyes fit inside
+// instead of twice against two shapes that differ by a fifth of a block. Rebuilt whenever the
+// render distance moves the clip planes; nothing else can change it.
+static C3D_Mtx  s_mono_projection;
+
 static MeshSlot s_slots[MESH_SLOTS];
 static int      s_culled;        // chunks the frustum rejected on the last draw
 static int      s_sort_moved;    // step 7.2: chunks the sort took out of slot order
@@ -166,6 +195,31 @@ static VisScratch s_vis_scratch;
 // the wrong chunk would still look plausible and cull the wrong half of the world.
 static float s_cam_x, s_cam_y, s_cam_z;
 
+// Step 9.3. The visible set, computed once per frame and consumed by each eye.
+//
+// The cache is keyed on the view matrix itself rather than on a frame counter the caller has
+// to remember to tick. citro3d's stereo puts the eye offset in the *projection*, so both eyes
+// of a 3D frame are handed the same view — a byte compare is therefore an exact answer to
+// "is this the second eye of the frame I already culled?", and it cannot go stale the way a
+// flag someone has to clear can. Moving the camera changes the matrix and re-culls; standing
+// perfectly still does not, and the answer would be identical anyway. The one thing a view
+// compare cannot see is the world changing underneath a still camera, so meshing, releasing
+// and moving the clip planes all clear s_cull_valid explicitly.
+static C3D_Mtx s_cull_view;
+static bool    s_cull_valid;
+static int     s_vis_list[MESH_SLOTS];
+static float   s_vis_depth[MESH_SLOTS];
+static int     s_vis_n;
+static int     s_cull_runs;          // culls performed on the last frame: 1 in 3D, not 2
+
+// Step 9.3, the other half: the sight walk depends only on which *chunk* the camera is in, so
+// it survives every frame the player spends inside one — which at walking pace is most of
+// them. Rotating the camera invalidates the frustum and not this, which is why the two are
+// cached separately rather than under one flag.
+static bool s_walk_valid;
+static int  s_walk_cx, s_walk_cy, s_walk_cz;
+static int  s_walk_runs;             // sight walks actually performed on the last frame
+
 // The remesh backlog: one flag per slot in s_slots, parallel by index. A flag per slot
 // rather than a list of coordinates, because it makes dedup free and impossible to get
 // wrong — touching the same chunk twenty times in one frame sets the same bool twenty
@@ -189,6 +243,26 @@ static int s_build_count;
 
 // One scratch for every chunk meshed — 5,832 bytes, reused, never per-chunk.
 static MeshScratch s_scratch;
+
+// Step 9.3. Everything the per-frame cull cached is now suspect. Called from wherever the
+// *world* changes under a camera that may not have moved: the view-matrix compare cannot see
+// a remesh, an unload, or a clip plane moving, and each of those can change which chunks are
+// visible without the player touching the stick.
+static void cullInvalidate(void)
+{
+	s_cull_valid = false;
+	s_walk_valid = false;
+}
+
+// The buried-solid-rock skip that step 9.4 originally added lived here, and it is deliberately
+// gone. The idea was sound — a chunk opaque all the way through with six opaque face neighbours
+// meshes to exactly nothing — but the terrain this game generates never produces one. A census
+// over an 11x11-column area on eight seeds (scratchpad/buryprobe.c, 2026-08-18) found 4,356
+// chunks, 296 of them opaque all the way through, and **zero** with six opaque face neighbours:
+// the step 5.4 cave noise perforates the deep rock everywhere, so a fully enclosed opaque
+// neighbourhood does not occur. The test cost a 4,096-byte scan on every non-air chunk build to
+// answer "no" every time, so it was strictly a loss. If the cave parameters ever change enough
+// that solid regions appear, this is worth reinstating — the reasoning is in the vault log.
 
 static MeshSlot* slotFor(int cx, int cy, int cz)
 {
@@ -322,6 +396,15 @@ void chunkRenderSetDistance(int radius)
 	// The mono projection, which is also what a 2D frame uses. A 3D frame overwrites it twice
 	// per frame from drawEye anyway, so there is no eye state to preserve here.
 	chunkRenderSetEye(0.0f);
+
+	// Step 9.3. Kept separately from s_projection because the cull reads it every frame and
+	// s_projection is whichever eye was drawn last. Built here rather than in chunkRenderSetEye
+	// so it can only ever be the mono one.
+	Mtx_PerspTilt(&s_mono_projection, C3D_AngleFromDegrees(VIEW_FOV_DEG), 400.0f / 240.0f,
+	              s_dist.near_plane, s_dist.far_plane, false);
+
+	// The clip planes just moved, so anything the last frame decided was off-screen may not be.
+	cullInvalidate();
 }
 
 const RenderDist* chunkRenderDistance(void)
@@ -396,7 +479,9 @@ bool chunkRenderBuild(const World* w, int cx, int cy, int cz)
 	if (!chunk || chunkIsAllAir(chunk)) {
 		s->cx = cx; s->cy = cy; s->cz = cz;
 		s->vert_count = s->index_count = s->opaque_index_count = 0;
+		memset(s->face_start, 0, sizeof(s->face_start));
 		s->used = true;
+		cullInvalidate();
 
 		// Nothing to draw, but sight still has to get through it — an all-air chunk joins
 		// every pair of its faces. Skipping the flood fill here is exact, not an
@@ -436,6 +521,8 @@ bool chunkRenderBuild(const World* w, int cx, int cy, int cz)
 		s_refusals++;
 		s->used = false;      // a half-mesh is worse than no mesh
 		s->vert_count = s->index_count = s->opaque_index_count = 0;
+		memset(s->face_start, 0, sizeof(s->face_start));
+		cullInvalidate();
 		return false;
 	}
 
@@ -443,6 +530,8 @@ bool chunkRenderBuild(const World* w, int cx, int cy, int cz)
 	s->vert_count  = out.vert_count;
 	s->index_count = out.index_count;
 	s->opaque_index_count = out.opaque_index_count;
+	memcpy(s->face_start, out.face_start, sizeof(s->face_start));
+	cullInvalidate();
 
 	// Claimed even when the chunk meshed to nothing. This used to be `out.faces > 0` — an
 	// all-air chunk handed its slot straight back — and that was a bug you could reach by
@@ -471,8 +560,13 @@ int chunkRenderReleaseColumn(int cx, int cz)
 
 		s->used = false;
 		s->vert_count = s->index_count = s->opaque_index_count = 0;
+		memset(s->face_start, 0, sizeof(s->face_start));
 		released++;
 	}
+
+	// Slots left the pool, so the sight walk's box and the visible list are both describing a
+	// world that no longer exists.
+	if (released) cullInvalidate();
 	return released;
 }
 
@@ -557,13 +651,60 @@ int chunkRenderDirtyPeak(void)  { return dirtyqPeak(&s_dirty); }
 
 void chunkRenderDirtyResetPeak(void) { dirtyqResetPeak(&s_dirty); }
 
+// The camera, recovered from the view matrix rather than passed in. cameraView builds it as
+// rotations then a translation, so it is rigid: V = [R | -R*c], and c = -R^T * t. That keeps
+// chunkRenderDraw's signature honest — one matrix in, and no second copy of the camera that
+// could drift out of step with the one the vertices are transformed by.
+//
+// Hoisted out of caveWalk in step 9.2, because the face-bucket mask needs the camera position
+// too and it must be right even in a -DBS_CAVECULL=0 build, where the walk never runs.
+static void cameraFromView(const C3D_Mtx* view)
+{
+	const C3D_FVec* r0 = &view->r[0];
+	const C3D_FVec* r1 = &view->r[1];
+	const C3D_FVec* r2 = &view->r[2];
+
+	s_cam_x = -(r0->x * r0->w + r1->x * r1->w + r2->x * r2->w);
+	s_cam_y = -(r0->y * r0->w + r1->y * r1->w + r2->y * r2->w);
+	s_cam_z = -(r0->z * r0->w + r1->z * r1->w + r2->z * r2->w);
+}
+
+// Which chunk a world coordinate falls in. floorf and not a cast: a cast truncates towards
+// zero, so everything in the first chunk west of the origin would answer 0 along with the
+// chunk east of it, and the walk cache would then miss a chunk boundary crossing exactly
+// where the world is most likely to be wrong.
+static int chunkOfFloat(float v)
+{
+	return (int)floorf(v / (float)CHUNK_DIM);
+}
+
 #if BS_CAVECULL
 // Step 7.3, once per frame: box up every live slot, then walk sight outward from the camera.
 // Sets s_cave_ran, which is what the draw loop consults — a walk that could not run must let
 // everything through, because "the box was too big" is a missing optimisation and skipping
 // chunks anyway would be a hole in the world.
-static void caveWalk(const C3D_Mtx* view)
+static void caveWalk(void)
 {
+	// Step 9.3. The walk's answer is a function of the camera's *chunk* and the pool's
+	// contents, and nothing else — not the camera's position inside that chunk, and not where
+	// it is looking. So while the player stays in one chunk the previous frame's result is
+	// exactly the result this frame would compute, and at walking pace that is most frames.
+	// Anything that changes the pool clears s_walk_valid (see cullInvalidate), so the only
+	// thing left to check here is the boundary crossing.
+	const int cam_cx = chunkOfFloat(s_cam_x);
+	const int cam_cy = chunkOfFloat(s_cam_y);
+	const int cam_cz = chunkOfFloat(s_cam_z);
+
+	if (s_walk_valid && cam_cx == s_walk_cx && cam_cy == s_walk_cy && cam_cz == s_walk_cz) {
+		s_cave_ran = true;   // the cached walk is still the answer, so the cull may use it
+		return;
+	}
+
+	// Dropped before anything can fail. Every path out of here from this point on is either a
+	// completed walk, which sets it back at the end, or a refusal — and a refusal must not
+	// leave a stale walk looking valid.
+	s_walk_valid = false;
+
 	int min_x = 0, min_y = 0, min_z = 0;
 	int max_x = 0, max_y = 0, max_z = 0;
 	bool any = false;
@@ -600,33 +741,24 @@ static void caveWalk(const C3D_Mtx* view)
 		visWalkSet(&s_walk, s->cx, s->cy, s->cz, s->vis_mask, s->index_count != 0);
 	}
 
-	// The camera, recovered from the view matrix rather than passed in. cameraView builds it
-	// as rotations then a translation, so it is rigid: V = [R | -R*c], and c = -R^T * t. That
-	// keeps chunkRenderDraw's signature honest — one matrix in, and no second copy of the
-	// camera that could drift out of step with the one the vertices are transformed by.
-	const C3D_FVec* r0 = &view->r[0];
-	const C3D_FVec* r1 = &view->r[1];
-	const C3D_FVec* r2 = &view->r[2];
-	const float cam_x = -(r0->x * r0->w + r1->x * r1->w + r2->x * r2->w);
-	const float cam_y = -(r0->y * r0->w + r1->y * r1->w + r2->y * r2->w);
-	const float cam_z = -(r0->z * r0->w + r1->z * r1->w + r2->z * r2->w);
-
-	s_cam_x = cam_x; s_cam_y = cam_y; s_cam_z = cam_z;
-
-	visWalkRun(&s_walk, cam_x, cam_y, cam_z);
+	visWalkRun(&s_walk, s_cam_x, s_cam_y, s_cam_z);
 	s_cave_ran = true;
+	s_walk_runs++;
+
+	// Only now, after a walk that actually completed. An early return above — the box did not
+	// fit, or there is nothing loaded — must leave the cache invalid, or the next frame would
+	// reuse a walk that was never run and cull against whatever the last successful one said.
+	s_walk_valid = true;
+	s_walk_cx = cam_cx; s_walk_cy = cam_cy; s_walk_cz = cam_cz;
 }
 #endif
 
-// One run of one chunk's index buffer. Step 7.5 draws each chunk in up to two runs — the
-// opaque faces and then the alpha-tested ones — and both need the same model matrix and the
-// same vertex buffer, so the only thing that differs is where in the indices to start.
-static void drawRun(const C3D_Mtx* view, const MeshSlot* s, uint32_t first, uint32_t count)
+// Points the GPU at one chunk: the model matrix that places its chunk-local 0..16 vertices in
+// the world, and its vertex buffer. Split out from the draw in step 9.2, because a chunk is
+// now up to three opaque runs plus a transparent one and all four share this — setting a
+// matrix per run would hand back a good part of what the buckets save.
+static void slotBind(const C3D_Mtx* view, const MeshSlot* s)
 {
-	if (!count) return;
-
-	// Vertices are chunk-local 0..16, so the chunk is placed with a matrix rather than by
-	// baking world coordinates into bytes that could not hold them anyway.
 	C3D_Mtx model, mv;
 	Mtx_Identity(&model);
 	Mtx_Translate(&model, (float)(s->cx * CHUNK_DIM), (float)(s->cy * CHUNK_DIM),
@@ -637,49 +769,130 @@ static void drawRun(const C3D_Mtx* view, const MeshSlot* s, uint32_t first, uint
 	C3D_BufInfo* buf = C3D_GetBufInfo();
 	BufInfo_Init(buf);
 	BufInfo_Add(buf, s->verts, sizeof(MeshVertex), 2, 0x10);
+}
 
+// One run of the bound chunk's index buffer.
+static void drawIndices(const MeshSlot* s, uint32_t first, uint32_t count)
+{
+	if (!count) return;
 	C3D_DrawElements(GPU_TRIANGLES, (int)count, C3D_UNSIGNED_SHORT, s->indices + first);
 	metricsCountDraw(count / 3);
 }
 
-void chunkRenderDraw(const C3D_Mtx* view)
+// Step 7.5 pass 2 and step 4.2's neighbours still want the old one-call shape.
+static void drawRun(const C3D_Mtx* view, const MeshSlot* s, uint32_t first, uint32_t count)
 {
-	pipelineBind();   // see pipelineBind: the highlight leaves the GPU set up for itself
-	C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_uloc_projection, &s_projection);
+	if (!count) return;
+	slotBind(view, s);
+	drawIndices(s, first, count);
+}
 
-	// Step 7.1. Built once per frame from the same two matrices the draw uses, in the same
-	// order, so the cull and the rasteriser cannot disagree about where the screen edge is.
-	Frustum frustum;
-	C3D_Mtx vp;
-	Mtx_Multiply(&vp, &s_projection, view);
-	frustumFromMatrix(&frustum, &vp);
+// Step 9.2. The opaque half of one chunk, minus the face directions that cannot be looking at
+// the camera.
+//
+// The test is the chunk's own slab, one axis at a time. Every +X face in the chunk sits on a
+// plane x = bx+1 .. bx+16, and such a face is front-facing only if the camera is on the larger
+// side of its plane — so if cam_x <= bx, not one of them can be, and the whole bucket goes. The
+// same argument mirrored gives the other five. A camera inside the chunk passes both tests on
+// that axis and gets both buckets, which is right: standing in a hollow you can see walls
+// facing either way.
+//
+// This is the same thing the GPU's backface cull does, one frame stage earlier. The GPU's
+// version is exact and this one is conservative, but the GPU only reaches it after the vertex
+// shader has transformed the vertex — and the vertex stage is the narrow one on a PICA200.
+// Roughly half of a chunk's opaque vertices never leave the index buffer now.
+static void drawOpaque(const C3D_Mtx* view, const MeshSlot* s)
+{
+	if (!s->opaque_index_count) return;
+	slotBind(view, s);
+
+#if BS_FACEMASK
+	const float bx = (float)(s->cx * CHUNK_DIM);
+	const float by = (float)(s->cy * CHUNK_DIM);
+	const float bz = (float)(s->cz * CHUNK_DIM);
+	const float e  = (float)CHUNK_DIM;
+
+	bool want[BLOCK_FACES];
+	want[FACE_EAST]   = s_cam_x >  bx;
+	want[FACE_WEST]   = s_cam_x <  bx + e;
+	want[FACE_TOP]    = s_cam_y >  by;
+	want[FACE_BOTTOM] = s_cam_y <  by + e;
+	want[FACE_SOUTH]  = s_cam_z >  bz;
+	want[FACE_NORTH]  = s_cam_z <  bz + e;
+
+	// Buckets that survive next to each other are contiguous in the index buffer, so they go
+	// out as one call. From outside a chunk that is three separate directions and therefore
+	// three draws in the worst case, but the common one — a chunk off to the side and below,
+	// so +X, -Y and -Z — merges nothing, while a chunk straight ahead and level merges its
+	// pair. Merging costs a loop and saves command-buffer space, which is a fixed 0x40000
+	// bytes a frame on this hardware and something step 7 has already had to watch.
+	int f = 0;
+	while (f < BLOCK_FACES) {
+		if (!want[f]) { f++; continue; }
+		int g = f;
+		while (g + 1 < BLOCK_FACES && want[g + 1]) g++;
+		drawIndices(s, s->face_start[f], s->face_start[g + 1] - s->face_start[f]);
+		f = g + 1;
+	}
+#else
+	drawIndices(s, 0, s->opaque_index_count);
+#endif
+}
+
+// Step 9.3. Everything that decides *what* to draw, hoisted out of the draw so a 3D frame pays
+// for it once instead of once per eye. Frustum, sight walk, and the front-to-back sort are all
+// functions of the camera and the pool, and citro3d puts the eye offset in the projection —
+// both eyes are handed the same view matrix — so there was never a second answer to compute.
+//
+// The frustum comes from the *mono* projection, widened by the eye offset when the boxes are
+// tested, so the one list is a superset of what either eye can see.
+static void cullFrame(const C3D_Mtx* view)
+{
+	s_cull_runs++;
 	s_culled = 0;
 	s_cave_culled = 0;
 	s_cave_ran = false;
 
+	cameraFromView(view);
+
+	// Step 7.1. Built from the mono projection and the view the draw uses, in the same order,
+	// so the cull and the rasteriser cannot disagree about where the screen edge is.
+	Frustum frustum;
+	C3D_Mtx vp;
+	Mtx_Multiply(&vp, &s_mono_projection, view);
+	frustumFromMatrix(&frustum, &vp);
+
 #if BS_CAVECULL
-	caveWalk(view);
+	caveWalk();
 #endif
 
-	// Visible slots, gathered before anything is drawn so step 7.2 can order them.
-	int   visible[MESH_SLOTS];
-	float depth[MESH_SLOTS];
-	int   n = 0;
+	// The slack that makes one frustum answer for two eyes. Mtx_PerspStereoTilt moves the
+	// apex sideways by iod and re-aims at the focal plane, which translates the view volume
+	// and does not reshape it — so a box grown by the largest offset in every axis is a
+	// superset of both eyes' volumes. 0.2 blocks against a 16-block chunk: in 2D it keeps a
+	// handful of chunks a hair past the edge that the old per-eye test would have dropped,
+	// which costs a draw of geometry that is about to scroll on screen anyway.
+	const float slack = STEREO_MAX_IOD;
+
+	s_vis_n = 0;
 
 	for (int i = 0; i < MESH_SLOTS; i++) {
 		const MeshSlot* s = &s_slots[i];
 		if (!s->used || s->index_count == 0) continue;
 
 		// The chunk's world-space box. Exactly CHUNK_DIM on a side: the mesher never emits
-		// a vertex outside the chunk it was asked for, so there is no skin to add here, and
-		// adding one "to be safe" would keep chunks that are genuinely off-screen.
+		// a vertex outside the chunk it was asked for, so the only skin here is the eye
+		// offset above, and adding any more "to be safe" would keep chunks that are
+		// genuinely off-screen.
 		const float bx = (float)(s->cx * CHUNK_DIM);
 		const float by = (float)(s->cy * CHUNK_DIM);
 		const float bz = (float)(s->cz * CHUNK_DIM);
 
 #if BS_FRUSTUM
-		if (!frustumTestAABB(&frustum, bx, by, bz, bx + (float)CHUNK_DIM,
-		                     by + (float)CHUNK_DIM, bz + (float)CHUNK_DIM)) {
+		if (!frustumTestAABB(&frustum, bx - slack, by - slack, bz - slack,
+		                     bx + (float)CHUNK_DIM + slack,
+		                     by + (float)CHUNK_DIM + slack,
+		                     bz + (float)CHUNK_DIM + slack)) {
 			s_culled++;
 			continue;
 		}
@@ -700,29 +913,33 @@ void chunkRenderDraw(const C3D_Mtx* view)
 		// is exactly its distance in front of the camera. Row 3 of the same view-projection
 		// the frustum came from, so there is no second copy of the camera to keep in step —
 		// one dot product, no square root, no camera position threaded through the API.
+		// Row 3 is untouched by the eye offset, so the mono matrix gives the same order the
+		// per-eye ones would.
 		const float h = (float)CHUNK_DIM * 0.5f;
-		depth[n] = vp.r[3].x * (bx + h) + vp.r[3].y * (by + h) +
-		           vp.r[3].z * (bz + h) + vp.r[3].w;
-		visible[n] = i;
-		n++;
+		s_vis_depth[s_vis_n] = vp.r[3].x * (bx + h) + vp.r[3].y * (by + h) +
+		                       vp.r[3].z * (bz + h) + vp.r[3].w;
+		s_vis_list[s_vis_n] = i;
+		s_vis_n++;
 	}
 
+	const int n = s_vis_n;
+
 #if BS_SORT
-	// Insertion sort, nearest first. Insertion rather than anything cleverer because n is
-	// at most MESH_SLOTS (64) and in practice around a dozen after the frustum has run, and
-	// because the order barely changes between frames — a nearly-sorted input is the case
+	// Insertion sort, nearest first. Insertion rather than anything cleverer because n is at
+	// most MESH_SLOTS (150) and in practice a bit over a hundred after the frustum has run,
+	// and because the order barely changes between frames — a nearly-sorted input is the case
 	// insertion sort is linear on, which is exactly what walking through a world produces.
 	for (int i = 1; i < n; i++) {
-		const float d = depth[i];
-		const int   v = visible[i];
+		const float d = s_vis_depth[i];
+		const int   v = s_vis_list[i];
 		int j = i - 1;
-		while (j >= 0 && depth[j] > d) {
-			depth[j + 1]   = depth[j];
-			visible[j + 1] = visible[j];
+		while (j >= 0 && s_vis_depth[j] > d) {
+			s_vis_depth[j + 1] = s_vis_depth[j];
+			s_vis_list[j + 1]  = s_vis_list[j];
 			j--;
 		}
-		depth[j + 1]   = d;
-		visible[j + 1] = v;
+		s_vis_depth[j + 1] = d;
+		s_vis_list[j + 1]  = v;
 	}
 #endif
 
@@ -734,15 +951,38 @@ void chunkRenderDraw(const C3D_Mtx* view)
 	s_sort_moved = 0;
 	s_sort_ok    = true;
 	for (int k = 0; k < n; k++) {
-		if (k > 0 && depth[k] < depth[k - 1]) s_sort_ok = false;
-		if (k > 0 && visible[k] < visible[k - 1]) s_sort_moved++;
+		if (k > 0 && s_vis_depth[k] < s_vis_depth[k - 1]) s_sort_ok = false;
+		if (k > 0 && s_vis_list[k] < s_vis_list[k - 1]) s_sort_moved++;
 	}
 
+	s_cull_view  = *view;
+	s_cull_valid = true;
+}
+
+void chunkRenderDraw(const C3D_Mtx* view)
+{
+	// Step 9.3. Cull, unless this is the second eye of a frame already culled. The key is the
+	// view matrix itself: both eyes are handed the same one, so a byte compare answers the
+	// question exactly and without the caller having to remember to tick anything. Anything
+	// that changes the world rather than the camera clears s_cull_valid directly.
+#if BS_CULLCACHE
+	if (!s_cull_valid || memcmp(&s_cull_view, view, sizeof(C3D_Mtx)) != 0)
+		cullFrame(view);
+#else
+	cullFrame(view);
+#endif
+
+	const int n = s_vis_n;
+
+	pipelineBind();   // see pipelineBind: the highlight leaves the GPU set up for itself
+	C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_uloc_projection, &s_projection);
+
 	// Step 7.5, pass 1: the opaque run of every visible chunk, nearest first, which is the
-	// order step 7.2 just put them in.
+	// order step 7.2 just put them in — minus, since step 9.2, the face directions pointing
+	// away from the camera.
 	for (int k = 0; k < n; k++) {
-		const MeshSlot* s = &s_slots[visible[k]];
-		drawRun(view, s, 0, s->opaque_index_count);
+		const MeshSlot* s = &s_slots[s_vis_list[k]];
+		drawOpaque(view, s);
 	}
 
 	// Pass 2: the transparent run, farthest first and with the alpha test on.
@@ -760,7 +1000,7 @@ void chunkRenderDraw(const C3D_Mtx* view)
 	s_alpha_draws = 0;
 	C3D_AlphaTest(true, GPU_GREATER, ALPHA_CUTOFF);
 	for (int k = n - 1; k >= 0; k--) {
-		const MeshSlot* s = &s_slots[visible[k]];
+		const MeshSlot* s = &s_slots[s_vis_list[k]];
 		const uint32_t  count = s->index_count - s->opaque_index_count;
 		if (!count) continue;
 
@@ -840,6 +1080,14 @@ void chunkRenderProfile(float* scratch_us, float* mesh_us, int* builds)
 	if (mesh_us)    *mesh_us    = (float)s_mesh_ticks    / per_us / (float)n;
 	if (builds)     *builds     = s_build_count;
 }
+
+// Step 9.3's evidence, and the only way to tell the cache from a coincidence. Both are
+// cumulative since boot, so the claim they support is a ratio: cull runs against frames drawn
+// should be 1:1 in 2D and — the whole point — still 1:1 in 3D, where it was 2:1 before. Sight
+// walks against frames should sit far below 1, because the player crosses a chunk boundary
+// every sixteen blocks and not every frame.
+uint32_t chunkRenderCullRuns(void) { return (uint32_t)s_cull_runs; }
+uint32_t chunkRenderWalkRuns(void) { return (uint32_t)s_walk_runs; }
 
 int    chunkRenderCulled(void)     { return s_culled; }
 int    chunkRenderSortMoved(void)  { return s_sort_moved; }

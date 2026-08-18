@@ -370,3 +370,8 @@ void metricsSetStereo(bool on, float slider, size_t vram_free, size_t right_eye_
 }
 
 float metricsFrameMs(void)  { return s_now.frame_ms; }
+
+// Frames submitted since launch. Step 9.3 needs it as a denominator: "the cull ran 4,102
+// times" says nothing on its own, and "4,102 culls across 4,102 frames of a 3D build" is the
+// entire claim.
+u32   metricsFrames(void)   { return s_frame; }

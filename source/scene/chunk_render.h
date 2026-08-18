@@ -161,6 +161,16 @@ bool     chunkRenderSortOk(void);
 int      chunkRenderCaveCulled(void);
 bool     chunkRenderCaveRan(void);
 
+// Step 9.3's evidence, cumulative since boot. chunkRenderCullRuns() counts how many times the
+// frustum-plus-sight-walk-plus-sort pass actually ran; chunkRenderWalkRuns() how many times the
+// sight walk itself did. Cumulative rather than per frame because the claims are ratios against
+// the frame count: culls per frame must stay 1 even in a 3D frame, which draws twice, and walks
+// per frame must fall well below 1, since the walk only changes when the camera crosses a chunk
+// boundary. Neither is visible on screen — a frame culled twice looks exactly like a frame
+// culled once — so without these two numbers the step cannot be checked at all.
+uint32_t chunkRenderCullRuns(void);
+uint32_t chunkRenderWalkRuns(void);
+
 // The camera position the sight walk started from, recovered by inverting the view matrix
 // rather than being passed in. Reported so it can be checked against the camera main.c
 // already holds: the inversion is either exact or nonsense, and a walk begun from the wrong

@@ -872,6 +872,20 @@ static void worldReportDraw(int refused, bool built,
 	// opaque pass and the world would still look almost right.
 	printf("alpha %2d draws %5lu tris        \n", chunkRenderAlphaDraws(),
 	       (unsigned long)chunkRenderAlphaTris());
+
+	// Phase 9's evidence, and none of it is visible on screen — every one of these changes is
+	// meant to leave the picture exactly as it was.
+	//
+	// `cull/f` is culls per frame: at most 1.00 is the claim, in 2D and — the point of step
+	// 9.3 — in 3D as well, where the frame draws twice and used to cull twice. It goes well
+	// below 1 with the camera held still, because the cache is keyed on the view matrix and a
+	// stationary camera has nothing to re-cull. `walk/f` is sight walks per frame, which sits
+	// lower again: the walk only changes when the camera crosses a chunk boundary.
+	const uint32_t frames = metricsFrames();
+	const float    denom  = frames ? (float)frames : 1.0f;
+	printf("cull/f %4.2f walk/f %4.2f          \n",
+	       (float)chunkRenderCullRuns() / denom,
+	       (float)chunkRenderWalkRuns() / denom);
 	// Step 7.7. The setting, and the two numbers derived from it that decide whether it works:
 	// how far the fade lets you see, and whether it finishes before the load boundary. `hides`
 	// reading NO is the one failure mode that looks like scenery — chunks appearing out of

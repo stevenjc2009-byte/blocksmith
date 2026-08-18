@@ -350,6 +350,155 @@ static void testMesherTransparentSplit(void)
 	free(out.indices);
 }
 
+// Step 9.1. An opaque block underneath a see-through one must keep the face between them.
+//
+// Found by the 2026-08-18 culling audit, not by looking at the screen, and that is the point:
+// the neighbour test culled on `solid` alone, and leaves are solid. So the stone under a leaf,
+// and — far more often — the trunk inside its own canopy, lost the faces pointing at the
+// leaves. Through the alpha-0 holes in the leaf tile that reads as a pinhole of sky in the
+// middle of a tree, a few pixels across, which is exactly the kind of thing nobody finds by
+// playing and nobody sees in a screenshot.
+//
+// The rule the mesher now follows, and the reason each half exists:
+//
+//   cull iff the neighbour is solid AND (it is opaque OR it is the same block id)
+//
+// The first half is the occlusion that has always been there. The second is what keeps a
+// canopy cheap — leaf against leaf is still culled, so the transparent pass draws the shell of
+// a tree and not every leaf inside it. Dropping the second half would be correct and would
+// also multiply the canopy's face count; dropping the first is what shipped.
+static void testMesherOpaqueBehindTransparent(void)
+{
+	MeshOut out = {0};
+	out.vert_cap  = MESH_MAX_VERTS;
+	out.index_cap = MESH_MAX_INDICES;
+	out.verts     = (MeshVertex*)malloc(sizeof(MeshVertex) * out.vert_cap);
+	out.indices   = (uint16_t*)malloc(sizeof(uint16_t) * out.index_cap);
+	CHECK(out.verts != NULL && out.indices != NULL);
+	if (!out.verts || !out.indices) { free(out.verts); free(out.indices); return; }
+
+	// The premise. Leaves are solid (they occupy their cell for collision and AO) and
+	// transparent (you can see past them), and those are different questions.
+	CHECK(blockIsSolid(BLOCK_LEAVES));
+	CHECK(blockInfo(BLOCK_LEAVES)->transparent);
+	CHECK(!blockInfo(BLOCK_STONE)->transparent);
+
+	// --- Baseline: a one-block-thick stone floor with nothing above it. 256 top faces.
+	worldInit(&s_world);
+	for (int z = 0; z < CHUNK_DIM; z++)
+		for (int x = 0; x < CHUNK_DIM; x++)
+			CHECK_QUIET(worldSet(&s_world, CHUNK_DIM + x, CHUNK_DIM, CHUNK_DIM + z, BLOCK_STONE));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	const uint32_t bare_floor_faces = out.opaque_faces;
+	CHECK(bare_floor_faces > 0);
+
+	// --- Now put a leaf directly on one of those stone blocks. The stone's top face is now
+	// looking at a leaf instead of at air, and it must still be emitted: the leaf does not
+	// fill the pixels it covers. So the opaque count must not move at all.
+	CHECK(worldSet(&s_world, CHUNK_DIM + 4, CHUNK_DIM + 1, CHUNK_DIM + 4, BLOCK_LEAVES));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.opaque_faces == bare_floor_faces);
+
+	// The leaf itself keeps five faces, not six: the one pointing down at the stone is
+	// genuinely hidden, because stone is opaque. The asymmetry is the whole rule.
+	CHECK(out.faces == bare_floor_faces + 5);
+
+	// --- The canopy case, which is the one that actually happens. A wood post with leaves
+	// packed around it: every wood face touching a leaf must survive.
+	worldExit(&s_world);
+	worldInit(&s_world);
+	CHECK(worldSet(&s_world, CHUNK_DIM + 8, CHUNK_DIM + 8, CHUNK_DIM + 8, BLOCK_WOOD));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.opaque_faces == 6);        // lone wood block in air
+
+	for (int dy = -1; dy <= 1; dy++)
+		for (int dz = -1; dz <= 1; dz++)
+			for (int dx = -1; dx <= 1; dx++) {
+				if (!dx && !dy && !dz) continue;
+				const int lx = CHUNK_DIM + 8 + dx;
+				const int ly = CHUNK_DIM + 8 + dy;
+				const int lz = CHUNK_DIM + 8 + dz;
+				CHECK_QUIET(worldSet(&s_world, lx, ly, lz, BLOCK_LEAVES));
+			}
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.opaque_faces == 6);        // still all six, now that they face leaves
+
+	// And the shell around it is still culled internally: the 26 leaves form a 3x3x3 box with
+	// one cell missing, so the transparent run is its outside surface (54 faces) plus the six
+	// inward faces around the wood — leaf against wood is leaf against something opaque, so
+	// those six are culled too. 54 exactly, and if same-material culling ever broke this
+	// number would jump.
+	CHECK(out.faces - out.opaque_faces == 54);
+
+	worldExit(&s_world);
+	free(out.verts);
+	free(out.indices);
+}
+
+// Step 9.2. The opaque run is laid out face-major, six contiguous buckets, so the renderer
+// can drop the three directions that point away from the camera without touching the mesh.
+// That saving is only sound if the layout is exactly what it claims, and nothing on screen
+// would show it slipping: a mis-sized bucket draws the wrong triangles, and a bucket holding
+// mixed normals makes the whole optimisation silently wrong in a way that only shows as faces
+// vanishing at certain angles. So it is pinned here.
+static void testMesherFaceBuckets(void)
+{
+	MeshOut out = {0};
+	out.vert_cap  = MESH_MAX_VERTS;
+	out.index_cap = MESH_MAX_INDICES;
+	out.verts     = (MeshVertex*)malloc(sizeof(MeshVertex) * out.vert_cap);
+	out.indices   = (uint16_t*)malloc(sizeof(uint16_t) * out.index_cap);
+	CHECK(out.verts != NULL && out.indices != NULL);
+	if (!out.verts || !out.indices) { free(out.verts); free(out.indices); return; }
+
+	// A 4x4x4 cube of stone floating in air: every one of the six directions is exposed, and
+	// each shows exactly a 4x4 slab, so all six buckets must come out the same known size.
+	worldInit(&s_world);
+	for (int y = 0; y < 4; y++)
+		for (int z = 0; z < 4; z++)
+			for (int x = 0; x < 4; x++) {
+				const int wx = CHUNK_DIM + 6 + x;
+				const int wy = CHUNK_DIM + 6 + y;
+				const int wz = CHUNK_DIM + 6 + z;
+				CHECK_QUIET(worldSet(&s_world, wx, wy, wz, BLOCK_STONE));
+			}
+
+	// One leaf well away from it, so there is a transparent run after the opaque one. The
+	// buckets must close at the opaque boundary and not run on into it.
+	CHECK(worldSet(&s_world, CHUNK_DIM + 2, CHUNK_DIM + 2, CHUNK_DIM + 2, BLOCK_LEAVES));
+
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+
+	CHECK(out.face_start[0] == 0);
+	CHECK(out.face_start[BLOCK_FACES] == out.opaque_index_count);
+	CHECK(out.opaque_index_count < out.index_count);   // the leaf is there, after the buckets
+
+	// 16 faces a side, six indices a face.
+	for (int f = 0; f < BLOCK_FACES; f++) {
+		const uint32_t len = out.face_start[f + 1] - out.face_start[f];
+		CHECK_QUIET(len == 16 * 6);
+	}
+
+	// The layout claim itself: every index inside bucket f must land on a vertex whose
+	// normal is f. This is the thing the renderer bets on when it skips a bucket. If the
+	// mesher ever went back to walking cell-major, bucket 0 would hold all six normals
+	// and this would go red.
+	for (int f = 0; f < BLOCK_FACES; f++)
+		for (uint32_t i = out.face_start[f]; i < out.face_start[f + 1]; i++) {
+			const uint8_t nrm = out.verts[out.indices[i]].nrm;
+			CHECK_QUIET(nrm == (uint8_t)f);
+		}
+
+	worldExit(&s_world);
+	free(out.verts);
+	free(out.indices);
+}
+
 // The mesher, step 3.1. The counts here are the whole point of the step: a solid
 // chunk with solid neighbours must emit *nothing*, and a lone block must emit exactly
 // six faces. Both are invisible on screen — a chunk meshed with its interior included
@@ -1760,6 +1909,55 @@ static void testAllAirMeshesToNothing(void)
 	free(out.indices);
 }
 
+// The mirror of the test above: a chunk of solid opaque rock, with six neighbours the same,
+// also meshes to nothing. Nothing skips that build any more — step 9.4's buried-chunk early-out
+// was removed once a census showed the case never occurs in generated terrain, see
+// scene/chunk_render.c — but the mesher property itself is worth pinning down, because the two
+// halves of it fail in opposite directions and neither is visible on screen: a mesher that
+// emitted the enclosed faces would burn the whole budget on geometry inside solid rock, and one
+// that dropped a face too many would carve a hole in a cave wall nobody would find except by
+// walking into it.
+static void testAllOpaqueMeshesToNothing(void)
+{
+	MeshOut out = {0};
+	out.vert_cap  = MESH_MAX_VERTS;
+	out.index_cap = MESH_MAX_INDICES;
+	out.verts     = (MeshVertex*)malloc(sizeof(MeshVertex) * out.vert_cap);
+	out.indices   = (uint16_t*)malloc(sizeof(uint16_t) * out.index_cap);
+	CHECK(out.verts != NULL && out.indices != NULL);
+	if (!out.verts || !out.indices) { free(out.verts); free(out.indices); return; }
+
+	worldInit(&s_world);
+
+	// The full 3x3x3, middle included: solid rock with solid rock all around it.
+	bool built = true;
+	for (int dy = 0; dy <= 2; dy++)
+		for (int dz = 0; dz <= 2; dz++)
+			for (int dx = 0; dx <= 2; dx++)
+				built = fillChunk(dx, dy, dz, BLOCK_STONE) && built;
+	CHECK(built);
+
+	const Chunk* middle = worldChunk(&s_world, 1, 1, 1);
+	CHECK(middle != NULL);
+	CHECK(!chunkIsAllAir(middle));      // solid rock is not the all-air case above
+
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.faces == 0);
+	CHECK(out.index_count == 0);
+
+	// One block of air inside it and exactly the six faces around that hole appear. This is
+	// the direction that matters: a mesher that still emitted nothing here would delete a cave.
+	CHECK(worldSet(&s_world, 16 + 8, 16 + 8, 16 + 8, BLOCK_AIR));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.faces == 6);
+
+	worldExit(&s_world);
+	free(out.verts);
+	free(out.indices);
+}
+
 // --- Step 5.1: seeded PRNG and value noise -----------------------------------------
 //
 // The step's stated criterion is "same seed produces byte-identical chunks across runs".
@@ -2893,6 +3091,8 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testScratchFloor();
 	testMesher();
 	testMesherTransparentSplit();
+	testMesherOpaqueBehindTransparent();
+	testMesherFaceBuckets();
 	testMesherAO();
 	testRemeshList();
 	testIncrementalRemesh();
@@ -2904,6 +3104,7 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testEditPersistence();
 	testControlFeel();
 	testAllAirMeshesToNothing();
+	testAllOpaqueMeshesToNothing();
 	testRng();
 	testNoiseDeterminism();
 	testWorldgenTerrain();

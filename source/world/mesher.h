@@ -42,6 +42,22 @@ typedef struct {
 	uint32_t    opaque_index_count;
 	uint32_t    opaque_faces;
 
+	// Step 9.2. Where each of the six face directions starts inside the opaque run, plus a
+	// closing entry, so the length of bucket f is always face_start[f+1] - face_start[f] with
+	// no last-element special case. face_start[0] is 0 and face_start[BLOCK_FACES] equals
+	// opaque_index_count, always.
+	//
+	// The opaque geometry is emitted face-major — every +X face in the chunk, then every -X
+	// face, and so on — so each bucket is one contiguous run the renderer can draw or skip
+	// whole. At most three of the six directions can face the camera, so the renderer submits
+	// at most half of a chunk's opaque vertices. The GPU was already throwing the other half
+	// away in the backface test, but only after transforming them, and the vertex stage is
+	// the narrow one on this hardware. See chunkRenderDraw.
+	//
+	// The transparent run is deliberately NOT bucketed: it is a few percent of the geometry
+	// and it has to be drawn back-to-front as one ordered sequence.
+	uint32_t    face_start[BLOCK_FACES + 1];
+
 	bool        overflow;    // ran out of room: the mesh is incomplete, not corrupt
 } MeshOut;
 

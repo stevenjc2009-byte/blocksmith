@@ -75,6 +75,14 @@ typedef struct {
 // is two dependent loads; resolving all 5,832 cells up front makes each of those one.
 static uint8_t  s_cell_solid[SCRATCH_BLOCKS];
 
+// Step 9.1. Whether each cell *occludes* — solid and opaque. Solidity alone was the test until
+// the 2026-08-18 audit, and it culled the face between an opaque block and a see-through one:
+// the stone under a leaf, and the trunk inside its own canopy, lost the faces pointing at the
+// leaves and showed sky through the alpha holes instead. A second table rather than a second
+// condition on the block id, for the same reason s_cell_solid is a table: this is read once per
+// face, about 24,000 times a chunk, and it has to stay a single byte load.
+static uint8_t  s_cell_occl[SCRATCH_BLOCKS];
+
 static FacePlan s_plan[BLOCK_FACES];
 static uint8_t  s_solid[256];                       // indexed by a raw BlockId byte
 
@@ -83,6 +91,7 @@ static uint8_t  s_solid[256];                       // indexed by a raw BlockId 
 // A byte table for the same reason s_solid is one: the alternative is a call into
 // block.c per cell, and there is no link-time optimisation in this build.
 static uint8_t  s_deferred[256];
+static uint8_t  s_occludes[256];                    // solid and opaque: hides what is behind it
 static AtlasRect s_rect[BLOCK_COUNT][BLOCK_FACES];
 static bool     s_ready;
 
@@ -96,6 +105,7 @@ static void planBuild(void)
 		const BlockInfo* info = blockInfo((BlockId)i);
 		s_solid[i]    = (uint8_t)info->solid;
 		s_deferred[i] = (uint8_t)(info->solid && info->transparent);
+		s_occludes[i] = (uint8_t)(info->solid && !info->transparent);
 	}
 
 	for (int id = 0; id < BLOCK_COUNT; id++)
@@ -204,15 +214,42 @@ static void emitFace(MeshOut* o, int si, int lx, int ly, int lz,
 	o->faces++;
 }
 
-// One geometry pass over the chunk. `deferred` selects which half of the blocks it emits:
-// false for the opaque ones, true for the ones step 7.5 defers to the alpha-tested pass.
+// Step 9.2. One cell that is going to emit something: where it is, and what it is.
 //
-// Two passes over the same 4,096 cells rather than one pass writing into two buffers. The
-// second pass costs one byte test per cell — s_deferred is a table, and the cells it skips
-// cost nothing else — while a single pass would have to keep two index cursors and then
-// splice the runs together, for geometry that is a few percent of a chunk.
-static void meshPass(MeshOut* out, const MeshScratch* s, bool deferred)
+// This list exists because the opaque geometry is now laid out face-major — six runs, one per
+// face direction, see meshChunk — and the obvious way to produce that, six sweeps of the 4,096
+// cells, re-pays the solidity test, the block-id load and the deferred test five extra times
+// per cell. Sweeping once into this list and then walking the list six times pays them once,
+// and the list is already filtered down to the cells that can emit at all.
+//
+// 24 KB of .bss, static for the same reason MeshScratch is: the main thread's stack is 32 KB
+// and this runs on it.
+typedef struct {
+	uint16_t si;              // the cell's scratch index
+	uint8_t  id;              // its block, for the atlas rects
+	uint8_t  lx, ly, lz;      // its chunk-local position, 0..15
+} EmitCell;
+
+static EmitCell s_emit[CHUNK_BLOCKS];
+static int      s_emit_opaque_n;   // opaque cells, [0, s_emit_opaque_n)
+static int      s_emit_alpha_lo;   // transparent cells, [s_emit_alpha_lo, CHUNK_BLOCKS)
+
+// Both halves in one sweep, growing towards each other from the two ends of one array. They
+// cannot collide: together they are at most the 4,096 cells of a chunk.
+//
+// One sweep, not two. Until step 9.2 the transparent geometry got a full second walk of the
+// 4,096 cells, which for the overwhelming majority of chunks — every one with no leaves in it
+// anywhere — found nothing and cost the walk regardless.
+//
+// The transparent half comes out in reverse spatial order, because it is filled from the back.
+// That is fine and deliberate: it is drawn as one alpha-tested run inside a chunk that is
+// itself depth-sorted against the others, and cutout geometry is order-independent within a
+// draw. Nothing downstream may assume otherwise.
+static void emitCollect(const MeshScratch* s)
 {
+	int opaque = 0;
+	int alpha  = CHUNK_BLOCKS;
+
 	// y outer, x inner: x is the contiguous axis in both the chunk and the scratch, so
 	// this walks memory forwards. The scratch index rides along with the x loop rather
 	// than being recomputed per cell — 4,096 multiplies a chunk that buy nothing.
@@ -222,27 +259,57 @@ static void meshPass(MeshOut* out, const MeshScratch* s, bool deferred)
 
 			for (int lx = 0; lx < CHUNK_DIM; lx++, si++) {
 				if (!s_cell_solid[si]) continue;
+
 				const BlockId id = s->blocks[si];
-				if ((bool)s_deferred[id] != deferred) continue;
+				EmitCell*     e  = s_deferred[id] ? &s_emit[--alpha] : &s_emit[opaque++];
 
-				// Solid implies a real registry row, since s_solid says no for every id
-				// past the registry — so s_rect is safe to index without a check.
-				const AtlasRect* rects = s_rect[id];
-
-				for (int face = 0; face < BLOCK_FACES; face++) {
-					// A face exists only where solid meets non-solid. This single test
-					// is what removes 22 of every 24 faces in solid rock — and it reads
-					// the border of the scratch, so chunk seams are culled against the
-					// real neighbour instead of guessing air.
-					//
-					// It reads `solid`, not `transparent`, which is what keeps a canopy
-					// cheap: leaf against leaf is still culled, so the second pass draws
-					// the shell of a tree and not every leaf inside it.
-					if (s_cell_solid[si + s_plan[face].neighbour]) continue;
-
-					emitFace(out, si, lx, ly, lz, face, &rects[face]);
-				}
+				e->si = (uint16_t)si;
+				e->id = (uint8_t)id;
+				e->lx = (uint8_t)lx;
+				e->ly = (uint8_t)ly;
+				e->lz = (uint8_t)lz;
 			}
+		}
+	}
+
+	s_emit_opaque_n = opaque;
+	s_emit_alpha_lo = alpha;
+}
+
+// One geometry pass over a list of cells. `deferred` says which list it is: the flag decides
+// whether same-material culling applies, and it is constant for the whole pass, so the opaque
+// pass pays nothing for it. [face_first, face_end) selects which face directions to emit, so
+// the caller can lay the opaque run out face-major — see meshChunk.
+static void meshPass(MeshOut* out, const MeshScratch* s, const EmitCell* cells, int n,
+                     bool deferred, int face_first, int face_end)
+{
+	for (int i = 0; i < n; i++) {
+		const EmitCell* e  = &cells[i];
+		const int       si = e->si;
+
+		// Solid implies a real registry row, since s_solid says no for every id past the
+		// registry — so s_rect is safe to index without a check.
+		const AtlasRect* rects = s_rect[e->id];
+
+		for (int face = face_first; face < face_end; face++) {
+			const int ni = si + s_plan[face].neighbour;
+
+			// A face is hidden only by a neighbour that actually covers it. That is the
+			// test which removes 22 of every 24 faces in solid rock, and it reads the
+			// border of the scratch, so chunk seams are culled against the real neighbour
+			// instead of guessing air.
+			if (s_cell_occl[ni]) continue;
+
+			// ...and, in the transparent pass only, by a neighbour of the same material.
+			// This is what keeps a canopy cheap: leaf against leaf is culled, so the pass
+			// draws the shell of a tree and not every leaf inside it.
+			//
+			// The two halves are deliberately not one test on `solid`. Culling on solidity
+			// alone is what hid the trunk faces inside a canopy — see
+			// testMesherOpaqueBehindTransparent.
+			if (deferred && s_cell_solid[ni] && s->blocks[ni] == e->id) continue;
+
+			emitFace(out, si, e->lx, e->ly, e->lz, face, &rects[face]);
 		}
 	}
 }
@@ -256,17 +323,36 @@ void meshChunk(MeshOut* out, const MeshScratch* s)
 
 	if (!s_ready) planBuild();
 
-	for (int i = 0; i < SCRATCH_BLOCKS; i++)
-		s_cell_solid[i] = s_solid[s->blocks[i]];
+	for (int i = 0; i < SCRATCH_BLOCKS; i++) {
+		const BlockId id = s->blocks[i];
+		s_cell_solid[i] = s_solid[id];
+		s_cell_occl[i]  = s_occludes[id];
+	}
 
-	meshPass(out, s, false);
+	// Which cells emit at all, and which half of the frame each belongs to. One sweep for both.
+	emitCollect(s);
+
+	// Step 9.2. The opaque run is laid out face-major: six walks of the emit list, one per face
+	// direction, so each direction ends up as one contiguous stretch of indices the renderer
+	// can draw or skip whole. It skips the three directions that point away from the camera,
+	// which is about half the opaque vertices of every chunk on screen, every frame, per eye.
+	out->face_start[0] = 0;
+	for (int face = 0; face < BLOCK_FACES; face++) {
+		meshPass(out, s, s_emit, s_emit_opaque_n, false, face, face + 1);
+		out->face_start[face + 1] = out->index_count;
+	}
 
 	// The boundary between the two runs, taken before the second pass writes anything.
 	// Recorded even when the second pass turns out to be empty, so the renderer never has
 	// to special-case "this chunk has no transparent geometry" — it draws a zero-length
-	// second run, which it already skips.
+	// second run, which it already skips. face_start[BLOCK_FACES] is this same number by
+	// construction, which is what makes the last bucket's length need no special case.
 	out->opaque_index_count = out->index_count;
 	out->opaque_faces       = out->faces;
 
-	meshPass(out, s, true);
+	// The transparent pass. Not bucketed by face: it is a few percent of the geometry, and it
+	// is drawn back-to-front as one ordered sequence. A chunk with no transparent blocks — most
+	// of them — passes a count of zero here and the call returns immediately.
+	meshPass(out, s, &s_emit[s_emit_alpha_lo], CHUNK_BLOCKS - s_emit_alpha_lo,
+	         true, 0, BLOCK_FACES);
 }
