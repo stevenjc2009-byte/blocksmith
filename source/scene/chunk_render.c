@@ -115,6 +115,24 @@ static int             s_uloc_faceshade;
 #define FOG_GRADIENT  2.44f
 #endif
 
+// Step 7.6. The field of view lives here now instead of inline in chunkRenderInit, because
+// the mono and the two stereo projections must all be built from the same one — an eye
+// matrix a degree off the other would read as eye strain rather than as a bug.
+#define VIEW_FOV_DEG  65.0f
+
+// How far apart the eyes are, in blocks, at the 3D slider's maximum, and how far away the
+// plane that lands *on* the screen is. Both are comfort settings rather than physical ones:
+// the real interocular distance would be about 0.065 m, and a block is nominally a metre, so
+// 0.20 is a little over three times human separation — the exaggeration is deliberate and
+// standard for a handheld, because the screen is small and a physically correct separation
+// reads as almost flat on it. The focal length is what decides how much of the world sits
+// *behind* the screen rather than in front of it; 4 blocks puts the convergence plane a bit
+// beyond arm's reach, so terrain recedes into the screen and nothing painful pokes out of it.
+//
+// These are the two numbers to change if the effect reads wrong, and they are the only ones.
+#define STEREO_MAX_IOD    0.20f
+#define STEREO_FOCAL_LEN  4.0f
+
 static C3D_FogLut s_fog_lut;
 
 static C3D_Mtx  s_projection;
@@ -273,8 +291,7 @@ bool chunkRenderInit(void)
 	if (!atlasInit())
 		return false;
 
-	Mtx_PerspTilt(&s_projection, C3D_AngleFromDegrees(65.0f), 400.0f / 240.0f,
-	              VIEW_NEAR, VIEW_FAR, false);
+	chunkRenderSetEye(0.0f);
 
 	// Built once — it is 512 bytes of exponentials and nothing about it changes per frame.
 	// Only the three register writes that point the GPU at it are repeated, in pipelineBind.
@@ -282,6 +299,29 @@ bool chunkRenderInit(void)
 
 	pipelineBind();
 	return true;
+}
+
+// Step 7.6. Rebuilds the projection for one eye, and everything downstream — the frustum
+// test, the sight walk, the draw, and the highlight, which reads this same matrix — follows
+// it without knowing which eye it is looking through.
+//
+// iod 0 takes the mono branch rather than passing 0 to the stereo call. The two agree
+// mathematically, but "2D is bit-for-bit the matrix it was before 7.6" is worth having as a
+// fact rather than as an argument, given 2D is the default and the mode the game is judged in.
+void chunkRenderSetEye(float iod)
+{
+	if (iod == 0.0f) {
+		Mtx_PerspTilt(&s_projection, C3D_AngleFromDegrees(VIEW_FOV_DEG), 400.0f / 240.0f,
+		              VIEW_NEAR, VIEW_FAR, false);
+		return;
+	}
+	Mtx_PerspStereoTilt(&s_projection, C3D_AngleFromDegrees(VIEW_FOV_DEG), 400.0f / 240.0f,
+	                    VIEW_NEAR, VIEW_FAR, iod, STEREO_FOCAL_LEN, false);
+}
+
+float chunkRenderMaxIod(void)
+{
+	return STEREO_MAX_IOD;
 }
 
 // The world's projection matrix, so the highlight can line its cage up with the blocks

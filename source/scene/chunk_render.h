@@ -100,6 +100,18 @@ void chunkRenderDirtyResetPeak(void);
 // program and its own vertex format — does not have to put the GPU back afterwards.
 void chunkRenderDraw(const C3D_Mtx* view);
 
+// Step 7.6. Points the world at one eye. Call it before chunkRenderDraw; everything that
+// reads the projection — the frustum test, the sight walk, the draw itself, and the
+// highlight, which shares this matrix — follows without knowing which eye it is.
+//
+// `iod` is the interocular offset in blocks: negative for the left eye, positive for the
+// right, and exactly 0 for a 2D frame, which is the default and takes a separate branch so
+// that the mono matrix is bit-for-bit what it was before this step. chunkRenderMaxIod() is
+// the offset at the 3D slider's maximum, so the caller can scale the slider by it without
+// owning a second copy of the number.
+void  chunkRenderSetEye(float iod);
+float chunkRenderMaxIod(void);
+
 // The projection the world is drawn with, so a second pass can match it exactly instead
 // of keeping its own copy of the field of view and clip planes.
 const C3D_Mtx* chunkRenderProjection(void);

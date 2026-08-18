@@ -56,6 +56,15 @@ static volatile u32 s_lost_rows;     // ring was full: the writer fell behind
 // one row nobody would think to distrust.
 static char s_selftest[33];
 
+// Step 7.6's three facts, pushed in by main.c once a frame rather than read from here:
+// metrics.c has no business knowing about eyes, and screen.c has no business knowing about
+// the overlay. Whether the mode is on, where the console's slider is, and what is left of
+// VRAM after the right eye's render target.
+static bool   s_stereo;
+static float  s_slider;
+static size_t s_vram_free;
+static size_t s_right_eye_bytes;
+
 static Thread       s_writer;
 static LightEvent   s_writer_wake;
 static volatile bool s_writer_stop;
@@ -308,13 +317,27 @@ void metricsDrawOverlay(const char* status)
 	printf("%-32s\n", s_selftest[0] ? s_selftest : "selftest: not run");
 	printf("%-32s\n", spark);
 	printf("(| = dropped frame, >25 ms)     \n");
-	printf("                                \n");
+	// Step 7.6, on what used to be a blank spacer row. `slider` is the console's own 3D
+	// slider, which is not the same question as whether the game is in 3D: at slider 0 the
+	// two eyes are identical pictures and the mode still costs two of them, so "on" with a
+	// 0.00 slider is the one combination that looks broken and is not. `vram` is what the
+	// right eye's render target left behind, and `eye` is what it took — measured across the
+	// allocation in screenInit, not arithmetic. On the overlay rather than in a boot printf
+	// for the same reason the self-test line is: a line printed once has scrolled away
+	// before the emulator window is even paintable.
+	//
+	// Squeezed labels because the row has to fit 32 columns: the console drops the rest of a
+	// longer line silently, so a readable-but-33-column version of this would lose the eye
+	// figure off the right edge without saying so.
+	printf("3d %s sl%4.2f free%4luK eye%3luK\n", s_stereo ? "on " : "off", s_slider,
+	       (unsigned long)(s_vram_free / 1024), (unsigned long)(s_right_eye_bytes / 1024));
 	printf("%-32s\n", status ? status : "");
 	// Walking-mode controls, which is what a playtest build boots into. The free-fly
 	// camera's L/R up-down is a developer knob (main.c, BS_FLY) and is left off the
 	// legend rather than listed as something that does nothing.
 	printf("pad look  D-pad walk  A jump   \n");
-	printf("X break  Y place     START exit\n");
+	printf("X break  Y place  SELECT 3D    \n");
+	printf("START exit                     \n");
 }
 
 void metricsWorstReset(void)
@@ -336,6 +359,14 @@ void metricsSetSelfTest(const char* summary)
 			s_selftest[i] = summary[i];
 
 	s_selftest[i] = '\0';
+}
+
+void metricsSetStereo(bool on, float slider, size_t vram_free, size_t right_eye_bytes)
+{
+	s_stereo          = on;
+	s_slider          = slider;
+	s_vram_free       = vram_free;
+	s_right_eye_bytes = right_eye_bytes;
 }
 
 float metricsFrameMs(void)  { return s_now.frame_ms; }

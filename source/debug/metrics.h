@@ -69,5 +69,12 @@ void metricsWorstReset(void);
 // Truncated to 32 columns, which is all the console has.
 void metricsSetSelfTest(const char* summary);
 
+// Step 7.6's state, for the overlay row. `on` is whether the game is drawing two eyes,
+// `slider` is where the console's own 3D slider sits — a different question, since 3D on
+// with the slider at 0 still costs two eyes and draws two identical pictures — `vram_free` is
+// what is left after the right eye's render target was claimed, and `right_eye_bytes` is what
+// that target took (measured across the allocation, see screenRightEyeBytes).
+void metricsSetStereo(bool on, float slider, size_t vram_free, size_t right_eye_bytes);
+
 // Most recent per-frame figures, for callers that want to react to them.
 float metricsFrameMs(void);

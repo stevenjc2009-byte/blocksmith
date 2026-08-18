@@ -731,6 +731,37 @@ static void genFollow(float x, float z)
 
 #endif   // BS_WORLD_GEN
 
+// Step 7.6. Stereoscopic 3D, off until the player asks for it with SELECT.
+//
+// Off is the default and it is not a placeholder: the plan's constraint is that no feature
+// may depend on the 3D budget, so the game has to be judged in 2D and 3D has to be something
+// it can afford to lose. Nothing else in the program reads this — the only difference a
+// second eye makes is that the frame below runs its draw twice with a different projection.
+static bool s_stereo = false;
+
+// One eye's worth of frame: point the world's projection at it, clear, and draw. In 2D this
+// is called once with iod 0 and the sequence is identical to what it was before step 7.6.
+//
+// Each eye clears its own target. The right eye is a separate render target with its own
+// colour and depth buffer, so drawing into it without clearing would composite this frame's
+// right eye on top of the last one's.
+static void drawEye(C3D_RenderTarget* target, const C3D_Mtx* view, const RayHit* hit,
+                    float iod)
+{
+	chunkRenderSetEye(iod);
+	C3D_RenderTargetClear(target, C3D_CLEAR_ALL, CLEAR_COLOR, 0);
+	C3D_FrameDrawOn(target);
+	chunkRenderDraw(view);
+	for (int i = 0; i < BS_GPU_STRESS; i++) chunkRenderDraw(view);
+
+	// After the world, because it re-binds the GPU for its own vertex format and does not
+	// put it back — chunkRenderDraw re-establishes everything it needs at the top of its
+	// next call instead. See pipelineBind in chunk_render.c. highlightDraw itself checks
+	// hit->hit (see highlight.h), so there is no guard here to keep in sync with it.
+	// It reads chunkRenderProjection(), so it gets this eye's matrix for free.
+	highlightDraw(view, hit);
+}
+
 // `built` and `mesh_refused` are startup facts, so they belong in the report drawn once
 // rather than on the per-frame status line: the console is 32 columns and the status line
 // needs all of them for the aim, edit and queue counters that change every frame.
@@ -981,6 +1012,15 @@ int main(void)
 		u32 down = hidKeysDown();
 		if (down & KEY_START) break;
 
+		// Step 7.6. SELECT toggles 3D. gfxSet3D is what actually splits the top screen into
+		// two framebuffers, so it moves with the flag rather than being set once: left on
+		// while only one eye is being drawn, the hardware would show the right eye's stale
+		// buffer to the right eye.
+		if (down & KEY_SELECT) {
+			s_stereo = !s_stereo;
+			gfxSet3D(s_stereo);
+		}
+
 #if BS_WORLD_GEN
 		// Take delivery of at most one generated column, before anything reads the world
 		// this frame. One column is all the worker can hand over per install
@@ -1110,17 +1150,20 @@ int main(void)
 		metricsSyncBegin();
 		C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
 		metricsSyncEnd();
-			C3D_RenderTargetClear(screenTop(), C3D_CLEAR_ALL, CLEAR_COLOR, 0);
-			C3D_FrameDrawOn(screenTop());
-			chunkRenderDraw(&view);
-			for (int i = 0; i < BS_GPU_STRESS; i++) chunkRenderDraw(&view);
-
-			// After the world, because it re-binds the GPU for its own vertex format and
-			// does not put it back — chunkRenderDraw re-establishes everything it needs at
-			// the top of its next call instead. See pipelineBind in chunk_render.c.
-			// highlightDraw itself now checks it.target.hit (see highlight.h), so there is
-			// no guard here to keep in sync with it.
-			highlightDraw(&view, &it.target);
+			// Step 7.6. In 2D this is one call with iod 0, which is exactly the frame this
+			// loop drew before the step existed. In 3D it is the same work twice, and that
+			// is the cost the plan warned about rather than an implementation to be
+			// optimised away: two eyes means two frustum tests, two sight walks and two
+			// sets of draw calls, so the frame roughly doubles.
+			//
+			// Both eyes are drawn whenever 3D is on, even at slider 0 where the two
+			// pictures are identical. Skipping the right eye there would leave the right
+			// framebuffer holding whatever was in it when the slider was last open, and the
+			// moment the player nudged the slider a stale frame would flash.
+			const float iod = s_stereo ? osGet3DSliderState() * chunkRenderMaxIod() : 0.0f;
+			drawEye(screenTop(), &view, &it.target, s_stereo ? -iod : 0.0f);
+			if (s_stereo)
+				drawEye(screenTopRight(), &view, &it.target, iod);
 		metricsSubmitBegin();
 		C3D_FrameEnd(0);
 		metricsSubmitEnd();
@@ -1165,6 +1208,9 @@ int main(void)
 			snprintf(status, sizeof(status), "aim none b%d p%d r%d dq%d/%d",
 			         it.broke, it.placed, it.refused,
 			         chunkRenderDirtyCount(), chunkRenderDirtyPeak());
+
+		metricsSetStereo(s_stereo, osGet3DSliderState(), screenVramFree(),
+		                 screenRightEyeBytes());
 
 		// Init failures belong on screen, not in a comment: without this the only symptom
 		// of a broken highlight shader is "the cage does not appear", which is
