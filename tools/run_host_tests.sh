@@ -28,8 +28,10 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/world/budget.c \
 	source/world/dirtyq.c \
 	source/world/jobq.c \
+	source/world/visgraph.c \
 	source/world/worldgen.c \
 	source/world/world_test.c \
+	-lm \
 	-o build-host/world_test
 
 ./build-host/world_test

@@ -59,25 +59,26 @@ int chunkRenderReleaseColumn(int cx, int cz);
 // never grows the working set. Returns how many chunks were newly queued (a chunk touched
 // twice before it drains, or one with no slot, does not add to the count).
 //
-// Why this queues instead of meshing on the spot: a remesh costs ~1.47 ms (scratchFill
-// plus meshChunk — see chunkRenderProfile) and a corner edit reaches all eight chunks
-// around it, so meshing immediately would cost 8 x 1.47 ms = 11.8 ms against a 16.71 ms
-// frame at 59.83 Hz — one edit would eat almost the whole frame, and holding a break
-// button down would drop frames continuously. Queueing lets chunkRenderDrainDirty spread
-// that cost over as many frames as it takes.
+// Why this queues instead of meshing on the spot: a remesh costs ~2.1 ms (scratchFill plus
+// meshChunk at ~1.47 ms — see chunkRenderProfile — plus the 0.63 ms step 7.3's visibility
+// fill added, see chunkRenderVisUs) and a corner edit reaches all eight chunks around it,
+// so meshing immediately would cost 8 x 2.1 ms = 16.8 ms against a 16.71 ms frame at
+// 59.83 Hz — one edit would eat the whole frame outright, and holding a break button down
+// would drop frames continuously. Queueing lets chunkRenderDrainDirty spread that cost
+// over as many frames as it takes.
 int chunkRenderTouch(const World* w, int x, int y, int z);
 
 // Remeshes queued chunks until budget_ms of wall clock has been spent, max_chunks have been
 // completed, or the queue runs dry, and returns how many it completed. Call once per frame.
-// At ~1.47 ms a chunk, a 4 ms budget clears two or three, so the worst case of eight queued
-// chunks (a corner edit) drains over two or three frames instead of stalling one frame for
-// 11.8 ms.
+// At ~2.1 ms a chunk, a 4 ms budget clears two or three, so the worst case of eight queued
+// chunks (a corner edit) drains over three or four frames instead of stalling one frame for
+// 16.8 ms.
 //
 // Two limits rather than one, because they fail differently. The clock can only stop the
 // loop *after* a chunk has already overrun it — so on its own the worst case is
 // "budget plus however long one chunk took", which is not a number anyone can plan a frame
 // around. The count stops the loop before the next chunk starts, which makes the worst case
-// max_chunks x ~1.5 ms and lets step 6.2 share one budget across the edit queue and the
+// max_chunks x ~2.1 ms and lets step 6.2 share one budget across the edit queue and the
 // streaming queue without either of them being able to eat the frame.
 //
 // Always remeshes at least one chunk when the queue is non-empty, whatever budget_ms and
@@ -118,6 +119,25 @@ int      chunkRenderCulled(void);
 // whether the sequence it emitted really was non-decreasing in distance.
 int      chunkRenderSortMoved(void);
 bool     chunkRenderSortOk(void);
+
+// Step 7.3's evidence. chunkRenderCaveCulled() is how many chunks the sight walk rejected
+// that the frustum had *kept* — the two counts are disjoint, so they can be added up.
+// chunkRenderCaveRan() is false when the walk had to be skipped because the loaded area did
+// not fit VisWalk's box, in which case nothing was cave-culled at all and the count is 0 for
+// a reason that has nothing to do with the terrain.
+int      chunkRenderCaveCulled(void);
+bool     chunkRenderCaveRan(void);
+
+// The camera position the sight walk started from, recovered by inverting the view matrix
+// rather than being passed in. Reported so it can be checked against the camera main.c
+// already holds: the inversion is either exact or nonsense, and a walk begun from the wrong
+// chunk would cull plausibly and wrongly.
+void     chunkRenderCamera(float* x, float* y, float* z);
+
+// Average microseconds step 7.3's flood fill added to a chunk build. Separate from
+// chunkRenderProfile's two buckets on purpose — new cost on a path with an existing budget
+// has to be visible on its own, not hidden inside a number that was already there.
+float    chunkRenderVisUs(void);
 
 // Hash of every vertex byte in the pool, independent of slot order. Comparing an
 // incrementally remeshed pool against a fully rebuilt one is the only check that can

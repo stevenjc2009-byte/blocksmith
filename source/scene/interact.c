@@ -8,7 +8,7 @@
 // Does the player's box overlap the unit cube at (bx,by,bz)? This is a plain geometric
 // test rather than a call into physics.c's bodyBlocked, because the block in question has
 // not been written to the world yet — and it must not be, since writing it and then
-// reverting would already have queued a remesh and charged the frame 1.47 ms a chunk for
+// reverting would already have queued a remesh and charged the frame 2.1 ms a chunk for
 // an edit that never happened.
 static bool boxOverlapsCell(const Body* b, int bx, int by, int bz)
 {

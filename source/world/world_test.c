@@ -16,6 +16,7 @@
 #include "world/raycast.h"
 #include "world/remesh.h"
 #include "world/scratch.h"
+#include "world/visgraph.h"
 #include "world/world.h"
 #include "world/worldgen.h"
 
@@ -2458,6 +2459,239 @@ static void testJobQueue(void)
 	CHECK(jobqConsistent(&q));
 }
 
+// ---------------------------------------------------------------------------------------
+// Step 7.3, cave culling. Two things are being tested and only one of them is "does it cull":
+// the far more important property is that it never culls something it should have kept, and
+// most of what follows is aimed at that.
+
+// 35 KB and 18 KB. Static, because the 3DS main thread's stack is 32 KB and a test that only
+// runs on the host is still the wrong place to learn that.
+static VisWalk    s_walk;
+static VisScratch s_vis_scratch;
+static Chunk      s_vis_chunk;
+
+static void testVisPairIndex(void)
+{
+	// Fifteen distinct indices covering 0..14 exactly once, symmetric, and -1 on the
+	// diagonal. visChunkConnectivity ORs bits by this number and visWalkRun reads them back
+	// by it, so a collision here would silently join two faces that are not joined.
+	int seen[VIS_PAIRS] = {0};
+	int diagonal_wrong  = 0;
+	int asymmetric      = 0;
+	int out_of_range    = 0;
+
+	for (int a = 0; a < BLOCK_FACES; a++) {
+		for (int b = 0; b < BLOCK_FACES; b++) {
+			const int i = visPairIndex(a, b);
+			if (a == b) { if (i != -1) diagonal_wrong++; continue; }
+			if (i != visPairIndex(b, a)) asymmetric++;
+			if (i < 0 || i >= VIS_PAIRS) { out_of_range++; continue; }
+			if (a < b) seen[i]++;
+		}
+	}
+	CHECK(diagonal_wrong == 0);
+	CHECK(asymmetric == 0);
+	CHECK(out_of_range == 0);
+
+	int covered = 0;
+	for (int i = 0; i < VIS_PAIRS; i++)
+		if (seen[i] == 1) covered++;
+	CHECK(covered == VIS_PAIRS);
+
+	// The walk turns an entry face into the neighbour's entry face with face ^ 1, which is
+	// only correct because block.h writes the faces in +/- pairs. That is a contract between
+	// two files, so it is asserted rather than assumed.
+	CHECK((FACE_EAST ^ 1) == FACE_WEST);
+	CHECK((FACE_WEST ^ 1) == FACE_EAST);
+	CHECK((FACE_TOP ^ 1) == FACE_BOTTOM);
+	CHECK((FACE_BOTTOM ^ 1) == FACE_TOP);
+	CHECK((FACE_SOUTH ^ 1) == FACE_NORTH);
+	CHECK((FACE_NORTH ^ 1) == FACE_SOUTH);
+}
+
+static void testVisConnectivity(void)
+{
+	// Solid rock joins nothing.
+	chunkClear(&s_vis_chunk, BLOCK_STONE);
+	CHECK(visChunkConnectivity(&s_vis_chunk, &s_vis_scratch) == 0);
+
+	// Open sky joins everything — all fifteen pairs, and no bit above them.
+	chunkClear(&s_vis_chunk, BLOCK_AIR);
+	const uint16_t open = visChunkConnectivity(&s_vis_chunk, &s_vis_scratch);
+	CHECK(open == 0x7FFF);
+
+	// A straight east-west tunnel through solid rock joins east to west and nothing else.
+	// This is the case the whole algorithm exists for: every other face of this chunk is
+	// stone, so a camera to the north of it can see nothing beyond it.
+	chunkClear(&s_vis_chunk, BLOCK_STONE);
+	for (int x = 0; x < CHUNK_DIM; x++)
+		s_vis_chunk.blocks[chunkIndex(x, 8, 8)] = BLOCK_AIR;
+
+	const uint16_t tunnel = visChunkConnectivity(&s_vis_chunk, &s_vis_scratch);
+	CHECK(visConnected(tunnel, FACE_EAST, FACE_WEST));
+	CHECK(!visConnected(tunnel, FACE_TOP, FACE_BOTTOM));
+	CHECK(!visConnected(tunnel, FACE_EAST, FACE_TOP));
+	CHECK(!visConnected(tunnel, FACE_NORTH, FACE_SOUTH));
+	CHECK(tunnel == (uint16_t)(1u << visPairIndex(FACE_EAST, FACE_WEST)));
+
+	// Add a vertical shaft that does not meet the tunnel. Two separate components, so the
+	// mask gains top-bottom and must NOT gain east-top: a fill that leaked between the two
+	// would report a sight line that does not exist and stop the cull working at all.
+	for (int y = 0; y < CHUNK_DIM; y++)
+		s_vis_chunk.blocks[chunkIndex(2, y, 2)] = BLOCK_AIR;
+
+	const uint16_t both = visChunkConnectivity(&s_vis_chunk, &s_vis_scratch);
+	CHECK(visConnected(both, FACE_EAST, FACE_WEST));
+	CHECK(visConnected(both, FACE_TOP, FACE_BOTTOM));
+	CHECK(!visConnected(both, FACE_EAST, FACE_TOP));
+	CHECK(!visConnected(both, FACE_WEST, FACE_BOTTOM));
+
+	// Now join them, and the pairs that were absent must appear. Without this the test above
+	// would pass just as well against a fill that never connects anything.
+	for (int z = 2; z <= 8; z++)
+		s_vis_chunk.blocks[chunkIndex(2, 8, z)] = BLOCK_AIR;
+
+	const uint16_t joined = visChunkConnectivity(&s_vis_chunk, &s_vis_scratch);
+	CHECK(visConnected(joined, FACE_EAST, FACE_TOP));
+	CHECK(visConnected(joined, FACE_WEST, FACE_BOTTOM));
+
+	// Leaves are opaque today (block.c says so, and step 7.5 is where that changes), so a
+	// canopy blocks sight exactly like stone. When 7.5 flips the flag this check flips with
+	// it, which is the point of writing the fill against solid && !transparent rather than
+	// against solid.
+	chunkClear(&s_vis_chunk, BLOCK_LEAVES);
+	CHECK(visChunkConnectivity(&s_vis_chunk, &s_vis_scratch) == 0);
+}
+
+// Fills a walk box of nx x 1 x 1 chunks, every cell drawable, and returns how many the walk
+// reached. `middle_mask` is the connectivity of the cell between the camera and the far end.
+static int visLineWalk(uint16_t middle_mask, bool set_middle)
+{
+	CHECK_QUIET(visWalkBegin(&s_walk, 0, 0, 0, 3, 1, 1));
+	visWalkSet(&s_walk, 0, 0, 0, VIS_ALL_CONNECTED, true);
+	if (set_middle) visWalkSet(&s_walk, 1, 0, 0, middle_mask, true);
+	visWalkSet(&s_walk, 2, 0, 0, VIS_ALL_CONNECTED, true);
+
+	// Camera in the middle of chunk 0, looking along +X.
+	return visWalkRun(&s_walk, 8.0f, 8.0f, 8.0f);
+}
+
+static void testVisWalk(void)
+{
+	// A wall of rock in the middle: the far chunk is unreachable, so it must not be drawn.
+	CHECK(visLineWalk(0, true) == 2);
+	CHECK(visWalkVisible(&s_walk, 0, 0, 0));
+	CHECK(visWalkVisible(&s_walk, 1, 0, 0));    // the wall itself is on screen
+	CHECK(!visWalkVisible(&s_walk, 2, 0, 0));   // what is behind it is not
+
+	// The same box with the wall open. If this did not change, the check above would be
+	// proving nothing — it would pass against a walk that culled everything.
+	CHECK(visLineWalk(VIS_ALL_CONNECTED, true) == 3);
+	CHECK(visWalkVisible(&s_walk, 2, 0, 0));
+
+	// ...and a coordinate that was never inserted at all must behave like open sky, not like
+	// a wall. main.c never meshes an all-air chunk, so the sky above the terrain is a hole in
+	// the mesh list; a hole that stopped the walk would cull the world from head height up.
+	CHECK(visLineWalk(0, false) == 2);          // only two cells are drawable now
+	CHECK(visWalkVisible(&s_walk, 2, 0, 0));
+	CHECK(!visWalkVisible(&s_walk, 1, 0, 0));   // nothing there to draw
+
+	// A tunnel that runs east-west lets sight through along x and stops it going up. This is
+	// the connectivity mask actually steering the walk rather than the walk ignoring it.
+	CHECK_QUIET(visWalkBegin(&s_walk, 0, 0, 0, 2, 2, 1));
+	visWalkSet(&s_walk, 0, 0, 0, VIS_ALL_CONNECTED, true);
+	visWalkSet(&s_walk, 1, 0, 0, (uint16_t)(1u << visPairIndex(FACE_EAST, FACE_WEST)), true);
+	visWalkSet(&s_walk, 0, 1, 0, 0, true);
+	visWalkSet(&s_walk, 1, 1, 0, VIS_ALL_CONNECTED, true);
+	CHECK(visWalkRun(&s_walk, 8.0f, 8.0f, 8.0f) == 3);
+	CHECK(visWalkVisible(&s_walk, 1, 0, 0));
+	CHECK(visWalkVisible(&s_walk, 0, 1, 0));    // entered straight up out of the camera cell
+	CHECK(!visWalkVisible(&s_walk, 1, 1, 0));   // only reachable through two closed faces
+
+	// The camera's own cell is always visible, even when it is solid rock in every direction.
+	// Over-culling here would blank the screen from inside a wall.
+	CHECK_QUIET(visWalkBegin(&s_walk, 0, 0, 0, 3, 1, 1));
+	visWalkSet(&s_walk, 0, 0, 0, 0, true);
+	visWalkSet(&s_walk, 1, 0, 0, 0, true);
+	visWalkSet(&s_walk, 2, 0, 0, 0, true);
+	CHECK(visWalkRun(&s_walk, 8.0f, 8.0f, 8.0f) == 2);   // itself, plus the wall it faces
+	CHECK(visWalkVisible(&s_walk, 0, 0, 0));
+
+	// Standing in the middle of an open box, everything is visible: the walk must be able to
+	// leave in both directions along an axis when the camera is inside that slab.
+	CHECK_QUIET(visWalkBegin(&s_walk, 0, 0, 0, 3, 1, 1));
+	for (int i = 0; i < 3; i++) visWalkSet(&s_walk, i, 0, 0, VIS_ALL_CONNECTED, true);
+	CHECK(visWalkRun(&s_walk, 24.0f, 8.0f, 8.0f) == 3);
+
+	// A camera outside the box enters at the nearest cell rather than being lost. The player
+	// standing at the edge of the loaded area is this case every time the ring recentres.
+	CHECK_QUIET(visWalkBegin(&s_walk, 0, 0, 0, 3, 1, 1));
+	for (int i = 0; i < 3; i++) visWalkSet(&s_walk, i, 0, 0, VIS_ALL_CONNECTED, true);
+	CHECK(visWalkRun(&s_walk, -100.0f, 8.0f, 8.0f) == 3);
+
+	// A negative camera coordinate must floor, not truncate: at x = -1.5 the camera is in
+	// chunk -1, and answering chunk 0 would start the walk one cell too far east and cull
+	// whatever is behind it.
+	CHECK_QUIET(visWalkBegin(&s_walk, -1, 0, 0, 2, 1, 1));
+	visWalkSet(&s_walk, -1, 0, 0, VIS_ALL_CONNECTED, true);
+	visWalkSet(&s_walk,  0, 0, 0, 0, true);
+	CHECK(visWalkRun(&s_walk, -1.5f, 8.0f, 8.0f) == 2);
+	CHECK(visWalkVisible(&s_walk, -1, 0, 0));
+
+	// A box bigger than the scratch is refused rather than silently truncated. The caller's
+	// only safe response is to draw everything, so this has to be reported and not guessed.
+	CHECK(!visWalkBegin(&s_walk, 0, 0, 0, VIS_BOX_MAX_XZ + 1, 1, 1));
+	CHECK(!visWalkBegin(&s_walk, 0, 0, 0, 1, VIS_BOX_MAX_Y + 1, 1));
+	CHECK(!visWalkBegin(&s_walk, 0, 0, 0, 1, 1, 0));
+	CHECK(visWalkBegin(&s_walk, 0, 0, 0, VIS_BOX_MAX_XZ, VIS_BOX_MAX_Y, VIS_BOX_MAX_XZ));
+
+	// And the full-size box does not walk off the end of its queue: every cell open, camera
+	// in a corner, which is the most pushes the walk can ever generate.
+	for (int y = 0; y < VIS_BOX_MAX_Y; y++)
+		for (int z = 0; z < VIS_BOX_MAX_XZ; z++)
+			for (int x = 0; x < VIS_BOX_MAX_XZ; x++)
+				visWalkSet(&s_walk, x, y, z, VIS_ALL_CONNECTED, true);
+	CHECK(visWalkRun(&s_walk, 0.0f, 0.0f, 0.0f) ==
+	      VIS_BOX_MAX_XZ * VIS_BOX_MAX_Y * VIS_BOX_MAX_XZ);
+}
+
+// The property that matters most: the walk must never cull a chunk that a straight, purely
+// axis-aligned open path reaches. Built from real terrain rather than a hand-made box, so it
+// exercises the fill and the walk together.
+static void testVisWalkNeverHidesOpenSky(void)
+{
+	CHECK_QUIET(visWalkBegin(&s_walk, 0, 0, 0, 4, VIS_BOX_MAX_Y, 4));
+
+	// Solid ground in the bottom two chunk layers, open air above. Every air chunk above the
+	// ground, and the ground layer itself, has to survive.
+	chunkClear(&s_vis_chunk, BLOCK_STONE);
+	const uint16_t rock = visChunkConnectivity(&s_vis_chunk, &s_vis_scratch);
+	chunkClear(&s_vis_chunk, BLOCK_AIR);
+	const uint16_t sky = visChunkConnectivity(&s_vis_chunk, &s_vis_scratch);
+
+	for (int y = 0; y < VIS_BOX_MAX_Y; y++)
+		for (int z = 0; z < 4; z++)
+			for (int x = 0; x < 4; x++)
+				visWalkSet(&s_walk, x, y, z, (y < 2) ? rock : sky, true);
+
+	// Camera standing on the ground at the corner of the box, eye height inside chunk y = 2.
+	const int reached = visWalkRun(&s_walk, 8.0f, 34.0f, 8.0f);
+
+	int missing = 0;
+	for (int y = 2; y < VIS_BOX_MAX_Y; y++)
+		for (int z = 0; z < 4; z++)
+			for (int x = 0; x < 4; x++)
+				if (!visWalkVisible(&s_walk, x, y, z)) missing++;
+	CHECK(missing == 0);
+
+	// The rock underneath is not all culled either — the layer directly below the camera is
+	// entered through its top face — but the layer below *that* is sealed off and must go, or
+	// the walk is not culling anything at all.
+	CHECK(visWalkVisible(&s_walk, 0, 1, 0));
+	CHECK(!visWalkVisible(&s_walk, 0, 0, 0));
+	CHECK(reached < 4 * VIS_BOX_MAX_Y * 4);
+}
+
 int worldTestRun(char* summary, size_t cap, int* checks_out)
 {
 	s_checks = 0;
@@ -2498,6 +2732,10 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testBodyBlocked();
 	testCeilingCollision();
 	testPhysics();
+	testVisPairIndex();
+	testVisConnectivity();
+	testVisWalk();
+	testVisWalkNeverHidesOpenSky();
 
 	// Every allocation the world made must have been given back.
 	CHECK(budgetUsed() == 0);

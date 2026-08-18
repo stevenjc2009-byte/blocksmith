@@ -14,6 +14,7 @@
 
 #include <3ds.h>
 #include <citro3d.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -94,9 +95,13 @@ static int worldReportBuild(void)
 // edit queue drains first and the streaming queue gets what is left.
 //
 // The frame is 16.71 ms at 59.83 Hz, steady-state CPU work measured 0.62 ms with a 0.37 ms
-// submit, and a chunk costs ~1.47 ms. 4 ms and 3 chunks is a quarter of the frame with a
-// worst case that can be written down: 3 chunks, plus the one chunk each drain is always
-// allowed to complete, is ~5.9 ms and cannot grow.
+// submit. A chunk build costs ~1.47 ms to mesh plus the 0.63 ms step 7.3's visibility flood
+// fill added to every build (chunkRenderVisUs), so ~2.1 ms. The worst case can still be
+// written down — 3 chunks, plus the one chunk each drain is always allowed to complete, is
+// ~8.4 ms and cannot grow — but it is now half the frame rather than the quarter it was
+// before 7.3. It still fits (8.4 + 0.62 + 0.37 = 9.4 of 16.71) and the constants are left
+// alone; if that stops being true, DRAIN_MAX_CHUNKS is the knob, at the cost of a slower
+// drain rather than a dropped frame.
 #define DRAIN_BUDGET_MS   4.0f
 #define DRAIN_MAX_CHUNKS  3
 
@@ -731,7 +736,8 @@ static void genFollow(float x, float z)
 // needs all of them for the aim, edit and queue counters that change every frame.
 static void worldReportDraw(int refused, bool built,
                             const char* selftest, const StressResult* st,
-                            const DigOutResult* dig, const GenResult* gen)
+                            const DigOutResult* dig, const GenResult* gen,
+                            const Camera* cam)
 {
 	const float mb = 1024.0f * 1024.0f;
 
@@ -747,6 +753,24 @@ static void worldReportDraw(int refused, bool built,
 	       (unsigned long)chunkRenderTris(), chunkRenderCulled());
 	printf("sort moved %2d  near-to-far %s \n", chunkRenderSortMoved(),
 	       chunkRenderSortOk() ? "OK " : "BAD");
+
+	// Step 7.3. `cave` counts chunks the sight walk rejected that the frustum had kept, so it
+	// and `cull` above are disjoint. `walk` says whether the walk ran at all — a zero `cave`
+	// with `walk off` means the loaded area did not fit VisWalk's box and nothing was cave
+	// culled, which is a completely different fact from "there was nothing to cull".
+	//
+	// `cam` is the camera position chunk_render.c recovered by inverting the view matrix,
+	// against the one main.c is holding. They have to agree: the walk starts at whichever
+	// chunk that position lands in, and starting a chunk out would cull convincingly and
+	// wrongly. Kept in the report rather than deleted after one check, because the day
+	// cameraView stops being a rigid transform this line is what will say so.
+	float wx = 0.0f, wy = 0.0f, wz = 0.0f;
+	chunkRenderCamera(&wx, &wy, &wz);
+	printf("cave %2d walk %s  fill %4.0f us  \n", chunkRenderCaveCulled(),
+	       chunkRenderCaveRan() ? "on " : "off", chunkRenderVisUs());
+	printf("cam %6.2f %6.2f %6.2f %s\n", wx, wy, wz,
+	       (fabsf(wx - cam->x) < 0.02f && fabsf(wy - cam->y) < 0.02f &&
+	        fabsf(wz - cam->z) < 0.02f) ? "MATCH" : "WRONG");
 	printf("vbo pool %5.2f MB  refused %2d  \n", chunkRenderBytes() / mb,
 	       chunkRenderRefusals());
 	printf("startup mesh refused %2d        \n", gen->mesh_refused);
@@ -926,7 +950,8 @@ int main(void)
 	// Drawn once here with the spawn column in, and once more when the world is complete —
 	// the counters on it move for the first twenty-five frames now, and a report frozen at
 	// "1 column in" would read as a failed boot.
-	worldReportDraw(refused, WORLD_INTACT(), selftest, &stress, &dig, &s_genr);
+	worldReportDraw(refused, WORLD_INTACT(), selftest, &stress, &dig, &s_genr,
+			                &player.cam);
 	bool report_final = false;
 
 	// The queue's peak is only meaningful from the first real frame onwards: the startup
@@ -1102,7 +1127,8 @@ int main(void)
 		// measured, which is why metricsDrawOverlay rate-limits itself.
 		if (!report_final && !workerBusy() && jobqCount(&s_meshq) == 0) {
 			report_final = true;
-			worldReportDraw(refused, WORLD_INTACT(), selftest, &stress, &dig, &s_genr);
+			worldReportDraw(refused, WORLD_INTACT(), selftest, &stress, &dig, &s_genr,
+			                &player.cam);
 		}
 		// Frames the world took to fill, and step 6.3's whole criterion. The main thread
 		// gives the worker its CPU by *blocking* on the GPU, so "did moving the worker to
@@ -1114,7 +1140,8 @@ int main(void)
 #if BS_REPORT_ONLY
 		// Verification build: the overlay is suppressed so the whole report fits in
 		// a short emulator window. Redrawn each frame because nothing else is.
-		worldReportDraw(refused, WORLD_INTACT(), selftest, &stress, &dig, &s_genr);
+		worldReportDraw(refused, WORLD_INTACT(), selftest, &stress, &dig, &s_genr,
+			                &player.cam);
 #else
 		// Phase 4's status line. Every field answers a question a screenshot would
 		// otherwise leave open: whether the ray found anything (`aim` block and face),
