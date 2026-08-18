@@ -484,15 +484,33 @@ static void testMesherFaceBuckets(void)
 		CHECK_QUIET(len == 16 * 6);
 	}
 
-	// The layout claim itself: every index inside bucket f must land on a vertex whose
-	// normal is f. This is the thing the renderer bets on when it skips a bucket. If the
-	// mesher ever went back to walking cell-major, bucket 0 would hold all six normals
-	// and this would go red.
-	for (int f = 0; f < BLOCK_FACES; f++)
-		for (uint32_t i = out.face_start[f]; i < out.face_start[f + 1]; i++) {
-			const uint8_t nrm = out.verts[out.indices[i]].nrm;
-			CHECK_QUIET(nrm == (uint8_t)f);
+	// The layout claim itself: every index inside bucket i must land on a vertex whose normal
+	// is kFaceOrder[i]. This is the thing the renderer bets on when it skips a bucket. If the
+	// mesher ever went back to walking cell-major, bucket 0 would hold all six normals and
+	// this would go red; if the mesher and the renderer ever disagreed about the bucket
+	// order, the wrong faces would be dropped and this would go red too.
+	for (int i = 0; i < BLOCK_FACES; i++)
+		for (uint32_t k = out.face_start[i]; k < out.face_start[i + 1]; k++) {
+			const uint8_t nrm = out.verts[out.indices[k]].nrm;
+			CHECK_QUIET(nrm == kFaceOrder[i]);
 		}
+
+	// kFaceOrder must be a permutation of the six faces — a typo that repeated one and
+	// dropped another would leave a whole direction unmeshed, and the loop above would
+	// still pass.
+	int seen[BLOCK_FACES] = {0};
+	for (int i = 0; i < BLOCK_FACES; i++) {
+		CHECK_QUIET(kFaceOrder[i] < BLOCK_FACES);
+		seen[kFaceOrder[i]]++;
+	}
+	for (int f = 0; f < BLOCK_FACES; f++)
+		CHECK_QUIET(seen[f] == 1);
+
+	// No two adjacent buckets may be opposite faces of the same axis — that is the property
+	// the renderer's merge loop is built on, and it is what makes this order worth having
+	// over the enum order. FACE_* pairs each axis as (2n, 2n+1).
+	for (int i = 0; i + 1 < BLOCK_FACES; i++)
+		CHECK_QUIET((kFaceOrder[i] >> 1) != (kFaceOrder[i + 1] >> 1));
 
 	worldExit(&s_world);
 	free(out.verts);

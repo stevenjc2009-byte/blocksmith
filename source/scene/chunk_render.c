@@ -79,8 +79,9 @@ typedef struct {
 	uint32_t opaque_index_count;
 
 	// Step 9.2. The mesher's face_start, carried through unchanged: where each of the six
-	// face directions starts inside the opaque run, plus a closing entry equal to
-	// opaque_index_count. See mesher.h for the layout and drawOpaque for what reads it.
+	// face buckets starts inside the opaque run, plus a closing entry equal to
+	// opaque_index_count. Indexed by bucket slot — slot i holds the direction kFaceOrder[i].
+	// See mesher.h for the layout and drawOpaque for what reads it.
 	uint32_t face_start[BLOCK_FACES + 1];
 
 	bool     used;         // owns a chunk (even if that chunk meshed to nothing)
@@ -820,17 +821,18 @@ static void drawOpaque(const C3D_Mtx* view, const MeshSlot* s)
 	want[FACE_SOUTH]  = s_cam_z >  bz;
 	want[FACE_NORTH]  = s_cam_z <  bz + e;
 
-	// Buckets that survive next to each other are contiguous in the index buffer, so they go
-	// out as one call. From outside a chunk that is three separate directions and therefore
-	// three draws in the worst case, but the common one — a chunk off to the side and below,
-	// so +X, -Y and -Z — merges nothing, while a chunk straight ahead and level merges its
-	// pair. Merging costs a loop and saves command-buffer space, which is a fixed 0x40000
-	// bytes a frame on this hardware and something step 7 has already had to watch.
+	// Buckets that survive next to each other in the index buffer go out as one call. Which
+	// ones are neighbours is the mesher's kFaceOrder, not the enum order, and that ordering is
+	// chosen so this loop merges as often as it can: no two adjacent buckets are opposite faces
+	// of one axis, and opposite faces are exactly the pair that never both survive from outside
+	// the chunk. Three surviving directions therefore average 1.75 draws instead of 2.5.
+	// Merging costs a loop and saves command-buffer space, which is a fixed 0x40000 bytes a
+	// frame on this hardware and something step 7 has already had to watch.
 	int f = 0;
 	while (f < BLOCK_FACES) {
-		if (!want[f]) { f++; continue; }
+		if (!want[kFaceOrder[f]]) { f++; continue; }
 		int g = f;
-		while (g + 1 < BLOCK_FACES && want[g + 1]) g++;
+		while (g + 1 < BLOCK_FACES && want[kFaceOrder[g + 1]]) g++;
 		drawIndices(s, s->face_start[f], s->face_start[g + 1] - s->face_start[f]);
 		f = g + 1;
 	}

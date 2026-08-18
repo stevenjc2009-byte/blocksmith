@@ -36,6 +36,12 @@ static const MeshFace kFaces[BLOCK_FACES] = {
 	{ { 0, 0,-1}, {0,0,0}, {0,1,0}, {1,0,0}, true  },
 };
 
+// Step 9.2. The bucket order, declared in mesher.h — +X +Y +Z -X -Y -Z. No two neighbours
+// share an axis, which is what lets the renderer merge the buckets it keeps.
+const uint8_t kFaceOrder[BLOCK_FACES] = {
+	FACE_EAST, FACE_TOP, FACE_SOUTH, FACE_WEST, FACE_BOTTOM, FACE_NORTH
+};
+
 // Everything the inner loop needs for one face, precomputed.
 //
 // This exists because the first working mesher measured 3.55 ms per chunk on the
@@ -336,10 +342,14 @@ void meshChunk(MeshOut* out, const MeshScratch* s)
 	// direction, so each direction ends up as one contiguous stretch of indices the renderer
 	// can draw or skip whole. It skips the three directions that point away from the camera,
 	// which is about half the opaque vertices of every chunk on screen, every frame, per eye.
+	//
+	// The buckets go out in kFaceOrder, not enum order, so the ones the renderer keeps tend to
+	// land next to each other and merge into fewer draw calls.
 	out->face_start[0] = 0;
-	for (int face = 0; face < BLOCK_FACES; face++) {
+	for (int slot = 0; slot < BLOCK_FACES; slot++) {
+		const int face = kFaceOrder[slot];
 		meshPass(out, s, s_emit, s_emit_opaque_n, false, face, face + 1);
-		out->face_start[face + 1] = out->index_count;
+		out->face_start[slot + 1] = out->index_count;
 	}
 
 	// The boundary between the two runs, taken before the second pass writes anything.

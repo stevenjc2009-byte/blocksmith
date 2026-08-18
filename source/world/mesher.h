@@ -42,17 +42,19 @@ typedef struct {
 	uint32_t    opaque_index_count;
 	uint32_t    opaque_faces;
 
-	// Step 9.2. Where each of the six face directions starts inside the opaque run, plus a
-	// closing entry, so the length of bucket f is always face_start[f+1] - face_start[f] with
+	// Step 9.2. Where each of the six face buckets starts inside the opaque run, plus a
+	// closing entry, so the length of bucket i is always face_start[i+1] - face_start[i] with
 	// no last-element special case. face_start[0] is 0 and face_start[BLOCK_FACES] equals
 	// opaque_index_count, always.
 	//
-	// The opaque geometry is emitted face-major — every +X face in the chunk, then every -X
-	// face, and so on — so each bucket is one contiguous run the renderer can draw or skip
-	// whole. At most three of the six directions can face the camera, so the renderer submits
-	// at most half of a chunk's opaque vertices. The GPU was already throwing the other half
-	// away in the backface test, but only after transforming them, and the vertex stage is
-	// the narrow one on this hardware. See chunkRenderDraw.
+	// Indexed by BUCKET SLOT, not by face id: slot i holds the face direction kFaceOrder[i].
+	//
+	// The opaque geometry is emitted face-major — every face of one direction in the chunk,
+	// then every face of the next — so each bucket is one contiguous run the renderer can
+	// draw or skip whole. At most three of the six directions can face the camera, so the
+	// renderer submits at most half of a chunk's opaque vertices. The GPU was already
+	// throwing the other half away in the backface test, but only after transforming them,
+	// and the vertex stage is the narrow one on this hardware. See chunkRenderDraw.
 	//
 	// The transparent run is deliberately NOT bucketed: it is a few percent of the geometry
 	// and it has to be drawn back-to-front as one ordered sequence.
@@ -60,6 +62,19 @@ typedef struct {
 
 	bool        overflow;    // ran out of room: the mesh is incomplete, not corrupt
 } MeshOut;
+
+// The order the face buckets are emitted in: slot i of MeshOut.face_start holds the faces
+// pointing kFaceOrder[i].
+//
+// It is not the FACE_* enum order, and the difference is worth a draw call. The renderer
+// keeps one direction per axis (or both, for an axis whose slab the camera is inside) and
+// merges buckets that survive NEXT TO EACH OTHER into one C3D_DrawElements. Two opposite
+// faces of the same axis are never both kept while the camera is outside that slab, so an
+// ordering that puts them side by side wastes that adjacency. This one — +X +Y +Z -X -Y -Z
+// — has no two neighbours sharing an axis, which is the most merges the layout allows:
+// 1.75 draw calls per chunk averaged over the eight view octants, against 2.5 for the enum
+// order. Both are always correct; this one is just cheaper. See chunkRenderDraw.
+extern const uint8_t kFaceOrder[BLOCK_FACES];
 
 // Meshes the chunk sitting in the middle of `s`. Positions come out chunk-local,
 // 0..16 in block units, so the caller places the chunk with a model matrix.
