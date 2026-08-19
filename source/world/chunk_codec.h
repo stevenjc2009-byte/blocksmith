@@ -57,4 +57,10 @@ size_t chunkEncode(const Chunk* c, uint8_t* out, size_t cap);
 // Decodes `len` bytes into `c`. False on anything malformed, and on false `c` is left
 // untouched rather than half-filled — a caller that ignores the return value gets the
 // chunk it had, not a chunk with a corrupt band through the middle of it.
+//
+// Step 9.2a: this now also claims/releases world/budget.h bytes around the commit, the same
+// way world.c's worldSetChunkAll does for a freshly generated chunk — done here rather than
+// in world.c because region.c (this file's only real caller) has no World* to route a claim
+// through. False is also the answer to a budget refusal, not only to a malformed buffer, and
+// `c` is equally untouched either way.
 bool chunkDecode(Chunk* c, const uint8_t* in, size_t len);

@@ -19,16 +19,27 @@
 #include <string.h>
 #include <sys/stat.h>
 
+#include "app/crash.h"
+#include "app/input_map.h"
+#include "app/options.h"
 #include "app/worker.h"
 #include "debug/metrics.h"
+#include "gfx/atlas.h"
+#include "gfx/font.h"
 #include "gfx/screen.h"
+#include "gfx/sprite.h"
+#include "net/bsnet.h"
+#include "net/networld.h"
 #include "scene/camera.h"
 #include "scene/chunk_render.h"
 #include "scene/highlight.h"
 #include "scene/interact.h"
 #include "scene/player.h"
+#include "scene/title.h"
+#include "scene/ui.h"
 #include "world/budget.h"
 #include "world/handbuilt.h"
+#include "world/inventory.h"
 #include "world/jobq.h"
 #include "world/mesh_vertex.h"
 #include "world/region.h"
@@ -97,13 +108,12 @@ static int worldReportBuild(void)
 // edit queue drains first and the streaming queue gets what is left.
 //
 // The frame is 16.71 ms at 59.83 Hz, steady-state CPU work measured 0.62 ms with a 0.37 ms
-// submit. A chunk build costs ~1.47 ms to mesh plus the 0.63 ms step 7.3's visibility flood
-// fill added to every build (chunkRenderVisUs), so ~2.1 ms. The worst case can still be
-// written down — 3 chunks, plus the one chunk each drain is always allowed to complete, is
-// ~8.4 ms and cannot grow — but it is now half the frame rather than the quarter it was
-// before 7.3. It still fits (8.4 + 0.62 + 0.37 = 9.4 of 16.71) and the constants are left
-// alone; if that stops being true, DRAIN_MAX_CHUNKS is the knob, at the cost of a slower
-// drain rather than a dropped frame.
+// submit. A chunk build costs 917 us to mesh (step 9.4c measurement) plus the 0.63 ms step 7.3's
+// visibility flood fill added to every build (chunkRenderVisUs), so ~1.55 ms. The worst case can
+// still be written down — 3 chunks, plus the one chunk each drain is always allowed to complete,
+// is ~6.2 ms and cannot grow — but it is now lower than before. It still fits (6.2 + 0.62 + 0.37
+// = 7.19 of 16.71) and the constants are left alone; if that stops being true, DRAIN_MAX_CHUNKS
+// is the knob, at the cost of a slower drain rather than a dropped frame.
 #define DRAIN_BUDGET_MS   4.0f
 #define DRAIN_MAX_CHUNKS  3
 
@@ -418,6 +428,59 @@ typedef struct {
 // worldReportDraw takes a pointer to it and is called again once the world is complete.
 static GenResult s_genr;
 
+// Step 8.1. Makes sure sdmc:/blocksmith/worlds/<name> exists and returns it, or NULL if the
+// card would not take it — a locked or absent SD card, which is a real state on this console
+// and must leave the game playable rather than refusing to boot. NULL turns saving off for
+// the session: the world still generates, edits still work, they just do not survive a quit.
+//
+// Step 8.4 replaced the fixed name with the one the title screen came back with. The default
+// is still "default", and it is still what a build with the title screen compiled out plays,
+// so nothing about a BS_TITLE=0 automation run changed: the same directory, the same save.
+//
+// A name, not a path. scene/worldlist.h owns what a legal name is (worldlistNameValid) and
+// the title screen refuses to hand back anything that fails it, so this is joined onto
+// REGION_ROOT without re-validating — one validator, in the file that also creates the
+// directories, rather than a second opinion here that could disagree with it.
+//
+// Lives above the BS_WORLD_GEN guard on purpose: it is called both from genStart() below
+// (generated-world path) and, unconditionally, from the shared inventory-load code further
+// down main() — the hand-built world (BS_WORLD_GEN=0) needs a save directory exactly as much
+// as the generated one does. It used to sit inside the #if BS_WORLD_GEN block below, which
+// compiled fine for every ordinary build (BS_WORLD_GEN defaults to 1) but broke the
+// documented remesh-stress recipe below, `-DBS_REMESH_STRESS=1000`, which forces
+// BS_WORLD_GEN=0 and left the later unconditional call an implicit declaration.
+#define SAVE_WORLD_NAME "default"
+
+static char s_world_name[WORLDLIST_NAME_MAX] = SAVE_WORLD_NAME;
+
+static const char* saveWorldDir(void)
+{
+	static char dir[128];
+
+	// Each level in turn: mkdir does not create parents, and the two above the world are
+	// shared with the metrics CSV and the server address file, so either may already exist.
+	// EEXIST is the expected answer and is not distinguished — the only thing that matters
+	// is whether the final directory is usable, which the probe below actually tests rather
+	// than infers from a return code.
+	mkdir("sdmc:/blocksmith", 0777);
+	mkdir(REGION_ROOT, 0777);
+	snprintf(dir, sizeof(dir), "%s/%s", REGION_ROOT, s_world_name);
+	mkdir(dir, 0777);
+
+	// Written to and removed again, because mkdir returning -1/EEXIST proves nothing about
+	// whether the card is writable — a read-only SD reports the directory as already there.
+	// Finding out now costs one file; finding out at the first unload costs the player's
+	// building with no warning.
+	char probe[160];
+	snprintf(probe, sizeof(probe), "%s/.wtest", dir);
+	FILE* f = fopen(probe, "wb");
+	if (!f) return NULL;
+	const bool wrote = fwrite("bs", 1, 2, f) == 2;
+	fclose(f);
+	remove(probe);
+	return wrote ? dir : NULL;
+}
+
 // The whole streaming path is generated-world only. The hand-built world is filled and
 // meshed in one call and has no generator to move off the main thread, so under
 // BS_WORLD_GEN=0 none of this is compiled in rather than sitting there unreachable.
@@ -683,43 +746,6 @@ static void genSetRadius(int radius)
 	genQueueReadyColumns();
 }
 
-// Step 8.1. Makes sure sdmc:/blocksmith/worlds/<name> exists and returns it, or NULL if the
-// card would not take it — a locked or absent SD card, which is a real state on this console
-// and must leave the game playable rather than refusing to boot. NULL turns saving off for
-// the session: the world still generates, edits still work, they just do not survive a quit.
-//
-// The world name is fixed here. Step 8.4's world select is a listing of this directory, so
-// it changes which name is passed in and nothing else.
-#define SAVE_WORLD_NAME "default"
-
-static const char* saveWorldDir(void)
-{
-	static char dir[128];
-
-	// Each level in turn: mkdir does not create parents, and the two above the world are
-	// shared with the metrics CSV and the server address file, so either may already exist.
-	// EEXIST is the expected answer and is not distinguished — the only thing that matters
-	// is whether the final directory is usable, which the probe below actually tests rather
-	// than infers from a return code.
-	mkdir("sdmc:/blocksmith", 0777);
-	mkdir(REGION_ROOT, 0777);
-	snprintf(dir, sizeof(dir), "%s/%s", REGION_ROOT, SAVE_WORLD_NAME);
-	mkdir(dir, 0777);
-
-	// Written to and removed again, because mkdir returning -1/EEXIST proves nothing about
-	// whether the card is writable — a read-only SD reports the directory as already there.
-	// Finding out now costs one file; finding out at the first unload costs the player's
-	// building with no warning.
-	char probe[160];
-	snprintf(probe, sizeof(probe), "%s/.wtest", dir);
-	FILE* f = fopen(probe, "wb");
-	if (!f) return NULL;
-	const bool wrote = fwrite("bs", 1, 2, f) == 2;
-	fclose(f);
-	remove(probe);
-	return wrote ? dir : NULL;
-}
-
 // Starts the worker and queues the whole area. The spawn column goes first because the
 // ring is FIFO, so it is the first one back and the player has ground under them before
 // the loop starts.
@@ -779,6 +805,13 @@ static bool genInstallOne(void)
 	// neighbours forever instead of meshing what did arrive.
 	genSlotSet(&s_col_in[0][0], GEN_AREA_SPAN, cx, cz);
 	genSlotClear(&s_col_asked[0][0], GEN_AREA_SPAN, cx, cz);
+
+	// This column is now genuinely part of the live world, every chunk workerInstall() had
+	// already copied in above — the moment net/blockdiff.h's pending diffs for it (a remote
+	// edit that arrived while it was still streaming in) can land. Before genQueueReadyColumns
+	// so anything a drained diff touches gets swept into the same meshing pass as the rest of
+	// this column instead of waiting a frame.
+	networldOnColumnLoad(&s_world, cx, cz);
 
 	genQueueReadyColumns();
 	return true;
@@ -1024,6 +1057,62 @@ static void drawEye(C3D_RenderTarget* target, const C3D_Mtx* view, const RayHit*
 	highlightDraw(view, hit);
 }
 
+// The player's items. Outside the BS_BOTTOM_UI guard on purpose: a build with no bottom
+// screen still has an inventory, because Interact.holding is fed from it and a break still
+// has to put the block somewhere. Such a build simply has no way to *see* or rearrange it.
+// A file static rather than a local of main() for the same reason s_world is one — the
+// bottom-screen draw below is a file-scope function and needs it.
+static Inventory s_inv;
+
+#if BS_BOTTOM_UI
+
+static UiState s_ui;
+
+// Step 8.2. The bottom screen's whole content: hotbar, inventory grid, crafting panel, and
+// the engine numbers step 8.3's screen carried.
+//
+// This replaced step 8.3's font demo outright rather than gaining a toggle beside it. That
+// screen existed to settle one visual claim — "the font renders" — by putting every glyph,
+// three tints and three scales where they could be looked at, and that claim was settled at
+// step 8.3. Keeping it would mean the bottom screen of a shipped build showing an ASCII
+// table, and scene/ui.c draws with exactly the same spriteBegin/fontDraw batch, so the font
+// is still on screen every frame and would still visibly break if it broke.
+//
+// The layout, the hit testing and the pick-up/drop gesture all live in scene/ui.c; nothing
+// about them is decided here. This function is the frame plumbing only — bind the target,
+// hand over the numbers main.c already computed for the console overlay, and pass on the
+// touch point.
+static void drawBottomUi(bool ok, const char* status, const UiInput* in)
+{
+	C3D_RenderTarget* target = screenBottom();
+	if (!target) return;
+
+	// The clear colour is the panel colour, so the "background" is free: one clear rather
+	// than a full-screen quad that would blend over a surface nothing ever looks at.
+	C3D_RenderTargetClear(target, C3D_CLEAR_ALL, 0x1A1424FF, 0);
+	C3D_FrameDrawOn(target);
+
+	if (!ok) return;   // nothing to draw with; the screen stays the clear colour
+
+	const UiStats stats = {
+		.columns    = s_world.columns,
+		.chunks     = s_world.chunks,
+		.meshes     = chunkRenderMeshes(),
+		.culled     = chunkRenderCulled(),
+		.tris       = chunkRenderTris(),
+		.bytes      = (uint32_t)worldBytes(&s_world),
+		.bytes_peak = (uint32_t)budgetPeak(),
+		.status     = status,
+	};
+
+	// atlasTexture() rather than atlasBind(): gfx/sprite.c tracks the bound texture itself so
+	// it can flush exactly once per switch, and binding behind its back would leave it certain
+	// it had not switched. See gfx/atlas.h.
+	uiUpdateDraw(&s_ui, &s_inv, atlasTexture(), &stats, in);
+}
+
+#endif   // BS_BOTTOM_UI
+
 // `built` and `mesh_refused` are startup facts, so they belong in the report drawn once
 // rather than on the per-frame status line: the console is 32 columns and the status line
 // needs all of them for the aim, edit and queue counters that change every frame.
@@ -1064,6 +1153,8 @@ static void worldReportDraw(int refused, bool built,
 	printf("cam %6.2f %6.2f %6.2f %s\n", wx, wy, wz,
 	       (fabsf(wx - cam->x) < 0.02f && fabsf(wy - cam->y) < 0.02f &&
 	        fabsf(wz - cam->z) < 0.02f) ? "MATCH" : "WRONG");
+	// Step 9.1e. Disjoint from `cull` and `cave` above — see chunk_render.h.
+	printf("hzn %2d                       \n", chunkRenderHorizonCulled());
 	// Step 7.5. What the alpha-tested second pass actually submitted. Both zero looks
 	// identical on screen to "there is no canopy in view", and only one of those is a bug —
 	// the split is inside the mesher, so a wrong boundary would draw every leaf face in the
@@ -1165,8 +1256,145 @@ static void saveDirtyColumns(void)
 	workerFlushSaves();
 }
 
+// ── Step 8.4: the title screen, and the two things it hands the rest of main ──────────
+//
+// BS_TITLE follows BS_BOTTOM_UI because it cannot do anything else: scene/title.c draws with
+// gfx/sprite.h onto screenBottom(), and screenBottom() is NULL by construction in a
+// BS_BOTTOM_UI=0 build (gfx/screen.c never creates the target). A build with a title screen
+// and no bottom target would compile, boot, and hang on a black screen with no way past it.
+//
+// It is a switch of its own rather than just BS_BOTTOM_UI so it can be turned OFF in a build
+// that still wants the bottom UI. Every scripted measurement build — BS_REPORT_ONLY, the
+// stress knobs, the p9run.ps1 profile runs behind step 10.2 — drives the game with no
+// operator, and a menu that waits for a tap would stop all of them dead at boot with no
+// output at all. Those builds set BS_TITLE=0 and play SAVE_WORLD_NAME, which is exactly the
+// world they played before this step existed, so a measurement taken before and after is
+// still comparing the same thing.
+#ifndef BS_TITLE
+#define BS_TITLE BS_BOTTOM_UI
+#endif
+
+#if BS_TITLE && !BS_BOTTOM_UI
+#error "BS_TITLE=1 needs BS_BOTTOM_UI=1: scene/title.c draws on screenBottom(), which a \
+BS_BOTTOM_UI=0 build never creates, so the menu would be invisible and unescapable."
+#endif
+
+// app/options.h has to duplicate libctru's KEY_* bit values as hex literals, because it also
+// compiles on the host and cannot include <3ds.h> (see the block comment above OPT_KEY_A in
+// that file, which explicitly asks for this check to live on the console side). This is that
+// check. If devkitPro ever renumbers hid.h's BIT() assignments, the build stops here instead
+// of silently binding "jump" to a key that no longer exists.
+_Static_assert(OPT_KEY_A      == KEY_A,      "OPT_KEY_A drifted from libctru KEY_A");
+_Static_assert(OPT_KEY_X      == KEY_X,      "OPT_KEY_X drifted from libctru KEY_X");
+_Static_assert(OPT_KEY_Y      == KEY_Y,      "OPT_KEY_Y drifted from libctru KEY_Y");
+_Static_assert(OPT_KEY_DUP    == KEY_DUP,    "OPT_KEY_DUP drifted from libctru KEY_DUP");
+_Static_assert(OPT_KEY_DDOWN  == KEY_DDOWN,  "OPT_KEY_DDOWN drifted from libctru KEY_DDOWN");
+_Static_assert(OPT_KEY_DLEFT  == KEY_DLEFT,  "OPT_KEY_DLEFT drifted from libctru KEY_DLEFT");
+_Static_assert(OPT_KEY_DRIGHT == KEY_DRIGHT, "OPT_KEY_DRIGHT drifted from libctru KEY_DRIGHT");
+
+#if BS_TITLE
+
+// Runs the menu until the player either picks a world or quits. True means play — and
+// s_world_name now holds what they picked, so the very next saveWorldDir() call resolves to
+// their directory. False means they chose Quit, or the system asked the app to close
+// (aptMainLoop went false), and main must shut down without ever building a world.
+//
+// Blocking, on purpose. Nothing else in the program is alive yet: this runs before
+// worldReportBuild, before the worker, before the player. That is what makes it safe to
+// simply loop here rather than adding a mode to the main loop — there is no world to keep
+// simulating and no worker thread to keep fed while the menu is up.
+static bool runTitleScreen(Options* opts)
+{
+	C3D_RenderTarget* const bottom = screenBottom();
+	C3D_RenderTarget* const top    = screenTop();
+
+	// Not an assertion. The #error above makes the NULL case unreachable in any build that
+	// compiles, but screenInit can still fail to create a target at runtime, and losing the
+	// menu should cost the player the menu, not the game — so a missing bottom screen plays
+	// SAVE_WORLD_NAME exactly as a BS_TITLE=0 build would.
+	if (!bottom) return true;
+
+	TitleState ts;
+	titleInit(&ts);
+
+	while (aptMainLoop()) {
+		hidScanInput();
+
+		// KEY_TOUCH is read from *held*, not down: title.c needs "is the stylus on the
+		// screen right now" for its own tap-on-the-edge logic (TitleState.touch_prev), and a
+		// down-only bit would be true for exactly one frame of a press.
+		//
+		// Both signals are consulted because hid.h flags KEY_TOUCH as "Not actually provided
+		// by HID" — it is synthesised, and title.h's own comment recommends deriving touch
+		// from the point instead. Taking either as a yes cannot lose a real touch, which is
+		// the only direction of error that matters here: a spurious extra frame of "touching"
+		// re-reports a tap the player really did make, while a missed one makes the button
+		// they pressed do nothing and the menu feel broken.
+		touchPosition tp = {0};
+		hidTouchRead(&tp);
+
+		const TitleInput in = {
+			.keys_down  = hidKeysDown(),
+			.touch_down = (hidKeysHeld() & KEY_TOUCH) != 0 || tp.px != 0 || tp.py != 0,
+			.touch_x    = tp.px,
+			.touch_y    = tp.py,
+		};
+
+		C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+
+		// The top screen is cleared and bound every frame even though the menu draws
+		// nothing on it. C3D_FrameEnd only presents screens with a target bound this frame,
+		// so skipping it would leave the top screen holding whatever was in the framebuffer
+		// at boot — uninitialised VRAM — for as long as the player sits in the menu.
+		C3D_RenderTargetClear(top, C3D_CLEAR_ALL, CLEAR_COLOR, 0);
+		C3D_FrameDrawOn(top);
+
+		// title.c calls spriteBegin(320, 240) itself and assumes the caller has already
+		// bound the target it wants drawn on — see the file comment in scene/title.h.
+		C3D_RenderTargetClear(bottom, C3D_CLEAR_ALL, 0x1A1424FF, 0);
+		C3D_FrameDrawOn(bottom);
+		const TitleResult r = titleUpdateDraw(&ts, opts, &in);
+
+		C3D_FrameEnd(0);
+
+		if (r.action == TITLE_QUIT) return false;
+		if (r.action == TITLE_START_WORLD) {
+			// snprintf, not strcpy: both buffers are WORLDLIST_NAME_MAX and title.c will not
+			// hand back an over-long name, but this is the one place a name crosses out of
+			// the module that validates it, and a truncation here is a wrong save directory
+			// rather than a crash.
+			snprintf(s_world_name, sizeof(s_world_name), "%s", r.world_name);
+			return true;
+		}
+	}
+
+	// aptMainLoop() went false — the HOME menu closed us. Not a quit the player chose, but
+	// the same answer: do not build a world, fall through to the shutdown path.
+	return false;
+}
+
+#endif   // BS_TITLE
+
 int main(void)
 {
+	// Step 8.5, first of everything. It only writes this thread's TLS exception slot — no
+	// gfx, no FS, nothing that can itself fail — so every line after it is covered. A crash
+	// during screenInit is exactly the kind that is impossible to diagnose otherwise,
+	// because there is not yet a screen to print the error on.
+	crashInit();
+
+	// Before anything that could reach for crypto. libhydrogen's 3DS entropy
+	// source is PS_GenerateRandomBytes, and hydro_init() aborts the process
+	// rather than failing softly if PS is not open — so this cannot be done
+	// lazily inside the net code, or a hydro_* call from anywhere else would
+	// take the game down. Paired with psExit() at the bottom of main.
+	psInit();
+
+	// Right after psInit() for the same reason it exists: netInit() (net/bsnet.c) can reach
+	// libhydrogen through net/bsnet_transport.c, which needs PS open. Safe even if the player
+	// never opens Multiplayer — see bsnet.h's own contract.
+	netInit();
+
 	screenInit();
 	metricsInit();
 
@@ -1183,6 +1411,85 @@ int main(void)
 		return 1;
 	}
 
+	// Step 8.3. The GUI's batch and its font, brought up together because they are one
+	// thing in practice: spriteRect() samples the solid white texel that lives *inside*
+	// the font texture, so a batch without a font can draw nothing at all. A failure here
+	// is not fatal the way chunkRenderInit's is — a game with no HUD is worse than a game,
+	// but it is still a game — so it is recorded and the boot continues.
+	const bool ui_ok = spriteInit() && fontInit();
+
+	// Brought up in both builds on purpose, even though only a BS_BOTTOM_UI build draws
+	// with it. The batch claims a shader and 48 KB of linear memory, and a console build
+	// that skipped that would be measuring a different memory profile from the one that
+	// ships — which is exactly the kind of difference that makes an Old 3DS headroom figure
+	// wrong. The cast is what keeps -Wunused-variable quiet in the console build.
+	(void)ui_ok;
+
+	// ── Step 8.4: settings, then the menu ────────────────────────────────────────────
+	//
+	// Hoisted out of the BS_WORLD_GEN block below, where it used to be the only caller,
+	// because the options default needs the same answer — see the first-run block.
+	bool new_3ds = false;
+	APT_CheckNew3DS(&new_3ds);
+
+	// optionsSave writes into sdmc:/blocksmith, which nothing has created yet at this point
+	// in the boot: saveWorldDir() makes it, and that does not run until genStart. Made here
+	// so a first run can actually keep the render distance it just worked out. mkdir's return
+	// is ignored for the same reason it is inside saveWorldDir — EEXIST is the normal answer,
+	// and the only thing that settles whether the card is usable is trying to write to it,
+	// which optionsSave then does.
+	mkdir("sdmc:/blocksmith", 0777);
+
+	// Whether the file was there BEFORE the load, not after. app/options.c leaves a fresh
+	// Options at RENDER_DIST_MIN and says in its own comment on optionsDefaults that it
+	// cannot do better — it is host-portable and cannot ask APT_CheckNew3DS — and asks the
+	// console side to raise it once on the first run. This is that first run. Probing the
+	// file rather than comparing the value is what keeps a player who has deliberately
+	// chosen the Old 3DS radius on a New 3DS from having it silently put back every boot.
+	FILE* opt_probe = fopen(TITLE_OPTIONS_PATH, "rb");
+	const bool options_existed = opt_probe != NULL;
+	if (opt_probe) fclose(opt_probe);
+
+	// Loaded once, here, and never again: the options screen edits this struct in place and
+	// writes it back itself on the way out (see titleUpdateDraw's contract). A BS_TITLE=0
+	// build never shows that screen and still gets a fully valid Options out of this call,
+	// because optionsLoad defaults or clamps everything it cannot read.
+	Options opts;
+	optionsLoad(&opts, TITLE_OPTIONS_PATH, NULL);
+	if (!options_existed) {
+		opts.render_dist = renderDistDefault(new_3ds);
+		optionsSave(&opts, TITLE_OPTIONS_PATH);
+	}
+
+#if BS_TITLE
+	// ui_ok gates it. spriteInit/fontInit failing is survivable for the HUD — a game with no
+	// HUD is still a game — but it is not survivable for a menu, because the menu IS its
+	// drawing: with no batch there are no buttons, no world list and no way to tell the
+	// player any of that. Showing it anyway would trap them on a blank bottom screen with no
+	// route into a world at all. A build that cannot draw the menu skips it and plays
+	// SAVE_WORLD_NAME, exactly as a BS_TITLE=0 build does.
+	if (ui_ok && !runTitleScreen(&opts)) {
+		// Quit from the menu, or the system closed us while it was up. No world was ever
+		// built, so there is nothing to save and nothing to tear down beyond what boot
+		// itself brought up — this mirrors the tail of main() with the world, the worker and
+		// the highlight left out, none of which exist yet.
+		chunkRenderExit();
+		metricsExit();
+		screenExit();
+		netExit();
+		psExit();
+		crashExit();
+		return 0;
+	}
+#endif
+
+	// After the menu, because the options screen edits `opts` in place — doing this before it
+	// would snapshot the settings the player had when they *opened* the menu, which is the
+	// one moment they are guaranteed to be about to change. From here scene/player.c,
+	// scene/interact.c and scene/camera.c read their bindings and look feel out of this
+	// snapshot instead of out of hardcoded KEY_* constants.
+	inputMapSet(&opts);
+
 	// Self-test first: it resets the memory budget, so it has to run before the
 	// world claims anything.
 	char selftest[96] = "";
@@ -1195,23 +1502,43 @@ int main(void)
 
 	const int refused = worldReportBuild();
 
+	// s_world exists now (worldReportBuild() ran worldInit()), so net/networld.c can be told
+	// which World it is allowed to touch. Everything in networld.h is a harmless no-op before
+	// this line, and this is also the pointer worker-thread calls into networldOnColumnLoad()
+	// (see world/world.c's worldSet()) are compared against and ignored — see networld.h's
+	// threading note.
+	networldInit();
+	networldSetWorld(&s_world);
+
 	// The world. Since step 5.5 the generated one is not built here: the worker is started
 	// and the whole area queued, and only the column the player stands in is waited for.
 	// The other twenty-four arrive during the first frames, one per frame, while the game
 	// is already drawing. The hand-built world has no generator to move off the main
 	// thread and is still filled and meshed in one go.
+
+	// Kept initialized in all configs; only used when BS_WORLD_GEN is 1, so the generated-terrain
+	// streaming path stays identical across builds.
+	(void)s_mesh_radius;
+	(void)s_area_radius;
+
 #if BS_WORLD_GEN
 	// Step 7.7. The console's default render distance, before the first column is asked for,
 	// so the boot fills the ring the player is actually going to have rather than filling the
 	// small one and then widening it a frame later.
 	//
-	// APT_CheckNew3DS is asked here and nowhere else: render_dist.c is deliberately free of
-	// <3ds.h> so its arithmetic can be tested on the host, which means the one genuinely
-	// console-shaped question in the whole setting — which machine is this — has to be
-	// answered by the caller.
-	bool new_3ds = false;
-	APT_CheckNew3DS(&new_3ds);
-	genInitRadius(renderDistDefault(new_3ds));
+	// APT_CheckNew3DS is asked once, up with the options load — render_dist.c is deliberately
+	// free of <3ds.h> so its arithmetic can be tested on the host, which means the one
+	// genuinely console-shaped question in the whole setting — which machine is this — has to
+	// be answered by the caller.
+	//
+	// Since step 8.4 the radius comes from the player's setting rather than straight from
+	// renderDistDefault(). On a card with no options.ini the two are the same value, because
+	// the first-run block above seeds the file with exactly renderDistDefault(new_3ds) — so a
+	// fresh install still fills the ring this console can afford, and a profile measurement
+	// taken before this step is still comparable to one taken after it. optionsLoad clamps
+	// the field to [RENDER_DIST_MIN, RENDER_DIST_MAX], so a hand-edited ini cannot ask for a
+	// ring the mesh pool has no slots for.
+	genInitRadius(opts.render_dist);
 
 	// Centred on the spawn column, which is (0, 0) — the same column playerInit puts the
 	// feet in below. From here on the ring follows the player (genFollow).
@@ -1243,6 +1570,9 @@ int main(void)
 	// playable without a cage round the target block, so this reports and carries on
 	// rather than joining chunkRenderInit's fatal path above.
 	const bool highlight_ok = highlightInit();
+	// Kept built in all configs; only used when BS_BOTTOM_UI is 1, so the game's render path
+	// stays identical across builds.
+	(void)highlight_ok;
 
 	// On the flat ground at the foot of the stepped pyramid, looking down at it along the
 	// diagonal — so the first frame already shows a target cage without anyone having to
@@ -1288,6 +1618,18 @@ int main(void)
 	Interact it;
 	interactInit(&it);
 
+	// Step 8.2. Loaded after genStart, because that is what creates the world directory this
+	// file lives beside; saveWorldDir() returns NULL if the card is not writable, and
+	// inventoryLoad refuses a NULL directory, so the guard is the same test the region writer
+	// uses rather than a second opinion about the SD card. inventoryLoad always leaves `s_inv`
+	// valid — a missing or corrupt file is an empty inventory, not an error to handle here.
+	const char* const inv_dir = saveWorldDir();
+	if (inv_dir) inventoryLoad(&s_inv, inv_dir);
+	else         inventoryInit(&s_inv);
+#if BS_BOTTOM_UI
+	uiInit(&s_ui);
+#endif
+
 	// "Did the world come out whole?" — the meaning differs between the two paths. The
 	// hand-built world is filled in one call that either worked or did not; the generated
 	// one is whole only if nothing refused a column on the way in, which is not known
@@ -1327,6 +1669,27 @@ int main(void)
 		u32 down = hidKeysDown();
 		if (down & KEY_START) break;
 
+#if BS_BOTTOM_UI
+		// Step 8.2. Read here, next to the rest of the frame's input, rather than inside
+		// drawBottomUi: scene/ui.h states the same contract scene/title.h does — the UI never
+		// calls into HID itself — so every read of the pad and the panel happens in one place
+		// and cannot end up split across the frame.
+		//
+		// touch_down is taken as KEY_TOUCH *or* a non-zero point. libctru's hid.h comments
+		// KEY_TOUCH as "Not actually provided by HID", and taking either as a yes cannot lose
+		// a real touch, which is the only direction of error that matters here: a spurious
+		// extra frame re-reports a tap the player did make, a missed one makes the slot they
+		// pressed do nothing. ui.c edge-detects with its own touch_prev, so the extra frame
+		// costs nothing.
+		touchPosition tp = {0};
+		hidTouchRead(&tp);
+		const UiInput touch = {
+			.touch_down = (hidKeysHeld() & KEY_TOUCH) != 0 || tp.px != 0 || tp.py != 0,
+			.touch_x    = tp.px,
+			.touch_y    = tp.py,
+		};
+#endif
+
 		// Step 7.6. SELECT toggles 3D. gfxSet3D is what actually splits the top screen into
 		// two framebuffers, so it moves with the flag rather than being set once: left on
 		// while only one eye is being drawn, the hardware would show the right eye's stale
@@ -1335,6 +1698,14 @@ int main(void)
 			s_stereo = !s_stereo;
 			gfxSet3D(s_stereo);
 		}
+
+		// Every scene, every frame, whether or not Multiplayer is even open — see netUpdate()
+		// and networldUpdate()'s own contracts for why neither ever blocks a frame. Pumped
+		// before genInstallOne() below so a remote edit that just arrived for a column about
+		// to be installed this same frame is already queued (net/blockdiff.h) before that
+		// column's own drain call runs.
+		netUpdate();
+		networldUpdate();
 
 #if BS_WORLD_GEN && !BS_FLY
 		// Step 7.7. L and R change the render distance. They are free in walking mode — only
@@ -1432,7 +1803,33 @@ int main(void)
 		if (frame == DEMO_START_FRAME)     down |= INTERACT_KEY_BREAK;
 		if (frame == DEMO_START_FRAME + 30) down |= INTERACT_KEY_PLACE;
 #endif
+
+		// Step 8.2. Refreshed every frame rather than written once when the player taps a
+		// hotbar slot: the selected slot's contents change without the selection changing —
+		// place the last block of a stack and the same slot is now empty — and a `holding`
+		// updated only on selection would let the player keep placing a block they no longer
+		// have. interactEdit refuses BLOCK_AIR, so an empty hand is a refusal, not a
+		// long-range break.
+		it.holding = inventoryHeldItem(&s_inv);
+
 		interactEdit(&it, &s_world, &player.body, down);
+
+		// Read once, straight after the call that sets them, because interactEdit clears both
+		// at the top of its next call — see Interact.broke_id. A block that does not fit is
+		// left on the floor, which is the honest outcome: inventoryAdd reports the refusal
+		// rather than eating it, and the block is already gone from the world by the time we
+		// are told, so there is nothing here that could put it back. The count is not tracked
+		// separately — `it.refused` is about edits the world rejected, and this edit was
+		// accepted; it is the pickup that failed.
+		if (it.broke_id != BLOCK_AIR)
+			inventoryAdd(&s_inv, it.broke_id, 1, NULL);
+
+		// Charged only for a placement the world actually accepted. it.placed_id stays
+		// BLOCK_AIR on every refusal path in interactEdit — no target, no entry face, cell
+		// occupied, would entomb the player, empty hand — so a refused place cannot silently
+		// consume a block out of the hotbar.
+		if (it.placed_id != BLOCK_AIR)
+			inventoryRemove(&s_inv, it.placed_id, 1);
 
 #if BS_EDIT_STRESS
 		// The 4.5 check: an edit on a chunk corner every frame, which dirties eight
@@ -1459,6 +1856,10 @@ int main(void)
 		                                             DRAIN_MAX_CHUNKS);
 		const float edit_ms =
 			(float)((double)(svcGetSystemTick() - t_work) / CPU_TICKS_PER_MSEC);
+		// Kept built in all configs; only used when BS_WORLD_GEN is 1, so the measurement of
+		// hand-built-world performance stays consistent across configurations.
+		(void)edit_built;
+		(void)edit_ms;
 
 #if BS_WORLD_GEN
 		// Whatever is left of both limits. Negative time and a zero count are handled the
@@ -1472,6 +1873,33 @@ int main(void)
 		if (edit_built + stream_built > s_genr.worst_built)
 			s_genr.worst_built = edit_built + stream_built;
 #endif
+
+		// Phase 4's status line. Every field answers a question a screenshot would
+		// otherwise leave open: whether the ray found anything (`aim` block and face),
+		// whether an edit reached the world (`b`roke / `p`laced / `r`efused), and whether
+		// the queue is keeping up (`dq` current/peak) — read that against `worst` and
+		// `over` above. The console is 32 columns wide and truncates without complaining,
+		// so this has to stay inside it: "aim -12 8 -10 f2 b9 p9 r9 dq8/8" is 31.
+		//
+		// Built here, before the frame opens, rather than after it closes where it used to
+		// live: step 8.3's bottom-screen UI draws this same string *inside* the frame, and
+		// a value cannot be drawn before it exists. Both consumers now read one buffer, so
+		// the console overlay and the touch screen can never disagree about what the player
+		// is aiming at.
+		char status[33];
+		if (it.target.hit)
+			snprintf(status, sizeof(status), "aim %d %d %d f%d b%d p%d r%d dq%d/%d",
+			         it.target.x, it.target.y, it.target.z, it.target.face,
+			         it.broke, it.placed, it.refused,
+			         chunkRenderDirtyCount(), chunkRenderDirtyPeak());
+		else
+			snprintf(status, sizeof(status), "aim none b%d p%d r%d dq%d/%d",
+			         it.broke, it.placed, it.refused,
+			         chunkRenderDirtyCount(), chunkRenderDirtyPeak());
+		// A BS_REPORT_ONLY build with no bottom UI has no reader for it, and an unused
+		// buffer is a -Werror stop. Kept built anyway so the two builds run the same code
+		// path and the string cannot rot in the configuration nobody compiles.
+		(void)status;
 
 		metricsSyncBegin();
 		C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
@@ -1490,6 +1918,13 @@ int main(void)
 			drawEye(screenTop(), &view, &it.target, s_stereo ? -iod : 0.0f);
 			if (s_stereo)
 				drawEye(screenTopRight(), &view, &it.target, iod);
+#if BS_BOTTOM_UI
+			// Step 8.3. Last in the frame, and deliberately so: the sprite batch sets its
+			// own render state and does not restore it (see gfx/sprite.h), while
+			// chunkRenderDraw re-establishes everything it needs at the top of its next
+			// call. Drawing the UI first would mean paying to put the world's state back.
+			drawBottomUi(ui_ok, highlight_ok ? status : "HIGHLIGHT INIT FAILED", &touch);
+#endif
 		metricsSubmitBegin();
 		C3D_FrameEnd(0);
 		metricsSubmitEnd();
@@ -1518,22 +1953,7 @@ int main(void)
 		worldReportDraw(refused, WORLD_INTACT(), selftest, &stress, &dig, &s_genr,
 			                &player.cam);
 #else
-		// Phase 4's status line. Every field answers a question a screenshot would
-		// otherwise leave open: whether the ray found anything (`aim` block and face),
-		// whether an edit reached the world (`b`roke / `p`laced / `r`efused), and whether
-		// the queue is keeping up (`dq` current/peak) — read that against `worst` and
-		// `over` above. The console is 32 columns wide and truncates without complaining,
-		// so this has to stay inside it: "aim -12 8 -10 f2 b9 p9 r9 dq8/8" is 31.
-		char status[33];
-		if (it.target.hit)
-			snprintf(status, sizeof(status), "aim %d %d %d f%d b%d p%d r%d dq%d/%d",
-			         it.target.x, it.target.y, it.target.z, it.target.face,
-			         it.broke, it.placed, it.refused,
-			         chunkRenderDirtyCount(), chunkRenderDirtyPeak());
-		else
-			snprintf(status, sizeof(status), "aim none b%d p%d r%d dq%d/%d",
-			         it.broke, it.placed, it.refused,
-			         chunkRenderDirtyCount(), chunkRenderDirtyPeak());
+		// `status` is built above, before the frame opens — see the comment there.
 
 		metricsSetStereo(s_stereo, osGet3DSliderState(), screenVramFree(),
 		                 screenRightEyeBytes());
@@ -1555,6 +1975,14 @@ int main(void)
 	// two when the radius changes, and one that did would be missed by a ring walk.
 	saveDirtyColumns();
 
+	// Step 8.2, and only here: unlike the world, the inventory is small enough to write whole
+	// every time, so there is nothing to gain from saving it mid-play and a per-frame or
+	// per-edit write would put an SD round trip inside the frame that just broke a block.
+	// A failed save is counted by nobody and retried by nobody, same as a failed region
+	// write — inventory.h says as much — because stalling the quit to retry is worse than
+	// losing the last session's pickups.
+	if (inv_dir) inventorySave(&s_inv, inv_dir);
+
 	// Before worldExit: the worker holds a staging world of its own and must be joined
 	// before anything it could still be writing into is freed.
 	workerStop();
@@ -1564,5 +1992,8 @@ int main(void)
 	chunkRenderExit();
 	metricsExit();
 	screenExit();
+	netExit();
+	psExit();
+	crashExit();
 	return 0;
 }

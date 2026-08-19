@@ -14,11 +14,27 @@
 set -e
 
 cd "$(dirname "$0")/.."
-mkdir -p build-host
+
+# Every run gets its own subdirectory under build-host, named after this shell's own
+# PID, rather than all runs sharing build-host/ directly. Measured cause: two Claude
+# sessions running this script at the same time both write build-host/world_test(.exe)
+# — whichever gcc finishes second silently overwrites the binary the other session is
+# about to exec, and on Windows a still-open exe can also make the second gcc's link
+# step fail outright with a sharing violation. A stray same-named foreign binary left
+# behind this way was caught directly: build-host/ui_layout_test (no .exe extension, an
+# ELF Linux binary from a non-Windows session) sat next to build-host/ui_layout_test.exe
+# and bash's exact-name match picked the ELF file, failing with "cannot execute binary
+# file: Exec format error" — not a hang, but the same shared-directory collision this
+# guards against. $$ is this shell's own PID, unique per invocation, so concurrent runs
+# never touch each other's binaries. Removed at the end, but only on success — a failed
+# run's directory is left behind on purpose so its binaries can still be inspected.
+BH="build-host/run-$$"
+mkdir -p "$BH"
 
 gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	-I source \
 	tests/host_test.c \
+	tests/net_stub.c \
 	source/world/block.c \
 	source/world/chunk.c \
 	source/world/chunk_codec.c \
@@ -40,6 +56,78 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/scene/render_dist.c \
 	source/world/world_test.c \
 	-lm \
-	-o build-host/world_test
+	-o "$BH/world_test"
 
-./build-host/world_test
+"./$BH/world_test"
+
+# Step 8.4's options.ini module, built and run separately rather than folded into the list
+# above. It carries its own main() — the world suite is driven by tests/host_test.c — and
+# two mains cannot share a link. Separate binaries also mean a broken options parser cannot
+# stop the world suite from running, which is the half that guards the save format.
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/app/options.c \
+	source/app/options_test.c \
+	-o "$BH/options_test"
+
+"./$BH/options_test"
+
+# Step 8.4's world-list module. Third binary for the same reason options_test is a second
+# one: it carries its own main(). scene/worldlist.c lives under scene/ but has no <3ds.h>
+# in it — the directory says where it belongs in the program, not what it depends on.
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/scene/worldlist.c \
+	source/world/worldlist_test.c \
+	-o "$BH/worldlist_test"
+
+"./$BH/worldlist_test"
+
+# Step 8.2's inventory and crafting model. crc32.c is in the link because inventory.c's
+# save file is checksummed the same way a region file is, and the checksum implementation
+# is shared rather than duplicated.
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/inventory.c \
+	source/world/crafting.c \
+	source/world/crc32.c \
+	source/world/inventory_test.c \
+	-o "$BH/inventory_test"
+
+"./$BH/inventory_test"
+
+# Step 8.2's UI hit-testing/layout arithmetic (scene/ui_layout.c), pulled out of
+# scene/ui.c precisely so it could be linked here without <citro3d.h> -- see
+# scene/ui_layout.h's file comment. Fourth binary for the same reason inventory_test
+# is a separate one: it carries its own main(). Only ui_layout.c itself is linked in --
+# it pulls in world/inventory.h and world/crafting.h for INV_*/RECIPE_COUNT constants
+# only (compile-time macros), never calling a function those headers declare, so
+# inventory.c/crafting.c have nothing this binary needs from them.
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/scene/ui_layout.c \
+	source/scene/ui_layout_test.c \
+	-o "$BH/ui_layout_test"
+
+"./$BH/ui_layout_test"
+
+# Guards source/shaders/world.v.pica's uvScale constant against source/world/atlas_uv.h's
+# ATLAS_PX ever drifting apart again — the exact bug step 9.3c left behind (shader left at
+# 1/256 after the atlas shrank from 256x256 to 64x64, so every tile's UV collapsed into one
+# cell and the whole world rendered flat brown). A .pica file has no #include and the
+# picasso shader compiler has no _Static_assert, so the world/block_tiles_check.c trick
+# (duplicate the value on both sides, then _Static_assert the two copies agree) does not
+# apply here; this test parses the shader source text directly and checks the literal
+# against ATLAS_PX instead. Sixth binary for the same reason ui_layout_test is a fifth one:
+# it carries its own main().
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/atlas_uv_shader_test.c \
+	-o "$BH/atlas_uv_shader_test"
+
+"./$BH/atlas_uv_shader_test"
+
+# Only reached if every binary above exited 0 (set -e stops the script on the first
+# non-zero exit), so a failed run's directory is left behind for inspection rather than
+# silently deleted along with the evidence of what failed.
+rm -rf "$BH"

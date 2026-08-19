@@ -2,6 +2,8 @@
 
 #include <math.h>
 
+#include "app/input_map.h"
+
 // The largest tick the physics is ever handed, in seconds. Nothing in a steady frame
 // comes close to this — 16.71 ms is 0.0167 s — but the first frame after startup follows
 // the world build, the self-test and (on an instrumented build) a five-second remesh
@@ -40,10 +42,15 @@ void playerUpdate(Player* p, const World* w, float dt_ms)
 	const u32 held = hidKeysHeld();
 	float ix = 0.0f, iz = 0.0f;
 
-	if (held & KEY_DUP)    { ix += fx; iz += fz; }
-	if (held & KEY_DDOWN)  { ix -= fx; iz -= fz; }
-	if (held & KEY_DRIGHT) { ix += rx; iz += rz; }
-	if (held & KEY_DLEFT)  { ix -= rx; iz -= rz; }
+	// Step 8.4. The four directions come from the player's bindings rather than from KEY_DUP
+	// and friends directly. app/input_map.c answers with exactly those defaults until an
+	// options.ini says otherwise, so an unconfigured console walks on the D-pad as it always
+	// did. The bits are the same libctru KEY_* values — main.c static-asserts that, since
+	// app/options.h has to spell them as hex literals to stay host-compilable.
+	if (held & inputKey(ACTION_MOVE_FORWARD)) { ix += fx; iz += fz; }
+	if (held & inputKey(ACTION_MOVE_BACK))    { ix -= fx; iz -= fz; }
+	if (held & inputKey(ACTION_MOVE_RIGHT))   { ix += rx; iz += rz; }
+	if (held & inputKey(ACTION_MOVE_LEFT))    { ix -= rx; iz -= rz; }
 
 	// Two directions at once must not be faster than one. The D-pad only ever produces
 	// unit or 45-degree vectors, so this is a single normalise rather than a special case
@@ -59,7 +66,7 @@ void playerUpdate(Player* p, const World* w, float dt_ms)
 
 	// Grounded only: holding jump must not fly. on_ground is set by bodyMove when a
 	// downward move is stopped, so it is already false on the frame after a jump.
-	if ((hidKeysDown() & PLAYER_KEY_JUMP) && p->body.on_ground)
+	if ((hidKeysDown() & inputKey(ACTION_JUMP)) && p->body.on_ground)
 		p->body.vy = PLAYER_JUMP_SPEED;
 
 	bodyStep(&p->body, w, dt);

@@ -29,6 +29,15 @@ typedef struct {
 	u32     prev_keys;    // keys_down seen on the previous interactEdit call, so a held
 	                       // button can only fire once per press regardless of what the
 	                       // caller passes in — see interactEdit
+
+	// What THIS interactEdit call broke and placed, or BLOCK_AIR for neither. Step 8.2's
+	// inventory is filled from the first and charged for the second, and it needs the block
+	// *id*, which the cumulative counters above cannot carry. Both are cleared at the top of
+	// every interactEdit — they report one call, they do not accumulate — so a caller that
+	// reads them once per frame after the call sees each edit exactly once. Only one edit of
+	// each kind can happen per call, because the press that triggers it is edge-detected.
+	BlockId broke_id;
+	BlockId placed_id;
 } Interact;
 
 void interactInit(Interact* it);

@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "net/networld.h"
 #include "world/budget.h"
 
 static uint32_t hashKey(int32_t cx, int32_t cz)
@@ -17,18 +18,25 @@ static uint32_t hashKey(int32_t cx, int32_t cz)
 	return h;
 }
 
-// Returns the slot holding this column, or the empty slot where it would go.
-// NULL only when the table is completely full.
-static Column** slotFor(const World* w, int32_t cx, int32_t cz)
+// Returns the index of the slot holding this column, or of the empty slot where
+// it would go. Negative only when the table is completely full.
+//
+// An index rather than a Column**: the probe is identical for readers and
+// writers, but returning an interior pointer from a `const World*` meant
+// casting the const straight off w->slots, which -Wcast-qual rightly objects
+// to. An index carries no qualifier, so readers index w->slots[i] through their
+// const pointer and writers assign to it through theirs, with no cast either
+// side. worldColumnRemove wanted the index back anyway.
+static int slotIndexFor(const World* w, int32_t cx, int32_t cz)
 {
-	Column** slots = (Column**)w->slots;
 	const uint32_t start = hashKey(cx, cz) & (WORLD_MAP_SLOTS - 1);
 
 	for (int probe = 0; probe < WORLD_MAP_SLOTS; probe++) {
-		Column** s = &slots[(start + (uint32_t)probe) & (WORLD_MAP_SLOTS - 1)];
-		if (!*s || ((*s)->cx == cx && (*s)->cz == cz)) return s;
+		const uint32_t i = (start + (uint32_t)probe) & (WORLD_MAP_SLOTS - 1);
+		const Column* c = w->slots[i];
+		if (!c || (c->cx == cx && c->cz == cz)) return (int)i;
 	}
-	return NULL;
+	return -1;
 }
 
 void worldInit(World* w)
@@ -44,8 +52,12 @@ void worldExit(World* w)
 
 		for (int y = 0; y < COLUMN_CHUNKS; y++) {
 			if (!col->chunks[y]) continue;
-			free(col->chunks[y]);
-			budgetRelease(sizeof(Chunk));
+			// Release whatever this chunk's CURRENT form actually costs, not a fixed
+			// sizeof(Chunk) — since step 9.2a a promoted chunk (PALETTE4 or RAW) claimed
+			// more than the UNIFORM bytes it started at, and releasing the wrong amount
+			// would leave the budget singleton permanently out of balance.
+			budgetRelease(chunkGetBytes(col->chunks[y]));
+			chunkFree(col->chunks[y]);
 		}
 		free(col);
 		budgetRelease(sizeof(Column));
@@ -55,15 +67,15 @@ void worldExit(World* w)
 
 Column* worldColumn(const World* w, int cx, int cz)
 {
-	Column** s = slotFor(w, cx, cz);
-	return s ? *s : NULL;
+	const int i = slotIndexFor(w, cx, cz);
+	return i < 0 ? NULL : w->slots[i];
 }
 
 Column* worldColumnCreate(World* w, int cx, int cz)
 {
-	Column** s = slotFor(w, cx, cz);
-	if (!s) return NULL;          // table full
-	if (*s) return *s;
+	const int i = slotIndexFor(w, cx, cz);
+	if (i < 0) return NULL;          // table full
+	if (w->slots[i]) return w->slots[i];
 
 	if (!budgetClaim(sizeof(Column))) return NULL;
 
@@ -75,7 +87,7 @@ Column* worldColumnCreate(World* w, int cx, int cz)
 
 	col->cx = cx;
 	col->cz = cz;
-	*s = col;
+	w->slots[i] = col;
 	w->columns++;
 	return col;
 }
@@ -95,15 +107,17 @@ Chunk* worldChunkCreate(World* w, int cx, int cy, int cz)
 	if (!col) return NULL;
 	if (col->chunks[cy]) return col->chunks[cy];
 
-	if (!budgetClaim(sizeof(Chunk))) return NULL;
+	// A freshly created chunk always starts UNIFORM (all air) — chunkAlloc's own contract
+	// — so this is the one and only form whose bytes a brand new chunk can possibly need.
+	const size_t bytes = chunkFormBytes(CHUNK_FORM_UNIFORM);
+	if (!budgetClaim(bytes)) return NULL;
 
-	Chunk* c = (Chunk*)malloc(sizeof(Chunk));
+	Chunk* c = chunkAlloc(BLOCK_AIR);
 	if (!c) {
-		budgetRelease(sizeof(Chunk));
+		budgetRelease(bytes);
 		return NULL;
 	}
 
-	chunkClear(c, BLOCK_AIR);
 	col->chunks[cy] = c;
 	w->chunks++;
 	return c;
@@ -111,21 +125,21 @@ Chunk* worldChunkCreate(World* w, int cx, int cy, int cz)
 
 bool worldColumnRemove(World* w, int cx, int cz)
 {
-	Column** s = slotFor(w, cx, cz);
-	if (!s || !*s) return false;
+	const int slot = slotIndexFor(w, cx, cz);
+	if (slot < 0 || !w->slots[slot]) return false;
 
-	Column* col = *s;
+	Column* col = w->slots[slot];
 	for (int y = 0; y < COLUMN_CHUNKS; y++) {
 		if (!col->chunks[y]) continue;
-		free(col->chunks[y]);
-		budgetRelease(sizeof(Chunk));
+		budgetRelease(chunkGetBytes(col->chunks[y]));   // see worldExit for why this is per-chunk
+		chunkFree(col->chunks[y]);
 		w->chunks--;
 	}
 	free(col);
 	budgetRelease(sizeof(Column));
 	w->columns--;
 
-	// Knuth 6.4 algorithm R. This table has no tombstones — slotFor stops at the first
+	// Knuth 6.4 algorithm R. This table has no tombstones — slotIndexFor stops at the first
 	// empty slot — so emptying a slot in the middle of a probe chain would cut every
 	// column behind it out of the world while its memory is still claimed. Each entry
 	// that probed *past* this hole has to be walked back into it.
@@ -133,7 +147,7 @@ bool worldColumnRemove(World* w, int cx, int cz)
 	// The cheap-looking alternative, a tombstone flag, was rejected: the streaming ring
 	// deletes a column every time the player crosses a boundary, forever, so tombstones
 	// would accumulate until every lookup walked the whole table.
-	uint32_t i = (uint32_t)(s - w->slots);
+	uint32_t i = (uint32_t)slot;
 	w->slots[i] = NULL;
 
 	uint32_t j = i;
@@ -169,7 +183,7 @@ BlockId worldGet(const World* w, int x, int y, int z)
 
 	const Chunk* c = worldChunk(w, x >> 4, y >> 4, z >> 4);
 	if (!c) return BLOCK_AIR;
-	return c->blocks[chunkIndex(x & 15, y & 15, z & 15)];
+	return chunkGet(c, chunkIndex(x & 15, y & 15, z & 15));
 }
 
 bool worldSet(World* w, int x, int y, int z, BlockId id)
@@ -182,15 +196,118 @@ bool worldSet(World* w, int x, int y, int z, BlockId id)
 		// yet would allocate 4 KB to record nothing.
 		if (id == BLOCK_AIR) return true;
 
+		// net/networld.c needs to know the instant a column that did not exist a moment ago
+		// becomes real, so any remote edits queued for it (net/blockdiff.h) can land. Checked
+		// before the create call, not after — worldChunkCreate() cannot tell a brand new
+		// column from one that already held a different vertical chunk.
+		const bool new_column = worldColumn(w, x >> 4, z >> 4) == NULL;
+
 		c = worldChunkCreate(w, x >> 4, y >> 4, z >> 4);
 		if (!c) return false;
+
+		if (new_column) networldOnColumnLoad(w, x >> 4, z >> 4);
 	}
 
-	c->blocks[chunkIndex(x & 15, y & 15, z & 15)] = id;
+	// Pre-flight, then commit: chunkFormFor is a pure query, so the budget is asked BEFORE
+	// anything about c changes. A write that fits c's current form needs zero extra bytes
+	// (chunkFormBytes(form_after) - chunkGetBytes(c) is <= 0 whenever form_after == c's
+	// current form, since chunkFormFor never reports a smaller form than c already has) and
+	// so never touches the budget at all — this is the common case, an edit to already-RAW
+	// or already-matching-PALETTE4 terrain, and it stays exactly as cheap as before this
+	// step. Only an actual promotion claims anything, and if that claim is refused, chunkSet
+	// is never called, so c is left exactly as it was: still whatever form it was in, still
+	// holding whatever it held. There is no path here that claims and then fails to commit.
+	const ChunkForm form_before = chunkGetForm(c);
+	const ChunkForm form_after  = chunkFormFor(c, id);
+	const size_t bytes_before = chunkFormBytes(form_before);
+	const size_t bytes_after  = chunkFormBytes(form_after);
+
+	if (bytes_after > bytes_before) {
+		if (!budgetClaim(bytes_after - bytes_before)) return false;
+	}
+
+	if (!chunkSet(c, chunkIndex(x & 15, y & 15, z & 15), id)) {
+		// The only way chunkSet can fail is the promotion's own malloc failing, in which
+		// case c is untouched — release the claim above, it was never spent.
+		if (bytes_after > bytes_before) budgetRelease(bytes_after - bytes_before);
+		return false;
+	}
+	return true;
+}
+
+bool worldSetChunkAll(World* w, int cx, int cy, int cz, const BlockId in[CHUNK_BLOCKS])
+{
+	if ((unsigned)cy >= COLUMN_CHUNKS) return false;
+
+	Column* col = worldColumnCreate(w, cx, cz);
+	if (!col) return false;
+
+	Chunk* c = col->chunks[cy];
+	if (!c) {
+		// No existing chunk to size a delta against — this is exactly worldChunkCreate's
+		// own claim, done here instead of by calling it, so that the chunk this function
+		// commits is never first allocated UNIFORM and then immediately promoted: that
+		// would claim the UNIFORM bytes, free them, and claim the real form's bytes right
+		// after, for no reason other than code reuse. worldgen.c calls this once per chunk
+		// specifically to avoid paying for cell-by-cell promotion; doing it here anyway
+		// would defeat the point.
+		const size_t bytes = chunkFormBytes(chunkFormForAll(in));
+		if (!budgetClaim(bytes)) return false;
+
+		c = chunkAlloc(BLOCK_AIR);
+		if (!c) { budgetRelease(bytes); return false; }
+
+		if (!chunkLoadAll(c, in)) {
+			// chunkAlloc succeeded (it is UNIFORM, which cannot fail its own claim logic
+			// here since chunkLoadAll only fails on a promotion's malloc) but chunkLoadAll
+			// itself failed on its allocation — free the still-UNIFORM shell and give the
+			// claim back.
+			budgetRelease(bytes);
+			chunkFree(c);
+			return false;
+		}
+
+		col->chunks[cy] = c;
+		w->chunks++;
+		return true;
+	}
+
+	// Replacing an existing chunk's content: the same pre-flight/claim/commit/release shape
+	// worldSet uses, except chunkLoadAll may also SHRINK c (it is a wholesale replace, not
+	// an incremental edit — see chunk.h), so bytes_after can be smaller than bytes_before.
+	// That is not refused; it is not claimed either. Nothing here releases the shrink until
+	// after the commit actually happens, because chunkGetBytes(c) has to be read again
+	// afterward to know how much the form actually changed by — reading it before commit and
+	// assuming chunkFormForAll's answer is what will be installed is correct today (nothing
+	// else can be running between the query and the commit, single-threaded), but computing
+	// the release from the post-commit form rather than the pre-flight query keeps this
+	// function honest even if that ever changes.
+	const size_t bytes_before = chunkGetBytes(c);
+	const size_t bytes_after_query = chunkFormBytes(chunkFormForAll(in));
+
+	if (bytes_after_query > bytes_before) {
+		if (!budgetClaim(bytes_after_query - bytes_before)) return false;
+	}
+
+	if (!chunkLoadAll(c, in)) {
+		if (bytes_after_query > bytes_before)
+			budgetRelease(bytes_after_query - bytes_before);
+		return false;
+	}
+
+	const size_t bytes_after = chunkGetBytes(c);
+	if (bytes_after < bytes_before) budgetRelease(bytes_before - bytes_after);
 	return true;
 }
 
 size_t worldBytes(const World* w)
 {
-	return (size_t)w->columns * sizeof(Column) + (size_t)w->chunks * sizeof(Chunk);
+	size_t bytes = (size_t)w->columns * sizeof(Column);
+	for (int i = 0; i < WORLD_MAP_SLOTS; i++) {
+		const Column* col = w->slots[i];
+		if (!col) continue;
+		for (int y = 0; y < COLUMN_CHUNKS; y++)
+			if (col->chunks[y]) bytes += chunkGetBytes(col->chunks[y]);
+	}
+	return bytes;
 }

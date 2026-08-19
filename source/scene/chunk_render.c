@@ -51,6 +51,16 @@
 #define BS_CULLCACHE 1
 #endif
 
+// Step 9.1e, horizon culling: a candidate chunk whose whole box sits below the silhouette a
+// nearer, taller column already casts (roughly the same bearing from the camera, top elevation
+// angle already higher) cannot be on screen, whatever the frustum and the sight walk think.
+// -DBS_HORIZON=0 skips the test and draws whatever 7.1/7.3 kept — same rule as BS_CAVECULL:
+// the frame must be pixel-identical either way, and chunkRenderHorizonCulled() is how the
+// measurement is told apart from a rendering difference.
+#ifndef BS_HORIZON
+#define BS_HORIZON 1
+#endif
+
 // Baked per-face brightness, the values Phase 1 proved on the single cube: a high sun
 // leaning south-east, no two faces sharing a value, so a wrong normal index shows up as
 // an obviously wrong wall instead of a subtle one. Written by name so the face order in
@@ -65,8 +75,22 @@ static const float kFaceShade[BLOCK_FACES] = {
 };
 
 typedef struct {
+	// Step 9.2b. No per-slot index buffer any more. meshChunk's emitFace always advances
+	// vert_count by exactly 4 per quad, in the same order it writes that quad's six indices
+	// (base, base+1, base+2, base, base+2, base+3 — see mesher.c), so quad k of ANY chunk
+	// occupies vertices [4k, 4k+4) and produces those identical six values regardless of
+	// which face-direction bucket or opaque/transparent pass it fell in. One buffer sized for
+	// the largest slot (s_shared_indices, built once in chunkRenderInit) is therefore correct
+	// for every slot at once, and this struct only needs to remember counts and offsets into
+	// it — face_start below, plus index_count and opaque_index_count.
 	MeshVertex* verts;
-	uint16_t*   indices;
+
+	// Step 9.2c. How big *this* slot's `verts` buffer actually is, in vertices — 2048, 4096
+	// or 8192 depending which of the three tiers this slot index belongs to (see
+	// TIER_S/M/L_FACES). Not always MESH_SLOT_VERTS any more: that used to be true for
+	// every slot because there was only one size. Read by acquireSlot to decide whether an
+	// already-owned slot still fits a chunk that just grew.
+	uint32_t vert_cap;
 
 	int      cx, cy, cz;
 	uint32_t vert_count;
@@ -165,7 +189,86 @@ static C3D_Mtx  s_projection;
 // render distance moves the clip planes; nothing else can change it.
 static C3D_Mtx  s_mono_projection;
 
+// Step 9.2b. ONE index buffer shared by every slot, replacing what used to be MESH_SLOTS
+// separate 24 KB linearAlloc's — see the comment on MeshSlot for why one buffer is correct
+// for all of them. Filled once in chunkRenderInit and never written again: it has to be
+// linear memory because C3D_DrawElements DMAs straight out of it, but nothing about its
+// content depends on any chunk, so "once" is not a simplification here, it is the whole
+// content.
+static uint16_t* s_shared_indices;
+
+// Step 9.2c. Every slot used to reserve MESH_SLOT_VERTS (2048 faces, 64 KB) regardless of
+// what the chunk in it actually needed — the comment on slotFor below is what this step was
+// named for. Measured on the host (world/mesher.c and world/worldgen.c are <3ds.h>-free, so
+// this ran as real terrain generation + meshing on the PC, not a guess) across six worldgen
+// seeds at the pool's own ring size (25 columns, matching how MESH_SLOTS is derived): the
+// worst single chunk observed used 68.8 % of a slot, but the average was 20–25 %, and 58–66 %
+// of every live slot's bytes were unused. Full numbers in the vault log for this step.
+//
+// Three fixed-size tiers fix it without touching what makes the flat pool safe under the
+// player's load/unload churn: every slot *inside one tier* is still bit-identical in size
+// and recycled in place, exactly like the old single-size pool always was — nothing here can
+// fragment, because nothing here ever splits or coalesces a buffer. A chunk that needs more
+// than its tier holds does not grow in place; it moves to a slot in a bigger tier and the old
+// one goes back to its own tier's pool, same operation as claiming any other free slot.
+//
+// Cut points and slot counts are measured, not round numbers picked by eye: the same host
+// sample put 58–64 % of live chunks under 512 faces, 97.6–99.2 % under 1024, and never above
+// 1409 of the 2048-face absolute cap (worldgen's cave carving is what keeps any single chunk
+// from ever reaching the pathological checkerboard MESH_SLOT_FACES is sized against). Slot
+// counts (70/60/20) carry roughly 25–40 % margin over the worst tier occupancy seen across
+// six seeds (64/56/9), the same style of headroom MESH_SLOT_FACES itself already uses over a
+// fully exposed chunk surface. Tier L's cap is MESH_SLOT_FACES itself, so a pathological
+// world is refused exactly as before — nothing about the absolute worst case regresses.
+#define TIER_S_FACES  512
+#define TIER_M_FACES  1024
+#define TIER_L_FACES  MESH_SLOT_FACES   // 2048 — unchanged absolute worst case
+
+#define TIER_S_SLOTS  70
+#define TIER_M_SLOTS  60
+#define TIER_L_SLOTS  (MESH_SLOTS - TIER_S_SLOTS - TIER_M_SLOTS)   // 20 at MESH_SLOTS=150
+
+_Static_assert(TIER_S_SLOTS + TIER_M_SLOTS + TIER_L_SLOTS == MESH_SLOTS,
+               "tier slot counts must add up to the whole pool");
+_Static_assert(TIER_L_SLOTS > 0, "tier sizes leave nothing for the largest tier");
+
+static const int kTierFaces[3] = { TIER_S_FACES, TIER_M_FACES, TIER_L_FACES };
+static const int kTierSlots[3] = { TIER_S_SLOTS, TIER_M_SLOTS, TIER_L_SLOTS };
+
+// One linearAlloc per tier, carved into kTierSlots[t] equal pieces of kTierFaces[t]*4
+// vertices each — see chunkRenderInit. s_tier_start/s_tier_count say which range of
+// s_slots[] belongs to which tier; set once at init and never moved.
+static MeshVertex* s_tier_arena[3];
+static int         s_tier_start[3];
+static int         s_tier_count[3];
+
 static MeshSlot s_slots[MESH_SLOTS];
+
+// Step 9.2c. Where meshChunk writes vertices now, instead of straight into a slot: the
+// tiered pool cannot pick a slot until it knows out.vert_count, and that does not exist
+// until meshChunk has already run. Plain BSS and not linearAlloc, exactly like
+// s_index_scratch below and for the same reason — the GPU never reads this, only the
+// memcpy in chunkRenderBuild does, once, into whichever tier's slot gets picked.
+static MeshVertex s_vert_scratch[MESH_SLOT_VERTS];
+
+// Which tier a chunk needing this many vertices belongs in, smallest that fits.
+// need_verts can be 0 (an all-air chunk) up to MESH_SLOT_VERTS (meshChunk's own cap,
+// passed as out.vert_cap below) — never more, so this always resolves to 0, 1 or 2.
+static int tierForVerts(uint32_t need_verts)
+{
+	if (need_verts <= (uint32_t)TIER_S_FACES * 4) return 0;
+	if (need_verts <= (uint32_t)TIER_M_FACES * 4) return 1;
+	return 2;
+}
+
+// Step 9.2b. meshChunk's interface (world/mesher.h) always writes six index values per quad
+// into its caller's buffer — that contract belongs to a file this step does not own, so it is
+// unchanged. Every value it writes is always exactly what s_shared_indices already holds (see
+// the comment on MeshSlot), so this is a write-only landing pad: chunkRenderBuild points
+// meshChunk at it and only keeps the *counts* meshChunk also produces (vert_count,
+// index_count, opaque_index_count, face_start). Plain BSS and not linearAlloc — the GPU never
+// reads it, so it costs ordinary FCRAM and not the linear heap this step exists to shrink.
+static uint16_t s_index_scratch[MESH_SLOT_INDICES];
 static int      s_culled;        // chunks the frustum rejected on the last draw
 static int      s_sort_moved;    // step 7.2: chunks the sort took out of slot order
 static bool     s_sort_ok;       // ...and whether the emitted order really is near-to-far
@@ -189,6 +292,23 @@ static size_t   s_bytes;
 // these may be a local or an allocation.
 static VisWalk    s_walk;
 static VisScratch s_vis_scratch;
+
+// Step 9.1e's working memory: one entry per column currently holding a live slot. Sized off
+// RENDER_DIST_MAX_COLUMNS (25 at RENDER_DIST_MAX=2) with margin rather than exactly at it,
+// because a slot in flight during a distance change can briefly belong to a column outside the
+// current radius. A column past the cap simply does not participate as a blocker — the safe
+// direction, per the file-header rule every cull here follows: this may under-cull, it must
+// never over-cull.
+#define HZN_MAX_COLUMNS  40
+
+typedef struct {
+	int   cx, cz;
+	float top_y;   // world-space y of the highest meshed chunk's ceiling in this column
+} HznCol;
+
+static HznCol s_hzn_cols[HZN_MAX_COLUMNS];
+static int    s_hzn_n;
+static int    s_horizon_culled;
 
 // The camera position the walk used, recovered from the view matrix. Reported because that
 // recovery is an inversion that is either exactly right or completely wrong, and comparing it
@@ -265,27 +385,46 @@ static void cullInvalidate(void)
 // answer "no" every time, so it was strictly a loss. If the cave parameters ever change enough
 // that solid regions appear, this is worth reinstating — the reasoning is in the vault log.
 
-static MeshSlot* slotFor(int cx, int cy, int cz)
+// Does chunk (cx,cy,cz) already own a slot? Pure lookup, independent of size — used both to
+// recycle a slot in place and, when a chunk has outgrown its current tier, to know which
+// slot must eventually be handed back.
+static MeshSlot* findSlot(int cx, int cy, int cz)
 {
-	MeshSlot* free_slot  = NULL;
-	MeshSlot* empty_slot = NULL;   // claimed, but its chunk meshed to nothing
-
 	for (int i = 0; i < MESH_SLOTS; i++) {
 		MeshSlot* s = &s_slots[i];
 		if (s->used && s->cx == cx && s->cy == cy && s->cz == cz)
-			return s;                      // recycle in place: no allocation, no free
-		if (!s->used && !free_slot)
-			free_slot = s;
-		if (s->used && s->index_count == 0 && !empty_slot)
-			empty_slot = s;
+			return s;
 	}
+	return NULL;
+}
 
-	// A slot whose chunk holds no geometry is the right thing to take when the pool is
-	// otherwise full, and the wrong thing to take before that. Keeping it claimed is what
-	// lets chunkRenderTouch find the chunk again after a player digs it out — see the
-	// comment on `used` in chunkRenderBuild — but a dug-out chunk must not be allowed to
-	// hold 88 KB hostage from a chunk that has something to draw.
-	return free_slot ? free_slot : empty_slot;
+// Claims a slot with room for need_verts, preferring the smallest tier that fits and
+// borrowing from a bigger one only if that tier has nothing free. `exclude`, when not NULL,
+// is a slot never to return — the chunk's own current (too-small) slot, so a tier upgrade
+// cannot "claim" the very slot it is trying to replace out from under itself.
+//
+// Within one tier this is exactly the old single-pool slotFor's loop body: a slot nobody
+// has ever claimed first, and only if there is none of those, a claimed slot whose chunk
+// meshed to nothing (see the comment that used to sit here about not holding memory
+// hostage from a dug-out chunk — the reasoning did not change, it just now applies inside
+// each tier rather than across one pool).
+static MeshSlot* acquireSlot(uint32_t need_verts, const MeshSlot* exclude)
+{
+	const int min_tier = tierForVerts(need_verts);
+
+	for (int t = min_tier; t < 3; t++) {
+		MeshSlot* empty_slot = NULL;
+		const int start = s_tier_start[t];
+		const int end   = start + s_tier_count[t];
+		for (int i = start; i < end; i++) {
+			MeshSlot* s = &s_slots[i];
+			if (s == exclude) continue;
+			if (!s->used) return s;
+			if (s->index_count == 0 && !empty_slot) empty_slot = s;
+		}
+		if (empty_slot) return empty_slot;
+	}
+	return NULL;
 }
 
 // Everything the world draw needs the GPU to be set to. Called once at init and then
@@ -303,6 +442,12 @@ static void pipelineBind(void)
 	AttrInfo_Init(attr);
 	AttrInfo_AddLoader(attr, 0, GPU_BYTE, 3);            // v0 = position
 	AttrInfo_AddLoader(attr, 1, GPU_UNSIGNED_BYTE, 4);   // v1 = u, v, normal, ao
+
+	// The atlas, rebound here for exactly the reason the comment above gives about shader
+	// uniforms: the texture binding is one more piece of shared global state, and step 8.3's
+	// sprite batch takes unit 0 for the font sheet. Binding once inside atlasInit was correct
+	// only while nothing else in the program ever bound a texture.
+	atlasBind();
 
 	// No fragment shader: TEV stage 0 multiplies the atlas sample by the vertex
 	// colour, which is where the baked face shade and AO land.
@@ -352,14 +497,44 @@ bool chunkRenderInit(void)
 	s_uloc_modelview  = shaderInstanceGetUniformLocation(s_program.vertexShader, "modelView");
 	s_uloc_faceshade  = shaderInstanceGetUniformLocation(s_program.vertexShader, "faceShade");
 
-	// The whole pool, claimed once. If the console cannot give us this much linear
-	// memory we want to know at startup, not when the player walks somewhere new.
-	for (int i = 0; i < MESH_SLOTS; i++) {
-		s_slots[i].verts   = (MeshVertex*)linearAlloc(sizeof(MeshVertex) * MESH_SLOT_VERTS);
-		s_slots[i].indices = (uint16_t*)linearAlloc(sizeof(uint16_t) * MESH_SLOT_INDICES);
-		if (!s_slots[i].verts || !s_slots[i].indices)
+	// Step 9.2b. The one shared index buffer every slot draws from, built once and never
+	// written again — see the comment on s_shared_indices. Every quad's pattern is
+	// {v, v+1, v+2, v, v+2, v+3} relative to its own base vertex v = 4 * (quad's position in
+	// the slot), the same fill sprite.c already uses for its one shared quad buffer.
+	s_shared_indices = (uint16_t*)linearAlloc(sizeof(uint16_t) * MESH_SLOT_INDICES);
+	if (!s_shared_indices)
+		return false;
+	for (int q = 0; q < MESH_SLOT_FACES; q++) {
+		const uint16_t v   = (uint16_t)(q * 4);
+		uint16_t*      idx = &s_shared_indices[q * 6];
+		idx[0] = v;     idx[1] = (uint16_t)(v + 1); idx[2] = (uint16_t)(v + 2);
+		idx[3] = v;     idx[4] = (uint16_t)(v + 2); idx[5] = (uint16_t)(v + 3);
+	}
+	s_bytes += sizeof(uint16_t) * MESH_SLOT_INDICES;   // once, not once per slot
+
+	// Step 9.2c. The vertex buffers, one linearAlloc per TIER now rather than per slot —
+	// see the comment on TIER_S_FACES for the measurement this sizing comes from. Each
+	// tier's arena is carved into kTierSlots[t] equal pieces up front, same as the old
+	// per-slot loop did for one uniform size; what changed is that there are three sizes
+	// instead of one; If the console cannot give us this much linear memory we want to
+	// know at startup, not when the player walks somewhere new — same rule as before.
+	int next_slot = 0;
+	for (int t = 0; t < 3; t++) {
+		const uint32_t cap_verts = (uint32_t)kTierFaces[t] * 4;
+		const size_t   bytes     = sizeof(MeshVertex) * (size_t)cap_verts * (size_t)kTierSlots[t];
+
+		s_tier_arena[t] = (MeshVertex*)linearAlloc(bytes);
+		if (!s_tier_arena[t])
 			return false;
-		s_bytes += sizeof(MeshVertex) * MESH_SLOT_VERTS + sizeof(uint16_t) * MESH_SLOT_INDICES;
+		s_bytes += bytes;
+
+		s_tier_start[t] = next_slot;
+		s_tier_count[t] = kTierSlots[t];
+		for (int i = 0; i < kTierSlots[t]; i++) {
+			s_slots[next_slot + i].verts    = s_tier_arena[t] + (size_t)i * cap_verts;
+			s_slots[next_slot + i].vert_cap = cap_verts;
+		}
+		next_slot += kTierSlots[t];
 	}
 
 	if (!atlasInit())
@@ -447,21 +622,23 @@ const C3D_Mtx* chunkRenderProjection(void)
 void chunkRenderExit(void)
 {
 	atlasExit();
-	for (int i = 0; i < MESH_SLOTS; i++) {
-		linearFree(s_slots[i].indices);
-		linearFree(s_slots[i].verts);
-	}
+	// Step 9.2c. Three arenas now, not MESH_SLOTS individual allocations — every slot's
+	// `verts` pointer is an offset into one of these, so freeing per-slot would free the
+	// same block up to kTierSlots[t] times.
+	for (int t = 0; t < 3; t++)
+		linearFree(s_tier_arena[t]);
+	linearFree(s_shared_indices);
 	shaderProgramFree(&s_program);
 	DVLB_Free(s_dvlb);
 }
 
 bool chunkRenderBuild(const World* w, int cx, int cy, int cz)
 {
-	MeshSlot* s = slotFor(cx, cy, cz);
-	if (!s) {
-		s_refusals++;
-		return false;
-	}
+	// Step 9.2c. Looked up before anything else and independent of size: whether this
+	// chunk already owns a slot decides both the empty-chunk path below and, in the
+	// meshed path further down, whether a rebuild can recycle its slot in place or has to
+	// move to a different tier. NULL just means "this chunk has never been drawn before".
+	MeshSlot* existing = findSlot(cx, cy, cz);
 
 	// Deliberately does not touch the dirty queue. Clearing the flag here looks like
 	// tidiness and is how this shipped a bug for about three hours: the drain already
@@ -478,6 +655,14 @@ bool chunkRenderBuild(const World* w, int cx, int cy, int cz)
 	// with no storage at all is air by definition and takes the same path.
 	const Chunk* chunk = worldChunk(w, cx, cy, cz);
 	if (!chunk || chunkIsAllAir(chunk)) {
+		// Zero vertices needed, so any slot this chunk already owns fits trivially — reuse
+		// it in place, same as before. Only a brand-new chunk asks acquireSlot for
+		// anything, and it always lands in the smallest tier (0 <= TIER_S_FACES*4).
+		MeshSlot* s = existing ? existing : acquireSlot(0, NULL);
+		if (!s) {
+			s_refusals++;
+			return false;
+		}
 		s->cx = cx; s->cy = cy; s->cz = cz;
 		s->vert_count = s->index_count = s->opaque_index_count = 0;
 		memset(s->face_start, 0, sizeof(s->face_start));
@@ -498,18 +683,23 @@ bool chunkRenderBuild(const World* w, int cx, int cy, int cz)
 	// cost added to a path that already has a measured budget, and a number that hides inside
 	// another number cannot be argued with later.
 	const u64 tv = svcGetSystemTick();
-	s->vis_mask = visChunkConnectivity(chunk, &s_vis_scratch);
+	const uint16_t vis_mask = visChunkConnectivity(chunk, &s_vis_scratch);
 	s_vis_ticks += svcGetSystemTick() - tv;
 
 	const u64 t0 = svcGetSystemTick();
 	scratchFill(&s_scratch, w, cx, cy, cz);
 	const u64 t1 = svcGetSystemTick();
 
-	// Meshed straight into the slot's buffers: no staging copy, and the capacity
-	// check inside the mesher is what protects the linear heap.
+	// Step 9.2c. Meshed into s_vert_scratch, not a slot's own buffer any more: which slot
+	// this chunk belongs in depends on out.vert_count, which does not exist until meshChunk
+	// has already run — so there is no slot to mesh into yet. The index buffer is still NOT
+	// the slot's — s_index_scratch is a write-only landing pad meshChunk fills and this
+	// function throws away; see the comment on s_index_scratch for why that is exact, not a
+	// shortcut. vert_cap stays MESH_SLOT_VERTS, meshChunk's own absolute cap — unchanged
+	// from before this step, so a pathological chunk overflows exactly as it always did.
 	MeshOut out = {0};
-	out.verts     = s->verts;
-	out.indices   = s->indices;
+	out.verts     = s_vert_scratch;
+	out.indices   = s_index_scratch;
 	out.vert_cap  = MESH_SLOT_VERTS;
 	out.index_cap = MESH_SLOT_INDICES;
 	meshChunk(&out, &s_scratch);
@@ -520,11 +710,42 @@ bool chunkRenderBuild(const World* w, int cx, int cy, int cz)
 
 	if (out.overflow) {
 		s_refusals++;
-		s->used = false;      // a half-mesh is worse than no mesh
-		s->vert_count = s->index_count = s->opaque_index_count = 0;
-		memset(s->face_start, 0, sizeof(s->face_start));
-		cullInvalidate();
+		// Matches what the flat pool always did here: an overflowing remesh must not go on
+		// showing a chunk that no longer matches its own blocks, so a slot this chunk
+		// already owned is blanked rather than left showing stale geometry. A chunk that
+		// never had a slot simply continues not to have one — there is nothing to blank.
+		if (existing) {
+			existing->used = false;
+			existing->vert_count = existing->index_count = existing->opaque_index_count = 0;
+			memset(existing->face_start, 0, sizeof(existing->face_start));
+			cullInvalidate();
+		}
 		return false;
+	}
+
+	// The common case: the chunk already has a slot and it is still big enough (an edit
+	// that removed geometry, or added only a little, never crosses a tier boundary) — reuse
+	// it in place, no different from the flat pool's "recycle in place: no allocation, no
+	// free". Only a chunk that is brand new, or has just outgrown its tier, calls
+	// acquireSlot at all.
+	MeshSlot* s;
+	if (existing && existing->vert_cap >= out.vert_count) {
+		s = existing;
+	} else {
+		s = acquireSlot(out.vert_count, existing);
+		if (!s) {
+			// Pool full even after trying every tier from the smallest that fits upward.
+			// `existing`, if this chunk had a slot, is left exactly as it was — it keeps
+			// showing its last successfully built mesh instead of a hole, the same
+			// principle the overflow branch above uses for the same reason.
+			s_refusals++;
+			return false;
+		}
+		if (existing) {
+			existing->used = false;
+			existing->vert_count = existing->index_count = existing->opaque_index_count = 0;
+			memset(existing->face_start, 0, sizeof(existing->face_start));
+		}
 	}
 
 	s->cx = cx; s->cy = cy; s->cz = cz;
@@ -532,15 +753,21 @@ bool chunkRenderBuild(const World* w, int cx, int cy, int cz)
 	s->index_count = out.index_count;
 	s->opaque_index_count = out.opaque_index_count;
 	memcpy(s->face_start, out.face_start, sizeof(s->face_start));
+	// Only the vertices actually used, not the whole tier's capacity — copying vert_cap
+	// bytes every remesh would put back exactly the waste this step exists to remove.
+	if (out.vert_count)
+		memcpy(s->verts, s_vert_scratch, (size_t)out.vert_count * sizeof(MeshVertex));
+	s->vis_mask = vis_mask;
 	cullInvalidate();
 
 	// Claimed even when the chunk meshed to nothing. This used to be `out.faces > 0` — an
 	// all-air chunk handed its slot straight back — and that was a bug you could reach by
 	// playing: chunkRenderTouch only queues chunks that already own a slot, so a chunk dug
 	// out to nothing became permanently unqueueable, and a block placed back into it would
-	// exist in the World and never be drawn. The buffer is not wasted — slotFor takes an
-	// empty slot ahead of refusing, so the memory is still recoverable under pressure; it
-	// is only reserved while nothing else needs it.
+	// exist in the World and never be drawn. The buffer is not wasted — acquireSlot takes
+	// an empty slot ahead of refusing, so the memory is still recoverable under pressure;
+	// it is only reserved while nothing else needs it, and since 9.2c a dug-out chunk's
+	// empty slot is the smallest tier rather than always the largest.
 	s->used = true;
 
 	return true;
@@ -754,6 +981,97 @@ static void caveWalk(void)
 }
 #endif
 
+#if BS_HORIZON
+#define HZN_PI  3.14159265f
+
+// Step 9.1e, half of 9.1a's effect read back out: 9.1a never allocates a chunk above a
+// column's real terrain, so the highest *meshed, non-empty* slot in a column already IS that
+// column's silhouette height, at chunk resolution, for free — no second heightmap, no call
+// into worldgen's noise. `index_count == 0` slots (a dug-out chunk that kept its slot, see
+// chunkRenderBuild) are skipped: they draw nothing, so they cast nothing.
+//
+// Built once per cullFrame from the live pool, same rate as caveWalk's box — cheap because the
+// candidate set this step matters to is the same handful of columns the render distance
+// setting already caps at 25 (RENDER_DIST_MAX_COLUMNS).
+static void horizonBuild(void)
+{
+	s_hzn_n = 0;
+	for (int i = 0; i < MESH_SLOTS; i++) {
+		const MeshSlot* s = &s_slots[i];
+		if (!s->used || s->index_count == 0) continue;
+
+		const float top = (float)((s->cy + 1) * CHUNK_DIM);
+
+		int found = -1;
+		for (int c = 0; c < s_hzn_n; c++) {
+			if (s_hzn_cols[c].cx == s->cx && s_hzn_cols[c].cz == s->cz) { found = c; break; }
+		}
+		if (found >= 0) {
+			if (top > s_hzn_cols[found].top_y) s_hzn_cols[found].top_y = top;
+		} else if (s_hzn_n < HZN_MAX_COLUMNS) {
+			s_hzn_cols[s_hzn_n].cx = s->cx;
+			s_hzn_cols[s_hzn_n].cz = s->cz;
+			s_hzn_cols[s_hzn_n].top_y = top;
+			s_hzn_n++;
+		}
+		// A column past HZN_MAX_COLUMNS is silently dropped from the blocker set — see the
+		// comment on HZN_MAX_COLUMNS for why that is the safe direction and not a bug.
+	}
+}
+
+// True only when chunk (cx,cy,cz)'s entire box sits below a nearer column's silhouette, as
+// seen from the camera. Two tests, both conservative on purpose:
+//
+//   1. Bearing alignment: the blocking column N must actually sit in front of the candidate,
+//      not merely closer to the camera in some unrelated direction. `half_w` is N's angular
+//      half-width shrunk to 35% of its true 8-block half-extent (CHUNK_DIM * 0.5), so a
+//      near-miss reads as "not aligned" rather than "aligned" — the failure direction that
+//      matches every other cull in this file: this may keep a chunk it did not have to, it
+//      must never drop one that could be seen past N's actual silhouette.
+//   2. Elevation: N's top must subtend an angle at least as large as the candidate chunk's OWN
+//      top, i.e. even the highest point of the candidate cannot clear N's roofline.
+static bool horizonHidden(int cx, int cy, int cz)
+{
+	const float col_x = (float)(cx * CHUNK_DIM) + (float)CHUNK_DIM * 0.5f;
+	const float col_z = (float)(cz * CHUNK_DIM) + (float)CHUNK_DIM * 0.5f;
+	const float dx     = col_x - s_cam_x, dz = col_z - s_cam_z;
+	const float dist   = sqrtf(dx * dx + dz * dz);
+
+	// The camera's own column, or anything closer than a chunk's half-width, cannot be
+	// meaningfully "behind" anything else the loop will find — and dividing by a near-zero
+	// distance below would otherwise hand back a degenerate bearing.
+	if (dist < (float)CHUNK_DIM * 0.5f) return false;
+
+	const float bearing = atan2f(dz, dx);
+	const float top_y   = (float)((cy + 1) * CHUNK_DIM);
+	const float elev    = atan2f(top_y - s_cam_y, dist);
+
+	for (int c = 0; c < s_hzn_n; c++) {
+		if (s_hzn_cols[c].cx == cx && s_hzn_cols[c].cz == cz) continue;   // never self-block
+
+		const float ncx = (float)(s_hzn_cols[c].cx * CHUNK_DIM) + (float)CHUNK_DIM * 0.5f;
+		const float ncz = (float)(s_hzn_cols[c].cz * CHUNK_DIM) + (float)CHUNK_DIM * 0.5f;
+		const float ndx = ncx - s_cam_x, ndz = ncz - s_cam_z;
+		const float ndist = sqrtf(ndx * ndx + ndz * ndz);
+
+		// Must be genuinely nearer, with a full block of margin against two columns at
+		// essentially the same distance flickering across the cull from one frame to the next.
+		if (ndist >= dist - 1.0f) continue;
+
+		float dbear = atan2f(ndz, ndx) - bearing;
+		while (dbear >  HZN_PI) dbear -= 2.0f * HZN_PI;
+		while (dbear < -HZN_PI) dbear += 2.0f * HZN_PI;
+
+		const float half_w = atan2f((float)CHUNK_DIM * 0.5f * 0.35f, ndist);
+		if (fabsf(dbear) > half_w) continue;
+
+		const float nelev = atan2f(s_hzn_cols[c].top_y - s_cam_y, ndist);
+		if (nelev >= elev) return true;
+	}
+	return false;
+}
+#endif
+
 // Points the GPU at one chunk: the model matrix that places its chunk-local 0..16 vertices in
 // the world, and its vertex buffer. Split out from the draw in step 9.2, because a chunk is
 // now up to three opaque runs plus a transparent one and all four share this — setting a
@@ -772,11 +1090,13 @@ static void slotBind(const C3D_Mtx* view, const MeshSlot* s)
 	BufInfo_Add(buf, s->verts, sizeof(MeshVertex), 2, 0x10);
 }
 
-// One run of the bound chunk's index buffer.
-static void drawIndices(const MeshSlot* s, uint32_t first, uint32_t count)
+// One run out of the shared index buffer. `first` and `count` still come from the bound
+// slot's own face_start / opaque_index_count / index_count — only the storage they index
+// into is shared now, see s_shared_indices.
+static void drawIndices(uint32_t first, uint32_t count)
 {
 	if (!count) return;
-	C3D_DrawElements(GPU_TRIANGLES, (int)count, C3D_UNSIGNED_SHORT, s->indices + first);
+	C3D_DrawElements(GPU_TRIANGLES, (int)count, C3D_UNSIGNED_SHORT, s_shared_indices + first);
 	metricsCountDraw(count / 3);
 }
 
@@ -785,7 +1105,7 @@ static void drawRun(const C3D_Mtx* view, const MeshSlot* s, uint32_t first, uint
 {
 	if (!count) return;
 	slotBind(view, s);
-	drawIndices(s, first, count);
+	drawIndices(first, count);
 }
 
 // Step 9.2. The opaque half of one chunk, minus the face directions that cannot be looking at
@@ -833,11 +1153,11 @@ static void drawOpaque(const C3D_Mtx* view, const MeshSlot* s)
 		if (!want[kFaceOrder[f]]) { f++; continue; }
 		int g = f;
 		while (g + 1 < BLOCK_FACES && want[kFaceOrder[g + 1]]) g++;
-		drawIndices(s, s->face_start[f], s->face_start[g + 1] - s->face_start[f]);
+		drawIndices(s->face_start[f], s->face_start[g + 1] - s->face_start[f]);
 		f = g + 1;
 	}
 #else
-	drawIndices(s, 0, s->opaque_index_count);
+	drawIndices(0, s->opaque_index_count);
 #endif
 }
 
@@ -854,6 +1174,7 @@ static void cullFrame(const C3D_Mtx* view)
 	s_culled = 0;
 	s_cave_culled = 0;
 	s_cave_ran = false;
+	s_horizon_culled = 0;
 
 	cameraFromView(view);
 
@@ -866,6 +1187,14 @@ static void cullFrame(const C3D_Mtx* view)
 
 #if BS_CAVECULL
 	caveWalk();
+#endif
+
+#if BS_HORIZON
+	// Step 9.1e, at the same rate as caveWalk: a function of the pool's contents and the
+	// camera position, so it is rebuilt every cull rather than cached against a chunk
+	// boundary the way the sight walk is — the column table is a handful of entries and a
+	// single pass over MESH_SLOTS, nowhere near what the walk's box justifies caching for.
+	horizonBuild();
 #endif
 
 	// The slack that makes one frustum answer for two eyes. Mtx_PerspStereoTilt moves the
@@ -907,6 +1236,16 @@ static void cullFrame(const C3D_Mtx* view)
 		// previous one had kept".
 		if (s_cave_ran && !visWalkVisible(&s_walk, s->cx, s->cy, s->cz)) {
 			s_cave_culled++;
+			continue;
+		}
+#endif
+
+#if BS_HORIZON
+		// Step 9.1e. After frustum and cave, same reasoning as their own ordering comments:
+		// counted last so its number is "what this test rejected that the other two had
+		// kept", not an overlapping claim.
+		if (horizonHidden(s->cx, s->cy, s->cz)) {
+			s_horizon_culled++;
 			continue;
 		}
 #endif
@@ -1096,6 +1435,7 @@ int    chunkRenderSortMoved(void)  { return s_sort_moved; }
 bool   chunkRenderSortOk(void)     { return s_sort_ok; }
 int    chunkRenderCaveCulled(void) { return s_cave_culled; }
 bool   chunkRenderCaveRan(void)    { return s_cave_ran; }
+int    chunkRenderHorizonCulled(void) { return s_horizon_culled; }
 
 void chunkRenderCamera(float* x, float* y, float* z)
 {

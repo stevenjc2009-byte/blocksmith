@@ -85,5 +85,18 @@ BlockId worldGet(const World* w, int x, int y, int z);
 // reports success — there is nothing to store.
 bool worldSet(World* w, int x, int y, int z, BlockId id);
 
-// Bytes of block data currently held, for the budget report.
+// Step 9.2a/9.1b. Replaces a whole chunk's content in one shot, choosing whichever of
+// chunk.h's three storage forms fits `in` — this is what worldgen.c and (via
+// chunk_codec.c) a save load use instead of worldChunkCreate followed by CHUNK_BLOCKS
+// individual worldSet calls, so a freshly generated or loaded chunk is never promoted
+// cell by cell on its own construction. Allocates the column and chunk if they do not
+// exist yet. False if y is outside the world, the column table is full, or the budget
+// refused the bytes the chosen form needs; on a refusal nothing already loaded is
+// disturbed — a chunk that existed before the call still holds what it held before.
+bool worldSetChunkAll(World* w, int cx, int cy, int cz, const BlockId in[CHUNK_BLOCKS]);
+
+// Bytes of block data currently held, for the budget report. Walks every live chunk and
+// sums chunkGetBytes(c) rather than assuming a fixed per-chunk cost, because since step
+// 9.2a a chunk's size depends on its storage form — this is now an O(chunks) call, not
+// O(1), which is fine: the only caller is the bottom-screen report, once a frame.
 size_t worldBytes(const World* w);

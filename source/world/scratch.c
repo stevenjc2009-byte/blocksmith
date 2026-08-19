@@ -49,12 +49,15 @@ void scratchFill(MeshScratch* s, const World* w, int cx, int cy, int cz)
 						if (!c) {
 							memset(dst, absent, (size_t)ax.count);
 						} else {
-							// x is the contiguous axis in both layouts, so a whole
-							// run copies at once.
-							const BlockId* src = &c->blocks[chunkIndex(ax.local_begin,
-							                                           ay.local_begin + i,
-							                                           az.local_begin + j)];
-							memcpy(dst, src, (size_t)ax.count);
+							// x is the contiguous axis in both layouts, so a whole run is
+							// still one call — chunkCopyRun is the form-aware bulk primitive
+							// (memset for UNIFORM, an unpack loop for PALETTE4, memcpy for
+							// RAW) that replaced the direct &c->blocks[...] read this loop
+							// used before step 9.2a made Chunk opaque.
+							chunkCopyRun(c, chunkIndex(ax.local_begin,
+							                           ay.local_begin + i,
+							                           az.local_begin + j),
+							             ax.count, dst);
 						}
 					}
 				}

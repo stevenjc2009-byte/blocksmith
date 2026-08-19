@@ -1,5 +1,7 @@
 #include "world/mesher.h"
 
+#include <string.h>
+
 #include "world/atlas_uv.h"
 #include "world/block.h"
 
@@ -251,6 +253,12 @@ static int      s_emit_alpha_lo;   // transparent cells, [s_emit_alpha_lo, CHUNK
 // That is fine and deliberate: it is drawn as one alpha-tested run inside a chunk that is
 // itself depth-sorted against the others, and cutout geometry is order-independent within a
 // draw. Nothing downstream may assume otherwise.
+//
+// Step 9.4b: the inner loop below reads a chunk row four cells at a time, which only lines up
+// if a row is a multiple of 4 wide. Checked at compile time so a future change to CHUNK_DIM
+// fails the build instead of silently scanning past the row.
+_Static_assert(CHUNK_DIM % 4 == 0, "step 9.4b word scan needs a chunk row divisible by 4");
+
 static void emitCollect(const MeshScratch* s)
 {
 	int opaque = 0;
@@ -263,17 +271,52 @@ static void emitCollect(const MeshScratch* s)
 		for (int lz = 0; lz < CHUNK_DIM; lz++) {
 			int si = scratchIndex(1, ly + 1, lz + 1);
 
-			for (int lx = 0; lx < CHUNK_DIM; lx++, si++) {
-				if (!s_cell_solid[si]) continue;
+			// Step 9.4b. BLOCK_AIR == 0 and s_cell_solid[BLOCK_AIR] is false by
+			// construction, so four consecutive s_cell_solid bytes reading back as the
+			// word 0 mean four consecutive non-solid cells in this row — currently that
+			// can only be air, since air is the only non-solid block in the registry
+			// (see block.c) — and nothing in a run of four cells like that can ever
+			// emit. A 16-wide chunk row is exactly four uint32_t words, so testing the
+			// word first turns "4 byte loads + 4 branches" into "1 word load + 1
+			// branch" for every such run, which is most of an open-sky chunk.
+			//
+			// This is the loop that SCANS FOR solid cells to build the emit list — the
+			// only place in this file eligible for an air-skip. meshPass() below tests
+			// a single neighbour cell per face, not a run, so there is nothing to skip
+			// four of; skipping there would also risk stepping over the exact
+			// transparent-neighbour check step 9.1 added. Not touched.
+			//
+			// si is NOT provably 4-byte aligned: it is scratchIndex(1, ly+1, lz+1) + lx,
+			// and SCRATCH_DIM (18, world/scratch.h:17) is not a multiple of 4, so the
+			// row's starting address cycles through all four byte phases as ly and lz
+			// vary — there is no fixed alignment to assert. A `(uint32_t*)&s_cell_solid[si]`
+			// cast would be an unaligned load the ARM11 is not guaranteed to tolerate.
+			// memcpy's semantics don't depend on alignment at all: GCC lowers a
+			// fixed-size memcpy to a single load when it can prove one is safe for the
+			// target and to a safe byte sequence when it can't, so this is correct
+			// either way without knowing the CPU's unaligned-access policy at compile
+			// time. s_cell_solid itself (world/mesher.c) is a plain uint8_t[]; nothing
+			// about its declaration promises 4-byte alignment either, which is exactly
+			// why the row offset can't be trusted and memcpy is the right tool, not a
+			// cast plus an alignment attribute.
+			for (int lx = 0; lx < CHUNK_DIM; lx += 4, si += 4) {
+				uint32_t word;
+				memcpy(&word, &s_cell_solid[si], sizeof(word));
+				if (word == 0) continue;   // four non-solid cells: nothing to emit
 
-				const BlockId id = s->blocks[si];
-				EmitCell*     e  = s_deferred[id] ? &s_emit[--alpha] : &s_emit[opaque++];
+				for (int k = 0; k < 4; k++) {
+					const int sik = si + k;
+					if (!s_cell_solid[sik]) continue;
 
-				e->si = (uint16_t)si;
-				e->id = (uint8_t)id;
-				e->lx = (uint8_t)lx;
-				e->ly = (uint8_t)ly;
-				e->lz = (uint8_t)lz;
+					const BlockId id = s->blocks[sik];
+					EmitCell*     e  = s_deferred[id] ? &s_emit[--alpha] : &s_emit[opaque++];
+
+					e->si = (uint16_t)sik;
+					e->id = (uint8_t)id;
+					e->lx = (uint8_t)(lx + k);
+					e->ly = (uint8_t)ly;
+					e->lz = (uint8_t)lz;
+				}
 			}
 		}
 	}

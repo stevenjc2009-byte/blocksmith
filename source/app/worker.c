@@ -80,6 +80,15 @@ static char s_world_dir[128];
 // thread, and static rather than on the worker's 32 KB stack — which it would exactly fill.
 static uint8_t s_load_buf[REGION_COL_MAX];
 
+// Unpack buffer for workerInstall's staging → world copy. Since step 9.2a a Chunk is opaque
+// and there is no flat blocks[] to memcpy between the two worlds, so a chunk is unpacked
+// here and handed on whole. Main-thread-owned and safe as a static for the same reason the
+// rest of workerInstall is: it only runs while s_ready is set and the worker is parked. 4 KB
+// in .bss rather than on the stack because workerInstall runs on the *main* thread, whose
+// frame is already carrying the render path — this is not worth spending stack on when it is
+// live for a few microseconds per installed column.
+static BlockId s_install_blocks[CHUNK_BLOCKS];
+
 // Step 8.1. Fills the staging column from the region file, and says whether it managed it.
 // False is the ordinary answer, not an error: it means the card has never heard of this
 // column, which is true of all of them the first time a world is played.
@@ -388,9 +397,13 @@ bool workerInstall(World* w, int32_t* cx, int32_t* cz, bool* ok)
 			// would undo that.
 			if (!src->chunks[cy]) continue;
 
-			Chunk* dst = worldChunkCreate(w, rx, cy, rz);
-			if (!dst) { all = false; break; }
-			memcpy(dst->blocks, src->chunks[cy]->blocks, sizeof(dst->blocks));
+			// Unpack once, install whole. worldSetChunkAll re-picks the smallest storage
+			// form for the destination and settles the budget itself — the same route
+			// worldgen and the save loader take — so a freshly installed column is never
+			// promoted cell by cell on its own construction. Before step 9.2a this was a
+			// memcpy of two flat blocks[] arrays; a Chunk no longer has one.
+			chunkDecompressAll(src->chunks[cy], s_install_blocks);
+			if (!worldSetChunkAll(w, rx, cy, rz, s_install_blocks)) { all = false; break; }
 		}
 	}
 

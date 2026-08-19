@@ -3,6 +3,15 @@
 #include "world/noise.h"
 #include "world/rng.h"
 
+// Step 9.2a/9.1b. A flat staging buffer for one chunk's worth of cells, built here and then
+// committed in one shot via worldSetChunkAll — never CHUNK_BLOCKS individual worldSet calls,
+// which would promote a freshly generated chunk's storage cell by cell (UNIFORM ->
+// PALETTE4 -> RAW) for a chunk whose final content is already fully known before the first
+// write. Static rather than a stack array, following worker.c's s_load_buf convention: this
+// runs on whatever thread calls worldgenColumn, and 4 KB is not something to risk on a stack
+// that also has to hold the rest of a generation call's frames.
+static BlockId s_gen_flat[CHUNK_BLOCKS];
+
 // How far apart the terrain's largest features are, as a power of two in blocks. 64 gives
 // hills you walk over in a few seconds at 4.31 blocks/s rather than continent-scale
 // shapes that read as flat ground from inside the world.
@@ -269,27 +278,25 @@ bool worldgenColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 		if (y0 >= max_h)
 			continue;
 
-		Chunk* c = worldChunkCreate(w, cx, cy, cz);
-		if (!c)
-			return false;
-
 		// Entirely below the lowest ground AND deep enough that every block in it is
-		// carvable: solid stone in one memset, then the cave pass. The bound is
+		// carvable: solid stone throughout, then the cave pass. The bound is
 		// GEN_CAVE_MIN_DEPTH rather than the old GEN_DIRT_DEPTH + 1 so that this branch
 		// does not have to think about depth at all — one constant governs both the
 		// layering (5 > 3, so it is all stone) and the carve.
 		if (y0 + CHUNK_DIM <= min_h - GEN_CAVE_MIN_DEPTH) {
-			chunkClear(c, BLOCK_STONE);
+			for (int i = 0; i < CHUNK_BLOCKS; i++) s_gen_flat[i] = BLOCK_STONE;
 			for (int lz = 0; lz < CHUNK_DIM; lz++)
 				for (int lx = 0; lx < CHUNK_DIM; lx++)
 					for (int ly = 0; ly < CHUNK_DIM; ly++)
 						if (worldgenIsCave(g, cx * CHUNK_DIM + lx, y0 + ly,
 						                   cz * CHUNK_DIM + lz))
-							c->blocks[chunkIndex(lx, ly, lz)] = BLOCK_AIR;
+							s_gen_flat[chunkIndex(lx, ly, lz)] = BLOCK_AIR;
+			if (!worldSetChunkAll(w, cx, cy, cz, s_gen_flat))
+				return false;
 			continue;
 		}
 
-		chunkClear(c, BLOCK_AIR);
+		for (int i = 0; i < CHUNK_BLOCKS; i++) s_gen_flat[i] = BLOCK_AIR;
 		for (int lz = 0; lz < CHUNK_DIM; lz++) {
 			for (int lx = 0; lx < CHUNK_DIM; lx++) {
 				const int32_t x = cx * CHUNK_DIM + lx, z = cz * CHUNK_DIM + lz;
@@ -300,16 +307,18 @@ bool worldgenColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 				if (top > CHUNK_DIM - 1) top = CHUNK_DIM - 1;
 				for (int ly = 0; ly <= top; ly++) {
 					const int depth = h - 1 - (y0 + ly);
-					// The chunk is already air, so a carved block is simply not written.
+					// The buffer starts as air, so a carved block is simply not written.
 					// The depth guard comes first because it is a compare against a local
 					// and the cave test is two fBms.
 					if (depth >= GEN_CAVE_MIN_DEPTH &&
 					    worldgenIsCave(g, x, y0 + ly, z))
 						continue;
-					c->blocks[chunkIndex(lx, ly, lz)] = blockAtDepth(depth, sandy[lz][lx]);
+					s_gen_flat[chunkIndex(lx, ly, lz)] = blockAtDepth(depth, sandy[lz][lx]);
 				}
 			}
 		}
+		if (!worldSetChunkAll(w, cx, cy, cz, s_gen_flat))
+			return false;
 	}
 
 	return worldgenDecorate(g, w, cx, cz);

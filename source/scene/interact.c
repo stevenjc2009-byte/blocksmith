@@ -2,6 +2,8 @@
 
 #include <math.h>
 
+#include "app/input_map.h"
+#include "net/networld.h"
 #include "scene/chunk_render.h"
 #include "world/block.h"
 
@@ -27,6 +29,8 @@ void interactInit(Interact* it)
 	it->placed    = 0;
 	it->refused   = 0;
 	it->prev_keys = 0;
+	it->broke_id  = BLOCK_AIR;
+	it->placed_id = BLOCK_AIR;
 }
 
 void interactAim(Interact* it, const World* w, const Camera* cam)
@@ -57,13 +61,27 @@ int interactEdit(Interact* it, World* w, const Body* body, u32 keys_down)
 	const u32 fresh = keys_down & ~it->prev_keys;
 	it->prev_keys = keys_down;
 
+	// Step 8.2. Cleared every call, not accumulated: these two report what THIS call did, so
+	// the caller can act on it once. A cumulative counter would leave the caller diffing two
+	// integers to work out whether anything happened, and a stale id left over from an
+	// earlier frame would put a second copy of the same block into the inventory every frame
+	// until the next edit.
+	it->broke_id  = BLOCK_AIR;
+	it->placed_id = BLOCK_AIR;
+
+	// Step 8.4. The two verbs come from the player's bindings rather than the INTERACT_KEY_*
+	// constants directly. app/input_map.c answers with exactly those constants' values until
+	// an options.ini says otherwise.
+	const u32 key_break = inputKey(ACTION_BREAK);
+	const u32 key_place = inputKey(ACTION_PLACE);
+
 	if (!it->target.hit) {
 		// A press with nothing to aim at is still a refusal, not a no-op: `refused` is
 		// documented (interact.h) as counting edits the world, the body, or a miss
 		// rejected, and a press that found no target was rejected same as one the world
 		// vetoed. Leaving this uncounted made the overlay's `r` figure understate how
 		// many presses actually did nothing.
-		if (fresh & (INTERACT_KEY_BREAK | INTERACT_KEY_PLACE))
+		if (fresh & (key_break | key_place))
 			it->refused++;
 		return 0;
 	}
@@ -71,20 +89,38 @@ int interactEdit(Interact* it, World* w, const Body* body, u32 keys_down)
 	const RayHit* t = &it->target;
 	int queued = 0;
 
-	if (fresh & INTERACT_KEY_BREAK) {
+	if (fresh & key_break) {
+		// Read before the write, obviously, but worth saying why it is read at all: step
+		// 8.2's inventory is filled from what the player actually broke, so the id has to be
+		// captured here — after worldSet the cell is air and the information is gone.
+		const BlockId broken = worldGet(w, t->x, t->y, t->z);
+
 		// worldSet refuses y outside the world, which is exactly what should happen when
 		// the ray hit the solid floor below y == 0 — that is not a block anyone owns.
 		if (worldSet(w, t->x, t->y, t->z, BLOCK_AIR)) {
 			// Step 8.1. Only edits mark a column for saving — see the note on Column.dirty.
 			worldMarkDirty(w, t->x, t->z);
 			queued += chunkRenderTouch(w, t->x, t->y, t->z);
+			// Fire-and-forget to the server: the local write above is already done and is
+			// authoritative for this client's own view, so nothing here waits on it.
+			networldSendBlockEdit(t->x, t->y, t->z, BLOCK_AIR);
 			it->broke++;
+			it->broke_id = broken;
 		} else {
 			it->refused++;
 		}
 	}
 
-	if (fresh & INTERACT_KEY_PLACE) {
+	if (fresh & key_place) {
+		// Nothing in hand is a refusal, not a crash and not a silent no-op. Before step 8.2
+		// `holding` was a constant BLOCK_STONE and this could not happen; now it comes from
+		// the inventory's selected hotbar slot, and an empty slot is the ordinary case.
+		// Placing BLOCK_AIR would otherwise read as a second, longer-ranged break.
+		if (it->holding == BLOCK_AIR) {
+			it->refused++;
+			return queued;
+		}
+
 		// No entry face means the camera is inside a solid block, so there is no sensible
 		// cell to place into — the ray never crossed a boundary to name one.
 		if (t->face == RAY_FACE_NONE) {
@@ -110,7 +146,10 @@ int interactEdit(Interact* it, World* w, const Body* body, u32 keys_down)
 		if (worldSet(w, t->px, t->py, t->pz, it->holding)) {
 			worldMarkDirty(w, t->px, t->pz);
 			queued += chunkRenderTouch(w, t->px, t->py, t->pz);
+			// Fire-and-forget to the server, same as the break path above.
+			networldSendBlockEdit(t->px, t->py, t->pz, it->holding);
 			it->placed++;
+			it->placed_id = it->holding;
 		} else {
 			it->refused++;
 		}

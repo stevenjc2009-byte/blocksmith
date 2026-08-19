@@ -21,13 +21,18 @@
 #define MESH_SLOT_VERTS    (MESH_SLOT_FACES * 4)
 #define MESH_SLOT_INDICES  (MESH_SLOT_FACES * 6)
 
+// Step 9.2b: this is also the size of the ONE index buffer every slot now draws from — see
+// s_shared_indices in chunk_render.c. It used to size MESH_SLOTS separate linearAlloc's.
+
 // Step 7.7. The pool is sized for the *largest* render distance the setting allows, not for
 // the current one, and it is claimed once at boot. That is not laziness about resizing: the
 // linear heap is the only GPU-visible memory on this console and it cannot be defragmented,
 // so a pool that grew when the player raised the setting would be exactly the
 // allocate-and-free churn the pool exists to avoid. The cost is that an Old 3DS left on the
-// default distance carries slots it never fills — 96 of 150, about 8.2 MB — and the benefit is
-// that the setting can move at any moment, on any model, without an allocation that can fail.
+// default distance carries slots it never fills — 96 of 150, about 6.0 MB now that step 9.2b
+// folded every slot's index buffer into one shared 24 KB allocation (an unfilled slot wastes
+// only its 64 KB vertex buffer now, not 88 KB) — and the benefit is that the setting can move
+// at any moment, on any model, without an allocation that can fail.
 #define MESH_SLOTS         (RENDER_DIST_MAX_SLOTS)
 
 // The sky colour, in one place because step 6.4's fog has to be the same colour as the
@@ -80,13 +85,13 @@ int chunkRenderReleaseColumn(int cx, int cz);
 // never grows the working set. Returns how many chunks were newly queued (a chunk touched
 // twice before it drains, or one with no slot, does not add to the count).
 //
-// Why this queues instead of meshing on the spot: a remesh costs ~2.1 ms (scratchFill plus
-// meshChunk at ~1.47 ms — see chunkRenderProfile — plus the 0.63 ms step 7.3's visibility
-// fill added, see chunkRenderVisUs) and a corner edit reaches all eight chunks around it,
-// so meshing immediately would cost 8 x 2.1 ms = 16.8 ms against a 16.71 ms frame at
-// 59.83 Hz — one edit would eat the whole frame outright, and holding a break button down
-// would drop frames continuously. Queueing lets chunkRenderDrainDirty spread that cost
-// over as many frames as it takes.
+// Why this queues instead of meshing on the spot: a remesh costs ~1.55 ms (scratchFill plus
+// meshChunk at 917 us (step 9.4c measurement) — see chunkRenderProfile — plus the 0.63 ms step
+// 7.3's visibility fill added, see chunkRenderVisUs) and a corner edit reaches all eight chunks
+// around it, so meshing immediately would cost 8 x 1.55 ms = 12.4 ms against a 16.71 ms frame
+// at 59.83 Hz — one edit would eat most of the frame, and holding a break button down would drop
+// frames continuously. Queueing lets chunkRenderDrainDirty spread that cost over as many frames
+// as it takes.
 int chunkRenderTouch(const World* w, int x, int y, int z);
 
 // Remeshes queued chunks until budget_ms of wall clock has been spent, max_chunks have been
@@ -160,6 +165,12 @@ bool     chunkRenderSortOk(void);
 // a reason that has nothing to do with the terrain.
 int      chunkRenderCaveCulled(void);
 bool     chunkRenderCaveRan(void);
+
+// Step 9.1e's evidence. How many chunks the horizon test rejected that the frustum and the
+// sight walk had *both* kept — disjoint from chunkRenderCulled() and chunkRenderCaveCulled(),
+// so all three add up. See chunk_render.c's BS_HORIZON comment for what the test is and why it
+// is safe to leave on unconditionally: it can only under-cull, never over-cull.
+int      chunkRenderHorizonCulled(void);
 
 // Step 9.3's evidence, cumulative since boot. chunkRenderCullRuns() counts how many times the
 // frustum-plus-sight-walk-plus-sort pass actually ran; chunkRenderWalkRuns() how many times the

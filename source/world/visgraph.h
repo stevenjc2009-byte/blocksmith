@@ -49,16 +49,23 @@
 #define VIS_ALL_CONNECTED  0xFFFFu
 
 // Working memory for the flood fill, passed in rather than made static so the fill is a pure
-// function and the host test can run several in one process. 18 KB, allocated once by the
-// caller and reused for every chunk — the same rule MeshScratch follows, and for the same
-// reason: this must never be a per-chunk allocation on a console whose linear heap cannot be
-// defragmented.
+// function and the host test can run several in one process. ~22 KB (18 KB of label/stack/
+// comp_faces plus 4 KB for `blocks`), allocated once by the caller and reused for every chunk
+// — the same rule MeshScratch follows, and for the same reason: this must never be a
+// per-chunk allocation on a console whose linear heap cannot be defragmented.
 #define VIS_MAX_COMPONENTS  (CHUNK_BLOCKS / 2 + 1)   // a 16^3 checkerboard, the true worst case
 
 typedef struct {
 	uint16_t label[CHUNK_BLOCKS];
 	uint16_t stack[CHUNK_BLOCKS];
 	uint8_t  comp_faces[VIS_MAX_COMPONENTS];
+
+	// Step 9.2a. Since Chunk became opaque, the flood fill below can no longer read
+	// c->blocks[i] directly — a PALETTE4 or UNIFORM chunk has no such array. Filled ONCE
+	// per call, at the top of visChunkConnectivity, via chunkDecompressAll, so the flood
+	// fill's per-cell cost stays exactly what it was measured at (visgraph.c:17-22): a raw
+	// array read with no per-cell unpack call hiding inside the hot loop.
+	BlockId blocks[CHUNK_BLOCKS];
 } VisScratch;
 
 // Index of the unordered pair {a, b} in 0..14, or -1 when a == b. Entering a chunk through a

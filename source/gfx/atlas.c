@@ -9,9 +9,13 @@ static C3D_Tex s_tex;
 
 bool atlasInit(void)
 {
-	// vram = true: 256 KB of the ~6 MB VRAM budget, and texture reads out of VRAM
-	// are the cheap ones on this GPU. Measured: linear free went 30,936 -> 30,680 KB
-	// when this was false, i.e. the atlas was sitting in FCRAM instead.
+	// vram = true. As of step 9.3 the atlas is 64x64 RGBA5551 (2 bytes/texel), so it
+	// costs 8 KB of the ~6 MB VRAM budget rather than the 256 KB it cost at the old
+	// 256x256 RGBA8888 (4 bytes/texel) — both figures computed from the sheet, not
+	// measured on-device. Texture reads out of VRAM are the cheap ones on this GPU.
+	// The 30,936 -> 30,680 KB linear-free delta this comment used to quote was
+	// measured with vram=false at the old 256x256 RGBA8888 size; it has NOT been
+	// re-measured at the new size — that needs an actual boot.
 	Tex3DS_Texture t3x = Tex3DS_TextureImport(atlas_t3x, atlas_t3x_size, &s_tex, NULL, true);
 	if (!t3x)
 		return false;
@@ -25,13 +29,23 @@ bool atlasInit(void)
 	// far wider than 2px to stay bleed-free.
 	C3D_TexSetFilter(&s_tex, GPU_NEAREST, GPU_NEAREST);
 	C3D_TexSetWrap(&s_tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
-	C3D_TexBind(0, &s_tex);
+	atlasBind();
 	return true;
 }
 
 void atlasExit(void)
 {
 	C3D_TexDelete(&s_tex);
+}
+
+void atlasBind(void)
+{
+	C3D_TexBind(0, &s_tex);
+}
+
+C3D_Tex* atlasTexture(void)
+{
+	return &s_tex;
 }
 
 AtlasRect atlasTile(int tile)

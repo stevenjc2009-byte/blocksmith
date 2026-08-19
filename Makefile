@@ -23,9 +23,9 @@ include $(DEVKITARM)/3ds_rules
 #---------------------------------------------------------------------------------
 TARGET		:=	blocksmith
 BUILD		:=	build
-SOURCES		:=	source source/app source/gfx source/debug source/scene source/shaders source/world
+SOURCES		:=	source source/app source/gfx source/debug source/net source/scene source/shaders source/world deps/libhydrogen
 DATA		:=	data
-INCLUDES	:=	source
+INCLUDES	:=	source deps/libhydrogen
 GRAPHICS	:=	gfx
 GFXBUILD	:=	$(BUILD)
 
@@ -66,6 +66,48 @@ LIBS	:= -lcitro3d -lctru -lm
 #---------------------------------------------------------------------------------
 LIBDIRS	:= $(CTRULIB)
 
+#---------------------------------------------------------------------------------
+# libhydrogen (Noise XX handshake, shared with server/gateway) — mirrors
+# server/gateway/Makefile: pinned to an exact commit (a mismatch with the server
+# is an unexplained handshake failure, not a compile error), safe.directory set
+# per-command rather than globally for the same mounted-filesystem reason.
+#
+# Run `make deps` once before the first build. This is a plain file-existence
+# rule, so on a fresh checkout it must run (and finish) before `make` reads
+# this Makefile for the SOURCES wildcard scan below to pick up hydrogen.c —
+# GNU Make expands that scan at parse time, before any recipe (including this
+# one) has run, so `make deps && make` (or two plain `make` invocations) is
+# required the first time, same as the gateway's documented workflow.
+#---------------------------------------------------------------------------------
+# The `deps` target below is the first target in this file, and GNU Make makes the first
+# target the default goal. That silently turned a bare `make` — and, worse, the goal-less
+# sub-make inside the `all` recipe further down — into "check that libhydrogen is cloned,
+# then stop", so a full build produced nothing and said only "Nothing to be done for
+# 'deps'". Pinning the default goal back is the fix; the two branches need different ones
+# because this Makefile re-invokes itself inside $(BUILD), where `all` does not exist.
+ifneq ($(BUILD),$(notdir $(CURDIR)))
+.DEFAULT_GOAL	:=	all
+else
+.DEFAULT_GOAL	:=	$(OUTPUT).3dsx
+endif
+
+HYDRO_REPO	:=	https://github.com/jedisct1/libhydrogen.git
+HYDRO_COMMIT	:=	617036a353cd4f6478ab6c3f98c36dd31e23ce8e
+HYDRO		:=	deps/libhydrogen
+
+.PHONY: deps
+deps: $(HYDRO)/hydrogen.h
+
+$(HYDRO)/hydrogen.h:
+	@mkdir -p deps
+	git clone -q $(HYDRO_REPO) $(HYDRO)
+	git -C $(HYDRO) -c safe.directory='*' checkout -q $(HYDRO_COMMIT)
+	@test "$$(git -C $(HYDRO) -c safe.directory='*' rev-parse HEAD)" = "$(HYDRO_COMMIT)" \
+	  || (echo "libhydrogen checkout is not at the pinned commit"; exit 1)
+	@echo "libhydrogen pinned at $(HYDRO_COMMIT)"
+
+# libhydrogen is third-party; do not subject it to this project's warning set.
+hydrogen.o: CFLAGS := $(filter-out -Wall -Wextra,$(CFLAGS)) -w
 
 #---------------------------------------------------------------------------------
 # no real need to edit anything past this point unless you need to add additional
@@ -159,11 +201,24 @@ ifneq ($(ROMFS),)
 	export _3DSXFLAGS += --romfs=$(CURDIR)/$(ROMFS)
 endif
 
-.PHONY: all clean
+.PHONY: all clean cia
 
 #---------------------------------------------------------------------------------
 all: $(BUILD) $(GFXBUILD) $(DEPSDIR) $(ROMFS_T3XFILES) $(T3XHFILES)
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
+
+#---------------------------------------------------------------------------------
+# Step 10.1. Depends on `all` rather than repeating its prerequisites: the packaging
+# inputs makerom needs (blocksmith.elf, and the SMDH built from gfx/icon.png) are outputs
+# of the normal build, and a `cia` target that could run against a stale or missing .elf
+# would quietly produce a .cia that does not match the source it is named after.
+#
+# The work itself stays in tools/make_cia.sh rather than moving here. makerom and
+# bannertool each take a dozen arguments and want real shell quoting; expressing that in
+# make recipe syntax buys nothing and makes the failure messages worse. The script also
+# runs standalone from a devkitPro MSYS2 prompt, which is how it actually gets debugged.
+cia: all
+	@tools/make_cia.sh
 
 $(BUILD):
 	@mkdir -p $@
@@ -246,6 +301,14 @@ $(OUTPUT).elf	:	$(OFILES)
 # which already covers $(GRAPHICS).
 #---------------------------------------------------------------------------------
 atlas.t3x: atlas.png
+
+# Step 8.3. The same trap, the same fix: gfx/font.t3s names gfx/font.png, build/font.d is
+# written by tex3ds and then overwritten by the compiler's deps for source/gfx/font.c, and
+# without this line editing the font would leave the console drawing the old glyphs.
+# tools/make_font.py regenerates font.png; this is what makes that regeneration reach the
+# build. Not folded into one rule with atlas because two separate one-line facts are easier
+# to be right about than one clever pattern.
+font.t3x: font.png
 
 -include $(DEPSDIR)/*.d
 

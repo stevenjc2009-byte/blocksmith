@@ -2,6 +2,8 @@
 
 #include <math.h>
 
+#include "app/input_map.h"
+
 // Set -DBS_ORBIT=1 to replace the controls with an automatic orbit of the block.
 // This exists because no keyboard key reaches the emulated console, so a build
 // that needs a stick or a D-pad cannot be checked from a script. The orbit aims
@@ -78,8 +80,17 @@ void cameraLook(Camera* cam, float dt_ms)
 	circlePosition circle;
 	hidCircleRead(&circle);
 
-	cam->yaw   += stickAxis(circle.dx) * LOOK_SPEED * dt;
-	cam->pitch -= stickAxis(circle.dy) * LOOK_SPEED * dt;   // stick up looks up
+	// Step 8.4. Sensitivity multiplies LOOK_SPEED rather than replacing it, exactly as
+	// app/options.h says it should — 1.0 is the pre-8.4 feel to the last bit, because
+	// x * 1.0f is x. Invert flips pitch only: a player who wants inverted look means the
+	// vertical axis, and inverting yaw as well would be a different (and unasked-for)
+	// setting. Both are read every frame rather than cached, so a change made on the options
+	// screen is felt on the next frame without anything having to notify the camera.
+	const float look = LOOK_SPEED * inputLookScale();
+	const float pitch_sign = inputInvertLook() ? 1.0f : -1.0f;
+
+	cam->yaw   += stickAxis(circle.dx) * look * dt;
+	cam->pitch += stickAxis(circle.dy) * look * dt * pitch_sign;   // stick up looks up
 
 	if (cam->pitch >  PITCH_LIMIT) cam->pitch =  PITCH_LIMIT;
 	if (cam->pitch < -PITCH_LIMIT) cam->pitch = -PITCH_LIMIT;

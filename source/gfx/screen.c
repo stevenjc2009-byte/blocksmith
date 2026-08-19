@@ -11,12 +11,14 @@
 
 static C3D_RenderTarget* s_top;
 static C3D_RenderTarget* s_top_right;
+static C3D_RenderTarget* s_bottom;
 static size_t            s_right_eye_bytes;
 
 void screenInit(void)
 {
 	gfxInitDefault();
 
+#if !BS_BOTTOM_UI
 	// Screen-presentation gotcha, paid for once already on the model-kit project:
 	// C3D_FrameEnd only swaps buffers for screens that have a citro3d render
 	// target bound. Our only target is the top screen, so the bottom screen would
@@ -30,6 +32,7 @@ void screenInit(void)
 	// than indistinguishable from a dead screen.
 	printf("\x1b[44;37m");
 	consoleClear();
+#endif
 
 	C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
 
@@ -47,6 +50,19 @@ void screenInit(void)
 	s_right_eye_bytes = vram_before - vramSpaceFree();
 	C3D_RenderTargetSetOutput(s_top_right, GFX_TOP, GFX_RIGHT, DISPLAY_TRANSFER_FLAGS);
 	gfxSet3D(false);
+
+#if BS_BOTTOM_UI
+	// 240x320, not 320x240: every 3DS render target is created in the framebuffer's own
+	// rotated orientation, height first. The UI is laid out 320 wide and 240 tall, and the
+	// rotation between the two is carried by Mtx_OrthoTilt in gfx/sprite.c, which is the
+	// only place in the project that has to know about it.
+	//
+	// No depth buffer. A UI pass draws in submission order with depth testing off (see
+	// gfx/sprite.h), so a depth attachment here would be ~150 KB of VRAM allocated to be
+	// cleared every frame and never read.
+	s_bottom = C3D_RenderTargetCreate(240, 320, GPU_RB_RGBA8, -1);
+	C3D_RenderTargetSetOutput(s_bottom, GFX_BOTTOM, GFX_LEFT, DISPLAY_TRANSFER_FLAGS);
+#endif
 }
 
 void screenExit(void)
@@ -63,6 +79,11 @@ C3D_RenderTarget* screenTop(void)
 C3D_RenderTarget* screenTopRight(void)
 {
 	return s_top_right;
+}
+
+C3D_RenderTarget* screenBottom(void)
+{
+	return s_bottom;   // NULL in a console build — see screen.h
 }
 
 size_t screenVramFree(void)

@@ -68,6 +68,33 @@ uint16_t visChunkConnectivity(const Chunk* c, VisScratch* sc)
 	uint8_t open[256];
 	openTable(open);
 
+	// Step 9.1b. A UNIFORM chunk's answer does not need a flood fill, or even sc, to
+	// compute: every one of its 4,096 cells reads the same open[] answer, so either none of
+	// them are see-through (no pair of faces can possibly connect — mask 0) or all of them
+	// are (one component touching every face — every pair connects, all fifteen real bits
+	// set). That is NOT the same value as VIS_ALL_CONNECTED (0xFFFF): that macro is the
+	// per-frame walk's "unknown chunk" sentinel (see visgraph.h:45-49), which deliberately
+	// also sets the unused 16th bit so the whole walk table can be initialised with one
+	// memset(0xFF). A real flood-fill result — which is exactly what this shortcut must
+	// reproduce, bit for bit, since callers compare it against pairsOf()'s output — never
+	// sets that 16th bit, because visPairIndex() never returns 15. Using VIS_ALL_CONNECTED
+	// here instead of the fifteen-bit full mask was caught by testVisConnectivity's
+	// `open == 0x7FFF` assertion (tools/run_host_tests.sh: "FAIL L2900 open == 0x7FFF"),
+	// which is exactly the kind of bit-for-bit regression that check exists to catch.
+	// An all-air chunk is the common case this shortcuts and is already skipped before
+	// meshing by chunkIsAllAir in main.c/scene/chunk_render.c, so this mainly pays off for
+	// an all-stone chunk deep underground, which still reaches this function on its way
+	// into the cave-culling graph.
+	if (chunkGetForm(c) == CHUNK_FORM_UNIFORM)
+		return open[chunkGet(c, 0)] ? (uint16_t)((1u << VIS_PAIRS) - 1) : 0;
+
+	// Non-uniform (PALETTE4 or RAW): unpack once, here, rather than let the flood fill below
+	// call chunkGet per cell. See visgraph.c:17-22 above (now restated at the header, chunk.h)
+	// for why the fill itself must stay a raw array walk — the measured 749us-to-current-number
+	// win was earned by removing a per-cell function call from a loop that runs up to 28,672
+	// times, and a per-cell chunkGet would put one straight back.
+	chunkDecompressAll(c, sc->blocks);
+
 	memset(sc->label, 0, sizeof(sc->label));
 
 	// Component 0 is "unvisited", so real components start at 1 and comp_faces is indexed
@@ -87,7 +114,7 @@ uint16_t visChunkConnectivity(const Chunk* c, VisScratch* sc)
 	// i.e. no change. The cost is the flood, not the search for somewhere to start it, so the
 	// simpler loop is the one that stays. Do not re-try this without a measurement.
 	for (int seed = 0; seed < CHUNK_BLOCKS; seed++) {
-		if (sc->label[seed] || !open[c->blocks[seed]]) continue;
+		if (sc->label[seed] || !open[sc->blocks[seed]]) continue;
 
 		// An explicit stack, not recursion. A 16^3 open chunk is 4,096 cells deep in the
 		// worst case and the 3DS main thread's stack is not there to be spent on a flood
@@ -118,7 +145,7 @@ uint16_t visChunkConnectivity(const Chunk* c, VisScratch* sc)
 
 			for (int d = 0; d < n; d++) {
 				const int j = nbr[d];
-				if (sc->label[j] || !open[c->blocks[j]]) continue;
+				if (sc->label[j] || !open[sc->blocks[j]]) continue;
 
 				sc->label[j] = components;
 				sc->stack[top++] = (uint16_t)j;

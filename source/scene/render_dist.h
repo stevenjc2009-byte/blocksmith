@@ -30,10 +30,13 @@
 // Bounds of the setting, in columns. MIN 1 is what steps 5 and 6 shipped: 3x3 columns, a
 // 48x48 block area. MAX 2 is 5x5 columns, 80x80 blocks.
 //
-// MAX is 2 because of the mesh pool, which is the binding constraint and not a soft one:
-// slots are 88 KB each out of the linear heap, the heap cannot be defragmented, and the
-// pool is claimed once at boot for the largest ring the setting allows. A radius of 3 would
-// be 49 columns, about 294 slots, roughly 26 MB — more than an Old 3DS has to give.
+// MAX is 2 because of the mesh pool, which is the binding constraint and not a soft one: a
+// three-tier vertex slab pool (512/1024/2048 face slots, 70/60/20 slots each — see
+// scene/chunk_render.c's TIER_*_FACES/TIER_*_SLOTS) claimed once out of the linear heap at
+// boot for the largest ring the setting allows, and the heap cannot be defragmented. A
+// radius of 3 would be 49 columns, so 294 slots, which at this pool's measured average of
+// ~28.8 KB a slot is roughly 8.7 MB — about twice what the setting costs today, out of a
+// linear heap that also has to hold the atlas, the sprite batch and both framebuffers.
 #define RENDER_DIST_MIN  1
 #define RENDER_DIST_MAX  2
 
@@ -45,7 +48,10 @@
 #define RENDER_DIST_SLOTS_PER_COLUMN  6
 
 // Slots the widest allowed ring needs. This is what MESH_SLOTS is, and therefore what the
-// pool costs at boot on every model: 150 slots at 88 KB is 12.9 MB.
+// tiered pool costs at boot on every model: 150 slots split 70/60/20 across the three tiers,
+// 70*512 + 60*1024 + 20*2048 face slots at 4 vertices of 8 bytes each, plus the one shared
+// index buffer step 9.2b introduced — 4,448,256 bytes, and the console reports the pool as
+// 4.24 MB. It was 9.40 MB when every slot was a uniform 2048-face slab, before step 9.2c.
 #define RENDER_DIST_MAX_COLUMNS  ((2 * RENDER_DIST_MAX + 1) * (2 * RENDER_DIST_MAX + 1))
 #define RENDER_DIST_MAX_SLOTS    (RENDER_DIST_MAX_COLUMNS * RENDER_DIST_SLOTS_PER_COLUMN)
 

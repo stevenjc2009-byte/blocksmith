@@ -7,11 +7,15 @@
 
 #include <stdint.h>
 
-#define ATLAS_PX    256
+// Step 9.3c: sized to exactly the 9 tiles atlas.h enumerates (3x3 = 9 cells, zero
+// spare). Was 256 (12x12 = 144 cells, 135 of them unused). The next appended tile
+// needs the next power-of-two sheet — 128, a 6x6 = 36-cell grid — there is no
+// room left here. Must stay a power of two: the PICA200 requires it.
+#define ATLAS_PX    64
 #define TILE_PX     16
 #define ATLAS_PAD   2
 #define ATLAS_CELL  (TILE_PX + ATLAS_PAD * 2)   // 20
-#define ATLAS_GRID  (ATLAS_PX / ATLAS_CELL)     // 12
+#define ATLAS_GRID  (ATLAS_PX / ATLAS_CELL)     // 3
 
 // A tile's extent in atlas pixels, in **texture space** — v grows upwards, the
 // opposite of the PNG's rows, because that is how the hardware samples. So u0/v0

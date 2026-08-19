@@ -1,0 +1,51 @@
+; Blocksmith — the 2D sprite/text vertex shader (step 8.3).
+;
+; Everything the GUI draws goes through here: the bitmap font, the hotbar, the
+; inventory, the title screen. It is deliberately the cheapest shader in the project —
+; one matrix multiply and two moves — because the UI is drawn every frame on top of a
+; world that is already using the GPU, and a UI that costs measurable frame time is a
+; UI that has to be justified.
+;
+; No model-view matrix. Sprites are given screen pixels by the caller and the single
+; `projection` uniform is an ortho built by Mtx_OrthoTilt, which also carries the
+; 90-degree rotation every 3DS framebuffer needs. Two matrices would mean a second
+; dp4 block for a transform that is always identity.
+;
+; Attributes:
+;   v0 = position, 3x float — x and y in screen pixels, z the layer (0 = nearest).
+;   v1 = texcoord, 2x float — 0..1 into the bound texture.
+;   v2 = colour,   4x unsigned byte, 0..255. Scaled to 0..1 below rather than declared
+;        normalised, because the PICA200's attribute formats have no normalised
+;        unsigned byte — the hardware hands the shader 0..255 floats and the scale has
+;        to happen somewhere. Here is the cheapest somewhere.
+
+.fvec projection[4]
+
+.constf consts(0.0, 1.0, 0.00392156862, 0.0)   ; z = 1/255
+.alias  ones     consts.yyyy
+.alias  inv255   consts.zzzz
+
+.out outpos position
+.out outtex texcoord0
+.out outclr color
+
+.alias inpos v0
+.alias intex v1
+.alias inclr v2
+
+.proc main
+	mov r0.xyz, inpos
+	mov r0.w,   ones
+
+	dp4 outpos.x, projection[0], r0
+	dp4 outpos.y, projection[1], r0
+	dp4 outpos.z, projection[2], r0
+	dp4 outpos.w, projection[3], r0
+
+	mov outtex.xy, intex
+	mov outtex.zw, consts.xxxx
+
+	mul outclr, inv255, inclr
+
+	end
+.end

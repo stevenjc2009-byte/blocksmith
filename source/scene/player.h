@@ -15,6 +15,12 @@
 // Jump. The camera already owns the D-pad (move), START (exit) and, in fly mode, A and
 // L/R; walking mode has no boost, so A is free for the thing it is used for everywhere
 // else in the genre.
+//
+// Since step 8.4 this is the *default*, not the binding: playerUpdate reads
+// inputKey(ACTION_JUMP) (app/input_map.h), and app/options.c's s_action_defaults is what
+// makes that answer KEY_A on a console with no options.ini. Kept here because this is where
+// the reasoning for the choice lives, and app/options.h cites this line by name as its source
+// for the default — a header that cannot include <3ds.h> and so cannot state KEY_A itself.
 #define PLAYER_KEY_JUMP  KEY_A
 
 typedef struct {

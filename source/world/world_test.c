@@ -89,7 +89,203 @@ static void testChunkIndex(void)
 
 	// x must be the contiguous axis — the scratch fill memcpys runs of it.
 	CHECK(chunkIndex(1, 0, 0) - chunkIndex(0, 0, 0) == 1);
-	CHECK(sizeof(Chunk) == CHUNK_BLOCKS);
+
+	// Step 9.2a made Chunk opaque, so sizeof(Chunk) == CHUNK_BLOCKS is no longer even
+	// expressible here (Chunk has no complete type outside chunk.c) — the exact byte cost
+	// of each storage form is asserted in testChunkFormBytes below instead. What is still
+	// this function's business is that the three forms are strictly ordered, since every
+	// promotion decision in chunk.c assumes UNIFORM < PALETTE4 < RAW.
+	CHECK(chunkFormBytes(CHUNK_FORM_UNIFORM) < chunkFormBytes(CHUNK_FORM_PALETTE4));
+	CHECK(chunkFormBytes(CHUNK_FORM_PALETTE4) < chunkFormBytes(CHUNK_FORM_RAW));
+}
+
+// ---------------------------------------------------------------------------------------
+// Step 9.2a (palette-compressed storage) / 9.1b (uniform-chunk flags). These six tests all
+// exercise chunk.c's own API directly with a bare chunkAlloc'd Chunk* -- no World, no budget
+// -- because chunk.c has zero dependency on world/budget.h by design (see chunk.h's file
+// header): the storage-form logic must be correct on its own terms before anything asks
+// whether a promotion can be afforded.
+
+// The exact byte cost of each form, pinned as literal numbers rather than left as "some
+// value bigger than the last" (testChunkIndex already checks the ordering). These specific
+// numbers are what a promotion's budget delta is computed from in world.c and chunk_codec.c,
+// so a silent change here would silently change what every promotion costs.
+//   UNIFORM:   sizeof(struct Chunk) alone (form + uniform_id + a payload pointer) — no array.
+//   PALETTE4:  + a 16-slot BlockId palette, one pal_n byte, and 2,048 nibble-packed indices
+//              (4 bits * 4,096 cells) = 16 + 1 + 2,048 = 2,065 bytes on top of UNIFORM.
+//   RAW:       + one BlockId per cell = CHUNK_BLOCKS bytes on top of UNIFORM.
+static void testChunkFormBytes(void)
+{
+	const size_t hdr = chunkFormBytes(CHUNK_FORM_UNIFORM);
+	CHECK(chunkFormBytes(CHUNK_FORM_PALETTE4) == hdr + 16 + 1 + 2048);
+	CHECK(chunkFormBytes(CHUNK_FORM_RAW)      == hdr + (size_t)CHUNK_BLOCKS);
+	CHECK(chunkFormBytes(CHUNK_FORM_PALETTE4) - chunkFormBytes(CHUNK_FORM_UNIFORM)  == 2065);
+	CHECK(chunkFormBytes(CHUNK_FORM_RAW)      - chunkFormBytes(CHUNK_FORM_UNIFORM)  == 4096);
+	CHECK(chunkFormBytes(CHUNK_FORM_RAW)      - chunkFormBytes(CHUNK_FORM_PALETTE4) == 2031);
+}
+
+// A freshly allocated chunk stores no array at all -- its cost is exactly the UNIFORM form's
+// bytes, nothing more, and every cell reads back the fill id without ever touching a payload.
+static void testChunkUniformNoArray(void)
+{
+	Chunk* c = chunkAlloc(BLOCK_STONE);
+	CHECK(chunkGetForm(c) == CHUNK_FORM_UNIFORM);
+	CHECK(chunkGetBytes(c) == chunkFormBytes(CHUNK_FORM_UNIFORM));
+	CHECK(chunkIsUniform(c, BLOCK_STONE));
+	CHECK(!chunkIsUniform(c, BLOCK_AIR));
+
+	// Sparse sample rather than all 4,096 cells -- CHECK_QUIET exists for exactly this, but
+	// a UNIFORM chunk's whole point is that every cell is the same answer, so a handful of
+	// widely spaced points already proves it; testChunkRoundTripEveryFormEveryCell below is
+	// where the full sweep belongs.
+	for (int i = 0; i < CHUNK_BLOCKS; i += 137)
+		CHECK_QUIET(chunkGet(c, i) == BLOCK_STONE);
+	chunkFree(c);
+}
+
+// Writing a second, different id into a UNIFORM chunk promotes it to PALETTE4 -- and nothing
+// else about the chunk's content moves: every cell that was not the write target still reads
+// back the original uniform id.
+static void testChunkPromoteUniformToPalette(void)
+{
+	Chunk* c = chunkAlloc(BLOCK_STONE);
+
+	// Pre-flight query, checked before the write actually happens: the same id never
+	// promotes, a different one always fits (two distinct ids always fit a 16-slot palette).
+	CHECK(chunkFormFor(c, BLOCK_STONE) == CHUNK_FORM_UNIFORM);
+	CHECK(chunkFormFor(c, BLOCK_DIRT)  == CHUNK_FORM_PALETTE4);
+
+	CHECK(chunkSet(c, 42, BLOCK_DIRT));
+	CHECK(chunkGetForm(c)  == CHUNK_FORM_PALETTE4);
+	CHECK(chunkGetBytes(c) == chunkFormBytes(CHUNK_FORM_PALETTE4));
+	CHECK(chunkGet(c, 42)  == BLOCK_DIRT);
+	CHECK(chunkGet(c, 0)   == BLOCK_STONE);      // untouched cells: still the old uniform id
+	CHECK(chunkGet(c, CHUNK_BLOCKS - 1) == BLOCK_STONE);
+	chunkFree(c);
+}
+
+// A PALETTE4 chunk holding exactly 16 distinct ids stays PALETTE4; the 17th distinct id is
+// the one write that has to fall back to RAW, and everything written before that moment must
+// survive the fallback exactly.
+static void testChunkPromotePaletteToRaw(void)
+{
+	Chunk* c = chunkAlloc((BlockId)1);
+
+	// One id already there (the uniform fill), plus 15 more distinct writes: exactly 16,
+	// still fits PALETTE4.
+	for (int i = 0; i < 15; i++) CHECK(chunkSet(c, i, (BlockId)(i + 2)));
+	CHECK(chunkGetForm(c) == CHUNK_FORM_PALETTE4);
+
+	// The 17th distinct id promotes to RAW.
+	CHECK(chunkFormFor(c, (BlockId)200) == CHUNK_FORM_RAW);
+	CHECK(chunkSet(c, 4000, (BlockId)200));
+	CHECK(chunkGetForm(c)  == CHUNK_FORM_RAW);
+	CHECK(chunkGetBytes(c) == chunkFormBytes(CHUNK_FORM_RAW));
+
+	for (int i = 0; i < 15; i++) CHECK(chunkGet(c, i) == (BlockId)(i + 2));
+	CHECK(chunkGet(c, 4000) == (BlockId)200);
+	CHECK(chunkGet(c, 4001) == (BlockId)1);      // never written: still the original uniform id
+	chunkFree(c);
+}
+
+// A full 16x16x16 set-then-get sweep for each of the three forms, proving every (x, y, z)
+// round-trips through chunkIndex/chunkSet/chunkGet correctly in that form specifically --
+// not just a handful of sampled cells the way the other tests above check.
+static void testChunkRoundTripEveryFormEveryCell(void)
+{
+	// UNIFORM: chunkGet alone, no chunkSet needed -- every cell is the fill id by
+	// construction.
+	{
+		Chunk* c = chunkAlloc((BlockId)7);
+		for (int i = 0; i < CHUNK_BLOCKS; i++) CHECK_QUIET(chunkGet(c, i) == (BlockId)7);
+		chunkFree(c);
+	}
+
+	// PALETTE4: sweep ids 1..16 across every cell. The starting uniform id is 1 (one of the
+	// 16 swept values), not BLOCK_AIR (0) -- starting from an id outside the swept set would
+	// make 17 distinct ids total (the original plus 16 new ones) and silently overflow this
+	// into RAW instead of exercising PALETTE4's full 16-slot capacity.
+	{
+		Chunk* c = chunkAlloc((BlockId)1);
+		for (int i = 0; i < CHUNK_BLOCKS; i++)
+			CHECK_QUIET(chunkSet(c, i, (BlockId)(1 + (i % 16))));
+		CHECK(chunkGetForm(c) == CHUNK_FORM_PALETTE4);
+		for (int i = 0; i < CHUNK_BLOCKS; i++)
+			CHECK_QUIET(chunkGet(c, i) == (BlockId)(1 + (i % 16)));
+		chunkFree(c);
+	}
+
+	// RAW: sweep ids 1..32 (32 > 16, so this stays in RAW throughout).
+	{
+		Chunk* c = chunkAlloc((BlockId)1);
+		for (int i = 0; i < CHUNK_BLOCKS; i++)
+			CHECK_QUIET(chunkSet(c, i, (BlockId)(1 + (i % 32))));
+		CHECK(chunkGetForm(c) == CHUNK_FORM_RAW);
+		for (int i = 0; i < CHUNK_BLOCKS; i++)
+			CHECK_QUIET(chunkGet(c, i) == (BlockId)(1 + (i % 32)));
+		chunkFree(c);
+	}
+}
+
+// chunkCopyRun/chunkDecompressAll must read back the same bytes no matter which physical form
+// a chunk happens to be in, for the same logical content. Three chunks are built holding
+// IDENTICAL logical content (every cell BLOCK_STONE) but forced into three DIFFERENT physical
+// forms via chunkSet's documented never-demote rule: writing a different id and then writing
+// the original id straight back promotes the chunk and leaves it promoted, even though its
+// content is once again uniform.
+//
+// This also pins a real, deliberate asymmetry in chunkIsUniform() between PALETTE4 and RAW
+// (see chunk.c): PALETTE4's check is a cheap `pal_n == 1` shortcut that conservatively
+// answers false for an orphaned-slot chunk like `pal` below, while RAW has no cheaper
+// representation to shortcut through and so actually scans the array, giving the exact
+// answer (true) even though the chunk's form never demoted. Getting this backwards here
+// once already produced a real, reproducible failure in an earlier draft of this test
+// (asserting `!chunkIsUniform(raw, BLOCK_STONE)`, which failed because the scan correctly
+// found the RAW array WAS all BLOCK_STONE) -- recorded here so the asymmetry is never
+// "fixed" back into a wrong assumption by a future edit.
+static void testChunkRunCopyMatchesAcrossForms(void)
+{
+	Chunk* uni = chunkAlloc(BLOCK_STONE);
+
+	Chunk* pal = chunkAlloc(BLOCK_STONE);
+	CHECK(chunkSet(pal, 0, BLOCK_DIRT));         // promotes to PALETTE4
+	CHECK(chunkSet(pal, 0, BLOCK_STONE));        // logically stone again; orphaned slot, stays PALETTE4
+	CHECK(chunkGetForm(pal) == CHUNK_FORM_PALETTE4);
+
+	Chunk* raw = chunkAlloc(BLOCK_STONE);
+	// ids 100+i, well past BLOCK_COUNT (6), specifically so none of the 16 new ids can ever
+	// collide with the chunk's own uniform fill id (BLOCK_STONE) no matter what block.h's
+	// enum order happens to be. A small literal offset here was tried first (assuming
+	// BLOCK_STONE == 2) and was wrong on both counts tried -- BLOCK_STONE is actually 3
+	// (block.h's real order is AIR, GRASS, DIRT, STONE, ...) -- and each wrong guess was
+	// caught for real by the official host suite as "FAIL ... chunkGetForm(raw) ==
+	// CHUNK_FORM_RAW" (a collision wastes one iteration on a same-id no-op write, one short
+	// of the 17 distinct ids needed to force RAW). An offset outside BLOCK_COUNT entirely
+	// removes the need to know or guess any real block's numeric value.
+	for (int i = 0; i < 16; i++) CHECK(chunkSet(raw, i, (BlockId)(100 + i)));   // 17th distinct...
+	CHECK(chunkGetForm(raw) == CHUNK_FORM_RAW);                                // ...promotes here
+	for (int i = 0; i < 16; i++) CHECK(chunkSet(raw, i, BLOCK_STONE));       // back to logical stone
+	CHECK(chunkGetForm(raw) == CHUNK_FORM_RAW);
+
+	CHECK(chunkIsUniform(uni, BLOCK_STONE));
+	CHECK(!chunkIsUniform(pal, BLOCK_STONE));    // orphaned slot: the conservative false, by design
+	CHECK(chunkIsUniform(raw, BLOCK_STONE));     // RAW has no shortcut: a real scan, the exact answer
+
+	static const struct { int begin, count; } runs[] = {
+		{0, 1}, {0, 16}, {2000, 16}, {4080, 16}, {0, CHUNK_BLOCKS},
+	};
+	static BlockId out_u[CHUNK_BLOCKS], out_p[CHUNK_BLOCKS], out_r[CHUNK_BLOCKS];
+	for (size_t k = 0; k < sizeof(runs) / sizeof(runs[0]); k++) {
+		chunkCopyRun(uni, runs[k].begin, runs[k].count, out_u);
+		chunkCopyRun(pal, runs[k].begin, runs[k].count, out_p);
+		chunkCopyRun(raw, runs[k].begin, runs[k].count, out_r);
+		CHECK(memcmp(out_u, out_p, (size_t)runs[k].count) == 0);
+		CHECK(memcmp(out_u, out_r, (size_t)runs[k].count) == 0);
+	}
+
+	chunkFree(uni);
+	chunkFree(pal);
+	chunkFree(raw);
 }
 
 static void testWorldAccess(void)
@@ -252,7 +448,12 @@ static bool fillChunk(int cx, int cy, int cz, BlockId id)
 {
 	Chunk* c = worldChunkCreate(&s_world, cx, cy, cz);
 	if (!c) return false;
-	memset(c->blocks, id, CHUNK_BLOCKS);
+	// worldChunkCreate always hands back a fresh UNIFORM(BLOCK_AIR) chunk (see world.c), so
+	// going UNIFORM(BLOCK_AIR) -> UNIFORM(id) via chunkClear costs nothing extra in bytes —
+	// both are the same form — and needs no budget delta, unlike a real edit through
+	// worldSet/chunkSet. Chunk is opaque since step 9.2a, so this can no longer reach in and
+	// memset a c->blocks array that does not exist for a UNIFORM chunk anyway.
+	chunkClear(c, id);
 	return true;
 }
 
@@ -1321,7 +1522,10 @@ static void testColumnRemove(void)
 	CHECK(worldChunkCreate(&s_world, 3, 5, 4) != NULL);
 	CHECK(s_world.columns == 1 && s_world.chunks == 2);
 	const size_t used_one = budgetUsed();
-	CHECK(used_one == sizeof(Column) + 2 * sizeof(Chunk));
+	// Both chunks were just created by worldChunkCreate and never written to, so both are
+	// still CHUNK_FORM_UNIFORM — chunkFormBytes(CHUNK_FORM_UNIFORM), not the old fixed
+	// sizeof(Chunk), is what worldChunkCreate actually claimed for each (see world.c).
+	CHECK(used_one == sizeof(Column) + 2 * chunkFormBytes(CHUNK_FORM_UNIFORM));
 
 	CHECK(worldColumnRemove(&s_world, 3, 4));
 	CHECK(worldColumn(&s_world, 3, 4) == NULL);
@@ -1415,6 +1619,53 @@ static void testWorldSetBudgetExhausted(void)
 	CHECK(worldGet(&s_world, 4, 4, 4) == BLOCK_STONE);
 
 	budgetRelease(remaining - 1);
+	worldExit(&s_world);
+}
+
+// The refusal path testWorldSetBudgetExhausted covers is worldChunkCreate's -- a brand new
+// chunk that cannot even be born. This is the OTHER budget-checked path step 9.2a added to
+// worldSet: an existing chunk whose write requires a promotion (UNIFORM -> PALETTE4 here),
+// and the budget refuses the delta. The chunk must come back exactly as it went in: same
+// form, same bytes, same content, same total budget used -- there must be no path where the
+// claim succeeds partially or chunkSet runs anyway after a refused claim.
+static void testChunkPromotionBudgetRefused(void)
+{
+	worldInit(&s_world);
+
+	// worldChunkCreate directly, not worldSet with a real block: worldSet(..., BLOCK_STONE)
+	// on a chunk that does not exist yet would create it UNIFORM-AIR and then immediately
+	// write a distinct id into it, promoting it to PALETTE4 in the very same call -- there
+	// would be no existing UNIFORM chunk left to test a promotion refusal against. Creating
+	// the chunk directly, still holding nothing but air, is the only way to get a real,
+	// budget-tracked, already-existing UNIFORM chunk to promote out of.
+	CHECK(worldChunkCreate(&s_world, 0, 0, 0) != NULL);
+	Chunk* c = worldChunk(&s_world, 0, 0, 0);
+	CHECK(c != NULL);
+	CHECK(chunkGetForm(c) == CHUNK_FORM_UNIFORM);
+
+	const ChunkForm form_before      = chunkGetForm(c);
+	const size_t     chunk_bytes_before = chunkGetBytes(c);
+	const size_t     world_bytes_before = worldBytes(&s_world);
+	const size_t     used_before        = budgetUsed();
+
+	// A UNIFORM -> PALETTE4 promotion costs 2,065 B (testChunkFormBytes pins the exact
+	// number); leaving only 100 B in the budget guarantees the claim in worldSet's pre-flight
+	// (world.c) is refused, not merely made tight.
+	const size_t remaining = budgetCap() - budgetUsed();
+	CHECK(remaining > 100);
+	CHECK(budgetClaim(remaining - 100) == true);
+
+	// Same cell, a different id -- this is a promotion on an EXISTING chunk, not a creation,
+	// so it exercises worldSet's chunkFormFor/chunkSet pre-flight path specifically.
+	CHECK(worldSet(&s_world, 4, 4, 4, BLOCK_DIRT) == false);
+
+	CHECK(chunkGetForm(c)       == form_before);
+	CHECK(chunkGetBytes(c)      == chunk_bytes_before);
+	CHECK(worldBytes(&s_world)  == world_bytes_before);
+	CHECK(budgetUsed()          == used_before + (remaining - 100));   // the refused claim took nothing
+	CHECK(worldGet(&s_world, 4, 4, 4) == BLOCK_AIR);                   // untouched: still air, never written
+
+	budgetRelease(remaining - 100);
 	worldExit(&s_world);
 }
 
@@ -2704,6 +2955,40 @@ static void testWorldgenCaves(void)
 	CHECK(floor_caves == 0);           // nothing below the floor, ever
 }
 
+// Step 9.2a/9.1b's memory payoff, reproduced here as a standing regression check rather than
+// a one-off scratch measurement someone has to remember to re-run by hand. Radius 8 ->
+// (2*8+1)^2 == 289 columns, the render-distance figure the step's design doc measured
+// against: a real generated 289-column world came to 2,501,174 B against a 12,582,912 B
+// budget cap (WORLD_BUDGET_BYTES), roughly 47 % of what the OLD fixed-4,096-B-per-chunk
+// scheme would have cost for the exact same chunk count (5,323,344 B). That exact figure is
+// not asserted here — worldgen's noise parameters (tree density, cave carving, biome mix)
+// are free to change without this test needing a hand-updated constant every time — but the
+// bound below (75 % of the old scheme) is comfortably short of the ~47 % actually measured,
+// so a real regression in the palette/uniform win still fails loudly.
+static void testWorldgenMemoryProjection(void)
+{
+	worldInit(&s_world);
+
+	WorldGen g;
+	worldgenInit(&g, 20260819u);
+
+	const int radius = 8;
+	const int failed = worldgenArea(&g, &s_world, 0, 0, radius);
+	CHECK(failed == 0);
+	CHECK(s_world.columns == 289);
+
+	const size_t bytes = worldBytes(&s_world);
+	CHECK(bytes == budgetUsed());          // worldBytes must always equal what the budget holds
+
+	const size_t old_scheme_bytes = (size_t)s_world.chunks * (size_t)CHUNK_BLOCKS
+	                               + (size_t)s_world.columns * sizeof(Column);
+	CHECK(bytes < old_scheme_bytes);
+	CHECK(bytes < old_scheme_bytes * 3 / 4);
+
+	worldExit(&s_world);
+	CHECK(budgetUsed() == 0);
+}
+
 // Step 5.5's job ring. Same treatment as the dirty queue: the accounting is checked after
 // every operation, because a queue whose count drifts from its contents is the exact bug
 // Phase 4 shipped and could not see.
@@ -2817,7 +3102,20 @@ static void testJobQueue(void)
 // runs on the host is still the wrong place to learn that.
 static VisWalk    s_walk;
 static VisScratch s_vis_scratch;
-static Chunk      s_vis_chunk;
+
+// Chunk became opaque in step 9.2a, so this can no longer be a plain static struct the way
+// s_walk and s_vis_scratch above are — it needs a real chunkAlloc, done once on first use and
+// then reused (never freed) for the rest of the test process. That is safe to leave unfreed:
+// chunk.c has zero dependency on world/budget.h (see chunk.h's file header for why), so this
+// allocation never touches the budget singleton that testBudget and friends assert is exactly
+// 0 at the points they check it.
+static Chunk* s_vis_chunk;
+
+static Chunk* visChunk(void)
+{
+	if (!s_vis_chunk) s_vis_chunk = chunkAlloc(BLOCK_AIR);
+	return s_vis_chunk;
+}
 
 static void testVisPairIndex(void)
 {
@@ -2860,23 +3158,25 @@ static void testVisPairIndex(void)
 
 static void testVisConnectivity(void)
 {
+	Chunk* c = visChunk();
+
 	// Solid rock joins nothing.
-	chunkClear(&s_vis_chunk, BLOCK_STONE);
-	CHECK(visChunkConnectivity(&s_vis_chunk, &s_vis_scratch) == 0);
+	chunkClear(c, BLOCK_STONE);
+	CHECK(visChunkConnectivity(c, &s_vis_scratch) == 0);
 
 	// Open sky joins everything — all fifteen pairs, and no bit above them.
-	chunkClear(&s_vis_chunk, BLOCK_AIR);
-	const uint16_t open = visChunkConnectivity(&s_vis_chunk, &s_vis_scratch);
+	chunkClear(c, BLOCK_AIR);
+	const uint16_t open = visChunkConnectivity(c, &s_vis_scratch);
 	CHECK(open == 0x7FFF);
 
 	// A straight east-west tunnel through solid rock joins east to west and nothing else.
 	// This is the case the whole algorithm exists for: every other face of this chunk is
 	// stone, so a camera to the north of it can see nothing beyond it.
-	chunkClear(&s_vis_chunk, BLOCK_STONE);
+	chunkClear(c, BLOCK_STONE);
 	for (int x = 0; x < CHUNK_DIM; x++)
-		s_vis_chunk.blocks[chunkIndex(x, 8, 8)] = BLOCK_AIR;
+		chunkSet(c, chunkIndex(x, 8, 8), BLOCK_AIR);
 
-	const uint16_t tunnel = visChunkConnectivity(&s_vis_chunk, &s_vis_scratch);
+	const uint16_t tunnel = visChunkConnectivity(c, &s_vis_scratch);
 	CHECK(visConnected(tunnel, FACE_EAST, FACE_WEST));
 	CHECK(!visConnected(tunnel, FACE_TOP, FACE_BOTTOM));
 	CHECK(!visConnected(tunnel, FACE_EAST, FACE_TOP));
@@ -2887,9 +3187,9 @@ static void testVisConnectivity(void)
 	// mask gains top-bottom and must NOT gain east-top: a fill that leaked between the two
 	// would report a sight line that does not exist and stop the cull working at all.
 	for (int y = 0; y < CHUNK_DIM; y++)
-		s_vis_chunk.blocks[chunkIndex(2, y, 2)] = BLOCK_AIR;
+		chunkSet(c, chunkIndex(2, y, 2), BLOCK_AIR);
 
-	const uint16_t both = visChunkConnectivity(&s_vis_chunk, &s_vis_scratch);
+	const uint16_t both = visChunkConnectivity(c, &s_vis_scratch);
 	CHECK(visConnected(both, FACE_EAST, FACE_WEST));
 	CHECK(visConnected(both, FACE_TOP, FACE_BOTTOM));
 	CHECK(!visConnected(both, FACE_EAST, FACE_TOP));
@@ -2898,9 +3198,9 @@ static void testVisConnectivity(void)
 	// Now join them, and the pairs that were absent must appear. Without this the test above
 	// would pass just as well against a fill that never connects anything.
 	for (int z = 2; z <= 8; z++)
-		s_vis_chunk.blocks[chunkIndex(2, 8, z)] = BLOCK_AIR;
+		chunkSet(c, chunkIndex(2, 8, z), BLOCK_AIR);
 
-	const uint16_t joined = visChunkConnectivity(&s_vis_chunk, &s_vis_scratch);
+	const uint16_t joined = visChunkConnectivity(c, &s_vis_scratch);
 	CHECK(visConnected(joined, FACE_EAST, FACE_TOP));
 	CHECK(visConnected(joined, FACE_WEST, FACE_BOTTOM));
 
@@ -2910,9 +3210,22 @@ static void testVisConnectivity(void)
 	// changing one field in the block registry is the point of writing the fill against
 	// solid && !transparent rather than against solid — leaves are still solid, and still
 	// stop the player walking through them.
-	chunkClear(&s_vis_chunk, BLOCK_LEAVES);
-	CHECK(visChunkConnectivity(&s_vis_chunk, &s_vis_scratch) == 0x7FFF);
+	chunkClear(c, BLOCK_LEAVES);
+	CHECK(visChunkConnectivity(c, &s_vis_scratch) == 0x7FFF);
 	CHECK(blockIsSolid(BLOCK_LEAVES));
+
+	// Step 9.1b's short-circuit: a UNIFORM chunk must answer without ever decompressing into
+	// sc->blocks. Solid-and-not-open joins nothing (0), and open joins everything — the same
+	// two answers as the general path above, just reached through the fast branch instead of
+	// the flood fill. chunkClear always leaves a chunk UNIFORM, so both of the very first two
+	// assertions in this function already exercised it; these two are here to say so
+	// explicitly and to pin the UNIFORM answer down as its own named case.
+	chunkClear(c, BLOCK_STONE);
+	CHECK(chunkGetForm(c) == CHUNK_FORM_UNIFORM);
+	CHECK(visChunkConnectivity(c, &s_vis_scratch) == 0);
+	chunkClear(c, BLOCK_AIR);
+	CHECK(chunkGetForm(c) == CHUNK_FORM_UNIFORM);
+	CHECK(visChunkConnectivity(c, &s_vis_scratch) == 0x7FFF);
 }
 
 // Fills a walk box of nx x 1 x 1 chunks, every cell drawable, and returns how many the walk
@@ -3016,10 +3329,11 @@ static void testVisWalkNeverHidesOpenSky(void)
 
 	// Solid ground in the bottom two chunk layers, open air above. Every air chunk above the
 	// ground, and the ground layer itself, has to survive.
-	chunkClear(&s_vis_chunk, BLOCK_STONE);
-	const uint16_t rock = visChunkConnectivity(&s_vis_chunk, &s_vis_scratch);
-	chunkClear(&s_vis_chunk, BLOCK_AIR);
-	const uint16_t sky = visChunkConnectivity(&s_vis_chunk, &s_vis_scratch);
+	Chunk* c = visChunk();
+	chunkClear(c, BLOCK_STONE);
+	const uint16_t rock = visChunkConnectivity(c, &s_vis_scratch);
+	chunkClear(c, BLOCK_AIR);
+	const uint16_t sky = visChunkConnectivity(c, &s_vis_scratch);
 
 	for (int y = 0; y < VIS_BOX_MAX_Y; y++)
 		for (int z = 0; z < 4; z++)
@@ -3134,80 +3448,179 @@ static void testRenderDist(void)
 // build sharing a directory with a real save. On the console these tests would run at boot,
 // every boot, against the same card the player's world is on.
 
-// Fills a chunk with a shape and returns it, so each codec case reads as one line.
-static void codecFill(Chunk* c, int mode)
+// Fills a flat CHUNK_BLOCKS buffer with a shape, so each codec case reads as one line. A flat
+// buffer rather than a Chunk* directly: since step 9.2a a chunk's in-memory storage form is
+// chosen FROM its content by chunkLoadAll, not dictated by whoever is filling it cell by
+// cell, so building the shape in the open and handing the whole thing to chunkLoadAll keeps
+// that choice entirely inside chunk.c, same as worldgen.c and chunk_codec.c's decoder do.
+static void codecFill(BlockId* blocks, int mode)
 {
 	for (int y = 0; y < CHUNK_DIM; y++)
 		for (int z = 0; z < CHUNK_DIM; z++)
 			for (int x = 0; x < CHUNK_DIM; x++) {
 				const int i = chunkIndex(x, y, z);
 				switch (mode) {
-				case 0: c->blocks[i] = BLOCK_AIR; break;                       // uniform
-				case 1: c->blocks[i] = y < 4 ? BLOCK_STONE                     // layered
+				case 0: blocks[i] = BLOCK_AIR; break;                       // uniform
+				case 1: blocks[i] = y < 4 ? BLOCK_STONE                     // layered
 				                     : y < 7 ? BLOCK_DIRT
 				                     : y < 8 ? BLOCK_GRASS : BLOCK_AIR; break;
-				default: c->blocks[i] = ((x + y + z) & 1)                      // checkerboard
+				case 2: blocks[i] = ((x + y + z) & 1)                       // checkerboard
 				                      ? BLOCK_STONE : BLOCK_AIR; break;
+				default:
+					// mode 3: 32 distinct byte values ((x+y+z) % 32), specifically to push
+					// the IN-MEMORY form past PALETTE4's 16-slot ceiling. Mode 2's checkerboard
+					// already forces CODEC_RAW on *disk* (RLE would double in size), but it is
+					// only 2 distinct ids, so chunkLoadAll would still choose PALETTE4 in
+					// memory — mode 2 alone never proves the decoder can rebuild a RAW
+					// in-memory chunk, only a RAW-encoded one. This mode does both at once.
+					//
+					// NOT (x^y^z)&31, which this was first written as: x, y, z are each only
+					// 4 bits (0..15), and XOR of three 4-bit values can never set bit 4 or
+					// above, so that expression silently produced just 16 distinct ids (0..15)
+					// -- exactly PALETTE4's ceiling, not past it. Caught by the official host
+					// suite: "FAIL L3268 chunkGetForm(a) == CHUNK_FORM_RAW", because
+					// chunkLoadAll correctly chose PALETTE4 for content that this comment
+					// claimed needed RAW. (x+y+z) has no such ceiling — x+y+z ranges 0..45 and
+					// every integer in 0..31 is reachable before it ever has to wrap, so % 32
+					// genuinely visits all 32 remainders across the chunk.
+					blocks[i] = (BlockId)((x + y + z) % 32);
+					break;
 				}
 			}
 }
 
+// chunkClear() and chunkLoadAll() are chunk.c's plain API and, by design (chunk.h's file
+// header), chunk.c has zero dependency on world/budget.h — neither call ever touches the
+// budget singleton. chunkDecode() is different: chunk_codec.c claims/releases the byte delta
+// around every call (see chunk_codec.h), because region.c calls it directly with no World to
+// route through. This test exercises chunkDecode on a bare chunkAlloc'd chunk, outside
+// world.c's own tracking, so — exactly like worldExit/worldColumnRemove releasing
+// chunkGetBytes(c) before every chunkFree — it is this test's job to keep the singleton
+// honest across a direct chunkClear/chunkLoadAll call that discards whatever chunkDecode most
+// recently claimed. Skipping this is not cosmetic: it was caught for real by the official
+// host suite as a genuine stuck leak ("FAIL L3688 budgetUsed() == 0") the first version of
+// this test wrote, from calling chunkClear() to poison a chunk that still held PALETTE4/RAW
+// budget a previous chunkDecode had claimed for it.
+static void resyncBudget(Chunk* c, size_t bytes_before_direct_call)
+{
+	budgetRelease(bytes_before_direct_call);
+	CHECK(budgetClaim(chunkGetBytes(c)));
+}
+
 static void testChunkCodec(void)
 {
-	static Chunk    a, b;
+	Chunk* a = chunkAlloc(BLOCK_AIR);
+	Chunk* b = chunkAlloc(BLOCK_AIR);
+	CHECK(a && b);
+
+	// 'a' is only ever written through chunkLoadAll/chunkEncode (both budget-free); 'b' is the
+	// decode target, so it is the one whose cost this test must own in the budget singleton
+	// from the moment it exists — matching what worldChunkCreate() claims for a real chunk
+	// before anything is ever decoded into it.
+	CHECK(budgetClaim(chunkGetBytes(b)));
+
 	static uint8_t  buf[CHUNK_CODEC_MAX];
+	static BlockId  flat_a[CHUNK_BLOCKS];
+	static BlockId  flat_b[CHUNK_BLOCKS];
 
 	// Uniform: two bytes, whatever the block is. Half a 128-tall column is sky, so this is
 	// the case that decides what a world costs on the card.
-	codecFill(&a, 0);
-	size_t n = chunkEncode(&a, buf, sizeof(buf));
+	codecFill(flat_a, 0);
+	CHECK(chunkLoadAll(a, flat_a));
+	size_t n = chunkEncode(a, buf, sizeof(buf));
 	CHECK(n == 2);
 	CHECK(buf[0] == CODEC_UNIFORM);
-	memset(&b, 0xEE, sizeof(b));
-	CHECK(chunkDecode(&b, buf, n));
-	CHECK(memcmp(a.blocks, b.blocks, CHUNK_BLOCKS) == 0);
+	{
+		const size_t b_before = chunkGetBytes(b);
+		chunkClear(b, (BlockId)0xEE);                // poison: decode must fully overwrite it
+		resyncBudget(b, b_before);
+	}
+	CHECK(chunkDecode(b, buf, n));
+	chunkDecompressAll(a, flat_a);
+	chunkDecompressAll(b, flat_b);
+	CHECK(memcmp(flat_a, flat_b, CHUNK_BLOCKS) == 0);
+	CHECK(chunkGetForm(b) == CHUNK_FORM_UNIFORM);   // one id, everywhere -> the cheapest form
 
 	// Layered terrain: the shape RLE exists for. Must beat raw by a long way, not merely
 	// beat it — if this ever creeps up towards 4,098 the encoder has stopped working and
 	// the only symptom would be a bigger save file.
-	codecFill(&a, 1);
-	n = chunkEncode(&a, buf, sizeof(buf));
+	codecFill(flat_a, 1);
+	CHECK(chunkLoadAll(a, flat_a));
+	n = chunkEncode(a, buf, sizeof(buf));
 	CHECK(buf[0] == CODEC_RLE);
 	CHECK(n < 64);
-	memset(&b, 0xEE, sizeof(b));
-	CHECK(chunkDecode(&b, buf, n));
-	CHECK(memcmp(a.blocks, b.blocks, CHUNK_BLOCKS) == 0);
+	{
+		const size_t b_before = chunkGetBytes(b);
+		chunkClear(b, (BlockId)0xEE);
+		resyncBudget(b, b_before);
+	}
+	CHECK(chunkDecode(b, buf, n));
+	chunkDecompressAll(a, flat_a);
+	chunkDecompressAll(b, flat_b);
+	CHECK(memcmp(flat_a, flat_b, CHUNK_BLOCKS) == 0);
 
 	// Checkerboard: RLE's worst case, twice the size of the blocks it describes. The encoder
 	// must notice and fall back, because a player can build this.
-	codecFill(&a, 2);
-	n = chunkEncode(&a, buf, sizeof(buf));
+	codecFill(flat_a, 2);
+	CHECK(chunkLoadAll(a, flat_a));
+	n = chunkEncode(a, buf, sizeof(buf));
 	CHECK(buf[0] == CODEC_RAW);
 	CHECK(n == CHUNK_BLOCKS + 2);
-	memset(&b, 0xEE, sizeof(b));
-	CHECK(chunkDecode(&b, buf, n));
-	CHECK(memcmp(a.blocks, b.blocks, CHUNK_BLOCKS) == 0);
+	{
+		const size_t b_before = chunkGetBytes(b);
+		chunkClear(b, (BlockId)0xEE);
+		resyncBudget(b, b_before);
+	}
+	CHECK(chunkDecode(b, buf, n));
+	chunkDecompressAll(a, flat_a);
+	chunkDecompressAll(b, flat_b);
+	CHECK(memcmp(flat_a, flat_b, CHUNK_BLOCKS) == 0);
+
+	// 32 distinct ids: forces CODEC_RAW on disk (same as the checkerboard) AND
+	// CHUNK_FORM_RAW in memory (unlike the checkerboard, which is only 2 ids and stays
+	// PALETTE4) — the round trip this step's new in-memory form needs its own coverage for.
+	codecFill(flat_a, 3);
+	CHECK(chunkLoadAll(a, flat_a));
+	CHECK(chunkGetForm(a) == CHUNK_FORM_RAW);
+	n = chunkEncode(a, buf, sizeof(buf));
+	CHECK(buf[0] == CODEC_RAW);
+	{
+		const size_t b_before = chunkGetBytes(b);
+		chunkClear(b, (BlockId)0xEE);
+		resyncBudget(b, b_before);
+	}
+	CHECK(chunkDecode(b, buf, n));
+	CHECK(chunkGetForm(b) == CHUNK_FORM_RAW);
+	chunkDecompressAll(a, flat_a);
+	chunkDecompressAll(b, flat_b);
+	CHECK(memcmp(flat_a, flat_b, CHUNK_BLOCKS) == 0);
 
 	// Malformed input. Every one of these is a shape a power cut can produce, and the
 	// contract is that the caller's chunk is left alone rather than half-written — so each
 	// case checks the rejection AND that b still holds what it held.
-	codecFill(&a, 1);
-	n = chunkEncode(&a, buf, sizeof(buf));
-	codecFill(&b, 0);
+	codecFill(flat_a, 1);
+	CHECK(chunkLoadAll(a, flat_a));
+	n = chunkEncode(a, buf, sizeof(buf));
+	codecFill(flat_b, 0);
+	{
+		const size_t b_before = chunkGetBytes(b);
+		CHECK(chunkLoadAll(b, flat_b));
+		resyncBudget(b, b_before);
+	}
 
-	CHECK(!chunkDecode(&b, buf, 0));
-	CHECK(!chunkDecode(&b, buf, 1));
-	CHECK(!chunkDecode(&b, buf, n - 2));           // run table short
-	CHECK(!chunkDecode(&b, buf, n - 1));           // cut between a run's length and index
+	CHECK(!chunkDecode(b, buf, 0));
+	CHECK(!chunkDecode(b, buf, 1));
+	CHECK(!chunkDecode(b, buf, n - 2));           // run table short
+	CHECK(!chunkDecode(b, buf, n - 1));           // cut between a run's length and index
 
 	uint8_t bad[CHUNK_CODEC_MAX];
 	memcpy(bad, buf, n);
 	bad[0] = 99;                                    // unknown tag
-	CHECK(!chunkDecode(&b, bad, n));
+	CHECK(!chunkDecode(b, bad, n));
 
 	memcpy(bad, buf, n);
 	bad[n - 1] = 200;                               // palette index past the palette
-	CHECK(!chunkDecode(&b, bad, n));
+	CHECK(!chunkDecode(b, bad, n));
 
 	// One run too many, so the run table adds up past the end of the chunk. Appending is
 	// the way to build this case rather than lengthening the last run: every run in a
@@ -3215,23 +3628,161 @@ static void testChunkCodec(void)
 	memcpy(bad, buf, n);
 	bad[n]     = 255;                               // a further 256 blocks
 	bad[n + 1] = 0;
-	CHECK(!chunkDecode(&b, bad, n + 2));
+	CHECK(!chunkDecode(b, bad, n + 2));
 
-	// b must still be the uniform-air chunk it was filled with.
-	for (int i = 0; i < CHUNK_BLOCKS; i++) CHECK_QUIET(b.blocks[i] == BLOCK_AIR);
+	// b must still be the uniform-air chunk it was filled with — both its logical content
+	// AND its form: a decode that failed after partially promoting b's storage before
+	// rejecting the data would leave this passing on content while lying about cost.
+	CHECK(chunkGetForm(b) == CHUNK_FORM_UNIFORM);
+	CHECK(chunkIsUniform(b, BLOCK_AIR));
+	chunkDecompressAll(b, flat_b);
+	for (int i = 0; i < CHUNK_BLOCKS; i++) CHECK_QUIET(flat_b[i] == BLOCK_AIR);
 
 	// A buffer too small to hold even the raw form is a 0, not an overrun.
-	codecFill(&a, 2);
-	CHECK(chunkEncode(&a, buf, 8) == 0);
+	codecFill(flat_a, 2);
+	CHECK(chunkLoadAll(a, flat_a));
+	CHECK(chunkEncode(a, buf, 8) == 0);
+
+	// Give back b's baseline claim from the top of this function — the same
+	// budgetRelease(chunkGetBytes(c)) discipline worldExit/worldColumnRemove use right before
+	// every chunkFree, needed here because chunk.c's chunkFree itself never touches the
+	// budget singleton (see chunk.h). 'a' never touched budget.h (chunkLoadAll/chunkEncode are
+	// both budget-free), so it needs no matching release.
+	budgetRelease(chunkGetBytes(b));
+	chunkFree(a);
+	chunkFree(b);
+}
+
+// ── Step 9.2d: chunk_codec.c's palette-unify fast paths ──────────────────────────────
+//
+// testChunkCodec above already runs chunkEncode/chunkDecode over a PALETTE4-form chunk (its
+// "layered terrain" case) and a UNIFORM-form chunk (its "uniform" case), so both fast paths
+// already have correctness coverage from before this step existed. What this test adds that
+// that one does not:
+//
+//   1. Pins CHUNK_FORM_PALETTE4 explicitly before encoding, on a chunk built the way a
+//      player's edits actually build one (chunkSet, not chunkLoadAll from a flat buffer) --
+//      and picks the FIRST edit at cell 0 specifically, because chunk.c's chunkSet always
+//      puts the OLD uniform value in palette slot 0 and the new write in slot 1, regardless
+//      of where the write landed. A first-seen-order scan over the cells (the pre-9.2d
+//      algorithm) would instead see the NEW value first at cell 0 and put THAT in slot 0 --
+//      the opposite order. If the fast path silently assumed disk order had to match
+//      first-seen-cell order, this is the input that would catch it.
+//
+//   2. Proves backward compatibility: chunkDecode's new direct-to-PALETTE4 commit path must
+//      accept a CODEC_RLE buffer whose disk palette is in ANY order, not only the order this
+//      build's own chunkEncode happens to produce -- because a save file already on the
+//      user's SD card was written by whatever ordering rule was in force when it was
+//      written, and this step changed that rule (see chunk_codec.c's chunkEncode comment).
+//      The buffer below is built by hand, independently of chunkEncode, in a palette order
+//      that provably does not match either algorithm's natural output for this content.
+static void testChunkCodecPaletteUnify(void)
+{
+	Chunk* a = chunkAlloc(BLOCK_AIR);
+	Chunk* b = chunkAlloc(BLOCK_AIR);
+	CHECK(a && b);
+	CHECK(budgetClaim(chunkGetBytes(b)));
+
+	CHECK(chunkSet(a, 0, BLOCK_STONE));      // uniform_id (AIR) -> slot 0, STONE -> slot 1
+	CHECK(chunkSet(a, 4000, BLOCK_DIRT));    // 3rd distinct id -> slot 2
+	CHECK(chunkGetForm(a) == CHUNK_FORM_PALETTE4);
+
+	static uint8_t buf[CHUNK_CODEC_MAX];
+	size_t n = chunkEncode(a, buf, sizeof(buf));
+	CHECK(n > 0);
+	CHECK(buf[0] == CODEC_RLE);
+
+	{
+		const size_t b_before = chunkGetBytes(b);
+		chunkClear(b, (BlockId)0xEE);          // poison: decode must fully overwrite it
+		resyncBudget(b, b_before);
+	}
+	CHECK(chunkDecode(b, buf, n));
+	CHECK(chunkGetForm(b) == CHUNK_FORM_PALETTE4);
+	for (int i = 0; i < CHUNK_BLOCKS; i++) CHECK_QUIET(chunkGet(a, i) == chunkGet(b, i));
+
+	// ── Backward-compat: a hand-built CODEC_RLE buffer, same logical content as `a` above
+	// (STONE at cell 0, DIRT at cell 4000, AIR everywhere else) but with its disk palette in
+	// [DIRT, AIR, STONE] order -- not chunk.c's in-memory order ([AIR, STONE, DIRT], since
+	// AIR is the original uniform_id and gets slot 0), and not first-seen-cell order either
+	// ([STONE, AIR, DIRT], since cell 0 is STONE). All three orders are pairwise different
+	// for this content, so accepting this one is not accidentally accepting the same order
+	// twice under a different name.
+	static uint8_t old_style[CHUNK_CODEC_MAX];
+	size_t w = 0;
+	old_style[w++] = CODEC_RLE;
+	old_style[w++] = 2;                        // 3 palette entries, stored minus one
+	old_style[w++] = BLOCK_DIRT;                // slot 0
+	old_style[w++] = BLOCK_AIR;                 // slot 1
+	old_style[w++] = BLOCK_STONE;               // slot 2
+
+	// Each block below appends `length` cells of `slot`, split into RUN_MAX(=256)-sized runs
+	// the same way chunk_codec.c's encoder must, so a length above 256 is a legal input here.
+	{
+		int length = 1; uint8_t slot = 2;      // cell 0: STONE
+		while (length > 0) {
+			const int run = length > 256 ? 256 : length;
+			old_style[w++] = (uint8_t)(run - 1);
+			old_style[w++] = slot;
+			length -= run;
+		}
+	}
+	{
+		int length = 3999; uint8_t slot = 1;   // cells 1..3999: AIR
+		while (length > 0) {
+			const int run = length > 256 ? 256 : length;
+			old_style[w++] = (uint8_t)(run - 1);
+			old_style[w++] = slot;
+			length -= run;
+		}
+	}
+	{
+		int length = 1; uint8_t slot = 0;      // cell 4000: DIRT
+		while (length > 0) {
+			const int run = length > 256 ? 256 : length;
+			old_style[w++] = (uint8_t)(run - 1);
+			old_style[w++] = slot;
+			length -= run;
+		}
+	}
+	{
+		int length = 95; uint8_t slot = 1;     // cells 4001..4095: AIR
+		while (length > 0) {
+			const int run = length > 256 ? 256 : length;
+			old_style[w++] = (uint8_t)(run - 1);
+			old_style[w++] = slot;
+			length -= run;
+		}
+	}
+	CHECK(w <= CHUNK_CODEC_MAX);
+
+	{
+		const size_t b_before = chunkGetBytes(b);
+		chunkClear(b, (BlockId)0xEE);
+		resyncBudget(b, b_before);
+	}
+	CHECK(chunkDecode(b, old_style, w));
+	CHECK(chunkGetForm(b) == CHUNK_FORM_PALETTE4);
+	for (int i = 0; i < CHUNK_BLOCKS; i++) CHECK_QUIET(chunkGet(a, i) == chunkGet(b, i));
+
+	budgetRelease(chunkGetBytes(b));
+	chunkFree(a);
+	chunkFree(b);
 }
 
 #ifndef __3DS__
 
+#include <dirent.h>
 #include <sys/stat.h>
 
-#include "world/region.h"
+#if defined(_WIN32)
+#include <direct.h>    // _rmdir
+#include <process.h>   // _getpid — MinGW keeps it here, not in <unistd.h>
+#else
+#include <unistd.h>    // rmdir, getpid
+#endif
 
-#define TEST_WORLD_DIR "build-host/testworld"
+#include "world/region.h"
 
 // MinGW's <sys/stat.h> declares the one-argument MSVC mkdir; POSIX takes a mode. Only the
 // host tests create directories — the game's save path is made by app/save.c with the
@@ -3245,18 +3796,72 @@ static void testMkdir(const char* path)
 #endif
 }
 
+static void testRmdir(const char* path)
+{
+#if defined(_WIN32)
+	_rmdir(path);
+#else
+	rmdir(path);
+#endif
+}
+
+// The directory the region tests below write into. Derived from the pid rather than being
+// a fixed literal, because this suite does get run concurrently — two shells in the same
+// checkout, or a second session building the same tree — and a shared path means one run
+// truncates and rewrites the very region files another run is part-way through asserting
+// on. That does not present as a concurrency bug when it bites: it presents as unrelated
+// assertions failing at random line numbers on a suite that passes when re-run, which is
+// exactly how it showed up, and it cost a full A/B against an innocent change to rule out.
+static const char* testWorldDir(void)
+{
+	static char dir[64];
+
+	if (dir[0] == '\0') {
+#if defined(_WIN32)
+		const long pid = (long)_getpid();
+#else
+		const long pid = (long)getpid();
+#endif
+		snprintf(dir, sizeof(dir), "build-host/testworld-%ld", pid);
+	}
+	return dir;
+}
+
+// Deletes the per-process directory and everything under it, so a run leaves no more
+// behind than the fixed-path version did. Recursive because testRegionTornDirectory makes
+// a "cutworld" subdirectory: remove() takes files and empty directories on both platforms,
+// and the only thing it refuses is a non-empty directory, so recursing on failure and
+// letting the tail rmdir finish the job covers every case. Best-effort throughout — a
+// leftover file is untidy, not a test failure.
+static void testRmTree(const char* path)
+{
+	DIR* d = opendir(path);
+	if (!d) return;
+
+	for (const struct dirent* e = readdir(d); e; e = readdir(d)) {
+		if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+
+		char child[512];
+		snprintf(child, sizeof(child), "%s/%s", path, e->d_name);
+		if (remove(child) != 0) testRmTree(child);
+	}
+
+	closedir(d);
+	testRmdir(path);
+}
+
 static void regionTestDir(void)
 {
 	testMkdir("build-host");
-	testMkdir(TEST_WORLD_DIR);
+	testMkdir(testWorldDir());
 }
 
 static void regionTestClean(int32_t rx, int32_t rz)
 {
 	char p[256];
-	snprintf(p, sizeof(p), "%s/r.%ld.%ld.bsr", TEST_WORLD_DIR, (long)rx, (long)rz);
+	snprintf(p, sizeof(p), "%s/r.%ld.%ld.bsr", testWorldDir(), (long)rx, (long)rz);
 	remove(p);
-	snprintf(p, sizeof(p), "%s/r.%ld.%ld.tmp", TEST_WORLD_DIR, (long)rx, (long)rz);
+	snprintf(p, sizeof(p), "%s/r.%ld.%ld.tmp", testWorldDir(), (long)rx, (long)rz);
 	remove(p);
 }
 
@@ -3288,12 +3893,12 @@ static void testRegionRoundTrip(void)
 
 	const uint32_t n = regionEncodeColumn(col, buf, sizeof(buf));
 	CHECK(n > 0);
-	CHECK(regionWriteColumn(TEST_WORLD_DIR, 2, 3, buf, n));
+	CHECK(regionWriteColumn(testWorldDir(), 2, 3, buf, n));
 	worldExit(&s_world);
 
 	// Read it back into a world that has never seen it.
 	static uint8_t back[REGION_COL_MAX];
-	const uint32_t got = regionReadColumn(TEST_WORLD_DIR, 2, 3, back, sizeof(back));
+	const uint32_t got = regionReadColumn(testWorldDir(), 2, 3, back, sizeof(back));
 	CHECK(got == n);
 	CHECK(memcmp(buf, back, n) == 0);
 
@@ -3306,7 +3911,7 @@ static void testRegionRoundTrip(void)
 
 	// A column that was never saved reads as 0, not as an error and not as somebody else's
 	// bytes. Slot arithmetic that masked wrongly would show up right here.
-	CHECK(regionReadColumn(TEST_WORLD_DIR, 5, 7, back, sizeof(back)) == 0);
+	CHECK(regionReadColumn(testWorldDir(), 5, 7, back, sizeof(back)) == 0);
 
 	// Negative coordinates land in their own region and their own slot. -1 and 15 both mask
 	// to slot 15, so they must differ by region file or one would overwrite the other.
@@ -3369,7 +3974,7 @@ static void testRegionPowerCut(void)
 	                                          old_bytes, sizeof(old_bytes));
 	worldExit(&s_world);
 	CHECK(old_n > 0);
-	CHECK(regionWriteColumn(TEST_WORLD_DIR, 1, 1, old_bytes, old_n));
+	CHECK(regionWriteColumn(testWorldDir(), 1, 1, old_bytes, old_n));
 
 	// State B: same column, one block different, so the two encodings are the same length
 	// and only the payload contents and the directory tell them apart.
@@ -3379,11 +3984,14 @@ static void testRegionPowerCut(void)
 	                                          new_bytes, sizeof(new_bytes));
 	worldExit(&s_world);
 	CHECK(new_n > 0);
-	CHECK(regionWriteColumn(TEST_WORLD_DIR, 1, 1, new_bytes, new_n));
+	CHECK(regionWriteColumn(testWorldDir(), 1, 1, new_bytes, new_n));
 
-	const char* whole  = TEST_WORLD_DIR "/r.0.0.bsr";
-	const char* cutdir = TEST_WORLD_DIR "/cutworld";
-	const char* cut    = TEST_WORLD_DIR "/cutworld/r.0.0.bsr";
+	// Built rather than concatenated: the directory is only known at run time now, so
+	// string-literal pasting is not available here any more.
+	char whole[256], cutdir[256], cut[256];
+	snprintf(whole,  sizeof(whole),  "%s/r.0.0.bsr", testWorldDir());
+	snprintf(cutdir, sizeof(cutdir), "%s/cutworld", testWorldDir());
+	snprintf(cut,    sizeof(cut),    "%s/cutworld/r.0.0.bsr", testWorldDir());
 	testMkdir(cutdir);
 
 	const long total = fileBytes(whole);
@@ -3474,10 +4082,10 @@ static void testRegionTornDirectory(void)
 	regionTestBuild(&s_world, 4, 4, BLOCK_WOOD);
 	const uint32_t n = regionEncodeColumn(worldColumn(&s_world, 4, 4), bytes, sizeof(bytes));
 	worldExit(&s_world);
-	CHECK(regionWriteColumn(TEST_WORLD_DIR, 4, 4, bytes, n));
+	CHECK(regionWriteColumn(testWorldDir(), 4, 4, bytes, n));
 
 	char path[256];
-	snprintf(path, sizeof(path), "%s/r.0.0.bsr", TEST_WORLD_DIR);
+	snprintf(path, sizeof(path), "%s/r.0.0.bsr", testWorldDir());
 
 	// Scribble over directory copy A, which is the live one after a single write.
 	FILE* f = fopen(path, "r+b");
@@ -3492,13 +4100,13 @@ static void testRegionTornDirectory(void)
 
 	// One write means copy B has never been written, so there is no older good copy — the
 	// right answer here is "nothing", not a decode of a corrupt directory.
-	CHECK(regionReadColumn(TEST_WORLD_DIR, 4, 4, got, sizeof(got)) == 0);
+	CHECK(regionReadColumn(testWorldDir(), 4, 4, got, sizeof(got)) == 0);
 
 	// Now the case that matters: two writes, so both copies are live, and destroying the
 	// newer one must leave the older one serving the previous state rather than failing.
 	regionTestClean(0, 0);
-	CHECK(regionWriteColumn(TEST_WORLD_DIR, 4, 4, bytes, n));    // seq 1 -> copy A
-	CHECK(regionWriteColumn(TEST_WORLD_DIR, 4, 4, bytes, n));    // seq 2 -> copy B
+	CHECK(regionWriteColumn(testWorldDir(), 4, 4, bytes, n));    // seq 1 -> copy A
+	CHECK(regionWriteColumn(testWorldDir(), 4, 4, bytes, n));    // seq 2 -> copy B
 
 	f = fopen(path, "r+b");
 	CHECK(f != NULL);
@@ -3510,7 +4118,7 @@ static void testRegionTornDirectory(void)
 		fclose(f);
 	}
 
-	const uint32_t back = regionReadColumn(TEST_WORLD_DIR, 4, 4, got, sizeof(got));
+	const uint32_t back = regionReadColumn(testWorldDir(), 4, 4, got, sizeof(got));
 	CHECK(back == n);
 	CHECK(memcmp(got, bytes, n) == 0);
 
@@ -3529,11 +4137,18 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testBlockRegistry();
 	testBlockFaceTexFallback();
 	testChunkIndex();
+	testChunkFormBytes();
+	testChunkUniformNoArray();
+	testChunkPromoteUniformToPalette();
+	testChunkPromotePaletteToRaw();
+	testChunkRoundTripEveryFormEveryCell();
+	testChunkRunCopyMatchesAcrossForms();
 	testWorldAccess();
 	testWorldBytes();
 	testColumnTableFull();
 	testColumnRemove();
 	testWorldSetBudgetExhausted();
+	testChunkPromotionBudgetRefused();
 	testScratch26();
 	testScratchFloor();
 	testMesher();
@@ -3560,6 +4175,7 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testWorldgenBiome();
 	testWorldgenTrees();
 	testWorldgenCaves();
+	testWorldgenMemoryProjection();
 	testRaycast();
 	testBodyBlocked();
 	testCeilingCollision();
@@ -3570,10 +4186,12 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testVisWalkNeverHidesOpenSky();
 	testRenderDist();
 	testChunkCodec();
+	testChunkCodecPaletteUnify();
 #ifndef __3DS__
 	testRegionRoundTrip();
 	testRegionPowerCut();
 	testRegionTornDirectory();
+	testRmTree(testWorldDir());   // the per-process directory those three worked in
 #endif
 
 	// Every allocation the world made must have been given back.
