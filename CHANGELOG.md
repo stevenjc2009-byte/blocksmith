@@ -4,6 +4,62 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] — 2026-08-19
+
+Creating a world no longer looks like a freeze, the game can update itself, and
+a hang now leaves evidence behind.
+
+**Still not tested on real hardware.** Every figure below was measured in
+Azahar, which does not emulate GPU cost.
+
+### Added
+
+- **In-app updater** — Options → Check for Update. Asks GitHub for the newest
+  release, and if it is newer, streams the `.cia` straight into the AM service
+  and relaunches into it. The version check reads the tag out of the
+  `releases/latest` redirect rather than the API, because `api.github.com`
+  allows only 60 unauthenticated requests an hour per IP and a check that fails
+  at random is worse than no check. The certificate bundle needed to verify
+  github.com ships in the RomFs (`romfs/cacert.pem`) — the console's own root
+  store predates every CA in use today.
+- **A loading screen for world creation.** Heading, world name, a progress bar,
+  the stage in words, and live counters: columns in, meshes, queued, holes,
+  refusals, worker state, elapsed seconds. If generation stops making progress
+  it says so and offers **A — play anyway** or **START — quit**, rather than
+  leaving you looking at a frame that never changes.
+- **A watchdog thread** (`source/app/watchdog.c`). If the main thread stops
+  completing frames for ten seconds anywhere other than the HOME-menu wait, it
+  writes `sdmc:/blocksmith/hang.txt` naming the phase it stopped in, the frames
+  drawn, and what the world was doing. It writes through the raw FS service
+  rather than stdio, because a main thread stuck inside newlib holds newlib's
+  lock and an ordinary write would deadlock with it.
+
+### Changed
+
+- **Creating a world is 4.7× faster: 30.44 s → 6.50 s**, and the loading screen
+  now appears within **0.60 s** instead of 23.95 s. The cause was measured, not
+  guessed — an instrumented boot attributed **23,855.6 ms of 24,133.8 ms
+  (98.9 %)** to the on-console world self-test, which builds and tears down
+  whole worlds across 818 assertions on a 268 MHz ARM11. That self-test is now
+  off in release builds (`BS_SELFTEST`, default 0). The identical code still
+  runs on the host on every build — 2,694 checks of it — and can be switched
+  back on with `make EXTRA_CFLAGS="-DBS_SELFTEST=1"`.
+
+### Fixed
+
+- **The loading screen drew nothing at all** in its first build: every quad was
+  batched and never submitted, because `loadingDraw()` returned without calling
+  `spriteEnd()`. On screen that is indistinguishable from the frozen boot the
+  screen was written to replace.
+
+### Known issues
+
+- A freeze reported on real hardware after creating a world — no terrain on the
+  top screen, the HUD still showing its last numbers, and the HOME button dead —
+  **has not been reproduced** in Azahar on either console profile, and nothing
+  in this release is proven to fix it. The watchdog above exists so that the
+  next occurrence names itself.
+
 ## [0.1.0] — 2026-08-19
 
 First public release. Playable single-player: generate a world, walk around it,

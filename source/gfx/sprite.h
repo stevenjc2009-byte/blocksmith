@@ -50,6 +50,22 @@
 bool spriteInit(void);
 void spriteExit(void);
 
+// Rewinds the vertex buffer for a new frame. Call once immediately after C3D_FrameBegin,
+// before any spriteBegin, on every loop that draws — the main game loop, the title screen
+// and the loading screen each have their own.
+//
+// This exists because citro3d does not draw when you call it. C3D_DrawElements queues a
+// command and the GPU does not read a single vertex until C3D_FrameEnd, so every batch
+// submitted during a frame is still holding a live claim on the region of the buffer it
+// wrote. Batches within one frame therefore have to occupy *different* regions, which is
+// what the frame-scoped cursor gives them; rewinding per batch instead meant the second
+// batch of a frame silently overwrote the first one's vertices before the GPU ever saw
+// them, and the first batch was drawn with the second's geometry.
+//
+// A frame that never calls this still renders — it just keeps consuming buffer until it
+// wraps (see spriteOverflowCount) — so a missed call degrades rather than corrupts.
+void spriteFrameBegin(void);
+
 // Opens a 2D pass. `w` and `h` are the target's logical size in pixels — 400x240 for the
 // top screen, 320x240 for the bottom — and set the ortho matrix, so passing the wrong
 // ones scales the whole UI rather than failing.
@@ -86,3 +102,9 @@ void spriteEnd(void);
 // "the UI is one draw call" is a claim, and this is the number that settles it.
 int spriteDrawCount(void);
 int spriteQuadCount(void);
+
+// How many times this frame the buffer wrapped back to the start because a frame asked for
+// more quads than it holds. Nonzero means some batch this frame is drawing another batch's
+// geometry — the exact fault the frame-scoped cursor exists to prevent — so it is a number
+// worth looking at rather than a soft limit. Reset by spriteFrameBegin.
+int spriteOverflowCount(void);

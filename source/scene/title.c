@@ -3,8 +3,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "app/updater.h"
 #include "gfx/font.h"
 #include "gfx/sprite.h"
+#include "net/bsnet.h"
 #include "world/region.h"
 
 // ── Layout ─────────────────────────────────────────────────────────────────────────────
@@ -20,13 +22,25 @@
 
 #define TITLE_BAR_H  20   // a label only, never tapped — not held to the finger-size budget below
 
-// Title screen's three primary actions: the buttons a thumb has to land on cold, with
-// nothing smaller nearby to fall back on. 48 px = 7.9 mm, inside the 7-10 mm fingertip
-// target range general touch-UI guidance converges on (Apple's HIG cites roughly 7 mm,
-// Android's Material roughly 9 mm) and the most three stacked buttons plus margins can
-// afford on a 240 px screen (3*48 + 2*12 + 40(title+margin) = 232, 8 px of slack).
-#define MAIN_BTN_H  48
-#define MAIN_GAP    12
+// Title screen's primary actions: the buttons a thumb has to land on cold, with nothing
+// smaller nearby to fall back on. This used to be a literal 48 px for three buttons (7.9 mm,
+// inside the 7-10 mm fingertip target range general touch-UI guidance converges on — Apple's
+// HIG cites roughly 7 mm, Android's Material roughly 9 mm). Adding Multiplayer as a fourth
+// pushed three-buttons-at-48px past the 240 px budget, so this is now a formula for the same
+// reason BIND_ROW_H below is one: it recomputes instead of silently overlapping rows if a
+// fifth item is ever added, rather than a number that quietly stops being true.
+//
+//   240 = MAIN_TOP_Y(44) + items*MAIN_BTN_H + (items-1)*MAIN_GAP + margin(8)
+//
+// With 4 items and a 12 px gap that is 44 + 4*38 + 3*12 = 232, 8 px of slack (the "margin(8)"
+// above) — the same slack the old three-item budget had. 38 px (6.3 mm) is under the
+// original 48, but still
+// above LIST_BTN_H's 36 px (6.0 mm), which this file already uses elsewhere for buttons
+// reached less often than the title screen's own (see the comment above LIST_BTN_H).
+#define MAIN_ITEM_COUNT 4   // Play, Multiplayer, Options, Quit
+#define MAIN_TOP_Y   44
+#define MAIN_GAP     12
+#define MAIN_BTN_H   ((SCR_H - MAIN_TOP_Y - (MAIN_ITEM_COUNT - 1) * MAIN_GAP - 8) / MAIN_ITEM_COUNT)
 
 // The shared shape behind world-select and options-general: a handful of content rows,
 // then two buttons pinned to the bottom of the screen. Solved once, algebraically, rather
@@ -66,6 +80,26 @@
 #define BIND_ROW_Y   LIST_TOP_Y
 #define BIND_ROW_H   ((SCR_H - LIST_TOP_Y - 6 - LIST_BTN_H - 6) / ACTION_COUNT)
 #define BIND_BACK_Y  (BIND_ROW_Y + ACTION_COUNT * BIND_ROW_H + 6)
+
+// Options-general gained a third pinned button — "CHECK FOR UPDATE", reached about as
+// rarely as "CONTROLS >" is — so it no longer fits the two-button shape LIST_BTN1_Y/
+// LIST_BTN2_Y above was solved for. This is the same move MAIN_ITEM_COUNT's comment already
+// made once, for the title screen, when Multiplayer became a fourth item there: recompute
+// the shared height instead of shrinking anything already on screen.
+//
+//   240 = LIST_TOP_Y(24) + 4*LIST_ROW_H(32) + gap(6) + 3*OPT_BTN_H + 2*gap(4) + margin(6)
+//
+// The "4" is drawOptionsGeneral's own four setting rows (render dist, 3D depth, invert
+// look, look sensitivity) — unchanged by this, so LIST_TOP_Y and LIST_ROW_H are reused
+// rather than re-derived. That leaves 240 = 172 + 3*OPT_BTN_H, so OPT_BTN_H = 22 (3.6 mm)
+// with 2 px left over — under BIND_ROW_H's 24 px (4.0 mm) above, the previous low point in
+// this file, but the same mitigation applies: a full-width tap target reached this rarely
+// costs a D-pad user nothing extra over a taller one, and nothing on this screen requires
+// the smaller target to land first try the way the setting rows above it do.
+#define OPT_BTN_H   ((SCR_H - LIST_TOP_Y - 4 * LIST_ROW_H - 6 - 2 * 4 - 6) / 3)
+#define OPT_BTN1_Y  (LIST_TOP_Y + 4 * LIST_ROW_H + 6)
+#define OPT_BTN2_Y  (OPT_BTN1_Y + OPT_BTN_H + 4)
+#define OPT_BTN3_Y  (OPT_BTN2_Y + OPT_BTN_H + 4)
 
 // ── Palette ────────────────────────────────────────────────────────────────────────────
 
@@ -108,6 +142,16 @@ static bool uiButton(TRect r, const char* label, bool focused, bool tap, int tx,
 
 	const bool tapped_here = tap && ptIn(r, tx, ty);
 	return tapped_here || (focused && a_down);
+}
+
+// A filled bar for updaterProgress()'s percentage — the update screen is the only caller,
+// so this stays local rather than in gfx/sprite.h; a shared bar belongs there only once a
+// second caller needs one. Clamped so a stray reading cannot draw outside `r`.
+static void uiProgressBar(TRect r, int pct)
+{
+	pct = clampInt(pct, 0, 100);
+	spriteRect(r.x, r.y, r.w, r.h, COL_PANEL_LO);
+	spriteRect(r.x, r.y, r.w * (float)pct / 100.0f, r.h, COL_ACCENT);
 }
 
 // A settings row with a numeric value: label left, value and a "-"/"+" chip pair right.
@@ -363,8 +407,6 @@ static TitleResult drawWorldSelect(TitleState* ts, const TitleInput* in, bool ta
 
 // ── Main screen ────────────────────────────────────────────────────────────────────────
 
-#define MAIN_ITEM_COUNT 3   // Play, Options, Quit
-
 static TitleResult drawMain(TitleState* ts, const TitleInput* in, bool tap)
 {
 	TitleResult r = {TITLE_STAY, {0}};
@@ -376,20 +418,26 @@ static TitleResult drawMain(TitleState* ts, const TitleInput* in, bool tap)
 	const int tw = fontTextWidth("BLOCKSMITH", 2);
 	fontDraw((SCR_W - (float)tw) * 0.5f, 6, 2, COL_ACCENT, "BLOCKSMITH");
 
-	float y = 44;
-	const TRect play_r    = {10, y, SCR_W - 20, MAIN_BTN_H}; y += MAIN_BTN_H + MAIN_GAP;
-	const TRect options_r = {10, y, SCR_W - 20, MAIN_BTN_H}; y += MAIN_BTN_H + MAIN_GAP;
-	const TRect quit_r    = {10, y, SCR_W - 20, MAIN_BTN_H};
+	float y = MAIN_TOP_Y;
+	const TRect play_r  = {10, y, SCR_W - 20, MAIN_BTN_H}; y += MAIN_BTN_H + MAIN_GAP;
+	const TRect mp_r    = {10, y, SCR_W - 20, MAIN_BTN_H}; y += MAIN_BTN_H + MAIN_GAP;
+	const TRect opts_r  = {10, y, SCR_W - 20, MAIN_BTN_H}; y += MAIN_BTN_H + MAIN_GAP;
+	const TRect quit_r  = {10, y, SCR_W - 20, MAIN_BTN_H};
 
 	if (uiButton(play_r, "PLAY", ts->cursor == 0, tap, in->touch_x, in->touch_y, a))
 		titleEnterWorldSelect(ts);
 
-	if (uiButton(options_r, "OPTIONS", ts->cursor == 1, tap, in->touch_x, in->touch_y, a)) {
+	if (uiButton(mp_r, "MULTIPLAYER", ts->cursor == 1, tap, in->touch_x, in->touch_y, a)) {
+		ts->screen = TITLE_SCR_MULTIPLAYER;
+		ts->cursor = 0;
+	}
+
+	if (uiButton(opts_r, "OPTIONS", ts->cursor == 2, tap, in->touch_x, in->touch_y, a)) {
 		ts->screen = TITLE_SCR_OPTIONS_GENERAL;
 		ts->cursor = 0;
 	}
 
-	if (uiButton(quit_r, "QUIT", ts->cursor == 2, tap, in->touch_x, in->touch_y, a))
+	if (uiButton(quit_r, "QUIT", ts->cursor == 3, tap, in->touch_x, in->touch_y, a))
 		r.action = TITLE_QUIT;
 
 	return r;
@@ -397,7 +445,7 @@ static TitleResult drawMain(TitleState* ts, const TitleInput* in, bool tap)
 
 // ── Options: general settings ─────────────────────────────────────────────────────────
 
-#define GEN_ITEM_COUNT 6   // 4 settings + "Controls >" + Back
+#define GEN_ITEM_COUNT 7   // 4 settings + "Controls >" + "Check for Update" + Back
 
 static TRect optRowRect(int i)
 {
@@ -441,14 +489,20 @@ static void drawOptionsGeneral(TitleState* ts, Options* opts, const TitleInput* 
 	if (step) opts->look_sensitivity = clampF(opts->look_sensitivity + (float)step * 0.25f,
 	                                           OPTIONS_SENS_MIN, OPTIONS_SENS_MAX);
 
-	const TRect controls_r = {10, (float)LIST_BTN1_Y, SCR_W - 20, LIST_BTN_H};
+	const TRect controls_r = {10, (float)OPT_BTN1_Y, SCR_W - 20, OPT_BTN_H};
 	if (uiButton(controls_r, "CONTROLS >", ts->cursor == 4, tap, in->touch_x, in->touch_y, a)) {
 		ts->screen = TITLE_SCR_OPTIONS_BINDINGS;
 		ts->cursor = 0;
 	}
 
-	const TRect back_r = {10, (float)LIST_BTN2_Y, SCR_W - 20, LIST_BTN_H};
-	if (uiButton(back_r, "BACK", ts->cursor == 5, tap, in->touch_x, in->touch_y, a)
+	const TRect update_r = {10, (float)OPT_BTN2_Y, SCR_W - 20, OPT_BTN_H};
+	if (uiButton(update_r, "CHECK FOR UPDATE", ts->cursor == 5, tap, in->touch_x, in->touch_y, a)) {
+		ts->screen = TITLE_SCR_UPDATE;
+		ts->cursor = 0;
+	}
+
+	const TRect back_r = {10, (float)OPT_BTN3_Y, SCR_W - 20, OPT_BTN_H};
+	if (uiButton(back_r, "BACK", ts->cursor == 6, tap, in->touch_x, in->touch_y, a)
 	    || (in->keys_down & KEY_B)) {
 		// The one point either options screen ever writes to disk — see title.h's file
 		// comment for why this is the whole of this file's crash exposure: at worst a
@@ -456,7 +510,8 @@ static void drawOptionsGeneral(TitleState* ts, Options* opts, const TitleInput* 
 		// was left, never a whole session's worth.
 		optionsSave(opts, TITLE_OPTIONS_PATH);
 		ts->screen = TITLE_SCR_MAIN;
-		ts->cursor = 1;   // land back on the OPTIONS button, not PLAY
+		ts->cursor = 2;   // land back on the OPTIONS button, not PLAY (index 2 now that
+		                  // Multiplayer sits between Play and Options in the main menu)
 	}
 }
 
@@ -522,6 +577,229 @@ static void drawOptionsBindings(TitleState* ts, Options* opts, const TitleInput*
 	}
 }
 
+// ── Multiplayer ────────────────────────────────────────────────────────────────────────
+//
+// Unlike world-select/options-general this is not a 4-row list, so it does not reuse
+// LIST_BTN1_Y/LIST_BTN2_Y — those are solved for exactly four LIST_ROW_H rows above two
+// pinned buttons, and this screen's content (address, status, error, key, hint, player
+// list) is a different shape. Same pinned-button idiom, its own Y budget:
+//
+//   240 = MP_BTN2_Y + MP_BTN_H(36) + margin(6)
+//   MP_BTN1_Y = MP_BTN2_Y - MP_BTN_H(36) - gap(4)
+//
+// which leaves LIST_TOP_Y(24)..MP_BTN1_Y-6 = 24..152, 128 px, for everything above the
+// two buttons. Every row Y below is a literal rather than another formula, the same way
+// drawWorldSelect's and drawOptionsGeneral's row content is literal per-row code — only
+// the *count*-driven layouts (BIND_ROW_H, MAIN_BTN_H) earn a formula.
+#define MP_BTN_H            36
+#define MP_BTN2_Y           (SCR_H - 6 - MP_BTN_H)
+#define MP_BTN1_Y           (MP_BTN2_Y - 4 - MP_BTN_H)
+
+#define MP_ROW_SERVER        24
+#define MP_ROW_STATUS        33
+#define MP_ROW_ERROR         42
+#define MP_ROW_KEY_LABEL     54
+#define MP_ROW_KEY_HEX       63   // + a second line at +FONT_LINE(9) via fontDraw's own '\n'
+#define MP_ROW_HINT          84
+#define MP_ROW_PLAYERS_HDR   93
+#define MP_ROW_PLAYERS_TOP  102
+#define MP_ROW_STEP           9
+
+// How many player rows fit between MP_ROW_PLAYERS_TOP and the content bottom (152): the
+// 5th row's glyphs (102 + 4*9 = 138, +FONT_GLYPH_H(7) = 145) still clear it with 7 px to
+// spare; a 6th would not. NET_MAX_PLAYERS (bsnet.h) is 16, so this can genuinely be fewer
+// rows than the room holds — see the "+N more" fallback below, the same honesty
+// titleEnterWorldSelect's own truncation flag applies to a directory listing.
+#define MP_PLAYERS_VISIBLE    5
+
+#define MP_ITEM_COUNT 2   // Connect/Disconnect, Back
+
+static void drawMultiplayer(TitleState* ts, const TitleInput* in, bool tap)
+{
+	if (in->keys_down & KEY_DDOWN) ts->cursor = (ts->cursor + 1) % MP_ITEM_COUNT;
+	if (in->keys_down & KEY_DUP)   ts->cursor = (ts->cursor + MP_ITEM_COUNT - 1) % MP_ITEM_COUNT;
+	const bool a = (in->keys_down & KEY_A) != 0;
+
+	fontDraw(8, 4, 1, COL_TEXT_DIM, "MULTIPLAYER");
+
+	char addr_line[8 + NET_ADDR_MAX];
+	snprintf(addr_line, sizeof(addr_line), "Server: %s", netServerAddress());
+	fontDraw(8, MP_ROW_SERVER, 1, COL_TEXT, addr_line);
+
+	const NetStatus st = netStatus();
+	fontDraw(8, MP_ROW_STATUS, 1, (st == NET_FAILED) ? COL_WARN : COL_TEXT, netStatusText());
+
+	// netErrorText() and netStatusText() are used verbatim throughout — see title.h's
+	// header on why this file never writes its own network wording.
+	const char* err = netErrorText();
+	if (err[0] != '\0') fontDraw(8, MP_ROW_ERROR, 1, COL_WARN, err);
+
+	fontDraw(8, MP_ROW_KEY_LABEL, 1, COL_TEXT_DIM, "YOUR KEY:");
+
+	// netLocalKeyHex() is 64 hex characters wide (384 px at scale 1), well past the 300 px
+	// a bottom-screen line has to work with, so it is split across two lines here rather
+	// than shrinking the font past legibility. The unavailable-key case is much shorter
+	// than 64 characters, so it is left on one line rather than force-split at 32.
+	const char* key = netLocalKeyHex();
+	if (strlen(key) >= 64) {
+		char wrapped[2 * 32 + 2];
+		snprintf(wrapped, sizeof(wrapped), "%.32s\n%.32s", key, key + 32);
+		fontDraw(8, MP_ROW_KEY_HEX, 1, COL_ACCENT, wrapped);
+	} else {
+		fontDraw(8, MP_ROW_KEY_HEX, 1, COL_ACCENT, key);
+	}
+
+	fontDraw(8, MP_ROW_HINT, 1, COL_TEXT_DIM, "Also saved to SD: /blocksmith/client.pub");
+
+	const int player_count = netPlayerCount();
+	char hdr[24];
+	snprintf(hdr, sizeof(hdr), "PLAYERS (%d)", player_count);
+	fontDraw(8, MP_ROW_PLAYERS_HDR, 1, COL_TEXT_DIM, hdr);
+
+	const int shown = (player_count < MP_PLAYERS_VISIBLE) ? player_count : MP_PLAYERS_VISIBLE;
+	for (int i = 0; i < shown; i++) {
+		const float row_y = (float)(MP_ROW_PLAYERS_TOP + i * MP_ROW_STEP);
+
+		if (i == MP_PLAYERS_VISIBLE - 1 && player_count > MP_PLAYERS_VISIBLE) {
+			char more[24];
+			snprintf(more, sizeof(more), "+ %d more", player_count - (MP_PLAYERS_VISIBLE - 1));
+			fontDraw(8, row_y, 1, COL_TEXT_DIM, more);
+			break;
+		}
+
+		const char* name = netPlayerName(i);
+		if (!name) break;
+		fontDraw(8, row_y, 1, netPlayerIsLocal(i) ? COL_ACCENT : COL_TEXT, name);
+	}
+
+	const bool connected = (st == NET_CONNECTED);
+	const TRect conn_r = {10, (float)MP_BTN1_Y, SCR_W - 20, MP_BTN_H};
+	if (uiButton(conn_r, connected ? "DISCONNECT" : "CONNECT", ts->cursor == 0, tap,
+	             in->touch_x, in->touch_y, a)) {
+		if (connected) netDisconnect(); else netConnect();
+	}
+
+	const TRect back_r = {10, (float)MP_BTN2_Y, SCR_W - 20, MP_BTN_H};
+	if (uiButton(back_r, "BACK", ts->cursor == 1, tap, in->touch_x, in->touch_y, a)
+	    || (in->keys_down & KEY_B)) {
+		ts->screen = TITLE_SCR_MAIN;
+		ts->cursor = 1;   // land back on the MULTIPLAYER button
+	}
+}
+
+// ── Update ─────────────────────────────────────────────────────────────────────────────
+//
+// Content here is a handful of text lines and an optional bar, not rows, but it still ends
+// in the same two-pinned-buttons shape world-select and options-general do, so it reuses
+// LIST_BTN1_Y/LIST_BTN2_Y rather than earning its own Y budget the way Multiplayer's screen
+// above had to (see that screen's own comment for why *its* content did not fit the shape).
+static TitleResult drawUpdate(TitleState* ts, const TitleInput* in, bool tap)
+{
+	TitleResult r = {TITLE_STAY, {0}};
+	const bool a = (in->keys_down & KEY_A) != 0;
+
+	const bool available = updaterAvailable();
+	const updateState st = updaterState();
+	const bool busy = updaterBusy();
+
+	// Which verb (if any) goes on the action button. Nothing is offered at all while busy
+	// (CHECKING/DOWNLOADING/INSTALLING) or while the updater never got its services up -
+	// updaterBusy()'s own contract is that the player must not be offered a way out then,
+	// and updaterStartCheck()/updaterStartInstall() are both no-ops when !updaterAvailable().
+	const char* action_label = NULL;
+	if (available && !busy) {
+		if (st == UPDATE_AVAILABLE)     action_label = "INSTALL";
+		else if (st == UPDATE_DONE)     action_label = "RESTART";
+		else                             action_label = "CHECK NOW";   // IDLE, UP_TO_DATE, FAILED
+	}
+	// Back stays offered right up to and including UPDATE_DONE - only the three busy states
+	// take it away, per the task's own "BACK whenever !updaterBusy()" rule.
+	const bool show_back = !busy;
+
+	const int action_idx  = action_label ? 0 : -1;
+	const int back_idx    = show_back ? (action_label ? 1 : 0) : -1;
+	const int item_count  = (action_label ? 1 : 0) + (show_back ? 1 : 0);
+
+	// Guarded rather than always taken: item_count is 0 for the whole of CHECKING/
+	// DOWNLOADING/INSTALLING, and a modulo by 0 there would crash the console the first time
+	// a player pressed D-pad down mid-download.
+	if (item_count > 0) {
+		if (in->keys_down & KEY_DDOWN) ts->cursor = (ts->cursor + 1) % item_count;
+		if (in->keys_down & KEY_DUP)   ts->cursor = (ts->cursor + item_count - 1) % item_count;
+	}
+
+	fontDraw(8, 4, 1, COL_TEXT_DIM, "UPDATE");
+
+	float y = LIST_TOP_Y;
+	char line[64];
+
+	snprintf(line, sizeof(line), "THIS BUILD: v%s",
+	         BLOCKSMITH_VERSION_SET ? BLOCKSMITH_VERSION : "not set");
+	fontDraw(10, y, 1, COL_TEXT, line);
+	y += FONT_LINE;
+
+	// Empty until a check has reported UPDATE_AVAILABLE or later - see updater.h's own
+	// comment on updaterLatestVersion() - so this is skipped rather than drawn blank before
+	// that.
+	const char* latest = updaterLatestVersion();
+	if (latest[0] != '\0') {
+		snprintf(line, sizeof(line), "LATEST: %s", latest);
+		fontDraw(10, y, 1, COL_TEXT, line);
+		y += FONT_LINE;
+	}
+	y += 4;
+
+	if (!available) {
+		fontDraw(10, y, 1, COL_WARN, "UPDATES UNAVAILABLE - NETWORK SERVICES FAILED");
+	} else {
+		const char* msg = updaterMessage();
+		if (msg[0] != '\0') {
+			fontDraw(10, y, 1, (st == UPDATE_FAILED) ? COL_WARN : COL_TEXT, msg);
+			y += FONT_LINE;
+		}
+
+		const int pct = updaterProgress();
+		if (pct >= 0) {
+			y += 4;
+			const TRect bar_r = {10, y, SCR_W - 20, 14};
+			uiProgressBar(bar_r, pct);
+		}
+	}
+
+	if (action_label) {
+		const TRect action_r = {10, (float)LIST_BTN1_Y, SCR_W - 20, LIST_BTN_H};
+		if (uiButton(action_r, action_label, ts->cursor == action_idx, tap,
+		             in->touch_x, in->touch_y, a)) {
+			if (st == UPDATE_AVAILABLE) {
+				updaterStartInstall();
+			} else if (st == UPDATE_DONE) {
+				// updaterRelaunch() only arms the chainloader - the jump itself happens on
+				// exit (see updater.h) - so the caller has to fall out of its main loop
+				// right after calling it. TITLE_QUIT is exactly that: it is already what
+				// makes main() shut every subsystem down and exit cleanly for the Quit
+				// button on the main screen, and libctru performs the chainloader jump at
+				// that same process exit, so returning it here is the correct way off this
+				// screen rather than a reused-for-convenience shortcut.
+				updaterRelaunch();
+				r.action = TITLE_QUIT;
+			} else {
+				updaterStartCheck();
+			}
+		}
+	}
+
+	if (show_back) {
+		const TRect back_r = {10, (float)LIST_BTN2_Y, SCR_W - 20, LIST_BTN_H};
+		if (uiButton(back_r, "BACK", ts->cursor == back_idx, tap, in->touch_x, in->touch_y, a)
+		    || (in->keys_down & KEY_B)) {
+			ts->screen = TITLE_SCR_OPTIONS_GENERAL;
+			ts->cursor = 5;   // the "CHECK FOR UPDATE" button, where this screen was entered from
+		}
+	}
+
+	return r;
+}
+
 // ── Entry points ───────────────────────────────────────────────────────────────────────
 
 void titleInit(TitleState* ts)
@@ -552,6 +830,8 @@ TitleResult titleUpdateDraw(TitleState* ts, Options* opts, const TitleInput* in)
 	case TITLE_SCR_WORLD_SELECT:     r = drawWorldSelect(ts, in, tap);       break;
 	case TITLE_SCR_OPTIONS_GENERAL:  drawOptionsGeneral(ts, opts, in, tap);  break;
 	case TITLE_SCR_OPTIONS_BINDINGS: drawOptionsBindings(ts, opts, in, tap); break;
+	case TITLE_SCR_MULTIPLAYER:      drawMultiplayer(ts, in, tap);          break;
+	case TITLE_SCR_UPDATE:           r = drawUpdate(ts, in, tap);           break;
 	}
 
 	spriteEnd();

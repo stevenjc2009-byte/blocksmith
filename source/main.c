@@ -15,6 +15,7 @@
 #include <3ds.h>
 #include <citro3d.h>
 #include <math.h>
+#include <dirent.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -22,6 +23,8 @@
 #include "app/crash.h"
 #include "app/input_map.h"
 #include "app/options.h"
+#include "app/updater.h"
+#include "app/watchdog.h"
 #include "app/worker.h"
 #include "debug/metrics.h"
 #include "gfx/atlas.h"
@@ -30,10 +33,16 @@
 #include "gfx/sprite.h"
 #include "net/bsnet.h"
 #include "net/networld.h"
+#if BS_TAG_PROBE
+#include "../server/proto/bs_proto.h"   // verification build only; see BS_TAG_PROBE below
+#endif
 #include "scene/camera.h"
 #include "scene/chunk_render.h"
 #include "scene/highlight.h"
+#include "scene/playermodel.h"
 #include "scene/interact.h"
+#include "scene/loading.h"
+#include "scene/loading_draw.h"
 #include "scene/player.h"
 #include "scene/title.h"
 #include "scene/ui.h"
@@ -481,6 +490,33 @@ static const char* saveWorldDir(void)
 	return wrote ? dir : NULL;
 }
 
+// Whether this world has ever been played, which is the only thing the loading screen's
+// heading depends on: "CREATING WORLD" for one with nothing on the card yet, "LOADING WORLD"
+// for one being returned to. Asked of the card rather than plumbed down from the title screen
+// on purpose — worldlistCreate() deliberately treats an existing name as success (see
+// scene/worldlist.h), so "the player pressed New World" and "this world is new" are not the
+// same question, and the card is the one that knows.
+//
+// A region file is the whole test: region.c names them r.<rx>.<rz>.bsr, nothing else in a
+// world directory has that extension, and a world only gets one once a column has been saved.
+// A NULL dir (unwritable card) reads as new, which is what it will behave like.
+static bool worldHasBeenPlayed(const char* dir)
+{
+	if (!dir) return false;
+
+	DIR* d = opendir(dir);
+	if (!d) return false;
+
+	bool found = false;
+	const struct dirent* e;
+	while (!found && (e = readdir(d)) != NULL) {
+		const char* dot = strrchr(e->d_name, '.');
+		found = dot && strcmp(dot, ".bsr") == 0;
+	}
+	closedir(d);
+	return found;
+}
+
 // The whole streaming path is generated-world only. The hand-built world is filled and
 // meshed in one call and has no generator to move off the main thread, so under
 // BS_WORLD_GEN=0 none of this is compiled in rather than sitting there unreachable.
@@ -846,17 +882,146 @@ static int genDrainMesh(float budget_ms, int max_chunks)
 	return built;
 }
 
-// Blocks until the column the player spawns in has been installed, or until the worker has
-// run out of work to give. Only that one column: the other twenty-four arrive over the
-// first frames, which is the whole point of the step. Without this the player would spawn
-// above nothing and fall to the world floor before the ground under them existed.
-static void genWaitSpawnColumn(void)
+// How many of the area ring's columns are in. Walked rather than counted incrementally
+// because the ring moves: genRecenter drops and re-asks, and a counter maintained across that
+// would drift the first time a column arrived for a position the ring had already left (which
+// genInstallOne handles by dropping it — see s_col_dropped).
+static int genColumnsInstalled(void)
 {
-	while (!genColumnInstalled(s_center_cx, s_center_cz)) {
-		if (genInstallOne()) continue;
-		if (!workerBusy()) break;      // nothing more is coming; do not spin forever
-		svcSleepThread(1000000);       // 1 ms
+	int n = 0;
+	for (int32_t dz = -s_area_radius; dz <= s_area_radius; dz++)
+		for (int32_t dx = -s_area_radius; dx <= s_area_radius; dx++)
+			if (genColumnInstalled(s_center_cx + dx, s_center_cz + dz)) n++;
+	return n;
+}
+
+// One frame's counters for the loading screen. Everything here is already tracked; this only
+// gathers it, so the screen cannot disagree with the HUD about what the world is doing.
+static LoadingSample genLoadingSample(void)
+{
+	const int span  = 2 * s_area_radius + 1;
+	const int total = span * span;
+	const int in    = genColumnsInstalled();
+
+	LoadingSample s = {
+		.columns_in     = in,
+		.columns_total  = total,
+		.meshes         = s_genr.meshed,
+		.mesh_queued    = jobqCount(&s_meshq),
+		.spawn_ready    = genColumnInstalled(s_center_cx, s_center_cz),
+		.ring_ready     = in >= total,
+		.worker_busy    = workerBusy(),
+		.columns_failed = s_genr.columns_failed,
+		.submit_failed  = s_genr.submit_failed,
+	};
+	return s;
+}
+
+// Twice the in-game budget — 8 ms and 6 chunks against the frame's 16.71 ms. Nothing else is
+// running while this screen is up: no player, no interaction, no world HUD, and the top screen
+// is a flat clear. Spending that headroom roughly halves the number of frames the player
+// spends watching a bar. Still bounded rather than "drain the queue": one frame that built all
+// forty chunks would freeze the bar for a quarter of a second, which is the exact impression
+// this screen exists to remove.
+#define LOADING_DRAIN_BUDGET_MS  (2.0f * DRAIN_BUDGET_MS)
+#define LOADING_DRAIN_MAX_CHUNKS (2 * DRAIN_MAX_CHUNKS)
+
+// Waits for the world with the console still alive, and shows the player what it is waiting
+// for. Returns true to go and play, false if the player asked to quit or the system closed us.
+//
+// This replaces a plain `while (!installed) { ...; svcSleepThread(1 ms); }`, and the reason it
+// replaces it is a report from real hardware on 2026-08-19: "it's frozen my three d s. It is a
+// critical bug ... it freezes the entire console." That loop never called aptMainLoop(), and a
+// 3DS app that stops servicing APT stops responding to the HOME button — so any hitch in
+// generation, on a card or a console nobody here has, was not a slow load but a console the
+// player had to hold the power button to escape. Everything that waits in here is inside
+// aptMainLoop() now, and scene/loading.c guarantees the wait itself ends: LOADING_STALL_FRAMES
+// of no progress turns into an on-screen reason and a way out, never another frame of waiting.
+//
+// `draw` is false when spriteInit/fontInit failed or there is no bottom target. The loop still
+// runs — the APT pumping is the part that matters, not the pixels — it just has nothing to
+// paint, exactly as the title screen degrades to "no menu, play the default world".
+static bool runLoadingScreen(bool draw, const char* heading, const char* world_name)
+{
+	C3D_RenderTarget* const bottom = draw ? screenBottom() : NULL;
+	C3D_RenderTarget* const top    = screenTop();
+
+	LoadingState st;
+	loadingInit(&st);
+	bool touch_prev = false;
+
+	while (aptMainLoop()) {
+		watchdogPhase(WD_PHASE_INPUT);
+		hidScanInput();
+		const u32 down = hidKeysDown();
+
+		// Same two-signal touch read the title screen and the HUD use, for the same reason —
+		// hid.h flags KEY_TOUCH as "Not actually provided by HID".
+		touchPosition tp = {0};
+		hidTouchRead(&tp);
+		const bool touch_down = (hidKeysHeld() & KEY_TOUCH) != 0 || tp.px != 0 || tp.py != 0;
+		const bool tap = touch_down && !touch_prev;
+		touch_prev = touch_down;
+
+		// Feed the world. The worker stages one column at a time and waits for it to be taken,
+		// so in practice this installs one per frame; the bound is for the case genInstallOne
+		// returns true without consuming a staged column (a column that arrived for a ring
+		// position already left behind), which must not become an unbounded loop in here of all
+		// places.
+		watchdogPhase(WD_PHASE_LOAD_GEN);
+		for (int i = 0; i < 8 && genInstallOne(); i++) { }
+		watchdogPhase(WD_PHASE_LOAD_MESH);
+		genDrainMesh(LOADING_DRAIN_BUDGET_MS, LOADING_DRAIN_MAX_CHUNKS);
+
+		const LoadingSample sample = genLoadingSample();
+		const LoadingPhase phase = loadingStep(&st, &sample);
+
+		LoadingAction act = LOADING_ACTION_NONE;
+		if (phase == LOADING_STALLED) {
+			if (down & KEY_A)          act = LOADING_ACTION_PLAY;
+			else if (down & KEY_START) act = LOADING_ACTION_QUIT;
+			else if (tap)              act = loadingHitAction(&st, tp.px, tp.py);
+		}
+
+		watchdogPhase(WD_PHASE_LOAD_DRAW);
+		if (bottom) {
+			C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+			spriteFrameBegin();
+
+			// The top screen is cleared and bound every frame for the same reason the title
+			// screen does it: C3D_FrameEnd only presents a screen with a target bound this
+			// frame, so skipping it would leave whatever was in the framebuffer on show.
+			C3D_RenderTargetClear(top, C3D_CLEAR_ALL, CLEAR_COLOR, 0);
+			C3D_FrameDrawOn(top);
+
+			C3D_RenderTargetClear(bottom, C3D_CLEAR_ALL, 0x1A1424FF, 0);
+			C3D_FrameDrawOn(bottom);
+			loadingDraw(&st, heading, world_name);
+
+			C3D_FrameEnd(0);
+		} else {
+			gspWaitForVBlank();
+		}
+
+		// This loop beats the watchdog for the same reason the game loop does, and it is not
+		// optional here: a world that legitimately takes longer than WD_TIMEOUT_MS to build
+		// would otherwise be reported as a hang by a watchdog that had never seen a single
+		// completed frame. The counters go with it so a report raised *during* a load says how
+		// far the load had got.
+		watchdogCounters(sample.columns_in, sample.meshes, sample.mesh_queued,
+		                 sample.worker_busy);
+		watchdogBeat();
+		watchdogPhase(WD_PHASE_APT);
+
+		// Tested after the draw, so the frame that says 100% is actually presented rather than
+		// being the one frame that gets skipped on the way into the game.
+		if (phase == LOADING_READY || act == LOADING_ACTION_PLAY) return true;
+		if (act == LOADING_ACTION_QUIT) return false;
 	}
+
+	// aptMainLoop() went false — the HOME menu closed us, which is the outcome the old loop
+	// could not even represent.
+	return false;
 }
 
 // Called every frame with the player's feet. Cheap when nothing has changed, which is the
@@ -899,6 +1064,76 @@ static void genFollow(float x, float z)
 // Off by default:  make EXTRA_CFLAGS="-DBS_SAVE_CHECK=1"
 #ifndef BS_SAVE_CHECK
 #define BS_SAVE_CHECK 0
+#endif
+
+// A deliberate hang, for proving app/watchdog.c can actually go red. Set it to a frame number
+// and the main thread stops dead on that frame, in the world, with the last frame still on both
+// screens — the failure the player reported, reproduced on demand. The watchdog should notice
+// ten seconds later and leave sdmc:/blocksmith/hang.txt naming phase SIM.
+//
+// It sleeps rather than spins because that is the realistic shape: every unbounded wait in this
+// codebase blocks in a syscall (worker.c's save-slot loop, a LightLock, C3D_FrameBegin waiting
+// on the GPU), and a blocked thread yields its core while a spinning one does not — so this is
+// also the harder case for a watchdog pinned to the same core to survive.
+//
+// Off by default:  make EXTRA_CFLAGS="-DBS_HANG_TEST=300"
+#ifndef BS_HANG_TEST
+#define BS_HANG_TEST 0
+#endif
+
+// Where the time between "the player confirmed the world name" and "the loading screen appears"
+// actually goes. Measured rather than guessed at: the emulator puts that gap at 23.95 s of a
+// completely unrepainted screen (38 byte-identical captures) with nothing in Azahar's own log to
+// explain it, and every candidate on that path — the world self-test, the report grid, the
+// worker start — is plausible enough that picking one by eye would be a guess.
+//
+// Writes sdmc:/blocksmith/boot_timing.txt just before the loading screen opens. Plain stdio is
+// fine here, unlike in app/watchdog.c: this runs on a healthy main thread that is about to do
+// file I/O anyway.
+//
+// Off by default:  make EXTRA_CFLAGS="-DBS_BOOT_TIMING=1"
+#ifndef BS_BOOT_TIMING
+#define BS_BOOT_TIMING 0
+#endif
+
+// Whether to run world/world_test.c's 818 assertions on the console at boot. Off by default
+// because it was measured at 23855.6 ms — see the call site for the full reasoning and for why
+// nothing is lost by leaving it off.
+#ifndef BS_SELFTEST
+#define BS_SELFTEST 0
+#endif
+
+#if BS_BOOT_TIMING
+static char   s_boot_log[768];
+static size_t s_boot_len;
+static u64    s_boot_mark;
+
+static void bootBegin(void) { s_boot_mark = svcGetSystemTick(); }
+
+static void bootEnd(const char* what)
+{
+	const double ms = (double)(svcGetSystemTick() - s_boot_mark) / CPU_TICKS_PER_MSEC;
+	if (s_boot_len + 1 >= sizeof(s_boot_log)) return;
+	const int n = snprintf(s_boot_log + s_boot_len, sizeof(s_boot_log) - s_boot_len,
+	                       "%-22s %9.1f ms\n", what, ms);
+	if (n > 0) s_boot_len += (size_t)n;
+}
+
+static void bootTimingWrite(void)
+{
+	FILE* f = fopen("sdmc:/blocksmith/boot_timing.txt", "wb");
+	if (!f) return;
+	fwrite(s_boot_log, 1, s_boot_len, f);
+	fclose(f);
+}
+
+#define BOOT_BEGIN()   bootBegin()
+#define BOOT_END(what) bootEnd(what)
+#define BOOT_WRITE()   bootTimingWrite()
+#else
+#define BOOT_BEGIN()   ((void)0)
+#define BOOT_END(what) ((void)0)
+#define BOOT_WRITE()   ((void)0)
 #endif
 
 #define SAVE_CHECK_NOTE "sdmc:/blocksmith/savecheck.txt"
@@ -1055,6 +1290,21 @@ static void drawEye(C3D_RenderTarget* target, const C3D_Mtx* view, const RayHit*
 	// hit->hit (see highlight.h), so there is no guard here to keep in sync with it.
 	// It reads chunkRenderProjection(), so it gets this eye's matrix for free.
 	highlightDraw(view, hit);
+
+	// The other people in the session, from the pose table net/networld.c fills. Both calls
+	// are unconditional: each returns immediately when nobody else has sent a pose, which
+	// is every frame of a single-player game, so there is no "are we connected" test to
+	// keep in sync here.
+	//
+	// The tag pass has to come second and has to be last in this function: it opens a sprite
+	// batch, which turns depth testing off and blending on and puts neither back, so anything
+	// 3D drawn after it would be drawn without a depth test.
+	//
+	// 400x240 is the top screen, which is the only target drawEye is ever given. Passing the
+	// wrong size here would not fail — it would scale every tag's position, which is the kind
+	// of wrong that reads as a projection bug.
+	playerModelDraw(view);
+	playerModelDrawTags(view, 400.0f, 240.0f);
 }
 
 // The player's items. Outside the BS_BOTTOM_UI guard on purpose: a build with no bottom
@@ -1341,6 +1591,7 @@ static bool runTitleScreen(Options* opts)
 		};
 
 		C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+		spriteFrameBegin();
 
 		// The top screen is cleared and bound every frame even though the menu draws
 		// nothing on it. C3D_FrameEnd only presents screens with a target bound this frame,
@@ -1425,6 +1676,18 @@ int main(void)
 	// wrong. The cast is what keeps -Wunused-variable quiet in the console build.
 	(void)ui_ok;
 
+	// Step 8.7's updater, before the menu that offers it: the Options page greys its button out
+	// when updaterAvailable() is false, and it has to know that the first time it is drawn
+	// rather than a frame later.
+	//
+	// `true` is not a guess — netInit() above is unconditional and its first act is
+	// net/bsnet_sock.c's socInit(), so SOC belongs to the net module for the whole life of the
+	// process and the updater must share it rather than re-open it. See updaterInit's own
+	// comment for what happens if it does not. The return value is deliberately not checked
+	// here: a console that cannot bring up am:net or the RomFs still plays the game, and
+	// updaterAvailable() is how the menu finds out.
+	updaterInit(true);
+
 	// ── Step 8.4: settings, then the menu ────────────────────────────────────────────
 	//
 	// Hoisted out of the BS_WORLD_GEN block below, where it used to be the only caller,
@@ -1476,6 +1739,7 @@ int main(void)
 		chunkRenderExit();
 		metricsExit();
 		screenExit();
+		updaterExit();   // before netExit, for the reason given at the tail of main()
 		netExit();
 		psExit();
 		crashExit();
@@ -1492,23 +1756,51 @@ int main(void)
 
 	// Self-test first: it resets the memory budget, so it has to run before the
 	// world claims anything.
+	//
+	// Off by default since it was measured. This one call was the entire "I named my world and
+	// it just sat there" complaint: with BS_BOOT_TIMING=1 it came back at 23855.6 ms, against
+	// 3.1 ms for worldReportBuild, 158.0 for worldHasBeenPlayed and 117.1 for genStart — 98.9%
+	// of a 24-second wait in which nothing was drawn at all. It is 818 assertions, most of them
+	// building and tearing down whole worlds, on a 268 MHz ARM11.
+	//
+	// Nothing is lost by not running it here. tools/run_host_tests.sh runs this same code on
+	// every build and reports "world self-test: PASS 2694 checks"; what the console run added
+	// was proof that it also passes on the hardware — worth having on demand, not worth 24
+	// seconds of every world the player ever opens. Ask for it with
+	//   make EXTRA_CFLAGS="-DBS_SELFTEST=1"
+	// and the overlay prints the result exactly as it always did.
+	//
+	// Skipping it leaves nothing half-initialised. worldTestRun's own first act is
+	// budgetReset(), and every case inside it pairs its worldInit with a worldExit, so the
+	// budget this was "resetting before the world claims anything" is simply the untouched boot
+	// state when it does not run.
 	char selftest[96] = "";
+	BOOT_BEGIN();
+#if BS_SELFTEST
 	worldTestRun(selftest, sizeof(selftest), NULL);
+#else
+	snprintf(selftest, sizeof(selftest), "self-test off (BS_SELFTEST=0)");
+#endif
+	BOOT_END("worldTestRun");
 	// Onto the overlay as well as into the BS_* report line. The report path is a
 	// developer build; a normal Phase 4 boot never showed this result anywhere, which is
 	// why "did the suite pass on the console?" was unanswerable rather than merely
 	// awkward to read.
 	metricsSetSelfTest(selftest);
 
+	BOOT_BEGIN();
 	const int refused = worldReportBuild();
+	BOOT_END("worldReportBuild");
 
 	// s_world exists now (worldReportBuild() ran worldInit()), so net/networld.c can be told
 	// which World it is allowed to touch. Everything in networld.h is a harmless no-op before
 	// this line, and this is also the pointer worker-thread calls into networldOnColumnLoad()
 	// (see world/world.c's worldSet()) are compared against and ignored — see networld.h's
 	// threading note.
+	BOOT_BEGIN();
 	networldInit();
 	networldSetWorld(&s_world);
+	BOOT_END("networldInit");
 
 	// The world. Since step 5.5 the generated one is not built here: the worker is started
 	// and the whole area queued, and only the column the player stands in is waited for.
@@ -1520,6 +1812,12 @@ int main(void)
 	// streaming path stays identical across builds.
 	(void)s_mesh_radius;
 	(void)s_area_radius;
+
+	// Set by the loading screen when the player asked to quit from a stalled load, or when the
+	// system closed the app while it was up. Declared out here rather than inside the
+	// BS_WORLD_GEN block below because the main loop that reads it is shared by both world
+	// paths, and the hand-built world has no loading screen to set it.
+	bool quit_requested = false;
 
 #if BS_WORLD_GEN
 	// Step 7.7. The console's default render distance, before the first column is asked for,
@@ -1540,10 +1838,40 @@ int main(void)
 	// ring the mesh pool has no slots for.
 	genInitRadius(opts.render_dist);
 
+	// Asked before genStart, so it describes the world the player picked rather than one this
+	// boot has already written a column into.
+	BOOT_BEGIN();
+	const bool world_played_before = worldHasBeenPlayed(saveWorldDir());
+	BOOT_END("worldHasBeenPlayed");
+
 	// Centred on the spawn column, which is (0, 0) — the same column playerInit puts the
 	// feet in below. From here on the ring follows the player (genFollow).
+	BOOT_BEGIN();
 	const bool worker_ok = genStart(0, 0);
-	genWaitSpawnColumn();
+	BOOT_END("genStart");
+	BOOT_WRITE();
+
+	// From here to the end of the run, a second thread is watching this one. Started here rather
+	// than at the top of main() on purpose: everything before this point is the title screen,
+	// where the software keyboard applet legitimately holds the main thread for as long as the
+	// player takes to type a world name, and a watchdog cannot tell that apart from a hang.
+	// Failure is not reported or handled — app/watchdog.h says every call is a no-op when the
+	// thread could not be created, which is the same game this was before the file existed.
+	watchdogStart();
+
+	// Step 8.6. The wait for the world, with the console still answering the HOME button and
+	// the player able to see what it is waiting for — see runLoadingScreen's own comment for
+	// the hardware report that made this necessary. Two things changed besides the drawing:
+	// this waits for the whole ring and its geometry rather than for the single spawn column,
+	// which is what "I'm in it, but there's no blocks actually loaded in" was; and it can
+	// return false, meaning the player asked to quit from a stalled load or the system closed
+	// us. That is not an early return — the world, the worker and the card all exist by now, so
+	// it drops through into the normal main loop, which breaks immediately and takes the usual
+	// save-and-shutdown path out.
+	if (!runLoadingScreen(ui_ok,
+	                       world_played_before ? "LOADING WORLD" : "CREATING WORLD",
+	                       s_world_name))
+		quit_requested = true;
 
 	// Step 8.1's proof. After the spawn column is guaranteed installed and before the player
 	// exists, so it can unload and reload the column the player would otherwise be standing
@@ -1573,6 +1901,12 @@ int main(void)
 	// Kept built in all configs; only used when BS_BOTTOM_UI is 1, so the game's render path
 	// stays identical across builds.
 	(void)highlight_ok;
+
+	// Remote player bodies, on the same not-load-bearing footing as the highlight above: a
+	// failure here costs the ability to see other players, which is worse in a session and
+	// completely irrelevant in single player, and either way is not a reason to refuse to
+	// boot. playerModelDraw checks its own ready flag, so nothing downstream needs this.
+	(void)playerModelInit();
 
 	// On the flat ground at the foot of the stepped pyramid, looking down at it along the
 	// diagonal — so the first frame already shows a target cage without anyone having to
@@ -1665,9 +1999,14 @@ int main(void)
 		frame++;
 #endif
 
+		watchdogPhase(WD_PHASE_INPUT);
 		hidScanInput();
 		u32 down = hidKeysDown();
-		if (down & KEY_START) break;
+		// quit_requested comes from the loading screen (a stalled load the player gave up on,
+		// or the system closing us while it was up). Taken here rather than skipping the loop
+		// entirely so the exit runs exactly the path a START quit runs — inventory saved, dirty
+		// columns flushed, worker stopped — instead of a second, less-tested teardown.
+		if (down & KEY_START || quit_requested) break;
 
 #if BS_BOTTOM_UI
 		// Step 8.2. Read here, next to the rest of the frame's input, rather than inside
@@ -1704,8 +2043,48 @@ int main(void)
 		// before genInstallOne() below so a remote edit that just arrived for a column about
 		// to be installed this same frame is already queued (net/blockdiff.h) before that
 		// column's own drain call runs.
+		watchdogPhase(WD_PHASE_NET);
 		netUpdate();
 		networldUpdate();
+
+		// This console's own pose, going out to whoever else is in the session. Unconditional
+		// every frame is correct — networldSendPose() rate-limits itself to
+		// NETWORLD_POSE_INTERVAL_MS internally (net/networld.h) and is a no-op whether or
+		// not Multiplayer is even connected, so there is nothing to gate here. Resending an
+		// unchanged pose is deliberate, not waste: server/game/bsgame.c marks a player dirty
+		// on every POS_UPDATE it receives, so a player standing perfectly still keeps being
+		// broadcast and never ages out of anyone else's remote table.
+		networldSendPose(player.body.x, player.body.y, player.body.z,
+		                  player.cam.yaw, player.cam.pitch);
+
+#if BS_TAG_PROBE
+		// Verification only, never shipped: a single console cannot see itself, so there is
+		// no way to look at a remote player's body or name tag without inventing one. This
+		// feeds hand-built BS_APP_POS_UPDATE payloads through the same entry point the host
+		// test uses (networldApplyPayload, net/networld.h), so the real decode, the real
+		// remote table and the real draw all run — only the socket is missing.
+		//
+		// Reads nothing and writes nothing outside the pose table; in particular it never
+		// touches the SD card, so running it cannot damage a save.
+		{
+			static const struct { uint32_t sid; float dx, dz, dyaw; } kFake[] = {
+				{ 0x1234u, -2.0f, 10.0f, 3.14159265f },  // ahead and left, turned to face us
+				{ 0x0005u,  3.0f, 12.0f, 0.0f },         // ahead and right, facing away
+			};
+			for (unsigned k = 0; k < sizeof kFake / sizeof kFake[0]; k++) {
+				uint8_t msg[BS_POS_UPDATE_S_BYTES];
+				size_t  o = 0;
+				msg[o++] = BS_APP_POS_UPDATE;
+				bs_put_u32(&msg[o], kFake[k].sid);                      o += 4;
+				bs_put_f32(&msg[o], player.body.x + kFake[k].dx);       o += 4;
+				bs_put_f32(&msg[o], player.body.y);                     o += 4;
+				bs_put_f32(&msg[o], player.body.z + kFake[k].dz);       o += 4;
+				bs_put_f32(&msg[o], player.cam.yaw + kFake[k].dyaw);    o += 4;
+				bs_put_f32(&msg[o], 0.0f);                              o += 4;
+				networldApplyPayload(msg, o);
+			}
+		}
+#endif
 
 #if BS_WORLD_GEN && !BS_FLY
 		// Step 7.7. L and R change the render distance. They are free in walking mode — only
@@ -1725,11 +2104,13 @@ int main(void)
 		// edit queue, so the two share one budget rather than one each — see
 		// DRAIN_BUDGET_MS. Install stays here because it is what puts ground under the
 		// player, and it is a memcpy, not a mesh: 15.3 ms over 125 columns, 0.12 ms each.
+		watchdogPhase(WD_PHASE_INSTALL);
 		const u64 t_install = svcGetSystemTick();
 		genInstallOne();
 		const float install_ms =
 			(float)((double)(svcGetSystemTick() - t_install) / CPU_TICKS_PER_MSEC);
 #endif
+		watchdogPhase(WD_PHASE_SIM);
 
 		C3D_Mtx view;
 #if BS_FLY
@@ -1851,6 +2232,7 @@ int main(void)
 		// All of this frame's meshing, under one budget. Edits first: a broken block that
 		// takes two frames to disappear is felt, and a chunk of scenery that takes two
 		// frames to arrive at the edge of the render distance is not.
+		watchdogPhase(WD_PHASE_MESH);
 		const u64 t_work = svcGetSystemTick();
 		const int edit_built = chunkRenderDrainDirty(&s_world, DRAIN_BUDGET_MS,
 		                                             DRAIN_MAX_CHUNKS);
@@ -1901,8 +2283,14 @@ int main(void)
 		// path and the string cannot rot in the configuration nobody compiles.
 		(void)status;
 
+		// The one phase marker that is not a formality. C3D_FRAME_SYNCDRAW waits on the GPU
+		// before it returns, and a GPU that never signals leaves the main thread here forever —
+		// which is the shape of the report this watchdog was built for: a last frame still on
+		// both screens, the HUD numbers frozen mid-world, and HOME dead.
+		watchdogPhase(WD_PHASE_DRAW);
 		metricsSyncBegin();
 		C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+		spriteFrameBegin();
 		metricsSyncEnd();
 			// Step 7.6. In 2D this is one call with iod 0, which is exactly the frame this
 			// loop drew before the step existed. In 3D it is the same work twice, and that
@@ -1963,6 +2351,28 @@ int main(void)
 		// indistinguishable from aiming at nothing.
 		metricsDrawOverlay(highlight_ok ? status : "HIGHLIGHT INIT FAILED");
 #endif
+
+		// Last in the iteration, so a frame only counts once it has actually finished. The
+		// counters go out with it: what the world was doing is half of what a hang report needs
+		// to be worth reading, the other half being the phase markers above.
+		watchdogCounters(s_world.columns, chunkRenderMeshes(), jobqCount(&s_meshq),
+		                 workerBusy());
+		watchdogBeat();
+
+#if BS_HANG_TEST
+		// See the BS_HANG_TEST comment near the top of this file. Never in a release build.
+		{
+			static int hang_frames = 0;
+			if (++hang_frames >= BS_HANG_TEST) {
+				watchdogPhase(WD_PHASE_SIM);
+				for (;;) svcSleepThread(1000000000ULL);
+			}
+		}
+#endif
+
+		// And back to APT, which the watchdog treats as "not a hang" — the HOME menu can hold
+		// the app suspended inside aptMainLoop() for as long as the player likes.
+		watchdogPhase(WD_PHASE_APT);
 	}
 
 	// Step 8.1. Everything still in memory that the disk does not know about, written before
@@ -1973,6 +2383,11 @@ int main(void)
 	// The whole slot table is walked rather than the ring, because the ring is a shape and
 	// this is a list of what actually exists. A column can outlive the ring by a frame or
 	// two when the radius changes, and one that did would be missed by a ring walk.
+	// The quit path is the one place a long main-thread pause is legitimate — the dirty-column
+	// flush below is real SD writes — but it is also code the hardware report never reached, so
+	// the phase is marked rather than the watchdog stopped. A ten-second flush is worth a report.
+	watchdogPhase(WD_PHASE_SAVE);
+
 	saveDirtyColumns();
 
 	// Step 8.2, and only here: unlike the world, the inventory is small enough to write whole
@@ -1987,11 +2402,21 @@ int main(void)
 	// before anything it could still be writing into is freed.
 	workerStop();
 
+	// After the saving is done, so a slow flush is still being watched, and before the screens
+	// come down so nothing it could report on has been freed yet.
+	watchdogStop();
+
 	worldExit(&s_world);
 	highlightExit();
+	playerModelExit();
 	chunkRenderExit();
 	metricsExit();
 	screenExit();
+	// Before netExit, which is what closes the SOC session the updater was told to share: the
+	// updater's own worker thread is joined inside updaterExit, and joining it after its
+	// sockets had been pulled out from under it would be the same ordering mistake workerStop
+	// above exists to avoid.
+	updaterExit();
 	netExit();
 	psExit();
 	crashExit();

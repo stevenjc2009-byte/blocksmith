@@ -13,13 +13,17 @@
 # Changed from the sibling (modelkit.rsf):
 #   * Title / ProductCode / UniqueId - this game, not that one. See the
 #     "Title ID" note above TitleInfo for why 0xB10CC is safe to use.
-#   * RomFs section - REMOVED. The sibling ships one, to carry
-#     romfs/cacert.pem for its HTTPS updater. Blocksmith's Makefile has no
-#     ROMFS variable and there is no romfs/ directory in this project (checked
-#     2026-08-19) - there is nothing to embed. If a future step adds a
-#     romfs/ directory (e.g. for level data), this section needs to come
-#     back; until then including it would make makerom fail looking for a
-#     RootPath that does not exist.
+#   * RomFs section - RESTORED (2026-08-19, source/app/updater.c step). The
+#     header note directly above used to say this was removed because
+#     Blocksmith had no ROMFS variable and no romfs/ directory. That is no
+#     longer true: the Makefile now sets ROMFS := romfs and romfs/cacert.pem
+#     (copied verbatim from the sibling's own romfs/cacert.pem) is the CA
+#     bundle the in-app updater hands to libcurl so it can trust github.com.
+#     Without this section makerom has nothing to embed the file with and the
+#     CIA build's updater would have no certificate to check against, even
+#     though the .3dsx build (which reads ROMFS straight off the Makefile)
+#     would work fine - the two builds would silently disagree. See the
+#     RomFs block itself, below, for the same comment the sibling's carries.
 #   * SaveDataSize - unchanged at 0KB, same reasoning as the sibling: the
 #     game does not write a save file yet. Revisit when persistence lands.
 #   * SystemMode - unchanged at 64MB, the retail Old 3DS budget this project
@@ -262,9 +266,14 @@ AccessControlInfo:
    - soc:U
    - ssl:C
 
-# No RomFs section: Blocksmith's Makefile does not set ROMFS and there is no
-# romfs/ directory in this project. The sibling's RomFs block is intentionally
-# not carried over here - see the header comment.
+# The read-only filesystem baked into the title. One file lives here:
+# cacert.pem, the Mozilla CA bundle, which libcurl is pointed at so the
+# updater's check can verify github.com. The .3dsx build gets the same
+# directory through the Makefile's --romfs flag (ROMFS := romfs), so both
+# builds read the identical path, romfs:/cacert.pem. Copied verbatim from the
+# sibling project's own RomFs block (3ds-project-folder/model-making/modelkit.rsf).
+RomFs:
+  RootPath: romfs
 
 SystemControlInfo:
   SaveDataSize: 0KB # Change if the app uses savedata

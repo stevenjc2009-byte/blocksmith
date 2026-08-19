@@ -28,6 +28,12 @@ DATA		:=	data
 INCLUDES	:=	source deps/libhydrogen
 GRAPHICS	:=	gfx
 GFXBUILD	:=	$(BUILD)
+# RomFs exists for exactly one file: romfs/cacert.pem, the CA bundle the in-app updater
+# (source/app/updater.c) needs to trust github.com. The console's own root store predates
+# every CA in use today, so without this the update check fails with a TLS error. Same
+# reasoning and the same single file as the sibling project's Makefile
+# (3ds-project-folder/model-making) — see that file's own comment on its ROMFS line.
+ROMFS		:=	romfs
 
 APP_TITLE	:=	Blocksmith
 APP_DESCRIPTION	:=	Block survival, built for the 3DS
@@ -58,13 +64,19 @@ CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++11
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=3dsx.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
-LIBS	:= -lcitro3d -lctru -lm
+# curl and its mbedtls backend come first and in this order, same reasoning as the sibling
+# project's Makefile (3ds-project-folder/model-making): the linker resolves left to right,
+# so putting them after -lctru leaves the TLS symbols undefined; -lz last of the four
+# because curl is built with zlib support and pulls inflate out of it. These four are the
+# only reason $(PORTLIBS) is on LIBDIRS below, and they exist only for
+# source/app/updater.c.
+LIBS	:= -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz -lcitro3d -lctru -lm
 
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing
 # include and lib
 #---------------------------------------------------------------------------------
-LIBDIRS	:= $(CTRULIB)
+LIBDIRS	:= $(PORTLIBS) $(CTRULIB)
 
 #---------------------------------------------------------------------------------
 # libhydrogen (Noise XX handshake, shared with server/gateway) — mirrors

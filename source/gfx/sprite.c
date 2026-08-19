@@ -15,15 +15,23 @@ typedef struct {
 	uint32_t rgba;
 } SpriteVertex;
 
-// Quads the batch can hold before it has to flush early.
+// Quads the buffer holds for a whole FRAME — not for one batch. Every batch a frame opens
+// takes a fresh region (see spriteFrameBegin in the header for why they cannot share one),
+// so this has to cover all of them added together.
 //
-// 512 is not a guess. The bottom screen is 320x240; the densest thing the UI will ever
-// draw is a full inventory grid — 9x5 slots, each a panel quad plus an icon quad plus up
-// to two digits of count — which is 45 * 4 = 180 quads, plus a background, plus a hotbar,
-// plus a line or two of text. 512 leaves better than 2x headroom on the worst screen the
-// game has, at a cost of 512 * 4 * 24 = 48 KB of linear memory. Going bigger would buy
-// nothing; going smaller would make the inventory flush mid-screen for no reason.
-#define SPRITE_MAX_QUADS 512
+// 1024 is not a guess. The worst frame the game can draw is: the bottom screen's full
+// inventory grid — 9x5 slots, each a panel quad plus an icon quad plus up to two digits of
+// count, so 45 * 4 = 180 quads — plus its background, hotbar and a line or two of text,
+// call it 220; plus the top screen's name tags, which are one quad per character at
+// NETWORLD_MAX_REMOTE (15) players and 11 characters a label, so 165; and the top screen is
+// drawn TWICE when the 3D slider is up, so the tags count double. 220 + 330 = 550, and 1024
+// leaves not quite 2x headroom on a frame that has never actually occurred.
+//
+// The cost is 1024 * 4 * 24 = 96 KB of linear memory, up from 48 KB. That is affordable
+// against a measured app heap of 0.26-0.49 MB in a 12.00 MB cap, and it is the cheap half
+// of the trade: overflowing wraps the cursor and puts one batch's geometry into another,
+// which is the very fault this file was corrected for.
+#define SPRITE_MAX_QUADS 1024
 #define SPRITE_MAX_VERTS (SPRITE_MAX_QUADS * 4)
 #define SPRITE_MAX_IDX   (SPRITE_MAX_QUADS * 6)
 
@@ -35,9 +43,11 @@ static SpriteVertex* s_verts;
 static uint16_t*     s_indices;
 static bool          s_ready;
 
-static int      s_quads;          // pending, not yet submitted
+static int      s_base;           // first quad slot this frame's pending batch owns
+static int      s_quads;          // pending, not yet submitted, counted from s_base
 static C3D_Tex* s_tex;            // currently bound
 static int      s_draws, s_total_quads;
+static int      s_overflows;
 
 static C3D_Mtx s_projection;
 
@@ -97,13 +107,25 @@ void spriteExit(void)
 
 // Submits the pending quads and empties the batch. Does nothing when there is nothing
 // pending, so it is safe to call from anywhere that might be a boundary.
+//
+// The index run starts at this batch's own base rather than at zero, and the cursor then
+// advances past what was just submitted — the submitted quads stay claimed for the rest of
+// the frame, because the GPU has not read them yet (see spriteFrameBegin in the header).
+// The index buffer holds absolute vertex numbers, so an offset run needs no fixups.
 static void flush(void)
 {
 	if (!s_ready || s_quads == 0) return;
 
-	C3D_DrawElements(GPU_TRIANGLES, s_quads * 6, C3D_UNSIGNED_SHORT, s_indices);
+	C3D_DrawElements(GPU_TRIANGLES, s_quads * 6, C3D_UNSIGNED_SHORT, &s_indices[s_base * 6]);
 	s_draws++;
+	s_base += s_quads;
 	s_quads = 0;
+}
+
+void spriteFrameBegin(void)
+{
+	s_base = 0;
+	s_overflows = 0;
 }
 
 void spriteBegin(int w, int h)
@@ -166,10 +188,22 @@ void spriteQuad(float x, float y, float w, float h,
 
 	// Flushing rather than dropping. A dropped quad is a hole in the UI that nothing
 	// reports; an extra draw call is a number that shows up in spriteDrawCount() and can
-	// be traced back to whoever is drawing 512 quads.
-	if (s_quads >= SPRITE_MAX_QUADS) flush();
+	// be traced back to whoever is drawing a whole buffer's worth of quads.
+	//
+	// Wrapping past the end is the one case with no good answer: the frame has asked for
+	// more quads than exist, and every slot from here on is still claimed by a batch the
+	// GPU has not drawn yet. Wrapping keeps drawing (a wrong picture) where refusing would
+	// silently lose a screen of UI, and spriteOverflowCount() is what makes the difference
+	// visible instead of mysterious.
+	if (s_base + s_quads >= SPRITE_MAX_QUADS) {
+		flush();
+		if (s_base >= SPRITE_MAX_QUADS) {
+			s_base = 0;
+			s_overflows++;
+		}
+	}
 
-	SpriteVertex* v = &s_verts[s_quads * 4];
+	SpriteVertex* v = &s_verts[(s_base + s_quads) * 4];
 	const float x1 = x + w, y1 = y + h;
 
 	// Clockwise from the top-left in screen space. Winding does not matter — culling is
@@ -214,3 +248,4 @@ void spriteEnd(void)
 
 int spriteDrawCount(void) { return s_draws; }
 int spriteQuadCount(void) { return s_total_quads; }
+int spriteOverflowCount(void) { return s_overflows; }

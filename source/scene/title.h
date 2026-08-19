@@ -55,6 +55,8 @@ typedef enum {
 	TITLE_SCR_WORLD_SELECT,
 	TITLE_SCR_OPTIONS_GENERAL,
 	TITLE_SCR_OPTIONS_BINDINGS,
+	TITLE_SCR_MULTIPLAYER,
+	TITLE_SCR_UPDATE,          // Options' "CHECK FOR UPDATE" button - see title.c's drawUpdate
 } TitleScreenId;
 
 typedef struct {

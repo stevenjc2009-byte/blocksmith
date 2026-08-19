@@ -127,6 +127,34 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 "./$BH/atlas_uv_shader_test"
 
+# The updater's version-parse/compare/asset-naming seam (source/app/updater_version.c).
+# Pulled out of source/app/updater.c into its own pure-C file for exactly this reason: the
+# updater itself needs libcurl, AM and RomFs, none of which exist on this host, but the tag
+# parsing and comparison it depends on has no <3ds.h> in it at all and can be proven here.
+# Seventh binary for the same reason atlas_uv_shader_test is a sixth one: it carries its own
+# main().
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/app/updater_version.c \
+	source/app/updater_version_test.c \
+	-o "$BH/updater_version_test"
+
+"./$BH/updater_version_test"
+
+# The loading screen's state machine (source/scene/loading.c). Eighth binary, own main(),
+# same reason as every one above it. This one is not optional cover: the code it replaced —
+# genWaitSpawnColumn's bare spin on the worker, with no aptMainLoop() in it — hung a real
+# console hard enough to take the HOME button with it, and the property that makes the
+# replacement safe ("every wait ends, in every phase, whatever the world does") is a claim
+# about input sequences, not something the frame loop can be read for.
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/scene/loading.c \
+	source/scene/loading_test.c \
+	-o "$BH/loading_test"
+
+"./$BH/loading_test"
+
 # Only reached if every binary above exited 0 (set -e stops the script on the first
 # non-zero exit), so a failed run's directory is left behind for inspection rather than
 # silently deleted along with the evidence of what failed.
