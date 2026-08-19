@@ -8,6 +8,18 @@ build-host/
 *.cia
 *.bnr
 
+# Host-side test output for the net modules. Named build-<module> rather than build/ on
+# purpose — a host .o left beside its source is found by the console build's VPATH scan,
+# which then hands ld an object the ARM compiler never produced.
+build-blockdiff/
+build-networld/
+
+# Third-party and cross-repo sources fetched by `make deps`, both pinned to a commit:
+# libhydrogen, and the gateway's bs_proto.h (the wire format, which is defined in the
+# server repo and only mirrored here). Fetched, never authored — committing either would
+# create a second editable copy that can drift from the thing it has to agree with.
+deps/
+
 # picasso and tex3ds intermediates, in case they are ever emitted in-tree.
 *.shbin
 *.shbin.h

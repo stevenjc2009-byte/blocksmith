@@ -1,0 +1,15 @@
+diff --git a/impl/random.h b/impl/random.h
+index 303af7c..e86ce36 100644
+--- a/impl/random.h
++++ b/impl/random.h
+@@ -5,7 +5,9 @@ static TLS struct {
+     uint8_t  available;
+ } hydro_random_context;
+ 
+-#if defined(AVR) && !defined(__unix__)
++#if defined(__3DS__)
++#    include "random/n3ds.h"
++#elif defined(AVR) && !defined(__unix__)
+ #    include "random/avr.h"
+ #elif (defined(ESP32) || defined(ESP8266)) && !defined(__unix__)
+ #    include "random/esp32.h"

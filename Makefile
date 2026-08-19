@@ -25,7 +25,7 @@ TARGET		:=	blocksmith
 BUILD		:=	build
 SOURCES		:=	source source/app source/gfx source/debug source/net source/scene source/shaders source/world deps/libhydrogen
 DATA		:=	data
-INCLUDES	:=	source deps/libhydrogen
+INCLUDES	:=	source deps/libhydrogen deps/blocksmith-server
 GRAPHICS	:=	gfx
 GFXBUILD	:=	$(BUILD)
 # RomFs exists for exactly one file: romfs/cacert.pem, the CA bundle the in-app updater
@@ -107,8 +107,35 @@ HYDRO_REPO	:=	https://github.com/jedisct1/libhydrogen.git
 HYDRO_COMMIT	:=	617036a353cd4f6478ab6c3f98c36dd31e23ce8e
 HYDRO		:=	deps/libhydrogen
 
+#---------------------------------------------------------------------------------
+# bs_proto.h — the wire format, shared verbatim with the gateway. It lives in the
+# server repo because the server is where the protocol is defined; the client only
+# has to agree with it. Fetching it pinned, rather than keeping a copy here, is the
+# whole point: two editable copies of a wire format drift silently, and the symptom
+# of drift is a handshake that fails on real hardware for no visible reason.
+#
+# Pinned to a commit for the same reason libhydrogen is — the checkout is verified
+# against the pinned SHA, so a force-push or a redirected remote cannot quietly
+# change the protocol this build was compiled against.
+#
+# It is a separate clone from any server checkout a developer may already have
+# beside this one: deps/ is build-fetched and disposable, and nothing in this repo
+# is allowed to reach into a sibling repository's working tree.
+#---------------------------------------------------------------------------------
+PROTO_REPO	:=	https://github.com/stevenjc2009-byte/blocksmith-server.git
+PROTO_COMMIT	:=	486500e323d497fce803aa3af082d03402130641
+PROTO		:=	deps/blocksmith-server
+
 .PHONY: deps
-deps: $(HYDRO)/hydrogen.h
+deps: $(HYDRO)/hydrogen.h $(PROTO)/proto/bs_proto.h
+
+$(PROTO)/proto/bs_proto.h:
+	@mkdir -p deps
+	git clone -q $(PROTO_REPO) $(PROTO)
+	git -C $(PROTO) -c safe.directory='*' checkout -q $(PROTO_COMMIT)
+	@test "$$(git -C $(PROTO) -c safe.directory='*' rev-parse HEAD)" = "$(PROTO_COMMIT)" \
+	  || (echo "blocksmith-server checkout is not at the pinned commit"; exit 1)
+	@echo "bs_proto.h pinned at $(PROTO_COMMIT)"
 
 $(HYDRO)/hydrogen.h:
 	@mkdir -p deps
@@ -117,6 +144,22 @@ $(HYDRO)/hydrogen.h:
 	@test "$$(git -C $(HYDRO) -c safe.directory='*' rev-parse HEAD)" = "$(HYDRO_COMMIT)" \
 	  || (echo "libhydrogen checkout is not at the pinned commit"; exit 1)
 	@echo "libhydrogen pinned at $(HYDRO_COMMIT)"
+	@#
+	@# Upstream has no 3DS entropy backend — impl/random.h's dispatch chain ends in
+	@# "#error Unsupported platform" for __3DS__, so a fresh checkout does not compile
+	@# at all. patches/libhydrogen/ carries the backend (PS_GenerateRandomBytes, the
+	@# console's hardware CSPRNG) and the one-hunk dispatch entry that reaches it.
+	@#
+	@# Applied here rather than committed as a forked copy of libhydrogen for the same
+	@# reason the checkout is pinned: the crypto stays upstream's, byte for byte, and
+	@# the delta this project owns is 3 lines plus one new file, reviewable on its own.
+	@# git apply, not patch(1) — devkitPro's MSYS2 ships no patch(1), and this recipe
+	@# already requires git.
+	cp patches/libhydrogen/n3ds.h $(HYDRO)/impl/random/n3ds.h
+	git -C $(HYDRO) -c safe.directory='*' apply $(CURDIR)/patches/libhydrogen/0001-3ds-random-backend.patch
+	@grep -q "random/n3ds.h" $(HYDRO)/impl/random.h \
+	  || (echo "libhydrogen 3DS random backend did not apply"; exit 1)
+	@echo "libhydrogen patched for 3DS entropy"
 
 # libhydrogen is third-party; do not subject it to this project's warning set.
 hydrogen.o: CFLAGS := $(filter-out -Wall -Wextra,$(CFLAGS)) -w

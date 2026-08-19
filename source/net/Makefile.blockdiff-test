@@ -1,0 +1,55 @@
+# Makefile.blockdiff-test — host-only build for the pending block-diff store's unit test.
+#
+# Not part of the 3DS build (mc/Makefile, devkitARM). This compiles blockdiff.c and
+# blockdiff_test.c with a host gcc so the suite runs in seconds under WSL, the way
+# world/world_test.c's module is built and run on the PC (see world/block.h's header
+# comment for why: a failing assertion here takes a second to see instead of a rebuild,
+# an emulator launch and a screenshot).
+#
+# `make -f Makefile.blockdiff-test test`   build and run the suite
+# `make -f Makefile.blockdiff-test clean`  remove the built artefacts
+#
+# blockdiff.c only needs types and macros from world/world.h (BlockId, WORLD_HEIGHT) —
+# both header-only — so nothing from world/*.c is compiled or linked in here.
+
+CC ?= cc
+
+# Same warning set server/gateway/Makefile holds itself to, and for the same reason: a
+# warning in code that has to survive hostile, attacker-controlled remote input is a
+# review finding, not a style nit. -I.. resolves this module's own "world/world.h" and
+# "net/blockdiff.h" includes against mc/source, the same root the 3DS build uses.
+CFLAGS := -std=c11 -O2 -g \
+          -Wall -Wextra -Werror \
+          -Wformat=2 -Wconversion -Wsign-conversion -Wshadow \
+          -Wstrict-prototypes -Wmissing-prototypes -Wpointer-arith \
+          -Wvla -Wcast-qual -Wundef \
+          -I..
+
+# Everything lands in BUILD, never beside the sources, the way hosttest/Makefile does
+# it. This is not tidiness: mc/Makefile puts source/net on VPATH, so a host-built
+# blockdiff.o sitting in this directory is found by the console build's implicit rules,
+# which then skip compiling it into build/ and hand ld a name it cannot resolve —
+# "ld.exe: cannot find blockdiff.o". A whole 3DS link died that way. The old `clean`
+# rule was the other half of the hazard: `rm -f *.o` in a shared source directory would
+# have taken the neighbouring net objects with it.
+BUILD := build-blockdiff
+
+.PHONY: test clean
+
+$(BUILD):
+	mkdir -p $(BUILD)
+
+$(BUILD)/blockdiff_test: $(BUILD)/blockdiff.o $(BUILD)/blockdiff_test.o
+	$(CC) $^ -o $@
+
+$(BUILD)/blockdiff.o: blockdiff.c blockdiff.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/blockdiff_test.o: blockdiff_test.c blockdiff.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+test: $(BUILD)/blockdiff_test
+	./$(BUILD)/blockdiff_test
+
+clean:
+	rm -rf $(BUILD)

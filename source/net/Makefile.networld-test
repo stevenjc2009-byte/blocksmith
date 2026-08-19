@@ -1,0 +1,75 @@
+# Makefile.networld-test — host-only build for the transport <-> World glue's unit test.
+#
+# Not part of the 3DS build (mc/Makefile, devkitARM). Same reasoning and same shape as
+# Makefile.blockdiff-test: a host gcc build so the suite runs in seconds instead of a
+# devkitARM rebuild, an emulator launch and a screenshot.
+#
+# `make -f Makefile.networld-test test`   build and run the suite
+# `make -f Makefile.networld-test clean`  remove the built artefacts
+#
+# Unlike blockdiff.c, networld.c is not header-only against world/ — it calls worldSet(),
+# worldColumn() and friends for real, and world.c's own worldSet() calls back into
+# networldOnColumnLoad() (see world/world.c's "new_column" branch). Proving that hook fires
+# for real means linking the actual world/world.c, world/chunk.c and world/budget.c, not a
+# stand-in for any of them — the same three files a host gcc probe already confirmed are
+# pure C with no <3ds.h> dependency (see world/block.h's own header comment on why that is
+# true by design). net/bsnet_transport.c is the one real dependency NOT linked here: it is
+# Noise XX over a UDP socket via libhydrogen, none of it host-portable, so
+# networld_test.c#file provides netTransportRecv()/netTransportSend() test doubles itself and
+# satisfies those two symbols at link time instead.
+
+CC ?= cc
+
+# Same warning set Makefile.blockdiff-test holds itself to, for the same reason: this code
+# parses attacker-controlled bytes off the wire (applyBlockEdit/applyWorldSync in
+# networld.c), so a warning here is a review finding, not a style nit. -I.. resolves
+# "net/networld.h", "world/world.h" etc. against mc/source, the same root the 3DS build uses.
+#
+# The second -I is the pinned wire-format checkout that `make deps` fetches into deps/ at
+# the repo root (see mc/Makefile) — it is what resolves "proto/bs_proto.h", and this test
+# does not build until that has been run at least once.
+CFLAGS := -std=c11 -O2 -g \
+          -Wall -Wextra -Werror \
+          -Wformat=2 -Wconversion -Wsign-conversion -Wshadow \
+          -Wstrict-prototypes -Wmissing-prototypes -Wpointer-arith \
+          -Wvla -Wcast-qual -Wundef \
+          -I.. -I../../deps/blocksmith-server
+
+# Never beside the sources — see Makefile.blockdiff-test's own comment on why: mc/Makefile
+# puts source/net (and source/world) on VPATH, so a host-built .o left next to its source is
+# picked up by the console build's implicit rules and the real link dies looking for an
+# object the 3DS compiler never produced.
+BUILD := build-networld
+
+.PHONY: test clean
+
+$(BUILD):
+	mkdir -p $(BUILD)
+
+$(BUILD)/networld_test: $(BUILD)/world.o $(BUILD)/chunk.o $(BUILD)/budget.o \
+                         $(BUILD)/blockdiff.o $(BUILD)/networld.o $(BUILD)/networld_test.o
+	$(CC) $^ -o $@
+
+$(BUILD)/world.o: ../world/world.c ../world/world.h networld.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/chunk.o: ../world/chunk.c ../world/chunk.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/budget.o: ../world/budget.c ../world/budget.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/blockdiff.o: blockdiff.c blockdiff.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/networld.o: networld.c networld.h blockdiff.h bsnet_transport.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/networld_test.o: networld_test.c networld.h blockdiff.h bsnet_transport.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+test: $(BUILD)/networld_test
+	./$(BUILD)/networld_test
+
+clean:
+	rm -rf $(BUILD)
