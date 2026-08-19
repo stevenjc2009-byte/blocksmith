@@ -33,9 +33,6 @@
 #include "gfx/sprite.h"
 #include "net/bsnet.h"
 #include "net/networld.h"
-#if BS_TAG_PROBE
-#include "../server/proto/bs_proto.h"   // verification build only; see BS_TAG_PROBE below
-#endif
 #include "scene/camera.h"
 #include "scene/chunk_render.h"
 #include "scene/highlight.h"
@@ -1081,6 +1078,21 @@ static void genFollow(float x, float z)
 #define BS_HANG_TEST 0
 #endif
 
+// The same instrument aimed at the other window — the handoff between the loading screen's last
+// frame and the game loop's first one, where the second hardware freeze lives ("a hundred
+// percent, it says ready, but it just sort of freezes"). Set it to 1 and the main thread stops
+// dead inside the handoff, with the loading panel at 100% still on the bottom screen, which is
+// what the player described. The watchdog should leave hang.txt naming phase HANDOFF_GPU.
+//
+// This knob is the only way to prove the three WD_PHASE_HANDOFF_* markers work, and they are
+// worth proving: the whole window reported as nothing at all until they were added, because
+// runLoadingScreen exits with the phase left at WD_PHASE_APT and an APT stall is ignored.
+//
+// Off by default:  make EXTRA_CFLAGS="-DBS_HANG_HANDOFF=1"
+#ifndef BS_HANG_HANDOFF
+#define BS_HANG_HANDOFF 0
+#endif
+
 // Where the time between "the player confirmed the world name" and "the loading screen appears"
 // actually goes. Measured rather than guessed at: the emulator puts that gap at 23.95 s of a
 // completely unrepainted screen (38 byte-identical captures) with nothing in Azahar's own log to
@@ -1873,6 +1885,14 @@ int main(void)
 	                       s_world_name))
 		quit_requested = true;
 
+	// From here to the game loop's first watchdogPhase call is the handoff, and it is watched
+	// in three pieces. Until these existed it was watched in none: runLoadingScreen's last act
+	// is watchdogPhase(WD_PHASE_APT), an APT stall is ignored by design, and so a main thread
+	// that stopped anywhere in here wrote no report — which is exactly the window the second
+	// hardware freeze ("a hundred percent, it says ready, but it just sort of freezes") sits
+	// in, since the last frame presented is the loading panel at 100%.
+	watchdogPhase(WD_PHASE_HANDOFF_SAVE);
+
 	// Step 8.1's proof. After the spawn column is guaranteed installed and before the player
 	// exists, so it can unload and reload the column the player would otherwise be standing
 	// in. Compiled out entirely unless BS_SAVE_CHECK is set.
@@ -1893,6 +1913,16 @@ int main(void)
 	// After the stress, so it starts from a world the stress has already put back, and
 	// before the highlight and the player so nothing it edits is on screen mid-check.
 	const DigOutResult dig = digOutCheck(BS_DIG_OUT);
+
+	// The two GPU-side inits below are the first candidates in the handoff worth naming
+	// separately: both build buffers and bind shader programs, and both are the sort of call
+	// that can wait on hardware in a way it does not on an emulator.
+	watchdogPhase(WD_PHASE_HANDOFF_GPU);
+
+#if BS_HANG_HANDOFF
+	// See the BS_HANG_HANDOFF comment near the top of this file. Never in a release build.
+	for (;;) svcSleepThread(1000000000ULL);
+#endif
 
 	// The highlight is not load-bearing: if its shader or buffer fails, the game is still
 	// playable without a cage round the target block, so this reports and carries on
@@ -1957,6 +1987,7 @@ int main(void)
 	// inventoryLoad refuses a NULL directory, so the guard is the same test the region writer
 	// uses rather than a second opinion about the SD card. inventoryLoad always leaves `s_inv`
 	// valid — a missing or corrupt file is an empty inventory, not an error to handle here.
+	watchdogPhase(WD_PHASE_HANDOFF_SAVE);
 	const char* const inv_dir = saveWorldDir();
 	if (inv_dir) inventoryLoad(&s_inv, inv_dir);
 	else         inventoryInit(&s_inv);
@@ -1978,6 +2009,7 @@ int main(void)
 	// Drawn once here with the spawn column in, and once more when the world is complete —
 	// the counters on it move for the first twenty-five frames now, and a report frozen at
 	// "1 column in" would read as a failed boot.
+	watchdogPhase(WD_PHASE_HANDOFF_REPORT);
 	worldReportDraw(refused, WORLD_INTACT(), selftest, &stress, &dig, &s_genr,
 			                &player.cam);
 	bool report_final = false;
@@ -2056,35 +2088,6 @@ int main(void)
 		// broadcast and never ages out of anyone else's remote table.
 		networldSendPose(player.body.x, player.body.y, player.body.z,
 		                  player.cam.yaw, player.cam.pitch);
-
-#if BS_TAG_PROBE
-		// Verification only, never shipped: a single console cannot see itself, so there is
-		// no way to look at a remote player's body or name tag without inventing one. This
-		// feeds hand-built BS_APP_POS_UPDATE payloads through the same entry point the host
-		// test uses (networldApplyPayload, net/networld.h), so the real decode, the real
-		// remote table and the real draw all run — only the socket is missing.
-		//
-		// Reads nothing and writes nothing outside the pose table; in particular it never
-		// touches the SD card, so running it cannot damage a save.
-		{
-			static const struct { uint32_t sid; float dx, dz, dyaw; } kFake[] = {
-				{ 0x1234u, -2.0f, 10.0f, 3.14159265f },  // ahead and left, turned to face us
-				{ 0x0005u,  3.0f, 12.0f, 0.0f },         // ahead and right, facing away
-			};
-			for (unsigned k = 0; k < sizeof kFake / sizeof kFake[0]; k++) {
-				uint8_t msg[BS_POS_UPDATE_S_BYTES];
-				size_t  o = 0;
-				msg[o++] = BS_APP_POS_UPDATE;
-				bs_put_u32(&msg[o], kFake[k].sid);                      o += 4;
-				bs_put_f32(&msg[o], player.body.x + kFake[k].dx);       o += 4;
-				bs_put_f32(&msg[o], player.body.y);                     o += 4;
-				bs_put_f32(&msg[o], player.body.z + kFake[k].dz);       o += 4;
-				bs_put_f32(&msg[o], player.cam.yaw + kFake[k].dyaw);    o += 4;
-				bs_put_f32(&msg[o], 0.0f);                              o += 4;
-				networldApplyPayload(msg, o);
-			}
-		}
-#endif
 
 #if BS_WORLD_GEN && !BS_FLY
 		// Step 7.7. L and R change the render distance. They are free in walking mode — only

@@ -595,6 +595,18 @@ static void drawOptionsBindings(TitleState* ts, Options* opts, const TitleInput*
 #define MP_BTN2_Y           (SCR_H - 6 - MP_BTN_H)
 #define MP_BTN1_Y           (MP_BTN2_Y - 4 - MP_BTN_H)
 
+// Invite enrolment (net/bsnet.h's netConnectWithInvite) needs a third pinned button, so
+// there is a third slot above the other two. Extending the same upward recursion MP_BTN1_Y
+// already uses, rather than shrinking MP_BTN_H the way OPT_BTN_H's comment above had to
+// when a third *options* button landed, means BACK and the connected screen's DISCONNECT
+// stay at exactly the Y they have always been at; only the slot is new.
+//
+// It lands at 118, and 118 overlaps where a 3rd-to-5th player row would draw. That is safe
+// rather than lucky: this slot is only ever occupied while !connected, and netPlayerCount()
+// is documented in bsnet.h as 0 whenever not connected, so there is no state in which a
+// player row and this button are both on screen.
+#define MP_BTN0_Y           (MP_BTN1_Y - 4 - MP_BTN_H)
+
 #define MP_ROW_SERVER        24
 #define MP_ROW_STATUS        33
 #define MP_ROW_ERROR         42
@@ -612,12 +624,75 @@ static void drawOptionsBindings(TitleState* ts, Options* opts, const TitleInput*
 // titleEnterWorldSelect's own truncation flag applies to a directory listing.
 #define MP_PLAYERS_VISIBLE    5
 
-#define MP_ITEM_COUNT 2   // Connect/Disconnect, Back
+// The software keyboard applet for the "Have an invite code?" item below — same modal-
+// applet shape as titleCreateWorldFlow above, and for the same reason: this blocks the
+// frame loop, but libctru's swkbd is what is reading input while it owns the screen, not
+// this file's own per-frame code.
+//
+// Unlike a world name, this gets no swkbdSetValidation call at all — not calling it leaves
+// swkbd's own default (SWKBD_ANYTHING, applets/swkbd.h), which is exactly what
+// CLIENT-ENROLMENT-SPEC.md asks for: the server normalises the code (case, spacing,
+// hyphens) before checking it, so any filtering here could only ever reject something the
+// server would have accepted.
+static void titleInviteCodeFlow(TitleState* ts)
+{
+	SwkbdState kbd;
+	swkbdInit(&kbd, SWKBD_TYPE_NORMAL, 2, NET_INVITE_MAX - 1);
+	swkbdSetHintText(&kbd, "Have an invite code?");
+
+	char code[NET_INVITE_MAX];
+	code[0] = '\0';
+	const SwkbdButton btn = swkbdInputText(&kbd, code, sizeof(code));
+
+	// Same two default buttons and the same silent-cancel rule as titleCreateWorldFlow
+	// above: SWKBD_BUTTON_LEFT is Cancel and stays exactly that silent, and anything other
+	// than SWKBD_BUTTON_CONFIRM reaching past it is the applet not finishing the way the
+	// player asked (out of memory, bad params, or a HOME/soft-reset/power interrupt — see
+	// swkbdGetResult()'s own doc comment) — so the numeric SwkbdResult goes into the status
+	// line for the same reason it does there.
+	if (btn == SWKBD_BUTTON_LEFT) return;
+
+	if (btn != SWKBD_BUTTON_CONFIRM) {
+		snprintf(ts->status, sizeof(ts->status), "keyboard error %d - retry",
+		         (int)swkbdGetResult(&kbd));
+		ts->status_ttl = WORLD_ERROR_STATUS_TTL;
+		return;
+	}
+
+	// netConnectWithInvite() runs the same handshake/netUpdate() loop netConnect() already
+	// does (net/bsnet.h), so, exactly like the CONNECT button below, this just fires it and
+	// leaves the result to the status/error row drawMultiplayer already draws every frame.
+	// No local success/failure handling belongs here: failure can take up to ~12 s to land
+	// (the server's 10 s enrolment window plus handshake), long after this call returns.
+	netConnectWithInvite(code);
+}
 
 static void drawMultiplayer(TitleState* ts, const TitleInput* in, bool tap)
 {
-	if (in->keys_down & KEY_DDOWN) ts->cursor = (ts->cursor + 1) % MP_ITEM_COUNT;
-	if (in->keys_down & KEY_DUP)   ts->cursor = (ts->cursor + MP_ITEM_COUNT - 1) % MP_ITEM_COUNT;
+	const NetStatus st = netStatus();
+	const bool connected = (st == NET_CONNECTED);
+
+	// The invite item only makes sense when this console has no session to protect —
+	// offering "Have an invite code?" while already connected could only ever be tapped by
+	// mistake, so it disappears from the list entirely rather than sitting there disabled,
+	// the same convention drawUpdate's action_label/action_idx uses above for a verb that
+	// does not apply yet: each slot keeps a fixed Y, but the index and item_count shrink to
+	// skip whatever is not offered right now.
+	//
+	// CONNECT stays index 0 in both layouts. Stacking the new button on top and letting the
+	// others slide down would have been the obvious arrangement, but the cursor starts at 0
+	// and reads top-to-bottom everywhere in this file, so it would also have moved the
+	// default focus off CONNECT — what nearly every visit to this screen is for — and onto a
+	// button that matters once in a console's life. The new slot goes in the middle: the
+	// disconnected screen reads CONNECT / invite / BACK, and the connected screen is left
+	// exactly as it was before enrolment existed.
+	const int conn_idx   = 0;
+	const int invite_idx = connected ? -1 : 1;
+	const int back_idx   = connected ? 1  : 2;
+	const int item_count = connected ? 2  : 3;
+
+	if (in->keys_down & KEY_DDOWN) ts->cursor = (ts->cursor + 1) % item_count;
+	if (in->keys_down & KEY_DUP)   ts->cursor = (ts->cursor + item_count - 1) % item_count;
 	const bool a = (in->keys_down & KEY_A) != 0;
 
 	fontDraw(8, 4, 1, COL_TEXT_DIM, "MULTIPLAYER");
@@ -626,13 +701,23 @@ static void drawMultiplayer(TitleState* ts, const TitleInput* in, bool tap)
 	snprintf(addr_line, sizeof(addr_line), "Server: %s", netServerAddress());
 	fontDraw(8, MP_ROW_SERVER, 1, COL_TEXT, addr_line);
 
-	const NetStatus st = netStatus();
 	fontDraw(8, MP_ROW_STATUS, 1, (st == NET_FAILED) ? COL_WARN : COL_TEXT, netStatusText());
 
 	// netErrorText() and netStatusText() are used verbatim throughout — see title.h's
-	// header on why this file never writes its own network wording.
+	// header on why this file never writes its own network wording. This row has three
+	// things that can want it and only room for one, so it picks in order of how directly
+	// each answers what the player just did: a keyboard error from titleInviteCodeFlow
+	// above (ts->status) outranks a stale netErrorText() from a previous attempt, which
+	// outranks the one-time "just enrolled" confirmation, which only ever appears once
+	// nothing else needs the line.
 	const char* err = netErrorText();
-	if (err[0] != '\0') fontDraw(8, MP_ROW_ERROR, 1, COL_WARN, err);
+	if (ts->status_ttl > 0) {
+		fontDraw(8, MP_ROW_ERROR, 1, COL_WARN, ts->status);
+	} else if (err[0] != '\0') {
+		fontDraw(8, MP_ROW_ERROR, 1, COL_WARN, err);
+	} else if (netJustEnrolled()) {
+		fontDraw(8, MP_ROW_ERROR, 1, COL_ACCENT, "Enrolled - you're on the list now");
+	}
 
 	fontDraw(8, MP_ROW_KEY_LABEL, 1, COL_TEXT_DIM, "YOUR KEY:");
 
@@ -672,15 +757,25 @@ static void drawMultiplayer(TitleState* ts, const TitleInput* in, bool tap)
 		fontDraw(8, row_y, 1, netPlayerIsLocal(i) ? COL_ACCENT : COL_TEXT, name);
 	}
 
-	const bool connected = (st == NET_CONNECTED);
-	const TRect conn_r = {10, (float)MP_BTN1_Y, SCR_W - 20, MP_BTN_H};
-	if (uiButton(conn_r, connected ? "DISCONNECT" : "CONNECT", ts->cursor == 0, tap,
+	// Drawn in the order they are stacked. CONNECT rises into the extra slot only when the
+	// invite button is present to fill the one below it, so the connected screen keeps its
+	// two buttons pinned to the bottom the way it always has rather than leaving a gap.
+	const TRect conn_r = {10, (float)(connected ? MP_BTN1_Y : MP_BTN0_Y), SCR_W - 20, MP_BTN_H};
+	if (uiButton(conn_r, connected ? "DISCONNECT" : "CONNECT", ts->cursor == conn_idx, tap,
 	             in->touch_x, in->touch_y, a)) {
 		if (connected) netDisconnect(); else netConnect();
 	}
 
+	if (!connected) {
+		const TRect invite_r = {10, (float)MP_BTN1_Y, SCR_W - 20, MP_BTN_H};
+		if (uiButton(invite_r, "Have an invite code?", ts->cursor == invite_idx, tap,
+		             in->touch_x, in->touch_y, a)) {
+			titleInviteCodeFlow(ts);
+		}
+	}
+
 	const TRect back_r = {10, (float)MP_BTN2_Y, SCR_W - 20, MP_BTN_H};
-	if (uiButton(back_r, "BACK", ts->cursor == 1, tap, in->touch_x, in->touch_y, a)
+	if (uiButton(back_r, "BACK", ts->cursor == back_idx, tap, in->touch_x, in->touch_y, a)
 	    || (in->keys_down & KEY_B)) {
 		ts->screen = TITLE_SCR_MAIN;
 		ts->cursor = 1;   // land back on the MULTIPLAYER button

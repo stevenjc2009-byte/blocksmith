@@ -32,6 +32,19 @@ typedef enum {
 	WD_PHASE_LOAD_GEN,   // loading screen: installing a generated column
 	WD_PHASE_LOAD_MESH,  // loading screen: draining the mesh queue
 	WD_PHASE_LOAD_DRAW,  // loading screen: the frame itself
+
+	// The three below cover the handoff: the stretch between the loading screen's last drawn
+	// frame and the game loop's first one. They exist because of a second hardware report on
+	// 2026-08-19 — "a hundred percent, it says ready, but it just sort of freezes ... it
+	// freezes the entire console" — and because that window was, until they were added, the
+	// one place a hang could not be reported at all: runLoadingScreen leaves the phase at
+	// WD_PHASE_APT on its way out, and an APT stall is deliberately ignored (see below), so a
+	// main thread that stopped here left no file behind and looked exactly like a console
+	// sitting quietly in the HOME menu.
+	WD_PHASE_HANDOFF_GPU,     // highlightInit, playerModelInit
+	WD_PHASE_HANDOFF_SAVE,    // spawn height, playerInit, inventoryLoad, uiInit
+	WD_PHASE_HANDOFF_REPORT,  // worldReportDraw and the queue peak reset
+
 	WD_PHASE_NET,        // netUpdate/networldUpdate
 	WD_PHASE_INSTALL,    // in-game: genInstallOne, which locks the worker
 	WD_PHASE_SIM,        // player, camera, ring follow, aim, edit

@@ -42,8 +42,20 @@ static char          s_report[WD_REPORT_MAX];
 // Indexed by WdPhase. Short and upper-case because these end up being read off a photograph of
 // a screen or out of a text file by someone who is not looking at this source.
 static const char* const s_phase_name[WD_PHASE_COUNT] = {
-	"APT",  "INPUT", "LOAD_GEN", "LOAD_MESH", "LOAD_DRAW", "NET",
-	"INSTALL", "SIM", "MESH", "DRAW", "SAVE",
+	[WD_PHASE_APT]             = "APT",
+	[WD_PHASE_INPUT]           = "INPUT",
+	[WD_PHASE_LOAD_GEN]        = "LOAD_GEN",
+	[WD_PHASE_LOAD_MESH]       = "LOAD_MESH",
+	[WD_PHASE_LOAD_DRAW]       = "LOAD_DRAW",
+	[WD_PHASE_HANDOFF_GPU]     = "HANDOFF_GPU",
+	[WD_PHASE_HANDOFF_SAVE]    = "HANDOFF_SAVE",
+	[WD_PHASE_HANDOFF_REPORT]  = "HANDOFF_REPORT",
+	[WD_PHASE_NET]             = "NET",
+	[WD_PHASE_INSTALL]         = "INSTALL",
+	[WD_PHASE_SIM]             = "SIM",
+	[WD_PHASE_MESH]            = "MESH",
+	[WD_PHASE_DRAW]            = "DRAW",
+	[WD_PHASE_SAVE]            = "SAVE",
 };
 
 static const char* phaseName(u32 p)

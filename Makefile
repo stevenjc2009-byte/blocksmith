@@ -59,6 +59,19 @@ CFLAGS	+=	$(INCLUDE) -D__3DS__
 #   make EXTRA_CFLAGS=-DBS_GEO_START=3
 CFLAGS	+=	$(EXTRA_CFLAGS)
 
+# The network PSK is a shared secret and is NOT committed — this repository is
+# public. Supply it on the command line for a release build:
+#
+#   make cia BS_PSK=<64 hex characters>
+#
+# Without it the build still compiles and runs; Connect just reports that no PSK
+# is configured, which is the honest state for a clone nobody has pointed at a
+# server. The `cia` target refuses to package without it, because a release CIA
+# that cannot reach any server is a much worse failure than a loud one here.
+ifneq ($(BS_PSK),)
+CFLAGS	+=	-DBS_NETWORK_PSK_HEX=\"$(BS_PSK)\"
+endif
+
 CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++11
 
 ASFLAGS	:=	-g $(ARCH)
@@ -273,6 +286,24 @@ all: $(BUILD) $(GFXBUILD) $(DEPSDIR) $(ROMFS_T3XFILES) $(T3XHFILES)
 # make recipe syntax buys nothing and makes the failure messages worse. The script also
 # runs standalone from a devkitPro MSYS2 prompt, which is how it actually gets debugged.
 cia: all
+	@if [ -z "$(BS_PSK)" ]; then \
+	    echo "ERROR: BS_PSK is empty."; \
+	    echo "       A release CIA built without the network PSK cannot connect to"; \
+	    echo "       any server, and would fail silently in the player's hands."; \
+	    echo "       Re-run:  make cia BS_PSK=<64 hex characters>"; \
+	    exit 1; \
+	fi
+# Checked against the linked artifact, not against the flags, because make does not
+# rebuild on a changed -D: after a plain `make`, `make cia BS_PSK=...` would relink
+# stale objects that never saw the define and package a CIA that cannot connect.
+# Prints a count, never the value.
+	@if [ "$$(grep -c -F -- "$(BS_PSK)" $(TARGET).elf 2>/dev/null)" = "0" ]; then \
+	    echo "ERROR: BS_PSK is set but does not appear in $(TARGET).elf."; \
+	    echo "       The objects predate the flag — make does not rebuild on a"; \
+	    echo "       changed -D. Run 'make clean' and build again:"; \
+	    echo "       make clean && make cia BS_PSK=<64 hex characters>"; \
+	    exit 1; \
+	fi
 	@tools/make_cia.sh
 
 $(BUILD):

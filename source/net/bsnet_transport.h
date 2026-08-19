@@ -72,6 +72,48 @@ bool netTransportLocalPublicKey(uint8_t out[32]);
  * as best-effort and never assume delivery. */
 bool netTransportSend(const uint8_t *payload, size_t len);
 
+/* ------------------------------------------------------------- enrolment ---
+ *
+ * Invite codes, per deps/blocksmith-server/docs/CLIENT-ENROLMENT-SPEC.md. A
+ * console whose key is not on the server's allowlist completes the handshake
+ * normally and is then simply never spoken to again — unless an invite is
+ * armed, in which case the server silently gives it ten seconds to prove it
+ * knows the code. Nothing on the wire distinguishes those two cases, so the
+ * console cannot detect probation and offer to enrol; the player has to say up
+ * front that they have a code.
+ */
+
+/* Arms `code` to be sent as soon as the handshake reaches the point where the
+ * server would have opened that window, and puts the whole attempt into
+ * enrolment mode. Call BEFORE netTransportConnect(); on its own it sends
+ * nothing.
+ *
+ * Enrolment mode suppresses the empty-DATA liveness probe that the ordinary
+ * wait-for-welcome retry sends, because a well-formed DATA packet ends the
+ * probation session on the server immediately, and it waits BS_ENROL_WAIT_MS
+ * instead of the ordinary handshake timeout, which is shorter than the
+ * server's own window and would give up while the server was still listening.
+ *
+ * `len` is clamped to BS_INVITE_CODE_MAX. The code is sent exactly as passed —
+ * no trimming, no case folding, no validation. The server normalises, so a
+ * console-side check could only reject something the server would have taken. */
+void netTransportArmEnrol(const uint8_t *code, size_t len);
+
+/* Frames and sends one invite code as BS_PKT_ENROL. A sibling of
+ * netTransportSend() rather than a flag on it: the framing is identical and
+ * only the type byte differs, but that byte is the difference between game
+ * data and a one-time secret, which is not a distinction to hide in an
+ * argument. False if there is no session to send on.
+ *
+ * Ordinarily driven by netTransportArmEnrol(); exposed so the send can be
+ * exercised by itself. */
+bool netTransportSendEnrol(const uint8_t *code, size_t len);
+
+/* True once BS_PKT_ENROL_OK has arrived on this session: the console is now an
+ * ordinary allowlist entry and will connect without a code from here on.
+ * Cleared by the next netTransportConnect(). */
+bool netTransportEnrolled(void);
+
 /* Pops one decrypted, replay-checked payload into `out`.
  * Returns the byte count, 0 if nothing is queued, or -1 on error. */
 int netTransportRecv(uint8_t *out, size_t cap);

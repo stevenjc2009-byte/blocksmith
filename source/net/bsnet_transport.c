@@ -91,6 +91,41 @@ _Static_assert(NET_MAX_PAYLOAD == BS_MAX_PAYLOAD, "payload size drift");
 #define BS_SERVER_PK_FILE    BS_NET_DIR "/server.pub"
 #define BS_NETWORK_PSK_FILE  BS_NET_DIR "/network.psk"
 
+/* Values baked into the build, so a copy of the game handshakes with the right
+ * server straight out of the box the way BS_SERVER_ADDR points it at the right
+ * host. The SD files above still win when present, which is what makes a second
+ * or a test server possible without a rebuild.
+ *
+ * Empty means "not configured" and Connect refuses, which is the honest state
+ * for a build nobody has pointed at a server.
+ *
+ * The server's public key is committed. A public key is meant to be public:
+ * publishing it lets anyone verify they are talking to this gateway and lets
+ * nobody impersonate it. It is steve's gateway, read out of `bsgate-keys
+ * identity` inside the container on 2026-08-19, and it pairs with
+ * BS_SERVER_ADDR in bsnet.c — change the server and this changes with it.
+ *
+ * The network PSK is deliberately NOT committed. It is a shared secret: holding
+ * it gets you as far as completing a handshake, at which point the allowlist is
+ * what actually decides whether you are let in. That makes it "reached the
+ * gate", not "got in" — but this repository is public, and a secret sitting in
+ * public source is one grep away rather than one reverse-engineer away.
+ *
+ * Supply it at build time instead:
+ *
+ *     make cia BS_PSK=<64 hex characters>
+ *
+ * The Makefile turns that into -DBS_NETWORK_PSK_HEX and the `cia` target
+ * refuses to package without it, so a release build cannot silently ship
+ * unable to connect. A clone without the PSK still compiles and runs; it just
+ * says so at the Connect screen instead of failing obscurely. */
+#ifndef BS_SERVER_PK_HEX
+#define BS_SERVER_PK_HEX "2347a5d714537b8d97515e8a62dff87bbdde9921a5468b446507afa2512a401b"
+#endif
+#ifndef BS_NETWORK_PSK_HEX
+#define BS_NETWORK_PSK_HEX ""
+#endif
+
 #ifdef BSNET_TRANSPORT_DEBUG_LOG
 #define BSLOG(...) do { fprintf(stderr, "[bsnet] " __VA_ARGS__); fputc('\n', stderr); fflush(stderr); } while (0)
 #else
@@ -108,6 +143,18 @@ _Static_assert(NET_MAX_PAYLOAD == BS_MAX_PAYLOAD, "payload size drift");
 #define BS_WELCOME_MAX_TRIES     8u
 #define BS_KEEPALIVE_MS      4000u
 #define BS_RX_QUEUE_LEN         16u
+
+/* How long an enrolment attempt waits for BS_PKT_ENROL_OK. The server gives a
+ * probation session BS_ENROL_WINDOW_MS (10s) from the moment it finishes the
+ * handshake; this clock starts when *we* accept KX2, which is strictly earlier
+ * — KX3 still has to cross the wire — so waiting exactly 10s would sometimes
+ * give up while the server was still listening. The margin covers that skew
+ * plus one relay round trip. Failing slightly late costs a couple of seconds;
+ * failing early costs the invite, since a retry burns a fresh handshake and
+ * three wrong-looking attempts kill the code for everyone. */
+#define BS_ENROL_WINDOW_MS  10000u
+#define BS_ENROL_MARGIN_MS   2000u
+#define BS_ENROL_WAIT_MS    (BS_ENROL_WINDOW_MS + BS_ENROL_MARGIN_MS)
 
 static const uint8_t EMPTY_PAYLOAD[1] = { 0 };
 
@@ -158,6 +205,16 @@ static struct {
     unsigned phase_tries;
     uint64_t phase_deadline_ms;
 
+    /* Enrolment. `armed` survives across a connect so the code typed on the
+     * menu is still there when the handshake reaches probation; `sent` and
+     * `ok` are per-attempt. The code itself is never written to the SD card
+     * and is wiped the moment it has been sent. */
+    bool     enrol_armed;
+    bool     enrol_sent;
+    bool     enrol_ok;
+    uint8_t  enrol_code[BS_INVITE_CODE_MAX];
+    size_t   enrol_len;
+
     uint64_t last_send_ms;
     bool     probe_outstanding;
     uint64_t probe_sent_ms;
@@ -207,6 +264,15 @@ static bool load_hex_key(const char *path, uint8_t *out, size_t out_len)
     }
     fclose(f);
     return got;
+}
+
+/* Decodes one of the baked-in hex constants. Same length and alphabet rules as
+ * load_hex_key(), because a value that would be rejected off the SD card must
+ * not sneak in through the compile-time door. */
+static bool load_hex_literal(const char *hex, uint8_t *out, size_t out_len)
+{
+    if (hex == NULL || strlen(hex) != out_len * 2) return false;
+    return hydro_hex2bin(out, out_len, hex, out_len * 2, NULL, NULL) >= 0;
 }
 
 /* Loads the persisted identity seed, or mints one and saves it. Failure to
@@ -446,6 +512,17 @@ static void handle_app_packet(uint8_t type, const uint8_t *pkt, size_t len, uint
         return;
     }
 
+    if (type == BS_PKT_ENROL_OK) {
+        /* The payload is empty; the packet arriving at all is the message.
+         * This console is on the allowlist from here on, so drop out of
+         * enrolment mode — a reconnect must behave like any ordinary join. */
+        s.enrol_ok    = true;
+        s.enrol_armed = false;
+        BSLOG("<- ENROL_OK: enrolled");
+        hydro_memzero(plain, sizeof plain);
+        return;
+    }
+
     if (plain_len > 0) push_rx(plain, plain_len);
 
     hydro_memzero(plain, sizeof plain);
@@ -507,12 +584,27 @@ static void process_datagram(const uint8_t *pkt, size_t len, uint64_t now)
         s.phase_tries         = 1;
         s.phase_deadline_ms   = now + BS_WELCOME_RETRY_MS;
         s.probe_outstanding   = false;
+
+        /* This is the earliest moment a probation session can exist on the
+         * server, and the last one before the ordinary retry path would send
+         * the empty-DATA probe that ends it. */
+        if (s.enrol_armed && !s.enrol_sent) {
+            s.enrol_sent = netTransportSendEnrol(s.enrol_code, s.enrol_len);
+            hydro_memzero(s.enrol_code, sizeof s.enrol_code);
+            s.enrol_len = 0;
+            s.phase_deadline_ms = now + BS_ENROL_WAIT_MS;
+            if (!s.enrol_sent) {
+                fail("Could not send the invite code");
+                return;
+            }
+        }
         break;
     }
 
     case CSTATE_AWAIT_WELCOME:
     case CSTATE_RUNNING:
-        if (type != BS_PKT_DATA && type != BS_PKT_DISCONNECT) return;
+        if (type != BS_PKT_DATA && type != BS_PKT_DISCONNECT &&
+            type != BS_PKT_ENROL_OK) return;
         handle_app_packet(type, pkt, len, now);
         break;
 
@@ -561,6 +653,33 @@ static void tick_retries(uint64_t now)
 
     case CSTATE_AWAIT_WELCOME:
         if (now < s.phase_deadline_ms) break;
+
+        /* An enrolment attempt sends nothing at all while it waits. Not the
+         * DATA probe below, which ends the probation session on the server;
+         * not another ENROL, because a repeat of the same code is
+         * indistinguishable on the wire from a second guess and only three are
+         * allowed before the invite dies for everyone; and not a KX3 retry,
+         * because a duplicate handshake against a session already on probation
+         * is not something the server promises anything about. One shot, then
+         * the player retries from the menu with a fresh handshake. */
+        if (s.enrol_armed) {
+            /* Kept to 37 characters because the multiplayer screen draws this
+             * on one 320px line from x=8 at 6px per glyph — 52 characters
+             * before it runs off the right edge, with no wrapping and no
+             * clipping, so anything longer is simply not there. The spec
+             * suggests a fuller sentence about codes expiring after fifteen
+             * minutes and working once; that detail belongs to whoever armed
+             * the invite and can see its TTL, while the only move available to
+             * the player holding the console is to go and ask for another.
+             *
+             * Says nothing about WHY on purpose. Wrong, expired, already
+             * burnt, never armed, and (per the server's own notes) an
+             * allowlist that refused the append all look identical from here,
+             * so any more specific wording would be a guess. */
+            fail("Code didn't work - ask for a new one.");
+            break;
+        }
+
         if (s.phase_tries >= BS_WELCOME_MAX_TRIES) {
             fail("Handshake completed, but the server never admitted the session "
                  "- check that this device's key is on the server's allowlist");
@@ -620,8 +739,13 @@ bool netTransportInit(void)
     }
     hydro_memzero(seed, sizeof seed);
 
-    s.have_server_pk = load_hex_key(BS_SERVER_PK_FILE, s.server_pk, sizeof s.server_pk);
-    s.have_psk        = load_hex_key(BS_NETWORK_PSK_FILE, s.psk, sizeof s.psk);
+    /* SD first, baked-in second: a card that carries a server.pub/network.psk
+     * is deliberately pointing this console somewhere else, and that has to
+     * beat whatever the build shipped with. */
+    s.have_server_pk = load_hex_key(BS_SERVER_PK_FILE, s.server_pk, sizeof s.server_pk)
+                    || load_hex_literal(BS_SERVER_PK_HEX, s.server_pk, sizeof s.server_pk);
+    s.have_psk       = load_hex_key(BS_NETWORK_PSK_FILE, s.psk, sizeof s.psk)
+                    || load_hex_literal(BS_NETWORK_PSK_HEX, s.psk, sizeof s.psk);
 
     s.inited = true;
     return true;
@@ -690,6 +814,11 @@ bool netTransportConnect(const char *host, uint16_t port)
     s.probe_outstanding = false;
     s.rxq_head = s.rxq_count = 0;
 
+    /* Per-attempt, unlike enrol_armed: the code was armed before this call and
+     * has to survive into the handshake. */
+    s.enrol_sent = false;
+    s.enrol_ok   = false;
+
     send_hello();
     s.substate           = CSTATE_SENT_HELLO;
     s.phase_tries         = 1;
@@ -752,6 +881,37 @@ bool netTransportSend(const uint8_t *payload, size_t len)
     if (len > NET_MAX_PAYLOAD) return false;
     if (payload == NULL && len > 0) return false;
     return send_app_packet(BS_PKT_DATA, payload != NULL ? payload : EMPTY_PAYLOAD, len);
+}
+
+void netTransportArmEnrol(const uint8_t *code, size_t len)
+{
+    hydro_memzero(s.enrol_code, sizeof s.enrol_code);
+    s.enrol_len   = 0;
+    s.enrol_sent  = false;
+    s.enrol_ok    = false;
+    s.enrol_armed = false;
+
+    if (code == NULL || len == 0) return; /* disarms */
+
+    if (len > sizeof s.enrol_code) len = sizeof s.enrol_code;
+    memcpy(s.enrol_code, code, len);
+    s.enrol_len   = len;
+    s.enrol_armed = true;
+}
+
+bool netTransportSendEnrol(const uint8_t *code, size_t len)
+{
+    if (!s.inited) return false;
+    if (s.fd < 0) return false;
+    if (code == NULL || len == 0) return false;
+    if (len > BS_INVITE_CODE_MAX) return false;
+    BSLOG("-> ENROL (%u bytes)", (unsigned)len);
+    return send_app_packet(BS_PKT_ENROL, code, len);
+}
+
+bool netTransportEnrolled(void)
+{
+    return s.enrol_ok;
 }
 
 int netTransportRecv(uint8_t *out, size_t cap)

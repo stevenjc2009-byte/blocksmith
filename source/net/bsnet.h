@@ -68,6 +68,41 @@ void netExit(void);
  * happens. */
 bool netConnect(void);
 
+/* Longest invite code this build will send, plus the terminator. Mirrors
+ * BS_INVITE_CODE_MAX in the server's proto/bs_proto.h. Codes are ten symbols
+ * shown as XXXXX-XXXXX, so the extra room is only there to let a player type
+ * spaces or lowercase without the console silently truncating what it sends —
+ * the server does the normalising. */
+#define NET_INVITE_MAX    33
+
+/* Begins connecting with a one-time invite code, for a console that is not on
+ * the server's allowlist yet. Same handshake, same states, same netUpdate()
+ * loop as netConnect(); the difference is that once the handshake lands, the
+ * code is offered and the client waits out the server's ten-second enrolment
+ * window instead of the ordinary handshake timeout.
+ *
+ * Success is an ordinary NET_CONNECTED — the console is on the allowlist from
+ * that moment and every later join is a plain netConnect(). Failure is an
+ * ordinary NET_FAILED with netErrorText() explaining that the code did not
+ * work; the server deliberately does not say whether it was wrong, expired,
+ * already used or never armed, so neither does this.
+ *
+ * `code` is sent exactly as given. Do not trim, upper-case or validate it
+ * first: the server normalises, so a check here could only reject something
+ * the server would have accepted. Anything past NET_INVITE_MAX-1 bytes is
+ * dropped. Returns false on the same conditions as netConnect(), plus a NULL
+ * or empty code.
+ *
+ * A retry after failure means calling this again from scratch — the server
+ * discards the session on a wrong code, so nothing can be re-sent on it. */
+bool netConnectWithInvite(const char *code);
+
+/* True if the connection currently up was established by enrolling, i.e. this
+ * console just joined the allowlist. Only useful for saying so once on the
+ * screen; nothing else should branch on it, because from the next connect
+ * onwards an enrolled console is indistinguishable from any other. */
+bool netJustEnrolled(void);
+
 /* Ends the session, telling the server so the player slot frees at once
  * rather than after the 30-second idle timeout. Returns to NET_IDLE. Safe to
  * call in any state. */
