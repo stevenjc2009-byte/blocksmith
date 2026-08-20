@@ -4,6 +4,104 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.8] — 2026-08-20 — diagnostic pre-release
+
+A GPU pre-flight battery and command-list validator to narrow the real-hardware freeze.
+
+### Added
+
+- Added a GPU pre-flight battery that runs at boot and writes `sdmc:/blocksmith/selftest.txt`: memory fills at three sizes, two display transfer geometries, a texture copy, 200 fills back to back, a timeout control, and a self-check of the new command-list validator.
+- Added a per-frame command-list validator that walks every PICA200 command the GPU is given and flags infinities and NaNs in shader uniforms, out-of-range vertex and index buffer addresses, and impossible vertex counts.
+- The frame loop now waits two seconds for the GPU instead of forever, so a wedged GPU is reported rather than freezing the console.
+- Added a post-mortem that runs while the GPU is still stuck: it proves whether the GPU is alive, replays the stuck command list, and binary-searches the list to name the exact command the GPU cannot execute.
+- The command-list capture ring widened from 2 frames to 8.
+
+### Note
+
+This is a diagnostic pre-release, not a fix.
+
+## [1.1.7] — 2026-08-20 — diagnostic pre-release, NEVER PUBLISHED
+
+Built and then withdrawn in favour of 1.1.8, which carries everything below plus
+the test battery, so one console boot answers everything instead of two. There is
+no v1.1.7 release, tag or CIA. Kept here because the reasoning below is what 1.1.8
+was built on.
+
+v1.1.6 named the command the GPU never finished. This build carries that command
+off the console so its contents can be read.
+
+### What v1.1.6 said
+
+```
+gx queue     : cap 32  queued 5  submitted 5  completed 2
+  STUCK ON   : entry 2  type 1  ProcessCommandList - OUR draw commands
+    args     : 14189c00 00002430 00000000 00000000
+```
+
+Both screen-clearing commands completed. The GPU then accepted the frame's draw
+command list — 0x2430 bytes at 0x14189c00 — and never reported finishing it, so
+the two display transfers queued behind it never ran and the picture stopped on
+the last good frame.
+
+### Why the length is the useful part
+
+`gxprobe.txt` from the same boot measured a healthy frame's command list at
+0x2430 bytes as well. A citro3d command list's length is decided purely by the
+sequence of calls that produced it, so identical lengths mean the frame that hung
+issued *the same commands* as the 334 frames before it and differs only in the
+values inside them.
+
+Measured in the emulator this round: two consecutive frames of a stationary scene
+produce byte-identical command lists. The noise floor for a frame-to-frame diff is
+zero, which makes any difference at all significant.
+
+### Added
+
+- The last two frames' command lists are copied after every `C3D_FrameEnd`. When
+  the watchdog fires it writes `sdmc:/blocksmith/cmdhang.bin` (the list the GPU
+  never finished) and `sdmc:/blocksmith/cmdprev.bin` (the one it finished
+  immediately before). They are decoded off the device, so the decoder can be
+  corrected without another boot.
+- `hang.txt` gains a `cmd list` section reporting the list's address and length,
+  and — the part that can only be established on the console — whether the live
+  memory still matches what was handed to the GPU. If it differs, the command
+  buffer was overwritten after submission, and that is the bug regardless of what
+  either file decodes to.
+- `BS_FRAME_HANG_AFTER`, a test-only knob letting a parked arm run normally for N
+  frames first. Defaults to 0, so every previously built arm behaves identically.
+
+### Verified before shipping
+
+Both branches of the new comparison were made to fire in the emulator, because a
+comparison that has only ever been seen agreeing with itself proves nothing:
+
+- clean arm → `live vs submitted : IDENTICAL`, 120 captures, both files 9264 bytes
+- an arm that deliberately flips one byte of the list after the copy is taken →
+  `DIFFERS in 1 bytes, first at offset 16 (submitted 00, now ff)`
+
+The first attempt at both arms reported `NOT CAPTURED` and was thrown away: the
+park fired on the first frame of the game loop, before any `C3D_FrameEnd`, so the
+capture had never run. That is what `BS_FRAME_HANG_AFTER` exists to fix.
+
+### Ruled out this round
+
+Corrupt vertex data cannot be the cause. Chunk positions are `GPU_BYTE, 3` —
+three signed bytes in chunk-local space — so wrong vertex data can only ever
+produce a wrong-looking block inside a 256-unit cube. It cannot make a NaN, a
+huge triangle, or an out-of-range fetch, and therefore cannot wedge the GPU.
+
+That also retires the leading suspicion from the previous round. citro3d flushes
+the data cache for exactly two things, measured by disassembling the shipped
+binary: its own command buffer in `C3D_FrameEnd`, and decompressed texture data
+at load. It never flushes user vertex or index buffers, and this codebase never
+flushes anything. That is a real latent defect and it is written down, but with
+the vertex format being signed bytes it is not this bug.
+
+### Unchanged
+
+The game itself. Only the reporting is finer. Published as a pre-release so
+**Options → Check for Update** never offers it to anyone running v1.1.0.
+
 ## [1.1.6] — 2026-08-20 — diagnostic pre-release
 
 v1.1.5 froze a real Old 3DS and returned an unambiguous answer. This build asks

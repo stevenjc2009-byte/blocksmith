@@ -24,6 +24,7 @@
 #include "app/input_map.h"
 #include "app/options.h"
 #include "app/updater.h"
+#include "app/gputest.h"
 #include "app/watchdog.h"
 #include "app/worker.h"
 #include "debug/metrics.h"
@@ -1536,7 +1537,19 @@ static void drawStage(int stage, int k)
 {
 	watchdogDrawStage(stage, k, -1);
 #ifdef BS_FRAME_HANG_TEST
-	if (stage == (BS_FRAME_HANG_TEST)) for (;;) svcSleepThread(1000000000ULL);
+	// BS_FRAME_HANG_AFTER lets an arm run normally for that many frames before parking, instead
+	// of parking on the very first one. It defaults to 0, so every arm built before this existed
+	// behaves exactly as it did. It is needed because some of what the report prints is gathered
+	// by the main thread during normal play — watchdogGxSelfTest and watchdogCmdCapture both run
+	// after C3D_FrameEnd — and an arm that parks on frame 0 never reaches them, so it reports
+	// "NOT CAPTURED" and proves nothing about them either way.
+#ifndef BS_FRAME_HANG_AFTER
+#define BS_FRAME_HANG_AFTER 0
+#endif
+	if (stage == (BS_FRAME_HANG_TEST)) {
+		static int seen;
+		if (seen++ >= (BS_FRAME_HANG_AFTER)) for (;;) svcSleepThread(1000000000ULL);
+	}
 #endif
 }
 #else
@@ -1977,6 +1990,13 @@ int main(void)
 
 	screenInit();
 	metricsInit();
+
+#if BS_GPU_TESTS
+	// Before the title screen and before a world exists, so a console that fails one of these
+	// says so without the player having to reach the freeze first. Costs a few seconds of boot
+	// and writes sdmc:/blocksmith/selftest.txt. Diagnostic builds only. See app/gputest.h.
+	gpuTestPreflight();
+#endif
 
 	if (!chunkRenderInit()) {
 		printf("\x1b[2;1Hshader/atlas/pool init FAILED\n");
@@ -2761,6 +2781,22 @@ session_start:
 		drawStage(WD_DRAW_FRAME_VSYNC, -1);
 		C3D_FrameSync();
 		drawStage(WD_DRAW_FRAME_QUEUE, -1);
+#if BS_GPU_TESTS
+		// The whole reason this build can answer anything. C3D_FrameBegin(0) is a
+		// gxCmdQueueWait(queue, -1) — an unbounded wait, which is why the console dies with the
+		// HOME button unresponsive and the only evidence is what the watchdog thread can scrape
+		// afterwards. Waiting the same way but with a two-second bound turns that freeze into a
+		// return value: the main thread is still alive, and the GPU is still stuck in exactly the
+		// state that stuck it, which is the one moment the post-mortem's questions can be asked.
+		//
+		// On the normal path this changes nothing at all. The queue drains in microseconds, this
+		// wait returns true, and the C3D_FrameBegin below finds nothing left to wait for.
+		{
+			static uint32_t gpu_frame;
+			gpu_frame++;
+			if (!gpuTestFrameWait()) gpuTestPostMortem(gpu_frame);
+		}
+#endif
 		C3D_FrameBegin(0);
 #else
 		C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
@@ -2807,6 +2843,11 @@ session_start:
 		// guaranteed to be holding commands. That makes this the one place a snapshot can
 		// prove the hang report's queue reader actually sees them. Writes one file, once.
 		watchdogGxSelfTest();
+
+		// Same instant, every frame rather than once: keeps the last two frames' command lists
+		// so the report can write out the one the GPU never finished alongside the one it
+		// finished just before it. Two 24 KB memcpys' worth of BSS and one memcpy per frame.
+		watchdogCmdCapture();
 #endif
 
 		metricsFrameEnd();

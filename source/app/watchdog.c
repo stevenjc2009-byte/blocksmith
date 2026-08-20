@@ -27,6 +27,7 @@
 extern u32 __C3D_Context[];
 #endif
 
+#include "app/gputest.h"
 #include "version.h"
 
 // Alongside the crash dump and the save data (app/crash.c, main.c's saveWorldDir()). Two
@@ -40,6 +41,26 @@ extern u32 __C3D_Context[];
 // during normal play, before anything has gone wrong, and must never be mistaken for — or
 // overwrite — the report that says the console froze. See watchdogGxSelfTest.
 #define WD_GX_FILE_REL "/blocksmith/gxprobe.txt"
+
+// The stuck command list's own contents, and the previous frame's for comparison.
+//
+// gxAppend names WHICH command the GPU never finished; these two files carry what was actually
+// inside it. That is the next question and it cannot be answered from the console: the list is
+// a stream of PICA200 register writes, and reading it means decoding it, which is done off the
+// device so the decoder can be corrected without another boot.
+//
+// The comparison is the point. hang.txt measured the stuck list at 0x2430 bytes and gxprobe.txt
+// measured a healthy frame's at 0x2430 as well - the same length, which for a citro3d command
+// buffer means the same sequence of calls produced it. So the frame that hung issued the same
+// commands as the 334 frames before it and differs only in the VALUES inside them, and a diff
+// of these two files is the shortest path to which value.
+#define WD_CMD_HANG_REL "/blocksmith/cmdhang.bin"
+#define WD_CMD_PREV_REL "/blocksmith/cmdprev.bin"
+
+// 0x2430 measured on hardware and in the emulator; 24 KB is ~2.6x that. A list longer than this
+// is truncated rather than refused, and hang.txt says so, because a truncated head is still
+// worth reading and a silent cap is not.
+#define WD_CMD_MAX (24u * 1024u)
 
 // How often the monitor looks. 250 ms is fine-grained enough that the recorded stall time is
 // accurate to a quarter second, and coarse enough that the thread costs nothing: forty wakeups
@@ -168,6 +189,25 @@ static char          s_report[WD_REPORT_MAX];
 // 1280 and not 768: at 768 the first run truncated its last entry mid-word, ending the file at
 // "args     : 1f0bb800 30151800 0".
 static char          s_gxsnap[1280];
+
+// A ring of the last WD_CMD_RING frames' command lists, captured by watchdogCmdCapture after
+// every C3D_FrameEnd, because by the time the watchdog fires the main thread is parked inside the
+// next C3D_FrameBegin and cannot capture anything.
+//
+// Eight and not two. v1.1.7 kept two, on the reasoning that the interesting comparison is the
+// hung frame against the one immediately before it. That is still the first comparison, but it
+// assumes the fault appears in the frame that hangs — and if a value drifts, or a buffer is freed
+// and reused a frame or two ahead of the draw that trips over it, then the last healthy frame
+// already contains the damage and a two-frame diff shows nothing. Eight frames is a third of a
+// second of history, and it is 192 KB of BSS in BS_DRAW_PROBE builds only, against 27 MB of
+// linear heap free on the console that froze.
+#define WD_CMD_RING 8u
+
+static u8   s_cmd_copy[WD_CMD_RING][WD_CMD_MAX];
+static u32  s_cmd_len[WD_CMD_RING];
+static u32  s_cmd_addr[WD_CMD_RING];
+static u32  s_cmd_full[WD_CMD_RING];  // the list's real length, before any truncation to WD_CMD_MAX
+static volatile u32 s_cmd_seq;        // frames captured; newest slot is (seq-1) % WD_CMD_RING
 #endif
 
 // Indexed by WdPhase. Short and upper-case because these end up being read off a photograph of
@@ -226,6 +266,14 @@ static void fileWrite(const char* rel_path, const char* data, size_t len)
 	}
 
 	FSUSER_CloseArchive(archive);
+}
+
+// The same writer, for app/gputest.c. Its reports are written from the main thread rather than
+// the monitor, but from a frame that has already failed — so it wants the same no-stdio path for
+// the same reason, and there is no sense having two of them.
+void watchdogWriteFile(const char* rel_path, const void* data, size_t len)
+{
+	fileWrite(rel_path, (const char*)data, len);
 }
 
 #if BS_DRAW_PROBE
@@ -339,6 +387,158 @@ static size_t gxAppend(char* buf, size_t cap, size_t len, const char* oldest_lab
 			}
 		}
 	}
+
+	return len;
+}
+
+// Takes a copy of this frame's command list. Called from the main thread immediately after
+// C3D_FrameEnd, where the entry is guaranteed to be in the queue: FrameEnd has just added it and
+// nothing clears the queue until the next C3D_FrameBegin.
+//
+// The entry is found by SCANNING for type 1, not by indexing at lastEntry. lastEntry is the
+// right index at hang time and the wrong one here — a healthy frame is exactly the case where
+// the GPU has already finished the list and moved lastEntry past it.
+void watchdogCmdCapture(void)
+{
+	const gxCmdQueue_s* q = (const gxCmdQueue_s*)(const void*)__C3D_Context;
+	if (!q->entries || q->maxEntries == 0 || q->maxEntries > 64 || q->numEntries > q->maxEntries)
+		return;
+
+	for (unsigned i = 0; i < q->numEntries; i++) {
+		const gxCmdEntry_s* e = &q->entries[i];
+		if (e->type != 1) continue;
+
+		const u32 addr = e->args[0];
+		const u32 size = e->args[1];
+		if (!addr || !size) return;
+
+		const unsigned slot = s_cmd_seq % WD_CMD_RING;
+		const u32 take = (size < WD_CMD_MAX) ? size : WD_CMD_MAX;
+		memcpy(s_cmd_copy[slot], (const void*)addr, take);
+#ifndef BS_CMD_SCRIBBLE_TEST
+#define BS_CMD_SCRIBBLE_TEST 0
+#endif
+#if BS_CMD_SCRIBBLE_TEST
+		// The red arm for cmdDump's live-vs-submitted comparison, and nothing else uses it.
+		// Corrupts one byte of the list immediately AFTER the copy is taken — precisely the event
+		// the comparison exists to detect. Without it "IDENTICAL" has only ever been seen agreeing
+		// with itself and would be unfalsifiable, which is the mistake v1.1.5's build script made.
+		((u8*)addr)[16] ^= 0xFFu;
+#endif
+		s_cmd_len[slot]  = take;
+		s_cmd_addr[slot] = addr;
+		s_cmd_full[slot] = size;
+		s_cmd_seq++;
+
+#if BS_GPU_TESTS
+		// Check the list the GPU has just been given, before anything has gone wrong. This is the
+		// test most likely to name the bug outright: it sees the actual bytes of every draw in the
+		// frame, including the ones scene/chunk_render.c's draw guard does not cover — the
+		// highlight cage, other players, name tags and the whole bottom-screen sprite batch.
+		gpuTestValidateList(s_cmd_copy[slot], take, s_cmd_seq);
+
+		// And once, on the very first list, prove the replay machinery works while there is still
+		// a known-good list to prove it against. See gpuTestListProbe.
+		if (s_cmd_seq == 1u) gpuTestListProbe(s_cmd_copy[slot], take);
+#endif
+		return;
+	}
+}
+
+const uint8_t* watchdogLastCmdList(uint32_t* len, uint32_t* addr)
+{
+	const u32 seq = s_cmd_seq;
+	if (!seq) return NULL;
+	const unsigned slot = (seq - 1u) % WD_CMD_RING;
+	if (len)  *len  = s_cmd_len[slot];
+	if (addr) *addr = s_cmd_addr[slot];
+	return s_cmd_copy[slot];
+}
+
+// Writes cmdhang.bin and cmdprev.bin, and appends to the report what could only be established
+// here: whether the command buffer still holds what was handed to the GPU.
+//
+// That check has to happen on the console. If the live memory differs from the copy taken at
+// C3D_FrameEnd, then something overwrote the list after the GPU was pointed at it, and the bug
+// is that overwrite rather than anything inside the list — a conclusion no offline decode of
+// either file could reach, because both files would decode as perfectly valid command streams.
+static size_t cmdDump(char* buf, size_t cap, size_t len)
+{
+	const u32 seq = s_cmd_seq;
+	int m;
+
+	if (seq == 0) {
+		m = snprintf(buf + len, cap - len,
+			"\ncmd list     : NOT CAPTURED - no frame ever reached C3D_FrameEnd.\n");
+		if (m > 0) { const size_t room = cap - len - 1; len += ((size_t)m < room) ? (size_t)m : room; }
+		return len;
+	}
+
+	const unsigned cur  = (seq - 1u) % WD_CMD_RING;   // the frame the GPU never finished
+	const unsigned prev = (seq - 2u) % WD_CMD_RING;   // the last frame it did finish
+	const u8* live = (const u8*)s_cmd_addr[cur];
+
+	// Byte-compare the live list against the copy taken the instant it was submitted.
+	u32 diff_at = 0xFFFFFFFFu, was = 0, now = 0, diffs = 0;
+	for (u32 i = 0; i < s_cmd_len[cur]; i++) {
+		if (live[i] == s_cmd_copy[cur][i]) continue;
+		if (diffs == 0) { diff_at = i; was = s_cmd_copy[cur][i]; now = live[i]; }
+		diffs++;
+	}
+
+	m = snprintf(buf + len, cap - len,
+		"\n"
+		"cmd list     : addr %08lx  %lu bytes%s  (frame captures: %lu)\n",
+		(unsigned long)s_cmd_addr[cur], (unsigned long)s_cmd_full[cur],
+		(s_cmd_full[cur] > WD_CMD_MAX) ? "  TRUNCATED to 24 KB in the file" : "",
+		(unsigned long)seq);
+	if (m > 0) { const size_t room = cap - len - 1; len += ((size_t)m < room) ? (size_t)m : room; }
+
+	if (diffs == 0)
+		m = snprintf(buf + len, cap - len,
+			"  live vs    : IDENTICAL - the list the GPU is executing is byte-for-byte what was\n"
+			"  submitted    submitted to it, so nothing overwrote it after submission.\n");
+	else
+		m = snprintf(buf + len, cap - len,
+			"  live vs    : DIFFERS in %lu bytes, first at offset %lu (submitted %02lx, now %02lx).\n"
+			"  submitted    The command buffer was overwritten AFTER the GPU was pointed at it.\n"
+			"               That is the bug; nothing inside the list needs to be wrong.\n",
+			(unsigned long)diffs, (unsigned long)diff_at,
+			(unsigned long)was, (unsigned long)now);
+	if (m > 0) { const size_t room = cap - len - 1; len += ((size_t)m < room) ? (size_t)m : room; }
+
+	fileWrite(WD_CMD_HANG_REL, (const char*)live, s_cmd_len[cur]);
+	if (seq >= 2)
+		fileWrite(WD_CMD_PREV_REL, (const char*)s_cmd_copy[prev], s_cmd_len[prev]);
+
+	// The rest of the ring, oldest reachable frame first. cmd2.bin is two frames before the hang,
+	// cmd7.bin is seven. They exist because a two-frame diff only finds the fault if the fault
+	// appears in the frame that hangs; if a value drifts over several frames, or a buffer is
+	// reused ahead of the draw that trips over it, the damage is already in cmdprev.bin and only
+	// a longer history shows where it started.
+	unsigned written = 0;
+	for (unsigned k = 2; k < WD_CMD_RING && k < seq; k++) {
+		const unsigned slot = (seq - 1u - k) % WD_CMD_RING;
+		if (!s_cmd_len[slot]) continue;
+		char rel[48];
+		snprintf(rel, sizeof(rel), "%s/cmd%u.bin", WD_DIR_REL, k);
+		fileWrite(rel, (const char*)s_cmd_copy[slot], s_cmd_len[slot]);
+		written++;
+	}
+
+	m = snprintf(buf + len, cap - len,
+		"  files      : cmdhang.bin = this list, live. %s\n"
+		"               plus %u older frame(s) as cmdN.bin, N frames before the hang.\n",
+		(seq >= 2) ? "cmdprev.bin = the frame before it."
+		           : "cmdprev.bin NOT written (only one frame captured).",
+		written);
+	if (m > 0) { const size_t room = cap - len - 1; len += ((size_t)m < room) ? (size_t)m : room; }
+
+#if BS_GPU_TESTS
+	// What the per-frame validator saw on the way here. If it flagged a frame, that frame number
+	// against the capture count above says whether the damage arrived with the hang or before it.
+	len = gpuTestValidatorReport(buf, cap, len);
+#endif
 
 	return len;
 }
@@ -471,6 +671,7 @@ static void reportBuild(u32 phase, u32 frames, u32 stuck_ms)
 	}
 
 	len = gxAppend(s_report, sizeof(s_report), len, "STUCK ON");
+	len = cmdDump(s_report, sizeof(s_report), len);
 
 	// The draw guard's verdict. Printed even when nothing was wrong, because "no bad draw was
 	// ever issued" is the more useful half of the answer: it says the commands the GPU was

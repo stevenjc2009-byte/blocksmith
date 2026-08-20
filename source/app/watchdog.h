@@ -23,6 +23,7 @@
 // diagnostic that can itself block the main thread would be worse than no diagnostic.
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 // Where the main thread is. Ordered roughly as a frame runs; the names are what end up in the
@@ -164,6 +165,22 @@ void watchdogDrawStage(int stage, int k, int slot);
 // reader works rather than another unfalsifiable line in a report. Every call after the first
 // returns immediately. See the comment on watchdogGxSelfTest in watchdog.c.
 void watchdogGxSelfTest(void);
+
+// Copies this frame's GPU command list into a two-deep ring, so the hang report can write out
+// both the list the GPU never finished (cmdhang.bin) and the one it finished immediately before
+// it (cmdprev.bin). Call it from the main thread every frame, immediately after C3D_FrameEnd,
+// beside watchdogGxSelfTest — the watchdog thread cannot do this itself, because by the time it
+// fires the main thread is already parked inside the next C3D_FrameBegin.
+void watchdogCmdCapture(void);
+
+// The most recently captured list, or NULL if no frame has been captured yet. For
+// app/gputest.c's post-mortem, which reads the stuck entry straight out of the GX queue and
+// needs somewhere to fall back to when that read comes back empty — as it did on the first
+// emulator run of the post-mortem, where the queue held no entries at all and steps 2 and 3
+// were skipped for want of a list. A captured copy is a strictly worse source than the live
+// queue entry, because it cannot show a list that was overwritten after submission, so the
+// report says which of the two it used.
+const uint8_t* watchdogLastCmdList(uint32_t* len, uint32_t* addr);
 #endif
 
 // Hands the report one already-formatted line about the draw guard (scene/chunk_render.c).
@@ -175,3 +192,10 @@ void watchdogGuardLine(const char* line);
 // True once a report has been written this session. Only the deliberate-hang self-check reads
 // this; nothing in the game does.
 bool watchdogFired(void);
+
+// Writes one file under sdmc:/blocksmith/, creating the directory if it is not there, and sizing
+// the file to exactly len so a shorter report cannot leave the tail of a longer previous one
+// trailing it. Exposed for app/gputest.c, which needs the same raw-FS path the hang report uses
+// and for the same reason: it can be called from a frame that is already in trouble, where
+// nothing about the C library's buffering is worth relying on.
+void watchdogWriteFile(const char* rel_path, const void* data, size_t len);
