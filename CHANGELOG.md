@@ -4,6 +4,84 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.4] — 2026-08-20 — diagnostic pre-release
+
+v1.1.3 worked. It froze a real Old 3DS and wrote the report it was built to
+write. This release exists because that report answered less than it looked
+like it did.
+
+### What v1.1.3 actually said
+
+```
+version      : 1.1.3        phase        : DRAW
+frames drawn : 336          stalled for  : 10000 ms
+columns in   : 322          meshes       : 114
+worker       : IDLE         probe arm    : 0
+linear free  : 27081216 B   vram free    : 4440064 B
+draw stage   : finished, back in main.c
+```
+
+Two things are settled by it and are not being revisited:
+
+- **It is not a CPU spin.** The breadcrumb passed `CULL`, the one stage that
+  issues no GPU commands at all, and went past every draw after it.
+- **It is not memory.** `linear free` and `vram free` are byte-for-byte what the
+  emulator reports on a scene that runs fine.
+
+The mistake was in reading `finished, back in main.c` as "the CPU finished the
+whole frame". It does not say that. It says `chunkRenderDraw` returned — and six
+more GPU submissions happen after it inside the same `DRAW` window, none of
+which had a marker of its own, so all six looked identical in the report:
+`highlightDraw`, `playerModelDraw`, `playerModelDrawTags`, the bottom screen's
+clear and sprite batch, `C3D_FrameEnd`, and the next frame's `C3D_FrameBegin`.
+
+### Added
+
+- **The rest of the frame's breadcrumb.** Seven new `WD_DRAW_*` stages covering
+  every one of those six submissions plus the per-eye setup, so the next report
+  names the submission the console died on instead of the neighbourhood it died
+  in. One 32-bit store each, in a diagnostic build only.
+- **A draw guard.** Every chunk draw is checked before it is issued, against four
+  ways a `C3D_DrawElements` can be malformed: a vertex pointer that is not the
+  start of a real mesh slot, an index count that is not whole triangles, an index
+  range that runs off the shared index buffer, and a maximum index that reaches
+  past the bound slot's vertex capacity. A bad draw is refused rather than
+  issued, and `hang.txt` gains a `draw guard` line either naming it or saying
+  `clean`. `clean` is the more useful half of the answer: it would mean the
+  commands were well formed and the GPU stopped for some other reason.
+
+### Ruled out by measurement, not by argument
+
+- **Command-buffer overflow.** citro3d does not bounds-check its command buffer,
+  and a frame that overran it would hand the GPU whatever follows it in the
+  linear heap. Measured with `C3D_GetCmdBufUsage` on the same 322-column scene:
+  `cmd 3.5% max 3.5%` of `C3D_DEFAULT_CMDBUF_SIZE` (0x40000 bytes). Not close.
+- **Missing GPU cache flushes.** Every vertex buffer here is written by the CPU
+  into cached linear memory and read by the GPU, and nothing in this repo calls
+  `GSPGPU_FlushDataCache`. It does not need to: disassembling citro3d's
+  `C3D_FrameEnd` shows it calls `GSPGPU_FlushDataCache(__ctru_linear_heap,
+  __ctru_linear_heap_size)` on every frame that is not `C3D_FRAME_NONBLOCK`.
+
+### Verified
+
+The instrument was proven able to fail before being shipped, on three emulator
+arms driven through world creation into the same world:
+
+| arm | armed at | `draw stage` in `hang.txt` |
+| --- | --- | --- |
+| RED_B | `-DBS_FRAME_HANG_TEST=WD_DRAW_BOTTOM` | `drawBottomUi (bottom screen + UI sprites)` |
+| RED_E | `-DBS_FRAME_HANG_TEST=WD_DRAW_FRAME_END` | `C3D_FrameEnd (submitting to the GPU)` |
+| control | nothing armed | no `hang.txt` written at all |
+
+The control arm played normally and reported `meshes 114  tris 88084  cull 81`,
+the same figures the console reports, so the markers cost nothing and cannot
+fire on their own. The draw guard was proven separately: a build that corrupts
+its 300th chunk draw produced `BAD DRAW code 4 hits 1 slot 112 first 0 count
+12288 maxidx 8191 cap 4096`, and the unmodified build produced `clean`.
+
+**The freeze itself is still not fixed, and this build does not claim to fix
+it.** It is a pre-release for one reason: so the in-app updater never offers it.
+
 ## [1.1.3] — 2026-08-20 — diagnostic pre-release
 
 The same hunt, and the same instrument as v1.1.2 — but v1.1.2 could not carry it

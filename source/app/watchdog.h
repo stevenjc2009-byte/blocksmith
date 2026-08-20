@@ -110,6 +110,26 @@ typedef enum {
 	WD_DRAW_OPAQUE,      // the opaque pass; k and slot say which chunk
 	WD_DRAW_TRANSPARENT, // the transparent pass; k and slot say which chunk
 	WD_DRAW_DONE,        // returned to main.c
+
+	// Round 2 answered itself and then stopped short. The 1.1.3 report from real hardware
+	// said "finished, back in main.c", which was read at the time as "the CPU finished the
+	// whole frame". It does not say that. It says chunkRenderDraw returned — and there are
+	// six more GPU submissions after it inside the same WD_PHASE_DRAW window, none of which
+	// had a marker, so all six looked identical in the report:
+	//
+	//   highlightDraw, playerModelDraw, playerModelDrawTags, the bottom screen's own clear
+	//   and sprite batch, C3D_FrameEnd, and the next frame's C3D_FrameBegin.
+	//
+	// These close that gap. Appended rather than inserted in frame order so scene/
+	// chunk_render.c's existing numbering is untouched; the names carry the order, not the
+	// values.
+	WD_DRAW_EYE_SETUP,   // RenderTargetClear + FrameDrawOn, before the world; k is the eye
+	WD_DRAW_HIGHLIGHT,   // highlightDraw — the cage around the aimed-at block
+	WD_DRAW_PLAYERS,     // playerModelDraw — other people's bodies
+	WD_DRAW_TAGS,        // playerModelDrawTags — their name tags, a sprite batch
+	WD_DRAW_BOTTOM,      // drawBottomUi — bottom-screen clear, then the UI sprite batch
+	WD_DRAW_FRAME_END,   // inside C3D_FrameEnd: command list submitted, transfer queued
+	WD_DRAW_FRAME_WAIT,  // inside C3D_FrameBegin(C3D_FRAME_SYNCDRAW), waiting on the GPU
 	WD_DRAW_STAGE_COUNT
 } WdDrawStage;
 
@@ -117,6 +137,12 @@ typedef enum {
 // the stage is not inside a loop. Three stores, no lock, same contract as watchdogPhase.
 void watchdogDrawStage(int stage, int k, int slot);
 #endif
+
+// Hands the report one already-formatted line about the draw guard (scene/chunk_render.c).
+// The caller keeps the buffer alive for the rest of the process: this stores the pointer and
+// nothing else, because the monitor thread must never allocate or take a lock. Never call it
+// and the line is simply left out of the report.
+void watchdogGuardLine(const char* line);
 
 // True once a report has been written this session. Only the deliberate-hang self-check reads
 // this; nothing in the game does.

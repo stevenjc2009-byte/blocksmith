@@ -36,6 +36,25 @@
 #define BS_DRAW_HANG_TEST 0
 #endif
 
+// Validates every chunk draw before it is issued, and refuses the ones that are not safe.
+// See drawSane() for what it checks and why those four things and not others.
+//
+// It is a diagnostic first: a console that freezes with this on has hang.txt say whether a
+// bad draw was ever seen, which is the difference between "the GPU was handed an address it
+// could not read" and "the commands were fine and it stopped for some other reason". Refusing
+// the draw as well as recording it is not a guess at the fix — a draw that reaches outside the
+// buffer bound for it has no correct behaviour to fall back on.
+//
+// Off by default:  make EXTRA_CFLAGS="-DBS_DRAW_GUARD=1"
+#ifndef BS_DRAW_GUARD
+#define BS_DRAW_GUARD 0
+#endif
+
+// Deliberately corrupts one draw so the guard above can be seen going red. See drawIndices.
+#ifndef BS_DRAW_GUARD_REDTEST
+#define BS_DRAW_GUARD_REDTEST 0
+#endif
+
 // Step 7.3, cave culling. -DBS_CAVECULL=0 skips the walk entirely and draws whatever the
 // frustum kept. Unlike the two above, this one is not merely an instrumentation switch: the
 // frame must still be identical between the two builds, and if it ever is not, this flag is
@@ -1081,6 +1100,13 @@ static bool horizonHidden(int cx, int cy, int cz)
 }
 #endif
 
+#if BS_DRAW_GUARD
+// Which slot slotBind last pointed the GPU at. drawIndices needs it to know how many vertices
+// the bound buffer actually holds, and the two are deliberately separate calls (a chunk is up
+// to three opaque runs plus a transparent one, all sharing one bind).
+static const MeshSlot* s_bound;
+#endif
+
 // Points the GPU at one chunk: the model matrix that places its chunk-local 0..16 vertices in
 // the world, and its vertex buffer. Split out from the draw in step 9.2, because a chunk is
 // now up to three opaque runs plus a transparent one and all four share this — setting a
@@ -1097,7 +1123,87 @@ static void slotBind(const C3D_Mtx* view, const MeshSlot* s)
 	C3D_BufInfo* buf = C3D_GetBufInfo();
 	BufInfo_Init(buf);
 	BufInfo_Add(buf, s->verts, sizeof(MeshVertex), 2, 0x10);
+#if BS_DRAW_GUARD
+	s_bound = s;
+#endif
 }
+
+#if BS_DRAW_GUARD
+// The first draw that failed validation, kept verbatim so the report is evidence rather than a
+// summary. Written once and then left alone: the interesting one is the first, and a console
+// that is about to hang has no time to keep a history.
+static int      s_guard_code;       // 0 = nothing wrong has been seen
+static uint32_t s_guard_first, s_guard_count, s_guard_maxidx, s_guard_cap;
+static int      s_guard_slot, s_guard_hits;
+static uintptr_t s_guard_verts;
+
+int  chunkRenderGuardCode(void)   { return s_guard_code; }
+int  chunkRenderGuardHits(void)   { return s_guard_hits; }
+int  chunkRenderGuardSlot(void)   { return s_guard_slot; }
+uint32_t chunkRenderGuardFirst(void)  { return s_guard_first; }
+uint32_t chunkRenderGuardCount(void)  { return s_guard_count; }
+uint32_t chunkRenderGuardMaxIdx(void) { return s_guard_maxidx; }
+uint32_t chunkRenderGuardCap(void)    { return s_guard_cap; }
+uintptr_t chunkRenderGuardVerts(void) { return s_guard_verts; }
+
+// How many vertices the buffer bound for slot `s` actually holds, or 0 if that pointer is not
+// the start of a slot in any tier arena. Derived from the pointer rather than trusted from the
+// slot, because "the slot says one thing and the GPU was handed another" is precisely the
+// failure being hunted.
+static uint32_t boundVertCap(const MeshSlot* s)
+{
+	if (!s || !s->verts) return 0;
+	for (int t = 0; t < 3; t++) {
+		if (!s_tier_arena[t]) continue;
+		const uint32_t cap   = (uint32_t)kTierFaces[t] * 4;
+		const MeshVertex* lo = s_tier_arena[t];
+		const MeshVertex* hi = lo + (size_t)cap * (size_t)kTierSlots[t];
+		if (s->verts < lo || s->verts >= hi) continue;
+		// Must be the *start* of a slot, not somewhere in the middle of one.
+		if ((size_t)(s->verts - lo) % cap) return 0;
+		return cap;
+	}
+	return 0;
+}
+
+// Everything that has to be true for one C3D_DrawElements to be safe to issue. hang.txt proved
+// the CPU finishes the frame and the GPU then never signals, which is what a vertex fetch from
+// an address the GPU cannot read looks like from outside — so these are the four ways this
+// code could hand the GPU such an address.
+//
+// The last check is the one worth the trouble. Every slot in a tier holds exactly
+// kTierFaces[t]*4 vertices, but the index buffer is shared by every tier and runs to the
+// largest, so a run whose indices reach past its own tier's slot reads into the next slot —
+// and off the end of the arena entirely if the slot is the last one in it.
+static bool drawSane(uint32_t first, uint32_t count)
+{
+	const uint32_t cap = boundVertCap(s_bound);
+	int code = 0;
+	uint32_t maxidx = 0;
+
+	if (!cap)                                     code = 1;   // verts NULL / not a slot start
+	else if (count % 3u)                          code = 2;   // not whole triangles
+	else if (first + count > MESH_SLOT_INDICES)   code = 3;   // runs off the index buffer
+	else {
+		maxidx = s_shared_indices[first + count - 1u];
+		if ((uint32_t)maxidx >= cap)              code = 4;   // reaches past the bound slot
+	}
+
+	if (!code) return true;
+
+	s_guard_hits++;
+	if (!s_guard_code) {
+		s_guard_code   = code;
+		s_guard_first  = first;
+		s_guard_count  = count;
+		s_guard_maxidx = maxidx;
+		s_guard_cap    = cap;
+		s_guard_slot   = s_bound ? (int)(s_bound - s_slots) : -1;
+		s_guard_verts  = (uintptr_t)(s_bound ? s_bound->verts : NULL);
+	}
+	return false;
+}
+#endif
 
 // One run out of the shared index buffer. `first` and `count` still come from the bound
 // slot's own face_start / opaque_index_count / index_count — only the storage they index
@@ -1105,6 +1211,28 @@ static void slotBind(const C3D_Mtx* view, const MeshSlot* s)
 static void drawIndices(uint32_t first, uint32_t count)
 {
 	if (!count) return;
+#if BS_DRAW_GUARD_REDTEST
+	// The red arm for the guard, and nothing else uses it. A checker that has only ever been
+	// seen agreeing with the code it checks has not been tested — so this hands it one draw
+	// that is genuinely wrong, on the 300th chunk draw of the session so the frames before it
+	// stay a live control that must still come back clean.
+	//
+	//   =3  a run that ends past the end of the shared index buffer
+	//   =4  a run whose indices reach past the vertex buffer bound for it
+	{
+		static int seen = 0;
+		if (++seen == 300) {
+#if BS_DRAW_GUARD_REDTEST == 3
+			first = MESH_SLOT_INDICES - 3u; count = 6u;
+#else
+			first = 0u; count = MESH_SLOT_INDICES;
+#endif
+		}
+	}
+#endif
+#if BS_DRAW_GUARD
+	if (!drawSane(first, count)) return;
+#endif
 	C3D_DrawElements(GPU_TRIANGLES, (int)count, C3D_UNSIGNED_SHORT, s_shared_indices + first);
 	metricsCountDraw(count / 3);
 }

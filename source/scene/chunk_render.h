@@ -211,3 +211,22 @@ void chunkRenderProfileReset(void);
 void chunkRenderProfile(float* scratch_us, float* mesh_us, int* builds);
 int      chunkRenderRefusals(void);   // pool full, or a chunk too big for a slot
 size_t   chunkRenderBytes(void);      // linear memory the pool claimed
+
+#if BS_DRAW_GUARD
+// Step: the draw guard's findings, for whoever writes the report. See drawSane() in
+// chunk_render.c. Code 0 means every draw issued this session passed; 1 = the bound vertex
+// buffer was NULL or not the start of a pool slot, 2 = the index count was not whole
+// triangles, 3 = the run ran off the end of the shared index buffer, 4 = the run's indices
+// reached past the vertex buffer that was bound for it.
+//
+// All read-only and all plain loads, so the watchdog thread can call them while the main
+// thread is wedged — it must never take a lock (see app/watchdog.h).
+int       chunkRenderGuardCode(void);
+int       chunkRenderGuardHits(void);
+int       chunkRenderGuardSlot(void);
+uint32_t  chunkRenderGuardFirst(void);
+uint32_t  chunkRenderGuardCount(void);
+uint32_t  chunkRenderGuardMaxIdx(void);
+uint32_t  chunkRenderGuardCap(void);
+uintptr_t chunkRenderGuardVerts(void);
+#endif

@@ -66,6 +66,12 @@ static volatile s32  s_draw_stage = -1;
 static volatile s32  s_draw_k     = -1;
 static volatile s32  s_draw_slot  = -1;
 
+// The draw guard's verdict, already formatted by the main thread into a buffer it owns and
+// keeps alive for the rest of the process. A pointer and not a copy because this thread must
+// not allocate, must not take a lock, and must not call anything that might: the whole value
+// of this file is that it still writes a report when everything else is wedged.
+static const char* volatile s_guard_line;
+
 static const char* const s_draw_stage_name[WD_DRAW_STAGE_COUNT] = {
 	[WD_DRAW_IDLE]        = "not in chunkRenderDraw",
 	[WD_DRAW_ENTER]       = "entered, before the cull",
@@ -73,7 +79,14 @@ static const char* const s_draw_stage_name[WD_DRAW_STAGE_COUNT] = {
 	[WD_DRAW_BIND]        = "pipelineBind + projection uniform",
 	[WD_DRAW_OPAQUE]      = "opaque pass",
 	[WD_DRAW_TRANSPARENT] = "transparent pass",
-	[WD_DRAW_DONE]        = "finished, back in main.c",
+	[WD_DRAW_DONE]        = "chunkRenderDraw returned (world submitted)",
+	[WD_DRAW_EYE_SETUP]   = "eye setup: RenderTargetClear + FrameDrawOn",
+	[WD_DRAW_HIGHLIGHT]   = "highlightDraw (block cage)",
+	[WD_DRAW_PLAYERS]     = "playerModelDraw (remote bodies)",
+	[WD_DRAW_TAGS]        = "playerModelDrawTags (name-tag sprites)",
+	[WD_DRAW_BOTTOM]      = "drawBottomUi (bottom screen + UI sprites)",
+	[WD_DRAW_FRAME_END]   = "C3D_FrameEnd (submitting to the GPU)",
+	[WD_DRAW_FRAME_WAIT]  = "C3D_FrameBegin SYNCDRAW (waiting on the GPU)",
 };
 
 static const char* drawStageName(s32 s)
@@ -189,14 +202,31 @@ static void reportBuild(u32 phase, u32 frames, u32 stuck_ms)
 		"  loop index : %ld\n"
 		"  mesh slot  : %ld\n"
 		"\n"
-		"'draw stage' is how far into scene/chunk_render.c's chunkRenderDraw the main thread\n"
-		"got. CULL means it never issued a GPU command at all, so the console is stuck on the\n"
-		"CPU. Any later stage means it is stuck waiting on the GPU.\n",
+		"'draw stage' is where in the frame's drawing the main thread was, from entering\n"
+		"chunkRenderDraw (scene/chunk_render.c) through to the wait on the GPU at the top of\n"
+		"the next frame. CULL means it never issued a GPU command at all, so the console is\n"
+		"stuck on the CPU. Any later stage means it is stuck on or after a GPU submission,\n"
+		"and the stage names which one.\n",
 		(long)s_probe_arm, (unsigned long)s_linear_free, (unsigned long)s_vram_free,
 		drawStageName(s_draw_stage), (long)s_draw_k, (long)s_draw_slot);
 	if (m > 0) {
 		const size_t room = sizeof(s_report) - len - 1;
 		len += ((size_t)m < room) ? (size_t)m : room;
+	}
+
+	// The draw guard's verdict. Printed even when nothing was wrong, because "no bad draw was
+	// ever issued" is the more useful half of the answer: it says the commands the GPU was
+	// handed were well formed and it stopped for some other reason, which is a different bug
+	// from the one being hunted.
+	const char* g = s_guard_line;
+	if (g) {
+		const int gm = snprintf(s_report + len, sizeof(s_report) - len,
+			"\n"
+			"draw guard   : %s\n", g);
+		if (gm > 0) {
+			const size_t room2 = sizeof(s_report) - len - 1;
+			len += ((size_t)gm < room2) ? (size_t)gm : room2;
+		}
 	}
 #endif
 
@@ -312,6 +342,11 @@ void watchdogDrawStage(int stage, int k, int slot)
 	s_draw_slot  = slot;
 }
 #endif
+
+void watchdogGuardLine(const char* line)
+{
+	s_guard_line = line;
+}
 
 bool watchdogFired(void)
 {

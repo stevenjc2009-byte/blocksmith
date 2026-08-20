@@ -1215,6 +1215,18 @@ static void bootTimingWrite(void)
 #define BS_DRAW_PROBE 0
 #endif
 
+// Throwaway: how full citro3d's command buffer gets. See the sample site next to
+// C3D_FrameEnd for what it is testing and why it can be answered in an emulator.
+//
+// Off by default:  make EXTRA_CFLAGS="-DBS_CMDBUF_PROBE=1"
+#ifndef BS_CMDBUF_PROBE
+#define BS_CMDBUF_PROBE 0
+#endif
+
+#if BS_CMDBUF_PROBE
+static float s_cmdbuf_last, s_cmdbuf_max;
+#endif
+
 // Whether the self-advancing arm bisect runs at all. OFF by default, and that default is a
 // bug fix rather than a preference.
 //
@@ -1504,9 +1516,38 @@ static bool s_stereo = false;
 // Each eye clears its own target. The right eye is a separate render target with its own
 // colour and depth buffer, so drawing into it without clearing would composite this frame's
 // right eye on top of the last one's.
-static void drawEye(C3D_RenderTarget* target, const C3D_Mtx* view, const RayHit* hit,
-                    float iod)
+// The frame's half of the breadcrumb app/watchdog.h describes. chunkRenderDraw marks its own
+// insides; everything after it — the highlight, the two player passes, the bottom screen, the
+// submit, and the wait — happens in this file and used to be one unmarked stretch that the
+// report could only call "back in main.c".
+//
+// k carries the eye (0 left, 1 right) for the stages inside drawEye and -1 for the rest. The
+// mesh-slot field is always -1 here: none of these stages is inside a chunk loop.
+#if BS_DRAW_PROBE
+// Set to a WdDrawStage value and the main thread parks forever the instant that marker is set,
+// which is exactly the shape of the hardware freeze. This is how the markers are proven able to
+// go red: an arm built with, say, -DBS_FRAME_HANG_TEST=WD_DRAW_BOTTOM must produce a hang.txt
+// naming drawBottomUi and nothing else. Never in a release build.
+//
+// #ifdef and not #if, and left undefined by default on purpose: the value is a stage *name*,
+// and `#if WD_DRAW_BOTTOM` would quietly evaluate an enum constant the preprocessor has never
+// heard of as 0 and compile the whole check away — an armed build that cannot fire.
+static void drawStage(int stage, int k)
 {
+	watchdogDrawStage(stage, k, -1);
+#ifdef BS_FRAME_HANG_TEST
+	if (stage == (BS_FRAME_HANG_TEST)) for (;;) svcSleepThread(1000000000ULL);
+#endif
+}
+#else
+#define drawStage(stage, k) ((void)0)
+#endif
+
+static void drawEye(C3D_RenderTarget* target, const C3D_Mtx* view, const RayHit* hit,
+                    float iod, int eye)
+{
+	drawStage(WD_DRAW_EYE_SETUP, eye);
+	(void)eye;   // the markers are the only reader; a non-probe build has none
 	chunkRenderSetEye(iod);
 	C3D_RenderTargetClear(target, C3D_CLEAR_ALL, CLEAR_COLOR, 0);
 	C3D_FrameDrawOn(target);
@@ -1521,6 +1562,7 @@ static void drawEye(C3D_RenderTarget* target, const C3D_Mtx* view, const RayHit*
 	// next call instead. See pipelineBind in chunk_render.c. highlightDraw itself checks
 	// hit->hit (see highlight.h), so there is no guard here to keep in sync with it.
 	// It reads chunkRenderProjection(), so it gets this eye's matrix for free.
+	drawStage(WD_DRAW_HIGHLIGHT, eye);
 	highlightDraw(view, hit);
 
 	// The other people in the session, from the pose table net/networld.c fills. Both calls
@@ -1535,7 +1577,9 @@ static void drawEye(C3D_RenderTarget* target, const C3D_Mtx* view, const RayHit*
 	// 400x240 is the top screen, which is the only target drawEye is ever given. Passing the
 	// wrong size here would not fail — it would scale every tag's position, which is the kind
 	// of wrong that reads as a projection bug.
+	drawStage(WD_DRAW_PLAYERS, eye);
 	playerModelDraw(view);
+	drawStage(WD_DRAW_TAGS, eye);
 	playerModelDrawTags(view, 400.0f, 240.0f);
 }
 
@@ -2634,6 +2678,22 @@ session_start:
 		         networldSentEdits(), networldRecvMsgs(), networldSyncEntries(),
 		         networldAppliedEdits(), networldPendingCount(), networldRemoteCount());
 
+#if BS_CMDBUF_PROBE
+		// Throwaway instrument, not shipped. hang.txt proved the main thread finishes the
+		// whole frame and then blocks in C3D_FrameBegin(C3D_FRAME_SYNCDRAW), so the GPU took
+		// the world's commands and never signalled. One thing that does exactly that, and
+		// grows with the number of chunks on screen, is the command buffer overrunning: it is
+		// 0x40000 bytes (C3D_DEFAULT_CMDBUF_SIZE, passed in gfx/screen.c) and citro3d does not
+		// bounds-check the writes into it, so a frame that needs more silently walks off the
+		// end and the GPU is handed whatever follows it in the linear heap.
+		//
+		// Measurable here rather than on his console: Azahar runs the same citro3d and builds
+		// the same command list, and the usage figure does not depend on the GPU ever
+		// completing the frame.
+		snprintf(netline, sizeof(netline), "cmd %5.1f%% max %5.1f%%",
+		         (double)(s_cmdbuf_last * 100.0f), (double)(s_cmdbuf_max * 100.0f));
+#endif
+
 		// A BS_REPORT_ONLY build with no bottom UI has no reader for either, and an unused
 		// buffer is a -Werror stop. Kept built anyway so the two builds run the same code
 		// path and the strings cannot rot in the configuration nobody compiles.
@@ -2644,7 +2704,32 @@ session_start:
 		// before it returns, and a GPU that never signals leaves the main thread here forever —
 		// which is the shape of the report this watchdog was built for: a last frame still on
 		// both screens, the HUD numbers frozen mid-world, and HOME dead.
+#if BS_DRAW_GUARD
+		// Refreshed here, immediately before the call that hangs, so the report describes every
+		// draw issued up to and including the last frame the console completed. Formatted on
+		// this thread into a static that outlives the process — the monitor thread only stores
+		// the pointer, and it must not do work of its own (app/watchdog.h).
+		{
+			static char guard[160];
+			const int code = chunkRenderGuardCode();
+			if (code)
+				snprintf(guard, sizeof(guard),
+				         "BAD DRAW code %d hits %d slot %d first %lu count %lu "
+				         "maxidx %lu cap %lu verts %08lx",
+				         code, chunkRenderGuardHits(), chunkRenderGuardSlot(),
+				         (unsigned long)chunkRenderGuardFirst(),
+				         (unsigned long)chunkRenderGuardCount(),
+				         (unsigned long)chunkRenderGuardMaxIdx(),
+				         (unsigned long)chunkRenderGuardCap(),
+				         (unsigned long)chunkRenderGuardVerts());
+			else
+				snprintf(guard, sizeof(guard),
+				         "clean - every chunk draw issued this session validated");
+			watchdogGuardLine(guard);
+		}
+#endif
 		watchdogPhase(WD_PHASE_DRAW);
+		drawStage(WD_DRAW_FRAME_WAIT, -1);
 		metricsSyncBegin();
 		C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
 		spriteFrameBegin();
@@ -2660,17 +2745,25 @@ session_start:
 			// framebuffer holding whatever was in it when the slider was last open, and the
 			// moment the player nudged the slider a stale frame would flash.
 			const float iod = s_stereo ? osGet3DSliderState() * chunkRenderMaxIod() : 0.0f;
-			drawEye(screenTop(), &view, &it.target, s_stereo ? -iod : 0.0f);
+			drawEye(screenTop(), &view, &it.target, s_stereo ? -iod : 0.0f, 0);
 			if (s_stereo)
-				drawEye(screenTopRight(), &view, &it.target, iod);
+				drawEye(screenTopRight(), &view, &it.target, iod, 1);
 #if BS_BOTTOM_UI
 			// Step 8.3. Last in the frame, and deliberately so: the sprite batch sets its
 			// own render state and does not restore it (see gfx/sprite.h), while
 			// chunkRenderDraw re-establishes everything it needs at the top of its next
 			// call. Drawing the UI first would mean paying to put the world's state back.
+			drawStage(WD_DRAW_BOTTOM, -1);
 			drawBottomUi(ui_ok, highlight_ok ? status : "HIGHLIGHT INIT FAILED",
 			             netline, &touch);
 #endif
+#if BS_CMDBUF_PROBE
+		// Sampled here and not after C3D_FrameEnd, because FrameEnd is what rewinds the
+		// command buffer — read it afterwards and the answer is always zero.
+		s_cmdbuf_last = C3D_GetCmdBufUsage();
+		if (s_cmdbuf_last > s_cmdbuf_max) s_cmdbuf_max = s_cmdbuf_last;
+#endif
+		drawStage(WD_DRAW_FRAME_END, -1);
 		metricsSubmitBegin();
 		C3D_FrameEnd(0);
 		metricsSubmitEnd();
