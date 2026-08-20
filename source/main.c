@@ -1239,10 +1239,16 @@ static float s_cmdbuf_last, s_cmdbuf_max;
 // previous version. A diagnostic that silently inherits state from a build that is no longer
 // installed is a diagnostic that lies.
 //
-// It is off rather than version-stamped because the arms are no longer the instrument. The
-// draw-stage breadcrumb in scene/chunk_render.c answers the same question on the first boot
-// that freezes, without removing anything from the frame — so the shipped diagnostic now
-// draws the whole world, looks like the game, and still names where it died.
+// It is now version-stamped as well (see probeBegin), which is what makes turning it back on
+// safe. v1.2.3 turns it on deliberately: v1.2.2's hardware report showed the freeze happens on
+// the FIRST world frame — `frame captures: 1`, `columns in: 49`, the frame's own
+// ProcessCommandList submitted and never completed — so the failure is deterministic and
+// immediate, and stepping one arm per boot costs seconds rather than a play session.
+//
+// The breadcrumb alone cannot finish the job: it names the draw stage the main thread was in,
+// but the main thread is parked inside C3D_FrameEnd waiting on a GPU that stopped, so the
+// breadcrumb says "FrameEnd" no matter which of the draws inside the list is the poison. Only
+// removing them one at a time can say which.
 #ifndef BS_DRAW_BISECT
 #define BS_DRAW_BISECT 0
 #endif
@@ -1297,6 +1303,36 @@ static void probeBegin(void)
 	int  last_start = -1;
 	bool came_back  = true;
 	char line[128];
+
+	// Version stamp, and the reason this whole mechanism can be trusted again.
+	//
+	// v1.1.2's bisect read v1.1.1's leftover drawprobe.txt, concluded from it that every arm had
+	// already had its turn, and parked on the arm that draws nothing. steve installed it, launched
+	// a world and saw only block outlines — a build meant to freeze came back alive and was
+	// reported as passing when it had never been tested at all.
+	//
+	// Discarding a foreign file is not merely tidiness here: the arms are RENUMBERED between
+	// rounds. Round 1's arm 2 was "no highlight cage"; round 2's arm 2 is "cull only, not one GPU
+	// command". A line saying "arm 2" from an older build is not a fact about this build, so it is
+	// deleted rather than interpreted. Anything not written by exactly this version goes.
+	{
+		char stamp[80];
+		snprintf(stamp, sizeof stamp, "# blocksmith %s round 2 bisect\n",
+		         BLOCKSMITH_VERSION_SET ? BLOCKSMITH_VERSION : "(unset)");
+
+		bool ours = false;
+		FILE* v = fopen(PROBE_FILE, "r");
+		if (v) {
+			char first[80];
+			ours = (fgets(first, sizeof first, v) != NULL) && strcmp(first, stamp) == 0;
+			fclose(v);
+		}
+		if (!ours) {
+			remove(PROBE_FILE);
+			FILE* n = fopen(PROBE_FILE, "w");
+			if (n) { fputs(stamp, n); fclose(n); }
+		}
+	}
 
 	FILE* f = fopen(PROBE_FILE, "r");
 	if (f) {

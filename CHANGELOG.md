@@ -4,6 +4,54 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.3] - 2026-08-20
+
+### Why this build exists
+
+v1.2.2's hardware report was the first from a provably single boot (the boot fence worked). It said the freeze happens on the FIRST world frame, not after minutes of play: `frame captures: 1`, `list check: 1 clean frame(s)`, `columns in: 49` (world still streaming). The `frames drawn: 341` is almost entirely title screen. The frame's own ProcessCommandList was submitted and never completed — `gx queue: cap 32 queued 5 submitted 5 completed 2`, with both buffer clears completing and the draw never doing so. Vblanks kept arriving, the command list was byte-identical to what was submitted, it validated clean, and the draw guard passed every chunk.
+
+This clears v1.2.1's fix as the cause. That race needed a previous in-flight draw for genFollow and the mesh drains to overwrite. On the first world frame there is no previous draw.
+
+### The draw bisect is switched back on
+
+Version-stamped so it cannot repeat v1.1.2's failure. Round 1 (already done, on hardware) removed whole draws from the frame and left exactly one survivor — "no world" — so chunkRenderDraw() is the call that hangs. Round 2's six arms cut INSIDE it: 0 everything (control, must hang), 1 world draw skipped entirely (control, must survive), 2 cull only - all the CPU work and not one GPU command, 3 opaque pass only, 4 transparent pass only, 5 GPU state set up but no draw calls at all. Arm 2 is the pivot: if it hangs the fault is a CPU loop that never ends; if it survives the fault is something handed to the GPU.
+
+### Version stamping
+
+drawprobe.txt now carries a `# blocksmith <version> round 2 bisect` first line. Anything not written by exactly this version is deleted rather than interpreted. This matters because arms are RENUMBERED between rounds — round 1's arm 2 was "no highlight cage", round 2's arm 2 is "cull only". v1.1.2 read v1.1.1's file, concluded every arm had had its turn, and parked on the arm that draws nothing; a build meant to freeze came back alive and was reported as passing.
+
+### Two report lines that lied, fixed
+
+(a) The R1 command-list replay printed "REPLAY IS BROKEN" on timeout. replaySubmit uses GX_ProcessCommandList, which appends to the SAME GX queue the game's frame was submitted on — so when that frame is already wedged the replay can never run. It now samples the queue before submitting and says "the queue was ALREADY wedged; the replay never ran", with the queued/completed counts. On steve's console the old wording blamed the instrument for the bug it had just caught. (b) The `gsp vblank` explanation claimed ALIVE proves the stall is a GPU command that never finished. VBlank and command-completion are different GSP events, so ALIVE does not prove completion interrupts are being delivered. Reworded.
+
+### Verified
+
+(emulator, both directions): planted a foreign 1799-byte round-1 drawprobe.txt — it was discarded, not inherited, and boot 1 started at arm 0. Across 7 boots the arm advanced exactly one step per boot, 0 through 5, then reported "all arms done; parked on arm 5", with no false HUNG lines. Red control with a stall planted: boot 1 wrote `arm 0 START` and hung with no survival line; boot 2 correctly wrote `arm 0 HUNG - no survival line, the console froze on this arm` and advanced to arm 1. No hardware testing was performed; this build does not attempt to fix the freeze.
+
+## [1.2.3] - 2026-08-20
+
+### Why this build exists
+
+v1.2.2's hardware report was the first from a provably single boot (the boot fence worked). It said the freeze happens on the FIRST world frame, not after minutes of play: `frame captures: 1`, `list check: 1 clean frame(s)`, `columns in: 49` (world still streaming). The `frames drawn: 341` is almost entirely title screen. The frame's own ProcessCommandList was submitted and never completed — `gx queue: cap 32 queued 5 submitted 5 completed 2`, with both buffer clears completing and the draw never doing so. Vblanks kept arriving, the command list was byte-identical to what was submitted, it validated clean, and the draw guard passed every chunk.
+
+This clears v1.2.1's fix as the cause. That race needed a previous in-flight draw for genFollow and the mesh drains to overwrite. On the first world frame there is no previous draw.
+
+### The draw bisect is switched back on
+
+Version-stamped so it cannot repeat v1.1.2's failure. Round 1 (already done, on hardware) removed whole draws from the frame and left exactly one survivor — "no world" — so chunkRenderDraw() is the call that hangs. Round 2's six arms cut INSIDE it: 0 everything (control, must hang), 1 world draw skipped entirely (control, must survive), 2 cull only - all the CPU work and not one GPU command, 3 opaque pass only, 4 transparent pass only, 5 GPU state set up but no draw calls at all. Arm 2 is the pivot: if it hangs the fault is a CPU loop that never ends; if it survives the fault is something handed to the GPU.
+
+### Version stamping
+
+drawprobe.txt now carries a `# blocksmith <version> round 2 bisect` first line. Anything not written by exactly this version is deleted rather than interpreted. This matters because arms are RENUMBERED between rounds — round 1's arm 2 was "no highlight cage", round 2's arm 2 is "cull only". v1.1.2 read v1.1.1's file, concluded every arm had had its turn, and parked on the arm that draws nothing; a build meant to freeze came back alive and was reported as passing.
+
+### Two report lines that lied, fixed
+
+(a) The R1 command-list replay printed "REPLAY IS BROKEN" on timeout. replaySubmit uses GX_ProcessCommandList, which appends to the SAME GX queue the game's frame was submitted on — so when that frame is already wedged the replay can never run. It now samples the queue before submitting and says "the queue was ALREADY wedged; the replay never ran", with the queued/completed counts. On steve's console the old wording blamed the instrument for the bug it had just caught. (b) The `gsp vblank` explanation claimed ALIVE proves the stall is a GPU command that never finished. VBlank and command-completion are different GSP events, so ALIVE does not prove completion interrupts are being delivered. Reworded.
+
+### Verified
+
+(emulator, both directions): planted a foreign 1799-byte round-1 drawprobe.txt — it was discarded, not inherited, and boot 1 started at arm 0. Across 7 boots the arm advanced exactly one step per boot, 0 through 5, then reported "all arms done; parked on arm 5", with no false HUNG lines. Red control with a stall planted: boot 1 wrote `arm 0 START` and hung with no survival line; boot 2 correctly wrote `arm 0 HUNG - no survival line, the console froze on this arm` and advanced to arm 1. No hardware testing was performed; this build does not attempt to fix the freeze.
+
 ## [1.2.2] - 2026-08-20
 
 ### Instrument, not a guess

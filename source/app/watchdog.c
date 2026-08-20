@@ -687,9 +687,11 @@ static void reportBuild(u32 phase, u32 frames, u32 stuck_ms)
 			"\n"
 			"'gsp vblank' is citro3d's two frame counters, read twice while the main thread was\n"
 			"already stuck. They are bumped by the GSP event thread on every vblank tick.\n"
-			"ALIVE means vblanks are still arriving, so the stall is the GX queue - a GPU\n"
-			"command that never finished. STOPPED means event delivery itself has died, and\n"
-			"the drawing is not the bug.\n",
+			"ALIVE means the GSP event thread is running and delivering VBlank. It does NOT\n"
+			"prove command-completion interrupts are being delivered - those are a different\n"
+			"GSP event, so an incomplete GX command may mean the GPU never finished it OR that\n"
+			"its completion was never signalled. STOPPED means event delivery itself has died,\n"
+			"and the drawing is not the bug.\n",
 			(d0 || d1) ? "ALIVE" : "STOPPED",
 			d0, d1, (unsigned long)WD_FC_GAP_MS,
 			(unsigned long)s_fc_a[0], (unsigned long)s_fc_a[1],

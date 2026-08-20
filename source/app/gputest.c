@@ -471,6 +471,20 @@ static bool replayInit(void)
 	return s_replay != NULL;
 }
 
+// Is there already a command in the GX queue that has not reported completion? If so, anything
+// submitted now is appended behind it and cannot run, so a submission timeout says nothing at all
+// about the thing being submitted. Bounds-checked the same way watchdog.c's reader is: a wrong
+// pointer here would fault and cost the whole report.
+static bool queueIncomplete(unsigned* queued, unsigned* done)
+{
+	const gxCmdQueue_s* q = C3D_QUEUE;
+	if (!q->entries || q->maxEntries == 0 || q->maxEntries > 64) return false;
+	if (q->numEntries > q->maxEntries || q->lastEntry > q->maxEntries) return false;
+	*queued = q->numEntries;
+	*done   = q->lastEntry;
+	return q->lastEntry < q->numEntries;
+}
+
 // Submits `nwords` words from s_replay. The caller has already filled and sized it.
 static bool replaySubmit(u32 nwords, u32* us)
 {
@@ -742,13 +756,36 @@ void gpuTestListProbe(const uint8_t* list, uint32_t len_bytes)
 	          (unsigned long)nwords);
 
 	// R1. Replay it once, unchanged. This frame's list has already been executed by the GPU, so
-	//     the only acceptable result is PASS. A TIMEOUT here means the replay is broken.
+	//     the only acceptable result is PASS.
+	//
+	//     A TIMEOUT does NOT on its own mean the replay machinery is broken, and saying so cost
+	//     a real diagnosis. replaySubmit() uses GX_ProcessCommandList, which appends to the SAME
+	//     GX queue the game's own frame was submitted on. If that frame's ProcessCommandList is
+	//     still incomplete, this replay sits behind a command that will never finish and cannot
+	//     run at all.
+	//
+	//     That is exactly what happened on steve's console with v1.2.2: the first world frame
+	//     wedged, then R1 timed out behind it, and the report announced "REPLAY IS BROKEN" —
+	//     blaming the instrument for the bug it had just caught. So the queue is sampled BEFORE
+	//     submitting and the verdict says which of the two situations this is.
+	unsigned pre_queued = 0, pre_done = 0;
+	const bool pre_stuck = queueIncomplete(&pre_queued, &pre_done);
+
 	memcpy(s_replay, list, len_bytes);
 	bool ok = replaySubmit(nwords, &us);
 	len = app(s_self, sizeof(s_self), len,
 	          "R1 replay unchanged                %-8s %8lu us   %s\n",
 	          ok ? "PASS" : "TIMEOUT", (unsigned long)us,
-	          ok ? "replay machinery works" : "<- REPLAY IS BROKEN, ignore R2/R3 and the bisect");
+	          ok          ? "replay machinery works"
+	          : pre_stuck ? "<- the queue was ALREADY wedged; the replay never ran"
+	                      : "<- REPLAY IS BROKEN, ignore R2/R3 and the bisect");
+	if (!ok && pre_stuck)
+		len = app(s_self, sizeof(s_self), len,
+		          "   Before this replay was submitted the GX queue already had %u command(s)\n"
+		          "   queued and only %u completed. GX_ProcessCommandList appends to that same\n"
+		          "   queue, so this replay could never have run. The GAME'S OWN FRAME is what\n"
+		          "   hung; the replay machinery is not implicated, and R2/R3 below mean nothing.\n",
+		          pre_queued, pre_done);
 	selfFlush(len);
 
 	// R2. Replay it fifty times. Proves repetition of one list is not itself the trigger.
