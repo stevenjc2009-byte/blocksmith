@@ -4,6 +4,91 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.2] - 2026-08-20
+
+### Instrument, not a guess
+
+This release can tell us where the console actually stops. Everything v1.2.1 fixed is still in it. What is new is the visibility into the exact moment a freeze happens, and which boot froze.
+
+The reason it was needed: the user booted v1.2.0 twice, once into multiplayer and once into single player, and both froze. The SD card came back with `postmortem.txt` saying "frame 2, GPU wedged" and `hang.txt` saying "340 frames drawn, phase DRAW". Both stamped 1.2.0, and they cannot describe the same freeze. Nothing on the card said which boot either came from — so two separate failures were read as one, and the fix that followed was aimed at an average of them. That is the real reason five builds in a row have missed.
+
+### Boot fencing
+
+At startup, after `sdmc:/blocksmith` is created and before anything can write into it, the app deletes `hang.txt`, `postmortem.txt`, `gxprobe.txt`, `selftest.txt`, `cmdhang.bin`, `cmdprev.bin`, `bisect.bin`, `boot_timing.txt` and the numbered `cmd*.bin` capture ring, then writes `bootid.txt` naming the version and whether it is an Old or New 3DS. A boot that freezes cannot delete its own files, and the next boot deletes them before writing its own — so from now on, any diagnostic file sitting on the card was written by the boot that just froze. `drawprobe.txt` is deliberately exempt because its entire job is to survive a boot: a boot that hangs never writes its own survival line, and that silence is what the next boot reads.
+
+### Full reporting instrumentation
+
+Switched back on. It existed in v1.1.8 and was compiled out of v1.2.0 and v1.2.1, which is why their `hang.txt` could only say a phase name and could not say whether the GPU or the CPU was stuck. Now `hang.txt` carries: the GX command queue with which command is stuck, citro3d's two vblank counters sampled twice a second apart (which separates "the GPU never finished" from "event delivery died"), the draw-stage breadcrumb naming which pass and which chunk index was being drawn, and the draw guard's verdict on whether any malformed draw was ever issued.
+
+### Nothing is removed from the frame
+
+The draw bisect's arm selection is forced to arm 0, "everything drawn", so this build looks and plays like the game. This matters because an earlier diagnostic build silently parked itself on a "draw nothing" arm, came back alive, and was reported as passing when it had actually been skipped.
+
+### The command-list checker was manufacturing false evidence
+
+`hang.txt`'s `list check` section reads back the exact command list the GPU was executing and
+looks for values a rasteriser cannot use. It was decoding every vertex-shader float uniform as
+PICA **float24**, three packed words per vec4.
+
+citro3d does not upload in that format. It sets bit 31 of `GPUREG_VSH_FLOATUNIFORM_CONFIG`
+(register `0x2C0`), which selects plain IEEE **float32**, four words per vec4. Reading those
+words as float24 slices 24-bit fields straight across the float boundaries, and the garbage that
+falls out routinely has an exponent of all ones - which the checker then reported as "float
+uniform is Inf or NaN".
+
+Measured on a real captured list: all sixteen `0x2C0` writes in the frame are `80000000` /
+`80000004`, bit 31 set. All sixteen `0x2C1` uniform bursts have parameter counts divisible by
+four and none divisible by three. Decoded as float32 the values are an ordinary view matrix -
+`bf800000` (-1.0), `3f3504f3` (0.70710678), `c19069e8` (-18.05).
+
+The checker now reads the `0x2C0` mode bit and decodes accordingly, and a burst reached without
+a preceding config write is left unchecked rather than decoded on a guess.
+
+The effect, same captured list, same build otherwise:
+
+| | before | after |
+|---|---|---|
+| frames flagged | 597 of 795 | 0 of 199 |
+
+Its self-test was passing throughout, because it only ever fed itself synthetic float24 data -
+it agreed with its own wrong assumption. There is now a float32 red/green pair as well, and the
+green word (`3f35047f`) is chosen so it can only pass if the mode bit is honoured: it is an
+ordinary float32 whose low byte is `0x7f`, exactly where float24 slicing puts an exponent. With
+only the mode bit cleared, that same word flags. Both pairs report under test 9.
+
+**Any conclusion drawn from a `list check` line in a hang report before this release has to be
+thrown away.**
+
+### The GX queue heading could blame the wrong processor
+
+With a stall planted in the CPU-side draw loop, `hang.txt` printed `queued 1 submitted 0
+completed 0` under a heading reading `STUCK ON : entry 0 type 2 MemoryFill`. The numbers were
+right and the heading was a lie - nothing had been handed to the GPU at all.
+
+When `submitted` has not moved past `completed`, nothing is in flight; the entry is labelled
+`NOT SENT` and the report says in words that the stall is CPU-side. When it has, the label is
+still `STUCK ON`. This is the single most consequential line in the file, because it decides
+which half of the machine the next build looks at.
+
+### Verified
+
+Both emulator arms, on the shipping validator:
+
+- **Red** (stall planted at opaque-pass chunk index 3): `hang.txt` named `phase DRAW`,
+  `draw stage opaque pass`, `loop index 3`, `mesh slot 57` - an exact hit on the planted
+  location. `gsp vblank ALIVE (+59/+59)`, `gx queue ... NOT SENT`, `list check: 199 clean
+  frame(s), nothing flagged`, `draw guard clean`.
+- **Green** (shipping build, nothing planted): world renders normally at 114 meshes / 88084
+  tris, no `hang.txt`, no `postmortem.txt`, `drawprobe.txt` reads `arm 0 SURVIVED 600 frames`.
+- Validator self-test reports `9 validator red/green pair PASS - flags Inf in both float
+  formats, flags a bad address`.
+
+Red arm ran on an Old 3DS emulator profile, green arm on a New 3DS one.
+
+**No hardware testing was performed.** The freeze this build exists to locate has never
+reproduced in an emulator, so nothing here says the freeze is fixed - only that the instrument
+works and reports honestly.
+
 ## [1.2.1] - 2026-08-20
 
 ### Fixed - the hardware freeze, for real this time

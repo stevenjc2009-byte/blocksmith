@@ -349,6 +349,31 @@ static size_t gxAppend(char* buf, size_t cap, size_t len, const char* oldest_lab
 			len += ((size_t)bm < room) ? (size_t)bm : room;
 		}
 	} else if (done < num) {
+		// Which way round the stall is, and this line is the difference between aiming the next
+		// build at the GPU and aiming it at the CPU.
+		//
+		// `cur` is the first entry not yet HANDED to GX; `done` is how many it has reported
+		// finishing. If cur has not moved past done then nothing is in flight at all: the GPU
+		// finished everything it was given and these entries are merely waiting to be submitted,
+		// which means the thing that stopped is the main thread, not the hardware.
+		//
+		// Written after a red-arm run with a stall planted in the CPU-side draw loop printed
+		// "queued 1 submitted 0 completed 0" under a heading reading "STUCK ON: MemoryFill".
+		// The numbers were right and the heading was a lie; a report that has to be believed
+		// cannot carry one.
+		const bool in_flight = (cur > done);
+		if (!in_flight) {
+			const int fm = snprintf(buf + len, cap - len,
+				"  NOTE       : submitted == completed, so NOTHING is in flight. The GPU finished\n"
+				"               everything it was handed. The entr%s below %s never sent to it,\n"
+				"               so the stall is on the CPU side, not in the hardware.\n",
+				(num - done) == 1u ? "y" : "ies", (num - done) == 1u ? "was" : "were");
+			if (fm > 0) {
+				const size_t room = cap - len - 1;
+				len += ((size_t)fm < room) ? (size_t)fm : room;
+			}
+		}
+
 		// Every command GX has been given and not reported back, oldest first. The oldest is
 		// the one it is actually on; anything after it is queued behind it.
 		for (unsigned i = done; i < num && i < done + 4u; i++) {
@@ -356,7 +381,7 @@ static size_t gxAppend(char* buf, size_t cap, size_t len, const char* oldest_lab
 			const int em = snprintf(buf + len, cap - len,
 				"  %-10s : entry %u  type %u  %s\n"
 				"    args     : %08lx %08lx %08lx %08lx\n",
-				(i == done) ? oldest_label : "behind it",
+				(i == done) ? (in_flight ? oldest_label : "NOT SENT") : "behind it",
 				i, (unsigned)e->type, gxTypeName(e->type),
 				(unsigned long)e->args[0], (unsigned long)e->args[1],
 				(unsigned long)e->args[2], (unsigned long)e->args[3]);

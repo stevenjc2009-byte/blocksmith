@@ -193,6 +193,10 @@ static bool cmdAt(const u32* w, u32 nwords, u32 i, Cmd* out)
 #define F24_INFNAN 0x7Fu
 #define F24_HUGE   0x78u
 
+// The same two thresholds for IEEE float32, which is the format citro3d actually uploads in.
+// Exponent is [30:23] with bias 127, so all-ones is Inf/NaN and 127+57 = 184 is the 2^57 cutoff.
+#define F32_HUGE   0xB8u
+
 static bool addrReadable(u32 a)
 {
 	return (a >= 0x18000000u && a < 0x18600000u) ||   // VRAM
@@ -230,6 +234,13 @@ bool gpuTestValidateList(const uint8_t* list, uint32_t len, uint32_t frame)
 	u32 base = 0x18000000u;   // citro3d expresses every buffer as an offset from the VRAM base
 	u32 voff = 0, nverts = 0;
 
+	// -1 until a 0x2C0 config write says which format the uniform bursts are in. A burst reached
+	// without one is left UNCHECKED rather than decoded on a guess: guessing is what produced 597
+	// false "Inf or NaN" reports, and a validator that invents evidence is worse than one that
+	// stays quiet. In the real captured list every one of the 16 bursts is preceded by a config
+	// write, so this only bites on a list captured mid-stream.
+	int f32_uniforms = -1;
+
 	// Parameter p of the command starting at word i. Parameter 0 IS word0, at i; every parameter
 	// after it lives past the header, at i+1+p. Getting this wrong reads the header as a value
 	// and turns the whole validator into noise, so it is written once and used everywhere.
@@ -237,8 +248,38 @@ bool gpuTestValidateList(const uint8_t* list, uint32_t len, uint32_t frame)
 
 	Cmd c;
 	for (u32 i = 0; cmdAt(w, nwords, i, &c); i += c.words) {
-		// Float uniforms. A consecutive write to 0x2C1 is a burst of vec4s, three words each.
+		// Which format the uniform burst that follows is in. Bit 31 of 0x2C0 selects it, and
+		// getting this wrong is not a small error: citro3d puts this GPU in FLOAT32 mode for
+		// every uniform it uploads, four plain IEEE words per vec4, and reading those words as
+		// packed float24 slices 24-bit fields straight across the float boundaries.
+		//
+		// That is not hypothetical. Until this was added the validator assumed float24
+		// unconditionally and reported "float uniform is Inf or NaN" on 597 of 795 captured
+		// frames from a run whose world rendered perfectly and whose draw guard was clean. The
+		// real words in that capture were bf800000 (-1.0), 3f3504f3 (0.70710678), c19069e8
+		// (-18.05) — a correct view matrix. Every one of those 597 flags was the decoder
+		// mis-slicing its own input, and any conclusion ever drawn from a "list check" line in
+		// a hang report predating this fix has to be thrown away.
+		if (c.reg == 0x2C0u) {
+			f32_uniforms = (PARAM(i, 0u) & 0x80000000u) != 0u;
+			continue;
+		}
+
+		// Float uniforms. A consecutive write to 0x2C1 is a burst of vec4s: four IEEE float32
+		// words each in f32 mode, three packed float24 words each in f24 mode.
 		if (c.reg == 0x2C1u) {
+			if (f32_uniforms < 0) continue;   // format unknown - see the declaration
+			if (f32_uniforms) {
+				for (u32 p = 0; p < c.nparams; p++) {
+					const u32 v = PARAM(i, p);
+					const u32 e = (v >> 23) & 0xFFu;
+					if (e == 0xFFu)
+						flag(1, frame, i + p, c.reg, v, "float uniform is Inf or NaN");
+					else if (e >= F32_HUGE)
+						flag(2, frame, i + p, c.reg, v, "float uniform is absurdly large");
+				}
+				continue;
+			}
 			for (u32 p = 0; p + 2u < c.nparams; p += 3u) {
 				const u32 w0 = PARAM(i, p), w1 = PARAM(i, p + 1u), w2 = PARAM(i, p + 2u);
 				const u32 f[4] = {
@@ -314,15 +355,20 @@ static size_t validatorSelfCheck(char* buf, size_t cap, size_t len)
 	memcpy(save_what, s_vwhat, sizeof(save_what));
 	s_vcode = 0; s_vhits = 0; s_vframes_ok = 0;
 
-	// Four words: one consecutive write to 0x2C1 (the vertex shader float uniform data register)
-	// carrying three parameter words, which is exactly how citro3d sends one vec4.
+	// Six words: a write to 0x2C0 selecting the uniform format, then a consecutive write to 0x2C1
+	// (the vertex shader float uniform data register) carrying three parameter words.
 	//   word0 = parameter 0
 	//   word1 = header: register | extra params << 20 | consecutive << 31
-	u32 list[4];
-	list[0] = 0x00000000u;
-	list[1] = 0x2C1u | (2u << 20) | (1u << 31);
-	list[2] = 0x00000000u;
-	list[3] = 0x00000000u;
+	// The 0x2C0 write is not decoration. Without it the validator does not know the format and
+	// skips the burst, so a self-check that omitted it would report PASS on a validator that never
+	// looked at anything.
+	u32 list[6];
+	list[0] = 0x00000000u;                          // 0x2C0 param: bit 31 clear -> float24 mode
+	list[1] = 0x2C0u;
+	list[2] = 0x00000000u;                          // 0x2C1 param 0
+	list[3] = 0x2C1u | (2u << 20) | (1u << 31);
+	list[4] = 0x00000000u;                          // param 1
+	list[5] = 0x00000000u;                          // param 2
 
 	const bool green = gpuTestValidateList((const uint8_t*)list, sizeof(list), 0);
 
@@ -330,9 +376,34 @@ static size_t validatorSelfCheck(char* buf, size_t cap, size_t len)
 	// are sliced out of the 96 bits as w0:w1:w2, so field 0 is the top 24 bits of word0 and an
 	// exponent of 0x7F there means Inf or NaN.
 	const int before = s_vcode;
-	list[0] = 0x7F000000u;
+	list[2] = 0x7F000000u;
 	const bool red = gpuTestValidateList((const uint8_t*)list, sizeof(list), 0);
 	const bool caught_infnan = (!red && s_vcode == 1 && s_vcode != before);
+
+	// The float32 pair, which is the mode the hardware is actually in. This exists because the
+	// float24 pair above passed for ten builds while the shipped validator was decoding real
+	// float32 uploads as float24 and reporting hundreds of imaginary NaNs per run.
+	//
+	// The green word is chosen so it can only pass if the 0x2C0 mode bit is honoured:
+	// 0x3F35047F is an ordinary float32 (about 0.70706, exponent 0x7E), but its low byte is 0x7F,
+	// which is exactly where the float24 slicing puts field 1's exponent. A validator that ignored
+	// the mode bit would flag this word as Inf or NaN. Passing it proves the bit changed the
+	// answer, not merely that a healthy list looked healthy.
+	s_vcode = 0;
+	u32 flist[6];
+	flist[0] = 0x80000000u;                         // 0x2C0 param: bit 31 SET -> float32 mode
+	flist[1] = 0x2C0u;
+	flist[2] = 0x3F35047Fu;                         // ~0.70706f, but float24-toxic
+	flist[3] = 0x2C1u | (2u << 20) | (1u << 31);
+	flist[4] = 0xBF800000u;                         // -1.0f
+	flist[5] = 0x00000000u;                         // 0.0f
+	const bool green32 = gpuTestValidateList((const uint8_t*)flist, sizeof(flist), 0);
+
+	// And the same list with a real float32 NaN in it, to prove the f32 path can still go red.
+	s_vcode = 0;
+	flist[2] = 0x7FC00000u;                         // exponent 0xFF, mantissa set -> NaN
+	const bool red32 = gpuTestValidateList((const uint8_t*)flist, sizeof(flist), 0);
+	const bool caught_f32 = (!red32 && s_vcode == 1);
 
 	// And once more for the address check: a draw whose vertex buffer offset puts it outside both
 	// VRAM and FCRAM. base (register 0x200) is written first, then DRAWELEMENTS.
@@ -349,17 +420,19 @@ static size_t validatorSelfCheck(char* buf, size_t cap, size_t len)
 	const bool red2 = gpuTestValidateList((const uint8_t*)dlist, sizeof(dlist), 0);
 	const bool caught_addr = (!red2 && s_vcode == 5);
 
-	const bool pass = green && caught_infnan && caught_addr;
+	const bool pass = green && caught_infnan && caught_addr && green32 && caught_f32;
 	len = app(buf, cap, len,
 	          "%-34s %-8s %8s   %s\n",
 	          "9  validator red/green pair", pass ? "PASS" : "FAILED", "-",
-	          pass ? "flags Inf and a bad address, passes a clean list"
+	          pass ? "flags Inf in both float formats, flags a bad address"
 	               : "the per-frame list check is NOT trustworthy in this build");
 	if (!pass)
 		len = app(buf, cap, len,
-		          "     clean list accepted: %s   Inf caught: %s   bad address caught: %s\n"
+		          "     f24 clean accepted: %s   f24 Inf caught: %s   bad address caught: %s\n"
+		          "     f32 clean accepted: %s   f32 NaN caught: %s\n"
 		          "     Treat every \"nothing flagged\" this build reports as meaningless.\n",
-		          green ? "yes" : "NO", caught_infnan ? "yes" : "NO", caught_addr ? "yes" : "NO");
+		          green ? "yes" : "NO", caught_infnan ? "yes" : "NO", caught_addr ? "yes" : "NO",
+		          green32 ? "yes" : "NO", caught_f32 ? "yes" : "NO");
 
 	s_vcode = save_code; s_vframe = save_frame; s_vword = save_word; s_vreg = save_reg;
 	s_vval  = save_val;  s_vhits = save_hits;   s_vframes_ok = save_ok;

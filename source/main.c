@@ -1960,6 +1960,69 @@ static bool runTitleScreen(Options* opts, bool returning_from_server)
 
 #endif   // BS_TITLE
 
+// Deletes every diagnostic file this build can write, at boot, before anything can write one.
+//
+// This exists because of a specific and expensive mistake. steve booted v1.2.0 twice — once
+// into multiplayer, once into single player — and both froze. The card came back with
+// postmortem.txt saying "frame 2, GPU wedged" and hang.txt saying "340 frames drawn, phase
+// DRAW". Both stamped 1.2.0. Both cannot describe the same freeze, and nothing on the card said
+// which boot either came from, so two separate failures were read as one and the fix that
+// followed was aimed at an average of them.
+//
+// After this runs, any diagnostic file on the card is from the boot that just froze, full stop.
+// A boot that freezes writes files and cannot delete them; the next boot deletes them before
+// writing its own. There is no third possibility and no way to be looking at last time's
+// evidence.
+//
+// drawprobe.txt is deliberately NOT deleted: it is the one file whose whole job is to survive a
+// boot, because a boot that hangs never writes its own survival line and the silence is what the
+// next boot reads. bootid.txt is written last, so a card with diagnostic files but no bootid.txt
+// means the fence itself failed and nothing on it should be trusted.
+static void diagFenceBoot(void)
+{
+	static const char* const kill[] = {
+		"sdmc:/blocksmith/hang.txt",
+		"sdmc:/blocksmith/postmortem.txt",
+		"sdmc:/blocksmith/gxprobe.txt",
+		"sdmc:/blocksmith/selftest.txt",
+		"sdmc:/blocksmith/cmdhang.bin",
+		"sdmc:/blocksmith/cmdprev.bin",
+		"sdmc:/blocksmith/bisect.bin",
+		"sdmc:/blocksmith/boot_timing.txt",
+		"sdmc:/blocksmith/bootid.txt",
+	};
+	for (size_t i = 0; i < sizeof(kill) / sizeof(kill[0]); i++)
+		remove(kill[i]);
+
+	// The capture ring's numbered frames, same reasoning.
+	for (int k = 0; k < 8; k++) {
+		char p[64];
+		snprintf(p, sizeof p, "sdmc:/blocksmith/cmd%d.bin", k);
+		remove(p);
+	}
+
+	bool n3ds = false;
+	APT_CheckNew3DS(&n3ds);
+
+	FILE* f = fopen("sdmc:/blocksmith/bootid.txt", "wb");
+	if (!f) return;
+	fprintf(f,
+		"Blocksmith boot fence\n"
+		"\n"
+		"version   : %s\n"
+		"console   : %s\n"
+		"boot tick : %llu\n"
+		"\n"
+		"Every other diagnostic file in this folder was deleted immediately before this one\n"
+		"was written. So anything sitting beside it — hang.txt, postmortem.txt, gxprobe.txt,\n"
+		"cmd*.bin — was written by THIS boot and no other. drawprobe.txt is the exception and\n"
+		"is meant to span boots.\n",
+		BLOCKSMITH_VERSION_SET ? BLOCKSMITH_VERSION : "(unset)",
+		n3ds ? "New 3DS" : "Old 3DS",
+		(unsigned long long)svcGetSystemTick());
+	fclose(f);
+}
+
 // Wait for everything the GPU was handed last frame to actually finish.
 //
 // C3D_FrameEnd(0) hands the frame's command list to GX and RETURNS. The GPU is still reading
@@ -2086,6 +2149,10 @@ int main(void)
 	// and the only thing that settles whether the card is usable is trying to write to it,
 	// which optionsSave then does.
 	mkdir("sdmc:/blocksmith", 0777);
+
+	// Immediately after the folder exists and before anything can write a diagnostic into it.
+	// See diagFenceBoot: this is what makes "the file is on the card" mean "this boot wrote it".
+	diagFenceBoot();
 
 	// Whether the file was there BEFORE the load, not after. app/options.c leaves a fresh
 	// Options at RENDER_DIST_MIN and says in its own comment on optionsDefaults that it
