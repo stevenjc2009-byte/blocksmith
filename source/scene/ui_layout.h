@@ -48,7 +48,12 @@
 
 #define CRAFT_CLOSE_H 28
 #define CRAFT_ROW_Y0  (CRAFT_Y + CRAFT_CLOSE_H)              // 148
-#define CRAFT_ROW_H   ((CRAFT_H - CRAFT_CLOSE_H) / RECIPE_COUNT)   // (120-28)/3 = 30
+// Divides the panel evenly among however many recipes crafting.h declares, so adding one
+// costs no layout edit here. (120-28)/4 = 23 px a row at RECIPE_COUNT 4; it was 30 at 3.
+// The floor is the 7 px font (gfx/font.h FONT_GLYPH_H) plus enough slop to stay a usable
+// touch target, so there is room for two or three more recipes before this has to become a
+// scroll list instead of a fixed split. 92 divides exactly by 4, leaving no dead strip.
+#define CRAFT_ROW_H   ((CRAFT_H - CRAFT_CLOSE_H) / RECIPE_COUNT)   // (120-28)/4 = 23
 
 #define HUD_TOGGLE_Y  GRID_Y                       // 40, directly under the hotbar
 #define HUD_TOGGLE_H  32

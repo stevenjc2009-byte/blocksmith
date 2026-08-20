@@ -9,10 +9,13 @@ static C3D_Tex s_tex;
 
 bool atlasInit(void)
 {
-	// vram = true. As of step 9.3 the atlas is 64x64 RGBA5551 (2 bytes/texel), so it
-	// costs 8 KB of the ~6 MB VRAM budget rather than the 256 KB it cost at the old
-	// 256x256 RGBA8888 (4 bytes/texel) — both figures computed from the sheet, not
-	// measured on-device. Texture reads out of VRAM are the cheap ones on this GPU.
+	// vram = true. The atlas is 128x128 RGBA5551 (2 bytes/texel), so it costs 32 KB of
+	// the ~6 MB VRAM budget. It was 64x64 (8 KB) until TILE_PLANKS needed a tenth cell
+	// and there was no room; before step 9.3 it was 256x256 RGBA8888 (4 bytes/texel) and
+	// cost 256 KB. All three figures are computed from the sheet, not measured on-device.
+	// The size itself is not read from here — it comes out of the .t3x — but ATLAS_PX in
+	// world/atlas_uv.h and uvScale in shaders/world.v.pica must both match the PNG that
+	// tools/make_atlas.py writes. Texture reads out of VRAM are the cheap ones on this GPU.
 	// The 30,936 -> 30,680 KB linear-free delta this comment used to quote was
 	// measured with vram=false at the old 256x256 RGBA8888 size; it has NOT been
 	// re-measured at the new size — that needs an actual boot.

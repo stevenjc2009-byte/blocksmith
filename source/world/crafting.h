@@ -44,11 +44,12 @@ typedef struct {
 } CraftRecipe;
 
 // One entry per recipe below; see crafting.c for the table and the reasoning behind each
-// row (and behind what is deliberately *not* in it — wood appears in no recipe at all).
+// row (and behind what is deliberately *not* in it — nothing produces wood).
 enum {
 	RECIPE_DIRT_TO_GRASS = 0,
 	RECIPE_STONE_TO_SAND,
 	RECIPE_LEAVES_TO_DIRT,
+	RECIPE_WOOD_TO_PLANKS,
 	RECIPE_COUNT
 };
 

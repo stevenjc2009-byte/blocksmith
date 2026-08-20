@@ -36,6 +36,7 @@ enum {
 	TILE_WOOD_SIDE,  // step 5.3's trees, appended after the sentinel rather than
 	TILE_WOOD_TOP,   // beside sand, because inserting would re-texture everything
 	TILE_LEAVES,     // after the insertion point
+	TILE_PLANKS,     // the first crafted block; the tile that forced the sheet to 128
 };
 
 // Uploads the atlas to the GPU and binds it to texture unit 0. Returns false if

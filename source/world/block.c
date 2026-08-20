@@ -52,6 +52,19 @@ static const BlockInfo kBlocks[BLOCK_COUNT] = {
 		// the cheap canopy — sky through the holes, not the inside of a hollow shell.
 		.solid = true, .transparent = true, .liquid = false,
 	},
+	[BLOCK_PLANKS] = {
+		.name = "planks",
+		// The same tile on all six faces. A real plank block has a grain direction and
+		// so arguably wants the top and bottom rotated 90 degrees, but that would need a
+		// second tile for one block, and at this texel density and screen size the
+		// rotation is not readable — it would be a cell of the atlas spent on something
+		// nobody can see. Revisit if a future block genuinely needs a rotated variant.
+		.tex  = { BTEX_PLANKS, BTEX_PLANKS, BTEX_PLANKS,
+		          BTEX_PLANKS, BTEX_PLANKS, BTEX_PLANKS },
+		// Fully opaque, unlike leaves: the tile has no alpha-0 pixels, so it belongs in
+		// the first (opaque) pass and its faces against other solid blocks cull normally.
+		.solid = true, .transparent = false, .liquid = false,
+	},
 };
 
 const BlockInfo* blockInfo(BlockId id)

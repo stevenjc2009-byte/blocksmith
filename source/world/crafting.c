@@ -36,16 +36,38 @@
 //   cave with no soil underfoot and no easy way back to the surface. Lossy (4:1) for the
 //   same reason as the stone recipe: still worse than just digging dirt where it exists.
 //
+// RECIPE_WOOD_TO_PLANKS (1 wood -> 4 planks)
+//   The one recipe here that *gains* material, and the only one that should. The three
+//   above are all conversions between raw blocks the world already hands out, so making
+//   any of them profitable would just devalue mining; this one is a raw log becoming a
+//   worked building material that worldgen never places at all, which is the ordinary
+//   real relationship between a tree and a floor. Sawing one log into several boards is
+//   also simply what happens, and a 1:1 recipe would read as broken.
+//
+//   Wood's scarcity survives it, which was the objection this file used to raise against
+//   any wood recipe at all (see below): planks are an output, never an input, and there
+//   is no path back from planks to wood. A player still cannot synthesize a log — they
+//   can only spend one. Four is the count because a log is square in cross-section and
+//   the block list has no half-blocks or stairs to spend the surplus on, so a larger
+//   multiplier would just fill the inventory with a material there is little to do with
+//   yet; four fills a wall fast enough to be worth the trip to a tree.
+//
 // What is deliberately absent:
 //
-//   - Wood appears as the input or output of nothing. As an *output* it would let a
-//     player synthesize the one raw material this world does not hand out on every
-//     column (worldgen only places it inside a tree's trunk), which would erase the
-//     scarcity that gives wood any value at all. As an *input*, nothing else in the block
-//     list is a plausible product of processing a log — there is no planks or charcoal
-//     block to turn it into, and inventing one purely to give wood a recipe would be
-//     exactly the "invent a general item system for items that do not exist" this
-//     project's block.h explicitly warns against.
+//   - Wood is the input of exactly one recipe and the output of none. As an *output* it
+//     would let a player synthesize the one raw material this world does not hand out on
+//     every column (worldgen only places it inside a tree's trunk), which would erase the
+//     scarcity that gives wood any value at all. That reasoning is unchanged and is why
+//     no recipe converts anything back into BLOCK_WOOD.
+//
+//     This file previously argued wood should be the input of nothing either, on the
+//     grounds that "nothing else in the block list is a plausible product of processing a
+//     log — there is no planks or charcoal block to turn it into". That was an argument
+//     about the block list, not about wood, and it stopped being true when BLOCK_PLANKS
+//     was added: the missing product now exists as a real block, so the recipe is no
+//     longer an item invented to justify a recipe. Charcoal is still absent and still
+//     rejected on the original grounds — it would need a fuel and burning system that
+//     does not exist.
 //   - Sand -> stone (the reverse of RECIPE_STONE_TO_SAND) was considered — real-world
 //     lithification goes that direction too — and rejected as pointless: stone is already
 //     the more abundant of the two, so a recipe that turns scarce sand into abundant stone
@@ -69,6 +91,11 @@ const CraftRecipe CRAFT_RECIPES[RECIPE_COUNT] = {
 		.name = "Leaves -> Dirt",
 		.input_item = BLOCK_LEAVES, .input_count = 4,
 		.output_item = BLOCK_DIRT, .output_count = 1,
+	},
+	[RECIPE_WOOD_TO_PLANKS] = {
+		.name = "Wood -> Planks",
+		.input_item = BLOCK_WOOD, .input_count = 1,
+		.output_item = BLOCK_PLANKS, .output_count = 4,
 	},
 };
 

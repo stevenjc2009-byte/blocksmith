@@ -22,6 +22,10 @@ enum {
 	BLOCK_SAND,
 	BLOCK_WOOD,
 	BLOCK_LEAVES,
+	// Appended, never inserted. A block id is written into every saved chunk and into
+	// every block-edit packet on the wire, so inserting one would silently reinterpret
+	// every existing world and desync every client that had not been updated.
+	BLOCK_PLANKS,
 	BLOCK_COUNT
 };
 
@@ -39,6 +43,7 @@ enum {
 	BTEX_WOOD_SIDE,
 	BTEX_WOOD_TOP,
 	BTEX_LEAVES,
+	BTEX_PLANKS,
 };
 
 // Face order. This is a contract, not a convenience: the registry's tex[] below is

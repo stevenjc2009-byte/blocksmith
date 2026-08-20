@@ -11,7 +11,7 @@
 ;        8-byte vertex, and that unaligned attribute fetch is what froze the
 ;        console on the first world frame from v1.1.0 to v1.2.4.
 ;   v1 = (u, v, normal index, ao), 4x u8
-;        u/v are atlas pixel coordinates 0..63, scaled to 0..1 here
+;        u/v are atlas pixel coordinates 0..127, scaled to 0..1 here
 ;        normal index 0..5 selects a baked face brightness
 ;        ao is 0..3, 3 meaning unoccluded
 
@@ -22,14 +22,24 @@
 .fvec faceShade[8]
 
 ; uvScale MUST be 1/ATLAS_PX, with ATLAS_PX from source/world/atlas_uv.h. It was 1/256 —
-; left behind when step 9.3c shrank the sheet from 256x256 to 64x64 — and nothing catches a
-; mismatch, because a wrong scale still produces valid UVs and so still renders *a* texture.
-; At 1/256 every tile's rect (spanning atlas pixels 2..62 of 64) divided by 256 landed inside
-; UV 0..0.2422, i.e. all nine tiles collapsed into the same ~14x14 px corner of the sheet —
-; the wood row. Measured on screen: every block in the world drew with pale wood_top rings on
-; top and wood_side bark grooves on the sides, so the whole world was one flat brown, with no
-; grass green and no stone grey anywhere. With 1/64 the tiles reach UV 0.9688 and separate.
-.constf consts(0.0, 1.0, 0.015625, 0.33333333)   ; 0, 1, 1/64, 1/3
+; left behind when step 9.3c shrank the sheet from 256x256 to 64x64 — and a mismatch renders
+; no error at all, because a wrong scale still produces valid UVs and so still draws *a*
+; texture. At 1/256 every tile's rect (spanning atlas pixels 2..62 of 64) divided by 256
+; landed inside UV 0..0.2422, i.e. all nine tiles collapsed into the same ~14x14 px corner of
+; the sheet — the wood row. Measured on screen: every block in the world drew with pale
+; wood_top rings on top and wood_side bark grooves on the sides, so the whole world was one
+; flat brown, with no grass green and no stone grey anywhere.
+;
+; It is 1/128 now, because adding TILE_PLANKS grew the sheet to 128x128 (there was no tenth
+; cell in 64x64). Left at 1/64 it would have been the same failure in the other direction:
+; tile rects computed against a 128px sheet but divided by 64 reach UV up to 1.9375, so every
+; tile would wrap twice and each face would show four squashed copies of the wrong art.
+;
+; This is the third copy of the atlas size — here, source/world/atlas_uv.h and
+; tools/make_atlas.py. source/world/atlas_uv_shader_test.c parses this line and fails the host
+; suite when it disagrees with the header, which is the only reason the duplication is safe;
+; it is what caught this change. Update all three together.
+.constf consts(0.0, 1.0, 0.0078125, 0.33333333)   ; 0, 1, 1/128, 1/3
 .alias  zeros consts.xxxx
 .alias  ones  consts.yyyy
 .alias  uvScale consts.zzzz
@@ -65,7 +75,7 @@
 
 	; --- texture coordinates ---------------------------------------------
 	; Atlas pixel coords come in unnormalised (0..63) because PICA byte
-	; attributes are not scaled, so 1/64 converts them.
+	; attributes are not scaled, so 1/128 converts them.
 	mul r2, uvScale, inpack
 	mov outtc0, r2.xyxy
 
