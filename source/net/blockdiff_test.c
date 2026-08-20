@@ -34,7 +34,16 @@ static void check(bool cond, const char *what)
 /* ---------------------------------------------------- apply-callback plumbing */
 
 /* Records every (x, y, z, id) the store hands back through blockdiffDrain(), so a test can
- * inspect what was actually applied rather than just trusting the returned count. */
+ * inspect what was actually applied rather than just trusting the returned count.
+ *
+ * Every BlockDiffStore and every applied_log below has static storage duration rather than
+ * being a plain local. Not style: BLOCKDIFF_MAX_PENDING is 65536, so a BlockDiffStore is a
+ * little over 1 MB and an applied_log is roughly 850 KB, while the mingw default thread
+ * stack is exactly 1 MB. Declared as locals, this binary died before printing a single
+ * check — the run showed only its "== blockdiff test ==" banner, 0 ok lines and 0 FAIL
+ * lines. Static storage puts them in BSS, which has no such limit and costs nothing on
+ * disk. The console build is unaffected either way: its one store (networld.c's s_pending)
+ * has always been a static. */
 #define APPLIED_MAX (BLOCKDIFF_MAX_PENDING + 16)
 
 struct applied_log {
@@ -70,14 +79,14 @@ static void test_record_and_drain(void)
 {
     puts("record and drain");
 
-    BlockDiffStore s;
+    static BlockDiffStore s;
     blockdiffInit(&s);
 
     check(blockdiffCount(&s) == 0, "fresh store is empty");
     check(blockdiffRecord(&s, 10, 5, 20, BLOCK_STONE), "record accepted");
     check(blockdiffCount(&s) == 1, "count reflects the one pending diff");
 
-    struct applied_log log = {0};
+    static struct applied_log log; log.n = 0;
     const int n = blockdiffDrain(&s, 10 >> 4, 20 >> 4, logApply, &log);
     check(n == 1, "drain reports one diff");
     check(log.n == 1, "apply callback invoked once");
@@ -86,7 +95,7 @@ static void test_record_and_drain(void)
     check(blockdiffCount(&s) == 0, "store empty after drain");
 
     /* Draining an empty or unrelated column must be a harmless no-op. */
-    struct applied_log log2 = {0};
+    static struct applied_log log2; log2.n = 0;
     check(blockdiffDrain(&s, 10 >> 4, 20 >> 4, logApply, &log2) == 0,
           "draining an already-empty column reports zero");
     check(log2.n == 0, "and never calls apply");
@@ -98,14 +107,14 @@ static void test_latest_write_wins(void)
 {
     puts("latest write wins");
 
-    BlockDiffStore s;
+    static BlockDiffStore s;
     blockdiffInit(&s);
 
     check(blockdiffRecord(&s, 3, 8, 3, BLOCK_STONE), "first write accepted");
     check(blockdiffRecord(&s, 3, 8, 3, BLOCK_GRASS), "second write to same coordinate accepted");
     check(blockdiffCount(&s) == 1, "same coordinate collapses to one entry, not two");
 
-    struct applied_log log = {0};
+    static struct applied_log log; log.n = 0;
     const int n = blockdiffDrain(&s, 3 >> 4, 3 >> 4, logApply, &log);
     check(n == 1, "drain still reports exactly one diff");
     check(log.n == 1 && log.id[0] == BLOCK_GRASS, "the later write is the one that survives");
@@ -118,7 +127,7 @@ static void test_latest_write_wins(void)
     check(blockdiffRecord(&s, 7, 9, 7, BLOCK_AIR), "break recorded over the same coordinate");
     check(blockdiffCount(&s) == 1, "place-then-break is still one pending entry, not two");
 
-    struct applied_log log2 = {0};
+    static struct applied_log log2; log2.n = 0;
     blockdiffDrain(&s, 7 >> 4, 7 >> 4, logApply, &log2);
     check(log2.n == 1 && log2.id[0] == BLOCK_AIR,
           "place-then-break resolves to air, not the placed block");
@@ -130,7 +139,7 @@ static void test_columns_stay_separate(void)
 {
     puts("diffs for different columns stay separate");
 
-    BlockDiffStore s;
+    static BlockDiffStore s;
     blockdiffInit(&s);
 
     /* Column (0,0) covers x,z in 0..15; column (1,0) covers x in 16..31. */
@@ -138,13 +147,13 @@ static void test_columns_stay_separate(void)
     check(blockdiffRecord(&s, 20, 10, 4, BLOCK_SAND), "diff for column (1,0)");
     check(blockdiffCount(&s) == 2, "two distinct columns, two entries");
 
-    struct applied_log log = {0};
+    static struct applied_log log; log.n = 0;
     int n = blockdiffDrain(&s, 0, 0, logApply, &log);
     check(n == 1, "draining column (0,0) only touches its own diff");
     check(log.n == 1 && log.x[0] == 4, "and it's the (0,0) diff, not the other one");
     check(blockdiffCount(&s) == 1, "the other column's diff is untouched and still pending");
 
-    struct applied_log log2 = {0};
+    static struct applied_log log2; log2.n = 0;
     n = blockdiffDrain(&s, 1, 0, logApply, &log2);
     check(n == 1, "draining column (1,0) now finds its own diff");
     check(log2.n == 1 && log2.x[0] == 20, "and it's the right one");
@@ -158,13 +167,13 @@ static void test_columns_stay_separate(void)
     check(blockdiffRecord(&s, 4, 10, 20, BLOCK_SAND), "diff for column (0,1), same x, z=20");
     check(blockdiffCount(&s) == 2, "two distinct columns sharing an x, two entries");
 
-    struct applied_log logz = {0};
+    static struct applied_log logz; logz.n = 0;
     check(blockdiffDrain(&s, 0, 0, logApply, &logz) == 1,
           "draining column (0,0) by z alone finds only its own diff");
     check(logz.n == 1 && logz.z[0] == 4, "and it's the z=4 diff, not the z=20 one");
     check(blockdiffCount(&s) == 1, "the z=20 diff is untouched by a same-x, different-z drain");
 
-    struct applied_log logz2 = {0};
+    static struct applied_log logz2; logz2.n = 0;
     check(blockdiffDrain(&s, 0, 1, logApply, &logz2) == 1, "draining column (0,1) now finds it");
     check(logz2.n == 1 && logz2.z[0] == 20, "and it's the right one");
 
@@ -172,9 +181,10 @@ static void test_columns_stay_separate(void)
      * same convention world/world.c uses. Block -1 belongs to column -1, not column 0. */
     blockdiffClear(&s);
     check(blockdiffRecord(&s, -1, 5, -1, BLOCK_STONE), "diff at a negative coordinate");
-    check(blockdiffDrain(&s, 0, 0, logApply, &(struct applied_log){0}) == 0,
+    static struct applied_log discard; discard.n = 0;
+    check(blockdiffDrain(&s, 0, 0, logApply, &discard) == 0,
           "column (0,0) does not see a block at x=-1");
-    struct applied_log log3 = {0};
+    static struct applied_log log3; log3.n = 0;
     check(blockdiffDrain(&s, -1, -1, logApply, &log3) == 1,
           "column (-1,-1) is where the negative-coordinate diff actually lives");
 
@@ -185,7 +195,7 @@ static void test_y_bounds(void)
 {
     puts("out-of-range y rejected");
 
-    BlockDiffStore s;
+    static BlockDiffStore s;
     blockdiffInit(&s);
 
     check(blockdiffRecord(&s, 0, -1, 0, BLOCK_STONE) == false, "y below 0 rejected");
@@ -206,7 +216,7 @@ static void test_capacity(void)
 {
     puts("behaviour at the memory cap");
 
-    BlockDiffStore s;
+    static BlockDiffStore s;
     blockdiffInit(&s);
 
     check(blockdiffRefusals(&s) == 0, "fresh store has no refusals");
@@ -230,7 +240,7 @@ static void test_capacity(void)
     /* The eviction policy itself: the refusal must not have silently dropped anything that
      * was already accepted. Drain every column the fill loop used and confirm all
      * BLOCKDIFF_MAX_PENDING original diffs are still there, untouched. */
-    struct applied_log log = {0};
+    static struct applied_log log; log.n = 0;
     int drained_total = 0;
     for (int i = 0; i < BLOCKDIFF_MAX_PENDING; i++) {
         drained_total += blockdiffDrain(&s, i, 0, logApply, &log);
@@ -261,7 +271,7 @@ static void test_drain_empties_store(void)
 {
     puts("drain leaves the store empty");
 
-    BlockDiffStore s;
+    static BlockDiffStore s;
     blockdiffInit(&s);
 
     check(blockdiffRecord(&s, 1, 1, 1, BLOCK_STONE), "diff A recorded");
@@ -269,12 +279,12 @@ static void test_drain_empties_store(void)
     check(blockdiffRecord(&s, 40, 1, 1, BLOCK_WOOD), "diff C recorded, a different column");
     check(blockdiffCount(&s) == 3, "three diffs pending across two columns");
 
-    struct applied_log log = {0};
+    static struct applied_log log; log.n = 0;
     const int n = blockdiffDrain(&s, 0, 0, logApply, &log);
     check(n == 2, "draining column (0,0) picks up both A and B");
     check(blockdiffCount(&s) == 1, "only C, in the other column, is left pending");
 
-    struct applied_log log2 = {0};
+    static struct applied_log log2; log2.n = 0;
     check(blockdiffDrain(&s, 2, 0, logApply, &log2) == 1, "draining C's column picks it up");
     check(blockdiffCount(&s) == 0, "store is now completely empty");
 

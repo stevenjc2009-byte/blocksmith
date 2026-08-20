@@ -155,6 +155,15 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 "./$BH/loading_test"
 
+# net/blockdiff.c's pending-diff store. Ninth binary, own main(), same reason as every one
+# above it. This one had a test file sitting in the tree that the suite never built, so the
+# store's 256-slot-to-65536-slot rewrite — which replaced a linear scan with hash chaining
+# and a free list, and is what a join sync's whole payload now lands in — had cover written
+# for it that had never once run. A test nobody executes is not cover, it is a comment.
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g 	-I source 	source/net/blockdiff.c 	source/net/blockdiff_test.c 	-o "$BH/blockdiff_test"
+
+"./$BH/blockdiff_test"
+
 # Only reached if every binary above exited 0 (set -e stops the script on the first
 # non-zero exit), so a failed run's directory is left behind for inspection rather than
 # silently deleted along with the evidence of what failed.

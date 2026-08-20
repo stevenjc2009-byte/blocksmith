@@ -4,6 +4,49 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.7] - 2026-08-20
+
+### Added
+
+- **A pause menu.** SELECT now opens Resume / Options / Quit over the bottom screen.
+  Until now the only way to change a setting was to leave the world entirely and use
+  the title screen's options page, which meant unloading the world to change the render
+  distance and loading it again to see what the change did — the one comparison the
+  setting exists to let a player make.
+
+- **Render distance is changeable from that menu, and it takes effect immediately.**
+  The ring re-meshes around the player as the value steps, and the new value is written
+  to `sdmc:/blocksmith/options.ini` in the same breath, so it survives a reboot. The
+  arrows grey out at each end of the range rather than disappearing, so the row does not
+  change width when it hits a limit.
+
+- **A memory readout on that page.** Three figures, not one, because they come from three
+  different pools and answer three different questions: the world's block storage against
+  its budget, free space in the linear heap the chunk mesh pool is claimed from, and free
+  VRAM. A single "free RAM" number would be a fiction on this console.
+
+- **Wooden planks.** A new block, crafted four at a time from one wood log — the first
+  recipe in the game whose output is not also something you can dig up, and the first
+  thing wood is good for. The texture atlas grew from 64x64 to 128x128 to hold its tile,
+  which cost 24 KB of VRAM, measured on device as free VRAM moving 4636 KB to 4612 KB.
+
+### Changed
+
+- **3D moved from SELECT onto the pause menu's options page.** SELECT was the only button
+  that toggled it, and SELECT is now the button that opens the menu. Putting the toggle on
+  a settings page is where it belongs, but the honest reason it moved rather than being
+  dropped is that reusing its button would otherwise have deleted the feature outright.
+
+- **A paused world does not tick.** The player does not move, terrain does not stream in,
+  and the L/R render-distance keys are ignored, so the memory figures on screen hold still
+  while they are being read. Networking deliberately keeps running: a session that stopped
+  answering while its player read a menu would be dropped by the server.
+
+### Notes
+
+- The touch panel underneath the menu is fed a blank input while the menu is up, so a
+  finger landing on the QUIT row cannot also swap the hotbar slot sitting beneath it.
+
 ## [1.2.6] - 2026-08-20
 
 ### Fixed
