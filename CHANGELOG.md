@@ -4,6 +4,80 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] — 2026-08-20
+
+Multiplayer that actually works end to end: joining a server puts you in the
+server's world, your edits reach it, everyone else's edits reach you, and a
+session that ends says so instead of pretending.
+
+**Still not tested on real hardware.** Every figure below was measured in
+Azahar against a real gateway — the live server for the final check, a local
+`bsgate`/`bsgame` pair for the fault injection — and Azahar does not emulate
+GPU cost.
+
+### Added
+
+- **Connect enters the server's world directly.** There is no name prompt, no
+  NEW WORLD and no trip through world select on the multiplayer path, because
+  none of those describe a world this console owns. The join waits one round
+  trip for `BS_APP_WORLD_INFO` — the seed the server generates from — and only
+  then enters, showing "Joined - waiting for the world..." while it waits.
+  Entering on the handshake alone would have generated from this client's own
+  seed: a private landscape that looks exactly like a successful join.
+- **A server session writes nothing to the SD card.** The worker's save
+  directory and the inventory directory are both NULL on that path, and
+  `saveWorldDir()` is not called at all rather than called and ignored, because
+  calling it is what creates the directory. Measured: the world list is
+  byte-identical before and after a full join → dig → leave → rejoin cycle.
+- **Leaving a server session returns to the title screen** instead of quitting
+  the app, landing on the Multiplayer screen so the reason it ended is on
+  screen. START in a joined world now hangs up cleanly, frees the slot on the
+  gateway, and comes back ready to connect again.
+- **A lost server is detected.** The keepalive probe is now armed off *receive*
+  silence rather than send silence, retried on a deadline, and eventually
+  fatal — five retries at 2 s after 4 s of quiet, so a dead server is called at
+  roughly 14 s with "Lost the connection to the server". Before this the client
+  sat in Connected forever with a full HUD and edits going nowhere.
+- **A multiplayer HUD line**: `net s… r… y… a… q… p…` — edits sent, payloads
+  received, WORLD_SYNC entries seen, remote edits applied, edits still queued,
+  remote players. A session that is connected but silently moving nothing used
+  to look identical on screen to one that works.
+
+### Fixed
+
+- **Joining no longer discards the world's history.** The server's post-JOIN
+  `WORLD_SYNC` batch was being flushed into the 17×17 grid of *empty* columns
+  that `worldReportBuild()` allocates as a memory-budget proof, before the
+  generator had run — so every edit landed in air and the generated terrain
+  buried it. Diffs are now held until the column each one belongs to is
+  generated and installed. Measured against the live server: dig 8 blocks,
+  leave, rejoin — `y15` sync entries back (7 already stored there plus the 8
+  new), the player standing inside the shaft at `aim 8 48 8`, and 88064
+  triangles, identical to the frame at the end of the dig. Before the fix the
+  same run gave `y8 a0` with the ground visibly whole.
+- **The multiplayer menu could not complete a handshake.** `netUpdate()` is
+  where every retry and every arriving packet is processed, and the title
+  screen's loop never called it — so Connect sat on "Connecting..." forever,
+  the HELLO was never retried and the server's COOKIE was never read off the
+  socket. Both `netUpdate()` and `networldUpdate()` are now pumped there.
+- **The gateway now reports a dead game daemon.** `bsgate` answers keepalive
+  probes itself, so a client stayed Connected with `bsgame` dead behind it and
+  no explanation anywhere. It now logs "game daemon unreachable", counts the
+  messages lost, logs the recovery, and exposes `game link` in its status —
+  measured as `game_link down` / `game_down_s 11`, then "back after 13 s, 130
+  message(s) lost" on restart. **This half ships in the server repo**; the
+  console side of the release does not depend on it.
+
+### Verified
+
+- **Two clients, one server.** Two emulator copies joined at once — server
+  reported `sessions 2 / 16`, `joins total 2`. One dug 8 blocks; the other,
+  never touched between joining and the reading, showed `a8` applied remote
+  edits with its own break counter still at `b0`, and could aim into the bottom
+  of the shaft the first one made.
+- **Against the live server**, not just a local rig: connect, break, sync, and
+  the edits still there after leaving and rejoining.
+
 ## [0.2.0] — 2026-08-19
 
 Creating a world no longer looks like a freeze, the game can update itself, and
