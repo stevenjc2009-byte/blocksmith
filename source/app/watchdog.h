@@ -157,6 +157,13 @@ typedef enum {
 // k is the loop index within a pass and slot the mesh slot being drawn; pass -1 for both when
 // the stage is not inside a loop. Three stores, no lock, same contract as watchdogPhase.
 void watchdogDrawStage(int stage, int k, int slot);
+
+// Writes sdmc:/blocksmith/gxprobe.txt once, using the same GX-queue reader the hang report
+// uses. Call it from the main thread immediately after C3D_FrameEnd(0), which is the one
+// moment the queue is guaranteed to hold commands — that is what makes it a proof that the
+// reader works rather than another unfalsifiable line in a report. Every call after the first
+// returns immediately. See the comment on watchdogGxSelfTest in watchdog.c.
+void watchdogGxSelfTest(void);
 #endif
 
 // Hands the report one already-formatted line about the draw guard (scene/chunk_render.c).

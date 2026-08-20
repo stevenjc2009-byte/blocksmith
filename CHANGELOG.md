@@ -4,6 +4,111 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.6] — 2026-08-20 — diagnostic pre-release
+
+v1.1.5 froze a real Old 3DS and returned an unambiguous answer. This build asks
+the one question that answer left open.
+
+### What v1.1.5 said
+
+```
+draw stage   : C3D_FrameBegin(0) - waiting for the GX QUEUE to drain
+gsp vblank   : ALIVE  (+60 / +60 in 1000 ms)
+  counters   : 1397 / 1397  then  1457 / 1457
+```
+
+Both halves matter, and they point the same way.
+
+`GX QUEUE` rules out frame pacing. The two waits v1.1.5 separated are a wait for
+a VBlank tick and a wait for the GPU's command queue to empty; it stopped in the
+second. `ALIVE (+60 / +60)` then rules out the obvious explanation for that:
+VBlank interrupts were still being delivered at exactly 60 Hz while the console
+sat frozen, and the thread that counts them — libctru's GSP event thread — is
+the *same* thread that advances the GX queue when the GPU signals a command
+finished. It was alive, it was being scheduled, and the queue still never
+drained.
+
+So the console is not deadlocked, has not lost an interrupt thread, and is not
+starved. The GPU was handed a command and never reported completing it.
+
+### What v1.1.6 adds
+
+`hang.txt` now carries the queue itself:
+
+```
+gx queue     : cap 32  queued 5  submitted 5  completed 5
+  STUCK ON   : entry 2  type 1  ProcessCommandList - OUR draw commands
+    args     : 30189c00 00002430 00000000 00000000
+```
+
+`queued` / `submitted` / `completed` are citro3d's own counters, and the entry
+named is the oldest command GX has not reported back — which is the one it is
+stuck on. Its type splits the remaining possibilities three ways, and they have
+three different fixes:
+
+* **type 1, ProcessCommandList** — the world's own drawing. The bug is in what
+  the game submits.
+* **type 2, MemoryFill** — a colour or depth buffer clear. The bug is in the
+  render-target plumbing, not in any geometry.
+* **type 3, DisplayTransfer** — copying the finished picture to the screen. The
+  bug is in presentation, and the drawing is a bystander.
+
+There is a fourth outcome. If the report says `STUCK ON : NOTHING — every queued
+command reported complete`, then the GPU finished everything and the wait still
+did not return, and the fault is in libctru's own `isRunning` flag rather than
+in the hardware. `gxCmdQueueWait` polls that flag and not these counters, so
+that case is real and had to be distinguishable.
+
+### How the new reporting was proved before shipping
+
+A report that cannot be trusted is worse than no report, and neither place this
+code normally runs can establish that it works — on hardware the queue state is
+the unknown being measured, and an artificially parked build never submits
+anything, so it would print an empty queue whether the reader worked or not.
+
+So the same function is also run once from the main thread immediately after
+`C3D_FrameEnd(0)`, where the queue is guaranteed to be holding commands, and
+writes `sdmc:/blocksmith/gxprobe.txt`. Measured in the emulator:
+
+```
+gx queue     : cap 32  queued 5  submitted 4  completed 1
+  in flight  : entry 1  type 2  MemoryFill - a colour or depth buffer clear
+    args     : 1f0bb800 1a1424ff 1f106800 00000000
+  behind it  : entry 2  type 1  ProcessCommandList - OUR draw commands
+    args     : 30189c00 00002430 00000000 00000000
+  behind it  : entry 3  type 3  DisplayTransfer - copying a framebuffer to the screen
+    args     : 1f0bb800 30119400 014000f0 014000f0
+  behind it  : entry 4  type 3  DisplayTransfer - copying a framebuffer to the screen
+    args     : 1f000000 30000000 019000f0 019000f0
+```
+
+Every field decodes to something real: the fill targets VRAM, the command list
+sits in the linear heap, and the two transfers are `014000f0` and `019000f0` —
+240×320 and 240×400, the bottom and top screens, sideways, exactly as the 3DS
+draws them. A build parked deliberately on the queue marker was run separately
+to exercise the other branch, and produced `STUCK ON : NOTHING` with the last
+completed entry beside it.
+
+### Also
+
+* The hang report buffer went from 1280 to 4096 bytes. v1.1.5's report was
+  truncated mid-word at the old size; nothing decisive was lost that time
+  because the two lines that mattered came out above the cut, but the queue
+  section must not be the thing that falls off the end.
+* `gpuCmdBuf` / `gpuCmdBufSize` / `gpuCmdBufOffset` were briefly printed
+  alongside the queue and then removed: the self-test measured them as
+  `00000000 / 0 / 0`, because citro3d does not route through libctru's `GPUCMD_*`
+  layer and those globals are never set in this process. Three zeroes pretending
+  to be evidence is worse than no line at all.
+
+### Unchanged
+
+Behaviour. The game does exactly what v1.1.0 does; only the reporting is finer.
+Still settled by earlier hardware reports and not revisited here: it is not a
+CPU spin, not memory pressure (`linear free 27081216 B`, `vram free 4440064 B`,
+identical to the emulator), the world draw completes, and every chunk draw was
+validated well formed on the way out (`draw guard : clean`).
+
 ## [1.1.5] — 2026-08-20 — diagnostic pre-release
 
 v1.1.4 froze a real Old 3DS and named the stage it froze in. That stage turns

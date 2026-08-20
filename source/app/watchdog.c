@@ -11,6 +11,20 @@
 // no allocation, no service call — which is the only reason this thread is allowed to call it.
 // Nothing else in citro3d is safe from here; see the thread rules at the top of watchdogMain.
 #include <citro3d.h>
+
+// citro3d's C3D_Context is opaque outside the library — internal.h is not installed — but it
+// does not need to be declared to be read. __C3D_Context is a *global* symbol in the linked
+// ELF (arm-none-eabi-nm on blocksmith.elf: 00278828 B __C3D_Context), and C3D_FrameBegin
+// loads that exact address into r5 and hands it to gxCmdQueueWait unchanged:
+//
+//   1b5b7c: ldr r5,[pc,#..]   ; -> 0x00278828, __C3D_Context
+//   1b5b84: mov r0,r5
+//           bl  gxCmdQueueWait
+//
+// The queue it waits on therefore sits at offset 0 of the context, so the context base IS a
+// gxCmdQueue_s*. Measured by disassembling our own binary, not assumed from citro3d's source.
+// Declared as an array so the name yields its address without needing the struct's layout.
+extern u32 __C3D_Context[];
 #endif
 
 #include "version.h"
@@ -21,6 +35,11 @@
 // boot is ordinary stdio.
 #define WD_DIR_REL     "/blocksmith"
 #define WD_FILE_REL    "/blocksmith/hang.txt"
+
+// The GX queue self-test's output. A separate file from hang.txt on purpose: it is written
+// during normal play, before anything has gone wrong, and must never be mistaken for — or
+// overwrite — the report that says the console froze. See watchdogGxSelfTest.
+#define WD_GX_FILE_REL "/blocksmith/gxprobe.txt"
 
 // How often the monitor looks. 250 ms is fine-grained enough that the recorded stall time is
 // accurate to a quarter second, and coarse enough that the thread costs nothing: forty wakeups
@@ -40,8 +59,12 @@
 #define BS_DRAW_PROBE 0
 #endif
 
+// v1.1.5's report was cut off mid-word at the old 1280 — its last line ended at "citro3d's
+// two frame counter". Nothing decisive was lost that time, because the two lines that
+// mattered came out above the cut. The GX-queue section added below is decisive, and must
+// not be the thing that falls off the end.
 #if BS_DRAW_PROBE
-#define WD_REPORT_MAX 1280
+#define WD_REPORT_MAX 4096
 #else
 #define WD_REPORT_MAX 768
 #endif
@@ -111,12 +134,41 @@ static const char* drawStageName(s32 s)
 	if (s < 0 || s >= WD_DRAW_STAGE_COUNT || !s_draw_stage_name[s]) return "(none recorded)";
 	return s_draw_stage_name[s];
 }
+
+// The type byte of a GX command entry. Only the three the frame actually uses are named, and
+// each of those three was read out of the binary rather than out of a header: libctru's
+// helpers build their entry with a literal word whose low byte is the type, and objdump shows
+//
+//   GX_ProcessCommandList  literal at 0x1ba384 = 01 01 00 01  -> type 1
+//   GX_MemoryFill          literal at 0x1ba3f8 = 02 01 00 01  -> type 2
+//   GX_DisplayTransfer     literal at 0x1ba46c = 03 01 00 01  -> type 3
+//
+// Anything else prints as its raw number and says so, because guessing a name for a byte that
+// was never measured would put a claim in the report that no evidence supports.
+static const char* gxTypeName(unsigned t)
+{
+	switch (t) {
+	case 1: return "ProcessCommandList - OUR draw commands";
+	case 2: return "MemoryFill - a colour or depth buffer clear";
+	case 3: return "DisplayTransfer - copying a framebuffer to the screen";
+	default: return "(type not identified by disassembly)";
+	}
+}
 #endif
 
 static volatile bool s_quit;
 static volatile bool s_fired;
 static Thread        s_thread;
 static char          s_report[WD_REPORT_MAX];
+
+#if BS_DRAW_PROBE
+// The self-test's own buffer rather than a share of s_report. A share would work today, since
+// the self-test runs long before any hang, but "today" is not a guarantee worth taking on the
+// one buffer whose contents are the entire point of the build.
+// 1280 and not 768: at 768 the first run truncated its last entry mid-word, ending the file at
+// "args     : 1f0bb800 30151800 0".
+static char          s_gxsnap[1280];
+#endif
 
 // Indexed by WdPhase. Short and upper-case because these end up being read off a photograph of
 // a screen or out of a text file by someone who is not looking at this source.
@@ -151,7 +203,7 @@ static const char* phaseName(u32 p)
 //
 // Silent on every failure, same as the crash path: there is no console in a shipped build and
 // nothing useful to do about an SD card that will not take a 500-byte file.
-static void reportWrite(size_t len)
+static void fileWrite(const char* rel_path, const char* data, size_t len)
 {
 	FS_Archive archive;
 	Result rc = FSUSER_OpenArchive(&archive, ARCHIVE_SDMC, fsMakePath(PATH_EMPTY, ""));
@@ -160,7 +212,7 @@ static void reportWrite(size_t len)
 	FSUSER_CreateDirectory(archive, fsMakePath(PATH_ASCII, WD_DIR_REL), FS_ATTRIBUTE_DIRECTORY);
 
 	Handle file;
-	rc = FSUSER_OpenFile(&file, archive, fsMakePath(PATH_ASCII, WD_FILE_REL),
+	rc = FSUSER_OpenFile(&file, archive, fsMakePath(PATH_ASCII, rel_path),
 	                     FS_OPEN_WRITE | FS_OPEN_CREATE, 0);
 	if (R_SUCCEEDED(rc)) {
 		// Truncate to exactly this report, so a shorter one cannot leave the tail of a longer
@@ -168,13 +220,164 @@ static void reportWrite(size_t len)
 		FSFILE_SetSize(file, (u64)len);
 
 		u32 written = 0;
-		FSFILE_Write(file, &written, 0, s_report, (u32)len,
+		FSFILE_Write(file, &written, 0, data, (u32)len,
 		             FS_WRITE_FLUSH | FS_WRITE_UPDATE_TIME);
 		FSFILE_Close(file);
 	}
 
 	FSUSER_CloseArchive(archive);
 }
+
+#if BS_DRAW_PROBE
+// Appends the state of the GX command queue to buf, returning the new length.
+//
+// v1.1.5's hardware report answered the previous question and posed this one: the wait was
+// gxCmdQueueWait (`draw stage : GX QUEUE`) while vblanks were still arriving
+// (`gsp vblank : ALIVE (+60 / +60)`), so the GSP event thread was alive and a command it had
+// already submitted still never reported finishing. The queue itself records how far it got.
+//
+// Reading it is four u16 loads and a walk of a small array — no lock, no allocation, no
+// service call — so it obeys the same thread rules as everything else in this file. It is also
+// stable while the watchdog reads it: the main thread is parked inside gxCmdQueueWait, and the
+// main thread is the only thing that ever adds to this queue.
+//
+// Per <3ds/gpu/gx.h>, `curEntry` is the index of the first command not yet submitted and
+// `lastEntry` is the number GX has *completed*. So the command in flight is entries[lastEntry],
+// and there are two possible answers — which is the whole point of asking:
+//
+//   completed < queued  -> entries[lastEntry] is the command that never finished, and its type
+//                          says whether that is our world's command list (1), a buffer clear
+//                          (2), or the copy of a framebuffer to the screen (3).
+//   completed == queued -> the queue drained and the wait still did not return. Then a stuck
+//                          GPU is not the bug at all: gxCmdQueueWait polls a libctru global
+//                          (`isRunning`, 0x002799a1 in our ELF) and not these counters, so the
+//                          flag was simply never cleared.
+//
+// `oldest_label` names the first incomplete entry. It differs by caller and the difference is
+// not cosmetic: in the hang report that entry is the one the console is stuck on, while in the
+// self-test — where the frame is proceeding perfectly normally — it is merely the one GX has
+// not got to yet, and calling that "STUCK ON" would be a false statement in a file whose whole
+// job is to be believed.
+//
+// Deliberately NOT printed here: libctru's gpuCmdBuf / gpuCmdBufSize / gpuCmdBufOffset. They
+// were in the first version of this function and the self-test measured them as
+// `base 00000000  size 0 words  used 0 words` — citro3d does not route through libctru's
+// GPUCMD_* layer, so those globals are never set in this process and the line was three zeroes
+// pretending to be evidence. The type-1 entry's own args[0]/args[1] give the command list's
+// address and byte size directly, which is what the line was for.
+static size_t gxAppend(char* buf, size_t cap, size_t len, const char* oldest_label)
+{
+	const gxCmdQueue_s* q = (const gxCmdQueue_s*)(const void*)__C3D_Context;
+	const unsigned qcap = q->maxEntries;
+	const unsigned num  = q->numEntries;
+	const unsigned cur  = q->curEntry;
+	const unsigned done = q->lastEntry;
+
+	const int qm = snprintf(buf + len, cap - len,
+		"\n"
+		"gx queue     : cap %u  queued %u  submitted %u  completed %u\n",
+		qcap, num, cur, done);
+	if (qm > 0) {
+		const size_t room = cap - len - 1;
+		len += ((size_t)qm < room) ? (size_t)qm : room;
+	}
+
+	// Bounds before the walk. If any of this is implausible then the queue pointer is wrong or
+	// the memory is corrupt, and indexing entries[] would fault — which would cost the entire
+	// report, including the lines above it that are already correct. 64 is far above citro3d's
+	// real capacity and exists only as a sanity ceiling.
+	if (!q->entries || qcap == 0 || qcap > 64 || num > qcap || cur > qcap || done > qcap) {
+		const int bm = snprintf(buf + len, cap - len,
+			"  entries    : NOT READ - the counters above are implausible, so the entry array\n"
+			"               was not walked. entries=%08lx\n",
+			(unsigned long)(u32)q->entries);
+		if (bm > 0) {
+			const size_t room = cap - len - 1;
+			len += ((size_t)bm < room) ? (size_t)bm : room;
+		}
+	} else if (done < num) {
+		// Every command GX has been given and not reported back, oldest first. The oldest is
+		// the one it is actually on; anything after it is queued behind it.
+		for (unsigned i = done; i < num && i < done + 4u; i++) {
+			const gxCmdEntry_s* e = &q->entries[i];
+			const int em = snprintf(buf + len, cap - len,
+				"  %-10s : entry %u  type %u  %s\n"
+				"    args     : %08lx %08lx %08lx %08lx\n",
+				(i == done) ? oldest_label : "behind it",
+				i, (unsigned)e->type, gxTypeName(e->type),
+				(unsigned long)e->args[0], (unsigned long)e->args[1],
+				(unsigned long)e->args[2], (unsigned long)e->args[3]);
+			if (em <= 0) break;
+			const size_t room = cap - len - 1;
+			len += ((size_t)em < room) ? (size_t)em : room;
+		}
+	} else {
+		const int nm = snprintf(buf + len, cap - len,
+			"  STUCK ON   : NOTHING - every queued command reported complete, yet the wait\n"
+			"               never returned. The GPU is not the thing that is stuck; libctru's\n"
+			"               isRunning flag was never cleared.\n");
+		if (nm > 0) {
+			const size_t room = cap - len - 1;
+			len += ((size_t)nm < room) ? (size_t)nm : room;
+		}
+
+		// An empty queue and a reader pointed at the wrong memory produce the same two words.
+		// Printing the most recently completed entry tells them apart: a plausible type and a
+		// command-list address matching `cmd buffer base` above means this code really is
+		// looking at citro3d's queue. Without this, "NOTHING" would be unfalsifiable.
+		if (num > 0 && q->entries) {
+			const gxCmdEntry_s* e = &q->entries[num - 1];
+			const int lm = snprintf(buf + len, cap - len,
+				"  last done  : entry %u  type %u  %s\n"
+				"    args     : %08lx %08lx %08lx %08lx\n",
+				num - 1, (unsigned)e->type, gxTypeName(e->type),
+				(unsigned long)e->args[0], (unsigned long)e->args[1],
+				(unsigned long)e->args[2], (unsigned long)e->args[3]);
+			if (lm > 0) {
+				const size_t room = cap - len - 1;
+				len += ((size_t)lm < room) ? (size_t)lm : room;
+			}
+		}
+	}
+
+	return len;
+}
+
+// Proof that gxAppend can print something other than "NOTHING".
+//
+// The section above is only worth reading if it is known to work, and neither place it would
+// normally run can establish that: on hardware the queue state is the unknown being measured,
+// and the artificially-parked RED arm (-DBS_FRAME_HANG_TEST=WD_DRAW_FRAME_QUEUE) never submits
+// anything, so it would print an empty queue whether the reader worked or not — indistinguish-
+// able from a reader that is silently reading the wrong address.
+//
+// So the same function is run once from the main thread at the one instant the queue is
+// guaranteed to be loaded: immediately after C3D_FrameEnd(0), which has just added this
+// frame's command list and its display transfers and returned without waiting for them. If
+// gxprobe.txt comes back naming a type-1 ProcessCommandList whose args[0] equals the
+// `cmd buffer base` printed beside it, the reader is looking at the right memory and the entry
+// walk works. If it comes back "NOTHING" or "NOT READ", the reader is broken and the hang
+// report's queue section means nothing — which is exactly what needs to be known before
+// shipping a build to be booted once.
+void watchdogGxSelfTest(void)
+{
+	static bool done_once;
+	if (done_once) return;
+	done_once = true;
+
+	size_t len = 0;
+	const int n = snprintf(s_gxsnap, sizeof(s_gxsnap),
+		"Blocksmith GX queue self-test\n"
+		"\n"
+		"Sampled on the main thread immediately after C3D_FrameEnd(0) returned, where the\n"
+		"queue must be non-empty. This file proves the queue reader in source/app/watchdog.c\n"
+		"can see real commands; it is not a hang report and does not mean anything went wrong.\n");
+	if (n > 0) len = ((size_t)n < sizeof(s_gxsnap)) ? (size_t)n : sizeof(s_gxsnap) - 1;
+
+	len = gxAppend(s_gxsnap, sizeof(s_gxsnap), len, "in flight");
+	fileWrite(WD_GX_FILE_REL, s_gxsnap, len);
+}
+#endif
 
 static void reportBuild(u32 phase, u32 frames, u32 stuck_ms)
 {
@@ -267,6 +470,8 @@ static void reportBuild(u32 phase, u32 frames, u32 stuck_ms)
 		}
 	}
 
+	len = gxAppend(s_report, sizeof(s_report), len, "STUCK ON");
+
 	// The draw guard's verdict. Printed even when nothing was wrong, because "no bad draw was
 	// ever issued" is the more useful half of the answer: it says the commands the GPU was
 	// handed were well formed and it stopped for some other reason, which is a different bug
@@ -283,7 +488,7 @@ static void reportBuild(u32 phase, u32 frames, u32 stuck_ms)
 	}
 #endif
 
-	reportWrite(len);
+	fileWrite(WD_FILE_REL, s_report, len);
 	s_fired = true;
 }
 

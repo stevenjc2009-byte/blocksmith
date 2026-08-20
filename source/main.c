@@ -2801,6 +2801,14 @@ session_start:
 		C3D_FrameEnd(0);
 		metricsSubmitEnd();
 
+#if BS_DRAW_PROBE
+		// Right here and nowhere else: FrameEnd has just handed this frame's command list and
+		// its display transfers to GX and returned without waiting for them, so the queue is
+		// guaranteed to be holding commands. That makes this the one place a snapshot can
+		// prove the hang report's queue reader actually sees them. Writes one file, once.
+		watchdogGxSelfTest();
+#endif
+
 		metricsFrameEnd();
 
 		// One redraw when the world is finally complete: worker idle, nothing left to
