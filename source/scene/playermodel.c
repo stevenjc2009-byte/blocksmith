@@ -152,14 +152,25 @@ static void playerLabel(char* out, size_t cap, uint32_t sid)
 	snprintf(out, cap, "Player %04x", (unsigned)(sid & 0xffffu));
 }
 
+// One shader program for the whole process, built the first time and never torn down. Same
+// reasoning as scene/highlight.c: playerModelInit/playerModelExit run per session, and freeing
+// and rebuilding this static across a rejoin is the citro3d use-after-free that hard-crashes
+// the console. The vertex buffer below is still freed per session; only the shader is permanent.
+static bool s_shader_ready;
+
 bool playerModelInit(void)
 {
-	s_dvlb = DVLB_ParseFile((u32*)highlight_shbin, highlight_shbin_size);
-	shaderProgramInit(&s_program);
-	shaderProgramSetVsh(&s_program, &s_dvlb->DVLE[0]);
+	if (!s_shader_ready) {
+		s_dvlb = DVLB_ParseFile((u32*)highlight_shbin, highlight_shbin_size);
+		if (!s_dvlb)
+			return false;
+		shaderProgramInit(&s_program);
+		shaderProgramSetVsh(&s_program, &s_dvlb->DVLE[0]);
 
-	s_uloc_projection = shaderInstanceGetUniformLocation(s_program.vertexShader, "projection");
-	s_uloc_modelview  = shaderInstanceGetUniformLocation(s_program.vertexShader, "modelView");
+		s_uloc_projection = shaderInstanceGetUniformLocation(s_program.vertexShader, "projection");
+		s_uloc_modelview  = shaderInstanceGetUniformLocation(s_program.vertexShader, "modelView");
+		s_shader_ready = true;
+	}
 
 	s_verts = (PmVertex*)linearAlloc(sizeof(PmVertex) * PM_VERTS);
 	if (!s_verts)
@@ -183,8 +194,7 @@ void playerModelExit(void)
 	s_verts = NULL;
 	s_ready = false;
 
-	shaderProgramFree(&s_program);
-	DVLB_Free(s_dvlb);
+	// The shader is deliberately not freed here — see s_shader_ready above.
 }
 
 void playerModelDraw(const C3D_Mtx* view)

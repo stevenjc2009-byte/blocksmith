@@ -113,14 +113,28 @@ static void buildCage(HlVertex* verts)
 	}
 }
 
+// One shader program for the whole process, built the first time and never torn down.
+//
+// highlightInit/highlightExit run per session — join a world, leave, join again — and
+// shaderProgramFree does not null program->vertexShader, while citro3d separately caches a
+// pointer to the last program it bound. Freeing and rebuilding this static across a rejoin is
+// the exact use-after-free that hard-crashes the console, already paid for once in this
+// project. The vertex buffer below is still freed per session; only the shader is permanent.
+static bool s_shader_ready;
+
 bool highlightInit(void)
 {
-	s_dvlb = DVLB_ParseFile((u32*)highlight_shbin, highlight_shbin_size);
-	shaderProgramInit(&s_program);
-	shaderProgramSetVsh(&s_program, &s_dvlb->DVLE[0]);
+	if (!s_shader_ready) {
+		s_dvlb = DVLB_ParseFile((u32*)highlight_shbin, highlight_shbin_size);
+		if (!s_dvlb)
+			return false;
+		shaderProgramInit(&s_program);
+		shaderProgramSetVsh(&s_program, &s_dvlb->DVLE[0]);
 
-	s_uloc_projection = shaderInstanceGetUniformLocation(s_program.vertexShader, "projection");
-	s_uloc_modelview  = shaderInstanceGetUniformLocation(s_program.vertexShader, "modelView");
+		s_uloc_projection = shaderInstanceGetUniformLocation(s_program.vertexShader, "projection");
+		s_uloc_modelview  = shaderInstanceGetUniformLocation(s_program.vertexShader, "modelView");
+		s_shader_ready = true;
+	}
 
 	s_verts = (HlVertex*)linearAlloc(sizeof(HlVertex) * HL_VERTS);
 	if (!s_verts)
@@ -143,8 +157,9 @@ void highlightExit(void)
 	s_verts = NULL;
 	s_ready = false;
 
-	shaderProgramFree(&s_program);
-	DVLB_Free(s_dvlb);
+	// The shader is deliberately not freed here — see s_shader_ready above. It costs one
+	// DVLB and one shaderProgram_s for the life of the process, which is the price of not
+	// handing citro3d a dangling shaderInstance the next time the player joins a world.
 }
 
 void highlightDraw(const C3D_Mtx* view, const RayHit* hit)

@@ -780,34 +780,39 @@ bool chunkRenderBuild(const World* w, int cx, int cy, int cz)
 		}
 	}
 
-	s->cx = cx; s->cy = cy; s->cz = cz;
-	s->vert_count  = out.vert_count;
-	s->index_count = out.index_count;
-	s->opaque_index_count = out.opaque_index_count;
-	memcpy(s->face_start, out.face_start, sizeof(s->face_start));
+	// Payload first, metadata second. The counts below are what chunkRenderDraw turns into a
+	// draw call, so publishing them before the vertices they describe have landed would, for
+	// the window between the two, advertise a mesh whose bytes are still the previous
+	// occupant's. Today both halves run on the main thread with no draw between them, so this
+	// ordering is not load-bearing — it is written this way so it stays correct if that ever
+	// stops being true, and so it cannot be mistaken for the real race, which was one level up
+	// in main.c's frame loop (see gpuWaitPrevFrame there).
+	//
 	// Only the vertices actually used, not the whole tier's capacity — copying vert_cap
 	// bytes every remesh would put back exactly the waste this step exists to remove.
 	if (out.vert_count) {
 		memcpy(s->verts, s_vert_scratch, (size_t)out.vert_count * sizeof(MeshVertex));
 
-		// THE FREEZE. This memcpy goes through the ARM11's data cache; the GPU is a separate
-		// bus master and reads physical RAM. Without this flush the GPU is handed a pointer to
-		// a mesh that, as far as RAM is concerned, has not been written yet — so it reads
-		// whatever the linear heap held before, follows those bytes as geometry, and stops
-		// part-way through the command list without ever reporting completion.
+		// This memcpy goes through the ARM11's data cache; the GPU is a separate bus master
+		// and reads physical RAM. Without this flush the GPU can be handed a pointer to a mesh
+		// that, as far as RAM is concerned, has not been written yet.
 		//
-		// That is exactly what v1.1.6 and v1.1.8 measured on real hardware: the GX queue stuck
-		// on a ProcessCommandList that never finished, the two display transfers behind it
-		// never running, vblanks still arriving. v1.1.8 then proved the list itself innocent —
-		// the 9264 bytes the console choked on are byte-for-byte identical to a list that runs
-		// clean in an emulator. Nothing was wrong with the commands; the memory they pointed at
-		// was stale.
-		//
-		// It never reproduced in an emulator because emulators do not model the CPU's data
-		// cache, so the stale read cannot happen there. Eight builds looked for a bad value in
-		// the command list. There wasn't one.
+		// Read the history here carefully, because it was got wrong once. v1.2.0 added this
+		// flush — the codebase had none — on the theory that a stale read was THE freeze. It
+		// was not: steve booted v1.2.0 on his own console and it froze exactly as before, in
+		// single player and in multiplayer. The missing flush was a real defect on hardware
+		// that has no coherency between the CPU cache and the GPU's bus, and it stays for that
+		// reason alone. It was never the cause. The cause was the frame loop overwriting these
+		// same buffers while the previous frame's draw was still fetching from them, which
+		// v1.2.1 fixes in main.c. If anything, flushing sooner made that race land harder.
 		GSPGPU_FlushDataCache(s->verts, (size_t)out.vert_count * sizeof(MeshVertex));
 	}
+
+	s->cx = cx; s->cy = cy; s->cz = cz;
+	s->vert_count  = out.vert_count;
+	s->index_count = out.index_count;
+	s->opaque_index_count = out.opaque_index_count;
+	memcpy(s->face_start, out.face_start, sizeof(s->face_start));
 	s->vis_mask = vis_mask;
 	cullInvalidate();
 

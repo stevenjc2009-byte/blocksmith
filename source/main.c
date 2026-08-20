@@ -1960,6 +1960,41 @@ static bool runTitleScreen(Options* opts, bool returning_from_server)
 
 #endif   // BS_TITLE
 
+// Wait for everything the GPU was handed last frame to actually finish.
+//
+// C3D_FrameEnd(0) hands the frame's command list to GX and RETURNS. The GPU is still reading
+// the chunk vertex buffers — out of physical RAM, on its own bus — for however long that draw
+// takes. Everything the loop does next can write to exactly those buffers: genFollow frees
+// columns and hands their mesh slots to different chunks, and the two mesh drains memcpy fresh
+// geometry into slots that are already on screen. Until now the only wait for the GPU came
+// later, at C3D_FrameBegin — AFTER all of that had already run. So from the second world frame
+// onward the CPU rewrote geometry underneath a draw that was still in flight, and the vertex
+// fetch unit followed indices into half-overwritten memory and stopped without ever reporting
+// completion. That is the wedge every hardware report has shown.
+//
+// Frame 2 is exactly when steve's console died, and that is not a coincidence: the loading
+// loop drains meshes but never draws, so frame 1 is the first frame that ever submits a chunk
+// draw, and frame 2 is therefore the first iteration where an in-flight draw exists to race.
+// It never reproduced in an emulator because an emulator runs each GX command inline at
+// submission — there is no in-flight window to race at all.
+//
+// The v1.2.0 cache flushes made the CPU's writes reach RAM sooner, which if anything widened
+// the window rather than closing it. That is why they did not help.
+static void gpuWaitPrevFrame(void)
+{
+#if BS_GPU_TESTS
+	// Bounded (BS_GPU_WEDGE_NS) and self-reporting: if the queue really has stopped, this
+	// gives up rather than hanging the console, and writes sdmc:/blocksmith/postmortem.txt.
+	static u32 wait_frame;
+	wait_frame++;
+	if (!gpuTestFrameWait()) gpuTestPostMortem(wait_frame);
+#else
+	// c3d/renderqueue.h: "Waits for the GPU to finish rendering." Unbounded, which is fine
+	// in a build that has deliberately compiled the safety net out.
+	C3D_FrameSync();
+#endif
+}
+
 int main(void)
 {
 	// Step 8.5, first of everything. It only writes this thread's TLS exception slot — no
@@ -2571,6 +2606,14 @@ session_start:
 #endif
 
 		cameraView(&player.cam, &view);
+
+		// THE fix for the hardware freeze. Nothing below this line may run while last
+		// frame's draw is still fetching vertices — genFollow reassigns mesh slots and the
+		// two drains memcpy over them. See gpuWaitPrevFrame() for the full reasoning.
+		//
+		// This must sit ahead of genFollow, not merely ahead of the drains: genFollow
+		// reaches chunkRenderReleaseColumn, which hands a live slot to a different chunk.
+		gpuWaitPrevFrame();
 
 #if BS_WORLD_GEN
 		// After the move, so the ring is centred on where the player is now rather than

@@ -4,6 +4,93 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.1] - 2026-08-20
+
+### Fixed - the hardware freeze, for real this time
+
+**The CPU was rewriting chunk geometry while the GPU was still drawing it.**
+
+`C3D_FrameEnd(0)` hands the frame's command list to GX and returns immediately. The GPU keeps
+reading the chunk vertex buffers out of physical RAM, on its own bus, for as long as that draw
+takes. The frame loop then went straight on to the next iteration and did three things that
+write to exactly those buffers:
+
+- `genFollow()` (`source/main.c`) recentres the column ring, which reaches
+  `chunkRenderReleaseColumn` and hands a live mesh slot to a different chunk.
+- `chunkRenderDrainDirty()` rebuilds edited chunks - `memcpy` straight over a slot's vertices.
+- `genDrainMesh()` meshes newly generated columns - the same `memcpy`.
+
+The only wait for the GPU came *after* all three, at `C3D_FrameBegin`. So from the second world
+frame onward the vertex fetch unit was following indices into memory the CPU had already
+overwritten or reassigned, and it stopped part-way through the command list without ever
+reporting completion. That is the wedge every hardware report since v1.1.6 has shown:
+`ProcessCommandList` submitted, never completed, the two display transfers behind it stuck
+forever, vblanks still arriving, main thread alive.
+
+Frame 2 is not a coincidence. The loading loop drains meshes but never calls `chunkRenderDraw`,
+so frame 1 is the first frame that ever submits a chunk draw, which makes frame 2 the first
+iteration where an in-flight draw exists to race. steve's v1.2.0 post-mortem says `frame : 2`.
+
+It never reproduced in an emulator because an emulator executes each GX command inline at
+submission. There is no in-flight window there to race at all - which is also why nine builds
+of emulator testing could not find it.
+
+**The fix:** `gpuWaitPrevFrame()` in `source/main.c`, called once per frame immediately after
+`cameraView()` and before `genFollow()` - ahead of every path that can free or overwrite a mesh
+slot. It is `gpuTestFrameWait()` (bounded, and it writes `postmortem.txt` rather than hanging
+the console) in a build with the safety net compiled in, and `C3D_FrameSync()` otherwise. On a
+frame that works it costs nothing: the queue has already drained and it returns at once.
+
+### Corrected
+
+The v1.2.0 entry below claims the missing `GSPGPU_FlushDataCache` calls were the freeze. **They
+were not.** steve installed v1.2.0 on his own New 3DS and it froze exactly as before, in single
+player and in multiplayer. The flushes were a real defect on hardware with no coherency between
+the ARM11 data cache and the GPU's bus, and they stay for that reason alone - but they were
+never the cause. If anything, making the CPU's writes reach RAM sooner made the real race land
+harder. The comment in `source/scene/chunk_render.c` that asserted the cache theory as proven
+has been rewritten to say what actually happened.
+
+### Fixed - two latent crashes found in the same audit
+
+- **`source/scene/highlight.c`, `source/scene/playermodel.c`**: both created a `DVLB_s` and a
+  `shaderProgram_s` in `*Init()` and freed them in `*Exit()`, and both run per session - join a
+  world, leave, join again. `shaderProgramFree` does not null `program->vertexShader`, and
+  citro3d separately caches a pointer to the last program it bound, so rebuilding these statics
+  across a rejoin is the same use-after-free that hard-crashes the console and that this project
+  has already paid for once. Both now build their shader once for the life of the process and
+  never tear it down; the vertex buffers are still freed per session.
+- **`source/scene/chunk_render.c`**: `chunkRenderBuild` published a slot's `vert_count` /
+  `index_count` / `face_start` *before* the `memcpy` that fills the vertices those counts
+  describe. Not reachable today - both halves run on the main thread with no draw between them -
+  but it is one refactor away from being real, and it is easy to mistake for the actual race.
+  Payload now lands first, metadata second.
+
+### Verified
+
+- Azahar, shipping configuration: world renders correctly, highlight cage draws, counters
+  identical to v1.2.0 - cols 322, chunks 2473, meshes 114, tris 88084, cull 81. No
+  `postmortem.txt` written, so the bounded wait never fired.
+- `arm-none-eabi-nm blocksmith.elf` shows `gpuTestFrameWait` and `gpuTestPostMortem` present, so
+  the safety net is genuinely in the shipped binary rather than dropped by `--gc-sections`.
+
+### Not verified
+
+- **The console.** This is a hardware-only bug and no emulator can confirm the fix; only booting
+  it on a real 3DS can.
+- **The frame-rate cost.** Serialising the CPU behind the GPU gives up their overlap. Azahar's
+  timing does not predict hardware and the metrics CSV was empty, so the real cost is unmeasured.
+  If the game feels slower than v1.1.0, this is why, and the fix for that is double-buffering the
+  mesh slots rather than removing the wait.
+
+### Also worth checking, not a code change
+
+Luma3DS has a **New 3DS CPU** option (Rosalina / boot config) that forces the 804 MHz clock
+and/or the extra L2 cache onto titles that never asked for either. `cia/blocksmith.rsf` declares
+`CpuSpeed: 268MHz` and `EnableL2Cache: false` - this title explicitly opts out. Luma's own wiki
+notes that a few titles are unstable with it forced on. If the freeze somehow survives this
+release, set that option to **Off** before anything else.
+
 ## [1.2.0] — 2026-08-20
 
 The freeze that killed real 3DS consoles from v1.1.0 through v1.1.8 is fixed.
