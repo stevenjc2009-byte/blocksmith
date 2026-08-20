@@ -42,6 +42,17 @@ All notable changes to Blocksmith. Format loosely follows
   while they are being read. Networking deliberately keeps running: a session that stopped
   answering while its player read a menu would be dropped by the server.
 
+### Fixed
+
+- **The world stopped carrying 289 columns nobody was standing in.** At boot the game
+  allocates a 17x17 grid of columns to prove the console can claim the worst case it will
+  ever be asked for — and then never gave the grid back, so every session generated the
+  real world *around* it. On the same world at the same render distance the overlay now
+  reads `cols 25 chunks 124` where it read `cols 305 chunks 2392`, and peak block storage
+  halved from 515,181 to 258,320 bytes. The bytes were the smaller half of it: those 289
+  columns also occupied 289 of the world table's 1024 slots for the whole session, so
+  every lookup the streaming ring made for its own columns had to probe past them.
+
 ### Notes
 
 - The touch panel underneath the menu is fed a blank input while the menu is up, so a
