@@ -4,29 +4,35 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [1.2.3] - 2026-08-20
+## [1.2.4] - 2026-08-20
 
-### Why this build exists
+### The round-2 bisect came back and it narrowed the freeze to one thing
 
-v1.2.2's hardware report was the first from a provably single boot (the boot fence worked). It said the freeze happens on the FIRST world frame, not after minutes of play: `frame captures: 1`, `list check: 1 clean frame(s)`, `columns in: 49` (world still streaming). The `frames drawn: 341` is almost entirely title screen. The frame's own ProcessCommandList was submitted and never completed — `gx queue: cap 32 queued 5 submitted 5 completed 2`, with both buffer clears completing and the draw never doing so. Vblanks kept arriving, the command list was byte-identical to what was submitted, it validated clean, and the draw guard passed every chunk.
+Results, one arm per boot on real hardware: arm 0 "everything" HUNG (control, correct). Arm 1 "world draw skipped entirely" SURVIVED (control, correct). Arm 2 "cull only - all the CPU work, not one GPU command" SURVIVED. Arm 3 "opaque pass only" HUNG. Arm 4 "transparent pass only" HUNG. Arm 5 "GPU state set up, but no draw calls at all" SURVIVED.
 
-This clears v1.2.1's fix as the cause. That race needed a previous in-flight draw for genFollow and the mesh drains to overwrite. On the first world frame there is no previous draw.
+### What that eliminates
 
-### The draw bisect is switched back on
+Arm 2 surviving rules out a CPU loop that never ends - all the culling, the visibility walk and the horizon test ran to completion. Arm 5 surviving rules out the whole GPU state block: the shader program bind, the attribute configuration, the atlas texture bind, depth/blend/cull/fog state and every uniform upload. Arms 3 and 4 both hanging rules out anything unique to either pass, including the alpha test that only the transparent pass turns on and the face-mask bucket merging that only the opaque pass does. What is left is what happens only once a chunk draw is actually issued.
 
-Version-stamped so it cannot repeat v1.1.2's failure. Round 1 (already done, on hardware) removed whole draws from the frame and left exactly one survivor — "no world" — so chunkRenderDraw() is the call that hangs. Round 2's six arms cut INSIDE it: 0 everything (control, must hang), 1 world draw skipped entirely (control, must survive), 2 cull only - all the CPU work and not one GPU command, 3 opaque pass only, 4 transparent pass only, 5 GPU state set up but no draw calls at all. Arm 2 is the pivot: if it hangs the fault is a CPU loop that never ends; if it survives the fault is something handed to the GPU.
+### The experiment in this build
 
-### Version stamping
+The world vertex shader is the biggest thing in that remaining set, and it contains the only relative addressing in the entire project - `mova a0.x, inpack.zzzz` followed by `mov r3, faceShade[a0.x]`, in source/shaders/world.v.pica. That reads a byte off the vertex, loads it into the PICA200's address register, and fetches a uniform at an offset the CPU never sees. It is exactly the kind of construct an emulator implements as a bounds-safe array lookup while real silicon does a raw fetch out of the constant bank, which fits "hardware only, never reproduces in Azahar". This build replaces the indexed fetch with a fixed `mov r3, faceShade[0]`. Nothing else changed.
 
-drawprobe.txt now carries a `# blocksmith <version> round 2 bisect` first line. Anything not written by exactly this version is deleted rather than interpreted. This matters because arms are RENUMBERED between rounds — round 1's arm 2 was "no highlight cage", round 2's arm 2 is "cull only". v1.1.2 read v1.1.1's file, concluded every arm had had its turn, and parked on the arm that draws nothing; a build meant to freeze came back alive and was reported as passing.
+### Why it is written that way rather than deleting the array
 
-### Two report lines that lied, fixed
+faceShade stays declared and still read, so picasso keeps emitting it into the shader's uniform table and `shaderInstanceGetUniformLocation` still resolves it. If the array had become unused that lookup could return -1 and the upload loop in source/scene/chunk_render.c would write to whatever sits below it. Only the indexing changed - one variable.
 
-(a) The R1 command-list replay printed "REPLAY IS BROKEN" on timeout. replaySubmit uses GX_ProcessCommandList, which appends to the SAME GX queue the game's frame was submitted on — so when that frame is already wedged the replay can never run. It now samples the queue before submitting and says "the queue was ALREADY wedged; the replay never ran", with the queued/completed counts. On steve's console the old wording blamed the instrument for the bug it had just caught. (b) The `gsp vblank` explanation claimed ALIVE proves the stall is a GPU command that never finished. VBlank and command-completion are different GSP events, so ALIVE does not prove completion interrupts are being delivered. Reworded.
+### What it looks like on screen
 
-### Verified
+faceShade[0] is FACE_EAST at 0.78, so every face is now lit identically at 0.78 instead of 1.00 on top and 0.48 underneath. Textures are unaffected. The flatness is deliberate and doubles as proof the new shader is the one running.
 
-(emulator, both directions): planted a foreign 1799-byte round-1 drawprobe.txt — it was discarded, not inherited, and boot 1 started at arm 0. Across 7 boots the arm advanced exactly one step per boot, 0 through 5, then reported "all arms done; parked on arm 5", with no false HUNG lines. Red control with a stall planted: boot 1 wrote `arm 0 START` and hung with no survival line; boot 2 correctly wrote `arm 0 HUNG - no survival line, the console froze on this arm` and advanced to arm 1. No hardware testing was performed; this build does not attempt to fix the freeze.
+### Verified in the emulator
+
+by screenshotting the same world position with the experiment and with the original two lines restored, then measuring mean luminance of the same pixels in both. Top faces came out at 0.781 and 0.783 of their control brightness against a predicted 0.78/1.00 = 0.780. A west-facing wall went UP by 1.143 against a predicted 0.78/0.66 = 1.18, and a north-facing wall by 1.068 against a predicted 0.78/0.72 = 1.08. Had the build not taken effect every ratio would have been 1.000. This build carries no diagnostics and writes no report files; the result is meant to be judged by eye.
+
+### This is an experiment, not a known fix
+
+If the freeze persists, the shader is eliminated and the next cut is inside the draw itself.
 
 ## [1.2.3] - 2026-08-20
 

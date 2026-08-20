@@ -66,9 +66,37 @@
 	mov outtc0, r2.xyxy
 
 	; --- baked lighting ---------------------------------------------------
-	; faceShade[normal index]
-	mova a0.x, inpack.zzzz
-	mov r3, faceShade[a0.x]
+	; v1.2.4 EXPERIMENT, and the only change in this build. Restore the two commented
+	; lines to undo it.
+	;
+	; The round-2 draw bisect (v1.2.3, run on hardware) came back: arm 2 "cull only, no GPU
+	; command" SURVIVED, so the freeze is not a CPU loop. Arm 5 "GPU state set up, no draw
+	; calls" SURVIVED, so it is not the program bind, the attribute config, the texture bind,
+	; the depth/blend/fog state or the uniform uploads. Arms 3 (opaque only) and 4 (transparent
+	; only) BOTH hung, so it is not anything unique to either pass. What is left is what only
+	; happens once a chunk draw is actually issued - and the biggest thing in that set is this
+	; shader running per vertex.
+	;
+	; These two lines are the only relative addressing anywhere in the project. `mova` loads
+	; the address register from a value read off the vertex, and `faceShade[a0.x]` then fetches
+	; a uniform at an offset the CPU never sees. That is precisely the kind of construct an
+	; emulator implements as a bounds-safe array lookup while the silicon does a raw fetch out
+	; of the constant bank, which fits "hardware only, never in Azahar".
+	;
+	; The replacement keeps the faceShade array declared AND read, so picasso still emits it
+	; into the uniform table and shaderInstanceGetUniformLocation still resolves it - if the
+	; array became unused, that lookup could return -1 and chunk_render.c's upload loop would
+	; write to whatever sits below the array. Only the INDEXING changes. One variable.
+	;
+	; Expected on screen if this was the cause: the world draws, textures are correct, but
+	; every face is lit identically at faceShade[0] = 0.78 (FACE_EAST). No bright tops, no
+	; dark undersides. That flatness is also the proof the new shader is the one running - if
+	; the lighting still varies by face, this build did not take effect and any conclusion
+	; from it is void.
+	;
+	;	mova a0.x, inpack.zzzz
+	;	mov r3, faceShade[a0.x]
+	mov r3, faceShade[0]
 
 	; ao factor = aoFloor + aoRange * (ao / 3)
 	mul r4.x, aoScale, inpack.wwww
