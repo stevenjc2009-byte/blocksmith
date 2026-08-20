@@ -164,6 +164,17 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g 	-I source 	source/net/blockdiff.c 	so
 
 "./$BH/blockdiff_test"
 
+# net/networld.c, the client half of the multiplayer world. Tenth binary, own main(). Like
+# blockdiff_test above it, this had a Makefile of its own (source/net/Makefile.networld-test)
+# that had to be remembered and run by hand, which is the same thing as not running: the
+# per-chunk subscription work landed with tests nobody's default command executed. Both
+# Makefiles stay for their finer warning set; this line is what makes the suite the single
+# thing that has to pass. -I deps/blocksmith-server is the wire protocol header the client
+# and the server share, which is the whole point of it living in the server repo.
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g 	-I source -I deps/blocksmith-server 	source/world/world.c 	source/world/chunk.c 	source/world/budget.c 	source/net/blockdiff.c 	source/net/networld.c 	source/net/networld_test.c 	-o "$BH/networld_test"
+
+"./$BH/networld_test"
+
 # Only reached if every binary above exited 0 (set -e stops the script on the first
 # non-zero exit), so a failed run's directory is left behind for inspection rather than
 # silently deleted along with the evidence of what failed.

@@ -146,6 +146,25 @@ static size_t buildWorldSync(uint8_t *out, const struct sync_entry *e, uint16_t 
     return BS_WORLD_SYNC_BYTES(n);
 }
 
+static size_t buildChunkDiffs(uint8_t *out, int32_t cx, int32_t cz, uint8_t flags,
+                               const struct sync_entry *e, uint16_t n)
+{
+    out[0] = BS_APP_CHUNK_DIFFS;
+    bs_put_i32(out + 1, cx);
+    bs_put_i32(out + 5, cz);
+    out[9] = flags;
+    bs_put_u16(out + 10, n);
+    uint8_t *p = out + BS_CHUNK_DIFFS_HDR_BYTES;
+    for (uint16_t i = 0; i < n; i++) {
+        bs_put_i32(p,     e[i].x);
+        bs_put_i32(p + 4, e[i].y);
+        bs_put_i32(p + 8, e[i].z);
+        p[12] = e[i].block;
+        p += BS_SYNC_ENTRY_BYTES;
+    }
+    return BS_CHUNK_DIFFS_BYTES(n);
+}
+
 static void buildPosUpdateS(uint8_t *out, uint32_t sid, float x, float y, float z,
                              float yaw, float pitch)
 {
@@ -381,6 +400,178 @@ static void test_world_sync_batch(void)
     bs_put_u16(over + 1, (uint16_t)(BS_SYNC_MAX_ENTRIES + 1));
     networldApplyPayload(over, sizeof over);
     check(networldPendingCount() == 0, "a WORLD_SYNC claiming more than BS_SYNC_MAX_ENTRIES is dropped");
+}
+
+/* ------------------------------------------------ per-column diff subscription (V127-A) --- */
+/* networldSubscribeColumn()/networldUnsubscribeColumn() are plain encode-and-send, tested the
+ * same way test_send_block_edit_encodes_and_sends() covers BS_APP_BLOCK_EDIT above. The
+ * receive side, BS_APP_CHUNK_DIFFS, is deliberately tested against the SAME assertions as
+ * test_world_sync_batch() above it, entry for entry: the whole point of applyChunkDiffs()
+ * (networld.c) is that it is applyOrQueue() wearing a different header, not a second
+ * application path, so a test that could tell the two apart would mean that promise had been
+ * broken. */
+
+static void test_subscribe_column_encodes_and_sends(void)
+{
+    puts("networldSubscribeColumn() encodes BS_APP_CHUNK_SUB and hands it to the transport");
+
+    fakeTransportReset();
+
+    networldSubscribeColumn(-3, 12);
+    check(fake_sent_calls == 1, "the transport was asked to send exactly once");
+    check(fake_sent_len == BS_CHUNK_SUB_BYTES, "encoded to exactly BS_CHUNK_SUB_BYTES");
+    check(fake_sent_buf[0] == BS_APP_CHUNK_SUB, "type byte is BS_APP_CHUNK_SUB");
+    check(bs_get_i32(fake_sent_buf + 1) == -3, "col_x round-trips, including negative");
+    check(bs_get_i32(fake_sent_buf + 5) == 12, "col_z round-trips");
+
+    /* Fire-and-forget, same posture as networldSendBlockEdit(): a transport-level refusal (no
+     * session) must not crash, and there is no return value for the caller to check either way
+     * — this only proves the attempt still happens and nothing blows up when it fails. */
+    fake_send_fail = true;
+    networldSubscribeColumn(1, 1);
+    check(fake_sent_calls == 2, "still attempted the send even when the transport refuses it");
+}
+
+static void test_unsubscribe_column_encodes_and_sends(void)
+{
+    puts("networldUnsubscribeColumn() encodes BS_APP_CHUNK_UNSUB and hands it to the transport");
+
+    fakeTransportReset();
+
+    networldUnsubscribeColumn(7, -9);
+    check(fake_sent_calls == 1, "the transport was asked to send exactly once");
+    check(fake_sent_len == BS_CHUNK_UNSUB_BYTES, "encoded to exactly BS_CHUNK_UNSUB_BYTES");
+    check(fake_sent_buf[0] == BS_APP_CHUNK_UNSUB, "type byte is BS_APP_CHUNK_UNSUB");
+    check(bs_get_i32(fake_sent_buf + 1) == 7,  "col_x round-trips");
+    check(bs_get_i32(fake_sent_buf + 5) == -9, "col_z round-trips, including negative");
+
+    fake_send_fail = true;
+    networldUnsubscribeColumn(1, 1);
+    check(fake_sent_calls == 2, "still attempted the send even when the transport refuses it");
+}
+
+static void test_chunk_diffs_batch(void)
+{
+    puts("BS_APP_CHUNK_DIFFS applies a batch through the same rules as WORLD_SYNC, per entry");
+
+    World w;
+    worldInit(&w);
+    networldInit();
+    networldSetWorld(&w);
+    worldColumnCreate(&w, 0, 0);   /* column (0,0) loaded; column (5,0) is not */
+
+    struct sync_entry e[3] = {
+        { 4, 10, 4, BLOCK_STONE },          /* column (0,0): loaded, should apply directly */
+        { 84, 10, 4, BLOCK_SAND },          /* column (5,0): not loaded, should queue      */
+        { 6, 10, 6, (uint8_t)BLOCK_COUNT }, /* invalid block id: should be skipped         */
+    };
+    uint8_t buf[BS_CHUNK_DIFFS_BYTES(3)];
+    size_t len = buildChunkDiffs(buf, 0, 0, BS_CHUNK_DIFFS_LAST, e, 3);
+    networldApplyPayload(buf, len);
+
+    check(worldGet(&w, 4, 10, 4) == BLOCK_STONE, "the loaded-column entry applied");
+    check(networldPendingCount() == 1, "the unloaded-column entry was queued, and only it");
+    check(worldColumn(&w, 5, 0) == NULL, "queuing did not create a phantom column for it");
+    check(worldGet(&w, 6, 10, 6) == BLOCK_AIR, "the invalid entry was skipped, not applied");
+}
+
+static void test_chunk_diffs_unloaded_column_drains_on_load(void)
+{
+    puts("CHUNK_DIFFS queued for a column not yet loaded drains via networldOnColumnLoad(), "
+         "exactly like BLOCK_EDIT/WORLD_SYNC");
+
+    World w;
+    worldInit(&w);
+    networldInit();
+    networldSetWorld(&w);
+
+    struct sync_entry e[2] = {
+        { 40, 10, 5, BLOCK_STONE },   /* column (2,0) */
+        { 35, 20, 3, BLOCK_SAND },    /* column (2,0), same column */
+    };
+    uint8_t buf[BS_CHUNK_DIFFS_BYTES(2)];
+    size_t len = buildChunkDiffs(buf, 2, 0, BS_CHUNK_DIFFS_LAST, e, 2);
+    networldApplyPayload(buf, len);
+    check(networldPendingCount() == 2, "both queued for the not-yet-loaded column");
+
+    worldColumnCreate(&w, 2, 0);
+    networldOnColumnLoad(&w, 2, 0);
+
+    check(worldGet(&w, 40, 10, 5) == BLOCK_STONE, "first diff landed");
+    check(worldGet(&w, 35, 20, 3) == BLOCK_SAND, "second diff landed");
+    check(networldPendingCount() == 0, "store drained — the same blockdiff.h store, not a second one");
+}
+
+static void test_chunk_diffs_empty_last_batch_is_a_noop(void)
+{
+    puts("a CHUNK_DIFFS with zero entries and LAST set parses cleanly and applies nothing");
+
+    /* This is bs_proto.h's "a column with no edits still gets one packet" case. Nothing in this
+     * client tracks a per-column synced flag (see applyChunkDiffs()'s own comment in networld.c
+     * for why), so the only thing to prove here is that the empty/LAST shape does not crash or
+     * misparse — not that some synced state flips. */
+    networldInit();
+
+    uint8_t buf[BS_CHUNK_DIFFS_BYTES(0)];
+    size_t len = buildChunkDiffs(buf, 0, 0, BS_CHUNK_DIFFS_LAST, NULL, 0);
+    networldApplyPayload(buf, len);
+
+    check(networldPendingCount() == 0, "nothing queued for an empty batch");
+    check(networldRecvMsgs() == 1, "the packet still counted as received");
+}
+
+static void test_chunk_diffs_short_header_dropped(void)
+{
+    puts("a CHUNK_DIFFS shorter than its own header is dropped, not misparsed");
+
+    networldInit();
+
+    uint8_t short_msg[BS_CHUNK_DIFFS_HDR_BYTES - 1] = {0};
+    short_msg[0] = BS_APP_CHUNK_DIFFS;
+    networldApplyPayload(short_msg, sizeof short_msg);
+
+    check(networldPendingCount() == 0, "nothing queued from a truncated header");
+}
+
+static void test_chunk_diffs_malformed_length_dropped_whole(void)
+{
+    puts("a CHUNK_DIFFS whose declared count disagrees with its own length is dropped whole");
+
+    World w;
+    worldInit(&w);
+    networldInit();
+    networldSetWorld(&w);
+    worldColumnCreate(&w, 0, 0);
+
+    struct sync_entry e[2] = {
+        { 1, 10, 1, BLOCK_STONE },
+        { 2, 10, 2, BLOCK_STONE },
+    };
+    uint8_t buf[BS_CHUNK_DIFFS_BYTES(2)];
+    buildChunkDiffs(buf, 0, 0, BS_CHUNK_DIFFS_LAST, e, 2);
+    bs_put_u16(buf + 10, 5);   /* claims 5 entries, packet only carries room/bytes for 2 */
+    networldApplyPayload(buf, sizeof buf);
+
+    check(networldPendingCount() == 0, "nothing was queued from the malformed batch");
+    check(worldGet(&w, 1, 10, 1) == BLOCK_AIR, "and nothing applied either — dropped whole");
+}
+
+static void test_chunk_diffs_count_over_cap_dropped(void)
+{
+    puts("a CHUNK_DIFFS claiming more than BS_CHUNK_DIFFS_MAX_ENTRIES is rejected outright");
+
+    networldInit();
+
+    uint8_t over[BS_CHUNK_DIFFS_HDR_BYTES];
+    over[0] = BS_APP_CHUNK_DIFFS;
+    bs_put_i32(over + 1, 0);
+    bs_put_i32(over + 5, 0);
+    over[9] = 0;
+    bs_put_u16(over + 10, (uint16_t)(BS_CHUNK_DIFFS_MAX_ENTRIES + 1));
+    networldApplyPayload(over, sizeof over);
+
+    check(networldPendingCount() == 0,
+          "a CHUNK_DIFFS claiming more than BS_CHUNK_DIFFS_MAX_ENTRIES is dropped");
 }
 
 static void test_pump_is_bounded_per_frame(void)
@@ -922,6 +1113,75 @@ static void test_edit_hook_is_cleared_by_init_and_optional(void)
     check(hook_count == 0, "networldInit() cleared the hook");
 }
 
+/* ------------------------------------------- the rejoin sync capacity --------------------- */
+/* Written from a live report: steve and a friend built a house, steve rejoined, and the house
+ * was gone from HIS screen while still standing on everyone else's. This reproduces that
+ * exactly, with no server and no second console.
+ *
+ * The shape of it: the server replays every diff it holds (BS_DIFF_MAX is 65536, so it is not
+ * the one forgetting) the instant the handshake completes — which is on the title screen,
+ * before a world exists. With no world, every entry goes to the pending store, which REFUSES
+ * rather than evicts once full. BLOCKDIFF_MAX_PENDING was 256, and the server sends
+ * oldest-first, so the first 256 diffs survived and the newest were dropped. A house is the
+ * newest thing in the world. Players who never left still have theirs in RAM, which is why
+ * it stays visible to them — the asymmetry is the tell.
+ *
+ * The fix raised BLOCKDIFF_MAX_PENDING to match the server's 65536 exactly, so a join sync
+ * can no longer overflow it. The count below stays at 300 — over the OLD cap, so this test
+ * still goes red against the code that had the bug, which is the only reason to keep it.
+ * Measured against that code: "queued 256 of 300, refused 44", 3 checks failed. */
+
+#define REJOIN_EDITS 300
+
+static void test_rejoin_sync_larger_than_the_store_keeps_every_edit(void)
+{
+    puts("a join sync bigger than the pending store must not silently lose the newest edits");
+
+    World w;
+    worldInit(&w);
+    networldInit();
+
+    /* No world registered: this is the title screen, which is where a join sync actually
+     * arrives. networldSetWorld() is deliberately NOT called yet — explicitly reset to NULL
+     * rather than just relying on networldInit() above, which does not touch s_world at all
+     * (see networld.c). Without this, s_world can still hold whatever a PRECEDING test last
+     * registered via networldSetWorld(&some_local_World) and never cleared, and that local has
+     * since gone out of scope: found live via AddressSanitizer as a stack-use-after-return into
+     * test_edit_hook_is_cleared_by_init_and_optional()'s `w`, the test that happens to run
+     * immediately before this one. Not a bug this feature introduced, but this test's own stated
+     * precondition was never actually enforced, so it is enforced here explicitly. */
+    networldSetWorld(NULL);
+
+    /* REJOIN_EDITS distinct coordinates, all inside column (0,0) so one drain collects them.
+     * Oldest first, exactly as send_world_sync() walks the server's diff store. y varies so
+     * every coordinate is genuinely distinct rather than overwriting in place. */
+    for (int i = 0; i < REJOIN_EDITS; i++) {
+        uint8_t msg[BS_BLOCK_EDIT_BYTES];
+        buildBlockEdit(msg, i % 16, 40 + i / 16, (i / 4) % 16, BLOCK_STONE);
+        networldApplyPayload(msg, sizeof msg);
+    }
+
+    printf("    [measured] queued %d of %d, refused %d\n",
+           networldPendingCount(), REJOIN_EDITS, networldPendingRefusals());
+
+    check(networldPendingRefusals() == 0,
+          "no edit from the join sync was refused for want of room");
+    check(networldPendingCount() == REJOIN_EDITS,
+          "every edit the server replayed is still held, waiting for its column");
+
+    /* Now the player picks a world and the column streams in — the house should reappear. */
+    networldSetWorld(&w);
+    worldColumnCreate(&w, 0, 0);
+    networldOnColumnLoad(&w, 0, 0);
+
+    int landed = 0;
+    for (int i = 0; i < REJOIN_EDITS; i++)
+        if (worldGet(&w, i % 16, 40 + i / 16, (i / 4) % 16) == BLOCK_STONE) landed++;
+
+    printf("    [measured] %d of %d edits reached the world\n", landed, REJOIN_EDITS);
+    check(landed == REJOIN_EDITS, "the whole house is standing after the rejoin");
+}
+
 /* ------------------------------------------------------------------------- main */
 
 int main(void)
@@ -937,6 +1197,14 @@ int main(void)
     test_worldset_hook_autodrains();
     test_validation_rejects_hostile_input();
     test_world_sync_batch();
+    test_subscribe_column_encodes_and_sends();
+    test_unsubscribe_column_encodes_and_sends();
+    test_chunk_diffs_batch();
+    test_chunk_diffs_unloaded_column_drains_on_load();
+    test_chunk_diffs_empty_last_batch_is_a_noop();
+    test_chunk_diffs_short_header_dropped();
+    test_chunk_diffs_malformed_length_dropped_whole();
+    test_chunk_diffs_count_over_cap_dropped();
     test_pump_is_bounded_per_frame();
     test_send_block_edit_encodes_and_sends();
     test_pos_update_registers_remote();
@@ -956,6 +1224,7 @@ int main(void)
     test_edit_hook_silent_while_the_edit_is_only_queued();
     test_edit_hook_fires_per_entry_of_a_sync_batch();
     test_edit_hook_is_cleared_by_init_and_optional();
+    test_rejoin_sync_larger_than_the_store_keeps_every_edit();
 
     printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;

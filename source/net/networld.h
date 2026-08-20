@@ -2,8 +2,8 @@
 //
 // bsnet_transport.c moves opaque, already-decrypted bytes; bsnet.c is the UI-facing status
 // API for the other session's menus. Neither of them knows a block from a byte. This module
-// is the missing piece: it decodes BS_APP_BLOCK_EDIT / BS_APP_WORLD_SYNC (bs_proto.h, which
-// `make deps` fetches pinned into deps/blocksmith-server — it is included as
+// is the missing piece: it decodes BS_APP_BLOCK_EDIT / BS_APP_WORLD_SYNC / BS_APP_CHUNK_DIFFS
+// (bs_proto.h, which `make deps` fetches pinned into deps/blocksmith-server — it is included as
 // "proto/bs_proto.h", and was once "../../server/proto/bs_proto.h", a path that only
 // resolved on a machine with the server repo checked out next door; see bsnet_transport.h
 // for the whole story) into world writes, and it is the only thing in the client that calls
@@ -97,6 +97,42 @@ void networldSetEditHook(NetworldEditFn fn, void* userdata);
 // if there is no session or the transport refused the send — both the ordinary "the packet
 // did not make it" UDP outcome, not a caller error.
 bool networldSendBlockEdit(int x, int y, int z, uint8_t block);
+
+// ---- per-column diff subscription (V127-A) ---------------------------------------------------
+//
+// Why this pair exists at all, given BS_APP_WORLD_SYNC already replays every diff at JOIN: that
+// replay is sized to the SERVER's whole diff store (BS_DIFF_MAX, deps/blocksmith-server's
+// diffstore.h), and this client's own pending store (net/blockdiff.h's BLOCKDIFF_MAX_PENDING)
+// had to be raised to match it just to stop losing a joining player's own house — see that
+// header's comment and networld_test.c's test_rejoin_sync_larger_than_the_store_keeps_every_edit
+// for the exact, previously-real bug. Scoping delivery to columns the player has actually
+// streamed in is what lets the server's capacity grow past that number without this client's
+// memory growing with it: the console only ever holds diffs for columns it currently has loaded
+// (or has just asked for), never the server's entire history.
+//
+// Both calls are void and fire-and-forget, the same posture as networldSendBlockEdit() above:
+// there is no session-status check here because netTransportSend() already reports "no session"
+// as a plain false, and there is nothing a caller could usefully do with that beyond what already
+// happens on its own — a lost SUB just means the column streams in with whatever WORLD_SYNC or a
+// later resubscribe still recovers, not silence forever. Callers do not need the return value, so
+// neither function has one.
+
+// Tells the server this client now has column (col_x, col_z) loaded and wants its diffs — sends
+// BS_APP_CHUNK_SUB. Call the instant a column becomes part of the live World, alongside
+// networldOnColumnLoad(): main.c's genInstallOne() is that one place today (see this module's
+// own .c file for exactly where). Calling this before the column is actually live would only
+// mean any CHUNK_DIFFS batch that beat the install back gets queued the ordinary way, via the
+// same pending store BLOCK_EDIT and WORLD_SYNC already share — not lost, just delayed to the
+// next column load, so there is no strict ordering requirement between the two calls.
+void networldSubscribeColumn(int col_x, int col_z);
+
+// The other half: tells the server this client no longer wants diffs for column (col_x, col_z)
+// — sends BS_APP_CHUNK_UNSUB. Call the instant a column leaves the live World: main.c's
+// genUnloadColumn() is that one place today. A column dropped before ever being subscribed (see
+// genInstallOne()'s stale-ring-position branch, which removes a column without ever having
+// called networldSubscribeColumn() for it) does not need this call either — there is nothing to
+// unsubscribe from the server did not already fail to hear about.
+void networldUnsubscribeColumn(int col_x, int col_z);
 
 // The seed of the world the server put us in, from BS_APP_WORLD_INFO. False until that packet
 // arrives — which is immediately after JOIN, so in practice it is true well before the player

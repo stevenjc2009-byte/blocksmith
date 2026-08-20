@@ -684,6 +684,13 @@ static void genRequestArea(void)
 // asked for and never arrived.
 static void genUnloadColumn(int32_t cx, int32_t cz)
 {
+	// Tell the server to stop sending edits for this column before anything else, because
+	// after this function nothing here can use them: the blocks are gone and a diff arriving
+	// for them would only be queued for a column that is no longer loaded. A no-op in single
+	// player and whenever there is no session. Columns dropped for having gone stale (see
+	// genInstallOne) never subscribed in the first place and correctly never unsubscribe.
+	networldUnsubscribeColumn(cx, cz);
+
 	// Meshes first. A slot outliving its chunks would keep drawing terrain that is not
 	// there, and would still match in chunkRenderTouch — so an edit near the boundary
 	// would queue a remesh of a chunk that now reads as air and blank a neighbour.
@@ -885,6 +892,14 @@ static bool genInstallOne(void)
 	// so anything a drained diff touches gets swept into the same meshing pass as the rest of
 	// this column instead of waiting a frame.
 	networldOnColumnLoad(&s_world, cx, cz);
+
+	// And now ask the server for whatever it already holds for this column. Here rather than
+	// where the column was requested, because a subscription is a promise that the diffs can
+	// be applied on arrival, and until the blocks are in the world they cannot be. After the
+	// stale-ring check above for the same reason it exists: a column that arrived outside the
+	// ring is thrown away on the next line but one, and subscribing to it would leave the
+	// server broadcasting edits for terrain this console no longer has.
+	networldSubscribeColumn(cx, cz);
 
 	genQueueReadyColumns();
 	return true;

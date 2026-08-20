@@ -179,6 +179,57 @@ static void applyWorldInfo(const uint8_t* msg, size_t len)
 	s_have_world_seed = true;
 }
 
+// BS_APP_CHUNK_DIFFS: one column's worth of diffs, batched. Same per-entry shape as
+// applyWorldSync() above and deliberately handled the same way — apply now if the column is
+// already loaded, queue it via net/blockdiff.h otherwise — because a diff scoped to a column is
+// not different in kind from one that arrived as part of the old whole-world replay; only how
+// the server chose to batch it changed. Reusing applyOrQueue() rather than a second path is the
+// whole point: there is exactly one way a remote edit reaches this client's World, regardless of
+// which message type carried it in.
+//
+// cx/cz (the column this batch is for) and the LAST flag are read only far enough to validate
+// the packet's own shape. Both exist on the wire for reasons that are about the SERVER's side of
+// this protocol (bs_proto.h: cx/cz because UDP has no ordering guarantee between two columns
+// subscribed in the same tick, LAST because a column with zero diffs still has to be told
+// "empty", not "still coming") and neither is consumed here beyond that: every entry carries its
+// own absolute (x, y, z), which is what applyOrQueue() actually keys on to find its column — the
+// same way a WORLD_SYNC entry does, with no column header at all. This client tracks no
+// per-column "am I fully synced yet" state, because nothing in main.c reads such a thing: a
+// column meshes the moment it installs (genInstallOne() -> genQueueReadyColumns(), before any
+// CHUNK_DIFFS for it can have arrived) and a diff that lands afterwards — whether it was queued
+// from before the column existed or arrives live once it does — already reaches the screen via
+// the edit hook's remesh notification (see this header's own comment on NetworldEditFn). Adding a
+// synced/not-synced flag nobody reads would be state for its own sake.
+static void applyChunkDiffs(const uint8_t* msg, size_t len)
+{
+	if (len < BS_CHUNK_DIFFS_HDR_BYTES) return;
+
+	const uint16_t count = bs_get_u16(msg + 10);
+
+	// Same two-part malformed-packet posture as applyWorldSync(): the declared count must
+	// exactly explain the packet's own length, and independently must not exceed the sender's
+	// own per-batch cap — a payload lying about either is dropped whole, not parsed as far as
+	// it happens to still make sense.
+	if ((uint32_t)count > BS_CHUNK_DIFFS_MAX_ENTRIES) return;
+	if ((size_t)BS_CHUNK_DIFFS_BYTES(count) != len) return;
+
+	const uint8_t* p = msg + BS_CHUNK_DIFFS_HDR_BYTES;
+	for (uint16_t i = 0; i < count; i++) {
+		const int32_t x     = bs_get_i32(p);
+		const int32_t y     = bs_get_i32(p + 4);
+		const int32_t z     = bs_get_i32(p + 8);
+		const uint8_t block = p[12];
+
+		// Not counted in s_sync_entries: that counter is documented (networld.h) as
+		// specifically BS_APP_WORLD_SYNC entries, and s_recv_msgs already went up once for
+		// this packet in networldApplyPayload() below — enough to tell "chunk diffs are
+		// arriving" apart from "nothing is arriving" without redefining an existing counter's
+		// meaning out from under whatever already reads it.
+		if (editValid(x, y, z, block)) applyOrQueue(x, y, z, block);
+		p += BS_SYNC_ENTRY_BYTES;
+	}
+}
+
 // The one place that decides "new player or existing one": a known sid updates in place; an
 // unknown one takes the first free slot. A full table drops the newcomer rather than evicting
 // someone — the server caps a room at BS_GAME_MAX_PLAYERS (16) anyway, so a full table here
@@ -238,10 +289,11 @@ void networldApplyPayload(const uint8_t* payload, size_t len)
 	s_recv_msgs++;
 
 	switch (payload[0]) {
-	case BS_APP_BLOCK_EDIT: applyBlockEdit(payload, len); break;
-	case BS_APP_WORLD_SYNC: applyWorldSync(payload, len); break;
-	case BS_APP_POS_UPDATE: applyPosUpdate(payload, len); break;
-	case BS_APP_WORLD_INFO: applyWorldInfo(payload, len); break;
+	case BS_APP_BLOCK_EDIT:  applyBlockEdit(payload, len);  break;
+	case BS_APP_WORLD_SYNC:  applyWorldSync(payload, len);  break;
+	case BS_APP_POS_UPDATE:  applyPosUpdate(payload, len);  break;
+	case BS_APP_WORLD_INFO:  applyWorldInfo(payload, len);  break;
+	case BS_APP_CHUNK_DIFFS: applyChunkDiffs(payload, len); break;
 	// Every other type byte is something this client build has no use for. Silently skipped
 	// rather than treated as an error: the server is trusted to only ever send well-formed
 	// application types (server/game/bsgame.c kicks a *client* for sending one it does not
@@ -368,6 +420,29 @@ bool networldSendBlockEdit(int x, int y, int z, uint8_t block)
 	const bool ok = netTransportSend(out, sizeof out);
 	if (ok) s_sent_edits++;
 	return ok;
+}
+
+// See networld.h's own comment on this pair for why both are void, fire-and-forget, and
+// unguarded by any local session check — netTransportSend() already reports "no session" as a
+// plain false, which is exactly the same "the packet did not make it" outcome UDP always carries,
+// and there is nothing more useful to do with it than what networldSendBlockEdit() already does:
+// nothing, silently.
+void networldSubscribeColumn(int col_x, int col_z)
+{
+	uint8_t out[BS_CHUNK_SUB_BYTES];
+	out[0] = BS_APP_CHUNK_SUB;
+	bs_put_i32(out + 1, (int32_t)col_x);
+	bs_put_i32(out + 5, (int32_t)col_z);
+	netTransportSend(out, sizeof out);
+}
+
+void networldUnsubscribeColumn(int col_x, int col_z)
+{
+	uint8_t out[BS_CHUNK_UNSUB_BYTES];
+	out[0] = BS_APP_CHUNK_UNSUB;
+	bs_put_i32(out + 1, (int32_t)col_x);
+	bs_put_i32(out + 5, (int32_t)col_z);
+	netTransportSend(out, sizeof out);
 }
 
 bool networldWorldSeed(uint32_t* out)
