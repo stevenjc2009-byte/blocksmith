@@ -4,6 +4,96 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.5] — 2026-08-20 — diagnostic pre-release
+
+v1.1.4 froze a real Old 3DS and named the stage it froze in. That stage turns
+out to be two different bugs wearing one name.
+
+### What v1.1.4 actually said
+
+```
+version      : 1.1.4        phase        : DRAW
+frames drawn : 336          stalled for  : 10000 ms
+columns in   : 322          meshes       : 114
+worker       : IDLE         probe arm    : 0
+linear free  : 27081216 B   vram free    : 4440064 B
+draw stage   : C3D_FrameBegin SYNCDRAW (waiting on the GPU)
+draw guard   : clean - every chunk draw issued this session validated
+```
+
+Two more things are settled by it and are not being revisited:
+
+- **The world draw completes.** The breadcrumb went past every stage from
+  entering `chunkRenderDraw` through `highlightDraw`, the player models, the
+  name tags, the bottom screen and `C3D_FrameEnd`. The freeze is in the wait at
+  the top of the *next* frame.
+- **The chunk draws were well formed.** The guard added in v1.1.4 validated
+  every `C3D_DrawElements` issued that session and reported `clean`, so a
+  malformed draw is not the cause.
+
+### What that stage name got wrong
+
+`waiting on the GPU` is prose this project wrote into its own report, and it is
+only half right. Disassembling citro3d's `renderqueue.o` shows
+`C3D_FrameBegin(C3D_FRAME_SYNCDRAW)` is **two unrelated waits back to back**,
+with v1.1.4's single marker sitting before both:
+
+1. an inlined `C3D_FrameSync()` —
+   `do { gspWaitForAnyEvent(); } while (frameCounter[0]==a && frameCounter[1]==b)`.
+   That is frame **pacing**. It waits for a VBlank tick and never looks at the
+   GPU's progress at all.
+2. `gxCmdQueueWait(&ctx->gxQueue, -1)` — the real one: the command list, the
+   memory fills and the display transfers all completing.
+
+Stuck in 1 means GSP stopped delivering events, or the pacing counter stopped
+advancing, and the world draw is irrelevant. Stuck in 2 means a GPU command
+never finished. Different bugs, different fixes, and v1.1.4 could not tell them
+apart.
+
+### Added
+
+- **The two waits, called separately.** `main.c` now calls `C3D_FrameSync()`
+  and then `C3D_FrameBegin(0)`, which is exactly what
+  `C3D_FrameBegin(C3D_FRAME_SYNCDRAW)` does internally, with its own marker
+  before each. Behaviour is unchanged; only the reporting is finer.
+- **A live GSP vblank verdict.** Once a stall is confirmed, the watchdog thread
+  samples citro3d's two frame counters, sleeps one second and samples again —
+  both from inside the stall, because the question is whether ticks are still
+  arriving *now*. `hang.txt` gains a line reading, for example,
+  `gsp vblank : ALIVE (+60 / +60 in 1000 ms)`. ALIVE with the console stuck
+  means the GX queue never drained; STOPPED means event delivery itself died.
+  `C3D_FrameCounter` is three instructions reading a plain `.bss` array — no
+  lock, no allocation, no service call — which is the only reason the watchdog
+  thread is allowed to call it.
+
+### Verified
+
+Three emulator arms, each driven through world creation into the same world:
+
+| arm | armed at | `draw stage` | `gsp vblank` |
+| --- | --- | --- | --- |
+| RED_V | `C3D_FrameRate(1.0e-30f)` after 120 frames | `C3D_FrameSync - waiting for a VBLANK TICK, not for the GPU` | `STOPPED (+0 / +0 in 1000 ms)` |
+| RED_Q | `-DBS_FRAME_HANG_TEST=WD_DRAW_FRAME_QUEUE` | `C3D_FrameBegin(0) - waiting for the GX QUEUE to drain` | `ALIVE (+60 / +60 in 1000 ms)` |
+| control | nothing armed | no `hang.txt` written at all | — |
+
+The verdict came out opposite ways on the two red arms, which is what makes the
+line worth reading at all. RED_Q's counters moved `3691 / 3691` to
+`3751 / 3751` across the one-second gap — exactly 60 Hz, read live from inside
+a stalled console. The control played normally with the world on screen and the
+stats line reading `cols 322  chunks 2473  meshes 114  tris 88084  cull 81`.
+
+The first attempt at RED_V used `C3D_FrameRate(0.0f)` and wrote no report at
+all. That is not a passing test, it is a skipped one — and the reason is worth
+writing down: `C3D_FrameRate` opens with `vcmpe.f32 s15, #0.0` / `bxle lr` and
+rejects anything at or below zero, so the arm was a no-op that could never have
+fired. The accepted range is `0 < fps <= 60`. `1.0e-30` sits inside it and
+still stalls the counter, because after the first tick `framerateCounter` holds
+`60.0f` and `60.0f - 1.0e-30f` rounds back to `60.0f`, so it can never reach
+zero again.
+
+**The freeze itself is still not fixed, and this build does not claim to fix
+it.** It is a pre-release for one reason: so the in-app updater never offers it.
+
 ## [1.1.4] — 2026-08-20 — diagnostic pre-release
 
 v1.1.3 worked. It froze a real Old 3DS and wrote the report it was built to

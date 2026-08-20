@@ -2729,9 +2729,42 @@ session_start:
 		}
 #endif
 		watchdogPhase(WD_PHASE_DRAW);
-		drawStage(WD_DRAW_FRAME_WAIT, -1);
 		metricsSyncBegin();
+#if BS_DRAW_PROBE
+		// The same two waits C3D_FrameBegin(C3D_FRAME_SYNCDRAW) performs internally, called
+		// separately so the hang report can name which of them the console stopped in. See the
+		// WD_DRAW_FRAME_VSYNC comment in app/watchdog.h for the disassembly this comes from:
+		// SYNCDRAW is `C3D_FrameSync(); ...gxCmdQueueWait(-1)`, and C3D_FrameBegin(0) is that
+		// second half on its own. Identical work in an identical order — only the marker is new.
+#ifdef BS_VSYNC_STALL_TEST
+		// The red arm for the new marker AND for the report's STOPPED branch, which the
+		// emulator otherwise cannot reach: there is no way to switch off vblank interrupts.
+		//
+		// It does not need to. onVBlank0/1 only bump frameCounter when
+		// (framerateCounter - framerate) <= 0, so a framerate small enough that the counter
+		// never falls back to zero stops the tick while vblanks keep arriving and keep being
+		// dispatched. C3D_FrameSync's exit condition is "a counter changed", so it then spins
+		// forever on gspWaitForAnyEvent — precisely the failure mode the VSYNC marker exists to
+		// name. A build armed with -DBS_VSYNC_STALL_TEST=<frames> must produce a hang.txt
+		// reading "C3D_FrameSync - waiting for a VBLANK TICK" and "gsp vblank : STOPPED".
+		//
+		// NOT 0.0f, which was tried first and did nothing at all: C3D_FrameRate opens with
+		// `vcmpe.f32 s15,#0.0` / `bxle lr` and rejects anything <= 0, so the arm was a no-op
+		// and wrote no report. The accepted range is 0 < fps <= 60. 1e-30 is inside it, and
+		// after the first tick leaves framerateCounter at 60.0f, where 60.0f - 1e-30f rounds
+		// back to 60.0f exactly — so the counter can never reach zero again.
+		{
+			static int vstall;
+			if (++vstall == (BS_VSYNC_STALL_TEST)) C3D_FrameRate(1.0e-30f);
+		}
+#endif
+		drawStage(WD_DRAW_FRAME_VSYNC, -1);
+		C3D_FrameSync();
+		drawStage(WD_DRAW_FRAME_QUEUE, -1);
+		C3D_FrameBegin(0);
+#else
 		C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+#endif
 		spriteFrameBegin();
 		metricsSyncEnd();
 			// Step 7.6. In 2D this is one call with iod 0, which is exactly the frame this

@@ -5,6 +5,14 @@
 #include <stdio.h>
 #include <string.h>
 
+#if BS_DRAW_PROBE
+// Only for C3D_FrameCounter, and only in the probe build. It is a two-instruction read of a
+// plain .bss array (objdump: `ldr r3,[pc,#4]` / `ldr r0,[r3,r0,lsl #2]` / `bx lr`) — no lock,
+// no allocation, no service call — which is the only reason this thread is allowed to call it.
+// Nothing else in citro3d is safe from here; see the thread rules at the top of watchdogMain.
+#include <citro3d.h>
+#endif
+
 #include "version.h"
 
 // Alongside the crash dump and the save data (app/crash.c, main.c's saveWorldDir()). Two
@@ -72,6 +80,13 @@ static volatile s32  s_draw_slot  = -1;
 // of this file is that it still writes a report when everything else is wedged.
 static const char* volatile s_guard_line;
 
+#if BS_DRAW_PROBE
+// The two citro3d frame counters, sampled twice by watchdogMain once the stall is confirmed.
+// See the paragraph that formats them in reportBuild for what the pair is for.
+#define WD_FC_GAP_MS 1000
+static u32 s_fc_a[2], s_fc_b[2];
+#endif
+
 static const char* const s_draw_stage_name[WD_DRAW_STAGE_COUNT] = {
 	[WD_DRAW_IDLE]        = "not in chunkRenderDraw",
 	[WD_DRAW_ENTER]       = "entered, before the cull",
@@ -86,7 +101,9 @@ static const char* const s_draw_stage_name[WD_DRAW_STAGE_COUNT] = {
 	[WD_DRAW_TAGS]        = "playerModelDrawTags (name-tag sprites)",
 	[WD_DRAW_BOTTOM]      = "drawBottomUi (bottom screen + UI sprites)",
 	[WD_DRAW_FRAME_END]   = "C3D_FrameEnd (submitting to the GPU)",
-	[WD_DRAW_FRAME_WAIT]  = "C3D_FrameBegin SYNCDRAW (waiting on the GPU)",
+	[WD_DRAW_FRAME_WAIT]  = "C3D_FrameBegin SYNCDRAW (v1.1.4's undivided marker)",
+	[WD_DRAW_FRAME_VSYNC] = "C3D_FrameSync - waiting for a VBLANK TICK, not for the GPU",
+	[WD_DRAW_FRAME_QUEUE] = "C3D_FrameBegin(0) - waiting for the GX QUEUE to drain",
 };
 
 static const char* drawStageName(s32 s)
@@ -214,6 +231,42 @@ static void reportBuild(u32 phase, u32 frames, u32 stuck_ms)
 		len += ((size_t)m < room) ? (size_t)m : room;
 	}
 
+	// Is GSP still delivering events while the main thread is stuck? citro3d bumps
+	// frameCounter[0] and [1] from its two VBlank callbacks (onVBlank0 / onVBlank1), which run
+	// on libctru's GSP event thread — so these two numbers advance if and only if VBlank
+	// interrupts are still arriving and being dispatched. They say nothing about the GPU
+	// finishing a draw; that is exactly why they split the two waits apart:
+	//
+	//   ALIVE   -> vblanks are arriving, so C3D_FrameSync could not be the thing that is stuck.
+	//              The stall is gxCmdQueueWait, i.e. a GPU command that never completed.
+	//   STOPPED -> event delivery or the frame-pacing tick has died. The GPU is a red herring
+	//              and the world draw is irrelevant.
+	//
+	// Two samples a second apart rather than one, because a single number cannot be moving or
+	// still. Sampled by the caller before this runs, so the report only formats them.
+	{
+		const unsigned long d0 = (unsigned long)(s_fc_b[0] - s_fc_a[0]);
+		const unsigned long d1 = (unsigned long)(s_fc_b[1] - s_fc_a[1]);
+		const int fm = snprintf(s_report + len, sizeof(s_report) - len,
+			"\n"
+			"gsp vblank   : %s  (+%lu / +%lu in %lu ms)\n"
+			"  counters   : %lu / %lu  then  %lu / %lu\n"
+			"\n"
+			"'gsp vblank' is citro3d's two frame counters, read twice while the main thread was\n"
+			"already stuck. They are bumped by the GSP event thread on every vblank tick.\n"
+			"ALIVE means vblanks are still arriving, so the stall is the GX queue - a GPU\n"
+			"command that never finished. STOPPED means event delivery itself has died, and\n"
+			"the drawing is not the bug.\n",
+			(d0 || d1) ? "ALIVE" : "STOPPED",
+			d0, d1, (unsigned long)WD_FC_GAP_MS,
+			(unsigned long)s_fc_a[0], (unsigned long)s_fc_a[1],
+			(unsigned long)s_fc_b[0], (unsigned long)s_fc_b[1]);
+		if (fm > 0) {
+			const size_t roomf = sizeof(s_report) - len - 1;
+			len += ((size_t)fm < roomf) ? (size_t)fm : roomf;
+		}
+	}
+
 	// The draw guard's verdict. Printed even when nothing was wrong, because "no bad draw was
 	// ever issued" is the more useful half of the answer: it says the commands the GPU was
 	// handed were well formed and it stopped for some other reason, which is a different bug
@@ -261,8 +314,20 @@ static void watchdogMain(void* arg)
 		}
 
 		stuck_ms += WD_POLL_MS;
-		if (stuck_ms >= WD_TIMEOUT_MS && !s_fired)
+		if (stuck_ms >= WD_TIMEOUT_MS && !s_fired) {
+#if BS_DRAW_PROBE
+			// Straddle the report, not before it: the question is whether vblanks are STILL
+			// arriving now that the main thread has been stuck for WD_TIMEOUT_MS, so both
+			// samples have to be taken from inside the stall.
+			s_fc_a[0] = C3D_FrameCounter(0);
+			s_fc_a[1] = C3D_FrameCounter(1);
+			svcSleepThread((u64)WD_FC_GAP_MS * 1000000ULL);
+			s_fc_b[0] = C3D_FrameCounter(0);
+			s_fc_b[1] = C3D_FrameCounter(1);
+			stuck_ms += WD_FC_GAP_MS;
+#endif
 			reportBuild(phase, beat, stuck_ms);
+		}
 	}
 }
 

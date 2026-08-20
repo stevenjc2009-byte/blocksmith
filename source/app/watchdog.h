@@ -129,7 +129,28 @@ typedef enum {
 	WD_DRAW_TAGS,        // playerModelDrawTags — their name tags, a sprite batch
 	WD_DRAW_BOTTOM,      // drawBottomUi — bottom-screen clear, then the UI sprite batch
 	WD_DRAW_FRAME_END,   // inside C3D_FrameEnd: command list submitted, transfer queued
-	WD_DRAW_FRAME_WAIT,  // inside C3D_FrameBegin(C3D_FRAME_SYNCDRAW), waiting on the GPU
+	WD_DRAW_FRAME_WAIT,  // v1.1.4's marker for the whole of C3D_FrameBegin(C3D_FRAME_SYNCDRAW)
+
+	// Round 3 stopped one step short in its turn, and for the same reason: a name was trusted
+	// instead of read. v1.1.4's hardware report landed on WD_DRAW_FRAME_WAIT and the report's
+	// own prose called that "waiting on the GPU". Disassembling citro3d's C3D_FrameBegin shows
+	// it is two unrelated waits back to back, and the marker sits before both:
+	//
+	//   1. if (flags & C3D_FRAME_SYNCDRAW), an inlined C3D_FrameSync() — a
+	//      do { gspWaitForAnyEvent(); } while (frameCounter unchanged) loop. This is frame
+	//      PACING. It waits for a VBlank tick and never touches the GPU's progress.
+	//   2. gxCmdQueueWait(&ctx->gxQueue, -1) — the real one: the GX queue draining, i.e. the
+	//      command list, the memory fills and the display transfers all completing.
+	//
+	// Stuck in 1 means GSP stopped delivering events, or the frame-pacing counter stopped
+	// advancing, and the world draw is irrelevant. Stuck in 2 means a GPU command never
+	// finished. Different bugs, different fixes, and v1.1.4 could not tell them apart.
+	//
+	// main.c now calls the two halves separately — C3D_FrameSync() then C3D_FrameBegin(0),
+	// which is exactly what C3D_FrameBegin(C3D_FRAME_SYNCDRAW) does internally — so the
+	// report names which one. Behaviour is unchanged; only the reporting is finer.
+	WD_DRAW_FRAME_VSYNC, // inside C3D_FrameSync — waiting for a vblank tick (frame pacing)
+	WD_DRAW_FRAME_QUEUE, // inside C3D_FrameBegin(0) — waiting for the GX queue to drain
 	WD_DRAW_STAGE_COUNT
 } WdDrawStage;
 
