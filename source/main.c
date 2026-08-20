@@ -81,6 +81,20 @@ static int worldReportBuild(void)
 			for (int cy = 0; cy < COLUMN_CHUNKS; cy++)
 				if (!worldChunkCreate(&s_world, cx, cy, cz)) refused++;
 
+	// The grid has done its whole job the moment `refused` is known: it exists to prove the
+	// worst case can be claimed at all, not to be played in. It used to be left standing, and
+	// the streaming ring then generated the real world *around* it — so a session that should
+	// have held 25 columns held 305, and the overlay's column count was mostly this grid. The
+	// cost was never just the bytes: these 289 columns also sat in 289 of world.h's 1024 hash
+	// slots for the entire session, lengthening every probe the ring makes for its own.
+	//
+	// worldExit then worldInit rather than a loop of worldColumnRemove, because worldExit is
+	// the one path that is already responsible for releasing a column's chunks at whatever form
+	// each had grown into, and it leaves exactly the state worldInit gives — which is what the
+	// caller believed it was getting all along.
+	worldExit(&s_world);
+	worldInit(&s_world);
+
 	return refused;
 }
 
@@ -557,11 +571,14 @@ static WorldGen s_gen;
 // be misread whatever the order, and a stale entry is simply a coordinate mismatch.
 //
 // The `installed` flag is tracked here rather than asked of the World, and that is not
-// redundancy: worldReportBuild claims a 17x17 grid of columns before anything is generated
-// and never gives it back, so worldColumn() returns non-NULL for columns 0..16 from the
-// first moment. Testing the world called their ring complete before a single block had been
-// generated and meshed them against air — 32,358 triangles where the same world meshed after
-// full generation is 29,754.
+// redundancy. worldReportBuild() used to leave its 17x17 proving grid standing, so
+// worldColumn() returned non-NULL for columns 0..16 from the first moment: testing the world
+// called their ring complete before a single block had been generated and meshed them against
+// air — 32,358 triangles where the same world meshed after full generation is 29,754. That
+// grid is now freed as soon as its number is known, but the flag stays, because "the World has
+// a Column object here" and "this column's blocks have arrived" were never the same question:
+// a partially generated column is installed and meshable, and net/blockdiff.c can create a
+// Column for an edit that landed ahead of the terrain it belongs to.
 typedef struct {
 	int32_t cx, cz;
 	bool    set;
@@ -2355,10 +2372,10 @@ session_start:
 	// boot, because clearing the pending store at this point discarded the joined session's
 	// WORLD_SYNC batch. That batch is instead held until the column each edit belongs to is
 	// generated and installed, which is what puts the joining player into the world everyone
-	// else has been editing rather than a private copy of the same terrain. Note that the grid
-	// worldReportBuild() just allocated is empty — the worker has not started — so this call
-	// deliberately does nothing but register the pointer; applying a diff to those columns here
-	// would only have it generated over. See networldSetWorld()'s own comment.
+	// else has been editing rather than a private copy of the same terrain. Note that s_world is
+	// empty at this point — worldReportBuild() frees its proving grid before returning and the
+	// worker has not started — so this call deliberately does nothing but register the pointer.
+	// See networldSetWorld()'s own comment.
 	BOOT_BEGIN();
 	networldSetWorld(&s_world);
 
