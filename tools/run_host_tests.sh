@@ -175,6 +175,19 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g 	-I source -I deps/blocksmith-server 	
 
 "./$BH/networld_test"
 
+# interop_test.c, source/net's real client (networld.c) speaking to a REAL bsgame daemon over a
+# real Unix socket — see that file's own header comment for why networld_test.c and bsgame_test.c
+# (deps/blocksmith-server/game/) each passing on their own proves nothing about whether the two
+# processes agree with each other, only with themselves. `make -C .../game bsgame` first, so the
+# binary interop_test spawns is freshly built from what is actually checked out here rather than
+# whatever a previous session last built by hand — a stale daemon would make this suite validate
+# nothing. Eleventh binary, own main(), same reason as every one above it.
+make -C deps/blocksmith-server/game bsgame
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g 	-I source -I deps/blocksmith-server 	source/world/world.c 	source/world/chunk.c 	source/world/budget.c 	source/net/blockdiff.c 	source/net/networld.c 	source/net/interop_test.c 	-o "$BH/interop_test"
+
+"./$BH/interop_test"
+
 # Only reached if every binary above exited 0 (set -e stops the script on the first
 # non-zero exit), so a failed run's directory is left behind for inspection rather than
 # silently deleted along with the evidence of what failed.
