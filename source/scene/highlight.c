@@ -127,6 +127,11 @@ bool highlightInit(void)
 		return false;
 	buildCage(s_verts);
 
+	// Built once by the CPU, read from RAM by the GPU. linearAlloc memory is cached, so without
+	// this the GPU reads whatever the linear heap held before buildCage ran. See the flush in
+	// scene/chunk_render.c's chunkRenderBuild for what a stale read costs.
+	GSPGPU_FlushDataCache(s_verts, sizeof(HlVertex) * HL_VERTS);
+
 	s_ready = true;
 	return true;
 }

@@ -538,6 +538,10 @@ bool chunkRenderInit(void)
 		idx[0] = v;     idx[1] = (uint16_t)(v + 1); idx[2] = (uint16_t)(v + 2);
 		idx[3] = v;     idx[4] = (uint16_t)(v + 2); idx[5] = (uint16_t)(v + 3);
 	}
+	// Written by the CPU, read by the GPU, never written again — so one flush here, and the
+	// indices in RAM match the indices in the cache for the rest of the run. See the flush in
+	// chunkRenderBuild for what happens without one.
+	GSPGPU_FlushDataCache(s_shared_indices, sizeof(uint16_t) * MESH_SLOT_INDICES);
 	s_bytes += sizeof(uint16_t) * MESH_SLOT_INDICES;   // once, not once per slot
 
 	// Step 9.2c. The vertex buffers, one linearAlloc per TIER now rather than per slot —
@@ -783,8 +787,27 @@ bool chunkRenderBuild(const World* w, int cx, int cy, int cz)
 	memcpy(s->face_start, out.face_start, sizeof(s->face_start));
 	// Only the vertices actually used, not the whole tier's capacity — copying vert_cap
 	// bytes every remesh would put back exactly the waste this step exists to remove.
-	if (out.vert_count)
+	if (out.vert_count) {
 		memcpy(s->verts, s_vert_scratch, (size_t)out.vert_count * sizeof(MeshVertex));
+
+		// THE FREEZE. This memcpy goes through the ARM11's data cache; the GPU is a separate
+		// bus master and reads physical RAM. Without this flush the GPU is handed a pointer to
+		// a mesh that, as far as RAM is concerned, has not been written yet — so it reads
+		// whatever the linear heap held before, follows those bytes as geometry, and stops
+		// part-way through the command list without ever reporting completion.
+		//
+		// That is exactly what v1.1.6 and v1.1.8 measured on real hardware: the GX queue stuck
+		// on a ProcessCommandList that never finished, the two display transfers behind it
+		// never running, vblanks still arriving. v1.1.8 then proved the list itself innocent —
+		// the 9264 bytes the console choked on are byte-for-byte identical to a list that runs
+		// clean in an emulator. Nothing was wrong with the commands; the memory they pointed at
+		// was stale.
+		//
+		// It never reproduced in an emulator because emulators do not model the CPU's data
+		// cache, so the stale read cannot happen there. Eight builds looked for a bad value in
+		// the command list. There wasn't one.
+		GSPGPU_FlushDataCache(s->verts, (size_t)out.vert_count * sizeof(MeshVertex));
+	}
 	s->vis_mask = vis_mask;
 	cullInvalidate();
 

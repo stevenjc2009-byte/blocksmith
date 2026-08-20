@@ -37,6 +37,19 @@
 #define BS_GPU_TESTS 0
 #endif
 
+// The boot-time battery, separately switchable from the rest of BS_GPU_TESTS.
+//
+// A shipping build wants the timed frame wait and the post-mortem — they are what stops a wedged
+// GPU from taking the whole console down with it — but it does not want several seconds of boot
+// spent on memory fills, or a selftest.txt appearing on every player's SD card. Building with
+// -DBS_GPU_TESTS=1 -DBS_GPU_PREFLIGHT=0 keeps the safety net and drops the diagnostics.
+//
+// The per-frame validator and the command-list replay are not switched here: they hang off
+// BS_DRAW_PROBE in app/watchdog.c and are already absent from any build without it.
+#ifndef BS_GPU_PREFLIGHT
+#define BS_GPU_PREFLIGHT 1
+#endif
+
 #if BS_GPU_TESTS
 
 // How long the frame loop waits for the GX queue before declaring the GPU wedged. Two seconds is

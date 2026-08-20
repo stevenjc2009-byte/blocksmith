@@ -166,6 +166,12 @@ bool playerModelInit(void)
 		return false;
 	buildBody(s_verts);
 
+	// Built once by the CPU, read from RAM by the GPU every frame another player is on screen.
+	// linearAlloc memory is cached, so without this the GPU reads whatever the linear heap held
+	// before buildBody ran. Same defect, same fix, same consequence as the flush in
+	// scene/chunk_render.c's chunkRenderBuild — which is what froze real consoles up to v1.1.8.
+	GSPGPU_FlushDataCache(s_verts, sizeof(PmVertex) * PM_VERTS);
+
 	s_ready = true;
 	return true;
 }

@@ -4,6 +4,25 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] — 2026-08-20
+
+The freeze that killed real 3DS consoles from v1.1.0 through v1.1.8 is fixed.
+
+v1.1.0 froze a real Old 3DS and never reproduced in an emulator. Seven diagnostic builds narrowed it down to this: the GPU was handed a command list and never reported finishing it, so the next frame's `C3D_FrameBegin` blocked forever with the HOME button dead.
+
+The root cause is linearAlloc's memory layout on the 3DS. The CPU writes into a cached region, the GPU is a separate bus master reading physical RAM, and this codebase had zero GSPGPU_FlushDataCache calls anywhere. CPU-written vertex and index buffers sat in the ARM11 data cache, the GPU read stale RAM, followed garbage indices out of the vertex buffer, and stopped partway through the command list without reporting completion. Emulators do not model the CPU data cache, which is why it never reproduced in Azahar.
+
+The proof came from the console itself: the 9264-byte command list the GPU choked on (`cmdhang.bin`) is byte-for-byte identical to the same list replayed successfully in an emulator (`bisect.bin`) — 2316 words, 555 commands, identical register sequence, identical buffer offsets. The list was innocent; the memory it pointed at was stale.
+
+### Added
+
+The frame loop's wait on the GPU command queue is now bounded at two seconds instead of unbounded. On every working frame it costs nothing. If the GPU ever does wedge again the console writes `sdmc:/blocksmith/postmortem.txt` and keeps running instead of locking up with the HOME button dead.
+
+### Fixed
+
+- **The real freeze.** `GSPGPU_FlushDataCache` calls are now issued at every point where the CPU writes a buffer the GPU then reads: chunk vertex buffers and the shared index buffer in `source/scene/chunk_render.c`, the static index buffer at init and each sprite batch's vertex range at flush in `source/gfx/sprite.c`, the block-highlight cage in `source/scene/highlight.c`, and the other-player body mesh in `source/scene/playermodel.c`.
+- **A pre-existing compile break in `source/app/watchdog.c`.** The file declared `s_guard_line` inside `#if BS_DRAW_PROBE` but used it unconditionally, so any build without the probe flags failed to compile outright — `error: 's_guard_line' undeclared`. Unnoticed from v1.1.2 through v1.1.8 because every one of those builds set them.
+
 ## [1.1.8] — 2026-08-20 — diagnostic pre-release
 
 A GPU pre-flight battery and command-list validator to narrow the real-hardware freeze.

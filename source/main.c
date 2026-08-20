@@ -1991,7 +1991,7 @@ int main(void)
 	screenInit();
 	metricsInit();
 
-#if BS_GPU_TESTS
+#if BS_GPU_TESTS && BS_GPU_PREFLIGHT
 	// Before the title screen and before a world exists, so a console that fails one of these
 	// says so without the player having to reach the freeze first. Costs a few seconds of boot
 	// and writes sdmc:/blocksmith/selftest.txt. Diagnostic builds only. See app/gputest.h.
@@ -2797,6 +2797,26 @@ session_start:
 			if (!gpuTestFrameWait()) gpuTestPostMortem(gpu_frame);
 		}
 #endif
+		C3D_FrameBegin(0);
+#elif BS_GPU_TESTS
+		// The shipping build's safety net, and the only piece of the diagnostic battery it keeps.
+		//
+		// C3D_FRAME_SYNCDRAW is documented in c3d/renderqueue.h as "perform C3D_FrameSync before
+		// checking the GPU status", so the two lines below are exactly what the single call above
+		// does — split apart only so the queue wait can be given a bound. On every frame that
+		// works this costs nothing: the queue is already drained, the wait returns true at once,
+		// and C3D_FrameBegin(0) finds nothing left to wait for.
+		//
+		// On a frame that does not work it is the difference between a console that has to be
+		// held down to power off and one that writes postmortem.txt and keeps running. Up to
+		// v1.1.8 that wait was unbounded, which is why every freeze report had to be scraped out
+		// of the watchdog thread after the fact.
+		C3D_FrameSync();
+		{
+			static uint32_t gpu_frame;
+			gpu_frame++;
+			if (!gpuTestFrameWait()) gpuTestPostMortem(gpu_frame);
+		}
 		C3D_FrameBegin(0);
 #else
 		C3D_FrameBegin(C3D_FRAME_SYNCDRAW);

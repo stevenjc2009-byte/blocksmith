@@ -80,13 +80,24 @@ bool spriteInit(void)
 
 	// Filled once and never again. Every quad has the same six-index pattern relative to
 	// its own four vertices, so the index buffer is a constant — rebuilding it per frame
-	// would be 3 KB of pointless writes to uncached memory.
+	// would be 3 KB of pointless writes.
 	for (int q = 0; q < SPRITE_MAX_QUADS; q++) {
 		const uint16_t v = (uint16_t)(q * 4);
 		uint16_t* i = &s_indices[q * 6];
 		i[0] = v;     i[1] = (uint16_t)(v + 1); i[2] = (uint16_t)(v + 2);
 		i[3] = v;     i[4] = (uint16_t)(v + 2); i[5] = (uint16_t)(v + 3);
 	}
+
+	// linearAlloc memory is CACHED. The GPU is a separate bus master and reads physical RAM
+	// directly, so everything written above is still sitting in the ARM11's data cache and the
+	// GPU would read whatever the linear heap happened to hold beforehand. One flush covers the
+	// whole buffer because it is never written again.
+	//
+	// This is the bug that froze real consoles from v1.1.0 to v1.1.8 and never once reproduced
+	// in an emulator: emulators have no CPU data cache to be stale. See scene/chunk_render.c
+	// for the copy that actually did the freezing — the GPU followed stale indices out of the
+	// vertex buffer and stopped, mid command list, forever.
+	GSPGPU_FlushDataCache(s_indices, SPRITE_MAX_IDX * sizeof(uint16_t));
 
 	s_ready = true;
 	return true;
@@ -115,6 +126,11 @@ void spriteExit(void)
 static void flush(void)
 {
 	if (!s_ready || s_quads == 0) return;
+
+	// These vertices were written by the CPU moments ago and are still in the data cache. Only
+	// this batch's own range needs flushing, not the whole buffer: the quads before s_base were
+	// flushed by an earlier flush() this frame, and the ones after it have not been written yet.
+	GSPGPU_FlushDataCache(&s_verts[s_base * 4], (size_t)s_quads * 4u * sizeof(SpriteVertex));
 
 	C3D_DrawElements(GPU_TRIANGLES, s_quads * 6, C3D_UNSIGNED_SHORT, &s_indices[s_base * 6]);
 	s_draws++;

@@ -97,6 +97,17 @@ static volatile s32  s_meshes;
 static volatile s32  s_queued;
 static volatile bool s_worker_busy;
 
+// The draw guard's verdict, already formatted by the main thread into a buffer it owns and
+// keeps alive for the rest of the process. A pointer and not a copy because this thread must
+// not allocate, must not take a lock, and must not call anything that might: the whole value
+// of this file is that it still writes a report when everything else is wedged.
+//
+// Declared out here rather than beside the other probe state because watchdogGuardLine() is
+// compiled into EVERY build while the code that reads this is probe-only. With the declaration
+// inside #if BS_DRAW_PROBE, a build without the probe flags failed to compile at all — which
+// went unnoticed from v1.1.2 to v1.1.8 because every one of those builds set them.
+static const char* volatile s_guard_line;
+
 #if BS_DRAW_PROBE
 // Sampled by the main thread once per frame and only read here, so this thread never calls
 // linearSpaceFree() itself. That matters: those queries take libctru's own heap lock, and a
@@ -117,12 +128,6 @@ static volatile u32  s_vram_free;
 static volatile s32  s_draw_stage = -1;
 static volatile s32  s_draw_k     = -1;
 static volatile s32  s_draw_slot  = -1;
-
-// The draw guard's verdict, already formatted by the main thread into a buffer it owns and
-// keeps alive for the rest of the process. A pointer and not a copy because this thread must
-// not allocate, must not take a lock, and must not call anything that might: the whole value
-// of this file is that it still writes a report when everything else is wedged.
-static const char* volatile s_guard_line;
 
 #if BS_DRAW_PROBE
 // The two citro3d frame counters, sampled twice by watchdogMain once the stall is confirmed.
