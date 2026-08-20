@@ -2593,6 +2593,13 @@ session_start:
 	// if the player had caused it.
 	chunkRenderDirtyResetPeak();
 
+	// Set by the pause menu's Quit row, read once the play loop has torn the world down. It
+	// cannot simply fall through to app_shutdown the way leaving the loop used to: the only
+	// exits that existed before this menu were HOME and a lost server session, and both of
+	// those genuinely end the session. Quit does not — it means "put me back on the title
+	// screen", which is where choosing another world and quitting the app both live.
+	bool quit_to_title = false;
+
 	// Only the two scripted knobs read this, so a playtest build does not carry it.
 #if BS_INTERACT_DEMO || BS_EDIT_STRESS || BS_WALK_STRESS
 	int frame = 0;
@@ -2660,7 +2667,10 @@ session_start:
 			opts.render_dist = s_mesh_radius;
 			optionsSave(&opts, TITLE_OPTIONS_PATH);
 		}
-		if (pause_action == PAUSE_ACTION_QUIT) break;
+		if (pause_action == PAUSE_ACTION_QUIT) {
+			quit_to_title = true;
+			break;
+		}
 
 		// A paused world does not tick. Everything from here to the draw is gated on this:
 		// the player does not move, terrain does not stream in, and the memory figures the
@@ -3196,6 +3206,13 @@ session_start:
 	// losing the last session's pickups.
 	if (inv_dir) inventorySave(&s_inv, inv_dir);
 
+	// The play loop can be left with the menu still up. Choosing Quit closes it on the way
+	// out, but a lost server session (the netStatus() break above) does not, and neither
+	// would a HOME exit — and pausemenu.c's open flag is a static that outlives this world.
+	// Left set, the next world entered would boot straight into a paused menu over a world
+	// the player never asked to pause.
+	pauseMenuClose();
+
 	// Before worldExit: the worker holds a staging world of its own and must be joined
 	// before anything it could still be writing into is freed.
 	workerStop();
@@ -3230,6 +3247,11 @@ session_start:
 		s_left_server = true;
 		goto session_start;
 	}
+
+	// A single-player world left through the pause menu goes back to the same place, by the
+	// same route. Without this it falls through to app_shutdown and closes the game, which
+	// is what a row labelled "Quit to title" must not do.
+	if (quit_to_title) goto session_start;
 
 app_shutdown:
 	chunkRenderExit();

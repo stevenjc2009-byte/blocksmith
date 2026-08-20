@@ -158,7 +158,11 @@ void pauseMenuDraw(const PauseStats* st)
 		fontDraw((float)ROW_X, (float)(PANEL_Y + 10), 1, COL_HEAD, "PAUSED");
 		drawRow(ROW_RESUME,  "Resume",  s_cursor == ROW_RESUME);
 		drawRow(ROW_OPTIONS, "Options", s_cursor == ROW_OPTIONS);
-		drawRow(ROW_QUIT,    "Quit",    s_cursor == ROW_QUIT);
+		// "Quit to title", not "Quit": the row leaves the world and lands on the title
+		// screen, which is where the app's own quit lives. Saying just "Quit" next to a
+		// Resume would read as quitting the game outright, and a player who wanted another
+		// world would never press it.
+		drawRow(ROW_QUIT,    "Quit to title", s_cursor == ROW_QUIT);
 		fontDraw((float)ROW_X, (float)(PANEL_Y + PANEL_H - 16), 1, COL_DIM,
 		         "A choose   B/SELECT resume");
 		spriteEnd();
