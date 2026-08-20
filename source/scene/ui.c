@@ -246,6 +246,8 @@ static void drawHudFont(const UiStats* stats)
 	          (unsigned long)stats->bytes, (unsigned long)stats->bytes_peak);
 	y += 12;
 	if (stats->status) fontDrawf(6, y, 1, COL_TEXT_DIM, "%s", stats->status);
+	y += 12;
+	if (stats->net) fontDrawf(6, y, 1, COL_TEXT_DIM, "%s", stats->net);
 	y += 14;
 	fontDraw(6, y, 1, COL_TEXT_DIM, "tap a hotbar slot to select it");
 }

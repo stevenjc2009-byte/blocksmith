@@ -659,22 +659,111 @@ static void test_reset_remotes_empties_table(void)
     check(networldRemoteCount() == 0, "table empty after reset");
 }
 
-static void test_inert_before_world_is_registered(void)
+static void test_edits_before_a_world_exists_are_kept(void)
 {
-    puts("nothing here touches memory before networldSetWorld() has been called");
+    puts("an edit arriving before any World is registered is queued, not dropped");
 
+    /* This is the join case, and it used to be the bug. The server sends BS_APP_WORLD_SYNC —
+     * every edit every other player has made — immediately after JOIN, and JOIN completes on
+     * the title screen, tens of seconds before the player has picked a world for
+     * networldSetWorld() to register. Dropping here put the joining player in untouched
+     * terrain instead of the world everyone else had been building in. */
     networldInit();
     networldSetWorld(NULL);
 
     uint8_t msg[BS_BLOCK_EDIT_BYTES];
     buildBlockEdit(msg, 5, 10, 5, BLOCK_STONE);
     networldApplyPayload(msg, sizeof msg);   /* must not crash */
-    check(networldPendingCount() == 0, "an edit that arrives before any World is registered is simply dropped");
+    check(networldPendingCount() == 1, "the edit is held for a World that does not exist yet");
 
     World w;
     worldInit(&w);
-    networldOnColumnLoad(&w, 0, 0);   /* must not crash even though no World is registered */
-    check(networldPendingCount() == 0, "still nothing pending");
+    /* Still a no-op: the World this is called on is not the registered one (it is still NULL),
+     * which is the same guard that keeps the worker thread's staging World out. */
+    networldOnColumnLoad(&w, 0, 0);
+    check(networldPendingCount() == 1, "a foreign World cannot drain it either");
+}
+
+static void test_setworld_keeps_diffs_until_terrain_exists(void)
+{
+    puts("a diff that arrives before the World survives the terrain being generated over it");
+
+    /* The join case, end to end, in the order main.c actually runs it. This replaced a test
+     * that asserted the opposite — that networldSetWorld() flushes the store into whatever
+     * columns already exist — on the strength of a comment claiming the starting ring is built
+     * by then. It is not: worldReportBuild() allocates a 17x17 grid of *empty* columns as a
+     * memory-budget proof, and genStart() only afterwards starts the worker that fills them.
+     * Flushing there put the whole batch into air that generated terrain then overwrote, which
+     * on the emulator read as `net y8 a0 q0` with the dug trench visibly gone after a rejoin. */
+    networldInit();
+    networldSetWorld(NULL);
+
+    uint8_t early[BS_BLOCK_EDIT_BYTES], later[BS_BLOCK_EDIT_BYTES];
+    buildBlockEdit(early, 5, 10, 5, BLOCK_AIR);     /* column (0,0), in the report grid */
+    buildBlockEdit(later, 40, 12, 5, BLOCK_SAND);   /* column (2,0), streams in later */
+    networldApplyPayload(early, sizeof early);
+    networldApplyPayload(later, sizeof later);
+    check(networldPendingCount() == 2, "both held while there is no World");
+
+    World w;
+    worldInit(&w);
+    worldColumnCreate(&w, 0, 0);   /* exactly what worldReportBuild() leaves behind: empty */
+    networldSetWorld(&w);
+
+    check(networldPendingCount() == 2,
+          "an allocated but ungenerated column does not consume the diff aimed at it");
+
+    /* Generation, as workerInstall() does it: real blocks written straight over that column,
+     * with no idea a diff was ever aimed at it. A flush at registration time would already have
+     * been erased by this line. */
+    worldSet(&w, 5, 10, 5, BLOCK_STONE);
+    networldOnColumnLoad(&w, 0, 0);
+
+    check(worldGet(&w, 5, 10, 5) == BLOCK_AIR,
+          "the diff lands on top of the generated terrain, not under it");
+    check(networldPendingCount() == 1, "the diff for a column that is not built yet stays queued");
+
+    /* And that survivor still drains the ordinary way once its column streams in. */
+    worldColumnCreate(&w, 2, 0);
+    networldOnColumnLoad(&w, 2, 0);
+    check(worldGet(&w, 40, 12, 5) == BLOCK_SAND, "the still-queued diff lands on its column load");
+    check(networldPendingCount() == 0, "store is empty once both have landed");
+}
+
+static void test_world_info_carries_the_servers_seed(void)
+{
+    puts("BS_APP_WORLD_INFO hands the server's world seed to the client");
+
+    networldInit();
+
+    uint32_t seed = 0xDEADBEEFu;   /* poisoned: a false return must leave it untouched */
+    check(!networldWorldSeed(&seed), "no seed is claimed before the server sends one");
+    check(seed == 0xDEADBEEFu, "a false return does not write the out-parameter");
+
+    uint8_t info[BS_WORLD_INFO_BYTES];
+    info[0] = BS_APP_WORLD_INFO;
+    bs_put_u32(info + 1, 1495017430u);
+    networldApplyPayload(info, sizeof info);
+
+    check(networldWorldSeed(&seed), "the seed is available once WORLD_INFO arrives");
+    check(seed == 1495017430u, "and it is the exact value the server sent");
+
+    /* 0 is a seed a server can legitimately own, which is the whole reason the value comes
+     * back through an out-parameter instead of a sentinel return. */
+    networldInit();
+    bs_put_u32(info + 1, 0u);
+    networldApplyPayload(info, sizeof info);
+    seed = 0xDEADBEEFu;
+    check(networldWorldSeed(&seed) && seed == 0u, "a seed of 0 is a real seed, not 'no seed'");
+
+    /* Wrong length is malformed, not a seed of whatever happened to be in the first bytes —
+     * same drop-whole posture as every other decoder in this module. */
+    networldInit();
+    uint8_t truncated[BS_WORLD_INFO_BYTES - 1];
+    truncated[0] = BS_APP_WORLD_INFO;
+    memset(truncated + 1, 0xFF, sizeof truncated - 1);
+    networldApplyPayload(truncated, sizeof truncated);
+    check(!networldWorldSeed(NULL), "a short WORLD_INFO is dropped, not misparsed");
 }
 
 /* ------------------------------------------------------------------------- main */
@@ -704,7 +793,9 @@ int main(void)
     test_send_pose_encodes_and_sends();
     test_send_pose_rate_limited();
     test_reset_remotes_empties_table();
-    test_inert_before_world_is_registered();
+    test_edits_before_a_world_exists_are_kept();
+    test_setworld_keeps_diffs_until_terrain_exists();
+    test_world_info_carries_the_servers_seed();
 
     printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;

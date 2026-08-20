@@ -339,7 +339,13 @@ void netDisconnect(void)
     if (!s_net.inited) return;
 
     netTransportDisconnect();
-    networldResetRemotes();
+    /* Not just the remote roster: networldInit() also drops any block diffs still queued for
+     * columns that never loaded (net/networld.h says in as many words that calling it again on
+     * leaving a session is what it is for). That clear used to happen at world entry instead,
+     * which is far too late in one direction and far too early in the other — it wiped the
+     * WORLD_SYNC the server had just sent. Leaving the session is the moment those diffs stop
+     * being wanted, so it belongs here. */
+    networldInit();
     s_net.player_count = 0;
     s_net.ping_ms      = -1;
     set_status(NET_IDLE);

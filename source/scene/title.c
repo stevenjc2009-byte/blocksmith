@@ -7,6 +7,7 @@
 #include "gfx/font.h"
 #include "gfx/sprite.h"
 #include "net/bsnet.h"
+#include "net/networld.h"
 #include "world/region.h"
 
 // ── Layout ─────────────────────────────────────────────────────────────────────────────
@@ -667,8 +668,10 @@ static void titleInviteCodeFlow(TitleState* ts)
 	netConnectWithInvite(code);
 }
 
-static void drawMultiplayer(TitleState* ts, const TitleInput* in, bool tap)
+static TitleResult drawMultiplayer(TitleState* ts, const TitleInput* in, bool tap)
 {
+	TitleResult r = {TITLE_STAY, {0}};
+
 	const NetStatus st = netStatus();
 	const bool connected = (st == NET_CONNECTED);
 
@@ -717,6 +720,13 @@ static void drawMultiplayer(TitleState* ts, const TitleInput* in, bool tap)
 		fontDraw(8, MP_ROW_ERROR, 1, COL_WARN, err);
 	} else if (netJustEnrolled()) {
 		fontDraw(8, MP_ROW_ERROR, 1, COL_ACCENT, "Enrolled - you're on the list now");
+	} else if (connected) {
+		// Only ever on screen between the handshake completing and the server naming its
+		// world, which is one round trip — the seed arrives in BS_APP_WORLD_INFO, the first
+		// packet the server sends after JOIN. It stays up indefinitely against a server too
+		// old to send one, which is the intended outcome: see the gate at the bottom of this
+		// function for why waiting forever beats guessing a seed.
+		fontDraw(8, MP_ROW_ERROR, 1, COL_TEXT_DIM, "Joined - waiting for the world...");
 	}
 
 	fontDraw(8, MP_ROW_KEY_LABEL, 1, COL_TEXT_DIM, "YOUR KEY:");
@@ -780,6 +790,22 @@ static void drawMultiplayer(TitleState* ts, const TitleInput* in, bool tap)
 		ts->screen = TITLE_SCR_MAIN;
 		ts->cursor = 1;   // land back on the MULTIPLAYER button
 	}
+
+	// A server hosts the world, so joining one *is* entering it. This is the only place that
+	// happens: there is deliberately no name prompt, no NEW WORLD and no trip through world
+	// select on this path, because none of those describe anything about a world this console
+	// does not own. World select stays exactly what it was, for single player only.
+	//
+	// Gated on the seed being known, not on `connected` alone. networldWorldSeed() answers
+	// only once BS_APP_WORLD_INFO has arrived — the first packet the server sends after JOIN
+	// — so this costs one round trip and buys terrain identical to every other player's. The
+	// alternative, entering as soon as the handshake completes, would generate from this
+	// client's own BS_WORLD_SEED constant: a world that looks like a successful join and is
+	// a different world from the one everybody else is standing in. Waiting visibly (see the
+	// "waiting for the world" row above) is the better failure.
+	if (connected && networldWorldSeed(NULL)) r.action = TITLE_START_SERVER;
+
+	return r;
 }
 
 // ── Update ─────────────────────────────────────────────────────────────────────────────
@@ -925,7 +951,7 @@ TitleResult titleUpdateDraw(TitleState* ts, Options* opts, const TitleInput* in)
 	case TITLE_SCR_WORLD_SELECT:     r = drawWorldSelect(ts, in, tap);       break;
 	case TITLE_SCR_OPTIONS_GENERAL:  drawOptionsGeneral(ts, opts, in, tap);  break;
 	case TITLE_SCR_OPTIONS_BINDINGS: drawOptionsBindings(ts, opts, in, tap); break;
-	case TITLE_SCR_MULTIPLAYER:      drawMultiplayer(ts, in, tap);          break;
+	case TITLE_SCR_MULTIPLAYER:      r = drawMultiplayer(ts, in, tap);      break;
 	case TITLE_SCR_UPDATE:           r = drawUpdate(ts, in, tap);           break;
 	}
 

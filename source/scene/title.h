@@ -38,15 +38,25 @@
 typedef enum {
 	TITLE_STAY,          // no navigation happened this frame; keep calling every frame
 	TITLE_START_WORLD,   // player picked (or just created) a world — see TitleResult below
+	// Player joined a server, so the world to play is the server's rather than one of ours.
+	// It carries no name and no directory: the server owns both halves of what makes a world
+	// a world — the seed its terrain generates from and the block edits made in it — which is
+	// why this is its own action instead of a TITLE_START_WORLD carrying some reserved name.
+	// The caller must not call its saveWorldDir() equivalent at all on this path (that
+	// function mkdirs) and must pass NULL to workerSetWorldDir, which app/worker.h documents
+	// as "no save file at all", so a session leaves nothing on the card that could later
+	// disagree with the server.
+	TITLE_START_SERVER,
 	TITLE_QUIT,          // player chose Quit on the main screen
 } TitleAction;
 
 typedef struct {
 	TitleAction action;
-	// Valid only when action == TITLE_START_WORLD. A directory name under REGION_ROOT
-	// (world/region.h) — exactly what workerSetWorldDir(dir) wants once the caller has
-	// joined it onto REGION_ROOT, not a full path itself, since worldlistScan/Create never
-	// deal in full paths either.
+	// Valid only when action == TITLE_START_WORLD — TITLE_START_SERVER leaves it empty,
+	// because a server session has no directory of its own at all. A directory name under
+	// REGION_ROOT (world/region.h) — exactly what workerSetWorldDir(dir) wants once the
+	// caller has joined it onto REGION_ROOT, not a full path itself, since
+	// worldlistScan/Create never deal in full paths either.
 	char world_name[WORLDLIST_NAME_MAX];
 } TitleResult;
 

@@ -107,6 +107,9 @@ typedef struct {
 	const char* status;   // e.g. "aim -12 8 -10 f2 b9 p9 r9 dq8/8" — main.c already builds
 	                       // this exact string. May itself be NULL even when the struct
 	                       // isn't; that one line is then left blank.
+	const char* net;      // e.g. "net s4 r91 y12 a12 q0 p1" — the multiplayer traffic counters
+	                       // from net/networld.h, built by main.c the same way as `status`.
+	                       // Same NULL rule: the line is simply omitted.
 } UiStats;
 
 // What this frame's screen was, in case the caller wants to gate something on it — e.g.

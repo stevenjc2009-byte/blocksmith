@@ -69,10 +69,33 @@ void networldOnColumnLoad(World* w, int cx, int cz);
 // did not make it" UDP outcome, not a caller error.
 bool networldSendBlockEdit(int x, int y, int z, uint8_t block);
 
+// The seed of the world the server put us in, from BS_APP_WORLD_INFO. False until that packet
+// arrives — which is immediately after JOIN, so in practice it is true well before the player
+// has finished with the title screen, but a caller must handle false rather than assume: an
+// older server never sends one, and in single player there is no session at all. False means
+// "use this client's own seed", not "the seed is 0" — 0 is a value a server can legitimately
+// own, which is why the seed comes back through an out-parameter.
+bool networldWorldSeed(uint32_t* out);
+
 // Diagnostics, mirroring net/blockdiff.h's own counters — this module owns the store
 // privately, so a HUD or log line reaches these instead of the store directly.
 int networldPendingCount(void);
 int networldPendingRefusals(void);
+
+// Lifetime traffic counters, since the last networldInit(). These exist because the failure
+// they were added to diagnose is completely silent: a client can be Connected, dig a hole, and
+// have the edit never reach anyone, with nothing on screen different from the working case.
+// Each one splits the pipeline at a different point, so one HUD line says which half is broken:
+//   sent     — BS_APP_BLOCK_EDIT payloads this client handed to the transport
+//   recvd    — application payloads decoded off the transport, of any type
+//   synced   — BS_APP_WORLD_SYNC *entries* seen (the server's backlog of everyone's edits)
+//   applied  — remote edits that actually reached worldSet(), rather than being queued
+// "sent > 0 but the other three are 0" is a send that never comes back; "synced > 0 but
+// applied 0" is a delivery the world never took.
+int networldSentEdits(void);
+int networldRecvMsgs(void);
+int networldSyncEntries(void);
+int networldAppliedEdits(void);
 
 // ---- remote players and pose sync ---------------------------------------------------------
 //

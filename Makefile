@@ -136,7 +136,11 @@ HYDRO		:=	deps/libhydrogen
 # is allowed to reach into a sibling repository's working tree.
 #---------------------------------------------------------------------------------
 PROTO_REPO	:=	https://github.com/stevenjc2009-byte/blocksmith-server.git
-PROTO_COMMIT	:=	486500e323d497fce803aa3af082d03402130641
+# v1.2.0 of the server — the commit that added BS_APP_WORLD_INFO. Bumped from
+# 486500e (v1.1.0) when the join flow started requiring the server to name its
+# world: a clone still pinned to 486500e fetches a bs_proto.h without
+# BS_APP_WORLD_INFO in it and fails to compile net/networld.c.
+PROTO_COMMIT	:=	a3264a43225c80e83cea5081efdeb850b65a1988
 PROTO		:=	deps/blocksmith-server
 
 .PHONY: deps

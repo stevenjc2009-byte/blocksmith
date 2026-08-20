@@ -459,6 +459,21 @@ static GenResult s_genr;
 
 static char s_world_name[WORLDLIST_NAME_MAX] = SAVE_WORLD_NAME;
 
+// True when the title screen handed back TITLE_START_SERVER — the player joined a server, so
+// the world being played belongs to it and not to this console. It gates every call to
+// saveWorldDir() below, not just the ones that obviously write: that function mkdirs three
+// levels on its way to the answer (see its body), so even the read-only worldHasBeenPlayed()
+// probe would leave an empty world directory behind on a card that should have gained nothing
+// from the session. The server is the save file; this console keeps no copy.
+static bool s_server_session = false;
+
+// True for exactly one trip back to the menu, set when a server session ends and cleared the
+// moment the menu has been opened with it. Distinct from s_server_session, which is cleared at
+// the top of every session and so cannot survive the lap that has to read it: this one answers
+// "was the thing that just ended a server world?" rather than "is the thing about to start
+// one?". Its only job is to decide which screen the menu opens on — see runTitleScreen.
+static bool s_left_server = false;
+
 static const char* saveWorldDir(void)
 {
 	static char dir[128];
@@ -782,9 +797,24 @@ static void genSetRadius(int radius)
 // Starts the worker and queues the whole area. The spawn column goes first because the
 // ring is FIFO, so it is the first one back and the player has ground under them before
 // the loop starts.
+// The seed genStart() actually generated from — BS_WORLD_SEED in single player, the server's
+// own seed in a session. Kept because the gen overlay's readout is otherwise a lie the moment
+// the two differ, and "which world am I standing in" is exactly what that line is for.
+static uint32_t s_seed_used = BS_WORLD_SEED;
+
 static bool genStart(int32_t cx, int32_t cz)
 {
-	worldgenInit(&s_gen, BS_WORLD_SEED);
+	// Which world this is, decided here and nowhere else. In a session the server owns the
+	// seed and sends it as BS_APP_WORLD_INFO right after JOIN (net/networld.h): the terrain is
+	// never transmitted, so generating from anything other than the server's seed would put
+	// this player in their own private landscape and make every other player's block edit land
+	// in the wrong hillside. Single player, or a server too old to send one, keeps the client's
+	// own fixed seed — networldWorldSeed() leaves `seed` untouched when it has nothing to say.
+	uint32_t seed = BS_WORLD_SEED;
+	(void)networldWorldSeed(&seed);
+	s_seed_used = seed;
+
+	worldgenInit(&s_gen, seed);
 	jobqInit(&s_meshq);
 	memset(s_col_queued, 0, sizeof(s_col_queued));
 	memset(s_col_in, 0, sizeof(s_col_in));
@@ -797,7 +827,14 @@ static bool genStart(int32_t cx, int32_t cz)
 
 	// Before workerStart, which is where the worker copies it: the worker reads the card on
 	// its very first job, so a directory set afterwards would miss the spawn column.
-	workerSetWorldDir(saveWorldDir());
+	//
+	// NULL in a server session, which app/worker.h documents as "no save file at all: every
+	// column is generated and none is ever written". That is exactly the contract a joined
+	// world wants — terrain comes from the server's seed and edits come from its diff store,
+	// so a local copy could only ever be a second, staler answer to a question the server has
+	// already answered. saveWorldDir() is not called at all rather than called and ignored,
+	// because calling it is what creates the directory.
+	workerSetWorldDir(s_server_session ? NULL : saveWorldDir());
 
 	if (!workerStart(&s_gen))
 		return false;
@@ -1344,7 +1381,7 @@ static UiState s_ui;
 // about them is decided here. This function is the frame plumbing only — bind the target,
 // hand over the numbers main.c already computed for the console overlay, and pass on the
 // touch point.
-static void drawBottomUi(bool ok, const char* status, const UiInput* in)
+static void drawBottomUi(bool ok, const char* status, const char* netline, const UiInput* in)
 {
 	C3D_RenderTarget* target = screenBottom();
 	if (!target) return;
@@ -1365,6 +1402,7 @@ static void drawBottomUi(bool ok, const char* status, const UiInput* in)
 		.bytes      = (uint32_t)worldBytes(&s_world),
 		.bytes_peak = (uint32_t)budgetPeak(),
 		.status     = status,
+		.net        = netline,
 	};
 
 	// atlasTexture() rather than atlasBind(): gfx/sprite.c tracks the bound texture itself so
@@ -1477,7 +1515,7 @@ static void worldReportDraw(int refused, bool built,
 	// against `worst` and `drop` on the overlay — a large `wk` with `drop 0` is the
 	// measurement, and a `q` that never reaches 0 would mean the worker is not keeping up.
 	if (gen->ran) {
-		printf("gen s%-5lu in %2d fail %d mesh %3d\n", (unsigned long)BS_WORLD_SEED,
+		printf("gen s%-5lu in %2d fail %d mesh %3d\n", (unsigned long)s_seed_used,
 		       gen->columns_in, gen->columns_failed + gen->submit_failed, gen->meshed);
 		printf("wk %6.0f inst %5.1f ms q%-2d d%d \n", workerBusyMs(), workerInstallMs(),
 		       workerQueued(), workerDropped());
@@ -1565,7 +1603,15 @@ _Static_assert(OPT_KEY_DRIGHT == KEY_DRIGHT, "OPT_KEY_DRIGHT drifted from libctr
 // worldReportBuild, before the worker, before the player. That is what makes it safe to
 // simply loop here rather than adding a mode to the main loop — there is no world to keep
 // simulating and no worker thread to keep fed while the menu is up.
-static bool runTitleScreen(Options* opts)
+// `returning_from_server` opens the menu on the Multiplayer screen instead of the main one.
+// It is true exactly when the previous session was a server session that has just ended, and
+// it exists so the end of that session is not silent: netErrorText() is still holding
+// whatever finished it ("Lost the connection to the server", or the server's own
+// "Disconnected by the server"), and the Multiplayer screen is the only screen that prints
+// it. Landing on the main menu instead would tell the player their world had vanished and
+// nothing else. The cursor is left where titleInit put it, which is CONNECT — the one button
+// they are most likely to want next.
+static bool runTitleScreen(Options* opts, bool returning_from_server)
 {
 	C3D_RenderTarget* const bottom = screenBottom();
 	C3D_RenderTarget* const top    = screenTop();
@@ -1578,6 +1624,7 @@ static bool runTitleScreen(Options* opts)
 
 	TitleState ts;
 	titleInit(&ts);
+	if (returning_from_server) ts.screen = TITLE_SCR_MULTIPLAYER;
 
 	while (aptMainLoop()) {
 		hidScanInput();
@@ -1602,6 +1649,31 @@ static bool runTitleScreen(Options* opts)
 			.touch_y    = tp.py,
 		};
 
+		// The handshake only advances inside netUpdate(): netConnect() sends nothing itself,
+		// it arms the transport and returns, and every retry, every packet drained and every
+		// state change after that happens here (net/bsnet.c:348). The game loop below pumps it
+		// every frame — but Multiplayer lives on the title screen, which is this loop, and this
+		// loop did not, so a player who pressed Connect sat on "Connecting..." forever: the
+		// HELLO was never retried and the server's COOKIE was never read off the socket. It is
+		// pumped before titleUpdateDraw so the status the menu paints is this frame's, not the
+		// previous one's, and it is unconditional for the same reason as the game loop's copy —
+		// netUpdate() returns immediately when the net module was never initialised or is idle.
+		netUpdate();
+
+		// And the application-layer pump, for the same reason one loop up but a different
+		// mechanism. netUpdate() decrypts arriving packets into net/bsnet_transport.c's rx ring,
+		// which is 16 slots deep and evicts the *oldest* when it overflows. The one message a
+		// joining player cannot afford to lose — BS_APP_WORLD_SYNC, every block edit already
+		// made in this world — is sent immediately after JOIN, i.e. right here on the title
+		// screen, and is then the oldest thing in that ring while the player spends the next
+		// half-minute picking a world. Without this call it was reliably evicted by the next
+		// sixteen packets and the player entered untouched terrain. networldUpdate() parks
+		// early arrivals in the pending diff store (net/networld.c's applyOrQueue), where they
+		// wait for the column each one belongs to — every diff lands in networldOnColumnLoad(),
+		// on top of the terrain the worker generated, which is the only order that leaves it
+		// visible.
+		networldUpdate();
+
 		C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
 		spriteFrameBegin();
 
@@ -1621,6 +1693,16 @@ static bool runTitleScreen(Options* opts)
 		C3D_FrameEnd(0);
 
 		if (r.action == TITLE_QUIT) return false;
+
+		// Joining a server is entering its world — there is no name to copy and no directory
+		// to resolve, so this returns without touching s_world_name. That leaves it at
+		// SAVE_WORLD_NAME, which is only ever read for the loading screen's caption from here
+		// on, because s_server_session gates every saveWorldDir() call downstream.
+		if (r.action == TITLE_START_SERVER) {
+			s_server_session = true;
+			return true;
+		}
+
 		if (r.action == TITLE_START_WORLD) {
 			// snprintf, not strcpy: both buffers are WORLDLIST_NAME_MAX and title.c will not
 			// hand back an over-long name, but this is the one place a name crosses out of
@@ -1657,6 +1739,14 @@ int main(void)
 	// libhydrogen through net/bsnet_transport.c, which needs PS open. Safe even if the player
 	// never opens Multiplayer — see bsnet.h's own contract.
 	netInit();
+
+	// Alongside netInit(), which is where networld.h says to put it — and it matters that it is
+	// here rather than at world entry, where it used to live. networldInit() clears the pending
+	// block-diff store, and the server's post-JOIN WORLD_SYNC (every edit every other player has
+	// made) arrives while the player is still on the title screen choosing a world. Clearing at
+	// world entry threw that batch away microseconds before networldSetWorld() would have
+	// applied it. Leaving a session clears it instead — see netDisconnect() in net/bsnet.c.
+	networldInit();
 
 	screenInit();
 	metricsInit();
@@ -1736,6 +1826,30 @@ int main(void)
 		optionsSave(&opts, TITLE_OPTIONS_PATH);
 	}
 
+	// ── One session ─────────────────────────────────────────────────────────────────────
+	//
+	// Everything from here to the `goto` at the bottom of main() is one visit to one world:
+	// the menu, the world, the play loop and the teardown that undoes exactly what this pass
+	// set up. A server session comes back here when the player leaves it; a single-player
+	// session never does, and quits the app exactly as it always has.
+	//
+	// This is a backward goto rather than a `for (;;)` wrapping the same 700 lines, and that
+	// is a deliberate trade. Indenting the whole body to gain a brace would have turned a
+	// four-line behavioural change into a whole-file diff, which is the kind of change that
+	// hides a real mistake inside a wall of whitespace. Jumping backwards past declarations
+	// is well defined — every object below is re-initialised when control reaches its
+	// declaration again — and the only state that has to be reset by hand is the one static
+	// this loop can observe from the previous pass, which is done on the next line.
+	//
+	// What must stay OUTSIDE this region, and does: crashInit, psInit, netInit, networldInit,
+	// screenInit, metricsInit, chunkRenderInit, spriteInit/fontInit and updaterInit, all of
+	// them above. Their matching *Exit calls used to sit in the teardown below and have moved
+	// past the goto with them, because a second session needs a screen and a chunk renderer
+	// just as much as the first one did.
+session_start:
+	// The previous pass may have left this true. Nothing else survives a lap.
+	s_server_session = false;
+
 #if BS_TITLE
 	// ui_ok gates it. spriteInit/fontInit failing is survivable for the HUD — a game with no
 	// HUD is still a game — but it is not survivable for a menu, because the menu IS its
@@ -1743,21 +1857,26 @@ int main(void)
 	// player any of that. Showing it anyway would trap them on a blank bottom screen with no
 	// route into a world at all. A build that cannot draw the menu skips it and plays
 	// SAVE_WORLD_NAME, exactly as a BS_TITLE=0 build does.
-	if (ui_ok && !runTitleScreen(&opts)) {
-		// Quit from the menu, or the system closed us while it was up. No world was ever
-		// built, so there is nothing to save and nothing to tear down beyond what boot
-		// itself brought up — this mirrors the tail of main() with the world, the worker and
-		// the highlight left out, none of which exist yet.
-		chunkRenderExit();
-		metricsExit();
-		screenExit();
-		updaterExit();   // before netExit, for the reason given at the tail of main()
-		netExit();
-		psExit();
-		crashExit();
-		return 0;
-	}
+	//
+	// s_left_server is what puts the menu back on the Multiplayer screen after a session
+	// ends, so the player reads why it ended rather than guessing — see runTitleScreen.
+	//
+	// The answer is taken into a plain bool that exists in both configurations, rather than
+	// jumping straight out of the #if, so that the goto below is compiled in a BS_TITLE=0
+	// build too. A label with no reachable goto is a -Wunused-label warning, and a warning
+	// that only appears in one configuration is a warning nobody sees until it is load
+	// bearing.
+	const bool menu_quit = ui_ok && !runTitleScreen(&opts, s_left_server);
+	s_left_server = false;
+#else
+	const bool menu_quit = false;
 #endif
+
+	// Quit from the menu, or the system closed us while it was up. No world was ever built on
+	// this pass, so there is nothing to save and nothing to tear down beyond what boot itself
+	// brought up — and, on a second lap, the previous pass already tore its own world down
+	// before coming back here.
+	if (menu_quit) goto app_shutdown;
 
 	// After the menu, because the options screen edits `opts` in place — doing this before it
 	// would snapshot the settings the player had when they *opened* the menu, which is the
@@ -1809,10 +1928,17 @@ int main(void)
 	// this line, and this is also the pointer worker-thread calls into networldOnColumnLoad()
 	// (see world/world.c's worldSet()) are compared against and ignored — see networld.h's
 	// threading note.
+	// networldInit() is deliberately NOT called here any more — it moved up next to netInit() at
+	// boot, because clearing the pending store at this point discarded the joined session's
+	// WORLD_SYNC batch. That batch is instead held until the column each edit belongs to is
+	// generated and installed, which is what puts the joining player into the world everyone
+	// else has been editing rather than a private copy of the same terrain. Note that the grid
+	// worldReportBuild() just allocated is empty — the worker has not started — so this call
+	// deliberately does nothing but register the pointer; applying a diff to those columns here
+	// would only have it generated over. See networldSetWorld()'s own comment.
 	BOOT_BEGIN();
-	networldInit();
 	networldSetWorld(&s_world);
-	BOOT_END("networldInit");
+	BOOT_END("networldSetWorld");
 
 	// The world. Since step 5.5 the generated one is not built here: the worker is started
 	// and the whole area queued, and only the column the player stands in is waited for.
@@ -1852,8 +1978,13 @@ int main(void)
 
 	// Asked before genStart, so it describes the world the player picked rather than one this
 	// boot has already written a column into.
+	//
+	// Not asked at all in a server session: the question is about this card's copy of a world,
+	// a server session has none by design, and saveWorldDir() would create the directory just
+	// to be told it is empty. The caption below reads "JOINING WORLD" on that path instead, so
+	// the false here is never shown as "CREATING WORLD".
 	BOOT_BEGIN();
-	const bool world_played_before = worldHasBeenPlayed(saveWorldDir());
+	const bool world_played_before = !s_server_session && worldHasBeenPlayed(saveWorldDir());
 	BOOT_END("worldHasBeenPlayed");
 
 	// Centred on the spawn column, which is (0, 0) — the same column playerInit puts the
@@ -1881,8 +2012,9 @@ int main(void)
 	// it drops through into the normal main loop, which breaks immediately and takes the usual
 	// save-and-shutdown path out.
 	if (!runLoadingScreen(ui_ok,
-	                       world_played_before ? "LOADING WORLD" : "CREATING WORLD",
-	                       s_world_name))
+	                       s_server_session   ? "JOINING WORLD"
+	                       : world_played_before ? "LOADING WORLD" : "CREATING WORLD",
+	                       s_server_session ? netServerAddress() : s_world_name))
 		quit_requested = true;
 
 	// From here to the game loop's first watchdogPhase call is the handoff, and it is watched
@@ -1987,8 +2119,13 @@ int main(void)
 	// inventoryLoad refuses a NULL directory, so the guard is the same test the region writer
 	// uses rather than a second opinion about the SD card. inventoryLoad always leaves `s_inv`
 	// valid — a missing or corrupt file is an empty inventory, not an error to handle here.
+	// NULL in a server session, for the same reason the worker's directory is: the server owns
+	// the world, this console keeps nothing from it, and saveWorldDir() would mkdir the very
+	// directory the session is supposed not to create. One variable covers both ends — the
+	// load here and the inventorySave on the quit path below are both already guarded on it —
+	// so a joined session starts with an empty inventory and writes none back.
 	watchdogPhase(WD_PHASE_HANDOFF_SAVE);
-	const char* const inv_dir = saveWorldDir();
+	const char* const inv_dir = s_server_session ? NULL : saveWorldDir();
 	if (inv_dir) inventoryLoad(&s_inv, inv_dir);
 	else         inventoryInit(&s_inv);
 #if BS_BOTTOM_UI
@@ -2078,6 +2215,21 @@ int main(void)
 		watchdogPhase(WD_PHASE_NET);
 		netUpdate();
 		networldUpdate();
+
+		// A server session with no server left is over, and this is where that is noticed.
+		// The world on screen belongs to the server: its terrain came from the server's seed
+		// and its edits from the server's diffs, none of it is on this card, and every block
+		// broken from here on would go nowhere. Carrying on would be a convincing forgery of
+		// a shared world — which is exactly what it used to do, indefinitely and without a
+		// word, because net/bsnet_transport.c had no way to notice a server that stopped
+		// answering (see BS_PROBE_MAX_TRIES there). Leaving takes the ordinary teardown and
+		// lands on the Multiplayer screen with netErrorText() explaining it.
+		//
+		// Deliberately not gated on which status it moved to: NET_FAILED is the timeout and
+		// the server's own kick, NET_IDLE would be something calling netDisconnect() — none
+		// of them are a session this player is still in. Single-player never enters here,
+		// because s_server_session is only ever true on the join path.
+		if (s_server_session && netStatus() != NET_CONNECTED) break;
 
 		// This console's own pose, going out to whoever else is in the session. Unconditional
 		// every frame is correct — networldSendPose() rate-limits itself to
@@ -2281,10 +2433,24 @@ int main(void)
 			snprintf(status, sizeof(status), "aim none b%d p%d r%d dq%d/%d",
 			         it.broke, it.placed, it.refused,
 			         chunkRenderDirtyCount(), chunkRenderDirtyPeak());
-		// A BS_REPORT_ONLY build with no bottom UI has no reader for it, and an unused
+		// The multiplayer counterpart, and the reason it exists: a session that is Connected
+		// but silently moving nothing looks *identical* on screen to one that works, so
+		// "did my edit go anywhere, and did anyone else's arrive?" was unanswerable from a
+		// screenshot. Each field splits the pipeline somewhere different (net/networld.h):
+		//   s sent edits   r payloads received   y WORLD_SYNC entries seen
+		//   a remote edits applied   q still queued for unloaded columns   p remote players
+		// Same 32-column console limit as `status` above: "net s99 r999 y999 a999 q99 p9"
+		// is 30.
+		char netline[33];
+		snprintf(netline, sizeof(netline), "net s%d r%d y%d a%d q%d p%d",
+		         networldSentEdits(), networldRecvMsgs(), networldSyncEntries(),
+		         networldAppliedEdits(), networldPendingCount(), networldRemoteCount());
+
+		// A BS_REPORT_ONLY build with no bottom UI has no reader for either, and an unused
 		// buffer is a -Werror stop. Kept built anyway so the two builds run the same code
-		// path and the string cannot rot in the configuration nobody compiles.
+		// path and the strings cannot rot in the configuration nobody compiles.
 		(void)status;
+		(void)netline;
 
 		// The one phase marker that is not a formality. C3D_FRAME_SYNCDRAW waits on the GPU
 		// before it returns, and a GPU that never signals leaves the main thread here forever —
@@ -2314,7 +2480,8 @@ int main(void)
 			// own render state and does not restore it (see gfx/sprite.h), while
 			// chunkRenderDraw re-establishes everything it needs at the top of its next
 			// call. Drawing the UI first would mean paying to put the world's state back.
-			drawBottomUi(ui_ok, highlight_ok ? status : "HIGHLIGHT INIT FAILED", &touch);
+			drawBottomUi(ui_ok, highlight_ok ? status : "HIGHLIGHT INIT FAILED",
+			             netline, &touch);
 #endif
 		metricsSubmitBegin();
 		C3D_FrameEnd(0);
@@ -2409,9 +2576,34 @@ int main(void)
 	// come down so nothing it could report on has been freed yet.
 	watchdogStop();
 
+	// Before worldExit, and not optional now that the menu can be reached again with the app
+	// still running. The menu loop pumps networldUpdate() every frame (that is what lets a
+	// joining player's WORLD_SYNC arrive while they are still looking at buttons), and
+	// net/networld.c would happily go on writing remote edits into the World this line is
+	// about to free. networldSetWorld(NULL) is an explicitly supported state — see that
+	// function's own early return — and puts arriving diffs back in the pending store where
+	// they wait for whatever world comes next.
+	networldSetWorld(NULL);
+
 	worldExit(&s_world);
 	highlightExit();
 	playerModelExit();
+
+	// Leaving a server session hangs up, and it has to happen before the menu is drawn again
+	// for two separate reasons. The polite one: the gateway frees the slot and the other
+	// players stop seeing a ghost, instead of the session ageing out on a timeout. The
+	// load-bearing one: scene/title.c enters the world the instant it sees a live connection
+	// with a known seed, so coming back to the Multiplayer screen still connected would drop
+	// the player straight back into the world they just left, forever. netDisconnect() also
+	// runs networldInit(), which clears the seed — so the next CONNECT waits for the next
+	// server's BS_APP_WORLD_INFO rather than reusing this one's.
+	if (s_server_session) {
+		netDisconnect();
+		s_left_server = true;
+		goto session_start;
+	}
+
+app_shutdown:
 	chunkRenderExit();
 	metricsExit();
 	screenExit();

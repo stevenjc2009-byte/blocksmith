@@ -57,6 +57,21 @@ static RemoteSlot s_remotes[NETWORLD_MAX_REMOTE];
 static uint64_t s_last_pose_send_ms;
 static bool     s_pose_sent_once;
 
+// Which world the server put us in. The server owns the seed (server/game/bsgame.c persists it
+// in world_seed.txt) and sends it as BS_APP_WORLD_INFO, the first packet after JOIN, precisely
+// so this is known before any terrain is generated. "have" is separate from the value because
+// 0 is a legal seed, and because a single-player world must keep using its own seed rather
+// than silently generating from a server's.
+static uint32_t s_world_seed;
+static bool     s_have_world_seed;
+
+// Traffic counters — see networld.h for what each one distinguishes. Plain ints, main thread
+// only, reset by networldInit(): they are a diagnostic readout, not part of any protocol.
+static int s_sent_edits;
+static int s_recv_msgs;
+static int s_sync_entries;
+static int s_applied_edits;
+
 // Every value here came off the wire, so every one of it is treated as hostile — same posture
 // as server/game/validate.c's bsEditValid(), which this mirrors. y and block are checked
 // against the client's own real world model (world/world.h's WORLD_HEIGHT, world/block.h's
@@ -81,10 +96,23 @@ static bool editValid(int32_t x, int32_t y, int32_t z, uint8_t block)
 // first avoids ever taking that path for a column we do not already own.
 static void applyOrQueue(int32_t x, int32_t y, int32_t z, uint8_t block)
 {
-	if (!s_world) return;
+	// No world yet is the *normal* case for the batch that matters most. The server sends
+	// BS_APP_WORLD_SYNC — every edit every other player has ever made — immediately after JOIN
+	// (proto/bs_proto.h), and JOIN happens the moment the handshake completes, which is on the
+	// title screen: the player is still choosing a world, and s_world stays NULL for however
+	// long that takes. Dropping here meant a joining player never saw a single one of those
+	// edits, so "connect to the server" put them in an untouched copy of the terrain instead of
+	// the world everyone else had been building in. Queueing is exactly what this store is for
+	// — a column that does not exist yet is not different in kind from one that has not
+	// streamed in yet — and networldSetWorld() flushes whatever landed before the world did.
+	if (!s_world) {
+		blockdiffRecord(&s_pending, x, y, z, block);
+		return;
+	}
 
 	if (worldColumn(s_world, x >> 4, z >> 4) != NULL) {
 		worldSet(s_world, x, y, z, block);
+		s_applied_edits++;
 	} else {
 		blockdiffRecord(&s_pending, x, y, z, block);
 	}
@@ -123,9 +151,18 @@ static void applyWorldSync(const uint8_t* msg, size_t len)
 		const int32_t z     = bs_get_i32(p + 8);
 		const uint8_t block = p[12];
 
+		s_sync_entries++;
 		if (editValid(x, y, z, block)) applyOrQueue(x, y, z, block);
 		p += BS_SYNC_ENTRY_BYTES;
 	}
+}
+
+static void applyWorldInfo(const uint8_t* msg, size_t len)
+{
+	if (len != BS_WORLD_INFO_BYTES) return;
+
+	s_world_seed      = bs_get_u32(msg + 1);
+	s_have_world_seed = true;
 }
 
 // The one place that decides "new player or existing one": a known sid updates in place; an
@@ -184,10 +221,13 @@ void networldApplyPayload(const uint8_t* payload, size_t len)
 {
 	if (len < BS_APP_HDR_BYTES) return;
 
+	s_recv_msgs++;
+
 	switch (payload[0]) {
 	case BS_APP_BLOCK_EDIT: applyBlockEdit(payload, len); break;
 	case BS_APP_WORLD_SYNC: applyWorldSync(payload, len); break;
 	case BS_APP_POS_UPDATE: applyPosUpdate(payload, len); break;
+	case BS_APP_WORLD_INFO: applyWorldInfo(payload, len); break;
 	// Every other type byte is something this client build has no use for. Silently skipped
 	// rather than treated as an error: the server is trusted to only ever send well-formed
 	// application types (server/game/bsgame.c kicks a *client* for sending one it does not
@@ -197,7 +237,30 @@ void networldApplyPayload(const uint8_t* payload, size_t len)
 	}
 }
 
-void networldSetWorld(World* w) { s_world = w; }
+void networldSetWorld(World* w)
+{
+	// Registering the World is all this does. It used to also flush the pending store into any
+	// column that already existed, on the stated assumption that "main.c calls this straight
+	// after worldReportBuild(), with the starting ring built" — and that assumption is false.
+	// worldReportBuild() (main.c) *allocates* a 17x17 grid of columns as a memory-budget proof
+	// before a single block of terrain is generated; the worker only starts afterwards, in
+	// genStart(). So every column in that grid answered worldColumn() != NULL while holding
+	// nothing but air, the flush emptied the store into it, and the generated terrain then
+	// landed on top and wiped all of it.
+	//
+	// Measured, not argued: dig 8 blocks in a joined session, leave, rejoin. The HUD read
+	// `net s8 ... y8 a0 q0` — eight edits sent, eight sync entries back from the server, none
+	// still queued — and the ground was visibly whole, with the frame's triangle count
+	// (71532) identical to the pre-dig frame's. The trench had been applied to an empty column
+	// and generated over.
+	//
+	// Nothing is stranded by dropping the flush: every column that ever holds real terrain
+	// arrives through workerInstall(), and main.c calls networldOnColumnLoad() for each one the
+	// moment it is installed (genInstallOne, immediately before genQueueReadyColumns) — which
+	// is also the only point at which applying a diff is meaningful, since it has to go on top
+	// of the generated blocks rather than under them.
+	s_world = w;
+}
 
 void networldInit(void)
 {
@@ -205,6 +268,12 @@ void networldInit(void)
 	networldResetRemotes();
 	s_last_pose_send_ms = 0;
 	s_pose_sent_once    = false;
+	s_world_seed        = 0;
+	s_have_world_seed   = false;
+	s_sent_edits        = 0;
+	s_recv_msgs         = 0;
+	s_sync_entries      = 0;
+	s_applied_edits     = 0;
 }
 
 // Ages out any remote whose last pose is at or past NETWORLD_REMOTE_TIMEOUT_MS old. The server
@@ -226,8 +295,13 @@ void networldUpdate(void)
 {
 	ageOutRemotes();
 
-	if (!s_world) return;
-
+	// Draining is deliberately *not* gated on a registered World any more. The transport's rx
+	// ring is 16 slots deep and evicts oldest-first (bsnet_transport.c's push_rx), so a client
+	// sitting on the title screen with the session already up — which is where connecting
+	// happens — had the server's post-JOIN WORLD_SYNC pushed out of that ring by the next
+	// sixteen packets, about 1.6 s of one other player's 10 Hz pose updates, long before it
+	// ever reached a world. applyOrQueue() now parks anything that arrives early in the pending
+	// store, so the only requirement here is that the ring keeps being emptied.
 	uint8_t buf[NETWORLD_RECV_BUF];
 	for (int i = 0; i < NETWORLD_MAX_MSGS_PER_FRAME; i++) {
 		const int n = netTransportRecv(buf, sizeof buf);
@@ -259,11 +333,25 @@ bool networldSendBlockEdit(int x, int y, int z, uint8_t block)
 	bs_put_i32(out + 5, (int32_t)y);
 	bs_put_i32(out + 9, (int32_t)z);
 	out[13] = block;
-	return netTransportSend(out, sizeof out);
+	const bool ok = netTransportSend(out, sizeof out);
+	if (ok) s_sent_edits++;
+	return ok;
+}
+
+bool networldWorldSeed(uint32_t* out)
+{
+	if (!s_have_world_seed) return false;
+	if (out) *out = s_world_seed;
+	return true;
 }
 
 int networldPendingCount(void)     { return blockdiffCount(&s_pending); }
 int networldPendingRefusals(void)  { return blockdiffRefusals(&s_pending); }
+
+int networldSentEdits(void)    { return s_sent_edits; }
+int networldRecvMsgs(void)     { return s_recv_msgs; }
+int networldSyncEntries(void)  { return s_sync_entries; }
+int networldAppliedEdits(void) { return s_applied_edits; }
 
 int networldRemoteCount(void)
 {

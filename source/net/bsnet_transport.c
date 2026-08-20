@@ -144,6 +144,33 @@ _Static_assert(NET_MAX_PAYLOAD == BS_MAX_PAYLOAD, "payload size drift");
 #define BS_KEEPALIVE_MS      4000u
 #define BS_RX_QUEUE_LEN         16u
 
+/* How a live session notices the server has gone away.
+ *
+ * Until these existed it did not notice at all. The keepalive above was armed
+ * off send silence and cleared by any authenticated packet, with no deadline on
+ * the reply: if the server died, the one outstanding probe was never answered,
+ * `probe_outstanding` stayed true forever, no further probe was ever sent, and
+ * the client sat in ESTABLISHED — "Connected", full HUD, edits going nowhere —
+ * until the player gave up. The server had already timed the session out.
+ *
+ * Two changes make it detectable. The probe is armed off *receive* silence
+ * rather than send silence, because a solo player on a server receives nothing
+ * at all after the initial WORLD_INFO/WORLD_SYNC while still sending a pose
+ * every few hundred milliseconds — send silence never arrives, so the old
+ * trigger could not fire and there was nothing in flight to miss. And an
+ * unanswered probe is now retried on a deadline and eventually fatal.
+ *
+ * BS_PROBE_MAX_TRIES retries at BS_PROBE_RETRY_MS, after BS_KEEPALIVE_MS of
+ * quiet, puts the verdict at roughly 4 + 5x2 = 14 s of silence. Comfortably
+ * longer than any relay hiccup (the handshake gives up on a phase in ~3 s) and
+ * comfortably shorter than a player's patience. The gateway answers a
+ * zero-length probe itself, so this measures the link to the *gateway* — a
+ * gateway that is up with a dead bsgame behind it keeps the session alive and
+ * the player waiting, which is correct and is the case bsgate's own
+ * "game daemon unreachable" log line exists to explain from the other end. */
+#define BS_PROBE_RETRY_MS    2000u
+#define BS_PROBE_MAX_TRIES      5u
+
 /* How long an enrolment attempt waits for BS_PKT_ENROL_OK. The server gives a
  * probation session BS_ENROL_WINDOW_MS (10s) from the moment it finishes the
  * handshake; this clock starts when *we* accept KX2, which is strictly earlier
@@ -218,6 +245,8 @@ static struct {
     uint64_t last_send_ms;
     bool     probe_outstanding;
     uint64_t probe_sent_ms;
+    unsigned probe_tries;      /* unanswered probes in the current run of them */
+    uint64_t last_rx_ms;       /* last authenticated packet on our sid         */
     int      ping_ms;
 
     struct rx_item rxq[BS_RX_QUEUE_LEN];
@@ -500,10 +529,17 @@ static void handle_app_packet(uint8_t type, const uint8_t *pkt, size_t len, uint
         s.state    = NET_TRANSPORT_ESTABLISHED;
     }
 
+    /* Any authenticated packet on our sid is proof the far end is alive, which
+     * is what the session timeout in tick() below is measured against. Set here
+     * rather than in the raw receive path on purpose: an unauthenticated
+     * datagram proves only that *something* can reach this socket. */
+    s.last_rx_ms = now;
+
     if (s.probe_outstanding) {
         uint64_t rtt = now - s.probe_sent_ms;
         s.ping_ms = (s.ping_ms < 0) ? (int)rtt : (s.ping_ms * 4 + (int)rtt) / 5;
         s.probe_outstanding = false;
+        s.probe_tries       = 0;
     }
 
     if (type == BS_PKT_DISCONNECT) {
@@ -584,6 +620,12 @@ static void process_datagram(const uint8_t *pkt, size_t len, uint64_t now)
         s.phase_tries         = 1;
         s.phase_deadline_ms   = now + BS_WELCOME_RETRY_MS;
         s.probe_outstanding   = false;
+        s.probe_tries         = 0;
+        /* Seeded here, not left at zero, so the session-liveness clock in
+         * tick() starts from the moment this session became real rather than
+         * from the epoch — otherwise the first CSTATE_RUNNING tick would see an
+         * apparently ancient last packet and probe immediately. */
+        s.last_rx_ms          = now;
 
         /* This is the earliest moment a probation session can exist on the
          * server, and the last one before the ordinary retry path would send
@@ -696,8 +738,24 @@ static void tick_retries(uint64_t now)
         break;
 
     case CSTATE_RUNNING:
-        if (!s.probe_outstanding && now - s.last_send_ms >= BS_KEEPALIVE_MS) {
+        if (s.probe_outstanding) {
+            if (now - s.probe_sent_ms >= BS_PROBE_RETRY_MS) {
+                if (s.probe_tries >= BS_PROBE_MAX_TRIES) {
+                    /* Deliberately says nothing about the cause. From here a
+                     * powered-off server, a dropped tunnel, a revoked key and
+                     * a console that walked out of Wi-Fi range are identical,
+                     * and the only move available to the player is the same in
+                     * every case. */
+                    fail("Lost the connection to the server");
+                    break;
+                }
+                s.probe_tries++;
+                s.probe_sent_ms = now;
+                send_app_packet(BS_PKT_DATA, EMPTY_PAYLOAD, 0);
+            }
+        } else if (now - s.last_rx_ms >= BS_KEEPALIVE_MS) {
             s.probe_outstanding = true;
+            s.probe_tries       = 0;
             s.probe_sent_ms     = now;
             send_app_packet(BS_PKT_DATA, EMPTY_PAYLOAD, 0);
         }
