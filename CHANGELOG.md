@@ -4,6 +4,63 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.3] — 2026-08-20 — diagnostic pre-release
+
+The same hunt, and the same instrument as v1.1.2 — but v1.1.2 could not carry it
+out, because of a bug in the harness rather than in the game.
+
+### What went wrong with v1.1.2
+
+Installed on real hardware it booted, loaded a world, and drew nothing but the
+highlight cage: "I can just see the outline of the blocks, I can't actually see
+the world." It did not freeze either, which is the part that gives it away — a
+build meant to freeze that comes back alive has not been tested, it has been
+skipped.
+
+The cause is v1.1.1's `sdmc:/blocksmith/drawprobe.txt`, still on the SD card.
+v1.1.2 read it to decide which arm of the bisect to run next, saw `arm 5 START`
+as the last line, concluded every arm had already had its turn, and took the
+park branch — `s_probe_arm = PROBE_ARMS - 1`, arm 5, "GPU state set up, but no
+draw calls at all". So the console was obeying instructions left behind by a
+version that was no longer installed. Multiplayer worked, worlds loaded, the
+stats line counted meshes and triangles; they were simply never drawn.
+
+That is also why the breadcrumb v1.1.2 exists to collect came back empty. An arm
+that issues no draw calls cannot reach the stage the breadcrumb is there to
+name.
+
+### Fixed
+
+- **`BS_DRAW_BISECT`, defaulting to off.** The shipped diagnostic now runs one
+  arm on every boot — arm 0, everything drawn — regardless of what any previous
+  version left on the card. Nothing is removed from the frame, so it looks like
+  the game. The draw-stage breadcrumb added in v1.1.2 is what does the work now,
+  and it needs the whole frame present to be worth reading. The bisect code is
+  kept and can still be switched on with `-DBS_DRAW_BISECT=1`; it is simply no
+  longer the instrument.
+- The `HUNG` epitaph for a previous frozen boot is still written, because "the
+  last boot froze" is exactly what a build that is meant to freeze must record.
+
+### Verified
+
+Red and green, against the exact situation that produced the report. The real
+`drawprobe.txt` off the console was planted on a private emulator SD card, and
+both builds then booted into the same world from it.
+
+With v1.1.2 as shipped: the log gained `-- all arms done; parked on arm 5 --`
+and the screenshot is a dark screen with a floating wireframe cube outline and
+nothing else — the report reproduced exactly.
+
+With this build, same planted file: the log gained `arm 0 START  everything`
+then `arm 0 SURVIVED 600 frames`, and the screenshot shows grass, dirt, a tree
+trunk and the highlight cage. The bottom-screen stats line reads identically in
+both (`meshes 114  tris 88084  cull 81`), which is the control — the world was
+loaded and meshed either way, and only the drawing differed.
+
+**The freeze itself is still not fixed, and this build does not claim to fix
+it.** It is meant to freeze. That is now possible again, and when it does,
+`hang.txt` names the draw stage.
+
 ## [1.1.2] — 2026-08-20 — diagnostic pre-release
 
 Still not a normal release, and still the same hunt. v1.1.1 asked the console

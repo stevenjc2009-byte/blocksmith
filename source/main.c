@@ -1215,6 +1215,25 @@ static void bootTimingWrite(void)
 #define BS_DRAW_PROBE 0
 #endif
 
+// Whether the self-advancing arm bisect runs at all. OFF by default, and that default is a
+// bug fix rather than a preference.
+//
+// v1.1.2 shipped with it on. steve's SD card still held v1.1.1's drawprobe.txt, whose last
+// line was "arm 5 START", so the new build read someone else's log, concluded every arm had
+// had its turn, and parked on the arm that draws nothing. He installed it, launched a world
+// and reported "I can just see the outline of the blocks, I can't actually see the world" —
+// which was the probe doing exactly what it was told, on instructions left behind by the
+// previous version. A diagnostic that silently inherits state from a build that is no longer
+// installed is a diagnostic that lies.
+//
+// It is off rather than version-stamped because the arms are no longer the instrument. The
+// draw-stage breadcrumb in scene/chunk_render.c answers the same question on the first boot
+// that freezes, without removing anything from the frame — so the shipped diagnostic now
+// draws the whole world, looks like the game, and still names where it died.
+#ifndef BS_DRAW_BISECT
+#define BS_DRAW_BISECT 0
+#endif
+
 #if BS_DRAW_PROBE
 #define PROBE_FILE   "sdmc:/blocksmith/drawprobe.txt"
 #define PROBE_ARMS   6
@@ -1289,6 +1308,14 @@ static void probeBegin(void)
 		fprintf(f, "arm %d HUNG - no survival line, the console froze on this arm\n",
 		        last_start);
 
+#if !BS_DRAW_BISECT
+	// One arm, every boot: everything drawn. Nothing is removed from the frame, so the world
+	// looks like the game and the breadcrumb is what does the work. The HUNG line above still
+	// gets written, because "the last boot froze" is exactly what a build that is meant to
+	// freeze needs to record.
+	s_probe_arm = 0;
+	fprintf(f, "arm 0 START  %s\n", probeArmName(0));
+#else
 	s_probe_arm = last_start + 1;
 	if (s_probe_arm >= PROBE_ARMS) {
 		// Every arm has had its turn. Park on the one that draws nothing so the console is
@@ -1299,6 +1326,7 @@ static void probeBegin(void)
 	} else {
 		fprintf(f, "arm %d START  %s\n", s_probe_arm, probeArmName(s_probe_arm));
 	}
+#endif
 	fclose(f);
 
 	// Once here as well as once per frame: an arm that freezes on its very first frame never
