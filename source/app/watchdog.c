@@ -25,7 +25,18 @@
 // with nothing recursive in it is the same generous margin.
 #define WD_STACK_BYTES 4096
 
+// The draw-bisect build (BS_DRAW_PROBE, see main.c) adds three lines to the report and needs
+// the room for them. Left alone in a shipped build: this is a diagnostic's cost, not the
+// game's.
+#ifndef BS_DRAW_PROBE
+#define BS_DRAW_PROBE 0
+#endif
+
+#if BS_DRAW_PROBE
+#define WD_REPORT_MAX 1024
+#else
 #define WD_REPORT_MAX 768
+#endif
 
 static volatile u32  s_phase;
 static volatile u32  s_beat;
@@ -33,6 +44,16 @@ static volatile s32  s_columns;
 static volatile s32  s_meshes;
 static volatile s32  s_queued;
 static volatile bool s_worker_busy;
+
+#if BS_DRAW_PROBE
+// Sampled by the main thread once per frame and only read here, so this thread never calls
+// linearSpaceFree() itself. That matters: those queries take libctru's own heap lock, and a
+// watchdog that can block on a lock is a watchdog that writes no report at all — the exact
+// failure the raw-FS comment on reportWrite below exists to avoid.
+static volatile s32  s_probe_arm = -1;
+static volatile u32  s_linear_free;
+static volatile u32  s_vram_free;
+#endif
 
 static volatile bool s_quit;
 static volatile bool s_fired;
@@ -126,7 +147,23 @@ static void reportBuild(u32 phase, u32 frames, u32 stuck_ms)
 		s_worker_busy ? "BUSY" : "IDLE");
 
 	if (n <= 0) return;
-	const size_t len = ((size_t)n < sizeof(s_report)) ? (size_t)n : sizeof(s_report) - 1;
+	size_t len = ((size_t)n < sizeof(s_report)) ? (size_t)n : sizeof(s_report) - 1;
+
+#if BS_DRAW_PROBE
+	// Appended rather than woven into the format above, so a shipped report stays byte-for-byte
+	// what it already was and only the bisect build carries the extra three lines.
+	const int m = snprintf(s_report + len, sizeof(s_report) - len,
+		"\n"
+		"probe arm    : %ld\n"
+		"linear free  : %lu B\n"
+		"vram free    : %lu B\n",
+		(long)s_probe_arm, (unsigned long)s_linear_free, (unsigned long)s_vram_free);
+	if (m > 0) {
+		const size_t room = sizeof(s_report) - len - 1;
+		len += ((size_t)m < room) ? (size_t)m : room;
+	}
+#endif
+
 	reportWrite(len);
 	s_fired = true;
 }
@@ -223,6 +260,15 @@ void watchdogCounters(int columns, int meshes, int queued, bool worker_busy)
 	s_queued      = queued;
 	s_worker_busy = worker_busy;
 }
+
+#if BS_DRAW_PROBE
+void watchdogProbeState(int arm, uint32_t linear_free, uint32_t vram_free)
+{
+	s_probe_arm   = arm;
+	s_linear_free = linear_free;
+	s_vram_free   = vram_free;
+}
+#endif
 
 bool watchdogFired(void)
 {

@@ -1185,6 +1185,143 @@ static void bootTimingWrite(void)
 #define BOOT_WRITE()   ((void)0)
 #endif
 
+// ── The hardware draw probe ───────────────────────────────────────────────────────────
+//
+// For the freeze reported from a real Old 3DS on 2026-08-20, which the watchdog caught with
+// phase DRAW, worker IDLE and the mesh queue empty — i.e. on the first frame after the world
+// finished filling, which is also the first frame that submits the whole world. Azahar does
+// not reproduce it in either console mode (measured: 120 s in-world at the same cols 322 the
+// hang report names), so the guilty draw cannot be found here; it has to be found there.
+//
+// A GPU that stops signalling does not say which draw stopped it. Every draw call in a frame
+// only appends to a command list and returns, so the phase marker can never be finer than
+// "somewhere in this frame" — the block happens at the NEXT C3D_FrameBegin(C3D_FRAME_SYNCDRAW),
+// long after the guilty call returned. The only thing that separates the candidates is
+// removing them one at a time, so this removes them one at a time.
+//
+// It self-advances so the console does the bisect without a rebuild between arms: each boot
+// reads sdmc:/blocksmith/drawprobe.txt, takes the arm after the last one started, and appends
+// "START". A frame count later it appends "SURVIVED". An arm that hangs never writes its
+// SURVIVED line, so the next boot sees the gap and records HUNG for it. Six boots, one file.
+//
+// Arm 0 and arm 5 are the controls, and the probe is worthless without both: 0 draws the whole
+// frame and MUST hang (if it does not, the arms that follow prove nothing, because a green
+// result would just mean the freeze did not happen this run), and 5 draws nothing and MUST
+// survive (if it hangs too, the freeze is not in the drawing at all and the whole bisect is
+// aimed at the wrong place — which is itself the answer).
+//
+// Off by default:  make EXTRA_CFLAGS="-DBS_DRAW_PROBE=1"
+#ifndef BS_DRAW_PROBE
+#define BS_DRAW_PROBE 0
+#endif
+
+#if BS_DRAW_PROBE
+#define PROBE_FILE   "sdmc:/blocksmith/drawprobe.txt"
+#define PROBE_ARMS   6
+// Long enough that a frame merely being slow on hardware cannot be mistaken for surviving —
+// the watchdog gives up at 10 s, so 600 frames is ten seconds of healthy 60 Hz frames and
+// several times the watchdog's window at any frame rate that still counts as running.
+#define PROBE_FRAMES 600
+
+static int  s_probe_arm;
+static bool s_probe_written;
+
+// What each arm takes out of the frame. Everything is drawn when the bit is clear.
+#define PROBE_SKIP_WORLD  (s_probe_arm == 1 || s_probe_arm == 5)
+#define PROBE_SKIP_HIGH   (s_probe_arm == 2 || s_probe_arm == 5)
+#define PROBE_SKIP_PLAYER (s_probe_arm == 3 || s_probe_arm == 5)
+#define PROBE_SKIP_UI     (s_probe_arm == 4 || s_probe_arm == 5)
+
+static const char* probeArmName(int arm)
+{
+	switch (arm) {
+	case 0:  return "everything (control: MUST hang)";
+	case 1:  return "no world";
+	case 2:  return "no highlight cage";
+	case 3:  return "no player models or tags";
+	case 4:  return "no bottom screen UI";
+	default: return "nothing drawn (control: MUST survive)";
+	}
+}
+
+// Counts the arms already started and the arms that reported surviving. Reading the file back
+// rather than keeping a counter somewhere is what makes a hang self-recording: the process that
+// hangs never gets to write anything, so its silence has to be what the next boot reads.
+static void probeBegin(void)
+{
+	int started = 0, survived = 0;
+	char line[128];
+
+	FILE* f = fopen(PROBE_FILE, "r");
+	if (f) {
+		while (fgets(line, sizeof line, f)) {
+			if (strstr(line, "START"))    started++;
+			if (strstr(line, "SURVIVED")) survived++;
+		}
+		fclose(f);
+	}
+
+	f = fopen(PROBE_FILE, "a");
+	if (!f) return;
+
+	// A started arm with no survival line is one that never came back. Written now, on the
+	// boot after it, because that is the first moment anything is able to write it down.
+	if (started > survived)
+		fprintf(f, "arm %d HUNG - no survival line, the console froze on this arm\n",
+		        started - 1);
+
+	s_probe_arm = started;
+	if (s_probe_arm >= PROBE_ARMS) {
+		// Every arm has had its turn. Park on the one that draws nothing so the console is
+		// still usable rather than freezing again on a run that can no longer learn anything.
+		s_probe_arm = PROBE_ARMS - 1;
+		fprintf(f, "-- all arms done; parked on arm %d --\n", s_probe_arm);
+		s_probe_written = true;   // nothing more to record
+	} else {
+		fprintf(f, "arm %d START  %s\n", s_probe_arm, probeArmName(s_probe_arm));
+	}
+	fclose(f);
+
+	// Once here as well as once per frame: an arm that freezes on its very first frame never
+	// reaches probeFrame, and a hang report saying "arm -1, 0 bytes free" would be worse than
+	// no report at all.
+	watchdogProbeState(s_probe_arm, (u32)linearSpaceFree(), (u32)vramSpaceFree());
+}
+
+// Called once per completed game frame. Appends the survival line exactly once, then stops
+// touching the card — an arm that gets this far has answered its question and the rest of the
+// run is just the player looking at it.
+// Hands the watchdog the arm number and the two heap figures, so a hang report names which arm
+// was running and how much room was left. Sampled here, on the main thread, because the monitor
+// thread may not take libctru's heap lock — see watchdog.c.
+static void probeSample(void)
+{
+	watchdogProbeState(s_probe_arm, (u32)linearSpaceFree(), (u32)vramSpaceFree());
+}
+
+static void probeFrame(void)
+{
+	static int frames;
+	probeSample();
+	if (s_probe_written) return;
+	if (++frames < PROBE_FRAMES) return;
+
+	FILE* f = fopen(PROBE_FILE, "a");
+	if (f) {
+		fprintf(f, "arm %d SURVIVED %d frames\n", s_probe_arm, PROBE_FRAMES);
+		fclose(f);
+	}
+	s_probe_written = true;
+}
+#else
+#define PROBE_SKIP_WORLD  false
+#define PROBE_SKIP_HIGH   false
+#define PROBE_SKIP_PLAYER false
+#define PROBE_SKIP_UI     false
+#define probeBegin()      ((void)0)
+#define probeFrame()      ((void)0)
+#endif
+
 #define SAVE_CHECK_NOTE "sdmc:/blocksmith/savecheck.txt"
 
 typedef struct {
@@ -1330,15 +1467,21 @@ static void drawEye(C3D_RenderTarget* target, const C3D_Mtx* view, const RayHit*
 	chunkRenderSetEye(iod);
 	C3D_RenderTargetClear(target, C3D_CLEAR_ALL, CLEAR_COLOR, 0);
 	C3D_FrameDrawOn(target);
-	chunkRenderDraw(view);
-	for (int i = 0; i < BS_GPU_STRESS; i++) chunkRenderDraw(view);
+	// The clear above stays in every arm on purpose: it is the one piece of GPU work that
+	// cannot be the suspect (the loading screen has already done it several hundred times on
+	// the same hardware), and leaving it in keeps every arm a frame that still targets and
+	// presents a screen rather than an empty submission with nothing to compare.
+	if (!PROBE_SKIP_WORLD) {
+		chunkRenderDraw(view);
+		for (int i = 0; i < BS_GPU_STRESS; i++) chunkRenderDraw(view);
+	}
 
 	// After the world, because it re-binds the GPU for its own vertex format and does not
 	// put it back — chunkRenderDraw re-establishes everything it needs at the top of its
 	// next call instead. See pipelineBind in chunk_render.c. highlightDraw itself checks
 	// hit->hit (see highlight.h), so there is no guard here to keep in sync with it.
 	// It reads chunkRenderProjection(), so it gets this eye's matrix for free.
-	highlightDraw(view, hit);
+	if (!PROBE_SKIP_HIGH) highlightDraw(view, hit);
 
 	// The other people in the session, from the pose table net/networld.c fills. Both calls
 	// are unconditional: each returns immediately when nobody else has sent a pose, which
@@ -1352,8 +1495,10 @@ static void drawEye(C3D_RenderTarget* target, const C3D_Mtx* view, const RayHit*
 	// 400x240 is the top screen, which is the only target drawEye is ever given. Passing the
 	// wrong size here would not fail — it would scale every tag's position, which is the kind
 	// of wrong that reads as a projection bug.
-	playerModelDraw(view);
-	playerModelDrawTags(view, 400.0f, 240.0f);
+	if (!PROBE_SKIP_PLAYER) {
+		playerModelDraw(view);
+		playerModelDrawTags(view, 400.0f, 240.0f);
+	}
 }
 
 // The player's items. Outside the BS_BOTTOM_UI guard on purpose: a build with no bottom
@@ -2151,6 +2296,11 @@ session_start:
 			                &player.cam);
 	bool report_final = false;
 
+	// Before the first frame, so the arm is chosen and the START line is on the card even if
+	// this run is the one that freezes — see the BS_DRAW_PROBE comment. A no-op in any build
+	// that does not define it, which is every build that ships.
+	probeBegin();
+
 	// The queue's peak is only meaningful from the first real frame onwards: the startup
 	// build above went through chunkRenderBuild, not the queue, but the step 3.6 corner
 	// edit did touch it, and a peak carried over from before the loop would be reported as
@@ -2480,8 +2630,9 @@ session_start:
 			// own render state and does not restore it (see gfx/sprite.h), while
 			// chunkRenderDraw re-establishes everything it needs at the top of its next
 			// call. Drawing the UI first would mean paying to put the world's state back.
-			drawBottomUi(ui_ok, highlight_ok ? status : "HIGHLIGHT INIT FAILED",
-			             netline, &touch);
+			if (!PROBE_SKIP_UI)
+				drawBottomUi(ui_ok, highlight_ok ? status : "HIGHLIGHT INIT FAILED",
+				             netline, &touch);
 #endif
 		metricsSubmitBegin();
 		C3D_FrameEnd(0);
@@ -2528,6 +2679,11 @@ session_start:
 		watchdogCounters(s_world.columns, chunkRenderMeshes(), jobqCount(&s_meshq),
 		                 workerBusy());
 		watchdogBeat();
+
+		// Next to watchdogBeat because it means the same thing — this frame finished — and a
+		// survival line is only worth anything if it counts the same frames the watchdog would
+		// have counted against the arm.
+		probeFrame();
 
 #if BS_HANG_TEST
 		// See the BS_HANG_TEST comment near the top of this file. Never in a release build.

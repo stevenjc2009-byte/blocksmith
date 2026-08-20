@@ -4,6 +4,59 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.1] — 2026-08-20 — diagnostic pre-release
+
+Not a normal release. v1.1.0 froze a real Old 3DS a moment after a world
+finished loading, HOME included, and the failure does not reproduce in an
+emulator. This build is the instrument that finds it. Nothing about the game
+changed.
+
+### The evidence it was built from
+
+The watchdog wrote `sdmc:/blocksmith/hang.txt` on the frozen console: phase
+`DRAW`, 310 frames drawn, `columns in 322`, `meshes 99`, mesh queue empty,
+worker idle. Those two counters only exist after a `C3D_FrameEnd`, so a whole
+world frame completed and the GPU never signalled it — and the next
+`C3D_FrameBegin(C3D_FRAME_SYNCDRAW)` then blocked forever, which is also why
+HOME stopped answering. Ruled out with evidence rather than intuition:
+non-linear GPU buffers (every one is `linearAlloc`'d), cache coherency
+(`C3D_FrameEnd` flushes the whole linear heap), NULL vertex buffers (checked at
+init, fatal), zero-count draws (guarded in `drawIndices`/`drawRun`), mesh-slot
+exhaustion (99 of 150), stereo (never enabled), and the loading→game handoff
+(the phase name proves it was survived).
+
+### Added
+
+- **`BS_DRAW_PROBE`, a self-advancing six-arm draw bisect.** Each boot removes
+  one thing from the frame — arm 0 nothing removed, then the world, the
+  highlight cage, the player models and tags, the bottom-screen UI, and finally
+  everything — and appends the result to `sdmc:/blocksmith/drawprobe.txt`. Arms
+  0 and 5 are controls: 0 must hang and 5 must survive, and the bisect means
+  nothing without both. A started arm with no survival line is written up as
+  `HUNG` on the *next* boot, because a frozen console cannot write its own
+  epitaph.
+- **A finer watchdog phase would not have worked**, which is why this exists
+  instead: every draw call only appends to a command list and returns, and the
+  block happens at the next `C3D_FrameBegin`. There is no moment in between to
+  put a marker in. Removing one draw and seeing whether the console lives is the
+  only instrument that separates them.
+- **Three extra `hang.txt` lines** — `probe arm`, `linear free`, `vram free` —
+  present only in this build. Sampled on the main thread and merely read by the
+  monitor: `linearSpaceFree()` takes libctru's heap lock, and a watchdog that
+  can block on a lock is a watchdog that writes no report at all.
+
+### Verified
+
+The harness was proven both ways in Azahar before being cut, because a check
+that cannot go red proves nothing: three boots gave `arm 0 SURVIVED`, a
+deliberately killed run gave `arm 1 HUNG` on the boot after it, and arm 2's
+screenshot shows the same world with the highlight cage genuinely gone. The new
+`hang.txt` lines were proven by a throwaway `BS_HANG_TEST` build that stalls the
+main thread on purpose, which wrote `probe arm : 0`, `linear free : 27081216 B`,
+`vram free : 4440064 B`.
+
+**The freeze itself is not fixed, and this build does not claim to fix it.**
+
 ## [1.1.0] — 2026-08-20
 
 Multiplayer that actually works end to end: joining a server puts you in the

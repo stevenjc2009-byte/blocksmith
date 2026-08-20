@@ -23,6 +23,7 @@
 // diagnostic that can itself block the main thread would be worse than no diagnostic.
 
 #include <stdbool.h>
+#include <stdint.h>
 
 // Where the main thread is. Ordered roughly as a frame runs; the names are what end up in the
 // report, so they are the vocabulary this file is actually for.
@@ -83,6 +84,17 @@ void watchdogBeat(void);
 // The world's counters, so the report says what the world was doing as well as where the code
 // was. Cheap enough to call every frame — four stores.
 void watchdogCounters(int columns, int meshes, int queued, bool worker_busy);
+
+#ifndef BS_DRAW_PROBE
+#define BS_DRAW_PROBE 0
+#endif
+
+#if BS_DRAW_PROBE
+// Draw-bisect build only (see main.c). The main thread samples the two heap figures once per
+// frame and hands them over, because the monitor thread must never call linearSpaceFree()
+// itself — see the comment on the variables in watchdog.c.
+void watchdogProbeState(int arm, uint32_t linear_free, uint32_t vram_free);
+#endif
 
 // True once a report has been written this session. Only the deliberate-hang self-check reads
 // this; nothing in the game does.
