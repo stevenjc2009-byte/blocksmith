@@ -468,7 +468,25 @@ static void pipelineBind(void)
 
 	C3D_AttrInfo* attr = C3D_GetAttrInfo();
 	AttrInfo_Init(attr);
-	AttrInfo_AddLoader(attr, 0, GPU_BYTE, 3);            // v0 = position
+	// FOUR components on attribute 0, not three, and the fourth is MeshVertex.pad — a byte the
+	// shader never reads. It is declared solely so that attribute 1 begins at byte offset 4
+	// instead of byte offset 3.
+	//
+	// citro3d has no per-attribute offset. The PICA200 derives each attribute's offset inside the
+	// vertex from the running total of the sizes declared before it, so `3 signed bytes` followed
+	// by `4 unsigned bytes` puts a four-byte fetch on offset 3 of an 8-byte stride, on every
+	// vertex, forever. That is what shipped from v1.1.0 to v1.2.4 and it is the freeze: an x86
+	// host does unaligned loads without noticing, which is why twelve builds of this never once
+	// reproduced in Azahar, while the real GPU wedged on the first world frame. Read straight out
+	// of the hardware capture of the hung frame: ATTRIBBUFFERS_FORMAT_LOW = 0x000000d8.
+	//
+	// gfx/sprite.c declares 3 floats + 2 floats + 4 unsigned bytes = every attribute 4-byte
+	// aligned, and its draws land correctly on the console in the very frames the chunk draw
+	// hangs. That was the control that identified this.
+	//
+	// 4 + 4 now also equals the 8-byte stride exactly, so there is no longer any byte of the
+	// vertex the attribute configuration does not account for.
+	AttrInfo_AddLoader(attr, 0, GPU_BYTE, 4);            // v0 = position, + pad to align v1
 	AttrInfo_AddLoader(attr, 1, GPU_UNSIGNED_BYTE, 4);   // v1 = u, v, normal, ao
 
 	// The atlas, rebound here for exactly the reason the comment above gives about shader

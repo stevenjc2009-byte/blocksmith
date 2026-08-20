@@ -4,6 +4,54 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.5] - 2026-08-20
+
+### Fixed
+
+- **The freeze entering a world, present since v1.1.0, is fixed: the chunk vertex
+  attributes were misaligned.** Thirteen builds tried to find this and it never once
+  reproduced in an emulator, which was itself the clue.
+
+  citro3d has no per-attribute byte offset. The PICA200 works out where each attribute
+  starts inside a vertex by adding up the sizes of the attributes declared before it, so
+  `AttrInfo_AddLoader(attr, 0, GPU_BYTE, 3)` followed by
+  `AttrInfo_AddLoader(attr, 1, GPU_UNSIGNED_BYTE, 4)` placed a four-byte attribute fetch on
+  **byte offset 3** of an eight-byte vertex. Every vertex, every chunk, every frame. An
+  emulator runs that on an x86 host, which performs unaligned loads without complaint; the
+  real GPU took the command and never reported finishing it.
+
+  `MeshVertex.pad` was at the end of the struct "to keep the stride a power of two" — but the
+  stride was eight bytes either way. The thing that actually needed padding was the gap
+  between the two attributes. `pad` now sits at offset 3, attribute 0 is declared as four
+  components, and attribute 1 starts at offset 4. Both attributes are 4-byte aligned, the
+  vertex is still exactly 8 bytes, and the 4.24 MB chunk vertex pool is unchanged.
+
+  Evidence this was the right target, rather than argument:
+  - The hardware capture of the hung frame (v1.2.2) recorded
+    `GPUREG_ATTRIBBUFFERS_FORMAT_LOW = 0x000000d8` — the GPU being told, in its own words,
+    to fetch four bytes from offset 3 of an 8-byte stride.
+  - `source/gfx/sprite.c` uses the same `C3D_DrawElements`, the same shared index buffer and
+    the same offset-into-it draw, and renders correctly on the console in the very frames the
+    chunk draw wedges. Its vertex is 3 floats + 2 floats + 4 unsigned bytes: aligned
+    throughout. That was the control, and it ruled out the draw call itself.
+  - The round-2 draw bisect (v1.2.3, run on hardware) had already eliminated everything else
+    inside the draw: arm 2 (all the CPU work, not one GPU command) survived, so it was not a
+    loop; arm 5 (full GPU state, no draw calls) survived, so it was not the program bind, the
+    attribute *config*, the texture bind, the depth/blend/fog state or any uniform upload;
+    arms 3 and 4 (each pass alone) both hung, so it was nothing unique to either pass.
+
+  A `_Static_assert(offsetof(MeshVertex, u) == 4, ...)` now fails the build if anyone moves
+  the field back. It was tested against the old layout and does fail.
+
+### Changed
+
+- The world vertex shader's relative addressing (`mova a0.x, inpack.zzzz` /
+  `mov r3, faceShade[a0.x]`) is **restored**. v1.2.4 replaced it with a constant index to test
+  it as the cause; that build still froze, so it is cleared by measurement and per-face
+  lighting is correct again. Nothing was ever wrong with those two instructions.
+- Attribute 0 is now declared with four components rather than three, so 4 + 4 accounts for
+  every byte of the 8-byte stride. Previously one byte of each vertex was unaccounted for.
+
 ## [1.2.4] - 2026-08-20
 
 ### The round-2 bisect came back and it narrowed the freeze to one thing
