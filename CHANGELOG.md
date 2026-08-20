@@ -4,6 +4,65 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.2] — 2026-08-20 — diagnostic pre-release
+
+Still not a normal release, and still the same hunt. v1.1.1 asked the console
+six questions and cost six boots to get six answers; v1.1.2 asks the one
+question that is left and answers it on the first boot that freezes.
+
+### What v1.1.1 came back with
+
+`drawprobe.txt` off the real console: arm 0 `HUNG`, arm 1 (no world)
+`SURVIVED 600 frames`, and arms 2, 3 and 4 all `HUNG`. Only the arm that skipped
+the world survived — and it survived while still drawing the highlight cage,
+which matches what was on the screen ("I could see the outline of a block, but
+not the actual world"). So the freeze is inside `chunkRenderDraw()` in
+`source/scene/chunk_render.c`, and nothing else in the frame is implicated.
+
+`hang.txt` from the same session ruled out memory pressure by measurement rather
+than by argument: `linear free 27081216 B` and `vram free 4440064 B` on hardware
+are byte-for-byte what the emulator reports, so nothing is running out.
+
+One correction, because it is in that log file and it is wrong: an `arm 1 HUNG`
+line printed after `arm 1 SURVIVED`. v1.1.1's bookkeeping compared the total
+number of START lines against the total number of SURVIVED lines, so one genuine
+hang left those totals permanently one apart and every later boot invented a
+`HUNG` for an arm that had already survived. Fixed here — it now tracks the last
+arm to start and whether that same arm's own survival line followed.
+
+### Added
+
+- **A draw-stage breadcrumb.** `chunkRenderDraw` now records where it is —
+  entered, culling, binding, opaque pass, transparent pass, done — plus the loop
+  index and mesh slot when it is inside a pass, and the watchdog prints all
+  three into `hang.txt`. The distinction it is built around is `CULL` versus
+  everything after it: `cullFrame` issues no GPU commands at all, so a freeze
+  recorded there is the CPU spinning, and a freeze recorded later is the CPU
+  waiting on a GPU that never finished. From outside those two look identical,
+  which is why no amount of watching from `main.c` could separate them.
+- **A second bisect round**, kept as corroboration rather than as the primary
+  instrument: six arms that cut *inside* `chunkRenderDraw` — everything, the
+  whole call skipped, cull only, opaque only, transparent only, and state setup
+  with no draws.
+- **`BS_DRAW_HANG_TEST`**, the red arm for the breadcrumb. It stalls the main
+  thread deliberately partway through the opaque pass, so the report can be
+  checked for saying the right thing rather than assumed to.
+
+### Verified
+
+Every claim above was run, not reasoned about. In Azahar, with the stall planted
+at opaque-pass loop index 3, `hang.txt` came back `draw stage : opaque pass`,
+`loop index : 3`, `mesh slot : 57`. With the stall planted outside the draw
+instead, the same field read `finished, back in main.c`, `-1`, `-1` — so it
+tracks position rather than being a constant. Four consecutive emulator boots
+produced `arm 0 SURVIVED`, a deliberately killed `arm 1 HUNG`, `arm 2 SURVIVED`
+and `arm 3 SURVIVED` with **no** spurious `arm 2 HUNG`, which is the bookkeeping
+fix going green on the exact case that was red. Two more boots covered arms 4
+and 5, and screenshots confirm each cut is real: arm 2 draws no world at all,
+arm 4 draws no ground.
+
+**The freeze itself is not fixed, and this build does not claim to fix it.**
+
 ## [1.1.1] — 2026-08-20 — diagnostic pre-release
 
 Not a normal release. v1.1.0 froze a real Old 3DS a moment after a world

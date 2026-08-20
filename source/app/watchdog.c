@@ -33,7 +33,7 @@
 #endif
 
 #if BS_DRAW_PROBE
-#define WD_REPORT_MAX 1024
+#define WD_REPORT_MAX 1280
 #else
 #define WD_REPORT_MAX 768
 #endif
@@ -53,6 +53,34 @@ static volatile bool s_worker_busy;
 static volatile s32  s_probe_arm = -1;
 static volatile u32  s_linear_free;
 static volatile u32  s_vram_free;
+
+// Where inside chunkRenderDraw the main thread was last seen. Round 1 of the bisect proved
+// the freeze is inside that one call; this is the same question asked at a finer grain, and
+// it is asked by a breadcrumb rather than by another six-boot bisect because a breadcrumb
+// answers it on the first boot that freezes. Three plain stores per chunk, in a diagnostic
+// build only — nothing here is compiled into a shipped one.
+//
+// s_draw_k is the loop index within a pass and s_draw_slot the mesh slot it was drawing, so
+// a freeze does not just name the pass, it names the chunk. -1 means "not in a loop".
+static volatile s32  s_draw_stage = -1;
+static volatile s32  s_draw_k     = -1;
+static volatile s32  s_draw_slot  = -1;
+
+static const char* const s_draw_stage_name[WD_DRAW_STAGE_COUNT] = {
+	[WD_DRAW_IDLE]        = "not in chunkRenderDraw",
+	[WD_DRAW_ENTER]       = "entered, before the cull",
+	[WD_DRAW_CULL]        = "inside cullFrame (CPU only, no GPU commands)",
+	[WD_DRAW_BIND]        = "pipelineBind + projection uniform",
+	[WD_DRAW_OPAQUE]      = "opaque pass",
+	[WD_DRAW_TRANSPARENT] = "transparent pass",
+	[WD_DRAW_DONE]        = "finished, back in main.c",
+};
+
+static const char* drawStageName(s32 s)
+{
+	if (s < 0 || s >= WD_DRAW_STAGE_COUNT || !s_draw_stage_name[s]) return "(none recorded)";
+	return s_draw_stage_name[s];
+}
 #endif
 
 static volatile bool s_quit;
@@ -156,8 +184,16 @@ static void reportBuild(u32 phase, u32 frames, u32 stuck_ms)
 		"\n"
 		"probe arm    : %ld\n"
 		"linear free  : %lu B\n"
-		"vram free    : %lu B\n",
-		(long)s_probe_arm, (unsigned long)s_linear_free, (unsigned long)s_vram_free);
+		"vram free    : %lu B\n"
+		"draw stage   : %s\n"
+		"  loop index : %ld\n"
+		"  mesh slot  : %ld\n"
+		"\n"
+		"'draw stage' is how far into scene/chunk_render.c's chunkRenderDraw the main thread\n"
+		"got. CULL means it never issued a GPU command at all, so the console is stuck on the\n"
+		"CPU. Any later stage means it is stuck waiting on the GPU.\n",
+		(long)s_probe_arm, (unsigned long)s_linear_free, (unsigned long)s_vram_free,
+		drawStageName(s_draw_stage), (long)s_draw_k, (long)s_draw_slot);
 	if (m > 0) {
 		const size_t room = sizeof(s_report) - len - 1;
 		len += ((size_t)m < room) ? (size_t)m : room;
@@ -267,6 +303,13 @@ void watchdogProbeState(int arm, uint32_t linear_free, uint32_t vram_free)
 	s_probe_arm   = arm;
 	s_linear_free = linear_free;
 	s_vram_free   = vram_free;
+}
+
+void watchdogDrawStage(int stage, int k, int slot)
+{
+	s_draw_stage = stage;
+	s_draw_k     = k;
+	s_draw_slot  = slot;
 }
 #endif
 

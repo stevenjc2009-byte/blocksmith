@@ -1226,37 +1226,58 @@ static void bootTimingWrite(void)
 static int  s_probe_arm;
 static bool s_probe_written;
 
-// What each arm takes out of the frame. Everything is drawn when the bit is clear.
-#define PROBE_SKIP_WORLD  (s_probe_arm == 1 || s_probe_arm == 5)
-#define PROBE_SKIP_HIGH   (s_probe_arm == 2 || s_probe_arm == 5)
-#define PROBE_SKIP_PLAYER (s_probe_arm == 3 || s_probe_arm == 5)
-#define PROBE_SKIP_UI     (s_probe_arm == 4 || s_probe_arm == 5)
-
+// Round 2's arms. Round 1 removed whole draws from the frame and came back off real hardware
+// with exactly one survivor — arm 1, "no world" — so chunkRenderDraw() is the call that hangs
+// the console and nothing else in the frame does. These cut inside it, and the cuts themselves
+// live in scene/chunk_render.c (see app/drawprobe.h).
+//
+// Arm 2 is the one the whole round turns on. chunkRenderDraw does CPU work (the cull, the sort,
+// the sight walk, the horizon test) *and* emits GPU commands, and from outside the two failures
+// are identical: the main thread stops beating either way. Arm 2 runs every bit of the CPU work
+// and emits not one GPU command. If it hangs, the fault is a loop that never ends. If it
+// survives, the fault is something handed to the GPU.
 static const char* probeArmName(int arm)
 {
 	switch (arm) {
 	case 0:  return "everything (control: MUST hang)";
-	case 1:  return "no world";
-	case 2:  return "no highlight cage";
-	case 3:  return "no player models or tags";
-	case 4:  return "no bottom screen UI";
-	default: return "nothing drawn (control: MUST survive)";
+	case 1:  return "world draw skipped entirely (control: MUST survive)";
+	case 2:  return "cull only - all the CPU work, not one GPU command";
+	case 3:  return "opaque pass only - no transparent pass";
+	case 4:  return "transparent pass only - no opaque pass";
+	default: return "GPU state set up, but no draw calls at all";
 	}
 }
 
-// Counts the arms already started and the arms that reported surviving. Reading the file back
-// rather than keeping a counter somewhere is what makes a hang self-recording: the process that
-// hangs never gets to write anything, so its silence has to be what the next boot reads.
+int bsProbeArm(void) { return s_probe_arm; }
+
+// Works out which arm ran last and whether it came back, by reading the file it wrote. Reading
+// it back rather than keeping a counter is what makes a hang self-recording: the boot that
+// hangs never gets to write anything, so its silence is what the next boot has to notice.
+//
+// It tracks the LAST arm to start and whether a survival line followed it, rather than counting
+// STARTs against SURVIVEDs. The counting version shipped in the first probe build and was
+// wrong: one genuine hang left the two totals permanently one apart, so every boot after it
+// wrote a HUNG line for an arm that had plainly survived. steve's round-1 log carries three
+// such false lines. The only trustworthy question is per-arm — did THIS arm report back — so
+// that is the question now asked.
 static void probeBegin(void)
 {
-	int started = 0, survived = 0;
+	int  last_start = -1;
+	bool came_back  = true;
 	char line[128];
 
 	FILE* f = fopen(PROBE_FILE, "r");
 	if (f) {
 		while (fgets(line, sizeof line, f)) {
-			if (strstr(line, "START"))    started++;
-			if (strstr(line, "SURVIVED")) survived++;
+			int a = -1;
+			if (sscanf(line, "arm %d", &a) != 1 || a < 0) continue;
+
+			if (strstr(line, "START")) {
+				last_start = a;
+				came_back  = false;      // until its own SURVIVED line says otherwise
+			} else if (strstr(line, "SURVIVED") && a == last_start) {
+				came_back = true;
+			}
 		}
 		fclose(f);
 	}
@@ -1264,13 +1285,11 @@ static void probeBegin(void)
 	f = fopen(PROBE_FILE, "a");
 	if (!f) return;
 
-	// A started arm with no survival line is one that never came back. Written now, on the
-	// boot after it, because that is the first moment anything is able to write it down.
-	if (started > survived)
+	if (last_start >= 0 && !came_back)
 		fprintf(f, "arm %d HUNG - no survival line, the console froze on this arm\n",
-		        started - 1);
+		        last_start);
 
-	s_probe_arm = started;
+	s_probe_arm = last_start + 1;
 	if (s_probe_arm >= PROBE_ARMS) {
 		// Every arm has had its turn. Park on the one that draws nothing so the console is
 		// still usable rather than freezing again on a run that can no longer learn anything.
@@ -1314,10 +1333,6 @@ static void probeFrame(void)
 	s_probe_written = true;
 }
 #else
-#define PROBE_SKIP_WORLD  false
-#define PROBE_SKIP_HIGH   false
-#define PROBE_SKIP_PLAYER false
-#define PROBE_SKIP_UI     false
 #define probeBegin()      ((void)0)
 #define probeFrame()      ((void)0)
 #endif
@@ -1467,21 +1482,18 @@ static void drawEye(C3D_RenderTarget* target, const C3D_Mtx* view, const RayHit*
 	chunkRenderSetEye(iod);
 	C3D_RenderTargetClear(target, C3D_CLEAR_ALL, CLEAR_COLOR, 0);
 	C3D_FrameDrawOn(target);
-	// The clear above stays in every arm on purpose: it is the one piece of GPU work that
-	// cannot be the suspect (the loading screen has already done it several hundred times on
-	// the same hardware), and leaving it in keeps every arm a frame that still targets and
-	// presents a screen rather than an empty submission with nothing to compare.
-	if (!PROBE_SKIP_WORLD) {
-		chunkRenderDraw(view);
-		for (int i = 0; i < BS_GPU_STRESS; i++) chunkRenderDraw(view);
-	}
+	// Round 1's cuts were here. They are gone because round 1 is answered: on real hardware
+	// every arm froze except the one that skipped this call, so the bisect has moved inside
+	// chunkRenderDraw and this file draws the whole frame again in every arm.
+	chunkRenderDraw(view);
+	for (int i = 0; i < BS_GPU_STRESS; i++) chunkRenderDraw(view);
 
 	// After the world, because it re-binds the GPU for its own vertex format and does not
 	// put it back — chunkRenderDraw re-establishes everything it needs at the top of its
 	// next call instead. See pipelineBind in chunk_render.c. highlightDraw itself checks
 	// hit->hit (see highlight.h), so there is no guard here to keep in sync with it.
 	// It reads chunkRenderProjection(), so it gets this eye's matrix for free.
-	if (!PROBE_SKIP_HIGH) highlightDraw(view, hit);
+	highlightDraw(view, hit);
 
 	// The other people in the session, from the pose table net/networld.c fills. Both calls
 	// are unconditional: each returns immediately when nobody else has sent a pose, which
@@ -1495,10 +1507,8 @@ static void drawEye(C3D_RenderTarget* target, const C3D_Mtx* view, const RayHit*
 	// 400x240 is the top screen, which is the only target drawEye is ever given. Passing the
 	// wrong size here would not fail — it would scale every tag's position, which is the kind
 	// of wrong that reads as a projection bug.
-	if (!PROBE_SKIP_PLAYER) {
-		playerModelDraw(view);
-		playerModelDrawTags(view, 400.0f, 240.0f);
-	}
+	playerModelDraw(view);
+	playerModelDrawTags(view, 400.0f, 240.0f);
 }
 
 // The player's items. Outside the BS_BOTTOM_UI guard on purpose: a build with no bottom
@@ -2630,9 +2640,8 @@ session_start:
 			// own render state and does not restore it (see gfx/sprite.h), while
 			// chunkRenderDraw re-establishes everything it needs at the top of its next
 			// call. Drawing the UI first would mean paying to put the world's state back.
-			if (!PROBE_SKIP_UI)
-				drawBottomUi(ui_ok, highlight_ok ? status : "HIGHLIGHT INIT FAILED",
-				             netline, &touch);
+			drawBottomUi(ui_ok, highlight_ok ? status : "HIGHLIGHT INIT FAILED",
+			             netline, &touch);
 #endif
 		metricsSubmitBegin();
 		C3D_FrameEnd(0);

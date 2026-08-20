@@ -94,6 +94,28 @@ void watchdogCounters(int columns, int meshes, int queued, bool worker_busy);
 // frame and hands them over, because the monitor thread must never call linearSpaceFree()
 // itself — see the comment on the variables in watchdog.c.
 void watchdogProbeState(int arm, uint32_t linear_free, uint32_t vram_free);
+
+// How far into scene/chunk_render.c's chunkRenderDraw the main thread got. Round 1 of the
+// bisect proved the freeze is inside that call; this says whereabouts on the first boot that
+// freezes, instead of costing another six-boot round to find out.
+//
+// The distinction the report is built around is CULL versus everything after it: cullFrame
+// issues no GPU commands at all, so a freeze recorded there is the CPU spinning, and a freeze
+// recorded anywhere later is the CPU waiting on a GPU that never finished.
+typedef enum {
+	WD_DRAW_IDLE = 0,    // not inside chunkRenderDraw
+	WD_DRAW_ENTER,       // entered, before the cull
+	WD_DRAW_CULL,        // inside cullFrame — CPU only
+	WD_DRAW_BIND,        // pipelineBind and the projection uniform
+	WD_DRAW_OPAQUE,      // the opaque pass; k and slot say which chunk
+	WD_DRAW_TRANSPARENT, // the transparent pass; k and slot say which chunk
+	WD_DRAW_DONE,        // returned to main.c
+	WD_DRAW_STAGE_COUNT
+} WdDrawStage;
+
+// k is the loop index within a pass and slot the mesh slot being drawn; pass -1 for both when
+// the stage is not inside a loop. Three stores, no lock, same contract as watchdogPhase.
+void watchdogDrawStage(int stage, int k, int slot);
 #endif
 
 // True once a report has been written this session. Only the deliberate-hang self-check reads

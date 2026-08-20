@@ -3,6 +3,8 @@
 #include <math.h>
 #include <string.h>
 
+#include "app/drawprobe.h"
+#include "app/watchdog.h"
 #include "debug/metrics.h"
 #include "gfx/atlas.h"
 #include "world/dirtyq.h"
@@ -25,6 +27,13 @@
 // between the two builds is chunkRenderSortMoved(), not the pixels.
 #ifndef BS_SORT
 #define BS_SORT 1
+#endif
+
+// The deliberate stall that proves the draw-stage breadcrumb can report a freeze inside a
+// pass. Defined here rather than only at the use site so the default is visible next to the
+// other build switches. See the block it guards, in the opaque loop of chunkRenderDraw.
+#ifndef BS_DRAW_HANG_TEST
+#define BS_DRAW_HANG_TEST 0
 #endif
 
 // Step 7.3, cave culling. -DBS_CAVECULL=0 skips the walk entirely and draws whatever the
@@ -1302,6 +1311,31 @@ static void cullFrame(const C3D_Mtx* view)
 
 void chunkRenderDraw(const C3D_Mtx* view)
 {
+#if BS_DRAW_PROBE
+	// Round 2 of the draw bisect. Round 1 (in main.c) narrowed the hardware freeze to this one
+	// call: on a real console every arm froze except the one that skipped chunkRenderDraw
+	// entirely. The arms below split what is inside it, and the first question they answer is
+	// the one that cannot be answered from outside — whether the console is stuck in the GPU
+	// or stuck in the CPU, which look identical from the watchdog's seat because either way
+	// the main thread stops beating.
+	//
+	// arm 1 skips the whole call, which is the surviving control repeated: if this one ever
+	// freezes, the bisect itself is wrong and nothing below it means anything.
+	// arm 2 runs cullFrame and then leaves without issuing a single GPU command. It is the
+	// deciding arm. Freezing here means the CPU is spinning inside the cull (the horizon
+	// wrap loops at hznDelta are the standing suspect — they never terminate on a NaN or an
+	// infinity). Surviving here means the cull is innocent and the hang is in the draw.
+	const int probe_arm = bsProbeArm();
+	if (probe_arm == 1) return;
+
+	// The breadcrumb trail. This is the part that does not need a whole round of boots: the
+	// watchdog thread prints the last stage reached into hang.txt, so the very first freeze
+	// says whether the main thread died on the CPU (CULL) or waiting on the GPU (anything
+	// after it), and in a pass, which chunk it was on. The arms above stay as corroboration.
+	watchdogDrawStage(WD_DRAW_ENTER, -1, -1);
+	watchdogDrawStage(WD_DRAW_CULL, -1, -1);
+#endif
+
 	// Step 9.3. Cull, unless this is the second eye of a frame already culled. The key is the
 	// view matrix itself: both eyes are handed the same one, so a byte compare answers the
 	// question exactly and without the caller having to remember to tick anything. Anything
@@ -1315,14 +1349,46 @@ void chunkRenderDraw(const C3D_Mtx* view)
 
 	const int n = s_vis_n;
 
+#if BS_DRAW_PROBE
+	// arm 2: all of the CPU work above, not one GPU command below. Returning before
+	// pipelineBind is deliberate — binding the shader and writing a uniform are themselves
+	// GPU commands, so leaving them in would make this arm no longer a clean CPU-only cut.
+	if (probe_arm == 2) return;
+	watchdogDrawStage(WD_DRAW_BIND, -1, -1);
+#endif
+
 	pipelineBind();   // see pipelineBind: the highlight leaves the GPU set up for itself
 	C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_uloc_projection, &s_projection);
 
 	// Step 7.5, pass 1: the opaque run of every visible chunk, nearest first, which is the
 	// order step 7.2 just put them in — minus, since step 9.2, the face directions pointing
 	// away from the camera.
+#if BS_DRAW_PROBE
+	// arms 4 and 5 have no opaque pass. arm 4 keeps the transparent one, so it still draws;
+	// arm 5 keeps the state setup above and nothing else.
+	if (probe_arm != 4 && probe_arm != 5)
+#endif
 	for (int k = 0; k < n; k++) {
 		const MeshSlot* s = &s_slots[s_vis_list[k]];
+#if BS_DRAW_PROBE
+		watchdogDrawStage(WD_DRAW_OPAQUE, k, s_vis_list[k]);
+#if BS_DRAW_HANG_TEST
+		// The red arm for the breadcrumb above, in the same spirit as BS_HANG_TEST in main.c:
+		// stop the main thread dead in the middle of the opaque pass and see whether hang.txt
+		// names the stage and the chunk. A report that says "opaque pass, loop index 3" when
+		// the stall was planted at index 3 is a breadcrumb that works; a report that still says
+		// DONE is a breadcrumb that was never wired up, and the freeze data would have been
+		// meaningless. Never in a release build:
+		//   make EXTRA_CFLAGS="-DBS_DRAW_PROBE=1 -DBS_DRAW_HANG_TEST=4"
+		// stalls at the (BS_DRAW_HANG_TEST-1)th chunk of the opaque pass, once the world has
+		// had 200 frames to settle so the stall lands in the game loop and not the loader.
+		{
+			static int hang_frames = 0;
+			if (k == BS_DRAW_HANG_TEST - 1 && ++hang_frames >= 200)
+				for (;;) svcSleepThread(1000000000ULL);
+		}
+#endif
+#endif
 		drawOpaque(view, s);
 	}
 
@@ -1340,11 +1406,21 @@ void chunkRenderDraw(const C3D_Mtx* view)
 	s_alpha_tris = 0;
 	s_alpha_draws = 0;
 	C3D_AlphaTest(true, GPU_GREATER, ALPHA_CUTOFF);
+#if BS_DRAW_PROBE
+	// arms 3 and 5 have no transparent pass. Only the loop is cut, not the alpha-test pair
+	// around it: those two calls are render state rather than draws, and leaving them in
+	// every arm keeps the GPU in the same configuration on the way out no matter which arm
+	// ran, so a difference between arms can only be the drawing itself.
+	if (probe_arm != 3 && probe_arm != 5)
+#endif
 	for (int k = n - 1; k >= 0; k--) {
 		const MeshSlot* s = &s_slots[s_vis_list[k]];
 		const uint32_t  count = s->index_count - s->opaque_index_count;
 		if (!count) continue;
 
+#if BS_DRAW_PROBE
+		watchdogDrawStage(WD_DRAW_TRANSPARENT, k, s_vis_list[k]);
+#endif
 		drawRun(view, s, s->opaque_index_count, count);
 		s_alpha_tris += count / 3;
 		s_alpha_draws++;
@@ -1353,6 +1429,10 @@ void chunkRenderDraw(const C3D_Mtx* view)
 	// Left off for whatever draws next. This is global GPU state, not per-program state,
 	// and the highlight pass in scene/highlight.c never sets it.
 	C3D_AlphaTest(false, GPU_ALWAYS, 0);
+
+#if BS_DRAW_PROBE
+	watchdogDrawStage(WD_DRAW_DONE, -1, -1);
+#endif
 }
 
 int chunkRenderMeshes(void)
