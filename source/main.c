@@ -43,6 +43,7 @@
 #include "scene/loading.h"
 #include "scene/loading_draw.h"
 #include "scene/player.h"
+#include "scene/pausemenu.h"
 #include "scene/title.h"
 #include "scene/ui.h"
 #include "world/budget.h"
@@ -2618,14 +2619,39 @@ session_start:
 		};
 #endif
 
-		// Step 7.6. SELECT toggles 3D. gfxSet3D is what actually splits the top screen into
-		// two framebuffers, so it moves with the flag rather than being set once: left on
-		// while only one eye is being drawn, the hardware would show the right eye's stale
-		// buffer to the right eye.
-		if (down & KEY_SELECT) {
+		// SELECT opens the pause menu. It used to toggle 3D directly (step 7.6); that toggle
+		// moved onto the menu's options page, which is where a setting belongs and where it
+		// now sits beside the render distance and the memory readout. gfxSet3D is still
+		// called from exactly one place — just below, off the menu's answer instead of off
+		// the button — for the reason step 7.6 gave: leaving 3D on while only one eye is
+		// drawn shows the right eye a stale buffer.
+		if (down & KEY_SELECT) pauseMenuToggle();
+
+		int  dist_step     = 0;
+		bool stereo_toggle = false;
+		const PauseAction pause_action = pauseMenuInput(down, &dist_step, &stereo_toggle);
+		if (stereo_toggle) {
 			s_stereo = !s_stereo;
 			gfxSet3D(s_stereo);
 		}
+		if (dist_step != 0) {
+			// genSetRadius clamps and re-meshes the ring live; opts.render_dist is the value
+			// that survives a reboot, so both have to move, and reading s_mesh_radius back
+			// after the call rather than trusting the requested value is what makes the saved
+			// setting the clamped one. Saved immediately rather than on menu exit — the
+			// player can leave this menu by quitting the world, and a setting they just
+			// watched take effect must not then be forgotten.
+			genSetRadius(s_mesh_radius + dist_step);
+			opts.render_dist = s_mesh_radius;
+			optionsSave(&opts, TITLE_OPTIONS_PATH);
+		}
+		if (pause_action == PAUSE_ACTION_QUIT) break;
+
+		// A paused world does not tick. Everything from here to the draw is gated on this:
+		// the player does not move, terrain does not stream in, and the memory figures the
+		// options page is showing hold still while they are being read. Networking is the
+		// deliberate exception — see the netUpdate() block below.
+		const bool paused = pauseMenuOpen();
 
 		// Every scene, every frame, whether or not Multiplayer is even open — see netUpdate()
 		// and networldUpdate()'s own contracts for why neither ever blocks a frame. Pumped
@@ -2668,8 +2694,8 @@ session_start:
 		// wired up rather than left for 8.4 because a setting that cannot be changed cannot be
 		// verified: the two distances have to be reachable in one run for the fog and the ring
 		// to be judged against each other.
-		if (down & KEY_L) genSetRadius(s_mesh_radius - 1);
-		if (down & KEY_R) genSetRadius(s_mesh_radius + 1);
+		if (!paused && (down & KEY_L)) genSetRadius(s_mesh_radius - 1);
+		if (!paused && (down & KEY_R)) genSetRadius(s_mesh_radius + 1);
 #endif
 
 #if BS_WORLD_GEN
@@ -2681,7 +2707,7 @@ session_start:
 		// player, and it is a memcpy, not a mesh: 15.3 ms over 125 columns, 0.12 ms each.
 		watchdogPhase(WD_PHASE_INSTALL);
 		const u64 t_install = svcGetSystemTick();
-		genInstallOne();
+		if (!paused) genInstallOne();
 		const float install_ms =
 			(float)((double)(svcGetSystemTick() - t_install) / CPU_TICKS_PER_MSEC);
 #endif
@@ -2689,9 +2715,9 @@ session_start:
 
 		C3D_Mtx view;
 #if BS_FLY
-		cameraUpdate(&player.cam, metricsFrameMs());
+		if (!paused) cameraUpdate(&player.cam, metricsFrameMs());
 #else
-		playerUpdate(&player, &s_world, metricsFrameMs());
+		if (!paused) playerUpdate(&player, &s_world, metricsFrameMs());
 #endif
 #if BS_WALK_STRESS
 		// Clear the startup frame's stall out of `worst` first, for the same reason
@@ -3019,8 +3045,31 @@ session_start:
 			// chunkRenderDraw re-establishes everything it needs at the top of its next
 			// call. Drawing the UI first would mean paying to put the world's state back.
 			drawStage(WD_DRAW_BOTTOM, -1);
+			// The menu covers this screen, so the panel under it must not still be taking
+			// taps: a finger landing on the QUIT row would otherwise also swap the hotbar
+			// slot it happens to sit over. Feeding a zeroed UiInput is enough — ui.c edge-
+			// detects against its own touch_prev, so releasing into a closed menu does not
+			// then register as a fresh press.
+			const UiInput blank = {0};
 			drawBottomUi(ui_ok, highlight_ok ? status : "HIGHLIGHT INIT FAILED",
-			             netline, &touch);
+			             netline, paused ? &blank : &touch);
+
+			// After the UI and on the same target, so it lands on top of it. See
+			// scene/pausemenu.c on why this opens its own sprite pass rather than joining
+			// the one uiUpdateDraw has already closed.
+			if (paused) {
+				const PauseStats pstats = {
+					.linear_free  = (uint32_t)linearSpaceFree(),
+					.vram_free    = (uint32_t)vramSpaceFree(),
+					.world_used   = (uint32_t)worldBytes(&s_world),
+					.world_budget = (uint32_t)budgetCap(),
+					.render_dist  = s_mesh_radius,
+					.dist_min     = RENDER_DIST_MIN,
+					.dist_max     = RENDER_DIST_MAX,
+					.stereo       = s_stereo,
+				};
+				pauseMenuDraw(&pstats);
+			}
 #endif
 #if BS_CMDBUF_PROBE
 		// Sampled here and not after C3D_FrameEnd, because FrameEnd is what rewinds the
