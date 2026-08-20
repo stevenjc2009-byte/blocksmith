@@ -36,6 +36,7 @@
 #include "net/networld.h"
 #include "scene/camera.h"
 #include "scene/chunk_render.h"
+#include "scene/crosshair.h"
 #include "scene/highlight.h"
 #include "scene/playermodel.h"
 #include "scene/interact.h"
@@ -1630,6 +1631,12 @@ static void drawEye(C3D_RenderTarget* target, const C3D_Mtx* view, const RayHit*
 	playerModelDraw(view);
 	drawStage(WD_DRAW_TAGS, eye);
 	playerModelDrawTags(view, 400.0f, 240.0f);
+
+	// The reticle, last of all so it sits over the name tags rather than under them, and
+	// inside drawEye rather than outside it so that each eye gets one at the same screen
+	// position — which is what puts it at screen depth instead of floating in front of or
+	// behind the block being aimed at. It opens and closes its own sprite batch.
+	crosshairDraw(400.0f, 240.0f);
 }
 
 // The player's items. Outside the BS_BOTTOM_UI guard on purpose: a build with no bottom
@@ -2094,6 +2101,21 @@ static void gpuWaitPrevFrame(void)
 #endif
 }
 
+// net/networld.h's edit hook. A remote player's edit has just been written into s_world, and
+// the cached mesh of the chunk holding that block — plus any neighbour whose faces the change
+// exposed or hid — now describes a world that no longer exists. This is the exact call
+// scene/interact.c makes after a *local* break or place; before this existed, only local edits
+// ever reached it, so another player's work was fully real to collision and to the block
+// raycast while being invisible on screen until the chunk happened to stream out and back in.
+//
+// Queue-only, like every other chunkRenderTouch() caller: the remesh itself is charged to the
+// frame budget in the main loop, so a burst of remote edits cannot blow a frame here.
+static void onRemoteEdit(void* userdata, int x, int y, int z)
+{
+	(void)userdata;
+	chunkRenderTouch(&s_world, x, y, z);
+}
+
 int main(void)
 {
 	// Step 8.5, first of everything. It only writes this thread's TLS exception slot — no
@@ -2323,6 +2345,14 @@ session_start:
 	// would only have it generated over. See networldSetWorld()'s own comment.
 	BOOT_BEGIN();
 	networldSetWorld(&s_world);
+
+	// Paired with the line above, and deliberately re-registered on every pass through
+	// session_start rather than once at boot: netDisconnect() (net/bsnet.c) calls
+	// networldInit(), which clears the hook along with everything else, so a hook set once at
+	// boot would be live for the first server session and silently gone for every one after it
+	// — the invisible-edits bug back again, but only on a rejoin, which is the worst possible
+	// version of it to have to reproduce. Harmless in single player: nothing ever fires it.
+	networldSetEditHook(onRemoteEdit, NULL);
 	BOOT_END("networldSetWorld");
 
 	// The world. Since step 5.5 the generated one is not built here: the worker is started

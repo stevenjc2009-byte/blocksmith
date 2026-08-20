@@ -766,6 +766,162 @@ static void test_world_info_carries_the_servers_seed(void)
     check(!networldWorldSeed(NULL), "a short WORLD_INFO is dropped, not misparsed");
 }
 
+/* ---------------------------------------------------- the remesh notification ------------- */
+/* Written after the bug it catches was reported from a live two-player session: a remote
+ * player's edits changed the world but nothing on screen changed. Collision reads world
+ * blocks directly, so the reporting player fell into a trench his friend had dug while still
+ * looking at solid ground. Every check below is about the hook that closes that gap — this
+ * module writes the block, and something outside it has to be told which block, or the chunk
+ * mesh describing that block is never rebuilt. */
+
+#define HOOK_LOG_MAX 16
+
+static struct { int x, y, z; } hook_log[HOOK_LOG_MAX];
+static int  hook_count;
+static int  hook_userdata_ok;
+static int  hook_userdata_marker;
+
+static void hookRecord(void *userdata, int x, int y, int z)
+{
+    if (userdata == &hook_userdata_marker) hook_userdata_ok++;
+    if (hook_count < HOOK_LOG_MAX) {
+        hook_log[hook_count].x = x;
+        hook_log[hook_count].y = y;
+        hook_log[hook_count].z = z;
+    }
+    hook_count++;
+}
+
+static void hookReset(void)
+{
+    memset(hook_log, 0, sizeof hook_log);
+    hook_count = 0;
+    hook_userdata_ok = 0;
+}
+
+static void test_edit_hook_fires_for_an_applied_edit(void)
+{
+    puts("an applied remote edit notifies the hook with its own coordinate");
+
+    World w;
+    worldInit(&w);
+    networldInit();
+    networldSetWorld(&w);
+    hookReset();
+    networldSetEditHook(hookRecord, &hook_userdata_marker);
+
+    worldColumnCreate(&w, 0, 0);   /* column (0,0): x,z in 0..15 */
+
+    uint8_t msg[BS_BLOCK_EDIT_BYTES];
+    buildBlockEdit(msg, 5, 10, 7, BLOCK_STONE);
+    networldApplyPayload(msg, sizeof msg);
+
+    check(worldGet(&w, 5, 10, 7) == BLOCK_STONE, "the block landed in the world");
+    check(hook_count == 1, "the hook fired exactly once");
+    check(hook_log[0].x == 5 && hook_log[0].y == 10 && hook_log[0].z == 7,
+          "it was handed the edited block's own coordinate, not the chunk's");
+    check(hook_userdata_ok == 1, "userdata was passed through unchanged");
+
+    networldSetEditHook(NULL, NULL);
+}
+
+static void test_edit_hook_silent_while_the_edit_is_only_queued(void)
+{
+    puts("a queued remote edit does not notify until it actually reaches the world");
+
+    World w;
+    worldInit(&w);
+    networldInit();
+    networldSetWorld(&w);
+    hookReset();
+    networldSetEditHook(hookRecord, &hook_userdata_marker);
+
+    /* Column (2,0) never created: the edit is parked in net/blockdiff.h. Nothing has changed
+     * in the world, so notifying here would dirty a chunk for no reason — and worse, would
+     * teach a caller that a notification means the block is readable, which it is not yet. */
+    uint8_t msg[BS_BLOCK_EDIT_BYTES];
+    buildBlockEdit(msg, 40, 10, 5, BLOCK_STONE);
+    networldApplyPayload(msg, sizeof msg);
+
+    check(networldPendingCount() == 1, "the edit is queued, as before");
+    check(hook_count == 0, "no notification for a block that is not in the world yet");
+
+    /* ...and it does fire when the column arrives and the diff is finally written. */
+    worldColumnCreate(&w, 2, 0);
+    networldOnColumnLoad(&w, 2, 0);
+
+    check(worldGet(&w, 40, 10, 5) == BLOCK_STONE, "the drained diff landed");
+    check(hook_count == 1, "the drain notified once, at the moment the block became real");
+    check(hook_log[0].x == 40 && hook_log[0].y == 10 && hook_log[0].z == 5,
+          "the drained diff's coordinate came through intact");
+
+    networldSetEditHook(NULL, NULL);
+}
+
+static void test_edit_hook_fires_per_entry_of_a_sync_batch(void)
+{
+    puts("a WORLD_SYNC batch notifies once per entry it applies");
+
+    World w;
+    worldInit(&w);
+    networldInit();
+    networldSetWorld(&w);
+    hookReset();
+    networldSetEditHook(hookRecord, &hook_userdata_marker);
+
+    worldColumnCreate(&w, 0, 0);
+
+    /* Three entries, all inside the one loaded column, so all three apply immediately. */
+    const int count = 3;
+    uint8_t msg[BS_APP_HDR_BYTES + 2 + 3 * BS_SYNC_ENTRY_BYTES];
+    msg[0] = BS_APP_WORLD_SYNC;
+    bs_put_u16(msg + 1, (uint16_t)count);
+    uint8_t *p = msg + BS_APP_HDR_BYTES + 2;
+    for (int i = 0; i < count; i++) {
+        bs_put_i32(p,     1 + i);
+        bs_put_i32(p + 4, 30);
+        bs_put_i32(p + 8, 2);
+        p[12] = BLOCK_STONE;
+        p += BS_SYNC_ENTRY_BYTES;
+    }
+    networldApplyPayload(msg, sizeof msg);
+
+    check(hook_count == 3, "one notification per applied entry, not one per packet");
+    check(hook_log[2].x == 3 && hook_log[2].y == 30 && hook_log[2].z == 2,
+          "the last entry's coordinate came through");
+
+    networldSetEditHook(NULL, NULL);
+}
+
+static void test_edit_hook_is_cleared_by_init_and_optional(void)
+{
+    puts("the hook is optional, and networldInit() clears it");
+
+    World w;
+    worldInit(&w);
+    networldInit();
+    networldSetWorld(&w);
+    worldColumnCreate(&w, 0, 0);
+    hookReset();
+
+    /* No hook registered at all: applying an edit must not crash on a NULL function pointer.
+     * This is the single-player path — main.c has no reason to register one there. */
+    uint8_t msg[BS_BLOCK_EDIT_BYTES];
+    buildBlockEdit(msg, 1, 12, 1, BLOCK_STONE);
+    networldApplyPayload(msg, sizeof msg);
+    check(worldGet(&w, 1, 12, 1) == BLOCK_STONE, "the edit still applies with no hook set");
+    check(hook_count == 0, "and nothing was notified");
+
+    /* Registered, then cleared by a re-init: leaving a session and joining another must not
+     * leave a hook pointing at the previous session's state. */
+    networldSetEditHook(hookRecord, &hook_userdata_marker);
+    networldInit();
+    networldSetWorld(&w);
+    buildBlockEdit(msg, 2, 12, 1, BLOCK_STONE);
+    networldApplyPayload(msg, sizeof msg);
+    check(hook_count == 0, "networldInit() cleared the hook");
+}
+
 /* ------------------------------------------------------------------------- main */
 
 int main(void)
@@ -796,6 +952,10 @@ int main(void)
     test_edits_before_a_world_exists_are_kept();
     test_setworld_keeps_diffs_until_terrain_exists();
     test_world_info_carries_the_servers_seed();
+    test_edit_hook_fires_for_an_applied_edit();
+    test_edit_hook_silent_while_the_edit_is_only_queued();
+    test_edit_hook_fires_per_entry_of_a_sync_batch();
+    test_edit_hook_is_cleared_by_init_and_optional();
 
     printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;

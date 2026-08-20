@@ -63,6 +63,35 @@ void networldUpdate(void);
 // error.
 void networldOnColumnLoad(World* w, int cx, int cz);
 
+// ---- remesh notification -----------------------------------------------------------------
+//
+// Writing a block into the World is only half of applying a remote edit. Nothing on screen is
+// read from the World directly: the terrain the player sees is a set of cached chunk meshes
+// (scene/chunk_render.h), each built once and reused until something marks it dirty. A local
+// break or place marks its own chunk — scene/interact.c calls chunkRenderTouch() right after
+// worldSet(). A remote edit had no equivalent, so from the local player's point of view
+// another player's edits did not exist visually while being fully real physically: collision
+// and the block raycast both read World blocks, so the block outline snapped to a block that
+// was not drawn, and a trench someone else dug was invisible right up until you fell into it.
+// Reported from a live two-player session; the world eventually caught up only because
+// streaming a column out and back in rebuilds its meshes from scratch.
+//
+// The fix cannot be a call to chunkRenderTouch() from this file. scene/ is 3DS-only — it pulls
+// in citro3d — and net/networld.c is compiled on the host by net/networld_test.c, which is
+// what makes any of this testable at all. So this module reports *which block changed* and the
+// owner of the renderer decides what that means.
+//
+// Called on the thread that called networldUpdate()/networldOnColumnLoad(), from inside that
+// call, once per edit, immediately after the block reaches the World — so the block is already
+// readable with worldGet() by the time the hook runs. Edits still parked in net/blockdiff.h
+// do not notify; they notify when they drain, which is the first moment there is anything to
+// redraw. Optional: with no hook set (single player) nothing is called.
+typedef void (*NetworldEditFn)(void* userdata, int x, int y, int z);
+
+// Registers (or with fn == NULL, clears) the hook above. networldInit() clears it too, so a
+// hook never survives from one session into the next.
+void networldSetEditHook(NetworldEditFn fn, void* userdata);
+
 // Encodes and sends one local edit to the server. Fire-and-forget: the caller's own worldSet()
 // already applied it locally, so this never blocks on or waits for a server round trip. False
 // if there is no session or the transport refused the send — both the ordinary "the packet

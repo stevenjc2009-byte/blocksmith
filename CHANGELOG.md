@@ -4,6 +4,45 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.6] - 2026-08-20
+
+### Fixed
+
+- **Another player's block edits are now visible.** In a server session, breaking or
+  placing a block changed the world for everyone but only changed the *picture* for
+  the player who did it. From anyone else's screen the edit was invisible: the terrain
+  kept drawing as it was before. It was not, however, imaginary — the block outline
+  snapped onto the edited block, and a player could walk into and fall down a trench
+  someone else had dug while still looking at solid, unbroken ground.
+
+  Nothing on screen is read from the world directly. The terrain is a set of cached
+  chunk meshes, each built once and rebuilt only when something marks it dirty. A local
+  break or place marks its own chunk immediately (`scene/interact.c`), but a remote edit
+  wrote the block and marked nothing, so the stale mesh survived until the chunk happened
+  to stream out of the ring and back in — which rebuilds it from scratch and is why the
+  world eventually, unpredictably, caught up. Collision and the block raycast both read
+  world blocks directly rather than the mesh, which is exactly why physics and the
+  outline stayed correct throughout and made the bug look like a rendering ghost rather
+  than a missing update.
+
+  `net/networld.c` now reports every remote edit the moment it reaches the world, and
+  `main.c` marks the affected chunk — plus any neighbour whose faces the change exposed —
+  through the same `chunkRenderTouch()` call a local edit has always made.
+
+### Added
+
+- A crosshair. A white reticle with a dark outline at the centre of the top screen,
+  drawn once per eye at identical screen coordinates so it carries no parallax and sits
+  at screen depth rather than floating in front of or behind the block being aimed at.
+  The outline is not decoration: a plain white reticle disappears against snow, sand and
+  the bright top faces of grass, and a plain black one disappears into cave mouths.
+
+### Notes
+
+- The fix is entirely client-side. No protocol change, no new message types, no altered
+  byte layouts — the pinned `proto/bs_proto.h` commit is untouched. **A server running
+  v1.2.5 needs no update to work with this client.**
+
 ## [1.2.5] - 2026-08-20
 
 ### Fixed

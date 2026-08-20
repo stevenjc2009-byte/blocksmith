@@ -19,6 +19,19 @@ static World* s_world;
 // held here instead of being dropped, until networldOnColumnLoad() says that column exists.
 static BlockDiffStore s_pending;
 
+// Who to tell when a remote edit actually lands in the world. See networld.h's own comment for
+// why this is a hook rather than a direct chunkRenderTouch() call.
+static NetworldEditFn s_edit_fn;
+static void*          s_edit_ud;
+
+// The single place an applied edit is announced. Called only after the block is really in the
+// world — never for one that is merely queued, which would tell the renderer to rebuild a mesh
+// that is still correct and, worse, imply a block is readable when it is not.
+static void notifyEdit(int32_t x, int32_t y, int32_t z)
+{
+	if (s_edit_fn) s_edit_fn(s_edit_ud, (int)x, (int)y, (int)z);
+}
+
 // netTransportRecv() (bsnet_transport.h) has no queue-depth contract of its own, so a very
 // busy server — or a hostile one — handing back messages faster than one frame can drain them
 // must not turn networldUpdate() into an unbounded loop on hardware with a 16.71 ms frame
@@ -113,6 +126,7 @@ static void applyOrQueue(int32_t x, int32_t y, int32_t z, uint8_t block)
 	if (worldColumn(s_world, x >> 4, z >> 4) != NULL) {
 		worldSet(s_world, x, y, z, block);
 		s_applied_edits++;
+		notifyEdit(x, y, z);
 	} else {
 		blockdiffRecord(&s_pending, x, y, z, block);
 	}
@@ -262,10 +276,21 @@ void networldSetWorld(World* w)
 	s_world = w;
 }
 
+void networldSetEditHook(NetworldEditFn fn, void* userdata)
+{
+	s_edit_fn = fn;
+	s_edit_ud = userdata;
+}
+
 void networldInit(void)
 {
 	blockdiffInit(&s_pending);
 	networldResetRemotes();
+
+	// Cleared with everything else: a hook left over from a previous session would point at
+	// renderer state that session has already torn down.
+	s_edit_fn = NULL;
+	s_edit_ud = NULL;
 	s_last_pose_send_ms = 0;
 	s_pose_sent_once    = false;
 	s_world_seed        = 0;
@@ -317,6 +342,13 @@ static void applyDrained(void* userdata, int x, int y, int z, BlockId id)
 {
 	World* w = (World*)userdata;
 	worldSet(w, x, y, z, id);
+
+	// Notified here and not when it was recorded: this is the first instant the block is real.
+	// Mostly a no-op in practice — the column this diff belongs to has only just been installed
+	// and its own chunks have no mesh to dirty yet (main.c calls this immediately before
+	// genQueueReadyColumns, which meshes them from the finished blocks) — but a diff on a column
+	// edge changes the faces of an *already meshed* neighbour, and that one does need saying.
+	notifyEdit(x, y, z);
 }
 
 void networldOnColumnLoad(World* w, int cx, int cz)
