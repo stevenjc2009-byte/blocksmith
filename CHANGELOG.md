@@ -32,6 +32,34 @@ All notable changes to Blocksmith. Format loosely follows
 
 ### Changed
 
+- **A server session now asks for the block edits it can actually see.** Joining used to
+  pull one `WORLD_SYNC` carrying every edit anyone had ever made anywhere in the world,
+  and the client held all of them forever. The client now subscribes per column as the
+  ring loads it (`CHUNK_SUB`), receives that column's diffs in 64-edit batches
+  (`CHUNK_DIFFS`), and unsubscribes as the column falls out of the ring (`CHUNK_UNSUB`).
+  What arrives at a join is bounded by render distance instead of by the age of the
+  server. **This is a protocol change and it is not backwards compatible in one
+  direction:** the server must be on v1.3.0 or newer before this client connects, because
+  bsgame kicks any client that sends a message type it does not know and this client sends
+  `CHUNK_SUB` on its very first loaded column. The reverse is safe — a v1.3.0 server that
+  hears no subscription within 500 ms falls back to serving the old full `WORLD_SYNC`, so
+  older clients keep working against it.
+
+- **The server's edit ceiling went from 65,536 to 131,072 blocks**, its hash table doubled
+  with it to 262,144 slots to hold the same ~0.5 load factor and the same short probes.
+  65,536 was under the 100,000-block figure that was asked for; 131,072 is the next power
+  of two above it. Memory on the server, which has it: 131,072 entries plus a 1 MB index.
+
+- **The client's store of edits waiting for their column stopped losing the newest ones.**
+  It held 256 entries and *refused* everything past that rather than evicting, while the
+  server replays its whole diff set to a joining client in one oldest-first burst — so on
+  a well-built world a join dropped whatever had most recently been built. Measured on a
+  300-edit sync against the old cap: `queued 256 of 300, refused 44`. The cap now matches
+  the server's own ceiling exactly, so a join sync cannot overflow it at all. That size
+  was only affordable after the store was hash-chained by column into 4096 buckets: the
+  old design scanned the whole array on every record and drain, which at the new size is
+  about 4.3 billion comparisons to absorb one sync — a hardware freeze, not a slow frame.
+
 - **3D moved from SELECT onto the pause menu's options page.** SELECT was the only button
   that toggled it, and SELECT is now the button that opens the menu. Putting the toggle on
   a settings page is where it belongs, but the honest reason it moved rather than being
