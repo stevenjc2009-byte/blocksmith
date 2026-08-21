@@ -15,9 +15,9 @@ typedef enum { PAGE_MAIN = 0, PAGE_OPTIONS } Page;
 // order on screen and MAIN_ROW_COUNT is what the cursor wraps against.
 enum { ROW_RESUME = 0, ROW_OPTIONS, ROW_QUIT, MAIN_ROW_COUNT };
 
-// Options-page rows. These two are interactive; the memory figures below them are a
+// Options-page rows. The first four are interactive; the memory figures below them are a
 // readout, so the cursor stops at OPT_ROW_COUNT rather than at the end of the list.
-enum { OPT_ROW_DIST = 0, OPT_ROW_3D, OPT_ROW_COUNT };
+enum { OPT_ROW_DIST = 0, OPT_ROW_3D, OPT_ROW_REMAP, OPT_ROW_DEBUG, OPT_ROW_COUNT };
 
 static bool s_open;
 static Page s_page;
@@ -88,6 +88,11 @@ PauseAction pauseMenuInput(uint32_t down, int* out_dist_step, bool* out_stereo_t
 		if (s_cursor == OPT_ROW_3D && out_stereo_toggle &&
 		    (down & (KEY_DLEFT | KEY_DRIGHT | KEY_A)))
 			*out_stereo_toggle = true;
+		// The remap and debug rows are plain A-activations, reported to the caller the same
+		// way RESUME and QUIT are: this module cannot open those screens itself without
+		// owning their state, which is main.c's job.
+		if ((down & KEY_A) && s_cursor == OPT_ROW_REMAP) return PAUSE_ACTION_REMAP;
+		if ((down & KEY_A) && s_cursor == OPT_ROW_DEBUG) return PAUSE_ACTION_DEBUG;
 		// B backs out to the main page. It does NOT close the menu: a player who opened
 		// options to try a render distance is mid-comparison, and dumping them back into
 		// the world would undo the reason they are here.
@@ -193,6 +198,18 @@ void pauseMenuDraw(const PauseStats* st)
 	fontDraw((float)(ROW_X + TEXT_PAD), y, 1, COL_TEXT, "3D");
 	fontDraw((float)(ROW_X + ROW_W - 44), y, 1,
 	         st->stereo ? COL_HEAD : COL_DIM, st->stereo ? "On" : "Off");
+
+	y += (float)ROW_H;
+	if (s_cursor == OPT_ROW_REMAP)
+		spriteRect((float)ROW_X, y - 3.0f, (float)ROW_W, (float)(ROW_H - 2), COL_SEL);
+	fontDraw((float)(ROW_X + TEXT_PAD), y, 1, COL_TEXT, "Controls");
+	fontDraw((float)(ROW_X + ROW_W - 44), y, 1, COL_DIM, ">");
+
+	y += (float)ROW_H;
+	if (s_cursor == OPT_ROW_DEBUG)
+		spriteRect((float)ROW_X, y - 3.0f, (float)ROW_W, (float)(ROW_H - 2), COL_SEL);
+	fontDraw((float)(ROW_X + TEXT_PAD), y, 1, COL_TEXT, "Debug");
+	fontDraw((float)(ROW_X + ROW_W - 44), y, 1, COL_DIM, ">");
 
 	// Memory. Three numbers because they answer three different questions and are drawn
 	// from three different pools — a single "free RAM" figure would be a fiction on this

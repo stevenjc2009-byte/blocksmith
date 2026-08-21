@@ -44,16 +44,11 @@ void optionsDefaults(Options* o)
 {
 	if (!o) return;
 
-	// renderDistDefault() needs to know new-3DS-or-not, which is a console question this
-	// pure-C file cannot ask (see render_dist.h's own file comment: that split lives in
-	// main.c). RENDER_DIST_MIN is the conservative side of that split — the Old 3DS radius
-	// — so a fresh options.ini never claims more mesh-pool budget than every console can
-	// actually give it. The console-side boot code is expected to raise this once, on the
-	// very first run, the same way it already asks APT_CheckNew3DS for render_dist.c.
 	o->render_dist      = RENDER_DIST_MIN;
 	o->slider_3d        = OPTIONS_SLIDER_DEFAULT;
 	o->invert_look      = false;
 	o->look_sensitivity = OPTIONS_SENS_DEFAULT;
+	o->debug_menu       = false;
 
 	for (int i = 0; i < ACTION_COUNT; i++)
 		o->bindings[i] = s_action_defaults[i];
@@ -182,6 +177,7 @@ bool optionsSave(const Options* o, const char* path)
 	n += fprintf(f, "slider_3d=%.9g\n",         (double)o->slider_3d);
 	n += fprintf(f, "invert_look=%d\n",         o->invert_look ? 1 : 0);
 	n += fprintf(f, "look_sensitivity=%.9g\n",  (double)o->look_sensitivity);
+	n += fprintf(f, "debug_menu=%d\n",          o->debug_menu ? 1 : 0);
 	for (int i = 0; i < ACTION_COUNT; i++)
 		// PRIX32 rather than a plain %08X: uint32_t is `unsigned int` on the host and
 		// `long unsigned int` on devkitARM, so either fixed conversion is wrong on one of
@@ -295,11 +291,18 @@ bool optionsLoad(Options* o, const char* path, int* bad_keys_out)
 				o->invert_look = v;
 			else
 				bad++;
-		} else if (!strcmp(key, "look_sensitivity")) {
+		} else 		if (!strcmp(key, "look_sensitivity")) {
 			matched = true;
 			float v;
 			if (parseFloat(val, &v))
 				o->look_sensitivity = clampFloat(v, OPTIONS_SENS_MIN, OPTIONS_SENS_MAX);
+			else
+				bad++;
+		} else if (!strcmp(key, "debug_menu")) {
+			matched = true;
+			bool v;
+			if (parseBool(val, &v))
+				o->debug_menu = v;
 			else
 				bad++;
 		} else {

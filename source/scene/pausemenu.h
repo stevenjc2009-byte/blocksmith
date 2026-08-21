@@ -23,6 +23,8 @@ typedef enum {
 	PAUSE_ACTION_NONE = 0,
 	PAUSE_ACTION_RESUME,   // close the menu and carry on
 	PAUSE_ACTION_QUIT,     // leave the world; the caller decides what that means
+	PAUSE_ACTION_REMAP,    // open the control-remapping screen (v1.4.0)
+	PAUSE_ACTION_DEBUG,    // open the debug menu (v1.4.0)
 } PauseAction;
 
 // Everything the menu displays, filled in by the caller each frame it draws.

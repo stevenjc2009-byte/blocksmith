@@ -4,6 +4,51 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.4.0] - 2026-08-21
+
+### Added
+
+- **Universal control remapping.** Options → Controls lists every mappable action
+  with its current button. Tap an action (or select it and press A) and press the
+  button you want: if that button already drives something else, the two actions
+  swap rather than one of them silently losing its binding. B during capture
+  cancels without changing anything, a row at the bottom restores the shipped
+  defaults, and every change is written straight back to `options.ini`, so it
+  survives a reboot like the rest of the settings.
+
+- **A sleep preserver.** Closing the lid no longer leaves the game running into
+  a suspended console: an APT hook marks the app asleep, the frame loop skips
+  simulation, networking and drawing until wake-up, and the New 3DS clock-speed
+  request is dropped for the duration so the battery is not drained fast on
+  purpose. Opening the lid resumes exactly where the frame left off.
+
+- **A battery gauge.** A four-bar indicator with a charging state, read from the
+  console's own power service at most once a second, sits in the corner of the
+  touch screen.
+
+- **A live minimap with fog of war.** The bottom-right of the touch screen can
+  show a 64×64 top-down map centred on the player: terrain colours where you
+  have walked, flat grey where you have not, and a small arrow for which way you
+  are facing. Explored area is saved per world seed and reloaded when you come
+  back — including on a server, since the fog belongs to this console's
+  exploration of that seed, not to any local save file. Until crafting exists to
+  make an equip-able map item, the toggle lives in the debug menu; the moment a
+  crafted map is possible this moves to equipping it, as intended.
+
+- **A debug menu.** Options → Debug opens a registry-driven menu: the render
+  distance stepper, the minimap toggle, live readouts (frame time, meshes and
+  triangles, culled chunks, world size, memory against budget, player position),
+  and greyed-out placeholder rows for Weather and Dimension so the systems the
+  roadmap adds later have somewhere to land without redesigning the menu.
+
+### Fixed
+
+- **A fresh clone could not build.** The Makefile pins the multiplayer protocol
+  by commit, and the pin still named the v1.3.0 server while v1.3.1's inventory
+  code already spoke v1.4.0's wire format — anyone running `make deps && make`
+  got a compile error through no fault of their own. The pin now names the
+  v1.4.0 server commit.
+
 ## [1.3.1] - 2026-08-21
 
 ### Fixed

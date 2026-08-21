@@ -20,9 +20,15 @@
 #include <string.h>
 #include <sys/stat.h>
 
+#include "app/battery.h"
 #include "app/crash.h"
+#include "app/debugmenu.h"
+#include "app/debugmenu_ui.h"
 #include "app/input_map.h"
 #include "app/options.h"
+#include "app/remap.h"
+#include "app/remap_ui.h"
+#include "app/sleep.h"
 #include "app/updater.h"
 #include "app/gputest.h"
 #include "app/watchdog.h"
@@ -43,6 +49,7 @@
 #include "scene/interact.h"
 #include "scene/loading.h"
 #include "scene/loading_draw.h"
+#include "scene/minimap.h"
 #include "scene/player.h"
 #include "scene/pausemenu.h"
 #include "scene/title.h"
@@ -829,6 +836,156 @@ static void genSetRadius(int radius)
 // own seed in a session. Kept because the gen overlay's readout is otherwise a lie the moment
 // the two differ, and "which world am I standing in" is exactly what that line is for.
 static uint32_t s_seed_used = BS_WORLD_SEED;
+
+// v1.4.0: control-remap screen state, debug-menu flag, and the minimap's fog-of-war for
+// whichever world is loaded. Reset or reloaded per session, like the seed above.
+static RemapState s_remap;
+static bool       s_remap_open;
+static bool       s_debug_open;
+static MinimapFog s_minimap_fog;
+static char       s_minimap_path[80];
+
+// Live numbers the debug menu's INFO rows read. Refreshed every frame the menu is open;
+// entries hold this struct's address, so it lives at file scope rather than on the frame.
+static DebugContext s_dctx;
+
+// The debug menu's render-distance stepper reports through this wrapper because
+// chunkRenderSetDistance lives behind <3ds.h> and the DebugContext only carries a pointer.
+// genSetRadius clamps and re-meshes the ring live; persisting opts.render_dist is the
+// caller's job, done right after debugMenuUiUpdate returns.
+static void bsDebugSetRenderDist(int r) { genSetRadius(r); }
+
+#if BS_BOTTOM_UI
+static int bsDbgGetDist(void* ctx)
+{
+	return ((const DebugContext*)ctx)->render_dist;
+}
+
+static void bsDbgSetDist(void* ctx, int v)
+{
+	(void)ctx;
+	bsDebugSetRenderDist(v);
+}
+
+static bool bsDbgGetMinimap(void* ctx)
+{
+	(void)ctx;
+	return minimapIsVisible();
+}
+
+static void bsDbgSetMinimap(void* ctx, bool v)
+{
+	(void)ctx;
+	minimapSetVisible(v);
+}
+
+static const char* bsDbgInfoFrame(char* buf, int cap, void* ctx)
+{
+	snprintf(buf, (size_t)cap, "%.2f ms", ((const DebugContext*)ctx)->frame_ms);
+	return buf;
+}
+
+static const char* bsDbgInfoDraw(char* buf, int cap, void* ctx)
+{
+	const DebugContext* d = (const DebugContext*)ctx;
+	snprintf(buf, (size_t)cap, "%d meshes %lu tris", d->meshes, (unsigned long)d->tris);
+	return buf;
+}
+
+static const char* bsDbgInfoCull(char* buf, int cap, void* ctx)
+{
+	snprintf(buf, (size_t)cap, "%d", ((const DebugContext*)ctx)->culled);
+	return buf;
+}
+
+static const char* bsDbgInfoWorld(char* buf, int cap, void* ctx)
+{
+	const DebugContext* d = (const DebugContext*)ctx;
+	snprintf(buf, (size_t)cap, "%d cols %d chunks", d->columns, d->chunks);
+	return buf;
+}
+
+static const char* bsDbgInfoMem(char* buf, int cap, void* ctx)
+{
+	const DebugContext* d = (const DebugContext*)ctx;
+	snprintf(buf, (size_t)cap, "%lu / %lu KB",
+	         (unsigned long)(d->blocks_bytes / 1024u),
+	         (unsigned long)(d->blocks_budget / 1024u));
+	return buf;
+}
+
+static const char* bsDbgInfoPlayer(char* buf, int cap, void* ctx)
+{
+	const DebugContext* d = (const DebugContext*)ctx;
+	snprintf(buf, (size_t)cap, "%.1f %.1f %.1f", d->player_x, d->player_y, d->player_z);
+	return buf;
+}
+
+// The menu's rows, registered once at boot. Weather and Dimension are the spec'd systems
+// that do not exist yet: registered unavailable so they show greyed and the menu visibly
+// reserves their place, and a later version flips available=true instead of redesigning.
+static void bsDebugRegister(void)
+{
+	DebugEntry* e;
+
+	e = debugMenuRegister();
+	if (e) {
+		e->name       = "Render distance";
+		e->kind       = DEBUG_SLIDER_INT;
+		e->available  = true;
+		e->getInt     = bsDbgGetDist;
+		e->setInt     = bsDbgSetDist;
+		e->slider_min = RENDER_DIST_MIN;
+		e->slider_max = RENDER_DIST_MAX;
+		e->ctx        = &s_dctx;
+	}
+
+	e = debugMenuRegister();
+	if (e) {
+		e->name      = "Minimap";
+		e->kind      = DEBUG_TOGGLE;
+		e->available = true;
+		e->getBool   = bsDbgGetMinimap;
+		e->setBool   = bsDbgSetMinimap;
+		e->ctx       = NULL;
+	}
+
+	e = debugMenuRegister();
+	if (e) {
+		e->name      = "Weather";
+		e->kind      = DEBUG_TOGGLE;
+		e->available = false;
+	}
+
+	e = debugMenuRegister();
+	if (e) {
+		e->name      = "Dimension";
+		e->kind      = DEBUG_ACTION;
+		e->available = false;
+	}
+
+	static const struct {
+		const char* name;
+		const char* (*info)(char*, int, void*);
+	} infos[] = {
+		{ "Frame",   bsDbgInfoFrame  },
+		{ "Draws",   bsDbgInfoDraw   },
+		{ "Culled",  bsDbgInfoCull   },
+		{ "World",   bsDbgInfoWorld  },
+		{ "Memory",  bsDbgInfoMem    },
+		{ "Player",  bsDbgInfoPlayer },
+	};
+	for (int i = 0; i < (int)(sizeof(infos) / sizeof(infos[0])); i++) {
+		e = debugMenuRegister();
+		if (!e) break;
+		e->name      = infos[i].name;
+		e->kind      = DEBUG_INFO;
+		e->available = true;
+		e->info      = infos[i].info;
+		e->ctx       = &s_dctx;
+	}
+}
+#endif
 
 static bool genStart(int32_t cx, int32_t cz)
 {
@@ -2247,6 +2404,17 @@ int main(void)
 	// updaterAvailable() is how the menu finds out.
 	updaterInit(true);
 
+	// v1.4.0: sleep preserver (APT hook) and battery telemetry (PTMU), both process-wide for
+	// the whole life of the app, so they sit here with the other boot-time services rather
+	// than inside the session loop. The UI-side one-time inits come with them.
+	sleepInit();
+	batteryInit();
+#if BS_BOTTOM_UI
+	remapUiInit();
+	debugMenuUiInit();
+	bsDebugRegister();
+#endif
+
 	// ── Step 8.4: settings, then the menu ────────────────────────────────────────────
 	//
 	// Hoisted out of the BS_WORLD_GEN block below, where it used to be the only caller,
@@ -2261,6 +2429,7 @@ int main(void)
 	// and the only thing that settles whether the card is usable is trying to write to it,
 	// which optionsSave then does.
 	mkdir("sdmc:/blocksmith", 0777);
+	mkdir("sdmc:/blocksmith/fog", 0777);
 
 	// Immediately after the folder exists and before anything can write a diagnostic into it.
 	// See diagFenceBoot: this is what makes "the file is on the card" mean "this boot wrote it".
@@ -2308,8 +2477,10 @@ int main(void)
 	// past the goto with them, because a second session needs a screen and a chunk renderer
 	// just as much as the first one did.
 session_start:
-	// The previous pass may have left this true. Nothing else survives a lap.
+	// The previous pass may have left these true. Nothing else survives a lap.
 	s_server_session = false;
+	s_remap_open     = false;
+	s_debug_open     = false;
 
 #if BS_TITLE
 	// ui_ok gates it. spriteInit/fontInit failing is survivable for the HUD — a game with no
@@ -2545,6 +2716,19 @@ session_start:
 	// boot. playerModelDraw checks its own ready flag, so nothing downstream needs this.
 	(void)playerModelInit();
 
+	// v1.4.0 minimap: claim the 64x64 texture and load this world's fog-of-war. The path is
+	// built from s_seed_used, which genStart set from the server's seed in a session, so two
+	// views of the same seed share one explored map — which is correct: same seed, same
+	// terrain. A texture that failed to claim leaves the path empty so the quit path's save
+	// becomes a no-op rather than a write over a map never loaded.
+	if (minimapGfxInit()) {
+		snprintf(s_minimap_path, sizeof(s_minimap_path), "sdmc:/blocksmith/fog/%lu.bin",
+		         (unsigned long)s_seed_used);
+		minimapLoad(&s_minimap_fog, s_minimap_path);
+	} else {
+		s_minimap_path[0] = '\0';
+	}
+
 	// On the flat ground at the foot of the stepped pyramid, looking down at it along the
 	// diagonal — so the first frame already shows a target cage without anyone having to
 	// walk anywhere, and walking forward goes up the pyramid.
@@ -2684,6 +2868,12 @@ session_start:
 		// columns flushed, worker stopped — instead of a second, less-tested teardown.
 		if (down & KEY_START || quit_requested) break;
 
+		// v1.4.0. Battery is polled at most once a second internally, so this is free on 59
+		// of 60 frames. A sleep frame runs no simulation, sends no packets and draws nothing:
+		// the APT hook has already told us the lid is closed and the OS is about to freeze us.
+		batteryPoll();
+		if (sleepShouldSkip()) continue;
+
 #if BS_BOTTOM_UI
 		// Step 8.2. Read here, next to the rest of the frame's input, rather than inside
 		// drawBottomUi: scene/ui.h states the same contract scene/title.h does — the UI never
@@ -2715,7 +2905,13 @@ session_start:
 
 		int  dist_step     = 0;
 		bool stereo_toggle = false;
-		const PauseAction pause_action = pauseMenuInput(down, &dist_step, &stereo_toggle);
+		PauseAction pause_action = PAUSE_ACTION_NONE;
+#if BS_BOTTOM_UI
+		// While the remap screen or the debug menu owns the frame, the pause menu underneath
+		// must not also read the pad — D-pad would move its cursor invisibly.
+		if (!s_remap_open && !s_debug_open)
+#endif
+			pause_action = pauseMenuInput(down, &dist_step, &stereo_toggle);
 		if (stereo_toggle) {
 			s_stereo = !s_stereo;
 			gfxSet3D(s_stereo);
@@ -2735,6 +2931,16 @@ session_start:
 			quit_to_title = true;
 			break;
 		}
+#if BS_BOTTOM_UI
+		if (pause_action == PAUSE_ACTION_REMAP) {
+			remapInit(&s_remap, &opts);
+			s_remap_open = true;
+		}
+		if (pause_action == PAUSE_ACTION_DEBUG) {
+			debugMenuUiOpen();
+			s_debug_open = true;
+		}
+#endif
 
 		// A paused world does not tick. Everything from here to the draw is gated on this:
 		// the player does not move, terrain does not stream in, and the memory figures the
@@ -3152,6 +3358,23 @@ session_start:
 			drawBottomUi(ui_ok, highlight_ok ? status : "HIGHLIGHT INIT FAILED",
 			             netline, paused ? &blank : &touch);
 
+			// v1.4.0 battery gauge, top-right corner of the bottom screen. Own sprite pass
+			// for the same reason pauseMenuDraw opens one: uiUpdateDraw closed its batch.
+			spriteBegin(320, 240);
+			spriteTexture(fontTexture());
+			batteryDraw(284.0f, 4.0f);
+			spriteEnd();
+
+			// v1.4.0 live minimap, bottom-right. Hidden while the menu is up so it cannot
+			// peek out from under the panel.
+			if (!paused && minimapIsVisible()) {
+				spriteBegin(320, 240);
+				minimapDraw(&s_minimap_fog, (int)player.body.x, (int)player.body.z,
+				            (int)player.body.x - MINIMAP_SIZE / 2,
+				            (int)player.body.z - MINIMAP_SIZE / 2, player.cam.yaw);
+				spriteEnd();
+			}
+
 			// After the UI and on the same target, so it lands on top of it. See
 			// scene/pausemenu.c on why this opens its own sprite pass rather than joining
 			// the one uiUpdateDraw has already closed.
@@ -3167,6 +3390,42 @@ session_start:
 					.stereo       = s_stereo,
 				};
 				pauseMenuDraw(&pstats);
+
+			// v1.4.0. The remap screen and the debug menu draw over the pause panel and take
+			// the frame's input themselves (their update calls draw internally, which is why
+			// they live here in the draw phase rather than up with the other input). Closing
+			// either persists: remap applies its bindings into opts and re-snapshots the
+			// input map; debug saves when it changed the render distance or toggled itself.
+			if (s_remap_open) {
+				s_remap_open = remapUiUpdate(&s_remap, down, touch.touch_down,
+				                             touch.touch_x, touch.touch_y);
+				if (!s_remap_open) {
+					remapApply(&s_remap, &opts);
+					optionsSave(&opts, TITLE_OPTIONS_PATH);
+					inputMapSet(&opts);
+				}
+			} else if (s_debug_open) {
+				s_dctx.render_dist     = s_mesh_radius;
+				s_dctx.render_dist_min = RENDER_DIST_MIN;
+				s_dctx.render_dist_max = RENDER_DIST_MAX;
+				s_dctx.set_render_dist = bsDebugSetRenderDist;
+				s_dctx.frame_ms        = metricsFrameMs();
+				s_dctx.meshes          = chunkRenderMeshes();
+				s_dctx.tris            = chunkRenderTris();
+				s_dctx.culled          = chunkRenderCulled();
+				s_dctx.columns         = s_world.columns;
+				s_dctx.chunks          = s_world.chunks;
+				s_dctx.blocks_bytes    = (uint32_t)worldBytes(&s_world);
+				s_dctx.blocks_budget   = (uint32_t)budgetCap();
+				s_dctx.player_x        = player.body.x;
+				s_dctx.player_y        = player.body.y;
+				s_dctx.player_z        = player.body.z;
+				const int dist_before  = s_mesh_radius;
+				s_debug_open = debugMenuUiUpdate(&s_dctx, &opts.debug_menu, down,
+				                                 touch.touch_down, touch.touch_x, touch.touch_y);
+				if (s_mesh_radius != dist_before || !s_debug_open)
+					optionsSave(&opts, TITLE_OPTIONS_PATH);
+			}
 			}
 #endif
 #if BS_CMDBUF_PROBE
@@ -3279,6 +3538,11 @@ session_start:
 	// losing the last session's pickups.
 	if (inv_dir) inventorySave(&s_inv, inv_dir);
 
+	// v1.4.0: the explored-fog map goes with it. Saved whatever session kind this was — the
+	// fog belongs to this console's exploration of the seed, not to a local world file — and
+	// only when a texture was actually claimed, which is what the empty path encodes.
+	if (s_minimap_path[0]) minimapSave(&s_minimap_fog, s_minimap_path);
+
 	// The play loop can be left with the menu still up. Choosing Quit closes it on the way
 	// out, but a lost server session (the netStatus() break above) does not, and neither
 	// would a HOME exit — and pausemenu.c's open flag is a static that outlives this world.
@@ -3304,6 +3568,7 @@ session_start:
 	networldSetWorld(NULL);
 
 	worldExit(&s_world);
+	minimapGfxExit();
 	highlightExit();
 	playerModelExit();
 
@@ -3335,6 +3600,8 @@ app_shutdown:
 	// sockets had been pulled out from under it would be the same ordering mistake workerStop
 	// above exists to avoid.
 	updaterExit();
+	sleepExit();
+	batteryExit();
 	netExit();
 	psExit();
 	crashExit();

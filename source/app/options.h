@@ -111,6 +111,7 @@ typedef struct {
 	bool     invert_look;
 	float    look_sensitivity;            // OPTIONS_SENS_MIN..OPTIONS_SENS_MAX
 	uint32_t bindings[ACTION_COUNT];      // action -> raw key bit, one of OPTIONS_VALID_KEYS
+	bool     debug_menu;                  // debug menu on/off
 } Options;
 
 // Fills `o` with the shipped defaults. Every field is already inside its legal range —

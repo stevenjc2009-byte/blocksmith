@@ -72,6 +72,19 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 "./$BH/options_test"
 
+# Universal input remapping logic (source/app/remap.c). Tenth binary, own main(),
+# same reason as options_test above it: pure logic that needs no <3ds.h>, tests
+# conflict swapping, reset-to-defaults, and round-trip persistence through the
+# existing options.ini mechanism.
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/app/options.c \
+	source/app/remap.c \
+	source/app/remap_test.c \
+	-o "$BH/remap_test"
+
+"./$BH/remap_test"
+
 # Step 8.4's world-list module. Third binary for the same reason options_test is a second
 # one: it carries its own main(). scene/worldlist.c lives under scene/ but has no <3ds.h>
 # in it — the directory says where it belongs in the program, not what it depends on.
@@ -198,6 +211,26 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 "./$BH/inv_bridge_test"
 
+# sleep.c's state machine (source/app/sleep.c). Twelfth binary, own main(). The apt hook
+# and osSetSpeedupEnable calls are console-only; this exercises the flag transitions and
+# enter/exit pairing in isolation via tests/sleep_test.c's own miniaturised logic.
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	tests/sleep_test.c \
+	-o "$BH/sleep_test"
+
+"./$BH/sleep_test"
+
+# battery.c's bar mapping and low-battery logic. Thirteenth binary, own main(). The PTMU
+# calls are console-only; this exercises the level-to-bars arithmetic and the charging
+# flag via tests/battery_test.c's own pure-C logic.
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	tests/battery_test.c \
+	-o "$BH/battery_test"
+
+"./$BH/battery_test"
+
 # interop_test.c, source/net's real client (networld.c) speaking to a REAL bsgame daemon over a
 # real Unix socket — see that file's own header comment for why networld_test.c and bsgame_test.c
 # (deps/blocksmith-server/game/) each passing on their own proves nothing about whether the two
@@ -205,11 +238,43 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 # binary interop_test spawns is freshly built from what is actually checked out here rather than
 # whatever a previous session last built by hand — a stale daemon would make this suite validate
 # nothing. Eleventh binary, own main(), same reason as every one above it.
+# Skipped on Windows/MSYS2 — poll.h and sys/un.h are Unix-only.
+case "$(uname -s)" in
+MINGW*|MSYS*|CYGWIN*) echo "skipping interop_test on Windows (Unix sockets unavailable)" ;;
+*)
 make -C deps/blocksmith-server/game bsgame
 
 gcc -std=c11 -Wall -Wextra -Werror -O1 -g 	-I source -I deps/blocksmith-server 	source/world/world.c 	source/world/chunk.c 	source/world/budget.c 	source/net/blockdiff.c 	source/net/networld.c 	source/net/interop_test.c 	-o "$BH/interop_test"
 
 "./$BH/interop_test"
+;;
+esac
+
+# scene/minimap.c's fog-of-war, color lookup and save/load round-trip. Fourteenth binary,
+# own main(), same reason as every one above it. Pure C — no <3ds.h> in the logic; the
+# 3DS-specific texture/draw half is guarded out on host and covered by the console build.
+# world/block.c is in the link because minimap.c re-uses BlockId/blockInfo() for its color
+# table.
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/block.c \
+	source/scene/minimap.c \
+	source/scene/minimap_test.c \
+	-o "$BH/minimap_test"
+
+"./$BH/minimap_test"
+
+# debugmenu.c registry logic + options.c debug_menu persistence. Fifteenth binary,
+# own main(), same reason as every one above it. Registry is pure data-structure
+# work; the options half reuses options.c to prove the new key round-trips.
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/app/options.c \
+	source/app/debugmenu.c \
+	source/app/debugmenu_test.c \
+	-o "$BH/debugmenu_test"
+
+"./$BH/debugmenu_test"
 
 # Only reached if every binary above exited 0 (set -e stops the script on the first
 # non-zero exit), so a failed run's directory is left behind for inspection rather than

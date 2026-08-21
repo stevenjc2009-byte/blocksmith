@@ -146,7 +146,7 @@ PROTO_REPO	:=	https://github.com/stevenjc2009-byte/blocksmith-server.git
 # The running server must be updated to v1.3.0 as well and BEFORE this client ships:
 # bsgame kicks any client sending a message type it does not know, and this client
 # sends CHUNK_SUB on its first loaded column.
-PROTO_COMMIT	:=	d35dd321348c038d4b76ce1cb14d378393fa68e5
+PROTO_COMMIT	:=	10111dfb453fa4e17565771023b6ac183dc05d21
 PROTO		:=	deps/blocksmith-server
 
 .PHONY: deps
