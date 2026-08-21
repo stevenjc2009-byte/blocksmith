@@ -11,7 +11,7 @@ All notable changes to Blocksmith. Format loosely follows
 - **On a server, your inventory now belongs to the server.** Until now every console kept
   its own inventory in RAM and told nobody, so two players could mine the same block and
   both bank it, and anything you were carrying vanished the moment the console slept. The
-  server now holds the full 23 slots and the selected hotbar index for each player, writes
+  server now holds all 24 slots and the selected hotbar index for each player, writes
   them to disk, and hands them back on the next join.
 
 - **Changes are applied on the console first and reported afterwards, not asked for and
