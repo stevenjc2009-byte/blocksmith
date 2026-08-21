@@ -136,11 +136,17 @@ HYDRO		:=	deps/libhydrogen
 # is allowed to reach into a sibling repository's working tree.
 #---------------------------------------------------------------------------------
 PROTO_REPO	:=	https://github.com/stevenjc2009-byte/blocksmith-server.git
-# v1.2.0 of the server — the commit that added BS_APP_WORLD_INFO. Bumped from
-# 486500e (v1.1.0) when the join flow started requiring the server to name its
-# world: a clone still pinned to 486500e fetches a bs_proto.h without
-# BS_APP_WORLD_INFO in it and fails to compile net/networld.c.
-PROTO_COMMIT	:=	a3264a43225c80e83cea5081efdeb850b65a1988
+# v1.3.0 of the server — the commit that added BS_APP_CHUNK_SUB / CHUNK_DIFFS /
+# CHUNK_UNSUB. Bumped from a3264a4 (v1.2.0, which added BS_APP_WORLD_INFO) because
+# net/networld.c now subscribes per column: a clone still pinned to a3264a4 fetches
+# a bs_proto.h with none of the CHUNK_* ids, BS_CHUNK_DIFFS_HDR_BYTES or bs_col_of()
+# in it and fails to compile.
+#
+# This pin is the PROTOCOL the client is built against, not the server it will meet.
+# The running server must be updated to v1.3.0 as well and BEFORE this client ships:
+# bsgame kicks any client sending a message type it does not know, and this client
+# sends CHUNK_SUB on its first loaded column.
+PROTO_COMMIT	:=	d35dd321348c038d4b76ce1cb14d378393fa68e5
 PROTO		:=	deps/blocksmith-server
 
 .PHONY: deps
