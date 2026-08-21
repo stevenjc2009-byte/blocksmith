@@ -4,6 +4,29 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.3.1] - 2026-08-21
+
+### Fixed
+
+- **Server inventories actually work now.** In v1.3.0 they did nothing at all: you would rejoin
+  with an empty inventory every time, exactly as before the feature existed. Two mistakes,
+  stacked, both on the console side — the server half was correct and has not changed.
+
+  The first is a matter of ordering. Joining a server finishes on the *title screen*, not on
+  entry to the world, and the server sends your inventory the instant you join. The client did
+  not start listening for it until much later, so the one message that carried everything you
+  owned arrived, was decoded, found nobody waiting for it, and was discarded. The client now
+  keeps the most recent snapshot and hands it over the moment something is listening, which
+  makes the order it arrives in stop mattering.
+
+  The second is that a server session deliberately starts from an empty inventory — the server
+  owns what you are carrying, so the console has nothing of its own to load. That emptying ran
+  *after* the snapshot would have been applied, wiping it. The listener is now registered after
+  it instead of before, so the server's answer is the last word rather than the first.
+
+  Both are covered by tests that walk the real sequence, including the title-screen arrival, and
+  both were confirmed to fail against the old code before the fix went in.
+
 ## [1.3.0] - 2026-08-21
 
 ### Changed

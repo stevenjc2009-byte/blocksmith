@@ -2408,12 +2408,11 @@ session_start:
 	// version of it to have to reproduce. Harmless in single player: nothing ever fires it.
 	networldSetEditHook(onRemoteEdit, NULL);
 
-	// v1.3.0, and re-registered here for exactly the reason the line above is: networldInit()
-	// clears this hook too (see net/networld.c), so registering it once at boot would give the
-	// first server session a live inventory and every rejoin afterwards a console whose
-	// inventory silently stops tracking the server's. Harmless in single player — no INV_STATE
-	// is ever sent, so it never fires.
-	networldSetInvHook(onInvState, NULL);
+	// The inventory hook is NOT registered here alongside the edit hook, though it was in the
+	// v1.3.0 release and that is exactly what made the feature do nothing. It is registered
+	// further down, immediately after s_inv is loaded or initialised — see that call site for
+	// why the order matters and why registering it at this point loses the server's inventory
+	// twice over.
 	BOOT_END("networldSetWorld");
 
 	// The world. Since step 5.5 the generated one is not built here: the worker is started
@@ -2599,11 +2598,31 @@ session_start:
 	// the world, this console keeps nothing from it, and saveWorldDir() would mkdir the very
 	// directory the session is supposed not to create. One variable covers both ends — the
 	// load here and the inventorySave on the quit path below are both already guarded on it —
-	// so a joined session starts with an empty inventory and writes none back.
+	// so a joined session starts with an empty inventory and writes none back — the server owns
+	// what this player is carrying, and the hook registered immediately below is what delivers it.
 	watchdogPhase(WD_PHASE_HANDOFF_SAVE);
 	const char* const inv_dir = s_server_session ? NULL : saveWorldDir();
 	if (inv_dir) inventoryLoad(&s_inv, inv_dir);
 	else         inventoryInit(&s_inv);
+
+	// Registered HERE, and not up with the edit hook, because both halves of the order matter and
+	// v1.3.0 got both of them wrong.
+	//
+	// Too early is wrong: JOIN completes inside runTitleScreen(), which pumps networldUpdate()
+	// itself, so the server's unprompted join-time INV_STATE has already arrived and been decoded
+	// by the time control reaches this function's top. Registering up there meant the hook was
+	// still NULL when the snapshot landed, and it was dropped.
+	//
+	// Too late is also wrong, and is why this sits below the two lines above rather than above
+	// them: net/networld.c replays the retained snapshot the instant a hook is registered, so
+	// registering before inventoryInit() would have that replay immediately overwritten by the
+	// empty inventory a server session initialises. Landing after it, the replay is the last
+	// writer and the console shows what the server is actually holding.
+	//
+	// Re-registered on every pass through session_start for the same reason the edit hook is:
+	// netDisconnect() calls networldInit(), which clears both. Harmless in single player — no
+	// INV_STATE ever arrives, so there is nothing to replay and nothing to fire.
+	networldSetInvHook(onInvState, NULL);
 #if BS_BOTTOM_UI
 	uiInit(&s_ui);
 #endif

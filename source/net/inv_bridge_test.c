@@ -455,8 +455,76 @@ static void test_apply_state_sends_nothing(void)
     check(fake_sent_calls == 0, "nothing was handed to the transport");
 }
 
+/* main.c's own inventory hook, reproduced: all it does is hand the snapshot to the bridge. */
+static void hookApply(void *ud, const NetworldInvState *state)
+{
+    (void)invBridgeApplyState((Inventory *)ud, state);
+}
+
+/* The bug that made the whole of v1.3.0's feature a no-op on a real console, as a test.
+ *
+ * The real sequence is not "register a hook, then receive a snapshot". JOIN completes inside
+ * main.c's runTitleScreen(), which pumps networldUpdate() itself, so the server's unprompted
+ * join-time INV_STATE arrives while the player is still on the title screen — before a world has
+ * been entered and therefore before there is any Inventory for a hook to point at. The hook can
+ * only be registered afterwards, and in v1.3.0 the snapshot was long gone by then.
+ *
+ * This walks that exact order, including the inventoryInit() a server session performs at world
+ * entry, which is the second thing that used to destroy the server's answer. */
+static void test_snapshot_that_arrived_before_the_hook_is_still_delivered(void)
+{
+    puts("a snapshot that arrived before the hook existed is replayed on registration");
+
+    networldInit();
+
+    /* --- title screen: JOIN, and the server volunteers a snapshot. No hook exists yet. --- */
+    uint8_t msg[BS_INV_STATE_BYTES];
+    memset(msg, 0, sizeof msg);
+    msg[0] = BS_APP_INV_STATE;
+    msg[1] = 2;                                   /* selected hotbar slot */
+    msg[BS_APP_HDR_BYTES + 1 + 0] = BLOCK_WOOD;   /* slot 0: 7 wood, as if mined last session */
+    msg[BS_APP_HDR_BYTES + 1 + 1] = 7;
+    networldApplyPayload(msg, sizeof msg);
+
+    /* --- world entry: a server session initialises an EMPTY inventory, then registers. --- */
+    Inventory inv;
+    inventoryInit(&inv);
+    check(inv.slots[0].count == 0, "the inventory really is empty before the hook is registered");
+
+    networldSetInvHook(hookApply, &inv);
+
+    check(inv.slots[0].item == BLOCK_WOOD, "slot 0 holds the wood the server was keeping");
+    check(inv.slots[0].count == 7, "and all 7 units of it");
+    check(inv.selected_hotbar == 2, "the server's selected hotbar slot came across too");
+
+    networldSetInvHook(NULL, NULL);
+}
+
+/* The other half of the ordering: registration must not fire when nothing has arrived, or a
+ * single-player session would have its loaded inventory wiped by a replay of nothing. */
+static void test_registration_without_a_snapshot_leaves_the_inventory_alone(void)
+{
+    puts("registering a hook with no snapshot received leaves the inventory untouched");
+
+    networldInit();
+
+    Inventory inv;
+    inventoryInit(&inv);
+    inv.slots[0].item  = BLOCK_STONE;   /* stands in for a single-player inventoryLoad() */
+    inv.slots[0].count = 12;
+
+    networldSetInvHook(hookApply, &inv);
+
+    check(inv.slots[0].item == BLOCK_STONE && inv.slots[0].count == 12,
+          "the locally loaded inventory survived registration");
+
+    networldSetInvHook(NULL, NULL);
+}
+
 int main(void)
 {
+    test_snapshot_that_arrived_before_the_hook_is_still_delivered();
+    test_registration_without_a_snapshot_leaves_the_inventory_alone();
     test_offline_sends_nothing_but_still_mutates();
     test_move_reports_units_actually_moved();
     test_refused_move_sends_nothing();

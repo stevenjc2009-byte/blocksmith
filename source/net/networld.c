@@ -43,6 +43,22 @@ static void*         s_inv_ud;
 // session that has not actually heard from this server yet.
 static bool s_have_inv_state;
 
+// The most recent well-formed INV_STATE, kept so that registering a hook after one has already
+// arrived still delivers it rather than losing it.
+//
+// The server volunteers the join-time snapshot immediately after JOIN, and JOIN completes on the
+// title screen — main.c's runTitleScreen() pumps networldUpdate() itself, for the same reason it
+// pumps netUpdate(). That is long before main.c has entered a world and has an inventory to put
+// a snapshot in. Without this retention the join snapshot was decoded, found s_inv_fn still NULL,
+// and was dropped: every join started with an empty inventory no matter what the server held, and
+// only the *next* snapshot — which the server sends in reply to an action — could ever fill it.
+//
+// Written only from applyInvState(), and only once the whole packet has validated, so it can
+// never hold a half-parsed state. Meaningful only while s_have_inv_state is true; networldInit()
+// clearing that flag is what makes a stale snapshot unreachable in a fresh session, so this does
+// not need clearing separately.
+static NetworldInvState s_last_inv_state;
+
 // The single place an applied edit is announced. Called only after the block is really in the
 // world — never for one that is merely queued, which would tell the renderer to rebuild a mesh
 // that is still correct and, worse, imply a block is readable when it is not.
@@ -228,6 +244,7 @@ static void applyInvState(const uint8_t* msg, size_t len)
 	// Only set once the whole packet has proven well-formed above — a malformed INV_STATE must
 	// not be the thing that first arms the capability probe networldSendInvAction() checks.
 	s_have_inv_state = true;
+	s_last_inv_state = state;
 	if (s_inv_fn) s_inv_fn(s_inv_ud, &state);
 }
 
@@ -391,6 +408,16 @@ void networldSetInvHook(NetworldInvFn fn, void* userdata)
 {
 	s_inv_fn = fn;
 	s_inv_ud = userdata;
+
+	// Deliver the snapshot that already arrived, if one has. Registration order is not something
+	// the caller can win by rearranging: the server's join-time INV_STATE lands during JOIN, on
+	// the title screen, and the only place a hook can usefully point is at an inventory that does
+	// not exist until a world has been entered. So the hook comes late by construction, and it is
+	// this replay — not the arrival — that puts the server's inventory on the console.
+	//
+	// Guarded on fn so that unregistering — passing NULL to deliberately stop receiving these —
+	// stays a plain assignment and never calls through a null pointer.
+	if (fn && s_have_inv_state) fn(userdata, &s_last_inv_state);
 }
 
 void networldInit(void)
