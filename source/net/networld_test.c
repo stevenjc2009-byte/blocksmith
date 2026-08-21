@@ -177,6 +177,36 @@ static void buildPosUpdateS(uint8_t *out, uint32_t sid, float x, float y, float 
     bs_put_f32(out + 21, pitch);
 }
 
+static void buildInvState(uint8_t *out, uint8_t selected_hotbar,
+                           const uint8_t *items, const uint8_t *counts)
+{
+    out[0] = BS_APP_INV_STATE;
+    out[1] = selected_hotbar;
+    uint8_t *p = out + 2;
+    for (uint32_t i = 0; i < BS_INV_SLOT_COUNT; i++) {
+        p[0] = items[i];
+        p[1] = counts[i];
+        p += 2;
+    }
+}
+
+/* A well-formed inventory: every 4th slot empty (item 0, count 0 — bs_proto.h's own rule),
+ * every other slot a distinct non-zero item with a distinct non-zero count, all <=
+ * BS_INV_STACK_MAX. Used as the base for both "this round-trips exactly" checks and, mutated in
+ * one slot at a time, the malformed-packet checks below. */
+static void fillValidInv(uint8_t *items, uint8_t *counts)
+{
+    for (uint32_t i = 0; i < BS_INV_SLOT_COUNT; i++) {
+        if (i % 4 == 0) {
+            items[i]  = 0;
+            counts[i] = 0;
+        } else {
+            items[i]  = (uint8_t)(i + 1);
+            counts[i] = (uint8_t)((i % BS_INV_STACK_MAX) + 1);
+        }
+    }
+}
+
 /* ------------------------------------------------------------------ scenarios ------------- */
 
 static void test_loaded_column_applies_directly(void)
@@ -1113,6 +1143,194 @@ static void test_edit_hook_is_cleared_by_init_and_optional(void)
     check(hook_count == 0, "networldInit() cleared the hook");
 }
 
+/* ---------------------------------------------------------- inventory sync (BS_APP_INV_*) - */
+/* BS_APP_INV_STATE / BS_APP_INV_ACTION, proto/bs_proto.h's newest pair. See that header's long
+ * comment on why the server always speaks first: an INV_ACTION networldSendInvAction() lets out
+ * before any INV_STATE has arrived would be exactly the CHUNK_SUB mistake v1.2.7 made, kicked
+ * outright by any server that predates this feature. The checks below cover the decode side
+ * (applyInvState(), networld.c) and the capability probe itself, the same two halves the CHUNK_
+ * SUB/CHUNK_DIFFS pair above gets. */
+
+static NetworldInvState inv_hook_state;
+static int              inv_hook_count;
+static int              inv_hook_userdata_ok;
+static int              inv_hook_userdata_marker;
+
+static void invHookRecord(void *userdata, const NetworldInvState *state)
+{
+    if (userdata == &inv_hook_userdata_marker) inv_hook_userdata_ok++;
+    inv_hook_state = *state;
+    inv_hook_count++;
+}
+
+static void invHookReset(void)
+{
+    memset(&inv_hook_state, 0, sizeof inv_hook_state);
+    inv_hook_count        = 0;
+    inv_hook_userdata_ok  = 0;
+}
+
+static void test_inv_state_valid_fires_hook_with_exact_values(void)
+{
+    puts("a valid INV_STATE fires the hook with the exact values encoded");
+
+    networldInit();
+    invHookReset();
+    networldSetInvHook(invHookRecord, &inv_hook_userdata_marker);
+
+    uint8_t items[BS_INV_SLOT_COUNT], counts[BS_INV_SLOT_COUNT];
+    fillValidInv(items, counts);
+    uint8_t msg[BS_INV_STATE_BYTES];
+    buildInvState(msg, 3, items, counts);
+    networldApplyPayload(msg, sizeof msg);
+
+    check(inv_hook_count == 1, "the hook fired exactly once");
+    check(inv_hook_userdata_ok == 1, "userdata was passed through unchanged");
+    check(inv_hook_state.selected_hotbar == 3, "selected_hotbar round-trips");
+
+    bool all_slots_ok = true;
+    for (uint32_t i = 0; i < BS_INV_SLOT_COUNT; i++) {
+        if (inv_hook_state.slots[i].item != items[i] || inv_hook_state.slots[i].count != counts[i])
+            all_slots_ok = false;
+    }
+    check(all_slots_ok, "every one of the 24 (item, count) pairs round-trips exactly");
+
+    networldSetInvHook(NULL, NULL);
+}
+
+static void test_inv_state_wrong_length_dropped(void)
+{
+    puts("an INV_STATE one byte short or one byte long is dropped, and the hook does not fire");
+
+    networldInit();
+    invHookReset();
+    networldSetInvHook(invHookRecord, &inv_hook_userdata_marker);
+
+    uint8_t short_msg[BS_INV_STATE_BYTES - 1] = {0};
+    short_msg[0] = BS_APP_INV_STATE;
+    networldApplyPayload(short_msg, sizeof short_msg);
+    check(inv_hook_count == 0, "one byte short: the hook did not fire");
+
+    uint8_t long_msg[BS_INV_STATE_BYTES + 1] = {0};
+    long_msg[0] = BS_APP_INV_STATE;
+    networldApplyPayload(long_msg, sizeof long_msg);
+    check(inv_hook_count == 0, "one byte long: the hook did not fire either");
+
+    networldSetInvHook(NULL, NULL);
+}
+
+static void test_inv_state_malformed_slot_drops_whole_packet(void)
+{
+    puts("a malformed slot (count 0 / item non-zero, or the reverse) drops the whole packet");
+
+    networldInit();
+    invHookReset();
+    networldSetInvHook(invHookRecord, &inv_hook_userdata_marker);
+
+    uint8_t items[BS_INV_SLOT_COUNT], counts[BS_INV_SLOT_COUNT];
+    uint8_t msg[BS_INV_STATE_BYTES];
+
+    fillValidInv(items, counts);
+    items[5] = 7; counts[5] = 0;   /* item non-zero, count zero: malformed */
+    buildInvState(msg, 0, items, counts);
+    networldApplyPayload(msg, sizeof msg);
+    check(inv_hook_count == 0, "item non-zero with count zero drops the whole packet, not just that slot");
+
+    fillValidInv(items, counts);
+    items[5] = 0; counts[5] = 7;   /* item zero, count non-zero: malformed the other way */
+    buildInvState(msg, 0, items, counts);
+    networldApplyPayload(msg, sizeof msg);
+    check(inv_hook_count == 0, "item zero with count non-zero drops the whole packet too");
+
+    networldSetInvHook(NULL, NULL);
+}
+
+static void test_inv_state_count_over_cap_dropped(void)
+{
+    puts("a slot claiming count > BS_INV_STACK_MAX drops the whole packet");
+
+    networldInit();
+    invHookReset();
+    networldSetInvHook(invHookRecord, &inv_hook_userdata_marker);
+
+    uint8_t items[BS_INV_SLOT_COUNT], counts[BS_INV_SLOT_COUNT];
+    fillValidInv(items, counts);
+    counts[3] = (uint8_t)(BS_INV_STACK_MAX + 1);   /* items[3] is already non-zero */
+    uint8_t msg[BS_INV_STATE_BYTES];
+    buildInvState(msg, 0, items, counts);
+    networldApplyPayload(msg, sizeof msg);
+
+    check(inv_hook_count == 0, "count over BS_INV_STACK_MAX is dropped, not clamped or partially applied");
+
+    networldSetInvHook(NULL, NULL);
+}
+
+static void test_send_inv_action_gated_on_inv_state(void)
+{
+    puts("networldSendInvAction() sends nothing before any INV_STATE has arrived, and exactly "
+         "BS_INV_ACTION_BYTES with the right bytes once one has");
+
+    networldInit();
+    fakeTransportReset();
+
+    check(networldSendInvAction(BS_INV_OP_MOVE, 1, 2, 3) == false,
+          "no INV_STATE received yet: the send is refused");
+    check(fake_sent_calls == 0,
+          "the transport was never even touched — this is the capability probe itself, "
+          "not a defensive nicety in front of it");
+
+    uint8_t items[BS_INV_SLOT_COUNT], counts[BS_INV_SLOT_COUNT];
+    fillValidInv(items, counts);
+    uint8_t msg[BS_INV_STATE_BYTES];
+    buildInvState(msg, 0, items, counts);
+    networldApplyPayload(msg, sizeof msg);
+
+    check(networldSendInvAction(BS_INV_OP_SWAP, 4, 5, 0) == true,
+          "an INV_STATE has now arrived, so the send goes through");
+    check(fake_sent_calls == 1, "the transport was asked to send exactly once");
+    check(fake_sent_len == BS_INV_ACTION_BYTES, "encoded to exactly BS_INV_ACTION_BYTES");
+    check(fake_sent_buf[0] == BS_APP_INV_ACTION, "type byte is BS_APP_INV_ACTION");
+    check(fake_sent_buf[1] == BS_INV_OP_SWAP, "op round-trips");
+    check(fake_sent_buf[2] == 4, "a round-trips");
+    check(fake_sent_buf[3] == 5, "b round-trips");
+    check(fake_sent_buf[4] == 0, "c round-trips, including zero");
+
+    /* A malformed INV_STATE must not have armed the probe either. */
+    networldInit();
+    fakeTransportReset();
+    uint8_t bad[BS_INV_STATE_BYTES - 1] = {0};
+    bad[0] = BS_APP_INV_STATE;
+    networldApplyPayload(bad, sizeof bad);
+    check(networldSendInvAction(BS_INV_OP_SELECT, 0, 0, 0) == false,
+          "a dropped, malformed INV_STATE does not arm the capability probe");
+    check(fake_sent_calls == 0, "and the transport was never touched for it");
+}
+
+static void test_inv_state_flag_does_not_survive_fresh_session(void)
+{
+    puts("the \"server has spoken\" flag does not survive into a fresh session");
+
+    networldInit();
+    fakeTransportReset();
+
+    uint8_t items[BS_INV_SLOT_COUNT], counts[BS_INV_SLOT_COUNT];
+    fillValidInv(items, counts);
+    uint8_t msg[BS_INV_STATE_BYTES];
+    buildInvState(msg, 0, items, counts);
+    networldApplyPayload(msg, sizeof msg);
+
+    check(networldSendInvAction(BS_INV_OP_SELECT, 1, 0, 0) == true,
+          "the send works within this session, once INV_STATE has arrived");
+
+    /* Leaving and rejoining a server — bsnet.c's netDisconnect() calls exactly this. */
+    networldInit();
+    fakeTransportReset();
+
+    check(networldSendInvAction(BS_INV_OP_SELECT, 1, 0, 0) == false,
+          "a fresh session has heard nothing from a server yet, even though the previous one did");
+    check(fake_sent_calls == 0, "and never touched the transport for it");
+}
+
 /* ------------------------------------------- the rejoin sync capacity --------------------- */
 /* Written from a live report: steve and a friend built a house, steve rejoined, and the house
  * was gone from HIS screen while still standing on everyone else's. This reproduces that
@@ -1224,6 +1442,12 @@ int main(void)
     test_edit_hook_silent_while_the_edit_is_only_queued();
     test_edit_hook_fires_per_entry_of_a_sync_batch();
     test_edit_hook_is_cleared_by_init_and_optional();
+    test_inv_state_valid_fires_hook_with_exact_values();
+    test_inv_state_wrong_length_dropped();
+    test_inv_state_malformed_slot_drops_whole_packet();
+    test_inv_state_count_over_cap_dropped();
+    test_send_inv_action_gated_on_inv_state();
+    test_inv_state_flag_does_not_survive_fresh_session();
     test_rejoin_sync_larger_than_the_store_keeps_every_edit();
 
     printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);

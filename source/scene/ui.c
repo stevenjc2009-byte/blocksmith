@@ -6,6 +6,7 @@
 #include "gfx/atlas.h"
 #include "gfx/font.h"
 #include "gfx/sprite.h"
+#include "net/inv_bridge.h"
 #include "scene/ui_layout.h"
 #include "world/block.h"
 #include "world/crafting.h"
@@ -88,6 +89,14 @@
 // This file now only calls into them.
 
 // ── Mutating gesture handlers ─────────────────────────────────────────────────────────
+//
+// v1.3.0: every mutation below goes through net/inv_bridge.h rather than calling
+// world/inventory.h and world/crafting.h directly. Each invBridge* call performs the exact
+// same local operation it is named after and returns the same value — the semantics
+// described in each comment below are unchanged — and additionally reports what happened to
+// the server, so a joined session's inventory survives a rejoin instead of living only on
+// this console. In single player nothing is sent (see inv_bridge.h on the capability probe),
+// so this file behaves identically offline.
 
 // See the file comment for the two-tap pick-up/drop gesture this implements.
 static void handleSlotTap(UiState* ui, Inventory* inv, int slot)
@@ -115,12 +124,12 @@ static void handleSlotTap(UiState* ui, Inventory* inv, int slot)
 		// whole lifted stack, leaving any overflow behind in the source slot exactly the
 		// way dropping onto a nearly-full stack of the same item should (see
 		// inventory.h's own comment on inventoryMoveUnits).
-		inventoryMoveUnits(inv, ui->picked_slot, slot, src->count);
+		invBridgeMoveUnits(inv, ui->picked_slot, slot, src->count);
 	} else {
 		// A different item already sits there: swap the two stacks outright. This is
 		// inventory.h's inventorySwapSlots, described in its own comment as "what a plain
 		// drag-and-drop (no merge) looks like" — exactly this situation.
-		inventorySwapSlots(inv, ui->picked_slot, slot);
+		invBridgeSwapSlots(inv, ui->picked_slot, slot);
 	}
 	ui->picked_slot = -1;
 }
@@ -133,7 +142,7 @@ static void handleSlotTap(UiState* ui, Inventory* inv, int slot)
 // is no gesture — long-press, double-tap — needed to disambiguate them.
 static void handleHotbarSelect(Inventory* inv, int hotbar_slot)
 {
-	inventorySelectHotbar(inv, (uint8_t)hotbar_slot);
+	invBridgeSelectHotbar(inv, (uint8_t)hotbar_slot);
 }
 
 static void handleCraftTap(Inventory* inv, int recipe_index)
@@ -143,7 +152,7 @@ static void handleCraftTap(Inventory* inv, int recipe_index)
 	// else can touch `inv` between the two, so the check can never disagree with what was
 	// drawn, but calling it again costs nothing and means this function has no invisible
 	// precondition on draw order.
-	if (craftCanMake(inv, recipe_index)) craftMake(inv, recipe_index);
+	if (craftCanMake(inv, recipe_index)) invBridgeCraft(inv, recipe_index);
 }
 
 // ── Icon UVs ───────────────────────────────────────────────────────────────────────────

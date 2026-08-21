@@ -175,6 +175,29 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g 	-I source -I deps/blocksmith-server 	
 
 "./$BH/networld_test"
 
+# net/inv_bridge.c, the seam between world/inventory.h and the wire (v1.3.0). Eleventh binary,
+# own main(), same reason as every one above it. It links the REAL inventory.c and crafting.c
+# alongside the real networld.c, because the thing under test is precisely the arithmetic
+# BETWEEN them: "how many units actually moved" is a number only inventory.c can produce and
+# only networld.c can encode, so a test that faked either half would be checking its own
+# stand-in rather than the seam. crc32.c is in the link for the same reason inventory_test
+# above needs it — the inventory save file is checksummed the same way a region file is.
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source -I deps/blocksmith-server \
+	source/world/world.c \
+	source/world/chunk.c \
+	source/world/budget.c \
+	source/world/inventory.c \
+	source/world/crafting.c \
+	source/world/crc32.c \
+	source/net/blockdiff.c \
+	source/net/networld.c \
+	source/net/inv_bridge.c \
+	source/net/inv_bridge_test.c \
+	-o "$BH/inv_bridge_test"
+
+"./$BH/inv_bridge_test"
+
 # interop_test.c, source/net's real client (networld.c) speaking to a REAL bsgame daemon over a
 # real Unix socket — see that file's own header comment for why networld_test.c and bsgame_test.c
 # (deps/blocksmith-server/game/) each passing on their own proves nothing about whether the two

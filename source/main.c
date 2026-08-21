@@ -33,6 +33,7 @@
 #include "gfx/screen.h"
 #include "gfx/sprite.h"
 #include "net/bsnet.h"
+#include "net/inv_bridge.h"
 #include "net/networld.h"
 #include "scene/camera.h"
 #include "scene/chunk_render.h"
@@ -2149,6 +2150,26 @@ static void onRemoteEdit(void* userdata, int x, int y, int z)
 	chunkRenderTouch(&s_world, x, y, z);
 }
 
+// v1.3.0. net/networld.h's inventory hook: the server has sent its authoritative copy of this
+// player's inventory (BS_APP_INV_STATE) and it replaces whatever s_inv currently holds.
+//
+// Overwriting rather than merging is the whole point — see net/inv_bridge.h on why every local
+// inventory change is applied optimistically and sent afterwards. On an unacknowledged UDP
+// transport a dropped INV_ACTION leaves this console holding a stack the server never moved,
+// and the snapshot is the only thing that ever notices. Merging would preserve exactly the
+// divergence the snapshot exists to erase.
+//
+// No remesh, no UI reset, nothing else to do: scene/ui.c reads s_inv fresh every frame (it owns
+// no copy of it) and the main loop re-reads inventoryHeldItem() every frame too, for reasons its
+// own comment already gives. A rejected snapshot (an item id this build does not have) leaves
+// s_inv untouched — invBridgeApplyState's comment covers what that means and why it is still the
+// right failure.
+static void onInvState(void* userdata, const NetworldInvState* state)
+{
+	(void)userdata;
+	(void)invBridgeApplyState(&s_inv, state);
+}
+
 int main(void)
 {
 	// Step 8.5, first of everything. It only writes this thread's TLS exception slot — no
@@ -2386,6 +2407,13 @@ session_start:
 	// — the invisible-edits bug back again, but only on a rejoin, which is the worst possible
 	// version of it to have to reproduce. Harmless in single player: nothing ever fires it.
 	networldSetEditHook(onRemoteEdit, NULL);
+
+	// v1.3.0, and re-registered here for exactly the reason the line above is: networldInit()
+	// clears this hook too (see net/networld.c), so registering it once at boot would give the
+	// first server session a live inventory and every rejoin afterwards a console whose
+	// inventory silently stops tracking the server's. Harmless in single player — no INV_STATE
+	// is ever sent, so it never fires.
+	networldSetInvHook(onInvState, NULL);
 	BOOT_END("networldSetWorld");
 
 	// The world. Since step 5.5 the generated one is not built here: the worker is started
@@ -2853,15 +2881,24 @@ session_start:
 		// are told, so there is nothing here that could put it back. The count is not tracked
 		// separately — `it.refused` is about edits the world rejected, and this edit was
 		// accepted; it is the pickup that failed.
+		//
+		// v1.3.0: through net/inv_bridge.h, which additionally reports the pickup to the server
+		// as BS_INV_OP_PICKUP — and reports the amount that actually *landed*, so a refusal by a
+		// full inventory tells the server nothing, matching the sentence above exactly.
 		if (it.broke_id != BLOCK_AIR)
-			inventoryAdd(&s_inv, it.broke_id, 1, NULL);
+			invBridgeAdd(&s_inv, it.broke_id, 1, NULL);
 
 		// Charged only for a placement the world actually accepted. it.placed_id stays
 		// BLOCK_AIR on every refusal path in interactEdit — no target, no entry face, cell
 		// occupied, would entomb the player, empty hand — so a refused place cannot silently
 		// consume a block out of the hotbar.
+		//
+		// v1.3.0: through net/inv_bridge.h, reporting BS_INV_OP_CONSUME. Same rule as the pickup
+		// above — the number sent is what was really taken out, so a placement charged against an
+		// inventory that somehow no longer held the block sends nothing rather than asking the
+		// server to remove a block it can see the player does not have.
 		if (it.placed_id != BLOCK_AIR)
-			inventoryRemove(&s_inv, it.placed_id, 1);
+			invBridgeRemove(&s_inv, it.placed_id, 1);
 
 #if BS_EDIT_STRESS
 		// The 4.5 check: an edit on a chunk corner every frame, which dirties eight

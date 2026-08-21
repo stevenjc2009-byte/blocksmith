@@ -4,6 +4,45 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] - 2026-08-21
+
+### Changed
+
+- **On a server, your inventory now belongs to the server.** Until now every console kept
+  its own inventory in RAM and told nobody, so two players could mine the same block and
+  both bank it, and anything you were carrying vanished the moment the console slept. The
+  server now holds the full 23 slots and the selected hotbar index for each player, writes
+  them to disk, and hands them back on the next join.
+
+- **Changes are applied on the console first and reported afterwards, not asked for and
+  waited on.** The link is unreliable UDP with no acknowledgements and no sequence numbers,
+  so asking the server for permission would make the touch panel appear to ignore taps for
+  as long as the round trip takes. Instead the tap happens instantly and a one-line report
+  follows it. If that report is lost, the server's next full snapshot puts the inventory
+  back the way the server sees it — the move visibly un-happens, which is legible to a
+  player, and it corrects itself without the client needing to detect the loss at all.
+
+- **Every report carries the amount that actually landed, never the amount that was asked
+  for.** Moving a stack of 40 into a slot that only has room for 4 reports 4. Picking up a
+  block into a full inventory reports nothing. Sending the requested figure instead would
+  let a server whose copy had already drifted apply *more* than this console did, and the
+  two would diverge further with every action rather than resynchronising at the next
+  snapshot.
+
+- **This is a protocol addition, and it is safe in both directions.** The server volunteers
+  the first inventory snapshot unprompted at join, which makes that snapshot the capability
+  probe as well as the payload: a console talking to a v1.3.0 server never receives one, so
+  it never sends an action, and its inventory behaves exactly as it did on v1.2.7. A
+  v1.4.0 server talking to a v1.2.7 console is safe for the opposite reason — this client
+  ignores app message types it does not recognise rather than dropping the link. **Update
+  in whichever order suits you.** Single-player is untouched either way; nothing is sent
+  when there is no session.
+
+- **Terrain generation and chunk streaming deliberately stay on the console.** Both were
+  weighed against moving them to the server and both were worse there — the terrain is
+  already deterministic from its seed, so sending it over the link would spend bandwidth
+  reproducing something the console can compute for free.
+
 ## [1.2.7] - 2026-08-20
 
 ### Added
@@ -54,8 +93,11 @@ All notable changes to Blocksmith. Format loosely follows
   It held 256 entries and *refused* everything past that rather than evicting, while the
   server replays its whole diff set to a joining client in one oldest-first burst — so on
   a well-built world a join dropped whatever had most recently been built. Measured on a
-  300-edit sync against the old cap: `queued 256 of 300, refused 44`. The cap now matches
-  the server's own ceiling exactly, so a join sync cannot overflow it at all. That size
+  300-edit sync against the old cap: `queued 256 of 300, refused 44`. The cap is now
+  65,536 entries, 256x what it held before. That is *half* the server's own 131,072
+  ceiling, not a match for it: a world that has been edited in more than 65,536 distinct
+  places can still overflow this store on a join, and the newest edits are still the ones
+  that lose. Closing that gap is a separate change. That size
   was only affordable after the store was hash-chained by column into 4096 buckets: the
   old design scanned the whole array on every record and drain, which at the new size is
   about 4.3 billion comparisons to absorb one sync — a hardware freeze, not a slow frame.

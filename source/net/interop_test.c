@@ -294,6 +294,25 @@ static void buildCanonicalChunkUnsub(uint8_t *out, int32_t cx, int32_t cz)
     bs_put_i32(out + 5, cz);
 }
 
+/* Same "never copied from the implementation it is checking" posture as the three builders
+ * above, written straight from bs_proto.h's own BS_APP_INV_STATE/BS_INV_STATE_BYTES comments
+ * (selected_hotbar at offset 1, then BS_INV_SLOT_COUNT (item, count) pairs), not from
+ * bsgame.c's send_inv_state() or networld.c's applyInvState(). `item`/`count` are
+ * BS_INV_SLOT_COUNT-long arrays, one entry per slot. */
+static void buildCanonicalInvState(uint8_t *out, uint8_t selected_hotbar,
+                                    const uint8_t *item, const uint8_t *count)
+{
+    out[0] = BS_APP_INV_STATE;
+    out[1] = selected_hotbar;
+
+    uint8_t *p = out + BS_APP_HDR_BYTES + 1u;
+    for (uint32_t i = 0; i < BS_INV_SLOT_COUNT; i++) {
+        p[0] = item[i];
+        p[1] = count[i];
+        p += 2;
+    }
+}
+
 /* ------------------------------------------------------------------------------ fake transport
  * Link-time test double for net/bsnet_transport.h, same seam networld_test.c uses (bsnet_
  * transport.c is real Noise XX over a real UDP socket, none of it host-portable). UNLIKE
@@ -323,6 +342,39 @@ static void captureReset(void)
 {
     g_captured_count = 0;
     g_last_sent_len  = 0;
+}
+
+/* Same idea as g_captured/g_captured_len/g_captured_count above, one capture point earlier
+ * (netTransportRecv, below), but for BS_APP_INV_STATE instead of BS_APP_CHUNK_DIFFS. Kept as a
+ * separate array/counter rather than reusing the CHUNK_DIFFS one: a scenario below needs to
+ * assert on "how many INV_STATE packets arrived" independent of how many CHUNK_DIFFS packets
+ * also happened to be in flight, and a shared counter would conflate the two message types. */
+#define INV_CAPTURE_MAX 4
+static uint8_t g_captured_inv[INV_CAPTURE_MAX][BS_INV_STATE_BYTES];
+static size_t  g_captured_inv_len[INV_CAPTURE_MAX];
+static int     g_captured_inv_count;
+
+static void captureInvReset(void)
+{
+    g_captured_inv_count = 0;
+}
+
+/* Registered once per scenario via networldSetInvHook() (networldInit() clears any previous
+ * registration, so this must be re-armed after every networldInit() call, same as the World
+ * pointer would need to be if a scenario used one). Captures the REAL decoded state — the
+ * struct networld.c's applyInvState() actually builds and hands to the hook — as a second,
+ * independent witness alongside g_captured_inv[]'s raw bytes: one proves the wire bytes are
+ * right, the other proves networld.c's own parse of those bytes is right. A scenario that only
+ * checked one of the two could not tell "the bytes are correct but the decode is buggy" apart
+ * from "the decode is fine but the raw capture is wrong". */
+static NetworldInvState g_last_inv_state;
+static int              g_inv_hook_calls;
+
+static void invHook(void *userdata, const NetworldInvState *state)
+{
+    (void)userdata;
+    g_last_inv_state = *state;
+    g_inv_hook_calls++;
 }
 
 bool netTransportSend(const uint8_t *payload, size_t len)
@@ -360,6 +412,11 @@ int netTransportRecv(uint8_t *out, size_t cap)
         g_captured_len[g_captured_count] = plen;
         g_captured_count++;
     }
+    if (plen > 0 && out[0] == BS_APP_INV_STATE && g_captured_inv_count < INV_CAPTURE_MAX) {
+        memcpy(g_captured_inv[g_captured_inv_count], out, plen);
+        g_captured_inv_len[g_captured_inv_count] = plen;
+        g_captured_inv_count++;
+    }
     return (int)plen;
 }
 
@@ -383,6 +440,20 @@ static void pumpFor(unsigned ms)
         networldUpdate();
         msleep(5);
     } while (now_ms() < deadline);
+}
+
+/* Same idea as pumpUntilCaptured() above, watching g_captured_inv_count instead of
+ * g_captured_count. A separate function rather than a parameter on the existing one: the two
+ * counters are reset independently (captureReset() vs captureInvReset()) by design, so a
+ * shared "which counter" flag would just be this function anyway with extra branching. */
+static void pumpUntilInvCaptured(int want, unsigned timeout_ms)
+{
+    uint64_t deadline = now_ms() + timeout_ms;
+    while (g_captured_inv_count < want && now_ms() < deadline) {
+        networldUpdate();
+        msleep(5);
+    }
+    networldUpdate();   /* one last drain in case something landed right at the deadline */
 }
 
 /* ------------------------------------------------------------------------------- scenario 1 --
@@ -625,6 +696,203 @@ static void test_sub_then_unsub_real_roundtrip(void)
     worldExit(&w);
 }
 
+/* ------------------------------------------------------------------------------- scenario 5 --
+ * Inventory sync, v1.3.0/v1.4.0. This is the single most important check in this file for the
+ * feature: proto/bs_proto.h's whole deployment-order safety argument (an old client never sends
+ * INV_ACTION, because it never received an INV_STATE to arm it) rests on the server actually
+ * volunteering INV_STATE at JOIN without being asked — see bs_proto.h's long comment above
+ * enum bs_inv_op and BS_APP_INV_STATE's own entry in enum bs_app_msg. bsgame_test.c already
+ * proves the server sends one (grep its own "JOIN sends an INV_STATE" case); this proves the
+ * REAL client — the same net/networld.c the console runs — actually receives and decodes it
+ * over the real socket, unprompted: nothing in this scenario ever calls networldSendInvAction()
+ * or anything else that could be mistaken for a request. */
+
+static void test_inv_state_volunteered_at_join(void)
+{
+    puts("real interop: JOIN alone gets the real client a BS_APP_INV_STATE from the real server, "
+         "WITHOUT the client ever asking for one, byte-identical to a fresh empty inventory");
+
+    const uint32_t client = 0xC1E00010u;
+
+    networldInit();
+    networldSetInvHook(invHook, NULL);
+    g_inv_hook_calls = 0;
+    g_client_sid = client;
+    captureReset();
+    captureInvReset();
+
+    send_join(client, "invclient1");   /* the ONLY thing this scenario does before pumping */
+
+    pumpUntilInvCaptured(1, 1000);
+    check(g_captured_inv_count == 1,
+          "exactly one BS_APP_INV_STATE arrived after JOIN, with no CHUNK_SUB, no INV_ACTION, "
+          "nothing else sent by this client");
+    if (g_captured_inv_count == 1) {
+        check(g_captured_inv_len[0] == BS_INV_STATE_BYTES,
+              "the unprompted INV_STATE is exactly BS_INV_STATE_BYTES (50) long, accepted by "
+              "networld.c's length check rather than dropped");
+
+        uint8_t zero_item[BS_INV_SLOT_COUNT]  = { 0 };
+        uint8_t zero_count[BS_INV_SLOT_COUNT] = { 0 };
+        uint8_t canon[BS_INV_STATE_BYTES];
+        buildCanonicalInvState(canon, 0, zero_item, zero_count);
+        check(memcmp(g_captured_inv[0], canon, BS_INV_STATE_BYTES) == 0,
+              "a brand-new player's INV_STATE is byte-identical to the canonical empty-inventory "
+              "encoding (selected_hotbar=0, all 24 slots {item=0,count=0})");
+    }
+
+    check(g_inv_hook_calls == 1,
+          "the real client's own decode (networld.c's applyInvState) parsed it and fired the "
+          "registered inv hook exactly once");
+    check(g_last_inv_state.selected_hotbar == 0,
+          "the client's decoded state agrees with the raw bytes: selected_hotbar 0");
+}
+
+/* ------------------------------------------------------------------------------- scenario 6 --
+ * networldSendInvAction()'s capability-probe gate (networld.c, and networld.h's own comment on
+ * it): refuses before any INV_STATE has been heard this session, and actually sends once one
+ * has. This is the other half of the deployment-order argument scenario 5 covers — that argument
+ * is only as good as this gate actually holding in the real client linked against the real
+ * server, not merely documented. */
+
+static void test_inv_action_gated_on_inv_state(void)
+{
+    puts("real interop: networldSendInvAction() refuses to send before any BS_APP_INV_STATE has "
+         "arrived this session, and actually sends once the real server's JOIN reply has landed");
+
+    const uint32_t client = 0xC1E00011u;
+
+    networldInit();
+    networldSetInvHook(invHook, NULL);
+    g_inv_hook_calls = 0;
+    g_client_sid = client;
+    captureReset();
+    captureInvReset();
+
+    check(networldSendInvAction(BS_INV_OP_SELECT, 0, 0, 0) == false,
+          "networldSendInvAction() refuses before any BS_APP_INV_STATE has been received this "
+          "session (fresh networldInit(), no packets exchanged yet)");
+    check(g_last_sent_len == 0, "the refused call touched the transport for nothing at all");
+
+    send_join(client, "invclient2");
+    pumpUntilInvCaptured(1, 1000);
+    check(g_captured_inv_count == 1, "the join's unprompted INV_STATE arrived");
+
+    captureReset();
+    check(networldSendInvAction(BS_INV_OP_SELECT, 0, 0, 0) == true,
+          "networldSendInvAction() now sends, having heard an INV_STATE from the real server");
+    check(g_last_sent_len == BS_INV_ACTION_BYTES,
+          "the now-permitted INV_ACTION is exactly BS_INV_ACTION_BYTES (5) long");
+}
+
+/* ------------------------------------------------------------------------------- scenario 7 --
+ * A real round trip that changes server state: BS_INV_OP_SELECT, the easiest op to prove with
+ * (bs_proto.h: "SELECT is the only idempotent op ... applying it twice is applying it once"), so
+ * this sends it and then reads the server's NEXT INV_STATE snapshot back, checking both the raw
+ * bytes on the wire (g_captured_inv) and the real client's own decode of them (g_last_inv_state,
+ * via the registered hook) agree that selected_hotbar changed and nothing else did. */
+
+static void test_inv_select_roundtrip_reflected_in_snapshot(void)
+{
+    puts("real interop: BS_INV_OP_SELECT sent to the real server changes selected_hotbar, and the "
+         "server's NEXT INV_STATE snapshot reflects it, both on the wire and in the client's own "
+         "decode");
+
+    const uint32_t client = 0xC1E00012u;
+    const uint8_t  target_slot = 3;
+
+    networldInit();
+    networldSetInvHook(invHook, NULL);
+    g_inv_hook_calls = 0;
+    g_client_sid = client;
+    captureReset();
+    captureInvReset();
+
+    send_join(client, "invclient3");
+    pumpUntilInvCaptured(1, 1000);
+    check(g_captured_inv_count == 1, "join's INV_STATE arrived");
+    check(g_last_inv_state.selected_hotbar == 0, "a fresh player starts on hotbar slot 0");
+
+    captureInvReset();
+    g_inv_hook_calls = 0;
+    check(networldSendInvAction(BS_INV_OP_SELECT, target_slot, 0, 0) == true,
+          "SELECT(3) sent to the real server");
+
+    pumpUntilInvCaptured(1, 1000);
+    check(g_captured_inv_count == 1, "the server answered the SELECT with exactly one new INV_STATE");
+    if (g_captured_inv_count == 1) {
+        check(g_captured_inv_len[0] == BS_INV_STATE_BYTES,
+              "the reply is exactly BS_INV_STATE_BYTES long");
+        check(g_captured_inv[0][1] == target_slot,
+              "the raw reply's selected_hotbar byte (offset 1) reflects the SELECT this client "
+              "just sent");
+    }
+
+    check(g_inv_hook_calls == 1, "the client's own decode parsed the reply and fired the hook once");
+    check(g_last_inv_state.selected_hotbar == target_slot,
+          "the client's own decode agrees with the raw bytes: selected_hotbar == 3 after the "
+          "round trip");
+
+    bool slots_unchanged = true;
+    for (int i = 0; i < NETWORLD_INV_SLOT_COUNT; i++) {
+        if (g_last_inv_state.slots[i].item != 0 || g_last_inv_state.slots[i].count != 0) {
+            slots_unchanged = false;
+        }
+    }
+    check(slots_unchanged,
+          "SELECT changed selected_hotbar and nothing else — all 24 slots are still empty");
+}
+
+/* ------------------------------------------------------------------------------- scenario 8 --
+ * BS_INV_OP_PICKUP, taken on trust by the real server by design (bs_proto.h's comment above
+ * BS_INV_OP_PICKUP/BS_INV_OP_CONSUME: bsgame has no terrain generator to check a pickup report
+ * against, so it never will). "Taken on trust" only matters if it actually always lands — this
+ * proves a real PICKUP sent by the real client always shows up in the real server's next
+ * snapshot, the same round-trip shape as scenario 7 but for the op the feature depends on most
+ * for ordinary play (every block break goes through this, not through SELECT). */
+
+static void test_inv_pickup_roundtrip_reflected_in_snapshot(void)
+{
+    puts("real interop: BS_INV_OP_PICKUP sent to the real server always lands in the NEXT "
+         "INV_STATE snapshot — taken on trust, by design, and always credited");
+
+    const uint32_t client = 0xC1E00013u;
+    const uint8_t  item   = BLOCK_DIRT;
+    const uint8_t  count  = 5;
+
+    networldInit();
+    networldSetInvHook(invHook, NULL);
+    g_inv_hook_calls = 0;
+    g_client_sid = client;
+    captureReset();
+    captureInvReset();
+
+    send_join(client, "invclient4");
+    pumpUntilInvCaptured(1, 1000);
+    check(g_captured_inv_count == 1, "join's INV_STATE arrived");
+
+    captureInvReset();
+    g_inv_hook_calls = 0;
+    check(networldSendInvAction(BS_INV_OP_PICKUP, item, count, 0) == true,
+          "PICKUP(BLOCK_DIRT, 5) sent to the real server");
+
+    pumpUntilInvCaptured(1, 1000);
+    check(g_captured_inv_count == 1, "the server answered the PICKUP with a new INV_STATE");
+    check(g_inv_hook_calls == 1, "the client's own decode parsed the reply and fired the hook once");
+
+    bool found = false;
+    for (int i = 0; i < NETWORLD_INV_SLOT_COUNT; i++) {
+        if (g_last_inv_state.slots[i].item == item && g_last_inv_state.slots[i].count == count) {
+            found = true;
+            break;
+        }
+    }
+    check(found,
+          "the picked-up item (BLOCK_DIRT x5) landed somewhere in the real server's snapshot, "
+          "credited without server-side verification, exactly as bs_proto.h documents PICKUP "
+          "must be");
+}
+
 /* --------------------------------------------------------------------------------------- main */
 
 int main(void)
@@ -654,6 +922,11 @@ int main(void)
     test_empty_last_batch();
     test_full_batch_max_entries();
     test_sub_then_unsub_real_roundtrip();
+
+    test_inv_state_volunteered_at_join();
+    test_inv_action_gated_on_inv_state();
+    test_inv_select_roundtrip_reflected_in_snapshot();
+    test_inv_pickup_roundtrip_reflected_in_snapshot();
 
     reap_daemon();
 

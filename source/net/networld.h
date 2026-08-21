@@ -98,6 +98,64 @@ void networldSetEditHook(NetworldEditFn fn, void* userdata);
 // did not make it" UDP outcome, not a caller error.
 bool networldSendBlockEdit(int x, int y, int z, uint8_t block);
 
+// ---- inventory sync -----------------------------------------------------------------------
+//
+// See proto/bs_proto.h's own long comment on BS_APP_INV_STATE/BS_APP_INV_ACTION for why the
+// server always speaks first: an old client that has never heard an INV_STATE must never send
+// an INV_ACTION, because an old server would kick it for a message type it does not recognise
+// (server/game/bsgame.c's handle_app_payload default case) — the exact same asymmetry that
+// header explains for BS_APP_CHUNK_SUB. That rule is enforced here, not left to the caller: see
+// networldSendInvAction() below.
+
+// Mirrors BS_INV_SLOT_COUNT (proto/bs_proto.h), restated as its own constant rather than
+// pulling that header's include path into this one for a single integer — the same choice
+// NETWORLD_MAX_REMOTE makes against BS_GAME_MAX_PLAYERS above.
+#define NETWORLD_INV_SLOT_COUNT 24
+
+// One inventory slot, decoded straight off the wire: (item id, stack count). Plain uint8 on
+// purpose — this mirrors the wire shape exactly, not world/inventory.h's own item type, which
+// this header and networld.c must not depend on (see this file's own header comment: the
+// boundary this module holds is "decodes bytes", not "knows what an item is"). Whoever owns
+// world/inventory.h converts these into its own types after the hook fires.
+typedef struct {
+	uint8_t item;
+	uint8_t count;
+} NetworldInvSlot;
+
+// The whole decoded BS_APP_INV_STATE payload, handed to the hook below. A plain struct holding
+// a fixed-size array, rather than a pointer + separate count: NETWORLD_INV_SLOT_COUNT is not a
+// run-time quantity here — INV_STATE is always exactly that many slots, rejected on length
+// otherwise (applyInvState(), networld.c) — so a count parameter would only ever carry one
+// value, and a fixed-size array already says that in the type instead of in a comment.
+typedef struct {
+	uint8_t         selected_hotbar;
+	NetworldInvSlot slots[NETWORLD_INV_SLOT_COUNT];
+} NetworldInvState;
+
+// Called once per valid BS_APP_INV_STATE, mirroring NetworldEditFn's own reasoning exactly:
+// this module stays host-testable (net/networld_test.c) precisely because it never reaches
+// into world/inventory.h itself, so it reports the decoded state and the owner of that header
+// decides what to do with it. `state` is only valid for the duration of the call.
+typedef void (*NetworldInvFn)(void* userdata, const NetworldInvState* state);
+
+// Registers (or with fn == NULL, clears) the hook above. networldInit() clears it too, for the
+// same reason networldSetEditHook()'s does — a hook left over from a previous session would
+// point at UI state that session has already torn down.
+void networldSetInvHook(NetworldInvFn fn, void* userdata);
+
+// Encodes and sends one inventory/crafting op as BS_APP_INV_ACTION. Fire-and-forget, the same
+// posture as networldSendBlockEdit() above — the caller's own local UI is authoritative either
+// way, so this never blocks on or waits for a server round trip.
+//
+// Sends NOTHING, and returns false, until at least one BS_APP_INV_STATE has been received this
+// session. This is not a defensive nicety: proto/bs_proto.h's whole reason INV_STATE is sent
+// unprompted is so that a client which has not heard it — an old build, or one not yet far
+// enough into a session — never originates INV_ACTION, which an old server would refuse
+// outright. Checking "have we heard INV_STATE" here, rather than trusting every caller to check
+// first, is what makes that guarantee actually hold rather than merely being documented. This
+// is the capability probe itself, not a guard in front of it.
+bool networldSendInvAction(uint8_t op, uint8_t a, uint8_t b, uint8_t c);
+
 // ---- per-column diff subscription (V127-A) ---------------------------------------------------
 //
 // Why this pair exists at all, given BS_APP_WORLD_SYNC already replays every diff at JOIN: that

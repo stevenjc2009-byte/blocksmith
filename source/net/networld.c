@@ -24,6 +24,25 @@ static BlockDiffStore s_pending;
 static NetworldEditFn s_edit_fn;
 static void*          s_edit_ud;
 
+// networld.h defines its own NETWORLD_INV_SLOT_COUNT rather than including this header for one
+// integer (see that comment); this keeps the duplicate honest the same way validate.h's
+// static-asserts do for BS_BLOCK_COUNT.
+_Static_assert(NETWORLD_INV_SLOT_COUNT == BS_INV_SLOT_COUNT,
+               "networld.h's slot count must match proto/bs_proto.h's");
+
+// Who to tell when a valid BS_APP_INV_STATE arrives. See networld.h's own comment on
+// NetworldInvFn for why this is a hook rather than a direct call into world/inventory.h.
+static NetworldInvFn s_inv_fn;
+static void*         s_inv_ud;
+
+// True once at least one valid BS_APP_INV_STATE has been decoded this session. This is the
+// capability probe networld.h's own comment on networldSendInvAction() describes — the server
+// speaks first, and a client that has not heard it must never originate BS_APP_INV_ACTION, or
+// an old server would kick it for a message type it does not recognise. Reset by networldInit()
+// alongside every other per-session static, so a stale "yes" never survives into a fresh
+// session that has not actually heard from this server yet.
+static bool s_have_inv_state;
+
 // The single place an applied edit is announced. Called only after the block is really in the
 // world — never for one that is merely queued, which would tell the renderer to rebuild a mesh
 // that is still correct and, worse, imply a block is readable when it is not.
@@ -179,6 +198,39 @@ static void applyWorldInfo(const uint8_t* msg, size_t len)
 	s_have_world_seed = true;
 }
 
+// BS_APP_INV_STATE: the whole inventory, authoritative, exactly BS_INV_STATE_BYTES or dropped
+// — same "reject on length, never half-parse" posture applyWorldInfo() above takes, for the
+// same reason bs_proto.h states there: a longer INV_STATE from a newer server must be
+// rejectable outright rather than silently misread.
+static void applyInvState(const uint8_t* msg, size_t len)
+{
+	if (len != BS_INV_STATE_BYTES) return;
+
+	NetworldInvState state;
+	state.selected_hotbar = msg[1];
+
+	const uint8_t* p = msg + BS_APP_HDR_BYTES + 1u;
+	for (uint32_t i = 0; i < BS_INV_SLOT_COUNT; i++) {
+		const uint8_t item  = p[0];
+		const uint8_t count = p[1];
+
+		// bs_proto.h: count == 0 iff item == 0 (BLOCK_AIR / ITEM_NONE); any other pairing is a
+		// packet the client is entitled to treat as malformed, and the whole packet is dropped
+		// — not the one bad slot — same posture as a bad length or an over-cap count below.
+		if ((count == 0) != (item == 0)) return;
+		if (count > BS_INV_STACK_MAX)    return;
+
+		state.slots[i].item  = item;
+		state.slots[i].count = count;
+		p += 2;
+	}
+
+	// Only set once the whole packet has proven well-formed above — a malformed INV_STATE must
+	// not be the thing that first arms the capability probe networldSendInvAction() checks.
+	s_have_inv_state = true;
+	if (s_inv_fn) s_inv_fn(s_inv_ud, &state);
+}
+
 // BS_APP_CHUNK_DIFFS: one column's worth of diffs, batched. Same per-entry shape as
 // applyWorldSync() above and deliberately handled the same way — apply now if the column is
 // already loaded, queue it via net/blockdiff.h otherwise — because a diff scoped to a column is
@@ -294,6 +346,7 @@ void networldApplyPayload(const uint8_t* payload, size_t len)
 	case BS_APP_POS_UPDATE:  applyPosUpdate(payload, len);  break;
 	case BS_APP_WORLD_INFO:  applyWorldInfo(payload, len);  break;
 	case BS_APP_CHUNK_DIFFS: applyChunkDiffs(payload, len); break;
+	case BS_APP_INV_STATE:   applyInvState(payload, len);  break;
 	// Every other type byte is something this client build has no use for. Silently skipped
 	// rather than treated as an error: the server is trusted to only ever send well-formed
 	// application types (server/game/bsgame.c kicks a *client* for sending one it does not
@@ -334,6 +387,12 @@ void networldSetEditHook(NetworldEditFn fn, void* userdata)
 	s_edit_ud = userdata;
 }
 
+void networldSetInvHook(NetworldInvFn fn, void* userdata)
+{
+	s_inv_fn = fn;
+	s_inv_ud = userdata;
+}
+
 void networldInit(void)
 {
 	blockdiffInit(&s_pending);
@@ -343,6 +402,13 @@ void networldInit(void)
 	// renderer state that session has already torn down.
 	s_edit_fn = NULL;
 	s_edit_ud = NULL;
+
+	// Same reasoning as the edit hook above, plus the capability probe itself: a fresh session
+	// has heard nothing from this server yet, regardless of what the previous session heard.
+	s_inv_fn          = NULL;
+	s_inv_ud          = NULL;
+	s_have_inv_state  = false;
+
 	s_last_pose_send_ms = 0;
 	s_pose_sent_once    = false;
 	s_world_seed        = 0;
@@ -420,6 +486,26 @@ bool networldSendBlockEdit(int x, int y, int z, uint8_t block)
 	const bool ok = netTransportSend(out, sizeof out);
 	if (ok) s_sent_edits++;
 	return ok;
+}
+
+// See networld.h's own comment on this for why the capability-probe check comes first and
+// unconditionally: sending nothing before an INV_STATE has arrived is not a defensive nicety,
+// it is the entire reason a new client->server message could be introduced at all without a
+// hand-sequenced release (proto/bs_proto.h's long comment on BS_APP_INV_STATE/BS_APP_INV_ACTION
+// spells out why). Encoded by hand, little-endian, never memcpy of a struct — the same posture
+// networldSendBlockEdit() takes just above, for the same struct-padding reason bs_proto.h's own
+// byte-order note gives.
+bool networldSendInvAction(uint8_t op, uint8_t a, uint8_t b, uint8_t c)
+{
+	if (!s_have_inv_state) return false;
+
+	uint8_t out[BS_INV_ACTION_BYTES];
+	out[0] = BS_APP_INV_ACTION;
+	out[1] = op;
+	out[2] = a;
+	out[3] = b;
+	out[4] = c;
+	return netTransportSend(out, sizeof out);
 }
 
 // See networld.h's own comment on this pair for why both are void, fire-and-forget, and
