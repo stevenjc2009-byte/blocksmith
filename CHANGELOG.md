@@ -4,6 +4,56 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] - 2026-08-22
+
+### Added
+
+- **Server-side saved players.** A server running v1.5.0 now remembers each
+  player between sessions — position, rotation, armor, XP, health and hunger —
+  and hands it all back when you rejoin. This release carries the client half
+  of that contract: the new `BS_APP_PLAYER_STATE` packet is decoded the moment
+  it arrives (even while the title screen is still pumping network updates)
+  and retained in `source/net/networld.c` alongside the inventory snapshot it
+  already kept. Armor, XP, health and hunger have no gameplay on the client
+  yet — they are held verbatim behind a deliberately dumb boundary
+  (`NetworldPlayerMeters`, `source/net/networld.h`) so the wire format is
+  frozen before those systems land. The report half of the pair exists too,
+  but stays dark twice over: the client sends nothing until the server has
+  proven it speaks player state, and the meter-filling code is compiled out
+  entirely (`BS_CLIENT_HAS_METERS=0`), so this build can never overwrite a
+  returning player's saved progress with zeros. The server side is server
+  v1.5.0, released separately.
+
+- **An adaptive lighting engine** (`source/world/light.{c,h}`, new). Sky light
+  is computed per world column by two engines the host suite asserts produce
+  byte-identical output — BFS flood fill at generation time on the worker
+  thread, fixed-order relaxation sweeps when blocks change on the main thread —
+  and baked into each vertex through the pad byte the mesher has carried since
+  the v1.2.5 alignment fix. On a New 3DS a new dynamic shader
+  (`source/shaders/world_dynamic.v.pica`) unpacks those values per corner, so
+  overhangs, caves and tree canopies finally shade by what is actually
+  overhead; on an Old 3DS nothing runs, nothing allocates, and every vertex is
+  byte-for-byte what it always was. The console model picks the path once at
+  startup via `APT_CheckNew3DS`; day-night modulation already rides in the
+  shader but is pinned to full daylight until a cycle exists.
+
+### Changed
+
+- **Protocol pin updated to server v1.5.0** (`e8e094c`), the commit that added
+  the player-state/report pair above, replacing the v1.3.0-era pin left from
+  the v1.4.0 repair. Fresh clones now build against the wire format this
+  release actually speaks; the Makefile documents the deployment order — state
+  first, reports only ever after the server has spoken.
+
+### Fixed
+
+- **Rejoining a server restores your last position and facing** instead of
+  dropping you at the world spawn point. The saved pose replays once, right
+  after player init in `source/main.c`, using the same arrival-order trick as
+  the inventory snapshot: the packet lands before the player object exists, is
+  kept by the network layer, then applied. Against a server that does not send
+  player state nothing changes — no packet, no restore, the usual spawn choice.
+
 ## [1.4.0] - 2026-08-21
 
 ### Added
