@@ -36,6 +36,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	tests/host_test.c \
 	tests/net_stub.c \
 	source/world/block.c \
+	source/world/registry.c \
 	source/world/chunk.c \
 	source/world/chunk_codec.c \
 	source/world/crc32.c \
@@ -59,6 +60,20 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	-o "$BH/world_test"
 
 "./$BH/world_test"
+
+# The master block registry itself (v1.6.0 Phase A). Sixteenth binary, own main(),
+# same reason as every one above it: registration, name lookup, the full-range
+# refusal, crc16 stability (with a pinned golden for the core table) and the
+# registry.bin sidecar round-trip are all plain-C contracts provable here in
+# seconds, and a broken registry must not stop the world suite from running.
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/registry_test.c \
+	-o "$BH/registry_test"
+
+"./$BH/registry_test"
 
 # Step 8.4's options.ini module, built and run separately rather than folded into the list
 # above. It carries its own main() — the world suite is driven by tests/host_test.c — and
@@ -190,7 +205,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g 	-I source 	source/net/blockdiff.c 	so
 # every other build (console included) the gate is 0 and the encoder does not exist, because
 # sending zeros would wipe a returning player's saved state — see that header. Flipping it
 # HERE and only here is what lets the encode path stay tested while production keeps it off.
-gcc -std=c11 -Wall -Wextra -Werror -O1 -g -DBS_CLIENT_HAS_METERS=1 	-I source -I deps/blocksmith-server 	source/world/world.c 	source/world/block.c 	source/world/chunk.c 	source/world/budget.c 	source/net/blockdiff.c 	source/net/networld.c 	source/net/networld_test.c 	-o "$BH/networld_test"
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g -DBS_CLIENT_HAS_METERS=1 	-I source -I deps/blocksmith-server 	source/world/world.c 	source/world/block.c 	source/world/registry.c 	source/world/chunk.c 	source/world/budget.c 	source/net/blockdiff.c 	source/net/networld.c 	source/world/mesher.c 	source/world/scratch.c 	source/net/networld_test.c 	-o "$BH/networld_test"
 
 "./$BH/networld_test"
 
@@ -205,6 +220,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	-I source -I deps/blocksmith-server \
 	source/world/world.c \
 	source/world/block.c \
+	source/world/registry.c \
 	source/world/chunk.c \
 	source/world/budget.c \
 	source/world/inventory.c \
@@ -212,6 +228,8 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/world/crc32.c \
 	source/net/blockdiff.c \
 	source/net/networld.c \
+	source/world/mesher.c \
+	source/world/scratch.c \
 	source/net/inv_bridge.c \
 	source/net/inv_bridge_test.c \
 	-o "$BH/inv_bridge_test"
@@ -251,7 +269,7 @@ MINGW*|MSYS*|CYGWIN*) echo "skipping interop_test on Windows (Unix sockets unava
 *)
 make -C deps/blocksmith-server/game bsgame
 
-gcc -std=c11 -Wall -Wextra -Werror -O1 -g 	-I source -I deps/blocksmith-server 	source/world/world.c 	source/world/block.c 	source/world/chunk.c 	source/world/budget.c 	source/net/blockdiff.c 	source/net/networld.c 	source/net/interop_test.c 	-o "$BH/interop_test"
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g 	-I source -I deps/blocksmith-server 	source/world/world.c 	source/world/block.c 	source/world/registry.c 	source/world/chunk.c 	source/world/budget.c 	source/net/blockdiff.c 	source/net/networld.c 	source/world/mesher.c 	source/world/scratch.c 	source/net/interop_test.c 	-o "$BH/interop_test"
 
 "./$BH/interop_test"
 ;;
@@ -265,6 +283,7 @@ esac
 gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	-I source \
 	source/world/block.c \
+	source/world/registry.c \
 	source/scene/minimap.c \
 	source/scene/minimap_test.c \
 	-o "$BH/minimap_test"

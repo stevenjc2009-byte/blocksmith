@@ -29,8 +29,14 @@
 #include "net/blockdiff.h"
 #include "net/bsnet_sock.h"
 #include "net/bsnet_transport.h"
+#include "world/atlas_uv.h"
 #include "world/block.h"
+#include "world/mesher.h"
+#include "world/registry.h"
+#include "world/scratch.h"
 #include "world/world.h"
+
+#include <stdlib.h>
 
 #include "proto/bs_proto.h"
 
@@ -395,13 +401,22 @@ static void test_validation_rejects_hostile_input(void)
     networldApplyPayload(msg, sizeof msg);
     check(worldGet(&w, 5, WORLD_HEIGHT - 1, 5) == BLOCK_AIR, "y == WORLD_HEIGHT rejected");
 
-    buildBlockEdit(msg, 5, 10, 5, (uint8_t)BLOCK_COUNT);
+    /* v1.6.0: the legal id space is the registry's, not BLOCK_COUNT's. A dyn id
+     * is accepted even when this table does not define it yet — it stores raw
+     * and reads back as air through blockInfo()'s contract until DEFS arrive. */
+    buildBlockEdit(msg, 5, 10, 5, REG_ID_DYN_LO);
     networldApplyPayload(msg, sizeof msg);
-    check(worldGet(&w, 5, 10, 5) == BLOCK_AIR, "block id == BLOCK_COUNT (one past the last real id) rejected");
+    check(worldGet(&w, 5, 10, 5) == REG_ID_DYN_LO,
+          "an undefined-but-legal dyn id is stored raw, not rejected");
+
+    buildBlockEdit(msg, 5, 10, 5, (uint8_t)REG_ID_DYN_HI + 1u /* 0xFE, reserved */);
+    networldApplyPayload(msg, sizeof msg);
+    check(worldGet(&w, 5, 10, 5) == REG_ID_DYN_LO,
+          "block id 0xFE (reserved) rejected");
 
     buildBlockEdit(msg, 5, 10, 5, (uint8_t)0xFF);
     networldApplyPayload(msg, sizeof msg);
-    check(worldGet(&w, 5, 10, 5) == BLOCK_AIR, "block id 0xFF rejected");
+    check(worldGet(&w, 5, 10, 5) == REG_ID_DYN_LO, "block id 0xFF rejected");
 
     buildBlockEdit(msg, 500000, 10, 5, BLOCK_STONE);
     networldApplyPayload(msg, sizeof msg);
@@ -435,7 +450,7 @@ static void test_world_sync_batch(void)
     struct sync_entry e[3] = {
         { 4, 10, 4, BLOCK_STONE },    /* column (0,0): loaded, should apply directly    */
         { 84, 10, 4, BLOCK_SAND },    /* column (5,0): not loaded, should queue         */
-        { 6, 10, 6, (uint8_t)BLOCK_COUNT }, /* invalid block id: should be skipped       */
+        { 6, 10, 6, 0xFF },           /* invalid block id: should be skipped            */
     };
     uint8_t buf[BS_WORLD_SYNC_BYTES(3)];
     size_t len = buildWorldSync(buf, e, 3);
@@ -524,7 +539,7 @@ static void test_chunk_diffs_batch(void)
     struct sync_entry e[3] = {
         { 4, 10, 4, BLOCK_STONE },          /* column (0,0): loaded, should apply directly */
         { 84, 10, 4, BLOCK_SAND },          /* column (5,0): not loaded, should queue      */
-        { 6, 10, 6, (uint8_t)BLOCK_COUNT }, /* invalid block id: should be skipped         */
+        { 6, 10, 6, 0xFF },                 /* invalid block id: should be skipped         */
     };
     uint8_t buf[BS_CHUNK_DIFFS_BYTES(3)];
     size_t len = buildChunkDiffs(buf, 0, 0, BS_CHUNK_DIFFS_LAST, e, 3);
@@ -1625,6 +1640,258 @@ static void test_rejoin_sync_larger_than_the_store_keeps_every_edit(void)
 
 /* ------------------------------------------------------------------------- main */
 
+/* ------------------------------------------------- registry sync (v1.6.0 Phase A) ---
+ *
+ * The client half of the master block registry: INFO/FETCH/DEFS. The table itself is
+ * probed by world/registry_test.c; everything here is about the WIRE behaviour —
+ * when a FETCH goes out, how batches converge, and what an edit carrying a not-yet-
+ * -defined id does before and after sync. These run last in main() because they
+ * mutate the process-wide registry the earlier tests expect pristine. */
+
+static void buildRegistryInfo(uint8_t *out /* BS_APP_REGISTRY_INFO_BYTES */)
+{
+    out[0] = BS_APP_REGISTRY_INFO;
+    out[1] = REGISTRY_REV;
+    out[2] = registryCount();
+    bs_put_u16(out + 3, registryCrc16());
+}
+
+static size_t buildRegistryDefs(uint8_t *out, uint8_t first,
+                                const BlockDef *defs, unsigned n, bool last)
+{
+    out[0] = BS_APP_REGISTRY_DEFS;
+    out[1] = first;
+    out[2] = (uint8_t)n;
+    out[3] = last ? 1 : 0;
+    for (unsigned i = 0; i < n; i++) {
+        registryDefPack(out + 4 + i * REGISTRY_WIRE_RECORD_BYTES,
+                        (BlockId)(first + i), &defs[i]);
+    }
+    return BS_APP_REGISTRY_DEFS_BYTES(n);
+}
+
+static BlockDef wireDef(const char *name)
+{
+    BlockDef d;
+    memset(&d, 0, sizeof d);
+    snprintf(d.name, sizeof d.name, "%s", name);
+    for (int f = 0; f < BLOCK_FACES; f++) d.tex[f] = BTEX_STONE;
+    d.flags    = REG_FLAG_SOLID;
+    d.hardness = 1;
+    return d;
+}
+
+static void test_registry_info_match_sends_nothing(void)
+{
+    puts("registry: a matching INFO costs zero traffic, a short one arms nothing");
+
+    registryInitCore();
+    networldInit();
+    fakeTransportReset();
+
+    uint8_t info[BS_APP_REGISTRY_INFO_BYTES];
+    buildRegistryInfo(info);
+    networldApplyPayload(info, sizeof info);
+    check(fake_sent_calls == 0, "a matching rev/count/crc16 sends nothing back");
+
+    /* A wrong-length INFO is dropped without arming the capability probe: the
+     * FETCH that must only ever follow a WELL-FORMED INFO stays unsent. */
+    networldInit();
+    fakeTransportReset();
+    uint8_t short_info[BS_APP_REGISTRY_INFO_BYTES - 1];
+    memcpy(short_info, info, sizeof short_info);
+    networldApplyPayload(short_info, sizeof short_info);
+    check(fake_sent_calls == 0, "a malformed INFO neither matches nor provokes a FETCH");
+}
+
+static void test_registry_info_mismatch_sends_fetch_once(void)
+{
+    puts("registry: a mismatched INFO answers with exactly one FETCH per session");
+
+    registryInitCore();
+    networldInit();
+    fakeTransportReset();
+
+    uint8_t info[BS_APP_REGISTRY_INFO_BYTES];
+    buildRegistryInfo(info);
+    info[3] ^= 0xFFu;   /* corrupt the crc low byte: guaranteed mismatch */
+    networldApplyPayload(info, sizeof info);
+    check(fake_sent_calls == 1 && fake_sent_len == BS_APP_REGISTRY_FETCH_BYTES
+          && fake_sent_buf[0] == BS_APP_REGISTRY_FETCH
+          && fake_sent_buf[1] == REG_ID_DYN_LO,
+          "the mismatch draws one FETCH asking from the dyn base 0x80");
+
+    /* The server re-transmits INFO (it volunteers it at join; a retry would too).
+     * The FETCH must not go out twice — one outstanding request is the whole design. */
+    fakeTransportReset();
+    networldApplyPayload(info, sizeof info);
+    check(fake_sent_calls == 0, "a second mismatched INFO does not re-send the FETCH");
+
+    /* A revision mismatch alone is also a mismatch, on a fresh session. */
+    networldInit();
+    fakeTransportReset();
+    buildRegistryInfo(info);
+    info[1] = (uint8_t)(REGISTRY_REV + 1u);
+    networldApplyPayload(info, sizeof info);
+    check(fake_sent_calls == 1 && fake_sent_buf[0] == BS_APP_REGISTRY_FETCH,
+          "a future-table revision draws the same single FETCH");
+}
+
+static void test_registry_defs_converge(void)
+{
+    puts("registry: DEFS batches converge the table; pre-sync unknown ids resolve");
+
+    registryInitCore();
+    networldInit();
+    fakeTransportReset();
+
+    World w;
+    worldInit(&w);
+    networldSetWorld(&w);
+    worldColumnCreate(&w, 0, 0);
+
+    /* An edit carrying a dyn id the local table does not know YET: accepted (it is
+     * inside the legal id space), stored raw, and read back as air through
+     * blockInfo()'s never-NULL contract until definitions arrive. */
+    uint8_t msg[BS_BLOCK_EDIT_BYTES];
+    buildBlockEdit(msg, 5, 10, 7, REG_ID_DYN_LO);
+    networldApplyPayload(msg, sizeof msg);
+    check(worldGet(&w, 5, 10, 7) == REG_ID_DYN_LO,
+          "an unknown-but-legal dyn id is stored raw, not rejected like 0xFF");
+    check(!blockIsSolid(REG_ID_DYN_LO) && strcmp(blockInfo(REG_ID_DYN_LO)->name, "air") == 0,
+          "before sync the id renders as air");
+
+    /* Mismatched INFO -> FETCH -> DEFS. After the batch lands, the SAME id in the
+     * SAME voxel resolves to the real definition — the doc's "render as air then
+     * resolve" contract, end to end. */
+    uint8_t info[BS_APP_REGISTRY_INFO_BYTES];
+    buildRegistryInfo(info);
+    info[3] ^= 0xFFu;
+    networldApplyPayload(info, sizeof info);
+    check(fake_sent_calls == 1, "the mismatch drew the FETCH");
+
+    BlockDef defs[2] = { wireDef("wire_a"), wireDef("wire_b") };
+    uint8_t batch[BS_APP_REGISTRY_DEFS_BYTES(2)];
+    size_t len = buildRegistryDefs(batch, REG_ID_DYN_LO, defs, 2, true);
+    networldApplyPayload(batch, len);
+
+    check(registryFind("wire_a") == REG_ID_DYN_LO && registryFind("wire_b") == REG_ID_DYN_LO + 1,
+          "both defs landed under their consecutive ids");
+    check(registryCount() == 10, "count moved from 8 to 10 defined rows");
+    check(blockIsSolid(REG_ID_DYN_LO), "after sync the same id resolves to the real def");
+    check(worldGet(&w, 5, 10, 7) == REG_ID_DYN_LO,
+          "the stored raw byte needed no rewrite — tables agree around it");
+    check(registryCrc16() != 0x7E5Bu,
+          "the converged table no longer hashes like the core-only one");
+}
+
+static void test_registry_defs_malformed_dropped_whole(void)
+{
+    puts("registry: malformed DEFS batches are dropped whole, table untouched");
+
+    registryInitCore();
+    networldInit();
+    fakeTransportReset();
+
+    BlockDef defs[2] = { wireDef("bad_a"), wireDef("bad_b") };
+    uint8_t batch[BS_APP_REGISTRY_DEFS_BYTES(2)];
+    size_t len = buildRegistryDefs(batch, REG_ID_DYN_LO, defs, 2, true);
+
+    /* Short by one record byte: length-exact posture, drop without parsing. */
+    networldApplyPayload(batch, len - 1);
+    check(registryCount() == 8 && registryFind("bad_a") == 0,
+          "a truncated DEFS applies nothing");
+
+    /* Claiming more records than the sender's own cap can carry. */
+    uint8_t greedy[BS_APP_REGISTRY_DEFS_BYTES(2)];
+    memcpy(greedy, batch, sizeof greedy);
+    greedy[2] = BS_APP_REGISTRY_DEFS_MAX_N + 1u;
+    networldApplyPayload(greedy, sizeof greedy);
+    check(registryCount() == 8, "an over-cap count is refused outright");
+
+    /* first below the dyn range would overwrite compiled-in core rows. */
+    uint8_t hostile[BS_APP_REGISTRY_DEFS_BYTES(2)];
+    memcpy(hostile, batch, sizeof hostile);
+    hostile[1] = BLOCK_STONE;
+    networldApplyPayload(hostile, sizeof hostile);
+    check(registryCount() == 8 && strcmp(blockInfo(BLOCK_STONE)->name, "stone") == 0,
+          "a batch aimed at the core range changes nothing");
+
+    /* A record whose embedded id disagrees with its slot position: all-or-nothing. */
+    uint8_t shuffled[BS_APP_REGISTRY_DEFS_BYTES(2)];
+    memcpy(shuffled, batch, sizeof shuffled);
+    shuffled[4] = REG_ID_DYN_LO + 1u;   /* record 0 claims id 0x81 */
+    networldApplyPayload(shuffled, sizeof shuffled);
+    check(registryCount() == 8 && registryFind("bad_a") == 0 && registryFind("bad_b") == 0,
+          "one inconsistent record refuses the WHOLE batch, not just itself");
+}
+
+/* Proves planBuild ordering plus the s_rect resize in one scenario: a solid block
+ * registered ABOVE the old [BLOCK_COUNT] rect table meshes correctly. Before the
+ * v1.6.0 fix this indexed s_rect[0x80] out of bounds of an 8-row array; today the
+ * table is [REGISTRY_MAX][BLOCK_FACES] and the face emits with the right atlas tile. */
+static void test_mesher_tables_after_register(void)
+{
+    puts("mesher: a freshly registered dyn block meshes with its own atlas rect");
+
+    registryInitCore();
+
+    BlockDef d = wireDef("mesh_probe");
+    d.tex[FACE_TOP] = BTEX_GRASS_TOP;   // distinguishable from the sides on purpose
+    BlockId id = registryRegister(&d);
+    check(id == REG_ID_DYN_LO, "the probe block took the first dyn id");
+
+    World w;
+    worldInit(&w);
+    /* Chunk (1,1,1), not (0,0,0): at the world's bottom layer the mesher culls
+     * the underside on purpose (scratchFill treats below-world as solid), which
+     * would make the expected face count 1280 instead of the full 1536. */
+    Chunk *c = worldChunkCreate(&w, 1, 1, 1);
+    check(c != NULL, "fixture chunk allocated");
+    if (!c) return;
+    chunkClear(c, id);   // whole chunk = the new block
+
+    static MeshScratch scratch;
+    scratchFill(&scratch, &w, 1, 1, 1);
+
+    MeshOut out = {0};
+    out.vert_cap  = MESH_MAX_VERTS;
+    out.index_cap = MESH_MAX_INDICES;
+    out.verts   = (MeshVertex *)malloc(sizeof(MeshVertex) * out.vert_cap);
+    out.indices = (uint16_t *)malloc(sizeof(uint16_t) * out.index_cap);
+    check(out.verts != NULL && out.indices != NULL, "mesh buffers allocated");
+    if (!out.verts || !out.indices) { free(out.verts); free(out.indices); return; }
+
+    meshChunk(&out, &scratch);
+    check(!out.overflow, "the mesh completed without overflow");
+    check(out.faces == 6 * CHUNK_DIM * CHUNK_DIM,
+          "a full chunk of the new solid block emits every face");
+    check(out.opaque_faces == out.faces && out.opaque_index_count == out.index_count,
+          "and all of it is opaque, since the def carries SOLID without TRANSPARENT");
+
+    unsigned wrong_tile = 0;
+    for (uint32_t i = 0; i < out.vert_count; i++) {
+        const MeshVertex *v = &out.verts[i];
+        const AtlasRect r = atlasRect(d.tex[v->nrm]);
+        if ((v->u != r.u0 && v->u != r.u1) || (v->v != r.v0 && v->v != r.v1)) {
+            wrong_tile++;
+        }
+    }
+    check(wrong_tile == 0, "every vertex UV corner comes from the def's own tiles");
+
+    /* mesherInvalidateTables() drops planBuild's readiness; the next meshChunk
+     * rebuilds lazily and reaches the identical answer. This is the exact call
+     * registryApplyRemote() makes after each applied batch. */
+    mesherInvalidateTables();
+    memset(out.verts, 0xAB, sizeof(MeshVertex) * out.vert_cap);
+    meshChunk(&out, &scratch);
+    check(out.faces == 6 * CHUNK_DIM * CHUNK_DIM && out.vert_count > 0,
+          "after invalidation the next meshChunk rebuilds the same geometry");
+
+    free(out.verts);
+    free(out.indices);
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -1678,6 +1945,13 @@ int main(void)
     test_player_state_capability_transitions();
     test_send_player_report_encodes();
     test_rejoin_sync_larger_than_the_store_keeps_every_edit();
+
+    /* Registry probes last: they mutate the process-wide table. */
+    test_registry_info_match_sends_nothing();
+    test_registry_info_mismatch_sends_fetch_once();
+    test_registry_defs_converge();
+    test_registry_defs_malformed_dropped_whole();
+    test_mesher_tables_after_register();
 
     printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;
