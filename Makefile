@@ -147,7 +147,7 @@ PROTO_REPO	:=	https://github.com/stevenjc2009-byte/blocksmith-server.git
 # this client's PLAYER_REPORT is capability-gated on having heard PLAYER_STATE (see
 # net/networld.h), so an old server simply never hears it — but the pose-restore
 # feature needs a server that sends PLAYER_STATE at JOIN.
-PROTO_COMMIT	:=	e8e094c9eda01780d01246c80160667e4c4b9fd9
+PROTO_COMMIT	:=	25ae9674af7ac8f7786dc5c4a0ac53969728982b
 PROTO		:=	deps/blocksmith-server
 
 .PHONY: deps
