@@ -83,6 +83,11 @@ extern const uint8_t kFaceOrder[BLOCK_FACES];
 // nowhere near a u16.
 void meshChunk(MeshOut* out, const MeshScratch* s);
 
+// Drops the derived block tables (solidity, occlusion, atlas rects) so the next
+// meshChunk() rebuilds them. Called when remote registry definitions are applied
+// at join; until then the tables are built lazily on first use and never change.
+void mesherInvalidateTables(void);
+
 // The worst case a single chunk can produce, for sizing buffers: a 3D checkerboard,
 // where every solid block has six exposed faces.
 #define MESH_MAX_FACES    (CHUNK_BLOCKS / 2 * BLOCK_FACES)   // 12288

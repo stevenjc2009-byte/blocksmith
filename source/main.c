@@ -61,6 +61,7 @@
 #include "world/light.h"
 #include "world/mesh_vertex.h"
 #include "world/region.h"
+#include "world/registry.h"
 #include "world/world.h"
 #include "world/world_test.h"
 #include "world/worldgen.h"
@@ -1020,7 +1021,27 @@ static bool genStart(int32_t cx, int32_t cz)
 	// so a local copy could only ever be a second, staler answer to a question the server has
 	// already answered. saveWorldDir() is not called at all rather than called and ignored,
 	// because calling it is what creates the directory.
-	workerSetWorldDir(s_server_session ? NULL : saveWorldDir());
+	const char* const world_dir = s_server_session ? NULL : saveWorldDir();
+
+	// v1.6.0 Phase A: single-player registry sidecar, applied before any column can be
+	// decoded — the worker that reads region files does not exist until workerStart() below.
+	// A false return means "no file yet" (a fresh world whose creation write failed) or an
+	// unreadable one; either way the table stays core-only, which is exactly what an empty
+	// sidecar would have said. In a session the dynamic rows arrive over the wire instead
+	// (REGISTRY_DEFS at join), so there is nothing to load here by design.
+	if (world_dir) {
+		char reg_path[96];
+		snprintf(reg_path, sizeof reg_path, "%s/registry.bin", world_dir);
+		(void)registrySidecarLoad(reg_path);
+	}
+
+	// v1.6.0 Phase A: the table is complete by now — core rows at boot, dynamic rows from
+	// the sidecar or off the wire during join — so it freezes before the worker exists.
+	// Post-freeze every consumer reads it without locks; workerSubmitColumn() refuses to
+	// run against an unfrozen table.
+	registryFreeze();
+
+	workerSetWorldDir(world_dir);
 
 	if (!workerStart(&s_gen))
 		return false;

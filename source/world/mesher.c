@@ -5,6 +5,7 @@
 #include "world/atlas_uv.h"
 #include "world/block.h"
 #include "world/light.h"
+#include "world/registry.h"
 
 // One face: the neighbour it looks at, an origin corner, and two tangent axes whose
 // cross product is the outward normal. Deriving the winding from the tangents is what
@@ -101,11 +102,25 @@ static uint8_t  s_solid[256];                       // indexed by a raw BlockId 
 // block.c per cell, and there is no link-time optimisation in this build.
 static uint8_t  s_deferred[256];
 static uint8_t  s_occludes[256];                    // solid and opaque: hides what is behind it
-static AtlasRect s_rect[BLOCK_COUNT][BLOCK_FACES];
+// Sized for the whole id space, not just BLOCK_COUNT: dynamic block ids arrive
+// over the wire (0x80..0xFD) and meshPass indexes this table by that raw byte.
+// The old [BLOCK_COUNT] bound was only ever safe because every id in a chunk
+// happened to be a core row; a server-registered solid block would have
+// written past the array. 256 rows x 6 faces x 4 bytes = 6 KB of bss.
+static AtlasRect s_rect[REGISTRY_MAX][BLOCK_FACES];
 static bool     s_ready;
 
-// Builds the three lookup tables. Runs once, on the first chunk meshed: the block
-// registry and kFaces are both const, so nothing here can go stale.
+// Drops the derived tables so the next meshChunk() rebuilds them lazily.
+// Called after remote registry definitions are applied at join; on the console
+// that happens before any worker exists, so no locking is needed here.
+void mesherInvalidateTables(void)
+{
+	s_ready = false;
+}
+
+// Builds the lookup tables. Runs once, on the first chunk meshed — and again
+// after mesherInvalidateTables(), since dynamic registrations can land between
+// joins. kFaces never changes; the block tables can.
 static void planBuild(void)
 {
 	// A raw id, not a validated one. blockInfo() already maps an unknown id to air, so
@@ -117,7 +132,10 @@ static void planBuild(void)
 		s_occludes[i] = (uint8_t)(info->solid && !info->transparent);
 	}
 
-	for (int id = 0; id < BLOCK_COUNT; id++)
+	// Every raw byte value gets a row: blockInfo() maps undefined ids to air,
+	// so the mesher never bounds-checks, and a dynamic id (0x80..0xFD) must
+	// find its real rect here once it is registered.
+	for (int id = 0; id < REGISTRY_MAX; id++)
 		for (int face = 0; face < BLOCK_FACES; face++)
 			s_rect[id][face] = atlasRect(blockFaceTex((BlockId)id, face));
 

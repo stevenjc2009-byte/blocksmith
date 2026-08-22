@@ -9,6 +9,7 @@
 #include "net/bsnet.h"
 #include "net/networld.h"
 #include "world/region.h"
+#include "world/registry.h"
 
 // ── Layout ─────────────────────────────────────────────────────────────────────────────
 //
@@ -350,6 +351,17 @@ static void titleCreateWorldFlow(TitleState* ts, TitleResult* r)
 	// comment — so this both makes a fresh world and re-opens an existing one typed by name,
 	// and either way the player just told this screen exactly what they want to do with it:
 	// play it. Making them find it in the list a second time would be busywork.
+
+	// v1.6.0 Phase A: every world gets its registry sidecar at creation — dynamic block
+	// defs only, the core rows are implied by the binary. Empty today (nothing on this
+	// console registers dynamic rows yet); genStart() loads it back before any column is
+	// decoded, and Phase B grows into it. The write's return value is deliberately not
+	// an error here: an absent sidecar reads back exactly like an empty one (no dynamic
+	// rows), so a failed SD write costs nothing today and nothing later.
+	char reg_path[96];
+	snprintf(reg_path, sizeof reg_path, "%s/%s/registry.bin", REGION_ROOT, name);
+	(void)registrySidecarSave(reg_path);
+
 	r->action = TITLE_START_WORLD;
 	snprintf(r->world_name, sizeof(r->world_name), "%s", name);
 }

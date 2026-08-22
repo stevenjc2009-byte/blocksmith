@@ -8,6 +8,7 @@
 #include "world/jobq.h"
 #include "world/light.h"
 #include "world/region.h"
+#include "world/registry.h"
 
 // 32 KB. worldgenColumn's frame is about 1.3 KB (the 16x16 height and sandy tables) and
 // nothing below it recurses, so this is mostly margin: a stack overflow on this console
@@ -335,6 +336,11 @@ void workerStop(void)
 
 bool workerSubmitColumn(int32_t cx, int32_t cz)
 {
+	// v1.6.0 Phase A: the block registry must be frozen before any generation runs —
+	// populate + freeze happen before workerStart(), so a submit past this point means a
+	// caller is generating against a table that could still change underneath it, which
+	// the design forbids (post-freeze tables are read-only, no locks). Fail loudly.
+	if (!registryFrozen()) return false;
 	if (!s_started) return false;
 
 	const Job job = {JOB_GENERATE, cx, cz, 0};

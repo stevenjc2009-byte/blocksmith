@@ -6,6 +6,8 @@
 #include "net/bsnet_sock.h"
 #include "net/bsnet_transport.h"
 #include "world/block.h"
+#include "world/mesher.h"
+#include "world/registry.h"
 
 #include "proto/bs_proto.h"
 
@@ -88,6 +90,30 @@ static float s_saved_pose_yaw, s_saved_pose_pitch;
 // land). Same write discipline as the pose above.
 static NetworldPlayerMeters s_player_meters;
 
+// ---- block registry sync (v1.6.0 Phase A) -------------------------------------------------
+// The REGISTRY_INFO/DEFS counterparts of the statics above, same capability-probe reasoning:
+// the server speaks first (INFO right after WORLD_INFO at join), and FETCH is only ever sent
+// once an INFO has been seen, so an old server never receives a message type it would kick.
+
+// True once a valid BS_APP_REGISTRY_INFO has been decoded this session. Gates nothing on its
+// own — DEFS are accepted whenever they arrive, since UDP gives no ordering guarantee between
+// them and the INFO — but it is what makes sending FETCH legitimate at all.
+static bool s_have_registry_info;
+
+// True when the compiled-in table provably matches the server's (INFO rev+count+crc16 all
+// agree) or the last batch of a fetch has been applied. Diagnostic today; nothing branches on
+// it yet, but it is the honest answer to "can this client trust its own table" and costs one
+// byte. Reset by networldInit() like every other per-session static.
+static bool s_reg_synced;
+
+// One FETCH per session: if the server's reply batches are lost or reordered, re-asking from a
+// timer is future work, not something this client improvises inside a decoder.
+static bool s_sent_fetch;
+
+// Forward declaration: applyRegistryInfo() answers an INFO mismatch with a FETCH, and the
+// senders live further down this file with every other encoder.
+static void sendRegistryFetch(uint8_t first_index);
+
 // The single place an applied edit is announced. Called only after the block is really in the
 // world — never for one that is merely queued, which would tell the renderer to rebuild a mesh
 // that is still correct and, worse, imply a block is readable when it is not.
@@ -151,14 +177,18 @@ static int s_applied_edits;
 
 // Every value here came off the wire, so every one of it is treated as hostile — same posture
 // as server/game/validate.c's bsEditValid(), which this mirrors. y and block are checked
-// against the client's own real world model (world/world.h's WORLD_HEIGHT, world/block.h's
-// BLOCK_COUNT) rather than a second copy of either number.
+// against the client's own real world model (world/world.h's WORLD_HEIGHT, world/registry.h's
+// id space) rather than a second copy of either number.
 static bool editValid(int32_t x, int32_t y, int32_t z, uint8_t block)
 {
 	if (x < -NETWORLD_XZ_LIMIT || x > NETWORLD_XZ_LIMIT) return false;
 	if (z < -NETWORLD_XZ_LIMIT || z > NETWORLD_XZ_LIMIT) return false;
-	if (y < 0 || y >= WORLD_HEIGHT)                       return false;
-	if (block >= BLOCK_COUNT)                             return false;
+	if (y < 0 || y >= WORLD_HEIGHT)                      return false;
+	// v1.6.0: the whole defined id space is legal, not just the core rows — a server can
+	// register dynamic blocks (0x80..0xFD) this client has not synced yet, and such an edit
+	// must still be applied (it renders as air until the registry catches up, then resolves).
+	// Only the two reserved ids above the dyn range are refused.
+	if (block > REG_ID_DYN_HI)                           return false;
 	return true;
 }
 
@@ -322,6 +352,70 @@ static void applyPlayerState(const uint8_t* msg, size_t len)
 	s_player_flags      = flags;
 }
 
+// BS_APP_REGISTRY_INFO: the server's whole-table fingerprint {rev u8, count u8, crc16 u16 LE},
+// exactly BS_APP_REGISTRY_INFO_BYTES or dropped — the same reject-on-length, never-half-parse
+// posture every other snapshot decoder in this file takes.
+//
+// Matching rev + count + crc16 means this build's compiled-in table already agrees with the
+// server's and the join costs zero extra traffic. Anything else asks for the dynamic rows with
+// one FETCH — core rows are compiled into every binary of this protocol era, so only 0x80..0xFD
+// ever travel. The FETCH goes out here, immediately: at join time this lands right after
+// WORLD_INFO, long before any server column can generate or mesh, which is the ordering slot
+// that makes "apply before generating" free (bs_proto.h's REGISTRY_INFO comment).
+static void applyRegistryInfo(const uint8_t* msg, size_t len)
+{
+	if (len != BS_APP_REGISTRY_INFO_BYTES) return;
+
+	// Armed before any content decision, exactly like applyInvState(): a malformed INFO is
+	// dropped without arming, but a well-formed one proves the server speaks registry at all.
+	s_have_registry_info = true;
+
+	const uint8_t  rev   = msg[1];
+	const uint8_t  count = msg[2];
+	const uint16_t crc   = bs_get_u16(msg + 3);
+
+	if (rev == REGISTRY_REV && count == registryCount() && crc == registryCrc16()) {
+		s_reg_synced = true;
+		return;
+	}
+
+	if (!s_sent_fetch) {
+		s_sent_fetch = true;
+		sendRegistryFetch(REG_ID_DYN_LO);
+	}
+}
+
+// BS_APP_REGISTRY_DEFS: one batch of consecutive dynamic defs {first u8, n u8, last u8,
+// n x 28B}. Exactly BS_APP_REGISTRY_DEFS_BYTES(n) or dropped; n over the sender's own cap is
+// dropped rather than trusted. The records themselves are validated twice over — once for
+// shape here, once for id/name sanity inside registryRemoteApply(), which commits all-or-
+// nothing so a bad batch can never leave a half-applied table behind.
+//
+// After a successful application the mesher's derived tables are dropped so the next
+// meshChunk() rebuilds them against the new rows; edits that arrived before sync were stored
+// as their raw ids and resolve now instead of rendering as air forever.
+//
+// A refused batch (duplicate, gap, out-of-range) is dropped whole and s_reg_synced stays
+// false — degraded but safe: unknown ids keep answering air through blockInfo()'s contract.
+static void registryApplyRemote(const uint8_t* msg, size_t len)
+{
+	if (len < BS_APP_HDR_BYTES + 3u) return;
+
+	const uint8_t first = msg[1];
+	const uint8_t n     = msg[2];
+	const uint8_t last  = msg[3];
+
+	if ((size_t)BS_APP_REGISTRY_DEFS_BYTES(n) != len) return;
+	if (n > BS_APP_REGISTRY_DEFS_MAX_N)               return;
+
+	if (n > 0) {
+		if (registryRemoteApply(first, msg + BS_APP_HDR_BYTES + 3u, n) != n) return;
+		mesherInvalidateTables();
+	}
+
+	if (last & 0x01u) s_reg_synced = true;
+}
+
 // BS_APP_CHUNK_DIFFS: one column's worth of diffs, batched. Same per-entry shape as
 // applyWorldSync() above and deliberately handled the same way — apply now if the column is
 // already loaded, queue it via net/blockdiff.h otherwise — because a diff scoped to a column is
@@ -437,8 +531,10 @@ void networldApplyPayload(const uint8_t* payload, size_t len)
 	case BS_APP_POS_UPDATE:  applyPosUpdate(payload, len);  break;
 	case BS_APP_WORLD_INFO:  applyWorldInfo(payload, len);  break;
 	case BS_APP_CHUNK_DIFFS: applyChunkDiffs(payload, len); break;
-	case BS_APP_INV_STATE:   applyInvState(payload, len);  break;
+	case BS_APP_INV_STATE:   applyInvState(payload, len);   break;
 	case BS_APP_PLAYER_STATE: applyPlayerState(payload, len); break;
+	case BS_APP_REGISTRY_INFO: applyRegistryInfo(payload, len); break;
+	case BS_APP_REGISTRY_DEFS: registryApplyRemote(payload, len); break;
 	// Every other type byte is something this client build has no use for. Silently skipped
 	// rather than treated as an error: the server is trusted to only ever send well-formed
 	// application types (server/game/bsgame.c kicks a *client* for sending one it does not
@@ -517,6 +613,12 @@ void networldInit(void)
 	// flags say no, and overwritten before they can ever be read again.
 	s_have_player_state = false;
 	s_player_flags      = 0;
+
+	// Registry sync state, same per-session discipline: a fresh session has heard no INFO,
+	// synced nothing, and owes no FETCH.
+	s_have_registry_info = false;
+	s_reg_synced         = false;
+	s_sent_fetch         = false;
 
 	s_last_pose_send_ms = 0;
 	s_pose_sent_once    = false;
@@ -615,6 +717,19 @@ bool networldSendInvAction(uint8_t op, uint8_t a, uint8_t b, uint8_t c)
 	out[3] = b;
 	out[4] = c;
 	return netTransportSend(out, sizeof out);
+}
+
+// The registry counterpart of the capability probe above: applyRegistryInfo() only calls this
+// after a well-formed INFO has arrived, so an old server — one that never speaks registry —
+// never receives this C->S type and never has reason to kick us for it. Fire-and-forget like
+// every sender in this file; if the reply batches are lost the client stays degraded (unknown
+// ids answer air) rather than retrying from inside a decoder.
+static void sendRegistryFetch(uint8_t first_index)
+{
+	uint8_t out[BS_APP_REGISTRY_FETCH_BYTES];
+	out[0] = BS_APP_REGISTRY_FETCH;
+	out[1] = first_index;
+	netTransportSend(out, sizeof out);
 }
 
 // See networld.h's own comment on this pair for why both are void, fire-and-forget, and
