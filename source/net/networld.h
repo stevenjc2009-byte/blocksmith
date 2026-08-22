@@ -156,6 +156,79 @@ void networldSetInvHook(NetworldInvFn fn, void* userdata);
 // is the capability probe itself, not a guard in front of it.
 bool networldSendInvAction(uint8_t op, uint8_t a, uint8_t b, uint8_t c);
 
+// ---- saved player state (v1.5.0) -----------------------------------------------------------
+//
+// BS_APP_PLAYER_STATE (S->C) / BS_APP_PLAYER_REPORT (C->S), the pair bs_proto.h added after
+// the inventory one for everything worth persisting about a player *beyond* the inventory:
+// where they stood, what they were wearing, their meters. The same deployment-order rule
+// applies and is enforced here the same way: the server volunteers PLAYER_STATE at JOIN, so
+// this module knows the server speaks it, and nothing is ever SENT back until it has — see
+// networldSendPlayerReport() below.
+//
+// The join-time snapshot has exactly the arrival-order problem INV_STATE had, resolved the
+// same way: JOIN completes on the title screen, main.c pumps networldUpdate() there, and the
+// server sends PLAYER_STATE immediately after its INV_STATE — long before main.c has entered
+// a world and built the Player the saved pose is meant to land in. So the decoded state is
+// retained here (mirroring s_last_inv_state's reasoning in networld.c) and read back through
+// the accessors below at the moment it becomes applicable: main.c consults
+// networldSavedPose() right after playerInit(), which is this client's own equivalent of the
+// inv hook's register-and-replay.
+
+// Mirrors BS_ARMOR_SLOTS (proto/bs_proto.h), restated rather than included for one integer —
+// the same choice NETWORLD_INV_SLOT_COUNT makes above, kept honest by networld.c's
+// _Static_assert against the real constant.
+#define NETWORLD_ARMOR_SLOTS 4
+
+// The armour+meters block PLAYER_STATE carries after its pose, decoded raw and retained as-is.
+// Deliberately dumb: this client has no armour, XP, health or hunger systems yet, so there is
+// nothing here to convert into — the boundary this module holds is "decodes bytes", not
+// "knows what health means". Consumed by survival systems when they land (roadmap §7); until
+// then the block is held only so those systems can hook in without a wire redesign.
+typedef struct {
+	uint8_t  armor[NETWORLD_ARMOR_SLOTS][2];   // head/chest/legs/feet, {item, count}
+	uint32_t xp_level;
+	float    xp_progress;                      // 0..1 through the current level
+	float    health;                           // 0..20
+	float    hunger;                           // 0..20
+} NetworldPlayerMeters;
+
+// The pose from the most recent valid BS_APP_PLAYER_STATE with BS_PLAYER_STATE_FLAG_POSE set,
+// written to the five out-parameters. True only when such a state arrived this session; false
+// leaves every out-parameter untouched — the same contract networldWorldSeed() uses, and for
+// the same reason: false means "the server had nothing saved" (or never spoke PLAYER_STATE at
+// all), which the caller answers by keeping its own spawn choice. Values are the wire floats
+// verbatim — see applyPlayerState() in networld.c for why they are not sanitised here.
+bool networldSavedPose(float* out_x, float* out_y, float* out_z,
+                       float* out_yaw, float* out_pitch);
+
+// Whether the most recent valid PLAYER_STATE carried BS_PLAYER_STATE_FLAG_EXT (meaningful
+// armour/meters), in which case networldPlayerMeters() returns the retained block. NULL
+// otherwise — including when a state arrived with the flag clear ("fresh spawn": the server
+// spoke, but had nothing saved), which is distinguishable from never hearing one at all by
+// design (bs_proto.h).
+bool networldPlayerMetersValid(void);
+const NetworldPlayerMeters* networldPlayerMeters(void);
+
+// Compile-honest meter gate. This client cannot fill in a single field of a PLAYER_REPORT
+// today — no armour, no XP, no health, no hunger — and sending zeros would be worse than not
+// sending: the server treats a report as authoritative and overwrites the state it persisted
+// for this player, so an empty report WIPES a returning player's saved pose-and-meters on
+// the very join that was supposed to restore them. Until survival systems exist and can hand
+// real values to networldSendPlayerReport(), this stays 0 and the send path does not exist
+// in the compiled binary at all. A future milestone flips it to 1 the day real meters do;
+// the capability probe below keeps the wire side safe either way.
+#ifndef BS_CLIENT_HAS_METERS
+#define BS_CLIENT_HAS_METERS 0
+#endif
+
+// Encodes and sends this client's own armour+meters as BS_APP_PLAYER_REPORT, from `m`.
+// Sends NOTHING, and returns false, until a valid PLAYER_STATE has been received this session
+// — the capability probe again, identical in kind to networldSendInvAction()'s: an old server
+// would kick this client for a message type it does not recognise. Independently gated on
+// BS_CLIENT_HAS_METERS above, for the zero-wipe reason stated there.
+bool networldSendPlayerReport(const NetworldPlayerMeters* m);
+
+
 // ---- per-column diff subscription (V127-A) ---------------------------------------------------
 //
 // Why this pair exists at all, given BS_APP_WORLD_SYNC already replays every diff at JOIN: that

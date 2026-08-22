@@ -1,0 +1,107 @@
+; Blocksmith — the world vertex shader, adaptive-lighting variant (v1.5.0).
+;
+; Compiled alongside world.v.pica and bound INSTEAD of it on a New 3DS only
+; (scene/chunk_render.c asks APT_CheckNew3DS once at init). An Old 3DS never
+; sees this program: same TEV setup, same attribute layout, same vertices with
+; pad written zero, so its frames stay byte-identical to the baked path.
+;
+; The one difference from world.v.pica is what the mesher puts in MeshVertex.pad.
+; There it is alignment filler the shader overwrites; here it carries the corner's
+; smooth light packed by world/mesher.c as sky<<4 | block, both 0..15, averaged
+; over the four cells touching the corner (the same taps the AO rule walks).
+;
+;   brightness = faceShade[nrm] x aoCurve(ao) x max(sky x dayLevel, block) / 15
+;
+; With dayLevel 1.0 and full sky light the multiplier is exactly 1, so a fully
+; sunlit face matches the baked shader's output; underground, max() falls and
+; caves go dark without any remeshing. dayLevel is a uniform so a future day/
+; night cycle becomes one register write per frame, not a re-mesh.
+;
+; Attributes (see MeshVertex in source/world/mesh_vertex.h — the format is locked):
+;   v0 = position, 4x s8 — xyz read, w is the pad byte this shader exists to read
+;   v1 = (u, v, normal index, ao), 4x u8
+
+.fvec projection[4], modelView[4]
+
+; Per-face brightness, indexed by the vertex's normal index. Six are used; the
+; array is 8 long because relative addressing wants a power of two to be safe.
+.fvec faceShade[8]
+
+; Day-night multiplier for the sky channel. Held per-channel-scaled so caves lit
+; only by block light do not dim with the sun.
+.fvec dayLevel[1]
+
+.constf consts(0.0, 1.0, 0.0078125, 0.33333333)   ; 0, 1, 1/128, 1/3
+.alias  zeros consts.xxxx
+.alias  ones  consts.yyyy
+.alias  uvScale consts.zzzz
+.alias  aoScale consts.wwww
+
+.constf aoMix(0.45, 0.55, 0.0, 0.0)
+.alias  aoFloor aoMix.xxxx
+.alias  aoRange aoMix.yyyy
+
+; Light unpack constants: 1/16 turns the pad byte into the sky nibble, -16 undoes
+; sky*16 inside the byte, 1/15 normalises a nibble to 0..1.
+.constf lightConsts(0.0625, -16.0, 0.06666667, 0.0)
+.alias  inv16   lightConsts.xxxx
+.alias  neg16   lightConsts.yyyy
+.alias  inv15   lightConsts.zzzz
+
+.out outpos position
+.out outtc0 texcoord0
+.out outclr color
+
+.alias inpos v0
+.alias inpack v1
+
+.proc main
+	; --- position ---------------------------------------------------------
+	mov r0.xyz, inpos
+	mov r0.w,   ones
+
+	dp4 r1.x, modelView[0], r0
+	dp4 r1.y, modelView[1], r0
+	dp4 r1.z, modelView[2], r0
+	dp4 r1.w, modelView[3], r0
+
+	dp4 outpos.x, projection[0], r1
+	dp4 outpos.y, projection[1], r1
+	dp4 outpos.z, projection[2], r1
+	dp4 outpos.w, projection[3], r1
+
+	; --- texture coordinates ---------------------------------------------
+	mul r2, uvScale, inpack
+	mov outtc0, r2.xyxy
+
+	; --- baked lighting ---------------------------------------------------
+	; Same relative-addressed faceShade fetch as world.v.pica — cleared by
+	; measurement there, reused unchanged here.
+	mova a0.x, inpack.zzzz
+	mov r3, faceShade[a0.x]
+
+	; ao factor = aoFloor + aoRange * (ao / 3)
+	mul r4.x, aoScale, inpack.wwww
+	mul r4.x, aoRange, r4.xxxx
+	add r4.x, aoFloor, r4.xxxx
+
+	; --- adaptive light ---------------------------------------------------
+	; pad = sky*16 + block. Uniforms may only sit in source 1 on this assembler,
+	; which fixes the operand order below.
+	mul r5.x, inv16, inpos.wwww          ; sky raw 0..15
+	flr r5.x, r5.xxxx
+	mul r6.x, neg16, r5.xxxx             ; -16 * sky
+	add r5.y, r6.xxxx, inpos.wwww        ; block raw 0..15
+	mul r5.x, inv15, r5.xxxx             ; sky 0..1
+	mul r5.y, inv15, r5.yyyy             ; block 0..1
+	mul r5.z, dayLevel.xxxx, r5.xxxx     ; day-scaled sky
+	max r5.w, r5.zzzz, r5.yyyy           ; lum = max(daySky, block)
+
+	; colour = faceShade x aoCurve x lum
+	mul r6.y, r3.xxxx, r4.xxxx
+	mul r6.z, r6.yyyy, r5.wwww
+	mov outclr.xyz, r6.zzz
+	mov outclr.w,   ones
+
+	end
+.end

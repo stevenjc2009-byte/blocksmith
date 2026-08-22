@@ -9,6 +9,11 @@
 //
 // 18³ is 5,832 bytes — one scratch is reused for every chunk meshed, so the cost
 // is a rounding error against the block data itself.
+//
+// v1.5.0 adds a parallel light band, one packed byte per cell (sky in the high
+// nibble, block in the low), filled by scratchFillLight from the per-column
+// light store. It is only read when the lighting engine is enabled; when it is
+// off the mesher never looks at it and vertices come out exactly as before.
 #pragma once
 
 #include "world/world.h"
@@ -18,6 +23,7 @@
 
 typedef struct {
 	BlockId blocks[SCRATCH_BLOCKS];
+	uint8_t light[SCRATCH_BLOCKS];   // sky<<4 | block; see scratchFillLight
 } MeshScratch;
 
 // sx/sy/sz are 0..17 — scratch space, where 0 is the border and 1..16 is the chunk.
@@ -30,6 +36,13 @@ static inline int scratchIndex(int sx, int sy, int sz)
 // unloaded neighbours read as air; anything below the world floor reads as
 // WORLD_FLOOR_BLOCK, matching worldGet so the two can never disagree.
 void scratchFill(MeshScratch* s, const World* w, int cx, int cy, int cz);
+
+// Fills the light band for the same 27-chunk neighbourhood, reading each cell's
+// owning column's channels. Call only while the lighting engine is enabled; a
+// column with no light yet (still streaming in) reads as full sky, which keeps
+// borders at today's brightness until its own propagation lands instead of
+// painting black seams at the edge of the loaded ring.
+void scratchFillLight(MeshScratch* s, const World* w, int cx, int cy, int cz);
 
 // Reads in *chunk-local* coordinates, which run -1..16: the mesher works in the
 // chunk's own frame and stepping off the edge is normal, not an error.

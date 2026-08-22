@@ -207,6 +207,37 @@ static void fillValidInv(uint8_t *items, uint8_t *counts)
     }
 }
 
+static void buildPlayerState(uint8_t *out, uint8_t flags,
+                             float x, float y, float z, float yaw, float pitch,
+                             const uint8_t *armor /* 8 bytes: 4 slots x {item,count} */,
+                             uint32_t xp_level, float xp_progress, float health, float hunger)
+{
+    out[0] = BS_APP_PLAYER_STATE;
+    out[1] = flags;
+    bs_put_f32(out + 2,  x);
+    bs_put_f32(out + 6,  y);
+    bs_put_f32(out + 10, z);
+    bs_put_f32(out + 14, yaw);
+    bs_put_f32(out + 18, pitch);
+    uint8_t *p = out + 22;
+    for (uint32_t i = 0; i < BS_ARMOR_SLOTS * 2u; i++)
+        p[i] = armor ? armor[i] : 0;
+    bs_put_u32(out + 30, xp_level);
+    bs_put_f32(out + 34, xp_progress);
+    bs_put_f32(out + 38, health);
+    bs_put_f32(out + 42, hunger);
+}
+
+/* Bit-exact float compare: the point of several checks below is that a value came off the wire
+ * and back verbatim — including NaN, whose every ordinary comparison is false. */
+static bool f32bits_eq(float a, float b)
+{
+    uint32_t ua, ub;
+    memcpy(&ua, &a, 4);
+    memcpy(&ub, &b, 4);
+    return ua == ub;
+}
+
 /* ------------------------------------------------------------------ scenarios ------------- */
 
 static void test_loaded_column_applies_directly(void)
@@ -1331,6 +1362,198 @@ static void test_inv_state_flag_does_not_survive_fresh_session(void)
     check(fake_sent_calls == 0, "and never touched the transport for it");
 }
 
+/* ------------------------------------------------ saved player state (BS_APP_PLAYER_*) --- */
+/* BS_APP_PLAYER_STATE / BS_APP_PLAYER_REPORT, bs_proto.h's v1.5.0 pair — the third
+ * server-speaks-first set after WORLD_INFO and INV_STATE. The decode side mirrors
+ * applyInvState() one for one: length-exact, capability armed only once the whole packet has
+ * validated, fresh-spawn (flags 0) still counts as the server having spoken. The float policy
+ * deliberately mirrors applyPosUpdate(): wire floats verbatim, no NaN/huge sanitisation, and
+ * test_player_state_float_policy_verbatim() holds that choice in place. */
+
+static void test_player_state_pose_and_meters_round_trip(void)
+{
+    puts("a valid PLAYER_STATE with both flags makes pose and meters available, values exact");
+
+    networldInit();
+
+    const uint8_t armor[BS_ARMOR_SLOTS * 2] = { 7, 1, 8, 1, 9, 1, 10, 3 };
+    uint8_t msg[BS_PLAYER_STATE_BYTES];
+    buildPlayerState(msg, BS_PLAYER_STATE_FLAG_POSE | BS_PLAYER_STATE_FLAG_EXT,
+                     12.5f, 33.0f, -7.25f, 1.5f, -0.5f, armor, 42, 0.75f, 17.5f, 9.5f);
+    networldApplyPayload(msg, sizeof msg);
+
+    float x = 0, y = 0, z = 0, yaw = 0, pitch = 0;
+    check(networldSavedPose(&x, &y, &z, &yaw, &pitch), "the pose is available");
+    check(f32bits_eq(x, 12.5f) && f32bits_eq(y, 33.0f) && f32bits_eq(z, -7.25f),
+          "position round-trips bit-exactly");
+    check(f32bits_eq(yaw, 1.5f) && f32bits_eq(pitch, -0.5f), "facing round-trips bit-exactly");
+
+    check(networldPlayerMetersValid(), "the meters are flagged meaningful");
+    const NetworldPlayerMeters *m = networldPlayerMeters();
+    check(m != NULL, "and reachable through the accessor");
+    check(memcmp(m->armor, armor, sizeof armor) == 0,
+          "all four armour slots round-trip exactly");
+    check(m->xp_level == 42, "xp level round-trips");
+    check(f32bits_eq(m->xp_progress, 0.75f), "xp progress round-trips");
+    check(f32bits_eq(m->health, 17.5f) && f32bits_eq(m->hunger, 9.5f),
+          "health and hunger round-trip");
+}
+
+static void test_player_state_flag_combinations(void)
+{
+    puts("flag combinations: fresh spawn is distinct from pose-only and ext-only");
+
+    networldInit();
+
+    /* flags == 0: bs_proto.h's fresh-spawn marker. The server spoke — which is what the
+     * capability probe asks — but claims nothing meaningful in this packet. */
+    uint8_t msg[BS_PLAYER_STATE_BYTES] = {0};
+    msg[0] = BS_APP_PLAYER_STATE;
+    networldApplyPayload(msg, sizeof msg);
+    check(!networldSavedPose(NULL, NULL, NULL, NULL, NULL),
+          "flags 0 claims no pose (and NULL out-parameters are legal)");
+    check(!networldPlayerMetersValid() && networldPlayerMeters() == NULL,
+          "flags 0 claims no meters");
+
+    /* POSE only. */
+    networldInit();
+    buildPlayerState(msg, BS_PLAYER_STATE_FLAG_POSE, 1, 2, 3, 4, 5, NULL, 0, 0, 0, 0);
+    networldApplyPayload(msg, sizeof msg);
+    float x, y, z, yaw, pitch;
+    check(networldSavedPose(&x, &y, &z, &yaw, &pitch), "pose-only: the pose is available");
+    check(x == 1 && y == 2 && z == 3 && yaw == 4 && pitch == 5, "pose-only: values exact");
+    check(!networldPlayerMetersValid(), "pose-only: no meters are claimed");
+    check(networldPlayerMeters() == NULL, "pose-only: the accessor stays NULL");
+
+    /* EXT only. */
+    networldInit();
+    buildPlayerState(msg, BS_PLAYER_STATE_FLAG_EXT, 0, 0, 0, 0, 0, NULL, 3, 0.5f, 20.0f, 20.0f);
+    networldApplyPayload(msg, sizeof msg);
+    check(!networldSavedPose(&x, &y, &z, &yaw, &pitch), "ext-only: no pose is claimed");
+    check(networldPlayerMetersValid() && networldPlayerMeters()->xp_level == 3,
+          "ext-only: the meters are available");
+}
+
+static void test_player_state_wrong_length_dropped(void)
+{
+    puts("a wrong-length PLAYER_STATE (45 and 47 bytes) is dropped whole");
+
+    networldInit();
+    fakeTransportReset();
+
+    NetworldPlayerMeters m;
+    memset(&m, 0, sizeof m);
+
+    uint8_t short_msg[BS_PLAYER_STATE_BYTES - 1] = {0};
+    short_msg[0] = BS_APP_PLAYER_STATE;
+    networldApplyPayload(short_msg, sizeof short_msg);
+
+    uint8_t long_msg[BS_PLAYER_STATE_BYTES + 1] = {0};
+    long_msg[0] = BS_APP_PLAYER_STATE;
+    networldApplyPayload(long_msg, sizeof long_msg);
+
+    float x, y, z, yaw, pitch;
+    check(!networldSavedPose(&x, &y, &z, &yaw, &pitch), "neither wrong length applied a pose");
+    check(!networldPlayerMetersValid(), "nor meters");
+    check(networldSendPlayerReport(&m) == false,
+          "a malformed PLAYER_STATE does not arm the capability probe");
+}
+
+static void test_player_state_float_policy_verbatim(void)
+{
+    puts("NaN and huge pose floats are kept verbatim — applyPosUpdate's posture, not a new one");
+
+    /* Policy mirror, asserted so any future change to it shows up here: inbound POS_UPDATE
+     * (applyPosUpdate, networld.c) does not range- or finiteness-check untrusted floats,
+     * because the Noise XX transport has already authenticated the peer — and neither does
+     * this decoder. The one consumer difference (main.c feeds these to playerInit() rather
+     * than a remote-render table) lives at the application point, before frame one; if that
+     * ever proves insufficient it changes BOTH decoders, not one of them quietly. */
+    networldInit();
+
+    const uint32_t nan_bits = 0x7FC00000u;
+    float nan_f;
+    memcpy(&nan_f, &nan_bits, 4);
+    const float huge = 1e30f;
+
+    uint8_t msg[BS_PLAYER_STATE_BYTES];
+    buildPlayerState(msg, BS_PLAYER_STATE_FLAG_POSE, nan_f, huge, -huge, nan_f, huge,
+                     NULL, 0, 0, 0, 0);
+    networldApplyPayload(msg, sizeof msg);
+
+    float x, y, z, yaw, pitch;
+    check(networldSavedPose(&x, &y, &z, &yaw, &pitch),
+          "the packet is accepted — hostile-looking floats are not a malformed packet here");
+    check(f32bits_eq(x, nan_f), "NaN in, NaN out, bit for bit");
+    check(f32bits_eq(y, huge) && f32bits_eq(z, -huge) && f32bits_eq(pitch, huge),
+          "huge-but-finite magnitudes survive untouched");
+}
+
+static void test_player_state_capability_transitions(void)
+{
+    puts("the PLAYER_STATE capability flag: valid arms it, init clears it");
+
+    networldInit();
+    fakeTransportReset();
+
+    NetworldPlayerMeters m;
+    memset(&m, 0, sizeof m);
+
+    uint8_t msg[BS_PLAYER_STATE_BYTES];
+    buildPlayerState(msg, 0, 0, 0, 0, 0, 0, NULL, 0, 0, 0, 0);
+    networldApplyPayload(msg, sizeof msg);
+
+    check(networldSendPlayerReport(&m) == true,
+          "even a flags-0 snapshot arms the probe — the server has spoken");
+    check(fake_sent_calls == 1, "and the report went out (this build flips BS_CLIENT_HAS_METERS)");
+
+    /* Leaving and rejoining — bsnet.c's netDisconnect() calls exactly this. */
+    networldInit();
+    fakeTransportReset();
+    check(networldSendPlayerReport(&m) == false,
+          "a fresh session has heard nothing from a server yet, even though the previous one did");
+    check(fake_sent_calls == 0, "and never touched the transport for it");
+}
+
+static void test_send_player_report_encodes(void)
+{
+    puts("networldSendPlayerReport() encodes exactly 30 bytes with an all-zero reserved tail");
+
+    networldInit();
+    fakeTransportReset();
+
+    const uint8_t armor[BS_ARMOR_SLOTS * 2] = { 7, 1, 0, 0, 0, 0, 10, 3 };
+    NetworldPlayerMeters m;
+    memcpy(m.armor, armor, sizeof armor);
+    m.xp_level    = 12;
+    m.xp_progress = 0.25f;
+    m.health      = 13.5f;
+    m.hunger      = 6.5f;
+
+    /* Arm first — the gating itself is covered by the two tests above this one. */
+    uint8_t state[BS_PLAYER_STATE_BYTES];
+    buildPlayerState(state, 0, 0, 0, 0, 0, 0, NULL, 0, 0, 0, 0);
+    networldApplyPayload(state, sizeof state);
+
+    check(networldSendPlayerReport(&m), "send reports success");
+    check(fake_sent_calls == 1, "the transport was asked to send exactly once");
+    check(fake_sent_len == BS_PLAYER_REPORT_BYTES, "encoded to exactly BS_PLAYER_REPORT_BYTES");
+    check(fake_sent_buf[0] == BS_APP_PLAYER_REPORT, "type byte is BS_APP_PLAYER_REPORT");
+    check(memcmp(fake_sent_buf + 1, armor, sizeof armor) == 0, "armour block round-trips");
+    check(bs_get_u32(fake_sent_buf + 9) == 12, "xp level round-trips");
+    check(bs_get_f32(fake_sent_buf + 13) == 0.25f, "xp progress round-trips");
+    check(bs_get_f32(fake_sent_buf + 17) == 13.5f, "health round-trips");
+    check(bs_get_f32(fake_sent_buf + 21) == 6.5f, "hunger round-trips");
+
+    bool tail_zero = true;
+    for (size_t i = 25; i < BS_PLAYER_REPORT_BYTES; i++)
+        if (fake_sent_buf[i] != 0) tail_zero = false;
+    check(tail_zero, "all five reserved tail bytes went out zero — bs_proto.h's MUST");
+
+    check(networldSendPlayerReport(NULL) == false, "NULL meters refused");
+    check(fake_sent_calls == 1, "and that refusal never reached the transport");
+}
+
 /* ------------------------------------------- the rejoin sync capacity --------------------- */
 /* Written from a live report: steve and a friend built a house, steve rejoined, and the house
  * was gone from HIS screen while still standing on everyone else's. This reproduces that
@@ -1448,6 +1671,12 @@ int main(void)
     test_inv_state_count_over_cap_dropped();
     test_send_inv_action_gated_on_inv_state();
     test_inv_state_flag_does_not_survive_fresh_session();
+    test_player_state_pose_and_meters_round_trip();
+    test_player_state_flag_combinations();
+    test_player_state_wrong_length_dropped();
+    test_player_state_float_policy_verbatim();
+    test_player_state_capability_transitions();
+    test_send_player_report_encodes();
     test_rejoin_sync_larger_than_the_store_keeps_every_edit();
 
     printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);

@@ -29,6 +29,8 @@ static void*          s_edit_ud;
 // static-asserts do for BS_BLOCK_COUNT.
 _Static_assert(NETWORLD_INV_SLOT_COUNT == BS_INV_SLOT_COUNT,
                "networld.h's slot count must match proto/bs_proto.h's");
+_Static_assert(NETWORLD_ARMOR_SLOTS == BS_ARMOR_SLOTS,
+               "networld.h's armour slot count must match proto/bs_proto.h's");
 
 // Who to tell when a valid BS_APP_INV_STATE arrives. See networld.h's own comment on
 // NetworldInvFn for why this is a hook rather than a direct call into world/inventory.h.
@@ -58,6 +60,33 @@ static bool s_have_inv_state;
 // clearing that flag is what makes a stale snapshot unreachable in a fresh session, so this does
 // not need clearing separately.
 static NetworldInvState s_last_inv_state;
+
+// ---- saved player state (v1.5.0) ---------------------------------------------------------
+// The PLAYER_STATE counterparts of the inventory statics above, same reasoning throughout.
+
+// True once at least one valid BS_APP_PLAYER_STATE has been decoded this session — the
+// capability probe networldSendPlayerReport() checks, for the identical reason
+// s_have_inv_state gates networldSendInvAction(): the server speaks first, and a client that
+// has not heard PLAYER_STATE must never originate PLAYER_REPORT, or an old server would kick
+// it for a message type it does not recognise. Reset by networldInit() with every other
+// per-session static.
+static bool s_have_player_state;
+
+// Which parts of the retained snapshot the server flagged as meaningful
+// (BS_PLAYER_STATE_FLAG_POSE / BS_PLAYER_STATE_FLAG_EXT). Kept alongside the values because
+// "the server spoke but had nothing saved" (flags 0) is a real state this client must be able
+// to tell from "never heard anything" — bs_proto.h's fresh-spawn marker.
+static uint8_t s_player_flags;
+
+// The pose those flags cover. Written only once the whole packet has validated, so it can
+// never hold a half-parsed state; meaningful only while s_have_player_state is true and the
+// POSE flag is set. main.c reads it through networldSavedPose() right after playerInit().
+static float s_saved_pose_x, s_saved_pose_y, s_saved_pose_z;
+static float s_saved_pose_yaw, s_saved_pose_pitch;
+
+// The armour+meters block, retained raw (networld.h: consumed by survival systems when they
+// land). Same write discipline as the pose above.
+static NetworldPlayerMeters s_player_meters;
 
 // The single place an applied edit is announced. Called only after the block is really in the
 // world — never for one that is merely queued, which would tell the renderer to rebuild a mesh
@@ -248,6 +277,51 @@ static void applyInvState(const uint8_t* msg, size_t len)
 	if (s_inv_fn) s_inv_fn(s_inv_ud, &state);
 }
 
+// BS_APP_PLAYER_STATE: exactly BS_PLAYER_STATE_BYTES or dropped — the same reject-on-length,
+// never-half-parse posture every other snapshot decoder in this file takes (applyWorldInfo(),
+// applyInvState() above), for the reason bs_proto.h states there: a longer PLAYER_STATE from a
+// newer server must be rejectable outright rather than silently misread.
+//
+// Float policy: the five pose floats and three meter floats are taken off the wire verbatim,
+// with no NaN/range sanitisation — deliberately the same posture applyPosUpdate() above takes
+// for POS_UPDATE's untrusted floats. The transport is Noise XX: every payload here already
+// came from an authenticated peer, and this packet's contents are that peer's own persisted
+// record of this player. The one consumer difference from a remote pose — these values reach
+// main.c's live physics body rather than a rendered remote — is answered by where they are
+// *applied* (main.c, at playerInit(), before the first frame), not by inventing a second
+// validation posture for one message type.
+static void applyPlayerState(const uint8_t* msg, size_t len)
+{
+	if (len != BS_PLAYER_STATE_BYTES) return;
+
+	const uint8_t flags = msg[1];
+
+	if (flags & BS_PLAYER_STATE_FLAG_POSE) {
+		s_saved_pose_x    = bs_get_f32(msg + 2);
+		s_saved_pose_y    = bs_get_f32(msg + 6);
+		s_saved_pose_z    = bs_get_f32(msg + 10);
+		s_saved_pose_yaw   = bs_get_f32(msg + 14);
+		s_saved_pose_pitch = bs_get_f32(msg + 18);
+	}
+
+	if (flags & BS_PLAYER_STATE_FLAG_EXT) {
+		uint8_t* armor = &s_player_meters.armor[0][0];
+		for (uint32_t i = 0; i < BS_ARMOR_SLOTS * 2u; i++)
+			armor[i] = msg[BS_APP_HDR_BYTES + 1u + 4u * 5u + i];
+
+		s_player_meters.xp_level    = bs_get_u32(msg + 30);
+		s_player_meters.xp_progress = bs_get_f32(msg + 34);
+		s_player_meters.health      = bs_get_f32(msg + 38);
+		s_player_meters.hunger      = bs_get_f32(msg + 42);
+	}
+
+	// Armed only after everything above has been stored — same discipline as applyInvState().
+	// Note flags == 0 (the fresh-spawn marker) still arms it: the server spoke, which is
+	// precisely what the capability probe is asking.
+	s_have_player_state = true;
+	s_player_flags      = flags;
+}
+
 // BS_APP_CHUNK_DIFFS: one column's worth of diffs, batched. Same per-entry shape as
 // applyWorldSync() above and deliberately handled the same way — apply now if the column is
 // already loaded, queue it via net/blockdiff.h otherwise — because a diff scoped to a column is
@@ -364,6 +438,7 @@ void networldApplyPayload(const uint8_t* payload, size_t len)
 	case BS_APP_WORLD_INFO:  applyWorldInfo(payload, len);  break;
 	case BS_APP_CHUNK_DIFFS: applyChunkDiffs(payload, len); break;
 	case BS_APP_INV_STATE:   applyInvState(payload, len);  break;
+	case BS_APP_PLAYER_STATE: applyPlayerState(payload, len); break;
 	// Every other type byte is something this client build has no use for. Silently skipped
 	// rather than treated as an error: the server is trusted to only ever send well-formed
 	// application types (server/game/bsgame.c kicks a *client* for sending one it does not
@@ -435,6 +510,13 @@ void networldInit(void)
 	s_inv_fn          = NULL;
 	s_inv_ud          = NULL;
 	s_have_inv_state  = false;
+
+	// The PLAYER_STATE snapshot and its capability flag, for the same reason as the inventory
+	// pair above: a stale "yes" must never survive into a session whose server has not spoken.
+	// Like s_last_inv_state, the retained values are left in place — unreachable while the
+	// flags say no, and overwritten before they can ever be read again.
+	s_have_player_state = false;
+	s_player_flags      = 0;
 
 	s_last_pose_send_ms = 0;
 	s_pose_sent_once    = false;
@@ -563,6 +645,65 @@ bool networldWorldSeed(uint32_t* out)
 	if (!s_have_world_seed) return false;
 	if (out) *out = s_world_seed;
 	return true;
+}
+
+// See networld.h's own comment on this pair: the pose accessors hand the retained join
+// snapshot to main.c at the one moment it is applicable — right after playerInit(), which is
+// this client's join-time position of the local player. The flag checks are what keep a
+// fresh-spawn snapshot (server spoke, nothing saved) from being read as a real pose.
+bool networldSavedPose(float* out_x, float* out_y, float* out_z,
+                       float* out_yaw, float* out_pitch)
+{
+	if (!s_have_player_state || !(s_player_flags & BS_PLAYER_STATE_FLAG_POSE)) return false;
+	if (out_x)    *out_x    = s_saved_pose_x;
+	if (out_y)    *out_y    = s_saved_pose_y;
+	if (out_z)    *out_z    = s_saved_pose_z;
+	if (out_yaw)  *out_yaw  = s_saved_pose_yaw;
+	if (out_pitch)*out_pitch= s_saved_pose_pitch;
+	return true;
+}
+
+bool networldPlayerMetersValid(void)
+{
+	return s_have_player_state && (s_player_flags & BS_PLAYER_STATE_FLAG_EXT) != 0;
+}
+
+const NetworldPlayerMeters* networldPlayerMeters(void)
+{
+	return networldPlayerMetersValid() ? &s_player_meters : NULL;
+}
+
+// Capability probe first and unconditionally, exactly as networldSendInvAction() above does:
+// no PLAYER_STATE heard this session means the server may predate PLAYER_REPORT entirely, and
+// bsgame kicks an unknown C->S type rather than ignoring it. Then the compile-honest meter
+// gate — see BS_CLIENT_HAS_METERS in networld.h for why sending before real meters exist
+// would wipe a returning player's saved state rather than update it.
+//
+// Encoded by hand, little-endian, never memcpy of a struct — same posture as every other
+// sender in this file. The five reserved tail bytes go out as zeros because bs_proto.h says
+// they MUST, the same way INV_ACTION's unused parameters do.
+bool networldSendPlayerReport(const NetworldPlayerMeters* m)
+{
+#if !BS_CLIENT_HAS_METERS
+	(void)m;
+	return false;
+#else
+	if (!s_have_player_state || !m) return false;
+
+	uint8_t out[BS_PLAYER_REPORT_BYTES];
+	out[0] = BS_APP_PLAYER_REPORT;
+	const uint8_t* armor = &m->armor[0][0];
+	for (uint32_t i = 0; i < BS_ARMOR_SLOTS * 2u; i++)
+		out[1 + i] = armor[i];
+
+	bs_put_u32(out + 9,  m->xp_level);
+	bs_put_f32(out + 13, m->xp_progress);
+	bs_put_f32(out + 17, m->health);
+	bs_put_f32(out + 21, m->hunger);
+
+	memset(out + 25, 0, 5u);
+	return netTransportSend(out, sizeof out);
+#endif
 }
 
 int networldPendingCount(void)     { return blockdiffCount(&s_pending); }

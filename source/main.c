@@ -58,6 +58,7 @@
 #include "world/handbuilt.h"
 #include "world/inventory.h"
 #include "world/jobq.h"
+#include "world/light.h"
 #include "world/mesh_vertex.h"
 #include "world/region.h"
 #include "world/world.h"
@@ -2304,6 +2305,11 @@ static void gpuWaitPrevFrame(void)
 static void onRemoteEdit(void* userdata, int x, int y, int z)
 {
 	(void)userdata;
+	// v1.5.0: remote edits relight before remeshing, same as scene/interact.c does for
+	// local break/place — otherwise another player's torch-adjacent or shade-casting
+	// change lands with stale light until the column happens to regenerate.
+	if (lightEnabled())
+		lightRelightColumn(&s_world, x >> 4, z >> 4);
 	chunkRenderTouch(&s_world, x, y, z);
 }
 
@@ -2770,6 +2776,27 @@ session_start:
 	playerInit(&player, (float)spawn_x + 0.5f, (float)spawn_y, (float)spawn_z + 0.5f,
 	           C3D_AngleFromDegrees(135.0f), C3D_AngleFromDegrees(35.0f));
 
+	// v1.5.0 server-side persistence, the pose half. The server volunteered this player's
+	// saved position and facing in its join-time PLAYER_STATE — which landed while the title
+	// screen was still pumping networldUpdate(), long before `player` existed above, so
+	// net/networld.c retained it and it is replayed here rather than at arrival. This is the
+	// same arrival-order fix the inventory snapshot got (see networldSetInvHook below): the
+	// read-back happens after init so a server that had something saved gets the last word
+	// over this client's own spawn choice, and reconnecting puts the player back where they
+	// logged out, facing the same way, instead of respawning at spawn.
+	//
+	// Consulted exactly once, here — not polled per frame afterwards. A PLAYER_STATE that
+	// somehow arrives later than this line is missed, which is the same accepted race
+	// networldWorldSeed() has always had (read once at genStart): both packets are sent by
+	// the server immediately after JOIN, so anything slow enough to lose them never made the
+	// handshake usable in the first place. False — single player, old server, fresh spawn —
+	// leaves the playerInit above untouched.
+	{
+		float px, py, pz, pyaw, ppitch;
+		if (networldSavedPose(&px, &py, &pz, &pyaw, &ppitch))
+			playerInit(&player, px, py, pz, pyaw, ppitch);
+	}
+
 	Interact it;
 	interactInit(&it);
 
@@ -3138,6 +3165,8 @@ session_start:
 			const int sx = CHUNK_DIM, sz = CHUNK_DIM;
 			const int sy = handbuiltHeight(sx, sz);
 			worldSet(&s_world, sx, sy, sz, (frame & 1) ? BLOCK_STONE : BLOCK_AIR);
+			if (lightEnabled())
+				lightRelightColumn(&s_world, sx >> 4, sz >> 4);
 			chunkRenderTouch(&s_world, sx, sy, sz);
 		}
 #endif

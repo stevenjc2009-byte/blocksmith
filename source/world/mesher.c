@@ -4,6 +4,7 @@
 
 #include "world/atlas_uv.h"
 #include "world/block.h"
+#include "world/light.h"
 
 // One face: the neighbour it looks at, an origin corner, and two tangent axes whose
 // cross product is the outward normal. Deriving the winding from the tangents is what
@@ -165,13 +166,32 @@ static void planBuild(void)
 	s_ready = true;
 }
 
+// Exact floor division by a count known to be 1..4, without the libgcc
+// __aeabi_idivmod call the ARM11 would otherwise pay per corner per channel.
+// Sums never exceed 15*4 = 60, where (n * 171) >> 9 is exact for /3.
+static inline int avgByCnt(int sum, int cnt)
+{
+	switch (cnt) {
+	case 2:  return sum >> 1;
+	case 3:  return (sum * 171) >> 9;
+	case 4:  return sum >> 2;
+	default: return sum;
+	}
+}
+
 // Writes one quad: four vertices and the six indices of its two triangles. Refuses
 // to write past the caller's buffers and says so, rather than trusting a size
 // argument — an overflowing mesher would corrupt the linear heap.
 //
 // `si` is the cell's own scratch index, so every AO tap is one add and one byte load.
-static void emitFace(MeshOut* o, int si, int lx, int ly, int lz,
-                     int face, const AtlasRect* r)
+//
+// `lit` is the lighting engine gate, resolved once per meshChunk. Off — every Old
+// 3DS build, every host test by default — pad is written 0 exactly as it always
+// was and the vertex bytes are identical to the pre-lighting mesher's. On, pad
+// carries the corner's smooth light (sky in the high nibble, block in the low)
+// for the dynamic shader to unpack.
+static void emitFace(MeshOut* o, const MeshScratch* s, int si, int lx, int ly, int lz,
+                     int face, const AtlasRect* r, bool lit)
 {
 	if (o->vert_count + 4 > o->vert_cap || o->index_count + 6 > o->index_cap) {
 		o->overflow = true;
@@ -207,7 +227,26 @@ static void emitFace(MeshOut* o, int si, int lx, int ly, int lz,
 		const int s2 = s_cell_solid[si + c->ao2];
 		v->ao = (s1 && s2) ? 0
 		                   : (uint8_t)(3 - s1 - s2 - s_cell_solid[si + c->aoc]);
-		v->pad = 0;
+
+		if (!lit) {
+			v->pad = 0;
+		} else {
+			// Smooth per-corner light: average the four cells touching this corner
+			// from outside the face — the neighbour cell plus the same two flanks
+			// and diagonal the AO rule already walks — skipping occluding ones.
+			// The neighbour cell is never occluding (the face would not have been
+			// emitted), so at least one tap always counts.
+			const int taps[4] = { si + p->neighbour, si + c->ao1, si + c->ao2,
+			                      si + c->aoc };
+			int ssum = 0, bsum = 0, cnt = 0;
+			for (int t = 0; t < 4; t++) {
+				if (s_cell_occl[taps[t]]) continue;
+				ssum += s->light[taps[t]] >> 4;
+				bsum += s->light[taps[t]] & 15;
+				cnt++;
+			}
+			v->pad = (uint8_t)((avgByCnt(ssum, cnt) << 4) | avgByCnt(bsum, cnt));
+		}
 	}
 
 	// Two triangles round the quad, keeping the counter-clockwise order the corners
@@ -330,7 +369,7 @@ static void emitCollect(const MeshScratch* s)
 // pass pays nothing for it. [face_first, face_end) selects which face directions to emit, so
 // the caller can lay the opaque run out face-major — see meshChunk.
 static void meshPass(MeshOut* out, const MeshScratch* s, const EmitCell* cells, int n,
-                     bool deferred, int face_first, int face_end)
+                     bool deferred, int face_first, int face_end, bool lit)
 {
 	for (int i = 0; i < n; i++) {
 		const EmitCell* e  = &cells[i];
@@ -358,7 +397,7 @@ static void meshPass(MeshOut* out, const MeshScratch* s, const EmitCell* cells, 
 			// testMesherOpaqueBehindTransparent.
 			if (deferred && s_cell_solid[ni] && s->blocks[ni] == e->id) continue;
 
-			emitFace(out, si, e->lx, e->ly, e->lz, face, &rects[face]);
+			emitFace(out, s, si, e->lx, e->ly, e->lz, face, &rects[face], lit);
 		}
 	}
 }
@@ -388,10 +427,11 @@ void meshChunk(MeshOut* out, const MeshScratch* s)
 	//
 	// The buckets go out in kFaceOrder, not enum order, so the ones the renderer keeps tend to
 	// land next to each other and merge into fewer draw calls.
+	const bool lit = lightEnabled();
 	out->face_start[0] = 0;
 	for (int slot = 0; slot < BLOCK_FACES; slot++) {
 		const int face = kFaceOrder[slot];
-		meshPass(out, s, s_emit, s_emit_opaque_n, false, face, face + 1);
+		meshPass(out, s, s_emit, s_emit_opaque_n, false, face, face + 1, lit);
 		out->face_start[slot + 1] = out->index_count;
 	}
 
@@ -407,5 +447,5 @@ void meshChunk(MeshOut* out, const MeshScratch* s)
 	// is drawn back-to-front as one ordered sequence. A chunk with no transparent blocks — most
 	// of them — passes a count of zero here and the call returns immediately.
 	meshPass(out, s, &s_emit[s_emit_alpha_lo], CHUNK_BLOCKS - s_emit_alpha_lo,
-	         true, 0, BLOCK_FACES);
+	         true, 0, BLOCK_FACES, lit);
 }

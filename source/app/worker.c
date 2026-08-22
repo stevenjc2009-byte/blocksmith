@@ -2,9 +2,11 @@
 
 #include <3ds.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "world/jobq.h"
+#include "world/light.h"
 #include "world/region.h"
 
 // 32 KB. worldgenColumn's frame is about 1.3 KB (the 16x16 height and sandy tables) and
@@ -88,6 +90,23 @@ static uint8_t s_load_buf[REGION_COL_MAX];
 // frame is already carrying the render path — this is not worth spending stack on when it is
 // live for a few microseconds per installed column.
 static BlockId s_install_blocks[CHUNK_BLOCKS];
+
+// v1.5.0 adaptive lighting: the BFS worklist lightPropagateColumn fills, allocated only
+// when the engine is enabled (New 3DS) so an Old 3DS never pays for it, and owned by this
+// thread for its whole life — the main thread's edit path uses the queue-free sweep engine
+// precisely so the two never share one. ~64 KB of heap against the worker's measured ~94%
+// idle capacity; propagation is what that headroom is for.
+static LightQueue* s_lightq;
+
+static bool workerLightQueue(void)
+{
+	if (!s_lightq) {
+		s_lightq = (LightQueue*)malloc(sizeof(LightQueue));
+		if (!s_lightq) return false;
+		lightQueueInit(s_lightq);
+	}
+	return true;
+}
 
 // Step 8.1. Fills the staging column from the region file, and says whether it managed it.
 // False is the ordinary answer, not an error: it means the card has never heard of this
@@ -187,6 +206,18 @@ static void workerMain(void* arg)
 			// every column.
 			ok = workerLoadColumn(job.cx, job.cz);
 			if (!ok) ok = worldgenColumn(s_gen, &s_staging, job.cx, job.cz);
+
+			// v1.5.0 adaptive lighting: light the staged column while it is here, before
+			// install can queue it ready — the jobq ordering is what guarantees light
+			// exists before the main-thread mesher reads it. A refusal (budget, allocator,
+			// queue overflow) leaves the column unlit, which degrades to today's look via
+			// scratchFillLight's full-sky default rather than to darkness; a false return
+			// from the BFS falls back to the sweep engine so a dropped entry can never
+			// ship half-lit terrain.
+			if (ok && lightEnabled() && workerLightQueue()) {
+				if (!lightPropagateColumn(&s_staging, job.cx, job.cz, s_lightq))
+					lightRelightColumn(&s_staging, job.cx, job.cz);
+			}
 			break;
 		// JOB_MESH is the main thread's — it writes GPU-visible memory, which belongs to
 		// the thread that owns the citro3d context. JOB_LOAD and JOB_SAVE exist as job
@@ -297,6 +328,9 @@ void workerStop(void)
 	// the game, and a half-installed column in a world about to be freed is worse than no
 	// column at all.
 	worldExit(&s_staging);
+
+	free(s_lightq);
+	s_lightq = NULL;
 }
 
 bool workerSubmitColumn(int32_t cx, int32_t cz)
@@ -405,6 +439,13 @@ bool workerInstall(World* w, int32_t* cx, int32_t* cz, bool* ok)
 			chunkDecompressAll(src->chunks[cy], s_install_blocks);
 			if (!worldSetChunkAll(w, rx, cy, rz, s_install_blocks)) { all = false; break; }
 		}
+
+		// v1.5.0 adaptive lighting: the staged column's channels ride across with its
+		// blocks, under the same parked-worker handshake that makes the chunk copy
+		// lock-free. A refusal leaves the live column unlit — scratchFillLight's
+		// full-sky default covers it — and the staging copy is freed with the rest of
+		// the staging world below either way.
+		if (all) lightColumnCopy(src, worldColumn(w, rx, rz));
 	}
 
 	// Frees the staged column and resets the staging world to empty, which is the state

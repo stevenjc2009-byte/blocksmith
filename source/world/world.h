@@ -42,6 +42,12 @@ typedef struct {
 	// exactly. The flag means "the disk does not know about this", so it is raised at the
 	// edit site (scene/interact.c) and nowhere else.
 	bool dirty;
+
+	// v1.5.0 adaptive lighting: the column's sky/block channels, owned end-to-end by
+	// world/light.c (attach/copy/detach) and opaque here. NULL whenever the lighting
+	// engine is off — which is every Old 3DS build and every host test by default — so
+	// this field costs one pointer and nothing else on those paths.
+	void* light;
 } Column;
 
 typedef struct {

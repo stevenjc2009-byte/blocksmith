@@ -136,17 +136,18 @@ HYDRO		:=	deps/libhydrogen
 # is allowed to reach into a sibling repository's working tree.
 #---------------------------------------------------------------------------------
 PROTO_REPO	:=	https://github.com/stevenjc2009-byte/blocksmith-server.git
-# v1.3.0 of the server — the commit that added BS_APP_CHUNK_SUB / CHUNK_DIFFS /
-# CHUNK_UNSUB. Bumped from a3264a4 (v1.2.0, which added BS_APP_WORLD_INFO) because
-# net/networld.c now subscribes per column: a clone still pinned to a3264a4 fetches
-# a bs_proto.h with none of the CHUNK_* ids, BS_CHUNK_DIFFS_HDR_BYTES or bs_col_of()
-# in it and fails to compile.
+# v1.5.0 of the server — the commit that added BS_APP_PLAYER_STATE / PLAYER_REPORT.
+# Bumped from 10111dfb (v1.3.0, which added BS_APP_CHUNK_SUB / CHUNK_DIFFS /
+# CHUNK_UNSUB) because net/networld.c now decodes PLAYER_STATE: a clone still pinned
+# to 10111dfb fetches a bs_proto.h with none of the PLAYER_* ids, flags or sizes in
+# it and fails to compile.
 #
 # This pin is the PROTOCOL the client is built against, not the server it will meet.
-# The running server must be updated to v1.3.0 as well and BEFORE this client ships:
-# bsgame kicks any client sending a message type it does not know, and this client
-# sends CHUNK_SUB on its first loaded column.
-PROTO_COMMIT	:=	10111dfb453fa4e17565771023b6ac183dc05d21
+# The running server must be updated to v1.5.0 as well and BEFORE this client ships:
+# this client's PLAYER_REPORT is capability-gated on having heard PLAYER_STATE (see
+# net/networld.h), so an old server simply never hears it — but the pose-restore
+# feature needs a server that sends PLAYER_STATE at JOIN.
+PROTO_COMMIT	:=	e8e094c9eda01780d01246c80160667e4c4b9fd9
 PROTO		:=	deps/blocksmith-server
 
 .PHONY: deps
@@ -237,6 +238,13 @@ export T3XHFILES		:=	$(patsubst %.t3s, $(BUILD)/%.h, $(GFXFILES))
 #---------------------------------------------------------------------------------
 endif
 #---------------------------------------------------------------------------------
+
+# world/light.c is included by world/world.c rather than compiled standalone —
+# tools/run_host_tests.sh names its files explicitly and predates the module, so
+# the engine's symbols must arrive inside world.o for every host link. Filtered
+# out here so the console build does not define them a second time. See the
+# comment at the include site in world/world.c; edit the two halves together.
+CFILES := $(filter-out light.c,$(CFILES))
 
 export OFILES_SOURCES 	:=	$(CPPFILES:.cpp=.o) $(CFILES:.c=.o) $(SFILES:.s=.o)
 

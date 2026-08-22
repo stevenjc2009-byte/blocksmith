@@ -6,6 +6,7 @@
 #include "net/networld.h"
 #include "scene/chunk_render.h"
 #include "world/block.h"
+#include "world/light.h"
 
 // Does the player's box overlap the unit cube at (bx,by,bz)? This is a plain geometric
 // test rather than a call into physics.c's bodyBlocked, because the block in question has
@@ -100,6 +101,12 @@ int interactEdit(Interact* it, World* w, const Body* body, u32 keys_down)
 		if (worldSet(w, t->x, t->y, t->z, BLOCK_AIR)) {
 			// Step 8.1. Only edits mark a column for saving — see the note on Column.dirty.
 			worldMarkDirty(w, t->x, t->z);
+			// Adaptive lighting: recompute the edited column's channels before the remesh
+			// is queued, so the drained mesh bakes the new light in the same frame. The
+			// sweep engine is queue-free and column-local, so this is exactly a full
+			// reflood of that one column — no neighbour can go stale behind it.
+			if (lightEnabled())
+				lightRelightColumn(w, t->x >> 4, t->z >> 4);
 			queued += chunkRenderTouch(w, t->x, t->y, t->z);
 			// Fire-and-forget to the server: the local write above is already done and is
 			// authoritative for this client's own view, so nothing here waits on it.
@@ -145,6 +152,9 @@ int interactEdit(Interact* it, World* w, const Body* body, u32 keys_down)
 
 		if (worldSet(w, t->px, t->py, t->pz, it->holding)) {
 			worldMarkDirty(w, t->px, t->pz);
+			// Same relight-before-remesh ordering as the break path above.
+			if (lightEnabled())
+				lightRelightColumn(w, t->px >> 4, t->pz >> 4);
 			queued += chunkRenderTouch(w, t->px, t->py, t->pz);
 			// Fire-and-forget to the server, same as the break path above.
 			networldSendBlockEdit(t->px, t->py, t->pz, it->holding);

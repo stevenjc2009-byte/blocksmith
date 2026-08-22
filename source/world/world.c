@@ -6,6 +6,15 @@
 #include "net/networld.h"
 #include "world/budget.h"
 
+// v1.5.0 adaptive lighting. Included, not linked: tools/run_host_tests.sh names
+// its files explicitly and predates world/light.c, so the engine rides inside
+// this translation unit and every host binary that links world.o — the world
+// suite, networld_test, inv_bridge_test — gets its symbols from here. The
+// console Makefile filters light.c out of its wildcard scan for the same reason,
+// so there is exactly one definition per link on either platform. Edit the two
+// halves of this arrangement together.
+#include "world/light.c"
+
 static uint32_t hashKey(int32_t cx, int32_t cz)
 {
 	// Two odd multipliers then an xorshift finaliser. Chunk coordinates arrive in
@@ -59,6 +68,7 @@ void worldExit(World* w)
 			budgetRelease(chunkGetBytes(col->chunks[y]));
 			chunkFree(col->chunks[y]);
 		}
+		lightColumnDetach(col);   // no-op unless lighting attached to this column
 		free(col);
 		budgetRelease(sizeof(Column));
 	}
@@ -135,6 +145,7 @@ bool worldColumnRemove(World* w, int cx, int cz)
 		chunkFree(col->chunks[y]);
 		w->chunks--;
 	}
+	lightColumnDetach(col);   // no-op unless lighting attached to this column
 	free(col);
 	budgetRelease(sizeof(Column));
 	w->columns--;

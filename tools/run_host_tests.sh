@@ -184,7 +184,13 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g 	-I source 	source/net/blockdiff.c 	so
 # Makefiles stay for their finer warning set; this line is what makes the suite the single
 # thing that has to pass. -I deps/blocksmith-server is the wire protocol header the client
 # and the server share, which is the whole point of it living in the server repo.
-gcc -std=c11 -Wall -Wextra -Werror -O1 -g 	-I source -I deps/blocksmith-server 	source/world/world.c 	source/world/chunk.c 	source/world/budget.c 	source/net/blockdiff.c 	source/net/networld.c 	source/net/networld_test.c 	-o "$BH/networld_test"
+#
+# -DBS_CLIENT_HAS_METERS=1 flips this build's copy of net/networld.h's compile-honest meter
+# gate so test_send_player_report_encodes() can reach the PLAYER_REPORT encoder at all: in
+# every other build (console included) the gate is 0 and the encoder does not exist, because
+# sending zeros would wipe a returning player's saved state — see that header. Flipping it
+# HERE and only here is what lets the encode path stay tested while production keeps it off.
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g -DBS_CLIENT_HAS_METERS=1 	-I source -I deps/blocksmith-server 	source/world/world.c 	source/world/block.c 	source/world/chunk.c 	source/world/budget.c 	source/net/blockdiff.c 	source/net/networld.c 	source/net/networld_test.c 	-o "$BH/networld_test"
 
 "./$BH/networld_test"
 
@@ -198,6 +204,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g 	-I source -I deps/blocksmith-server 	
 gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	-I source -I deps/blocksmith-server \
 	source/world/world.c \
+	source/world/block.c \
 	source/world/chunk.c \
 	source/world/budget.c \
 	source/world/inventory.c \
@@ -244,7 +251,7 @@ MINGW*|MSYS*|CYGWIN*) echo "skipping interop_test on Windows (Unix sockets unava
 *)
 make -C deps/blocksmith-server/game bsgame
 
-gcc -std=c11 -Wall -Wextra -Werror -O1 -g 	-I source -I deps/blocksmith-server 	source/world/world.c 	source/world/chunk.c 	source/world/budget.c 	source/net/blockdiff.c 	source/net/networld.c 	source/net/interop_test.c 	-o "$BH/interop_test"
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g 	-I source -I deps/blocksmith-server 	source/world/world.c 	source/world/block.c 	source/world/chunk.c 	source/world/budget.c 	source/net/blockdiff.c 	source/net/networld.c 	source/net/interop_test.c 	-o "$BH/interop_test"
 
 "./$BH/interop_test"
 ;;

@@ -10,6 +10,7 @@
 #include "world/dirtyq.h"
 #include "world/handbuilt.h"
 #include "world/jobq.h"
+#include "world/light.h"
 #include "world/mesher.h"
 #include "world/noise.h"
 #include "world/physics.h"
@@ -3770,6 +3771,331 @@ static void testChunkCodecPaletteUnify(void)
 	chunkFree(b);
 }
 
+// ── v1.5.0 adaptive lighting ─────────────────────────────────────────────────
+//
+// The engine has two independent propagators — the BFS the worker runs at
+// generation and the sweep the edit path runs — and the suite's job is to prove
+// they agree byte-for-byte, that the storage nibbles round-trip, and that a
+// mesher with the engine off emits exactly today's bytes.
+
+// A stone slab across column (0,0) at one height: the standard sun test floor.
+static void lightFloor(int y)
+{
+	for (int z = 0; z < CHUNK_DIM; z++)
+		for (int x = 0; x < CHUNK_DIM; x++)
+			CHECK_QUIET(worldSet(&s_world, x, y, z, BLOCK_STONE));
+}
+
+// The two engines' answer for one column, compared byte-for-byte.
+static void lightEnginesAgree(int cx, int cz)
+{
+	Column* col = worldColumn(&s_world, cx, cz);
+	CHECK(col != NULL && col->light != NULL);
+
+	uint8_t* bfs_sky = (uint8_t*)malloc(LIGHT_COL_BYTES);
+	uint8_t* bfs_blk = (uint8_t*)malloc(LIGHT_COL_BYTES);
+	CHECK(bfs_sky != NULL && bfs_blk != NULL);
+	if (!bfs_sky || !bfs_blk) { free(bfs_sky); free(bfs_blk); return; }
+
+	memcpy(bfs_sky, lightChannelSky(col), LIGHT_COL_BYTES);
+	memcpy(bfs_blk, lightChannelBlock(col), LIGHT_COL_BYTES);
+
+	CHECK(lightRelightColumn(&s_world, cx, cz));
+
+	const int diff = memcmp(bfs_sky, lightChannelSky(col), LIGHT_COL_BYTES) ||
+	                 memcmp(bfs_blk, lightChannelBlock(col), LIGHT_COL_BYTES);
+	CHECK(diff == 0);
+
+	free(bfs_sky);
+	free(bfs_blk);
+}
+
+static void testLightStorage(void)
+{
+	worldInit(&s_world);
+	Column* col = worldColumnCreate(&s_world, 0, 0);
+	CHECK(col != NULL);
+
+	const int    before_n = lightColumnsAttached();
+	const size_t before_b = lightBytesUsed();
+
+	CHECK(lightColumnAttach(col));
+	CHECK(lightColumnsAttached() == before_n + 1);
+	CHECK(lightBytesUsed() == before_b + 2 * LIGHT_COL_BYTES);
+
+	// Idempotent: attaching twice is one allocation.
+	CHECK(lightColumnAttach(col));
+	CHECK(lightColumnsAttached() == before_n + 1);
+
+	// Nibble round trip, including two cells sharing one byte along x.
+	lightSetSkyForTest(col, 0, 5, 0, 15);
+	lightSetSkyForTest(col, 1, 5, 0, 7);
+	CHECK(lightGetSky(col, 0, 5, 0) == 15);
+	CHECK(lightGetSky(col, 1, 5, 0) == 7);
+	CHECK(lightGetSky(col, 1, 6, 0) == 0);    // untouched neighbours stay dark
+	CHECK(lightGetBlock(col, 0, 5, 0) == 0);  // the other channel is separate
+	CHECK(lightGetSky(col, 0, -1, 0) == 0);   // below the floor reads unlit
+	CHECK(lightGetSky(col, 0, WORLD_HEIGHT, 0) == 15);   // above the ceiling: sun
+
+	// Copy carries both channels to a second column.
+	Column* dst = worldColumnCreate(&s_world, 1, 0);
+	CHECK(dst != NULL);
+	CHECK(lightColumnCopy(col, dst));
+	CHECK(lightGetSky(dst, 1, 5, 0) == 7);
+
+	lightColumnDetach(col);
+	lightColumnDetach(dst);
+	CHECK(lightColumnsAttached() == before_n);
+	CHECK(lightBytesUsed() == before_b);
+
+	worldExit(&s_world);
+}
+
+static void testLightSkySunColumns(void)
+{
+	lightEngineInit(true);
+	worldInit(&s_world);
+	lightFloor(40);
+
+	LightQueue* q = (LightQueue*)malloc(sizeof(LightQueue));
+	CHECK(q != NULL);
+	if (!q) { worldExit(&s_world); return; }
+	lightQueueInit(q);
+
+	CHECK(lightPropagateColumn(&s_world, 0, 0, q));
+
+	Column* col = worldColumn(&s_world, 0, 0);
+	CHECK(col != NULL);
+	CHECK(lightGetSky(col, 3, 41, 3) == 15);       // open sky above the slab
+	CHECK(lightGetSky(col, 3, 127, 3) == 15);
+	CHECK(lightGetSky(col, 3, 40, 3) == 0);        // the slab itself stops light
+	CHECK(lightGetSky(col, 3, 39, 3) == 0);        // sealed underneath stays dark
+	CHECK(lightGetBlock(col, 3, 41, 3) == 0);      // no luminous blocks yet
+
+	lightEnginesAgree(0, 0);
+
+	worldExit(&s_world);
+	free(q);
+	lightEngineInit(false);
+}
+
+static void testLightSkyOverhang(void)
+{
+	lightEngineInit(true);
+	worldInit(&s_world);
+	lightFloor(40);
+	// A roof over the east half: cells under it are lit only from the open west.
+	for (int z = 0; z < CHUNK_DIM; z++)
+		for (int x = 4; x < CHUNK_DIM; x++)
+			CHECK_QUIET(worldSet(&s_world, x, 44, z, BLOCK_STONE));
+
+	LightQueue* q = (LightQueue*)malloc(sizeof(LightQueue));
+	CHECK(q != NULL);
+	if (!q) { worldExit(&s_world); return; }
+	lightQueueInit(q);
+
+	CHECK(lightPropagateColumn(&s_world, 0, 0, q));
+
+	Column* col = worldColumn(&s_world, 0, 0);
+	CHECK(col != NULL);
+	CHECK(lightGetSky(col, 4, 43, 8) == 14);   // one step under the roof edge
+	CHECK(lightGetSky(col, 5, 43, 8) == 13);   // the falloff gradient marches east
+	CHECK(lightGetSky(col, 15, 43, 8) == 3);   // eleven steps from the lit edge
+	CHECK(lightGetSky(col, 10, 45, 8) == 15);  // above the roof is open sky again
+	CHECK(lightGetSky(col, 10, 41, 8) == 8);   // every under-roof row fades alike:
+	                                           // seven horizontal steps from the
+	                                           // lit column, whatever the height
+	CHECK(lightGetSky(col, 3, 43, 8) == 15);   // the lit column itself
+
+	lightEnginesAgree(0, 0);
+
+	worldExit(&s_world);
+	free(q);
+	lightEngineInit(false);
+}
+
+static void testLightBlockChannel(void)
+{
+	lightEngineInit(true);
+	worldInit(&s_world);
+
+	// A sealed stone shell with an air room inside, and one luminous block in
+	// the middle of it. No registry block emits in production — the table is
+	// patched here so the channel is proven end-to-end without inventing a torch.
+	for (int y = 39; y <= 45; y++)
+		for (int z = 0; z < CHUNK_DIM; z++)
+			for (int x = 0; x < CHUNK_DIM; x++) {
+				const bool room = (y >= 40 && y <= 44 && x >= 4 && x <= 11 &&
+				                   z >= 4 && z <= 11);
+				CHECK_QUIET(worldSet(&s_world, x, y, z,
+				                     room ? BLOCK_AIR : BLOCK_STONE));
+			}
+	CHECK(worldSet(&s_world, 7, 42, 7, BLOCK_WOOD));
+
+	lightSetLuminanceForTest(BLOCK_WOOD, 7);
+
+	LightQueue* q = (LightQueue*)malloc(sizeof(LightQueue));
+	CHECK(q != NULL);
+	if (!q) { worldExit(&s_world); return; }
+	lightQueueInit(q);
+
+	CHECK(lightPropagateColumn(&s_world, 0, 0, q));
+
+	Column* col = worldColumn(&s_world, 0, 0);
+	CHECK(col != NULL);
+	CHECK(lightGetBlock(col, 7, 42, 7) == 7);   // the emitter holds its own level
+	CHECK(lightGetBlock(col, 8, 42, 7) == 6);   // -1 per air cell outward
+	CHECK(lightGetBlock(col, 11, 42, 7) == 3);  // four steps east along the room
+	CHECK(lightGetBlock(col, 11, 44, 11) == 0); // ten steps to the far corner:
+	                                            // past the emitter's reach
+	CHECK(lightGetBlock(col, 7, 46, 7) == 0);   // beyond the sealed shell: nothing
+	CHECK(lightGetSky(col, 7, 42, 7) == 0);     // indoors: no sky in here
+
+	lightEnginesAgree(0, 0);
+
+	lightSetLuminanceForTest(BLOCK_WOOD, 0);    // restore production truth
+	worldExit(&s_world);
+	free(q);
+	lightEngineInit(false);
+}
+
+// The design doc's classic drift check: a long sequence of single-block edits,
+// each followed by the edit-path relight, must land exactly where a fresh full
+// recompute of the final terrain lands. Two independent engines have to agree.
+static void testLightIncrementalEqualsFull(void)
+{
+	lightEngineInit(true);
+	worldInit(&s_world);
+
+	// Random relief: stone columns of varying height, some capped with leaves so
+	// the transparent-block rule is exercised too.
+	Rng rng;
+	rngSeed(&rng, 0x5EED1234);
+	for (int z = 0; z < CHUNK_DIM; z++)
+		for (int x = 0; x < CHUNK_DIM; x++) {
+			const int h = 30 + (int)rngBelow(&rng, 24);
+			for (int y = 0; y <= h; y++) {
+				const BlockId id =
+				    (y == h && rngBelow(&rng, 4) == 0) ? BLOCK_LEAVES : BLOCK_STONE;
+				CHECK_QUIET(worldSet(&s_world, x, y, z, id));
+			}
+		}
+
+	LightQueue* q = (LightQueue*)malloc(sizeof(LightQueue));
+	CHECK(q != NULL);
+	if (!q) { worldExit(&s_world); return; }
+	lightQueueInit(q);
+
+	// First light, then 200 edits each followed by the edit-path engine.
+	CHECK(lightPropagateColumn(&s_world, 0, 0, q));
+
+	for (int e = 0; e < 200; e++) {
+		const int x = (int)rngBelow(&rng, CHUNK_DIM);
+		const int z = (int)rngBelow(&rng, CHUNK_DIM);
+		const int y = 28 + (int)rngBelow(&rng, 28);
+		const BlockId id = worldGet(&s_world, x, y, z) == BLOCK_AIR
+		                       ? BLOCK_STONE : BLOCK_AIR;
+		CHECK_QUIET(worldSet(&s_world, x, y, z, id));
+		CHECK_QUIET(lightRelightColumn(&s_world, 0, 0));
+	}
+
+	// The BFS run now must reproduce the edited-and-relit state exactly.
+	lightEnginesAgree(0, 0);
+
+	worldExit(&s_world);
+	free(q);
+	lightEngineInit(false);
+}
+
+// Constraint 1 made executable: with the engine off, meshChunk's vertex bytes are
+// exactly what the pre-lighting mesher produced — pad zero everywhere, even when
+// the scratch's light band holds garbage. With it on, only pad may differ, and
+// only where light actually varies.
+static void testMesherO3DSParity(void)
+{
+	MeshOut ref = {0}, lit = {0};
+	ref.vert_cap = lit.vert_cap = MESH_MAX_VERTS;
+	ref.index_cap = lit.index_cap = MESH_MAX_INDICES;
+	ref.verts     = (MeshVertex*)malloc(sizeof(MeshVertex) * MESH_MAX_VERTS);
+	ref.indices   = (uint16_t*)malloc(sizeof(uint16_t) * MESH_MAX_INDICES);
+	lit.verts     = (MeshVertex*)malloc(sizeof(MeshVertex) * MESH_MAX_VERTS);
+	lit.indices   = (uint16_t*)malloc(sizeof(uint16_t) * MESH_MAX_INDICES);
+	CHECK(ref.verts && ref.indices && lit.verts && lit.indices);
+	if (!ref.verts || !ref.indices || !lit.verts || !lit.indices) {
+		free(ref.verts); free(ref.indices); free(lit.verts); free(lit.indices);
+		return;
+	}
+
+	// Floor, an overhang casting real shadow, and a pillar for tile variety.
+	worldInit(&s_world);
+	lightFloor(40);
+	for (int z = 0; z < CHUNK_DIM; z++)
+		for (int x = 6; x < CHUNK_DIM; x++)
+			CHECK_QUIET(worldSet(&s_world, x, 44, z, BLOCK_STONE));
+	for (int y = 41; y <= 43; y++)
+		CHECK_QUIET(worldSet(&s_world, 2, y, 2, BLOCK_WOOD));
+
+	// --- Engine off: reference bytes. Garbage in the light band must not leak.
+	memset(s_scratch.light, 0xFF, sizeof(s_scratch.light));
+	scratchFill(&s_scratch, &s_world, 0, 2, 0);
+	meshChunk(&ref, &s_scratch);
+	CHECK(ref.faces > 0);
+
+	bool any_pad_set = false;
+	for (uint32_t i = 0; i < ref.vert_count; i++)
+		if (ref.verts[i].pad != 0) any_pad_set = true;
+	CHECK(!any_pad_set);
+
+	// --- Engine on: same geometry, light baked into pad.
+	lightEngineInit(true);
+	LightQueue* q = (LightQueue*)malloc(sizeof(LightQueue));
+	CHECK(q != NULL);
+	if (!q) {
+		lightEngineInit(false);
+		worldExit(&s_world);
+		free(ref.verts); free(ref.indices); free(lit.verts); free(lit.indices);
+		return;
+	}
+	lightQueueInit(q);
+	CHECK(lightPropagateColumn(&s_world, 0, 0, q));
+
+	scratchFill(&s_scratch, &s_world, 0, 2, 0);
+	scratchFillLight(&s_scratch, &s_world, 0, 2, 0);
+	meshChunk(&lit, &s_scratch);
+
+	CHECK(lit.vert_count == ref.vert_count);
+	CHECK(lit.index_count == ref.index_count);
+	CHECK(memcmp(lit.indices, ref.indices,
+	             sizeof(uint16_t) * ref.index_count) == 0);
+
+	bool pads_differ = false, all_fields_else_equal = true;
+	int  shadowed = 0;
+	for (uint32_t i = 0; i < ref.vert_count; i++) {
+		MeshVertex a = ref.verts[i], b = lit.verts[i];
+		const uint8_t ra = a.pad, rb = b.pad;   // captured before the wipe below
+		a.pad = b.pad = 0;
+		if (memcmp(&a, &b, sizeof(a)) != 0) all_fields_else_equal = false;
+		if (ra != rb) pads_differ = true;
+		if ((rb >> 4) < 15) shadowed++;
+	}
+	CHECK(all_fields_else_equal);   // nothing but pad moved
+	CHECK(pads_differ);             // ...and pad really carries the light
+	CHECK(shadowed > 0);            // the overhang's shade reached vertices
+
+	// Fully sunlit corners average four taps of 15 and pack to exactly 0xF0:
+	// the value that makes the dynamic shader reproduce the baked brightness.
+	// (pad is declared int8_t; the GPU fetches it unsigned, so compare bytes.)
+	int full_sun = 0;
+	for (uint32_t i = 0; i < lit.vert_count; i++)
+		if ((uint8_t)lit.verts[i].pad == 0xF0) full_sun++;
+	CHECK(full_sun > 0);
+
+	lightEngineInit(false);
+	worldExit(&s_world);
+	free(q);
+	free(ref.verts); free(ref.indices); free(lit.verts); free(lit.indices);
+}
+
 #ifndef __3DS__
 
 #include <dirent.h>
@@ -4185,6 +4511,12 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testVisWalk();
 	testVisWalkNeverHidesOpenSky();
 	testRenderDist();
+	testLightStorage();
+	testLightSkySunColumns();
+	testLightSkyOverhang();
+	testLightBlockChannel();
+	testLightIncrementalEqualsFull();
+	testMesherO3DSParity();
 	testChunkCodec();
 	testChunkCodecPaletteUnify();
 #ifndef __3DS__
