@@ -44,6 +44,10 @@
 static int s_scroll;    // first visible action index
 static int s_cursor;    // 0..action_count (action_count = the "Reset to defaults" row)
 
+// Armed by remapUiInit(), consumed by the first remapUiUpdate() after it. See the
+// consumption site in remapUiUpdate for why the opening frame's input must be thrown away.
+static bool s_swallow_frame;
+
 // ── Drawing helpers ──────────────────────────────────────────────────────────
 
 static void drawRow(int index, const char* label, bool selected)
@@ -56,16 +60,41 @@ static void drawRow(int index, const char* label, bool selected)
 
 // ── Entry points ─────────────────────────────────────────────────────────────
 
+// Called at boot AND from main.c every time the pause menu opens this screen. It used to
+// be boot-only, which left s_cursor and s_scroll holding whatever row the player was on
+// the last time they were here: reopening the screen dropped them halfway down a list
+// they had just arrived at. Resetting on open makes every visit start at the top.
 void remapUiInit(void)
 {
 	s_scroll = 0;
 	s_cursor = 0;
+	// Re-armed on every open, not just at boot — the second visit has the same spent-input
+	// problem as the first. See remapUiUpdate.
+	s_swallow_frame = true;
 }
 
 bool remapUiUpdate(RemapState* rs, uint32_t down,
                    bool touch_down, int touch_x, int touch_y)
 {
 	if (!rs) return false;
+
+	// The frame that opened this screen carries input that has already been spent. main.c
+	// reads hidKeysDown() once per frame into one word, hands it to pauseMenuInput() —
+	// which consumes KEY_A to pick the "Controls" row and opens this screen — and then
+	// hands the SAME, unchanged word here in the same loop iteration. remapUiInit() has
+	// just parked the cursor on action row 0, so without this guard the A that opened the
+	// screen fell straight through to remapStartCapture() below: the binding list was
+	// unreachable, because the very first frame was already "Press a button...".
+	//
+	// Swallowed rather than returned on, so the panel still draws on its opening frame —
+	// an early return here would show one frame of bare pause menu. down/touch_down are
+	// this function's own parameters, so zeroing them affects nothing outside it and every
+	// branch below sees a clean frame instead of each one needing its own guard.
+	if (s_swallow_frame) {
+		s_swallow_frame = false;
+		down            = 0;
+		touch_down      = false;
+	}
 
 	const int action_count = remapActionCount();
 	const int total_rows = action_count + 1;  // actions + reset row (cursor positions)
@@ -131,11 +160,25 @@ bool remapUiUpdate(RemapState* rs, uint32_t down,
 		remapStartCapture(rs, s_cursor);
 	}
 
-	// B: exit remap screen.
-	if (down & KEY_B) return false;
+	// B: exit remap screen. Noted here — where the press is actually read, alongside the
+	// other button handling — but acted on at the very END of the function, after the draw
+	// block. Returning from this spot skipped the draw, so the closing frame rendered the
+	// bare pause menu underneath before main.c's next frame drew the OPTIONS page: one
+	// frame of flash on every exit.
+	const bool closing = (down & KEY_B) != 0;
 
 	// ── Touch ─────────────────────────────────────────────────────────────
-	if (touch_down) {
+	//
+	// touch_down is a rising EDGE, not the held level: main.c derives it from
+	// hidKeysHeld() & KEY_TOUCH against the previous frame's value before calling here.
+	// It has to be, because this block starts a capture and resets bindings — fed the
+	// level, a stylus resting on the "Reset to defaults" row re-ran remapReset() once per
+	// frame at 60 Hz. The edge is derived at the call site rather than with a static
+	// touch_prev of our own so the whole frame's input is read in one place.
+	//
+	// `&& !closing` preserves the behaviour the old early return had: a frame that closes
+	// the screen does not also act on what the stylus is over.
+	if (touch_down && !closing) {
 		const int y0 = PANEL_Y + 34;
 
 		// Check action rows first.
@@ -191,5 +234,7 @@ bool remapUiUpdate(RemapState* rs, uint32_t down,
 	         "A select   B back");
 
 	spriteEnd();
-	return true;
+
+	// The B press read above takes effect here, one draw later — see `closing`.
+	return !closing;
 }

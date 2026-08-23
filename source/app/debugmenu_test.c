@@ -9,6 +9,13 @@
 #include "app/debugmenu.h"
 #include "app/options.h"
 
+// Pulled in as source, not linked, on purpose. tools/run_host_tests.sh builds this
+// binary from options.c + debugmenu.c + this file; debugmenu_ui.c's console half is
+// compiled out on the host (see its #ifdef __3DS__ block), so including it here puts
+// debugMenuUiOpen/debugMenuUiUpdate in this translation unit without the script — and
+// without a second binary — having to know about it.
+#include "app/debugmenu_ui.c"
+
 static int  s_checks;
 static int  s_fails;
 static char s_first[160];
@@ -220,6 +227,195 @@ static void testDebugMenuOptionBackwardCompat(void)
 	CHECK(o.debug_menu == false);
 }
 
+// ── UI input tests ──────────────────────────────────────────────────────
+//
+// The frame-input-reuse bug these guard, in full: main.c reads hidKeysDown() once
+// per frame into `down`, hands that same word to pauseMenuInput() — which consumes
+// KEY_A to pick the "Debug" row and calls debugMenuUiOpen() — and then, in the SAME
+// loop iteration, hands the unchanged word to debugMenuUiUpdate(). debugMenuUiOpen()
+// has just parked the cursor on entry 0, which is the "Render distance" slider, so
+// the A press that opened the menu also stepped the slider, re-meshing the whole
+// ring. The player never pressed A twice; one press did two things.
+//
+// A test that only checked "A does nothing on the open frame" could pass against a
+// build where A never works at all, so testUiSecondFrameAActivates() below is the
+// control: same entry, same key, one frame later, and it MUST move.
+
+static void makeSliderEntry(int initial)
+{
+	debugMenuReset();
+	DebugEntry* e = debugMenuRegister();
+	e->name       = "Render distance";
+	e->kind       = DEBUG_SLIDER_INT;
+	e->getInt     = getSlider;
+	e->setInt     = setSlider;
+	e->slider_min = 2;
+	e->slider_max = 6;
+	e->ctx        = NULL;
+	s_slider_val  = initial;
+}
+
+static void testUiOpenFrameDoesNotActivate(void)
+{
+	makeSliderEntry(3);
+
+	DebugContext ctx = {0};
+	debugMenuUiInit();
+	debugMenuUiOpen();
+
+	// The exact word main.c passes on the opening frame: the A that chose "Debug".
+	CHECK(debugMenuUiUpdate(&ctx, NULL, KEY_A, false, 0, 0) == true);
+	CHECK(s_slider_val == 3);   // must NOT have stepped to 4
+}
+
+static void testUiSecondFrameAActivates(void)
+{
+	makeSliderEntry(3);
+
+	DebugContext ctx = {0};
+	debugMenuUiInit();
+	debugMenuUiOpen();
+
+	debugMenuUiUpdate(&ctx, NULL, KEY_A, false, 0, 0);       // opening frame, swallowed
+	debugMenuUiUpdate(&ctx, NULL, KEY_A, false, 0, 0);       // deliberate press
+	CHECK(s_slider_val == 4);
+}
+
+static void testUiOpenFrameSwallowsTouchToo(void)
+{
+	// Same defect class: the pause menu is button-driven today, but a touch that is
+	// still down on the opening frame would land on whatever row happens to sit under
+	// the stylus. Row 0 is at PANEL_Y + 34; ROW_X + 6 is inside it.
+	makeSliderEntry(3);
+
+	DebugContext ctx = {0};
+	debugMenuUiInit();
+	debugMenuUiOpen();
+
+	CHECK(debugMenuUiUpdate(&ctx, NULL, 0, true, ROW_X + 6, PANEL_Y + 34) == true);
+	CHECK(s_cursor == 0);
+}
+
+static void testUiOpenFrameGuardIsOncePerOpen(void)
+{
+	// Closing and reopening must arm the guard again — otherwise the second visit to
+	// the menu has the original bug back.
+	makeSliderEntry(3);
+
+	DebugContext ctx = {0};
+	debugMenuUiInit();
+	debugMenuUiOpen();
+	debugMenuUiUpdate(&ctx, NULL, 0, false, 0, 0);           // opening frame
+	CHECK(debugMenuUiUpdate(&ctx, NULL, KEY_B, false, 0, 0) == false);   // B closes
+
+	debugMenuUiOpen();
+	CHECK(debugMenuUiUpdate(&ctx, NULL, KEY_A, false, 0, 0) == true);
+	CHECK(s_slider_val == 3);
+}
+
+// ── main.c debug-menu save-path test ────────────────────────────────────
+//
+// This one parses source text rather than calling a function, for the same reason
+// world/atlas_uv_shader_test.c does: the code under test is inside main.c's frame
+// loop, which has no host build and no seam to call into. Mirroring the sequence
+// here instead would prove nothing — a mirror passes whatever main.c actually says.
+//
+// The bug: the pause-menu path assigns opts.render_dist = s_mesh_radius before
+// optionsSave (main.c, the `if (dist_step != 0)` block), because s_mesh_radius is
+// the CLAMPED value genSetRadius settled on and opts.render_dist is what survives a
+// reboot. The debug-menu path calls the same optionsSave with that assignment
+// missing, so a render distance changed from the debug menu applies live and is then
+// written to options.ini as the OLD number and lost on the next boot.
+//
+// Every failure path below is a loud failure, never a skip: a parse that cannot find
+// the call site must not read as "nothing wrong".
+
+#define MAIN_PATH "source/main.c"
+
+// Reads MAIN_PATH and returns true when `opts.render_dist = s_mesh_radius` appears
+// between the debugMenuUiUpdate( call and the optionsSave( that follows it. Fills
+// errbuf and returns false on any parse failure, so the caller can fail loudly.
+static bool debugSavePathAssignsRenderDist(char* errbuf, size_t errbufsz)
+{
+	FILE* f = fopen(MAIN_PATH, "r");
+	if (!f) {
+		snprintf(errbuf, errbufsz, "cannot open %s (run from the project root)", MAIN_PATH);
+		return false;
+	}
+
+	char line[512];
+	bool seen_call   = false;
+	bool seen_assign = false;
+
+	while (fgets(line, sizeof(line), f)) {
+		if (!seen_call) {
+			if (strstr(line, "debugMenuUiUpdate(")) seen_call = true;
+			continue;
+		}
+		if (strstr(line, "opts.render_dist") && strstr(line, "s_mesh_radius"))
+			seen_assign = true;
+		// The first optionsSave after the call is the debug menu's own save; stop there
+		// so a later, unrelated save site cannot make this pass by accident.
+		if (strstr(line, "optionsSave(")) {
+			fclose(f);
+			return seen_assign;
+		}
+	}
+
+	fclose(f);
+	snprintf(errbuf, errbufsz,
+	         seen_call ? "no optionsSave( after debugMenuUiUpdate( in %s"
+	                   : "no debugMenuUiUpdate( call found in %s",
+	         MAIN_PATH);
+	return false;
+}
+
+static void testMainDebugSaveWritesNewRenderDist(void)
+{
+	char err[200];
+	err[0] = '\0';
+	const bool ok = debugSavePathAssignsRenderDist(err, sizeof(err));
+	if (!ok && err[0])
+		printf("  debug save-path parse: %s\n", err);
+	CHECK(ok);
+}
+
+// The parse test above proves main.c *contains* the assignment. This one proves the
+// assignment is what makes the new number survive, by running the same two lines main.c
+// now runs and then reading the file back off disk. The pair is deliberate: the parser
+// alone would go green against `opts.render_dist = s_mesh_radius;` written anywhere with
+// any semantics, and this alone would go green against a main.c that never does it.
+//
+// Red-armed: delete the `opts.render_dist = new_radius;` line below and the last CHECK
+// fails with in.render_dist == 1 instead of 2 — the exact reboot symptom.
+//
+// The numbers are RENDER_DIST_MIN (1) and RENDER_DIST_MAX (2), measured from
+// scene/render_dist.h, not picked: options.c:277 clamps render_dist into that range on
+// load, so a bigger "new" value would come back clamped and the test would pass for the
+// wrong reason.
+static void testDebugSaveRoundTripsNewRenderDist(void)
+{
+	const char* path = TEST_DIR "/debug_roundtrip.ini";
+
+	Options opts;
+	optionsDefaults(&opts);
+	opts.render_dist = RENDER_DIST_MIN;   // what was on disk before the menu was opened
+	CHECK(optionsSave(&opts, path));
+
+	// What genSetRadius clamped to and s_mesh_radius now reads back as, live.
+	const int new_radius = RENDER_DIST_MAX;
+	CHECK(new_radius != RENDER_DIST_MIN);   // otherwise this test could not go red
+
+	opts.render_dist = new_radius;
+	CHECK(optionsSave(&opts, path));
+
+	Options in;
+	int bad = -1;
+	CHECK(optionsLoad(&in, path, &bad));
+	CHECK(bad == 0);
+	CHECK(in.render_dist == RENDER_DIST_MAX);
+}
+
 // ── Main ────────────────────────────────────────────────────────────────
 
 int main(void)
@@ -238,6 +434,12 @@ int main(void)
 	testDebugMenuOptionDefault();
 	testDebugMenuOptionRoundTrip();
 	testDebugMenuOptionBackwardCompat();
+	testUiOpenFrameDoesNotActivate();
+	testUiSecondFrameAActivates();
+	testUiOpenFrameSwallowsTouchToo();
+	testUiOpenFrameGuardIsOncePerOpen();
+	testMainDebugSaveWritesNewRenderDist();
+	testDebugSaveRoundTripsNewRenderDist();
 
 	testCleanup();
 

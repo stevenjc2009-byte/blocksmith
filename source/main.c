@@ -49,7 +49,6 @@
 #include "scene/interact.h"
 #include "scene/loading.h"
 #include "scene/loading_draw.h"
-#include "scene/minimap.h"
 #include "scene/player.h"
 #include "scene/pausemenu.h"
 #include "scene/title.h"
@@ -831,21 +830,38 @@ static void genSetRadius(int radius)
 	genQueueReadyColumns();
 }
 
-// Starts the worker and queues the whole area. The spawn column goes first because the
-// ring is FIFO, so it is the first one back and the player has ground under them before
-// the loop starts.
+// Everything from here down to the #if below is shared, not streaming machinery: the debug
+// menu's state and rows, and the per-session UI flags beside them, are read from main() and
+// from the frame loop, neither of which is guarded. Hoisted out for exactly the reason
+// saveWorldDir was (see its comment above): sitting inside compiled fine for every ordinary
+// build, because BS_WORLD_GEN defaults to 1, and left BS_WORLD_GEN=0 with a dozen undeclared
+// identifiers and implicit declarations at call sites that were never generated-world only.
+#endif   // BS_WORLD_GEN
+
+// The one thing the hoisted block still needs from the streaming machinery, in the build that
+// has none. There is no ring to resize when the world is hand-built — it is filled and meshed
+// in one call and never re-meshed — so a render-distance change has nothing to act on and this
+// does nothing. A no-op definition rather than an #if at each caller because there are three
+// of them and two (the debug menu's slider, the pause menu's stepper) are shared UI compiled
+// into both builds; the third, the L and R shortcut in the frame loop, is already compiled out
+// under BS_WORLD_GEN=0 for the same reason, and that is the precedent this follows. It is
+// deliberately not chunkRenderSetDistance: changing the fog and the near plane in a world
+// nothing streams into would be new behaviour, and nothing has asked for it.
+#if !BS_WORLD_GEN
+static void genSetRadius(int radius) { (void)radius; }
+#endif
+
 // The seed genStart() actually generated from — BS_WORLD_SEED in single player, the server's
 // own seed in a session. Kept because the gen overlay's readout is otherwise a lie the moment
 // the two differ, and "which world am I standing in" is exactly what that line is for.
 static uint32_t s_seed_used = BS_WORLD_SEED;
 
-// v1.4.0: control-remap screen state, debug-menu flag, and the minimap's fog-of-war for
-// whichever world is loaded. Reset or reloaded per session, like the seed above.
+// v1.4.0: control-remap screen state and the debug-menu flag. Reset per session, like the
+// seed above. The minimap's fog-of-war buffer and save path used to live here too; the
+// whole feature was removed in v1.6.0 (see below, at the old init site).
 static RemapState s_remap;
 static bool       s_remap_open;
 static bool       s_debug_open;
-static MinimapFog s_minimap_fog;
-static char       s_minimap_path[80];
 
 // Live numbers the debug menu's INFO rows read. Refreshed every frame the menu is open;
 // entries hold this struct's address, so it lives at file scope rather than on the frame.
@@ -867,18 +883,6 @@ static void bsDbgSetDist(void* ctx, int v)
 {
 	(void)ctx;
 	bsDebugSetRenderDist(v);
-}
-
-static bool bsDbgGetMinimap(void* ctx)
-{
-	(void)ctx;
-	return minimapIsVisible();
-}
-
-static void bsDbgSetMinimap(void* ctx, bool v)
-{
-	(void)ctx;
-	minimapSetVisible(v);
 }
 
 static const char* bsDbgInfoFrame(char* buf, int cap, void* ctx)
@@ -942,16 +946,9 @@ static void bsDebugRegister(void)
 		e->ctx        = &s_dctx;
 	}
 
-	e = debugMenuRegister();
-	if (e) {
-		e->name      = "Minimap";
-		e->kind      = DEBUG_TOGGLE;
-		e->available = true;
-		e->getBool   = bsDbgGetMinimap;
-		e->setBool   = bsDbgSetMinimap;
-		e->ctx       = NULL;
-	}
-
+	// A "Minimap" toggle used to sit here, between Render distance and Weather. It went
+	// with the feature in v1.6.0, so every entry below it moved up one index — the debug
+	// menu builds its rows from this registration order, so this list IS the row order.
 	e = debugMenuRegister();
 	if (e) {
 		e->name      = "Weather";
@@ -987,8 +984,14 @@ static void bsDebugRegister(void)
 		e->ctx       = &s_dctx;
 	}
 }
-#endif
+#endif   // BS_BOTTOM_UI
 
+// And back into the streaming machinery.
+#if BS_WORLD_GEN
+
+// Starts the worker and queues the whole area. The spawn column goes first because the
+// ring is FIFO, so it is the first one back and the player has ground under them before
+// the loop starts.
 static bool genStart(int32_t cx, int32_t cz)
 {
 	// Which world this is, decided here and nowhere else. In a session the server owns the
@@ -1345,6 +1348,15 @@ static void genFollow(float x, float z)
 #define BS_HANG_HANDOFF 0
 #endif
 
+// Out of the streaming block again, and for the same reason as the debug-menu state above: the
+// boot timer and the draw probe are instrumentation for the whole program, and every one of
+// their call sites — BOOT_BEGIN/BOOT_END around the boot steps, probeBegin/probeFrame in the
+// game loop, bsProbeArm() from scene/chunk_render.c — is shared code that both worlds compile.
+// Both already have a correct #if/#else with an off arm defined; nesting them in here meant a
+// BS_WORLD_GEN=0 build got neither arm. The save-check probe below stays inside, because that
+// one really is generated-world only — it unloads and reloads a streamed column.
+#endif   // BS_WORLD_GEN
+
 // Where the time between "the player confirmed the world name" and "the loading screen appears"
 // actually goes. Measured rather than guessed at: the emulator puts that gap at 23.95 s of a
 // completely unrepainted screen (38 byte-identical captures) with nothing in Azahar's own log to
@@ -1627,6 +1639,9 @@ static void probeFrame(void)
 #define probeBegin()      ((void)0)
 #define probeFrame()      ((void)0)
 #endif
+
+// And back into the streaming machinery for the save-check probe, which needs it.
+#if BS_WORLD_GEN
 
 #define SAVE_CHECK_NOTE "sdmc:/blocksmith/savecheck.txt"
 
@@ -2051,6 +2066,76 @@ static void saveDirtyColumns(void)
 	}
 	workerFlushSaves();
 }
+
+// ── v1.6.0: the same writes, one at a time, for app/sleep.c's lid-close flush ──────────
+//
+// saveDirtyColumns() above is the quit path and is allowed to take as long as the card
+// takes. Closing the lid is not the quit path — it is a player who expects the console to
+// settle immediately — but a battery that dies while the lid is shut takes the whole
+// session with it, so doing nothing is not the answer either. app/sleep.h's
+// SLEEP_FLUSH_BUDGET_MS is the compromise, and this is the step it spends that budget on.
+//
+// Split as a step rather than a whole loop because the budget is checked BETWEEN columns:
+// sleep.c drives, this writes exactly one column and blocks until it lands, and the clock
+// gets looked at in between. workerFlushSaves() per column costs more total time than one
+// flush at the end would, and that is the trade — a batched submit would leave the budget
+// measuring a queue rather than the card, which is the number that matters here.
+//
+// Slot order, not newest-first. `Column` (world/world.h) holds cx, cz, its eight chunk
+// pointers, `dirty` and `light` — there is no timestamp, no sequence number and no
+// touched-at counter anywhere in it, so there is nothing to sort by. Adding a field to get
+// an ordering would be inventing state the game does not otherwise keep, so this walks the
+// slot table in order and the cursor below is what stops that from being unfair.
+//
+// The cursor persists across calls and is only rewound once the walk reaches the end, so a
+// lid-close that runs out of budget halfway resumes where it stopped the next time rather
+// than re-writing the same head of the table forever. It is reset when the hook is
+// registered, in genStart(), so a new world starts at slot 0.
+//
+// ⚠ `dirty` is never cleared — world/world.h documents it as raised at the edit site and
+// the column is simply freed when it unloads — so a column written by one lid-close is
+// still dirty at the next one and will be written again when the cursor comes back round.
+// That is wasted card time, not lost data, and clearing the flag here would change what
+// the quit path above means. Left alone deliberately.
+//
+// Guarded on BS_WORLD_GEN because the only place that registers these is inside the same
+// guard — a BS_REMESH_STRESS/BS_DIG_OUT/BS_EDIT_STRESS build has a hand-built world and no
+// worker, so both would be statics nobody calls and -Wall would say so.
+#if BS_WORLD_GEN
+static int s_sleep_flush_cursor;
+
+static bool sleepFlushOneColumn(void)
+{
+	while (s_sleep_flush_cursor < WORLD_MAP_SLOTS) {
+		const Column* col = s_world.slots[s_sleep_flush_cursor++];
+		if (!col || !col->dirty) continue;
+
+		// The return value is deliberately not branched on: app/worker.h says false means a
+		// column that could not be encoded, which is a corrupt column and a bug report
+		// rather than something to retry, and either way the budget has been spent.
+		(void)workerSubmitSave(col);
+		workerFlushSaves();
+		return true;
+	}
+
+	s_sleep_flush_cursor = 0;
+	return false;
+}
+
+// The other half of the lid-close work. Unconditional netDisconnect() would be wrong here
+// only in the sense that it is pointless off a server session — bsnet.h says it is safe to
+// call in any state — but s_server_session is the honest gate and it is free, so the
+// single-player lid-close touches nothing at all.
+//
+// Why leaving at all is the right answer, and what was rejected instead, is argued in
+// app/sleep.c above the call to this. The short version: the gateway drops a silent session
+// after 30 s (BS_SESSION_IDLE_MS, deps/blocksmith-server/gateway/bsgate.c:75) and nothing of
+// ours runs while the lid is shut to stop it.
+static void sleepLeaveSession(void)
+{
+	if (s_server_session) netDisconnect();
+}
+#endif  // BS_WORLD_GEN
 
 // ── Step 8.4: the title screen, and the two things it hands the rest of main ──────────
 //
@@ -2665,6 +2750,18 @@ session_start:
 	BOOT_BEGIN();
 	const bool worker_ok = genStart(0, 0);
 	BOOT_END("genStart");
+
+	// v1.6.0. From here until workerStop() below there is a world in memory and a worker
+	// able to write it, which is exactly the window in which closing the lid should flush.
+	// Registered on worker_ok and nowhere else: with no worker, sleepFlushOneColumn() would
+	// be handing columns to a thread that was never started. Outside this window both hooks
+	// stay NULL and app/sleep.c's ONSLEEP does nothing — which is what makes closing the lid
+	// on the title screen or the world list safe.
+	if (worker_ok) {
+		s_sleep_flush_cursor = 0;
+		sleepSetFlushHook(sleepFlushOneColumn);
+		sleepSetLeaveHook(sleepLeaveSession);
+	}
 	BOOT_WRITE();
 
 	// From here to the end of the run, a second thread is watching this one. Started here rather
@@ -2743,18 +2840,12 @@ session_start:
 	// boot. playerModelDraw checks its own ready flag, so nothing downstream needs this.
 	(void)playerModelInit();
 
-	// v1.4.0 minimap: claim the 64x64 texture and load this world's fog-of-war. The path is
-	// built from s_seed_used, which genStart set from the server's seed in a session, so two
-	// views of the same seed share one explored map — which is correct: same seed, same
-	// terrain. A texture that failed to claim leaves the path empty so the quit path's save
-	// becomes a no-op rather than a write over a map never loaded.
-	if (minimapGfxInit()) {
-		snprintf(s_minimap_path, sizeof(s_minimap_path), "sdmc:/blocksmith/fog/%lu.bin",
-		         (unsigned long)s_seed_used);
-		minimapLoad(&s_minimap_fog, s_minimap_path);
-	} else {
-		s_minimap_path[0] = '\0';
-	}
+	// The v1.4.0 minimap claimed its 64x64 texture and loaded this world's fog-of-war here.
+	// Removed entirely in v1.6.0, not repaired: scene/minimap.c:251 called worldGet(NULL, wx,
+	// 0, wz) and world/world.c:44 dereferences w->slots[i] with no NULL guard, so the first
+	// pixel it ever drew was a data abort on a real console. The spec's touch-screen map is
+	// a fresh build, not a fix of this one. Fog files already written to
+	// sdmc:/blocksmith/fog/*.bin are left where they are — deliberately, no cleanup code.
 
 	// On the flat ground at the foot of the stepped pyramid, looking down at it along the
 	// diagonal — so the first frame already shows a target cage without anyone having to
@@ -2896,6 +2987,27 @@ session_start:
 	// screen", which is where choosing another world and quitting the app both live.
 	bool quit_to_title = false;
 
+#if BS_BOTTOM_UI
+	// Last frame's touch_down, kept across iterations so the screens layered over the pause
+	// panel can be handed a touch EDGE instead of a touch LEVEL.
+	//
+	// The bug this fixes: touch_down below comes from hidKeysHeld() & KEY_TOUCH, which is
+	// true for every frame the stylus is on the glass. debugmenu_ui.c and remap_ui.c both
+	// treated it as a press, so holding the stylus on a toggle row flipped it at 60 Hz and
+	// whichever state it happened to land on when the player lifted off was a coin flip.
+	//
+	// Derived here rather than by giving each UI module its own static touch_prev, for the
+	// reason the touch read itself is here (see the UiInput comment below): the frame's
+	// input is read in one place. It also keeps the two modules' host tests able to drive
+	// a single press as one call with touch_down=true, instead of having to model an edge
+	// detector's internal state.
+	//
+	// `touch` itself is NOT edge-filtered — drawBottomUi still gets the level, because
+	// scene/ui.c edge-detects against its own touch_prev and taking that away would break
+	// the hotbar.
+	bool touch_prev = false;
+#endif
+
 	// Only the two scripted knobs read this, so a playtest build does not carry it.
 #if BS_INTERACT_DEMO || BS_EDIT_STRESS || BS_WALK_STRESS
 	int frame = 0;
@@ -2917,10 +3029,18 @@ session_start:
 		if (down & KEY_START || quit_requested) break;
 
 		// v1.4.0. Battery is polled at most once a second internally, so this is free on 59
-		// of 60 frames. A sleep frame runs no simulation, sends no packets and draws nothing:
-		// the APT hook has already told us the lid is closed and the OS is about to freeze us.
+		// of 60 frames.
+		//
+		// The `if (sleepShouldSkip()) continue;` that stood on the next line from v1.4.0 to
+		// v1.6.0 is gone, and it never once ran its `continue`. It was written for a "sleep
+		// frame" that does not exist: disassembling libctru's aptMainLoop() shows it calling
+		// aptHandleSleep(), which fires APTHOOK_ONSLEEP, parks the process in
+		// LightEvent_Wait for the whole of the sleep, fires APTHOOK_ONWAKEUP and returns —
+		// all of it before aptMainLoop() hands control back to this loop body. The flag was
+		// therefore always false again by the time this line could read it. app/sleep.h
+		// carries the disassembly and the rest of the reasoning; the lid-close work now
+		// happens in the hook, where the console actually is when the lid is shut.
 		batteryPoll();
-		if (sleepShouldSkip()) continue;
 
 #if BS_BOTTOM_UI
 		// Step 8.2. Read here, next to the rest of the frame's input, rather than inside
@@ -2941,6 +3061,11 @@ session_start:
 			.touch_x    = tp.px,
 			.touch_y    = tp.py,
 		};
+		// The rising edge of the above, for the remap screen and the debug menu — see
+		// touch_prev's declaration before the loop. One press is one true, however long the
+		// stylus stays down.
+		const bool touch_press = touch.touch_down && !touch_prev;
+		touch_prev = touch.touch_down;
 #endif
 
 		// SELECT opens the pause menu. It used to toggle 3D directly (step 7.6); that toggle
@@ -2982,6 +3107,13 @@ session_start:
 #if BS_BOTTOM_UI
 		if (pause_action == PAUSE_ACTION_REMAP) {
 			remapInit(&s_remap, &opts);
+			// The screen's own cursor/scroll are statics that outlive a visit, so without
+			// this the second visit opens halfway down the list where the last one left
+			// off. remapUiInit also arms the guard that throws away this frame's already-
+			// spent A press — the same A that just chose the "Controls" row, which without
+			// it fell straight through into "Press a button..." on row 0. This is the
+			// mirror of debugMenuUiOpen() just below.
+			remapUiInit();
 			s_remap_open = true;
 		}
 		if (pause_action == PAUSE_ACTION_DEBUG) {
@@ -3415,15 +3547,8 @@ session_start:
 			batteryDraw(284.0f, 4.0f);
 			spriteEnd();
 
-			// v1.4.0 live minimap, bottom-right. Hidden while the menu is up so it cannot
-			// peek out from under the panel.
-			if (!paused && minimapIsVisible()) {
-				spriteBegin(320, 240);
-				minimapDraw(&s_minimap_fog, (int)player.body.x, (int)player.body.z,
-				            (int)player.body.x - MINIMAP_SIZE / 2,
-				            (int)player.body.z - MINIMAP_SIZE / 2, player.cam.yaw);
-				spriteEnd();
-			}
+			// The v1.4.0 live minimap drew here, bottom-right. Removed in v1.6.0 — see the
+			// init site above for why it was cut rather than fixed.
 
 			// After the UI and on the same target, so it lands on top of it. See
 			// scene/pausemenu.c on why this opens its own sprite pass rather than joining
@@ -3447,7 +3572,7 @@ session_start:
 			// either persists: remap applies its bindings into opts and re-snapshots the
 			// input map; debug saves when it changed the render distance or toggled itself.
 			if (s_remap_open) {
-				s_remap_open = remapUiUpdate(&s_remap, down, touch.touch_down,
+				s_remap_open = remapUiUpdate(&s_remap, down, touch_press,
 				                             touch.touch_x, touch.touch_y);
 				if (!s_remap_open) {
 					remapApply(&s_remap, &opts);
@@ -3472,9 +3597,19 @@ session_start:
 				s_dctx.player_z        = player.body.z;
 				const int dist_before  = s_mesh_radius;
 				s_debug_open = debugMenuUiUpdate(&s_dctx, &opts.debug_menu, down,
-				                                 touch.touch_down, touch.touch_x, touch.touch_y);
-				if (s_mesh_radius != dist_before || !s_debug_open)
+				                                 touch_press, touch.touch_x, touch.touch_y);
+				if (s_mesh_radius != dist_before || !s_debug_open) {
+					// The assignment is the load-bearing half and was missing until now: the
+					// debug menu's slider goes through bsDebugSetRenderDist -> genSetRadius,
+					// which clamps and re-meshes the ring live but never touches opts, so this
+					// save wrote the OLD number back. Measured symptom: change render distance
+					// in the debug menu, watch it apply, reboot, and it is back where it was.
+					// Reading s_mesh_radius back rather than the requested value is what makes
+					// the saved setting the clamped one — same rule, and same two lines, as the
+					// pause menu's `if (dist_step != 0)` path above.
+					opts.render_dist = s_mesh_radius;
 					optionsSave(&opts, TITLE_OPTIONS_PATH);
+				}
 			}
 			}
 #endif
@@ -3588,10 +3723,8 @@ session_start:
 	// losing the last session's pickups.
 	if (inv_dir) inventorySave(&s_inv, inv_dir);
 
-	// v1.4.0: the explored-fog map goes with it. Saved whatever session kind this was — the
-	// fog belongs to this console's exploration of the seed, not to a local world file — and
-	// only when a texture was actually claimed, which is what the empty path encodes.
-	if (s_minimap_path[0]) minimapSave(&s_minimap_fog, s_minimap_path);
+	// The v1.4.0 explored-fog map was saved here on the way out. Gone with the feature in
+	// v1.6.0; existing sdmc:/blocksmith/fog/*.bin files are left orphaned by design.
 
 	// The play loop can be left with the menu still up. Choosing Quit closes it on the way
 	// out, but a lost server session (the netStatus() break above) does not, and neither
@@ -3599,6 +3732,14 @@ session_start:
 	// Left set, the next world entered would boot straight into a paused menu over a world
 	// the player never asked to pause.
 	pauseMenuClose();
+
+	// v1.6.0, and before workerStop() rather than after it. Past this line the worker is
+	// joined and s_world is about to be freed, so a lid closed during teardown must not be
+	// able to reach either. Cleared unconditionally — clearing a hook that was never set
+	// because genStart() failed is a no-op, and getting this wrong is a crash on lid-close
+	// back at the title screen rather than anything visible here.
+	sleepSetFlushHook(NULL);
+	sleepSetLeaveHook(NULL);
 
 	// Before worldExit: the worker holds a staging world of its own and must be joined
 	// before anything it could still be writing into is freed.
@@ -3618,7 +3759,6 @@ session_start:
 	networldSetWorld(NULL);
 
 	worldExit(&s_world);
-	minimapGfxExit();
 	highlightExit();
 	playerModelExit();
 

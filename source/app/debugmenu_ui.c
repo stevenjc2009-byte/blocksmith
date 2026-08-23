@@ -1,11 +1,35 @@
 #include "app/debugmenu_ui.h"
 
-#include <3ds.h>
 #include <stdio.h>
+
+#include "scene/ui_layout.h"
+
+// <3ds.h> and the sprite/font batch are console-only; everything above the draw
+// block is plain integer work on a button word. Split the same way app/battery.c
+// splits its bar arithmetic from its PTM:U and drawing half, and for the same reason: the input
+// half is where the bugs are, and "pressing A on the frame the menu opened must not
+// activate the row under the cursor" is a claim about an input sequence that an
+// emulator run cannot prove but source/app/debugmenu_test.c can, in a second.
+#ifdef __3DS__
+#include <3ds.h>
 
 #include "gfx/font.h"
 #include "gfx/sprite.h"
-#include "scene/ui_layout.h"
+#else
+// Host stand-ins for the only libctru symbols this file uses. Same duplication —
+// and the same risk — as app/options.h's OPT_KEY_* block, which documents these bit
+// values as verified against C:\devkitPro\libctru\include\3ds\services\hid.h:
+//   KEY_A BIT(0), KEY_B BIT(1), KEY_DRIGHT BIT(4), KEY_DLEFT BIT(5),
+//   KEY_DUP BIT(6), KEY_DDOWN BIT(7).
+// Only the host build sees these; the console build uses the real header above, so a
+// drift upstream changes behaviour on console and is caught by the host test failing.
+#define KEY_A      0x00000001u
+#define KEY_B      0x00000002u
+#define KEY_DRIGHT 0x00000010u
+#define KEY_DLEFT  0x00000020u
+#define KEY_DUP    0x00000040u
+#define KEY_DDOWN  0x00000080u
+#endif
 
 #define COL_SCRIM   0xC0100C08u
 #define COL_PANEL   0xF0201A14u
@@ -32,11 +56,17 @@ static bool s_open;
 static int  s_cursor;
 static int  s_scroll;
 
+// Armed by debugMenuUiOpen(), consumed by the first debugMenuUiUpdate() after it. See
+// that consumption site for the whole story; the flag lives up here with the rest of the
+// screen's state because "am I on my opening frame" is screen state, not input state.
+static bool s_swallow_frame;
+
 void debugMenuUiInit(void)
 {
-	s_open   = false;
-	s_cursor = 0;
-	s_scroll = 0;
+	s_open          = false;
+	s_cursor        = 0;
+	s_scroll        = 0;
+	s_swallow_frame = false;
 }
 
 void debugMenuUiOpen(void)
@@ -44,6 +74,9 @@ void debugMenuUiOpen(void)
 	s_open   = true;
 	s_cursor = 0;
 	s_scroll = 0;
+	// Re-armed on every open, not just the first: closing and reopening otherwise brings
+	// the bug straight back on the second visit (testUiOpenFrameGuardIsOncePerOpen).
+	s_swallow_frame = true;
 }
 
 bool debugMenuUiIsOpen(void) { return s_open; }
@@ -54,6 +87,27 @@ bool debugMenuUiUpdate(const DebugContext* ctx, bool* enabled,
 {
 	(void)enabled;
 	if (!ctx) return false;
+
+	// The frame that opened this menu carries input that has already been spent. main.c
+	// reads hidKeysDown() once per frame into one word, hands it to pauseMenuInput() —
+	// which consumes KEY_A to pick the "Debug" row and calls debugMenuUiOpen() — and then
+	// hands the SAME, unchanged word to this function in the same loop iteration.
+	// debugMenuUiOpen() has just parked the cursor on entry 0, so without this guard the
+	// one A press that opened the menu also activated row 0: the "Render distance" slider
+	// stepped and the whole ring re-meshed on every single open. The stylus has the same
+	// problem from the other direction — a touch still held from the tap that reached the
+	// menu lands on whatever row happens to sit under it.
+	//
+	// Swallowed rather than returned on, so the panel still draws on its opening frame: an
+	// early return here would show one frame of bare pause menu before the panel appears.
+	// down/touch_down are this function's own parameters, so zeroing them affects nothing
+	// outside it, and every branch below sees a clean frame instead of each one needing
+	// its own guard.
+	if (s_swallow_frame) {
+		s_swallow_frame = false;
+		down            = 0;
+		touch_down      = false;
+	}
 
 	if (s_open && (down & KEY_B)) {
 		s_open = false;
@@ -112,6 +166,14 @@ bool debugMenuUiUpdate(const DebugContext* ctx, bool* enabled,
 		}
 	}
 
+	// touch_down is a rising EDGE, not the held level: main.c derives it from
+	// hidKeysHeld() & KEY_TOUCH against the previous frame's value before calling here.
+	// It has to be, because this block toggles: fed the level, a stylus resting on a
+	// toggle row flipped it once per frame at 60 Hz and the state on lift-off was a coin
+	// flip. The edge is derived at the call site rather than with a static touch_prev of
+	// our own so the whole frame's input is read in one place — and so this function stays
+	// a pure function of its arguments, which is what lets debugmenu_test.c drive a single
+	// press as one call.
 	if (touch_down) {
 		const int y0 = PANEL_Y + 34;
 		for (int i = 0; i < VISIBLE_ROWS; i++) {
@@ -133,6 +195,7 @@ bool debugMenuUiUpdate(const DebugContext* ctx, bool* enabled,
 		}
 	}
 
+#ifdef __3DS__
 	spriteBegin(SCR_W, SCR_H);
 	spriteTexture(fontTexture());
 
@@ -196,5 +259,6 @@ bool debugMenuUiUpdate(const DebugContext* ctx, bool* enabled,
 	         "A/Touch toggle   B close");
 
 	spriteEnd();
+#endif  // __3DS__
 	return true;
 }

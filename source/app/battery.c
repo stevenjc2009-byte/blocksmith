@@ -1,55 +1,42 @@
 #include "app/battery.h"
 
-#include <3ds.h>
-#include <time.h>
+// ── Cached reading and the pure logic over it ───────────────────────────────────────────
+//
+// No <3ds.h> above the __3DS__ guard further down, which is the whole point: the host
+// suite links THIS file, so the bar arithmetic it checks is the arithmetic that ships.
+// Until v1.6.0 tests/battery_test.c was compiled as a lone translation unit carrying its
+// own hand-copied testBars()/testLow(), and its 16 checks passed no matter what the code
+// below did — deleting this file outright left them green. Same split as app/debugmenu_ui.c.
 
-#include "gfx/sprite.h"
-
-#define POLL_INTERVAL_MS 1000
-
-static int  s_level;
+static int  s_level    = BATTERY_LEVEL_UNKNOWN;
 static bool s_charging;
-static u64  s_last_poll_tick;
+static bool s_known;
 
-static u64 tickMs(void)
+void batteryApplyReading(int level, bool charging, bool valid)
 {
-	return svcGetSystemTick() / (SYSCLOCK_ARM11 / 1000);
+	if (!valid) {
+		// Drop the whole reading rather than half of it. A failed PTMU_Get* leaves its
+		// out-parameter untouched, so keeping `charging` from a call that did succeed
+		// would pair a real charge state with a level that was never read.
+		s_level    = BATTERY_LEVEL_UNKNOWN;
+		s_charging = false;
+		s_known    = false;
+		return;
+	}
+
+	s_level    = level;
+	s_charging = charging;
+	s_known    = true;
 }
 
-void batteryInit(void)
-{
-	ptmuInit();
-	s_level         = 0;
-	s_charging      = false;
-	s_last_poll_tick = 0;
-}
-
-void batteryExit(void)
-{
-	ptmuExit();
-}
-
-void batteryPoll(void)
-{
-	const u64 now = tickMs();
-	if (now - s_last_poll_tick < POLL_INTERVAL_MS) return;
-	s_last_poll_tick = now;
-
-	u8 level = 0;
-	u8 charge = 0;
-	PTMU_GetBatteryLevel(&level);
-	PTMU_GetBatteryChargeState(&charge);
-
-	s_level    = (int)level;
-	s_charging = charge != 0;
-}
-
-int batteryLevel(void) { return s_level; }
+int  batteryLevel(void)    { return s_level; }
 bool batteryCharging(void) { return s_charging; }
+bool batteryKnown(void)    { return s_known; }
 
 int batteryBars(void)
 {
 	// Level 0-5 maps to 0-4 bars. Level 0 = 0 bars, 1 = 1, 2 = 2, 3-4 = 3, 5 = 4.
+	// BATTERY_LEVEL_UNKNOWN is negative and falls into the first branch.
 	if (s_level <= 0) return 0;
 	if (s_level == 1) return 1;
 	if (s_level == 2) return 2;
@@ -59,8 +46,75 @@ int batteryBars(void)
 
 bool batteryLow(void)
 {
-	return s_level <= 1 && !s_charging;
+	// The !s_known term is not redundant with the range check: BATTERY_LEVEL_UNKNOWN is
+	// -1, which satisfies `s_level <= 1`, so without it a PTM:U that failed to open would
+	// flash a critical-battery warning on a console that is plugged in and full.
+	return s_known && s_level <= 1 && !s_charging;
 }
+
+// ── PTM:U service and rendering — console build only ────────────────────────────────────
+#ifdef __3DS__
+
+#include <3ds.h>
+
+#include "gfx/sprite.h"
+
+#define POLL_INTERVAL_MS 1000
+
+static u64    s_last_poll_tick;
+static bool   s_ptmu_open;
+static Result s_ptmu_rc;
+
+static u64 tickMs(void)
+{
+	return svcGetSystemTick() / (SYSCLOCK_ARM11 / 1000);
+}
+
+void batteryInit(void)
+{
+	s_ptmu_rc   = ptmuInit();
+	s_ptmu_open = R_SUCCEEDED(s_ptmu_rc);
+	s_last_poll_tick = 0;
+
+	// An unopened PTM:U means every PTMU_Get* below runs on an invalid handle and leaves
+	// its out-parameter alone, so the old code's `u8 level = 0` sailed through as a real
+	// reading of "empty". Start from — and stay at — the explicit unknown state instead;
+	// batteryInitResult() keeps the Result itself for anyone who wants the reason.
+	batteryApplyReading(0, false, false);
+}
+
+void batteryExit(void)
+{
+	// Only close what actually opened. ptmuExit() on a service that never opened
+	// decrements a refcount that was never incremented.
+	if (!s_ptmu_open) return;
+	ptmuExit();
+	s_ptmu_open = false;
+}
+
+void batteryPoll(void)
+{
+	// No handle, nothing to poll. Returning early rather than calling anyway also stops
+	// the module from overwriting the unknown state with a stale zero every second.
+	if (!s_ptmu_open) return;
+
+	const u64 now = tickMs();
+	if (now - s_last_poll_tick < POLL_INTERVAL_MS) return;
+	s_last_poll_tick = now;
+
+	u8 level  = 0;
+	u8 charge = 0;
+	const Result rc_level  = PTMU_GetBatteryLevel(&level);
+	const Result rc_charge = PTMU_GetBatteryChargeState(&charge);
+
+	// Both must succeed. A half-read is reported as unknown rather than mixed with the
+	// previous second's other half, which would silently pin the gauge at whatever it
+	// last managed to read.
+	const bool valid = R_SUCCEEDED(rc_level) && R_SUCCEEDED(rc_charge);
+	batteryApplyReading((int)level, charge != 0, valid);
+}
+
+Result batteryInitResult(void) { return s_ptmu_rc; }
 
 void batteryDraw(float x, float y)
 {
@@ -69,8 +123,14 @@ void batteryDraw(float x, float y)
 	const float gap    = 1.0f;
 	const float outline = 1.0f;
 	const int bars = batteryBars();
+	const bool known = batteryKnown();
 
-	const uint32_t outline_col = SPRITE_RGBA(200, 200, 200, 255);
+	// An unknown reading draws the same zero bars as a flat battery, so the outline is
+	// what tells them apart: dimmed to the empty-cell grey when there is no reading, so
+	// a dead PTM:U looks switched-off rather than looking like a console about to die.
+	const uint32_t outline_col = known
+		? SPRITE_RGBA(200, 200, 200, 255)
+		: SPRITE_RGBA(90, 90, 90, 255);
 	const uint32_t fill_col    = batteryLow()
 		? SPRITE_RGBA(220, 50, 50, 255)
 		: SPRITE_RGBA(80, 200, 80, 255);
@@ -90,3 +150,5 @@ void batteryDraw(float x, float y)
 		spriteRect(bx, y + outline, bar_w, bar_h, fill_col);
 	}
 }
+
+#endif  // __3DS__

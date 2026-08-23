@@ -4,6 +4,64 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.1] - 2026-08-23
+
+A repair release. Everything here fixes a defect that was live in 1.5.0; there are no
+new features. The block-registry module added in the unreleased "Phase A" work is present
+but dormant — it speaks only to a server that volunteers `REGISTRY_INFO`, which no released
+server does, so against the current server it costs nothing and changes nothing.
+
+### Removed
+
+- **The minimap.** `scene/minimap.c` called `worldGet(NULL, …)`, and `worldGet` only
+  short-circuits on `y < 0`, so at `y == 0` it reached `slotIndexFor` and dereferenced a null
+  world — opening Options → Debug → Minimap data-aborted a real console. Its fog was never
+  updated (nothing outside the test called `minimapFogUpdate`) and its writes into a tiled
+  `C3D_Tex` were linear, so the feature was three independent repairs deep. Removed rather
+  than patched; the touch-screen map in the spec is a larger, different feature to be built
+  fresh.
+
+### Fixed
+
+- **The debug menu stepped render distance every time it opened.** Opening it consumed the
+  same `hidKeysDown()` word that opened it, so each open incremented the distance and
+  re-meshed the ring. It then saved the *old* value, because `opts.render_dist` was never
+  assigned from `s_mesh_radius`.
+- **The controls screen was unreachable.** The same frame-input reuse dropped the player
+  straight into binding capture instead of the binding list.
+- **Held-stylus input toggled at 60 Hz** in both new menus — `hidKeysHeld() & KEY_TOUCH` is a
+  level, and it was being treated as an edge. Both are edge-triggered now.
+- **Sleep left the CPU clocked up.** The wake hook called `osSetSpeedupEnable(true)` — the only
+  such call in the tree — so after the first lid cycle a New 3DS ran at 804 MHz and
+  `battery.c`'s `tickMs()`, which divides by `SYSCLOCK_ARM11`, silently mis-measured. Both
+  arms removed.
+- **Closing the lid lost recent building.** There is now a time-capped flush (budget
+  `SLEEP_FLUSH_BUDGET_MS`, 500 ms) that saves dirty columns one at a time and keeps a cursor,
+  so a truncated flush resumes at the next lid-close instead of restarting.
+- **A lidded multiplayer session became a zombie.** The old `sleepNetHeartbeat()` claimed the
+  socket survived sleep; it cannot — the process sits in libctru's `LightEvent_Wait` for the
+  whole sleep, so nothing can be sent. It is replaced by a leave hook that disconnects on
+  lid-close, which drops the player back to the Multiplayer screen instead of leaving them in
+  a convincing forgery of a shared world. A short lid-close now also costs a rejoin; that is
+  deliberate.
+- **A dead frame-skip guard** was removed. Both APT hooks complete inside a single
+  `aptMainLoop()` call, so the flag was always false again by the time the loop body read it.
+- **The probe build configurations did not compile.** `-DBS_WORLD_GEN=0` (and with it
+  `BS_EDIT_STRESS`, `BS_DIG_OUT`, `BS_REMESH_STRESS`, `BS_CMDBUF_PROBE`) failed with 12
+  errors: the debug-menu state, the remap-screen state and the boot/draw-probe instrumentation
+  were all written inside the `#if BS_WORLD_GEN` block while their callers sat outside it.
+  Pre-existing, not new to this release.
+
+### Testing
+
+- `tests/battery_test.c` and `tests/sleep_test.c` were compiled as lone translation units
+  carrying hand-copied duplicates of the logic they claimed to check, so neither linked the
+  module it was named after. Measured: with `battery.c` sabotaged to return a wrong bar count,
+  the old test still passed all 16 checks. Both now link the real module behind an
+  `#ifdef __3DS__` split, with the sabotage arms recorded in `tools/run_host_tests.sh`.
+  Battery 16 → 25 real checks, sleep 13 → 34.
+- Suite total is now 17 binaries and 4012 checks.
+
 ## [1.5.0] - 2026-08-22
 
 ### Added

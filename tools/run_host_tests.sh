@@ -236,21 +236,44 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 "./$BH/inv_bridge_test"
 
-# sleep.c's state machine (source/app/sleep.c). Twelfth binary, own main(). The apt hook
-# and osSetSpeedupEnable calls are console-only; this exercises the flag transitions and
-# enter/exit pairing in isolation via tests/sleep_test.c's own miniaturised logic.
+# sleep.c's lid-close behaviour. Twelfth binary, own main(). The REAL source/app/sleep.c is
+# in the link — its aptHook and svcGetSystemTick half sits behind an #ifdef __3DS__ (same
+# split as app/battery.c below and app/debugmenu_ui.c), so the whole of what closing the lid
+# actually does compiles here with nothing stubbed and nothing faked.
+#
+# It was not always. Until v1.6.0 this stanza compiled tests/sleep_test.c alone, and that
+# file carried a private testSleepEnter()/testSleepShouldSkip() hand-copy of the flag machine
+# — this script's own comment said so, in as many words: "tests/sleep_test.c's own
+# miniaturised logic". Measured: with source/app/sleep.c deleted outright it still printed
+# "sleep state machine: PASS / 13 checks". Linking the real file is the entire fix, and the
+# v1.6.0 rewrite is what gives it something worth linking — the time-capped flush and the
+# network leave that now happen in the APT hook.
+#
+# Both halves sabotaged, both measured. Making sleepFlushBounded() read its budget once at
+# the top instead of between columns: old test PASS 13 checks, new test FAILED 7 of 34,
+# first "L144 saved == 3". Dropping the leave hook call from sleepOnSleep(): old test PASS
+# 13 checks, new test FAILED 4 of 34, first "L217 s_leave_calls == 1".
 gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	-I source \
+	source/app/sleep.c \
 	tests/sleep_test.c \
 	-o "$BH/sleep_test"
 
 "./$BH/sleep_test"
 
-# battery.c's bar mapping and low-battery logic. Thirteenth binary, own main(). The PTMU
-# calls are console-only; this exercises the level-to-bars arithmetic and the charging
-# flag via tests/battery_test.c's own pure-C logic.
+# battery.c's bar mapping, low-battery and unknown-state logic. Thirteenth binary, own
+# main(). The REAL source/app/battery.c is in the link — its PTM:U and drawing half sits
+# behind an #ifdef __3DS__ (same split as app/debugmenu_ui.c), so the pure half compiles here
+# with nothing stubbed and nothing faked.
+#
+# It was not always. Until v1.6.0 this stanza compiled tests/battery_test.c alone, and that
+# file carried private testBars()/testLow() hand-copies of the arithmetic — so its 16 checks
+# passed no matter what battery.c did. Measured: changing batteryBars() to return 99 for
+# levels 3-4 still printed "battery bar mapping: PASS / 16 checks". Linking the real file is
+# the entire fix; the same sabotage now fails 3 of 25 checks.
 gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	-I source \
+	source/app/battery.c \
 	tests/battery_test.c \
 	-o "$BH/battery_test"
 
@@ -275,24 +298,21 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g 	-I source -I deps/blocksmith-server 	
 ;;
 esac
 
-# scene/minimap.c's fog-of-war, color lookup and save/load round-trip. Fourteenth binary,
-# own main(), same reason as every one above it. Pure C — no <3ds.h> in the logic; the
-# 3DS-specific texture/draw half is guarded out on host and covered by the console build.
-# world/block.c is in the link because minimap.c re-uses BlockId/blockInfo() for its color
-# table.
-gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
-	-I source \
-	source/world/block.c \
-	source/world/registry.c \
-	source/scene/minimap.c \
-	source/scene/minimap_test.c \
-	-o "$BH/minimap_test"
-
-"./$BH/minimap_test"
-
-# debugmenu.c registry logic + options.c debug_menu persistence. Fifteenth binary,
-# own main(), same reason as every one above it. Registry is pure data-structure
-# work; the options half reuses options.c to prove the new key round-trips.
+# The minimap_test stanza that stood here is gone with the feature. scene/minimap.c,
+# minimap.h and minimap_test.c were deleted in v1.6.0: minimap.c:251 called worldGet(NULL,
+# wx, 0, wz) and world.c:44 dereferences w->slots[i] with no NULL guard, so the first pixel
+# the minimap ever drew was a data abort on a real console. Repair was rejected in favour of
+# removal — the spec's touch-screen map gets built fresh later — so its 16606 passing checks
+# went with it rather than being kept green over code nothing calls. Measured before: 16606
+# checks in this stanza; after: the stanza does not exist and the suite is 13 binaries.
+#
+# debugmenu.c registry logic + options.c debug_menu persistence, plus (v1.6.0) the input
+# half of app/debugmenu_ui.c, which debugmenu_test.c #includes as source — see that file.
+# Own main(), same reason as every one above it. Registry is pure data-structure work; the
+# options half reuses options.c to prove the new key round-trips; the UI half proves the
+# frame-input-reuse fix, which is a claim about a sequence of frames that no emulator run
+# can make. Measured before the fix: FAIL 4/74, first failure "L268 s_slider_val == 3" —
+# the A press that opened the menu also stepped the render-distance slider. After: PASS 80.
 gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	-I source \
 	source/app/options.c \
