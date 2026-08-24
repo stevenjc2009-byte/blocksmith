@@ -1,0 +1,22 @@
+# Release notes shown on the 3DS top screen before the update downloads.
+# Attach this to the v1.7.0 GitHub release alongside blocksmith1.7.0.cia.
+# Checked with: sh tools/make_whatsnew.sh 1.7.0
+#
+# v1.7.0 ONLY. The lead item is the one that matters: v1.6.0 could not start.
+# Player-facing prose only - it wraps at 61 characters on a 400px screen.
+# The developer-facing story lives in CHANGELOG.md.
+
+[features]
+New terrain. It is carved out of the world rather than drawn as a heightmap.
+That means real caves, overhangs and cliff faces instead of hills with holes.
+Water. There is a sea now, and lakes. It is still and does not flow yet.
+Tall grass grows on grass blocks. It is the first plant that is not a cube.
+The surface is redone. Grass, dirt and sand now depend on depth and slope.
+Worlds you already have keep the terrain they were made with. Nothing is reshaped.
+
+[fixes]
+Version 1.6.0 could not start at all. It showed a black screen and nothing else.
+If you installed 1.6.0, this is the update that makes the game run again.
+Parts of the world could fail to appear and never come back, leaving holes in it.
+There is now room for every piece of the world you can see at the furthest setting.
+Trees no longer try to grow underwater.

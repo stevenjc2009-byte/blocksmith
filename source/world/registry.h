@@ -24,7 +24,7 @@
 // The id space is partitioned so that old saves and old packets stay meaningful:
 enum {
 	REG_ID_AIR    = 0x00,  // must stay 0: word-at-a-time air scans depend on it
-	REG_ID_CORE_LO = 0x01, // compiled-in core rows, GRASS=1 .. PLANKS=7 forever
+	REG_ID_CORE_LO = 0x01, // compiled-in core rows, GRASS=1 .. TALL_GRASS=9 forever
 	REG_ID_CORE_HI = 0x7F,
 	REG_ID_DYN_LO  = 0x80, // dynamic rows: registered at boot/join, lowest free first
 	REG_ID_DYN_HI  = 0xFD, // 0xFE/0xFF reserved so a u8 count can never overflow
@@ -127,7 +127,9 @@ const BlockInfo* registryView(BlockId id);
 // Name lookup over all defined rows. Returns 0 when absent.
 BlockId registryFind(const char* name);
 
-// Number of defined rows, including air (8 after InitCore on a fresh table).
+// Number of defined rows, including air (10 after InitCore on a fresh table: the eight
+// item-bearing core blocks 0x00..0x07, plus water 0x08 and tall grass 0x09, which are
+// core rows but deliberately not items — see world/block.h).
 uint8_t registryCount(void);
 
 bool registryIsDefined(BlockId id);

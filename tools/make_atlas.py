@@ -33,9 +33,10 @@ mode, so no level beyond the base is ever sampled.
 Why 16 slots but only 15 addressable. MeshVertex.u/v are uint8_t (the format is
 locked — see source/world/mesh_vertex.h), so a tile's TOP edge v1 must fit in
 255. The topmost slot in texture space would need v1 = 256, which does not fit,
-so slot 15 is left unaddressable. TILES holds 10, so there are 5 spare
-addressable slots. The next step up is a 16x512 sheet: 32 slots, 31 addressable,
-16 KB of VRAM instead of 8 KB.
+so slot 15 is left unaddressable. TILES holds 12, so there are 3 spare
+addressable slots — 12 and 13, plus the reserved MARKER_SLOT 14, which is not
+really spare at all. The next step up is a 16x512 sheet: 32 slots, 31
+addressable, 16 KB of VRAM instead of 8 KB.
 
 Why every unused slot is painted (v1.6.0 F7). It used to be left at the sheet's
 background fill, and that was a defect: tex 10..14 address REAL, addressable
@@ -46,8 +47,8 @@ unsupported tex looked like a Blocksmith rendering bug instead of a server
 misconfiguration — and this project has already lost days to exactly that, since
 a wrong texture constant still renders *a* texture and never raises anything.
 
-So every slot TILES does not fill — 10..14, and the unaddressable 15 as well —
-is painted with tile_missing()'s magenta/black quadrant checker before any art
+So every slot TILES does not fill — 12..14 today, and the unaddressable 15 as
+well — is painted with tile_missing()'s magenta/black quadrant checker before art
 goes down. Those spares are not wasted by this: the marker is simply the DEFAULT
 content of an unclaimed slot, and each one gets overwritten by real art as TILES
 grows. MARKER_SLOT (14) is the one exception and stays a marker forever, which
@@ -118,6 +119,16 @@ TILES = [
     # the C side. This is the tile that forced the sheet from 64x64 to 128x128 —
     # there was no tenth cell.
     "planks",
+    # Roadmap tasks 17 and 19. Appended for the same reason everything since the
+    # sentinel has been: this order is the contract with the C side (gfx/atlas.h's
+    # TILE_* enum and world/block.h's BTEX_* mirror of it), and inserting would
+    # silently re-texture every tile after the insertion point.
+    #
+    # These claim slots 10 and 11 of the four that were free (10..13). 12 and 13
+    # stay as the missing-texture marker, which is what an unclaimed slot is
+    # supposed to look like, and MARKER_SLOT (14) cannot be claimed at all.
+    "water",
+    "tall_grass",
 ]
 
 
@@ -347,6 +358,121 @@ def tile_planks(rng):
     return img
 
 
+def tile_water(rng):
+    """Open water — roadmap task 17. Returns RGB, i.e. FULLY OPAQUE, and that is a
+    decision rather than an oversight.
+
+    The pass this block draws in is an alpha TEST, not alpha blending (see
+    tile_leaves and source/gfx/atlas.c). RGBA5551 carries one bit of alpha, so a
+    texel is either drawn or it is not and there is no value that comes out
+    half-visible. Punching a dither of alpha-0 holes through the surface — the usual
+    1-bit trick — would show the seabed through a stipple, and at 16x16 on a 240px
+    screen a stipple reads as holes in the water, not as depth. So the surface is
+    solid and the only depth cue is the art.
+
+    The swell repeats on an 8px pitch, so the tile is seamless against itself in both
+    directions: 16 px is exactly two swells. That matters more for this tile than for
+    any other in the sheet. An ocean is the largest co-planar run greedy meshing will
+    ever be handed, and GPU_REPEAT tiles this art up to ATLAS_MAX_MERGE_BLOCKS (15)
+    times across a single quad — anything that reads as a ruled line here becomes a
+    240 px ruler out there, which is why the glints below are broken into dashes for
+    the same reason tools/make_atlas.py's planks seams are jittered.
+
+    Blues, and no green in them: grass_top's greens sit at (58,112,74) and up, and a
+    teal sea next to a green field on a 5-bit-per-channel sheet is two shades of the
+    same thing. These are unambiguously blue.
+    """
+    trough = (26, 62, 118)
+    base   = (36, 80, 140)
+    crest  = (56, 112, 172)
+    glint  = (112, 172, 212)
+
+    # One swell, eight rows tall. Every step is at least 8 apart in some channel,
+    # which is what it takes to survive RGBA5551's five bits — a smaller step is
+    # quantised away and the band simply disappears (see the note in
+    # tools/run_host_tests.sh about a 132 -> 133 sand edit the format swallowed).
+    swell = [crest, crest, base, base, trough, trough, base, base]
+
+    img = Image.new("RGB", (TILE_PX, TILE_PX))
+    px = img.load()
+    for y in range(TILE_PX):
+        shade = swell[y % 8]
+        # Mostly the row's own step, occasionally the one above it. A flat band per
+        # row reads as a striped flag and per-pixel noise reads as static; mixing two
+        # ADJACENT steps softens the edge without inventing a third colour the
+        # quantiser would round back onto one of them anyway.
+        above = swell[(y - 1) % 8]
+        for x in range(TILE_PX):
+            px[x, y] = shade if rng.random() < 0.78 else above
+
+    # Glints riding the two crest rows: short bright dashes with gaps, never a
+    # continuous line. Both rows are crest rows of the 8px swell, so this stays
+    # seamless vertically.
+    for crest_y in (0, 8):
+        x = rng.randrange(4)
+        while x < TILE_PX:
+            for dx in range(2 + rng.randrange(3)):
+                if x + dx < TILE_PX:
+                    px[x + dx, crest_y] = glint
+            x += 5 + rng.randrange(5)
+    return img
+
+
+def tile_tall_grass(rng):
+    """Tall grass — roadmap task 19, and the first tile drawn for a BLOCK_SHAPE_CROSS
+    block. Returns RGBA and is MOSTLY alpha 0.
+
+    That is the whole point of it. A cross is two quads on the cell's diagonals
+    (world/mesher.c's emitCross), so whatever is opaque in this tile is what the plant
+    is; if the tile were opaque everywhere the block would render as two solid cards
+    standing in an X, which is not a plant, it is a signpost. Alpha is 0 or 255 and
+    never between, exactly as tile_leaves needs it to be and for the same reason: the
+    draw is an alpha test, so a middling value lands on one side of the threshold and
+    looks like a mistake either way.
+
+    Deliberately NOT following tile_leaves' keep-the-border-opaque rule. Leaves does
+    that because it is a full cube whose silhouette is the cell, so a transparent edge
+    row costs nothing and buys a margin. A cross has no silhouette but its own art: an
+    opaque border would draw a rectangle around every clump of grass in the world.
+    Nothing bleeds in from the neighbouring slot regardless — gfx/atlas.c asks for
+    GPU_NEAREST on both filters and the sheet carries no mip chain, so the only texels
+    ever sampled are the ones inside this tile's own half-open rect.
+
+    Image row 0 is the TOP of the block face (place() blits this image as-is into the
+    slot, and slot_png_y() is what applies the sheet-wide V flip), so the blades are
+    rooted on the last row and grow upwards.
+    """
+    blades = [(72, 132, 68), (86, 150, 78), (58, 112, 58)]
+    tip    = (126, 184, 100)
+
+    img = Image.new("RGBA", (TILE_PX, TILE_PX), (0, 0, 0, 0))
+    px = img.load()
+
+    # Roots spread evenly across the tile rather than scattered at random. A random
+    # scatter leaves bare columns, and 16 px is too small to afford one: the X is seen
+    # from every horizontal angle, so a gap that happens to line up with a viewing
+    # direction reads as a hole in the plant rather than as a gap between blades.
+    for root in range(1, TILE_PX, 2):
+        x      = root
+        height = 7 + rng.randrange(8)          # 7..14 of the 16 rows
+        shade  = rng.choice(blades)
+        top_y  = TILE_PX - 1
+        for step in range(height):
+            y = TILE_PX - 1 - step
+            top_y = y
+            px[x, y] = shade + (255,)
+            # Two px wide for the first couple of rows, so the blade has a base. A
+            # blade that is one pixel wide all the way down is a hair at 240p, and on
+            # a cross that hair is the entire block near the ground.
+            if step < 2 and x + 1 < TILE_PX:
+                px[x + 1, y] = shade + (255,)
+            # Lean: at most one column per row, so a blade curves instead of kinking.
+            if step >= 2 and rng.random() < 0.34:
+                x = max(0, min(TILE_PX - 1, x + rng.choice((-1, 1))))
+        px[x, top_y] = tip + (255,)
+    return img
+
+
 def tile_sentinel(_rng):
     """Not art — a bleed alarm.
 
@@ -402,6 +528,8 @@ PAINTERS = {
     "wood_top": tile_wood_top,
     "leaves": tile_leaves,
     "planks": tile_planks,
+    "water": tile_water,
+    "tall_grass": tile_tall_grass,
 }
 
 

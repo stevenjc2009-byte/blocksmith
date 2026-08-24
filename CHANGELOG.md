@@ -4,6 +4,73 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.7.0] - 2026-08-24
+
+**If you installed 1.6.0, it did not start. This release fixes that, and you should install it.**
+
+1.6.0 shipped with a renderer that refused to initialise. `DIRTYQ_MAX` in `world/dirtyq.h` is a
+hand-maintained copy of the mesh-pool size `MESH_SLOTS`, and it was left at 150 when 1.6.0 took
+the pool to 294. `chunkRenderInit()` opens by asking the remesh backlog for one flag per mesh
+slot, that request was refused, and the game quit before drawing a frame — with no message on
+screen, because the text console is not up that early in boot. A black screen that answers only
+START. Every release check 1.6.0 passed tested the packaging: the branch, the tag, the `.cia`,
+the asset URLs, the `/releases/latest` redirect. **None of them started the program.** Booting
+the build to a title screen is now part of cutting a release.
+
+The rest of this release is the terrain rework: a Beta 1.7.3-style density-field generator with
+real caves and overhangs, water, tall grass, and a resurfaced world.
+
+### Fixed
+
+- **The game boots.** `DIRTYQ_MAX` raised to match the pool, and a
+  `_Static_assert(DIRTYQ_MAX >= MESH_SLOTS)` added in the one translation unit that can see both
+  numbers, so the two can never silently drift apart again — they now fail the build instead of
+  the console.
+- **Chunks that would never have been drawn at all.** The mesh pool is sized against a measured
+  worst case, and the new generator's caves push more chunks over the "not empty" line than the
+  old terrain did — measured worst case 298 chunks against a pool of 294, and 7 chunks in a
+  single column against a limit of 6. Over that limit a chunk is not merely slow to appear, it is
+  never built: a hole in the world that walking away and coming back does not repair. The pool is
+  now sized structurally — every chunk of every column in the widest view distance — so no future
+  change to terrain generation can put it back under. 7.24 MB to 8.77 MB.
+
+### Added
+
+- **A new terrain generator.** Density-field terrain in the Beta 1.7.3 style: instead of picking
+  a height for each column, the world is carved out of a 3D field, which is what makes real caves,
+  overhangs and cliff faces possible rather than approximated. Sampled on a coarse lattice and
+  interpolated, entirely in fixed-point arithmetic so the console and the test host agree to the
+  bit.
+- **Water.** A sea level and a water block, filling below the waterline. Still and static in this
+  release — flow comes later. It is see-through, you cannot stand on it, and it does not hide the
+  seabed.
+- **Tall grass.** The first plant, drawn as crossed quads rather than a cube, scattered across
+  grass by the surface pass.
+- **A resurfaced world.** Grass, dirt and sand chosen by depth and slope over the new terrain,
+  and trees that no longer try to grow at or below the waterline.
+- **Per-world generator versions.** Every world records which generator built it, in a small
+  `genver.bin` file beside its region data. **Worlds you already have keep the terrain they were
+  made with** and are not reshaped under you; only new worlds get the new generator. A world saved
+  by a newer version of the game than you are running is refused rather than loaded and quietly
+  damaged.
+
+### Testing
+
+- 7,751 host checks across 21 binaries, up from 7,507.
+- The new generator is pinned by 12 terrain hashes, so a change to its output is a test failure
+  rather than something you notice in-game months later.
+- The step-up physics gained 57 checks. Its first sabotage test was found to be inert — the body
+  it moved never reached the step it was supposed to climb, so the test "passed" a run in which
+  nothing happened. Fixed, then re-armed.
+
+### Known limitations
+
+- Nothing in this release has run on real hardware. The boot failure above was found and fixed on
+  the host and confirmed in an emulator; a console has not seen it.
+- The larger mesh pool needs 8.77 MB of linear heap. If it is not there, the game will say so at
+  startup rather than misbehave later.
+- Water does not flow, has no current, and does not slow you down. That is the next release.
+
 ## [1.6.0] - 2026-08-24
 
 Finishes the master block registry and rebuilds the rendering foundation underneath it.

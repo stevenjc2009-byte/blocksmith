@@ -180,6 +180,13 @@ static bool resolveZ(Body* b, const World* w, float dz)
 // than one block, this is where a real height comparison belongs: the rise would become
 // "however tall the obstruction actually is, up to some threshold" instead of a flat 1.0,
 // and that threshold is the constant to introduce at that point -- not before.
+// There is no swim or sneak state in the game yet. When they arrive, the line below is
+// the one place they belong: sneaking suppresses the step entirely (the player is
+// deliberately moving carefully, and a sneaking player who auto-climbed would be
+// astonished), and swimming replaces it rather than gating it, because a swimmer rises by
+// buoyancy through water that is not solid here at all and so never reaches this code.
+// Both are one more term on this same condition -- deliberately NOT built ahead of the
+// states themselves, which would be a guess about fields that do not exist.
 static bool tryStepUp(Body* b, const World* w, float target_x, float target_z)
 {
 	if (!b->on_ground) return false;   // must never fire mid-air

@@ -75,16 +75,62 @@
 // column and NO column in the whole sample meshed more than 5. So 6 is still margin over the
 // measurement and not a number that has quietly gone tight — it is what makes the widest ring
 // 294 slots against a worst observed simultaneous occupancy of 242.
-#define RENDER_DIST_SLOTS_PER_COLUMN  6
+//
+// ── v1.7.0: 6 WENT UNDER, and the margin stops being a measurement ───────────────────────
+//
+// The paragraph above is exactly the trap it claims not to be. Its measurement was taken on
+// the generator v1.7.0 replaced, and the density field moved it. Re-measured with the real
+// mesher on the real new worldgen (4 seeds x 81 radius-3 ring positions on an 11-column
+// stride, 324 rings, each ring in its own world with a one-column margin so no chunk meshes
+// against unloaded-as-air):
+//
+//     worst meshed chunks in ONE COLUMN         7      <- this constant was 6
+//     worst meshed chunks in one radius-3 ring  298    <- the pool held 294
+//     mean meshed chunks per column             4.685  (was 4.187)
+//
+// The 7 held on all four seeds independently, so it is not one freak column. A slot the pool
+// cannot supply is not a degraded frame: acquireSlot returns NULL, chunk_render.c counts a
+// refusal, and the chunk is never meshed at all — a hole in the terrain that walking away and
+// back does not repair. Greedy merging did NOT absorb this; merging made each chunk SMALLER
+// (chunks over 512 faces fell 103 -> 87, over 1024 fell 8 -> 3) while the density field's
+// caves made MORE chunks non-empty, and it is the COUNT that sizes the pool, not the size.
+//
+// So this stops being a measured margin and becomes the arithmetic ceiling. A column holds
+// COLUMN_CHUNKS chunks and cannot hold more, so at COLUMN_CHUNKS per column the pool covers
+// every possible ring of every possible terrain and no future generator can put it back
+// under. That is the same reasoning world/jobq.h already applies to JOBQ_CAP, which clears
+// the structural 49 * COLUMN_CHUNKS = 392 rather than the measured 242 — this file was the
+// odd one out.
+//
+// Rejected: 7, which matches the measurement exactly and leaves no margin; 7 plus a
+// hand-picked fudge, which has no principled stopping point and would need re-measuring on
+// the next generator anyway. Going to the ceiling instead of to 7 costs 49 extra S-tier
+// slots, 802,816 bytes — paid once, against a bug class that has now cost a release.
+#define RENDER_DIST_SLOTS_PER_COLUMN  COLUMN_CHUNKS
+
+// The guarantee spelled out, so that trimming the constant above to reclaim memory fails the
+// build instead of quietly reintroducing terrain holes at the widest ring. Checked by BOTH
+// the console build and the host suite, since this header is deliberately <3ds.h>-free.
+_Static_assert(RENDER_DIST_SLOTS_PER_COLUMN >= COLUMN_CHUNKS,
+               "the mesh pool must cover a ring in which EVERY chunk of every column is "
+               "meshed; anything below COLUMN_CHUNKS per column is a measurement that a "
+               "worldgen change can invalidate, which is what happened in v1.7.0");
 
 // Slots the widest allowed ring needs. This is what MESH_SLOTS is, and therefore what the
-// tiered pool costs at boot on every model. At RENDER_DIST_MAX 3 that is 49 columns, so 294
-// slots, split 158/120/16 across the three tiers (see scene/chunk_render.c's TIER_*_SLOTS for
-// the measurement behind that split): 158*512 + 120*1024 + 16*2048 face slots at 4 vertices of
-// 8 bytes each, plus the one shared index buffer step 9.2b introduced — 7,593,984 bytes, 7.24 MB.
+// tiered pool costs at boot on every model. At RENDER_DIST_MAX 3 that is 49 columns, so 392
+// slots, split 256/120/16 across the three tiers (see scene/chunk_render.c's TIER_*_SLOTS for
+// the measurement behind that split): 256*512 + 120*1024 + 16*2048 face slots at 4 vertices of
+// 8 bytes each, plus the one shared index buffer step 9.2b introduced — 9,199,616 bytes, 8.77 MB.
 //
-// It was 4,448,256 bytes (4.24 MB) at RENDER_DIST_MAX 2 with 150 slots split 70/60/20, and
-// 9.40 MB when every slot was a uniform 2048-face slab, before step 9.2c.
+// It was 7,593,984 bytes (7.24 MB) at 294 slots split 158/120/16, before v1.7.0 took the
+// per-column figure to the arithmetic ceiling: +1,605,632 bytes, all of it S tier, which is
+// the cheapest slot there is (16,384 bytes against L's 65,536). Before that it was 4,448,256
+// bytes (4.24 MB) at RENDER_DIST_MAX 2 with 150 slots split 70/60/20, and 9.40 MB when every
+// slot was a uniform 2048-face slab, before step 9.2c.
+//
+// NOT VERIFIED ON HARDWARE: the one hardware reading on record shows 25.83 MB of linear heap
+// free, so 8.77 MB fits it with room, but that reading was taken at 4.24 MB of pool and no
+// console has run any build since v1.2.5.
 #define RENDER_DIST_MAX_COLUMNS  ((2 * RENDER_DIST_MAX + 1) * (2 * RENDER_DIST_MAX + 1))
 #define RENDER_DIST_MAX_SLOTS    (RENDER_DIST_MAX_COLUMNS * RENDER_DIST_SLOTS_PER_COLUMN)
 

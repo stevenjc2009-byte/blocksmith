@@ -145,7 +145,7 @@ int main(void)
 	WorldGen gen;
 
 	worldInit(&world);
-	worldgenInit(&gen, PROBE_SEED);
+	worldgenInit(&gen, PROBE_SEED, GEN_VERSION_LEGACY);
 	const int failed = worldgenArea(&gen, &world, 0, 0, PROBE_RADIUS);
 
 	// worldgenColumn already ends by calling worldgenDecorate, so the trees are in. Counting

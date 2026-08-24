@@ -24,6 +24,8 @@
 #include "world/visgraph.h"
 #include "world/world.h"
 #include "world/worldgen.h"
+#include "world/worldgen_density.h"
+#include "world/genversion.h"
 
 // Big enough to matter on a 32 KB console stack, and only ever one of each.
 static World       s_world;
@@ -33,10 +35,24 @@ static int  s_checks;
 static int  s_fails;
 static char s_first[96];
 
+// Every failing check, printed as it happens — off unless asked for.
+//
+// The harness only ever reported s_first plus a count. That is enough to know a run went red,
+// and not enough to do the one thing this project keeps having to relearn: in a sabotage arm,
+// READ EVERY CASE. A count cannot tell you that an arm you thought broke five things actually
+// broke four and neutralised the fifth, and s_first cannot tell you WHICH four. Compile with
+// -DWORLD_TEST_VERBOSE to get the list. Nothing about the default build changes.
+#ifdef WORLD_TEST_VERBOSE
+#define CHECK_REPORT(expr) fprintf(stderr, "FAIL L%d %s\n", __LINE__, (expr))
+#else
+#define CHECK_REPORT(expr) ((void)0)
+#endif
+
 #define CHECK(cond) do {                                                        \
 		s_checks++;                                                             \
 		if (!(cond)) {                                                          \
 			s_fails++;                                                          \
+			CHECK_REPORT(#cond);                                                \
 			if (!s_first[0])                                                    \
 				snprintf(s_first, sizeof(s_first), "L%d %s", __LINE__, #cond);  \
 		}                                                                       \
@@ -49,6 +65,7 @@ static char s_first[96];
 		if (!(cond)) {                                                          \
 			s_checks++;                                                         \
 			s_fails++;                                                          \
+			CHECK_REPORT(#cond);                                                \
 			if (!s_first[0])                                                    \
 				snprintf(s_first, sizeof(s_first), "L%d %s", __LINE__, #cond);  \
 		}                                                                       \
@@ -1456,10 +1473,15 @@ static void restoreCoreRegistry(void)
 // flag would present as a block that is mysteriously solid, not as an error.
 static void testBlockShapeRegistry(void)
 {
-	// Every core row is a full cube, and that is what makes the no-regression anchor
-	// above mean anything.
+	// Every core row that carries an ITEM id is a full cube, and that is what makes the
+	// no-regression anchor above mean anything. BLOCK_COUNT is the item-bearing span
+	// (0x00..0x07) and stops short of the two core rows added by roadmap tasks 17 and 19 —
+	// water, which is a cube, and tall grass, which is deliberately NOT one and is covered
+	// by testMesherCoreWaterAndTallGrass(). See world/block.h for why BLOCK_COUNT stayed 8.
 	for (int id = 0; id < BLOCK_COUNT; id++)
 		CHECK_QUIET(blockInfo((BlockId)id)->shape == BLOCK_SHAPE_FULL_CUBE);
+	CHECK(blockInfo((BlockId)BLOCK_WATER)->shape == BLOCK_SHAPE_FULL_CUBE);
+	CHECK(blockInfo((BlockId)BLOCK_TALL_GRASS)->shape == BLOCK_SHAPE_CROSS);
 	CHECK(blockIsFullCube(BLOCK_STONE));
 	CHECK(blockIsFullCube(BLOCK_AIR));
 
@@ -1741,6 +1763,233 @@ static void testMesherCrossShape(void)
 	}
 
 	restoreCoreRegistry();
+	free(out.verts);
+	free(out.indices);
+}
+
+// ── roadmap tasks 17 and 19: the two blocks that actually ship ───────────────
+//
+// Everything above proves the mesher's cross and transparent paths against blocks this
+// test file registers itself. That is the right way to test the PATHS and the wrong way to
+// test the BLOCKS: a def built here is a def this file controls, so it would keep passing
+// with world/registry.c's real rows deleted, mis-flagged, or never added at all. The two
+// checks the brief actually asks for are about BLOCK_TALL_GRASS and BLOCK_WATER as
+// registryInitCore() defines them, so those are the ids used below and no def is built.
+//
+// None of this is visible on the console either, in the standing way: tall grass wired as a
+// cube draws as a solid green block, water wired opaque draws as a solid blue one, and water
+// that failed to cull against itself draws exactly right while costing thousands of quads a
+// frame. All three ship as art or as a frame rate, never as an error.
+static void testMesherCoreWaterAndTallGrass(void)
+{
+	MeshOut out = {0};
+	out.vert_cap  = MESH_MAX_VERTS;
+	out.index_cap = MESH_MAX_INDICES;
+	out.verts     = (MeshVertex*)malloc(sizeof(MeshVertex) * out.vert_cap);
+	out.indices   = (uint16_t*)malloc(sizeof(uint16_t) * out.index_cap);
+	CHECK(out.verts != NULL && out.indices != NULL);
+	if (!out.verts || !out.indices) { free(out.verts); free(out.indices); return; }
+
+	restoreCoreRegistry();   // core rows only: no def in this file is in play
+
+	// Short aliases for the worldSet() calls below. CHECK() stringifies its condition into a
+	// 96-byte buffer and -Werror=format-truncation turns one byte over into a build failure,
+	// so the long spelling does not fit inside a four-argument worldSet.
+	const BlockId kWater = (BlockId)BLOCK_WATER;
+	const BlockId kGrass = (BlockId)BLOCK_TALL_GRASS;
+
+	// --- What the registry says the two blocks are. The mesher's behaviour below is
+	// derived entirely from these, so reading them first says which flag any later failure
+	// belongs to instead of leaving "the geometry is wrong" to be bisected by hand.
+	CHECK(registryIsDefined(kWater));
+	CHECK(registryIsDefined(kGrass));
+	CHECK(strcmp(blockInfo(kWater)->name, "water") == 0);
+	CHECK(strcmp(blockInfo(kGrass)->name, "tall_grass") == 0);
+
+	// Water: drawn, a full cube, transparent, liquid, not solid.
+	CHECK(blockIsDrawn(kWater));
+	CHECK(blockIsFullCube(kWater));
+	CHECK(blockInfo(kWater)->transparent);
+	CHECK(blockInfo(kWater)->liquid);
+	CHECK(!blockIsSolid(kWater));
+	// Not targetable, which is the whole of "not minable and not placeable today": both
+	// break and place in scene/interact.c run off the raycast, and blockIsTargetable() is
+	// what the raycast stops on. Water being LIQUID is what makes this false.
+	CHECK(!blockIsTargetable(kWater));
+
+	// Tall grass: drawn, a cross, transparent, not liquid, not solid — and targetable,
+	// which is the deliberate difference from water. v1.6.0's raycast rule is drawn-and-not
+	// -liquid, so a plant can be broken while being walked through.
+	CHECK(blockIsDrawn(kGrass));
+	CHECK(!blockIsFullCube(kGrass));
+	CHECK(blockInfo(kGrass)->shape == BLOCK_SHAPE_CROSS);
+	CHECK(blockInfo(kGrass)->transparent);
+	CHECK(!blockInfo(kGrass)->liquid);
+	CHECK(!blockIsSolid(kGrass));
+	CHECK(blockIsTargetable(kGrass));
+
+	// The two do not share a tile. A painter wired to the wrong slot would leave every
+	// count below intact and put water's art on the grass.
+	{
+		const AtlasRect w = atlasRect(blockFaceTex((BlockId)BLOCK_WATER, FACE_TOP));
+		const AtlasRect g = atlasRect(blockFaceTex((BlockId)BLOCK_TALL_GRASS, FACE_EAST));
+		CHECK(w.v0 != g.v0);
+	}
+
+	// ── Tall grass is a cross ────────────────────────────────────────────────────
+	//
+	// A stone floor, then one tall grass standing on it. Four quads and sixteen vertices is
+	// the cross signature; six and twenty-four would be a cube, and the difference between
+	// them is a solid green block on screen.
+	worldInit(&s_world);
+	for (int z = 0; z < CHUNK_DIM; z++)
+		for (int x = 0; x < CHUNK_DIM; x++)
+			CHECK_QUIET(worldSet(&s_world, CHUNK_DIM + x, CHUNK_DIM, CHUNK_DIM + z,
+			                     BLOCK_STONE));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	const uint32_t floor_faces = out.faces;
+	CHECK(floor_faces > 0);
+	CHECK(out.opaque_faces == floor_faces);
+	CHECK(countDarkVerts(&out) == 0);          // a flat floor has no darkened corner
+
+	CHECK(worldSet(&s_world, CHUNK_DIM + 6, CHUNK_DIM + 1, CHUNK_DIM + 6, kGrass));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+
+	CHECK(out.faces == floor_faces + 4);                       // two planes, two windings
+	CHECK(out.vert_count == floor_faces * 4 + 16);
+	CHECK(out.index_count - out.opaque_index_count == 4 * 6);  // all four are deferred
+	CHECK(out.opaque_faces == floor_faces);                    // the floor kept its top face
+	CHECK(countDarkVerts(&out) == 0);                          // and it darkened nothing
+
+	// The sixteen vertices themselves: emitCross's normal and AO, and UVs on the corners of
+	// tall grass's own tile rather than the stone's. Reading these off the real block is what
+	// separates "the cross path works" (proved above, with a def this file wrote) from "tall
+	// grass goes down the cross path".
+	{
+		const AtlasRect tile  = atlasRect(blockFaceTex((BlockId)BLOCK_TALL_GRASS, FACE_EAST));
+		const AtlasRect stone = atlasRect(blockFaceTex(BLOCK_STONE, FACE_TOP));
+		CHECK(tile.v0 != stone.v0);   // else the UV check below proves nothing
+		const MeshVertex* cv = &out.verts[floor_faces * 4];
+		bool nrm_ok = true, ao_ok = true, uv_ok = true;
+		for (int i = 0; i < 16; i++) {
+			if (cv[i].nrm != (uint8_t)FACE_TOP) nrm_ok = false;
+			if (cv[i].ao != 3) ao_ok = false;
+			if ((cv[i].u != tile.u0 && cv[i].u != tile.u1) ||
+			    (cv[i].v != tile.v0 && cv[i].v != tile.v1))
+				uv_ok = false;
+		}
+		CHECK(nrm_ok);
+		CHECK(ao_ok);
+		CHECK(uv_ok);
+	}
+	worldExit(&s_world);
+
+	// ── Water is a transparent cube ──────────────────────────────────────────────
+	//
+	// Face CELLS, not quads, throughout: the deferred run is greedy-merged on u like the
+	// opaque one, so a quad count would move when merging changed and say nothing about
+	// culling. Cells are the number of block faces actually covered, which is the claim.
+
+	// One water block alone in air: six faces, all deferred, nothing opaque. A cube, and in
+	// the transparent pass — which is where the same-material cull lives, and therefore the
+	// reason water can be made to cull against itself at all.
+	worldInit(&s_world);
+	CHECK(worldSet(&s_world, CHUNK_DIM + 4, CHUNK_DIM + 4, CHUNK_DIM + 4, kWater));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.opaque_faces == 0);
+	CHECK(out.opaque_index_count == 0);
+	CHECK(meshFaceCellsRange(&out, 0, out.faces) == 6);
+	const uint32_t lone_water_cells = meshFaceCellsRange(&out, 0, out.faces);
+
+	// Two water blocks side by side: the pair of faces they point at each other with is
+	// gone. 12 - 2 = 10. This is the ocean check — without it a 16x16x16 body of water is
+	// 24576 quads instead of the 1536 that face air.
+	CHECK(worldSet(&s_world, CHUNK_DIM + 5, CHUNK_DIM + 4, CHUNK_DIM + 4, kWater));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(meshFaceCellsRange(&out, 0, out.faces) == 2 * lone_water_cells - 2);
+	CHECK(out.opaque_faces == 0);
+	worldExit(&s_world);
+
+	// The negative control for that cull, and the reason it has to be a control: the rule in
+	// planBuild is same-ID, not "any transparent neighbour". Swap the second water for
+	// leaves — also transparent, also a full cube, also deferred — and nothing is culled.
+	// Without this arm, a cull that fired between any two transparent blocks would pass
+	// above and would hollow out every leaf touching water.
+	worldInit(&s_world);
+	CHECK(worldSet(&s_world, CHUNK_DIM + 4, CHUNK_DIM + 4, CHUNK_DIM + 4, kWater));
+	CHECK(worldSet(&s_world, CHUNK_DIM + 5, CHUNK_DIM + 4, CHUNK_DIM + 4, BLOCK_LEAVES));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(meshFaceCellsRange(&out, 0, out.faces) == 12);
+	worldExit(&s_world);
+
+	// Water does not occlude, and this is a cost being pinned rather than a win. Water is
+	// not solid, so planBuild's s_occludes is false for it, so the stone under an ocean is
+	// still meshed and still drawn — behind an opaque blue cube nobody can see through.
+	// The only way to make water hide the seabed is to make it solid, which is a wall.
+	// Recorded here so that when it is changed it is changed on purpose.
+	worldInit(&s_world);
+	for (int z = 0; z < CHUNK_DIM; z++)
+		for (int x = 0; x < CHUNK_DIM; x++)
+			CHECK_QUIET(worldSet(&s_world, CHUNK_DIM + x, CHUNK_DIM, CHUNK_DIM + z,
+			                     BLOCK_STONE));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	const uint32_t bare_floor_cells = meshFaceCellsRange(&out, 0, out.opaque_faces);
+	CHECK(bare_floor_cells > 0);
+
+	for (int z = 0; z < CHUNK_DIM; z++)
+		for (int x = 0; x < CHUNK_DIM; x++)
+			CHECK_QUIET(worldSet(&s_world, CHUNK_DIM + x, CHUNK_DIM + 1, CHUNK_DIM + z,
+			                     kWater));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(meshFaceCellsRange(&out, 0, out.opaque_faces) == bare_floor_cells);
+	CHECK(countDarkVerts(&out) == 0);   // and a sheet of water darkens nothing beneath it
+
+	// The control that says the counter above can move at all, one cell at a time so the
+	// answer stays arithmetic. A whole SHEET of stone is the WRONG control and was tried
+	// first: it takes the floor's 256 top faces away and then contributes its own top,
+	// bottom and skirt, so the opaque total goes UP, and the "<" comparison went red at
+	// 1/3072 while the culling it was meant to demonstrate was working perfectly.
+	//
+	// One block instead. Water on a single floor cell changes nothing. Stone on the SAME
+	// cell costs the floor the face under it and adds five of its own — the sixth rests on
+	// the floor and is culled from both sides. -1 +5.
+	worldExit(&s_world);
+	worldInit(&s_world);
+	for (int z = 0; z < CHUNK_DIM; z++)
+		for (int x = 0; x < CHUNK_DIM; x++)
+			CHECK_QUIET(worldSet(&s_world, CHUNK_DIM + x, CHUNK_DIM, CHUNK_DIM + z,
+			                     BLOCK_STONE));
+	CHECK(worldSet(&s_world, CHUNK_DIM + 8, CHUNK_DIM + 1, CHUNK_DIM + 8, kWater));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(meshFaceCellsRange(&out, 0, out.opaque_faces) == bare_floor_cells);
+
+	CHECK(worldSet(&s_world, CHUNK_DIM + 8, CHUNK_DIM + 1, CHUNK_DIM + 8, BLOCK_STONE));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(meshFaceCellsRange(&out, 0, out.opaque_faces) == bare_floor_cells - 1 + 5);
+	worldExit(&s_world);
+
+	// Water and tall grass in the same cell column, which is what a shoreline is. Different
+	// ids, so no cull between them either, and the cross still emits its four quads next to
+	// a transparent cube: 6 water faces + 4 cross quads, none of them lost.
+	worldInit(&s_world);
+	CHECK(worldSet(&s_world, CHUNK_DIM + 4, CHUNK_DIM + 4, CHUNK_DIM + 4, kWater));
+	CHECK(worldSet(&s_world, CHUNK_DIM + 5, CHUNK_DIM + 4, CHUNK_DIM + 4, kGrass));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.opaque_faces == 0);
+	CHECK(out.faces == 6 + 4);
+	CHECK(out.vert_count == 6 * 4 + 16);
+	worldExit(&s_world);
+
 	free(out.verts);
 	free(out.indices);
 }
@@ -2432,6 +2681,334 @@ static void testPhysics(void)
 
 		CHECK(body.y == 12.0f);                     // climbed it
 		CHECK(body.vx == PLAYER_WALK_SPEED);        // and kept its speed
+
+		worldExit(&s_world);
+	}
+}
+
+// Auto-step, the refusal half.
+//
+// testPhysics() above proves the one-block climb works, and that a two-block wall and an
+// airborne body are turned away. This covers the rest of the ways the step must decline,
+// because a step-up that always succeeded would pass every success check in this file and
+// still let the player walk up a cliff — the success cases alone cannot tell a working
+// step from one with no refusal logic in it at all.
+//
+// Every case here is a matched pair wherever one can be built: the refusal, and the SAME
+// geometry with the single refusing feature removed. A refusal check on its own cannot
+// separate "correctly refused" from "the body never reached the obstruction", and that is
+// not hypothetical — the first cost probe written for this work reset the body to x=7.6
+// each frame, which at 4.3 blocks/s covers 0.0717 blocks per tick and leaves the box's
+// east face at 7.9717, inside cell 7. The step at cell 8 was never touched, tryStepUp was
+// never called, and the measurement came back "+0.000 extra lookups" from an arm where
+// nothing had happened. The paired arms below all report a visibly different outcome from
+// their partner, so neither half can be silently inert.
+static void testStepUpRefusals(void)
+{
+	// --- No headroom over the target.
+	//
+	// A one-block step that is climbable on its own, plus a solid block at y=13. The
+	// destination box stands with its feet at 12 and its head at 13.8, so it reaches
+	// into y=13 and the probe refuses.
+	//
+	// This is a different shape of refusal from testPhysics()'s two-block wall. There
+	// the obstruction and the thing filling the headroom are the same column, so a
+	// probe that only ever looked at the step's own column would still pass. Here they
+	// are separate blocks with a clear cell between them, which is what actually proves
+	// the probe tests the whole standing box.
+	{
+		worldInit(&s_world);
+		for (int x = 0; x < 16; x++)
+			for (int z = 0; z < 12; z++)
+				CHECK_QUIET(worldSet(&s_world, x, 10, z, BLOCK_STONE));   // floor top at y=11
+		CHECK(worldSet(&s_world, 8, 11, 5, BLOCK_STONE));   // the step, top at y=12
+		CHECK(worldSet(&s_world, 8, 13, 5, BLOCK_STONE));   // ceiling over the destination
+
+		Body body;
+		bodyInit(&body, 5.0f, 11.0f, 5.0f);
+		body.on_ground = true;
+		// Starts clear, so the stop below is the step's doing and not a body that began
+		// the test already embedded in something.
+		CHECK(!bodyBlocked(&s_world, 5.0f, 11.0f, 5.0f));
+
+		const int blocked = bodyMove(&body, &s_world, 4.0f, 0.0f, 0.0f);
+
+		CHECK(blocked & BLOCKED_X);
+		CHECK(body.x > 7.69f && body.x < 7.71f);   // stopped flush at the step's west face
+		CHECK(body.y == 11.0f);                    // never rose a millimetre
+		CHECK(body.on_ground == true);             // still standing on the original floor
+
+		worldExit(&s_world);
+	}
+
+	// --- The control for it: byte-identical world minus the y=13 block. Without this
+	// arm the check above cannot tell a working headroom probe from a step-up that
+	// never fires in this geometry for some unrelated reason.
+	{
+		worldInit(&s_world);
+		for (int x = 0; x < 16; x++)
+			for (int z = 0; z < 12; z++)
+				CHECK_QUIET(worldSet(&s_world, x, 10, z, BLOCK_STONE));
+		CHECK(worldSet(&s_world, 8, 11, 5, BLOCK_STONE));
+		// No ceiling this time. That is the only difference.
+
+		Body body;
+		bodyInit(&body, 5.0f, 11.0f, 5.0f);
+		body.on_ground = true;
+
+		const int blocked = bodyMove(&body, &s_world, 4.0f, 0.0f, 0.0f);
+
+		CHECK(!(blocked & BLOCKED_X));   // completed the whole move
+		CHECK(body.x > 8.9f);            // and got past the step's column
+		CHECK(body.y == 12.0f);          // standing on top of it, exactly
+
+		worldExit(&s_world);
+	}
+
+	// --- Falling. A body that is not on the ground must not step, and this pins it with
+	// the body placed inside the window where its box genuinely overlaps the step's row
+	// (feet at 11.5, so the box spans 11.5..13.3 and the step occupies 11..12) rather
+	// than merely near it. The control arm flips on_ground alone and nothing else, so
+	// the difference between the two is exactly the guard being tested.
+	{
+		worldInit(&s_world);
+		for (int x = 0; x < 16; x++)
+			for (int z = 0; z < 12; z++)
+				CHECK_QUIET(worldSet(&s_world, x, 10, z, BLOCK_STONE));
+		CHECK(worldSet(&s_world, 8, 11, 5, BLOCK_STONE));
+
+		Body body;
+		bodyInit(&body, 7.6f, 11.5f, 5.0f);
+		body.on_ground = false;
+		body.vy = -8.0f;                 // genuinely falling, not merely un-grounded
+
+		const int blocked = bodyMove(&body, &s_world, 0.3f, 0.0f, 0.0f);
+
+		CHECK(blocked & BLOCKED_X);
+		CHECK(body.x > 7.69f && body.x < 7.71f);
+		CHECK(body.y == 11.5f);            // did not rise
+		CHECK(body.on_ground == false);    // and the step did not invent a landing
+
+		// Control: same world, same position, same delta — grounded.
+		bodyInit(&body, 7.6f, 11.5f, 5.0f);
+		body.on_ground = true;
+
+		const int ok = bodyMove(&body, &s_world, 0.3f, 0.0f, 0.0f);
+
+		CHECK(!(ok & BLOCKED_X));
+		CHECK(body.x > 7.89f && body.x < 7.91f);
+		CHECK(body.y == 12.5f);            // rose exactly one block
+
+		worldExit(&s_world);
+	}
+
+	// --- The same rule under a real fall driven by gravity, rather than by setting
+	// on_ground by hand. This is the arm that proves resolveY's own bookkeeping clears
+	// on_ground early enough in the substep that the horizontal resolve which follows it
+	// cannot step — the hand-set version above would still pass if resolveY forgot.
+	//
+	// The body starts inside the overlap window on purpose. Dropped from higher up it
+	// sails past the step's column before it has fallen far enough to touch it, and
+	// blocked_airborne comes back 0: measured, and the reason that counter is asserted
+	// non-zero below instead of just being printed.
+	//
+	// "Still airborne when the tick ended" is the predicate, not "was airborne when it
+	// began". A tick that begins airborne and ends grounded is a landing, and a body that
+	// lands at the foot of a step and walks up it within that same tick has not stepped
+	// in mid-air — on_ground was made true by a genuine resolveY landing in that very
+	// substep. Scoring the start state alone reports a spurious 0.907-block "airborne
+	// rise" for exactly that legitimate tick; measured, then corrected to this.
+	{
+		worldInit(&s_world);
+		for (int x = 0; x < 32; x++)
+			for (int z = 0; z < 12; z++)
+				CHECK_QUIET(worldSet(&s_world, x, 10, z, BLOCK_STONE));
+		CHECK(worldSet(&s_world, 8, 11, 5, BLOCK_STONE));
+
+		Body body;
+		bodyInit(&body, 7.6f, 11.9f, 5.0f);
+		body.on_ground = false;
+		body.vy = -1.0f;
+
+		int airborne_ticks = 0, blocked_airborne = 0, rose_airborne = 0;
+
+		for (int i = 0; i < 240; i++) {
+			body.vx = PLAYER_WALK_SPEED;
+			const bool was_air = !body.on_ground;
+			const float y0 = body.y;
+			const int blk = bodyStep(&body, &s_world, 1.0f / 60.0f);
+			if (was_air) {
+				airborne_ticks++;
+				if (blk & BLOCKED_X) blocked_airborne++;
+				if (!body.on_ground && body.y > y0) rose_airborne++;
+			}
+		}
+
+		CHECK(airborne_ticks > 0);       // it really did spend time off the ground
+		CHECK(blocked_airborne > 0);     // and really was pressed into the step while there
+		CHECK(rose_airborne == 0);       // and never gained height while off the ground
+		CHECK(body.on_ground == true);   // ended up settled, not still falling
+		CHECK(body.y == 11.0f);          // on the floor, not on top of the step
+
+		worldExit(&s_world);
+	}
+
+	// --- A plant is not a stair.
+	//
+	// Cross-shaped blocks are registered non-solid, so bodyBlocked ignores them, no
+	// horizontal resolve ever reports blocked, and tryStepUp is therefore never even
+	// called. The failure this guards against is a step-up keyed on "is something drawn
+	// here" rather than on "is something solid here", which would make the player hop up
+	// onto every flower they walked into.
+	//
+	// The solid cube from the same helper is the control: same dynamic id range, same
+	// registration call, differing only in shape and solidity — so a difference in
+	// outcome is about the block, not about high ids behaving oddly.
+	{
+		BlockId cross = 0, cube = 0;
+		CHECK(registerShapeBlocks(&cross, &cube));
+		if (cross && cube) {
+			CHECK(!blockIsSolid(cross));
+			CHECK(blockIsSolid(cube));
+
+			worldInit(&s_world);
+			for (int x = 0; x < 16; x++)
+				for (int z = 0; z < 12; z++)
+					CHECK_QUIET(worldSet(&s_world, x, 10, z, BLOCK_STONE));
+			CHECK(worldSet(&s_world, 8, 11, 5, cross));   // a plant standing on the floor
+
+			Body body;
+			bodyInit(&body, 5.0f, 11.0f, 5.0f);
+			body.on_ground = true;
+
+			int blocked = bodyMove(&body, &s_world, 4.0f, 0.0f, 0.0f);
+
+			CHECK(!(blocked & BLOCKED_X));   // walked straight through it
+			CHECK(body.x > 8.9f);
+			CHECK(body.y == 11.0f);          // and was never lifted by it
+
+			// The control: swap that one cell for the solid cube and nothing else. Now
+			// it IS an obstruction, and now the step-up is allowed to fire.
+			CHECK(worldSet(&s_world, 8, 11, 5, cube));
+			bodyInit(&body, 5.0f, 11.0f, 5.0f);
+			body.on_ground = true;
+
+			blocked = bodyMove(&body, &s_world, 4.0f, 0.0f, 0.0f);
+
+			CHECK(!(blocked & BLOCKED_X));
+			CHECK(body.y == 12.0f);          // climbed the cube, having ignored the plant
+
+			worldExit(&s_world);
+		}
+		restoreCoreRegistry();
+	}
+
+	// --- A diagonal squeeze between two blocks.
+	//
+	// Two two-block walls meeting at a corner, with the far diagonal cell deliberately
+	// left empty. The body sits in the inside corner and pushes into both at once. The
+	// tempting bug is a step-up that writes both horizontal coordinates at once and so
+	// slips the body through the diagonal seam that neither axis alone would open; the
+	// real tryStepUp takes the current value for the axis it is not resolving, which is
+	// what keeps this shut. Both axes must report blocked and the body must not rise.
+	{
+		worldInit(&s_world);
+		for (int x = 0; x < 12; x++)
+			for (int z = 0; z < 12; z++)
+				CHECK_QUIET(worldSet(&s_world, x, 10, z, BLOCK_STONE));
+
+		CHECK(worldSet(&s_world, 6, 11, 5, BLOCK_STONE));
+		CHECK(worldSet(&s_world, 6, 12, 5, BLOCK_STONE));   // +x wall, two tall
+		CHECK(worldSet(&s_world, 5, 11, 6, BLOCK_STONE));
+		CHECK(worldSet(&s_world, 5, 12, 6, BLOCK_STONE));   // +z wall, two tall
+		// (6,_,6) is left empty on purpose: that is the diagonal gap.
+
+		Body body;
+		bodyInit(&body, 5.5f, 11.0f, 5.5f);
+		body.on_ground = true;
+
+		const int blocked = bodyMove(&body, &s_world, 0.3f, 0.0f, 0.3f);
+
+		CHECK(blocked & BLOCKED_X);
+		CHECK(blocked & BLOCKED_Z);
+		CHECK(body.x > 5.69f && body.x < 5.71f);   // stopped flush on x
+		CHECK(body.z > 5.69f && body.z < 5.71f);   // and flush on z
+		CHECK(body.y == 11.0f);                    // and did not climb out over the top
+
+		worldExit(&s_world);
+	}
+
+	// --- A body that is already inside a wall must not be lifted out through it.
+	//
+	// The step-up probes the destination, not the origin, so a body that starts
+	// embedded is a case the probe cannot reason about from its own result. What must
+	// hold is the modest thing: it does not rise. Here the wall is four blocks tall, so
+	// the destination at y+1 is inside it too and the probe refuses on its own terms.
+	{
+		worldInit(&s_world);
+		for (int x = 0; x < 12; x++)
+			for (int z = 0; z < 12; z++)
+				CHECK_QUIET(worldSet(&s_world, x, 10, z, BLOCK_STONE));
+		for (int y = 11; y <= 14; y++)
+			CHECK(worldSet(&s_world, 5, y, 5, BLOCK_STONE));
+
+		Body body;
+		bodyInit(&body, 5.5f, 11.0f, 5.5f);
+		body.on_ground = true;
+		CHECK(bodyBlocked(&s_world, 5.5f, 11.0f, 5.5f));   // genuinely embedded to begin with
+
+		const int blocked = bodyMove(&body, &s_world, 0.3f, 0.0f, 0.0f);
+
+		CHECK(blocked & BLOCKED_X);
+		CHECK(body.y == 11.0f);   // did not climb the wall it was stuck in
+
+		worldExit(&s_world);
+	}
+
+	// --- The regression that matters most: a long walk up a real staircase, checking
+	// every tick that the body is never below the surface of the column it is standing
+	// over. Falling through the world is the worst failure this module can have, and the
+	// flat-floor 18,000-tick check in testPhysics() cannot see it because nothing there
+	// ever invokes the step-up. This walks 16 rises — the body climbs from y=11 to y=27
+	// — with tryStepUp firing repeatedly, and asserts the floor was never breached.
+	//
+	// The climb total is asserted too. Without it a step-up that silently stopped working
+	// would leave the body stuck against the first riser, never below any surface, and
+	// the check would pass while proving nothing.
+	{
+		worldInit(&s_world);
+		bool built = true;
+		for (int x = 0; x < 36; x++)
+			for (int z = 0; z < 10; z++) {
+				const int h = 10 + x / 2;             // one block up every two columns
+				for (int y = 0; y <= h; y++)
+					if (!worldSet(&s_world, x, y, z, BLOCK_STONE)) built = false;
+			}
+		CHECK(built);
+
+		Body body;
+		bodyInit(&body, 0.5f, 11.0f, 5.5f);
+		body.on_ground = true;
+
+		float lowest = 9999.0f;
+		int below_surface = 0, ticks = 0;
+
+		for (int i = 0; i < 2000; i++) {
+			if (body.x > 32.0f) break;   // stay well inside the built area
+			body.vx = PLAYER_WALK_SPEED;
+			bodyStep(&body, &s_world, 1.0f / 60.0f);
+			ticks++;
+			if (body.y < lowest) lowest = body.y;
+			// The top surface of the column the body's centre is over.
+			const float top = (float)(10 + (int)body.x / 2) + 1.0f;
+			if (body.y < top - 0.001f) below_surface++;
+		}
+
+		CHECK(ticks > 400);              // it really did run, and for a long time
+		CHECK(below_surface == 0);       // never once beneath the surface under it
+		CHECK(lowest == 11.0f);          // and never below the height it started at
+		CHECK(body.y >= 26.0f);          // climbed at least 15 risers by auto-step alone
+		CHECK(body.on_ground == true);   // finished standing on the staircase, not in it
 
 		worldExit(&s_world);
 	}
@@ -3449,7 +4026,7 @@ static void testRng(void)
 static void testWorldgenTerrain(void)
 {
 	WorldGen g;
-	worldgenInit(&g, 12345u);
+	worldgenInit(&g, 12345u, GEN_VERSION_LEGACY);
 
 	// Heights stay inside the declared band. This is what stops the surface from being
 	// clamped flat at the top of the world, and it is checked over a wide area rather
@@ -3574,7 +4151,7 @@ static uint32_t genTestHash(void)
 static void testWorldgenDeterminism(void)
 {
 	WorldGen g;
-	worldgenInit(&g, 0xBEEFu);
+	worldgenInit(&g, 0xBEEFu, GEN_VERSION_LEGACY);
 
 	// Hashed rather than snapshotted. A 48x128x48 copy would be 295 KB of .bss, and this
 	// file is compiled into the 3DS build too — the console runs the same self-test, and a
@@ -3617,7 +4194,7 @@ static void testWorldgenDeterminism(void)
 	// 48x48 area (one row of it happened to give 29/48 = 60.4 %, which is why a row is not
 	// a big enough sample), and the worst of 24 adjacent seed pairs was 74.6 %.
 	WorldGen g2;
-	worldgenInit(&g2, 0xBEEFu + 1);
+	worldgenInit(&g2, 0xBEEFu + 1, GEN_VERSION_LEGACY);
 	int height_differs = 0;
 	for (int z = 0; z < 48; z++)
 		for (int x = 0; x < 48; x++)
@@ -3636,7 +4213,7 @@ static void testWorldgenDeterminism(void)
 static void testWorldgenBiome(void)
 {
 	WorldGen g;
-	worldgenInit(&g, 12345u);
+	worldgenInit(&g, 12345u, GEN_VERSION_LEGACY);
 
 	// The field is a normalised noise value. Anything outside [0, FX_ONE] means the octave
 	// weights no longer sum to one, and every threshold derived from it silently moves.
@@ -3653,7 +4230,7 @@ static void testWorldgenBiome(void)
 	const uint32_t seeds[3] = { 12345u, 0xBEEFu, 7919u };
 	for (int s = 0; s < 3; s++) {
 		WorldGen gs;
-		worldgenInit(&gs, seeds[s]);
+		worldgenInit(&gs, seeds[s], GEN_VERSION_LEGACY);
 		int sandy = 0, cols = 0;
 		for (int z = -96; z < 96; z += 3)
 			for (int x = -96; x < 96; x += 3) {
@@ -3710,7 +4287,7 @@ static void testWorldgenTrees(void)
 	// 60 candidate seeds, 1616 splits this region 47.7 % sand to 52.3 % grass — the most
 	// even of them, so both halves get real coverage and there is still ground for trees.
 	WorldGen g;
-	worldgenInit(&g, 1616u);
+	worldgenInit(&g, 1616u, GEN_VERSION_LEGACY);
 
 	worldInit(&s_world);
 	for (int cz = 0; cz < 3; cz++)
@@ -3851,7 +4428,7 @@ static void testWorldgenCaves(void)
 	// a mutant 21.91 %, and the two stop overlapping. A small sample did not make the test
 	// weaker in an obvious way — it made a real defect invisible.
 	WorldGen g;
-	worldgenInit(&g, 1337u);
+	worldgenInit(&g, 1337u, GEN_VERSION_LEGACY);
 
 	worldInit(&s_world);
 	for (int cz = -GEN_CAVE_TEST_R; cz <= GEN_CAVE_TEST_R; cz++)
@@ -3935,8 +4512,8 @@ static void testWorldgenCaves(void)
 	// state instead of hashing a position — which is the thing that would break the moment
 	// Phase 6 regenerates a column in a different order.
 	WorldGen same, other;
-	worldgenInit(&same, 1337u);
-	worldgenInit(&other, 1338u);
+	worldgenInit(&same, 1337u, GEN_VERSION_LEGACY);
+	worldgenInit(&other, 1338u, GEN_VERSION_LEGACY);
 
 	int agree = 0, differs = 0, caves = 0, floor_caves = 0;
 	for (int i = 0; i < 4000; i++) {
@@ -3970,7 +4547,7 @@ static void testWorldgenMemoryProjection(void)
 	worldInit(&s_world);
 
 	WorldGen g;
-	worldgenInit(&g, 20260819u);
+	worldgenInit(&g, 20260819u, GEN_VERSION_LEGACY);
 
 	const int radius = 8;
 	const int failed = worldgenArea(&g, &s_world, 0, 0, radius);
@@ -4580,12 +5157,25 @@ static void testRenderDist(void)
 	CHECK(lo.area_radius == lo.radius + 1);
 	CHECK(hi.area_radius == hi.radius + 1);
 
-	// Slots: 9 columns and 49 columns at six chunks each. The pool is claimed for the maximum
-	// at boot, so this number is what decides whether the setting is affordable at all.
+	// Slots: 9 columns and 49 columns at COLUMN_CHUNKS chunks each. The pool is claimed for the
+	// maximum at boot, so this number is what decides whether the setting is affordable at all.
+	//
+	// v1.7.0 took the per-column figure from a measured 6 to the arithmetic ceiling
+	// COLUMN_CHUNKS, so the absolute pin below moves 294 -> 392. It stays an absolute number
+	// next to the relative one on purpose: the relative check cannot notice
+	// RENDER_DIST_SLOTS_PER_COLUMN itself moving, and it moving is what broke the pool.
 	CHECK(lo.slots == 9 * RENDER_DIST_SLOTS_PER_COLUMN);
 	CHECK(hi.slots == 49 * RENDER_DIST_SLOTS_PER_COLUMN);
-	CHECK(hi.slots == 294);
+	CHECK(hi.slots == 392);
 	CHECK(hi.slots > lo.slots);
+
+	// v1.7.0. The pool must cover a ring in which EVERY chunk of every column is meshed, not
+	// just the worst ring whatever worldgen happened to be current was measured at. The density
+	// generator put the worst measured radius-3 ring at 298 against a pool of 294 — four chunks
+	// that would never have been meshed at all, i.e. holes in the terrain — and these two are
+	// the host-side statement that it can no longer happen by arithmetic rather than by luck.
+	CHECK(hi.slots >= RENDER_DIST_MAX_COLUMNS * COLUMN_CHUNKS);
+	CHECK(lo.slots >= 9 * COLUMN_CHUNKS);
 
 	// The slot count the pool is actually cut against, kept in step with the setting's own
 	// arithmetic. scene/chunk_render.c splits exactly this many slots across its three tiers.
@@ -5396,6 +5986,698 @@ static void testMesherO3DSParity(void)
 	free(ref.verts); free(ref.indices); free(lit.verts); free(lit.indices);
 }
 
+// ── v1.7.0 terrain rework ─────────────────────────────────────────────────────────────
+
+// FNV-1a over every block of one generated column. The whole column, not a sample, because
+// the claim being pinned is byte identity and a sampled hash would pass over a change that
+// only moved one block.
+static uint32_t genTestHashColumn(const World* w, int32_t cx, int32_t cz)
+{
+	uint32_t h = 2166136261u;
+	for (int y = 0; y < WORLD_HEIGHT; y++)
+		for (int lz = 0; lz < CHUNK_DIM; lz++)
+			for (int lx = 0; lx < CHUNK_DIM; lx++) {
+				h ^= (uint8_t)worldGet(w, cx * CHUNK_DIM + lx, y, cz * CHUNK_DIM + lz);
+				h *= 16777619u;
+			}
+	return h;
+}
+
+// The four materials the ground can be made of. A predicate rather than an inline
+// disjunction so CHECK_QUIET's stringified condition fits its 96-byte report buffer.
+static bool genTestIsGround(BlockId b)
+{
+	return b == BLOCK_STONE || b == BLOCK_DIRT || b == BLOCK_GRASS || b == BLOCK_SAND;
+}
+
+// **The single most important check in the v1.7.0 terrain rework.**
+//
+// A world stamped GEN_VERSION_LEGACY must generate terrain identical block for block to what
+// the generator produced before the density field existed. Not similar, not the same shape —
+// identical, because a player's house is placed against specific blocks.
+//
+// The hashes below were taken from the shipping generator BEFORE any of the v1.7.0 work was
+// applied, by a probe linking the same worldgen.c this test links. They are pinned literals
+// on purpose: a hash recomputed at test time from the code under test would agree with any
+// change at all, which is the classic check that cannot go red.
+//
+// If this fails, the legacy path has been altered and every existing world on every SD card
+// has changed shape. There is no acceptable way to update these numbers other than deciding,
+// deliberately and separately, to break existing worlds.
+static void testWorldgenLegacyByteIdentity(void)
+{
+	static const struct { uint32_t seed; int32_t cx, cz; uint32_t hash; } pinned[] = {
+		{1337u,   0,  0, 0x036f1cd5u}, {1337u,   1,  0, 0x523065f4u},
+		{1337u,  -1, -1, 0x2b5f273du}, {1337u,   7, -3, 0xbc2562b1u},
+		{4242u,   0,  0, 0x1845ad62u}, {4242u,   1,  0, 0x8364d627u},
+		{4242u,  -1, -1, 0x8d15246cu}, {4242u,   7, -3, 0xe9023721u},
+		{90210u,  0,  0, 0x8360fda4u}, {90210u,  1,  0, 0x43d8f303u},
+		{90210u, -1, -1, 0x34fd601fu}, {90210u,  7, -3, 0x11cfcfc9u},
+	};
+
+	for (size_t i = 0; i < sizeof(pinned) / sizeof(pinned[0]); i++) {
+		WorldGen g;
+		CHECK(worldgenInit(&g, pinned[i].seed, GEN_VERSION_LEGACY));
+		worldInit(&s_world);
+		CHECK(worldgenColumn(&g, &s_world, pinned[i].cx, pinned[i].cz));
+		CHECK(genTestHashColumn(&s_world, pinned[i].cx, pinned[i].cz) == pinned[i].hash);
+		worldExit(&s_world);
+	}
+
+	// The other half of the promise: the density generator must actually produce something
+	// DIFFERENT. Without this, the checks above would pass for the wrong reason — a dispatch
+	// that silently ran legacy for both versions would look perfect here.
+	{
+		WorldGen legacy, density;
+		CHECK(worldgenInit(&legacy,  1337u, GEN_VERSION_LEGACY));
+		CHECK(worldgenInit(&density, 1337u, GEN_VERSION_DENSITY));
+
+		worldInit(&s_world);
+		CHECK(worldgenColumn(&legacy, &s_world, 0, 0));
+		const uint32_t h_legacy = genTestHashColumn(&s_world, 0, 0);
+		worldExit(&s_world);
+
+		worldInit(&s_world);
+		CHECK(worldgenColumn(&density, &s_world, 0, 0));
+		const uint32_t h_density = genTestHashColumn(&s_world, 0, 0);
+		worldExit(&s_world);
+
+		CHECK(h_legacy != h_density);
+		CHECK(h_legacy == 0x036f1cd5u);
+	}
+}
+
+// The version contract that needs no filesystem: which values exist, which this build will
+// run, and what worldgenInit does with one it does not know.
+static void testGenVersionContract(void)
+{
+	// Append-only and ordered. A renumber would re-point every stamp already on a card.
+	CHECK(GEN_VERSION_LEGACY == 1u);
+	CHECK(GEN_VERSION_DENSITY == 2u);
+	CHECK(GEN_VERSION_NEWEST == GEN_VERSION_DENSITY);
+	CHECK(GEN_VERSION_FOR_NEW_WORLDS == GEN_VERSION_NEWEST);
+
+	CHECK(!genVersionKnown(0u));
+	CHECK(genVersionKnown(GEN_VERSION_LEGACY));
+	CHECK(genVersionKnown(GEN_VERSION_DENSITY));
+	CHECK(!genVersionKnown(GEN_VERSION_NEWEST + 1u));
+	CHECK(!genVersionKnown(0xFFFFFFFFu));
+
+	// A joined server session generates legacy, because the protocol carries no generator
+	// version and two clients on different generators would stand in different worlds.
+	CHECK(genVersionForSession() == GEN_VERSION_LEGACY);
+
+	// worldgenInit refuses an unknown version rather than defaulting to one. Refusing is the
+	// only safe answer: generating at the wrong version is corruption that looks like terrain.
+	WorldGen g;
+	CHECK(!worldgenInit(&g, 1337u, 0u));
+	CHECK(!worldgenInit(&g, 1337u, GEN_VERSION_NEWEST + 1u));
+	CHECK(!worldgenInit(&g, 1337u, 0xFFFFFFFFu));
+	CHECK(worldgenInit(&g, 1337u, GEN_VERSION_LEGACY));
+	CHECK(g.version == GEN_VERSION_LEGACY);
+	CHECK(worldgenInit(&g, 1337u, GEN_VERSION_DENSITY));
+	CHECK(g.version == GEN_VERSION_DENSITY);
+
+	// The seed mix must not depend on the version, or stamping an existing world would move
+	// its noise even on the legacy path.
+	WorldGen a, b;
+	CHECK(worldgenInit(&a, 4242u, GEN_VERSION_LEGACY));
+	CHECK(worldgenInit(&b, 4242u, GEN_VERSION_DENSITY));
+	CHECK(a.seed == b.seed);
+}
+
+// The biome table (task 16): shape, bounds, and the fact that it reads the EXISTING biome
+// field rather than a second one of its own.
+static void testDensityBiomeTable(void)
+{
+	int prev_h = -1, prev_a = -1;
+
+	// Monotonic in both columns across the whole field range, and inside the world at both
+	// extremes of the noise. Stepped finely enough to catch a dip inside one segment, not
+	// only at the control points.
+	for (int32_t v = 0; v <= FX_ONE; v += FX_ONE / 256) {
+		int base_h, amp;
+		wgdBiomeParams((fx)v, &base_h, &amp);
+
+		CHECK_QUIET(base_h >= prev_h);
+		CHECK_QUIET(amp >= prev_a);
+		prev_h = base_h;
+		prev_a = amp;
+
+		// The nominal extremes of this biome must stay inside the world. The lower bound
+		// matters as much as the upper: a base below amp/2 would put the surface at y < 0
+		// and the fill loop would produce an empty column.
+		CHECK_QUIET(base_h - amp / 2 > 0);
+		CHECK_QUIET(base_h + amp / 2 < WORLD_HEIGHT);
+	}
+	CHECK(prev_h > 0);       // the loop actually ran
+
+	// Clamped, not extrapolated, outside the control points.
+	int lo_h, lo_a, hi_h, hi_a, edge_h, edge_a;
+	wgdBiomeParams(0, &lo_h, &lo_a);
+	wgdBiomeParams(0x00001333, &edge_h, &edge_a);
+	CHECK(lo_h == edge_h);
+	CHECK(lo_a == edge_a);
+	wgdBiomeParams(FX_ONE, &hi_h, &hi_a);
+	wgdBiomeParams(0x0000EF9D, &edge_h, &edge_a);
+	CHECK(hi_h == edge_h);
+	CHECK(hi_a == edge_a);
+
+	// The table must straddle sea level. The lowest biome is under it *even at its nominal
+	// peak*, so there is a real seabed for task 17 to fill; the highest has its BASE above
+	// it, so its ground is dry land — but not its whole nominal range, because a mountain
+	// biome's low points are valleys and a valley floor at 56 is correct.
+	CHECK(lo_h + lo_a / 2 < GEN_SEA_LEVEL);
+	CHECK(hi_h > GEN_SEA_LEVEL);
+
+	// It reads the existing field. The sand threshold is a control point, so the shape and
+	// the surface material change at exactly the same biome value rather than near it.
+	int sand_h, sand_a;
+	wgdBiomeParams(GEN_SAND_BELOW, &sand_h, &sand_a);
+	CHECK(sand_h > lo_h);
+	CHECK(sand_h < hi_h);
+
+	// Both out-parameters are optional, and asking for one must not require the other.
+	int only_h = -1, only_a = -1;
+	wgdBiomeParams(0x0000AE14, &only_h, NULL);
+	wgdBiomeParams(0x0000AE14, NULL, &only_a);
+	CHECK(only_h > 0);
+	CHECK(only_a > 0);
+}
+
+// The density field itself (task 15): sign at the extremes, and that a standalone height
+// query agrees with the blocks the column fill actually produced.
+static void testDensityField(void)
+{
+	WorldGen g;
+	CHECK(worldgenInit(&g, 1337u, GEN_VERSION_DENSITY));
+
+	// The vertical bias must dominate at both ends, or the world has a hollow floor or a
+	// stone sky. Checked over a spread of columns, not one, because the biome varies.
+	for (int32_t z = -48; z <= 48; z += 16)
+		for (int32_t x = -48; x <= 48; x += 16) {
+			CHECK_QUIET(wgdDensityAt(&g, x, 0, z) > 0);
+			CHECK_QUIET(wgdDensityAt(&g, x, WORLD_HEIGHT - 1, z) < 0);
+		}
+
+	// wgdHeight evaluates a 2x2x17 corner sub-grid; wgdColumn evaluates the whole 5x5x17 one
+	// and interpolates it. They must agree for every cell of a column, or spawn-finding and
+	// the terrain disagree about where the ground is.
+	worldInit(&s_world);
+	CHECK(worldgenColumn(&g, &s_world, 3, -2));
+	int checked = 0;
+	for (int lz = 0; lz < CHUNK_DIM; lz++)
+		for (int lx = 0; lx < CHUNK_DIM; lx++) {
+			const int32_t x = 3 * CHUNK_DIM + lx, z = -2 * CHUNK_DIM + lz;
+			const int h = worldgenHeight(&g, x, z);
+			CHECK_QUIET(h > 0 && h <= WORLD_HEIGHT);
+			// The block below the reported height is a ground material — the height query
+			// and the fill loop cannot be pointing at different y values. Wrapped in a
+			// predicate rather than written out, because CHECK_QUIET stringifies its
+			// argument into a 96-byte buffer and the four-way test overruns it.
+			CHECK_QUIET(genTestIsGround(worldGet(&s_world, x, h - 1, z)));
+			checked++;
+		}
+	CHECK(checked == CHUNK_DIM * CHUNK_DIM);
+	worldExit(&s_world);
+}
+
+// What the terrain actually looks like, asserted as distributions rather than by eye. A
+// terrain claim is partly visual and this does not replace looking at it — but every line
+// here goes red for a specific way the generator can be wrong: a flat world, a noise sponge
+// and a world whose surface pass never ran all fail different ones.
+// Width of a biome bucket in the distribution test below, as a shift of the fx biome value.
+// 8 gives 256 buckets across the field: narrow enough that the biome contributes under a
+// block of height inside one, wide enough that buckets hold hundreds of columns.
+#define GEN_D_TEST_BSHIFT  8
+#define GEN_D_TEST_BUCKETS ((FX_ONE >> GEN_D_TEST_BSHIFT) + 2)
+
+static void testDensityDistribution(void)
+{
+	static const uint32_t seeds[3] = {1337u, 4242u, 90210u};
+
+	for (int si = 0; si < 3; si++) {
+		WorldGen g;
+		CHECK(worldgenInit(&g, seeds[si], GEN_VERSION_DENSITY));
+		worldInit(&s_world);
+
+		// 5 x 5 columns, i.e. 80 x 80 blocks. Not 3 x 3: the biome field varies over 128
+		// blocks (GEN_BIOME_SHIFT 7), so a 48-block sample can sit entirely inside one biome
+		// and show almost no relief — measured, seed 90210 spans 8 blocks over 5 x 5 and
+		// would have failed the "not flat" line below over 3 x 3 for a reason that is not a
+		// bug in the generator.
+		for (int32_t cz = -2; cz <= 2; cz++)
+			for (int32_t cx = -2; cx <= 2; cx++)
+				CHECK_QUIET(worldgenColumn(&g, &s_world, cx, cz));
+
+		int hmin = WORLD_HEIGHT, hmax = 0;
+		long surface_mat = 0, air_under = 0, solid_total = 0;
+
+		// **How much of the relief is the noise's rather than the biome's.**
+		// Each column is bucketed by its biome-field value, narrowly enough (256 wide out of
+		// FX_ONE) that the biome's own contribution to height inside one bucket is well under
+		// a block. If the noise term were deleted, wgdHeight would collapse to a pure function
+		// of the biome value and every column in a bucket would share a height; with the noise
+		// wired in they differ by roughly its amplitude. Measured over this same 5 x 5 area:
+		// 23 / 9 / 8 blocks for seeds 1337 / 4242 / 90210, against 1 / 1 / 1 with the noise
+		// term multiplied by zero.
+		//
+		// The obvious statistical checks were tried first and are not good enough to keep: the
+		// widest height range inside one 16 x 16 column scored 7 healthy against 7 noise-
+		// deleted on seed 4242, and adjacent 2-block steps came out at zero either way on two
+		// of three seeds even over 128 x 128 blocks. Both would have passed a generator whose
+		// noise contributed nothing at all.
+		static int bk_lo[GEN_D_TEST_BUCKETS], bk_hi[GEN_D_TEST_BUCKETS];
+		for (int i = 0; i < GEN_D_TEST_BUCKETS; i++) { bk_lo[i] = WORLD_HEIGHT; bk_hi[i] = -1; }
+		long grass = 0, dirt = 0, sand = 0, stone_top = 0;
+		static int seen[WORLD_HEIGHT + 1];
+		memset(seen, 0, sizeof seen);
+
+		for (int32_t cz = -2; cz <= 2; cz++)
+			for (int32_t cx = -2; cx <= 2; cx++)
+				for (int lz = 0; lz < CHUNK_DIM; lz++)
+					for (int lx = 0; lx < CHUNK_DIM; lx++) {
+						const int32_t x = cx * CHUNK_DIM + lx, z = cz * CHUNK_DIM + lz;
+						int top = -1;
+						for (int y = WORLD_HEIGHT - 1; y >= 0; y--) {
+							const BlockId b = worldGet(&s_world, x, y, z);
+							// v1.7.0 tasks 17 and 19. Water and plants are stepped over for
+							// the same reason trees are: this scan is looking for the top of
+							// the GROUND, and neither an ocean nor a tuft of grass is it.
+							// Without them the "top" of a seabed column is the waterline and
+							// every surface-material check below reads the wrong cell.
+							if (b == BLOCK_LEAVES || b == BLOCK_WOOD ||
+							    b == BLOCK_WATER  || b == BLOCK_TALL_GRASS) continue;
+							if (b != BLOCK_AIR) {
+								if (top < 0) top = y;
+								solid_total++;
+							} else if (top >= 0) {
+								air_under++;
+							}
+						}
+						CHECK_QUIET(top >= 0);
+						if (top < 0) continue;
+
+						const int h = top + 1;
+						if (h < hmin) hmin = h;
+						if (h > hmax) hmax = h;
+						seen[h] = 1;
+
+						const int bk = (int)(worldgenBiome(&g, x, z) >> GEN_D_TEST_BSHIFT);
+						if (bk >= 0 && bk < GEN_D_TEST_BUCKETS) {
+							if (h < bk_lo[bk]) bk_lo[bk] = h;
+							if (h > bk_hi[bk]) bk_hi[bk] = h;
+						}
+
+						switch (worldGet(&s_world, x, top, z)) {
+							case BLOCK_GRASS: grass++;     surface_mat++; break;
+							case BLOCK_DIRT:  dirt++;      surface_mat++; break;
+							case BLOCK_SAND:  sand++;      surface_mat++; break;
+							case BLOCK_STONE: stone_top++; surface_mat++; break;
+							default: break;
+						}
+					}
+
+		int widest_in_biome = 0;
+		for (int i = 0; i < GEN_D_TEST_BUCKETS; i++)
+			if (bk_hi[i] >= 0 && bk_hi[i] - bk_lo[i] > widest_in_biome)
+				widest_in_biome = bk_hi[i] - bk_lo[i];
+
+		int n_distinct = 0;
+		for (int h = 0; h <= WORLD_HEIGHT; h++) n_distinct += seen[h];
+
+		// **Surface materials belong to the topmost solid run and nowhere else.** Everything
+		// deeper than the dirt band is stone, so grass never grows on the floor of a sealed
+		// cave. This is the check that goes red if the fill loop's `exposed` flag is removed
+		// — which is a change that looks harmless in a diff and produces green fields
+		// underground.
+		long buried_soil = 0;
+		for (int32_t cz = -2; cz <= 2; cz++)
+			for (int32_t cx = -2; cx <= 2; cx++)
+				for (int lz = 0; lz < CHUNK_DIM; lz++)
+					for (int lx = 0; lx < CHUNK_DIM; lx++) {
+						const int32_t x = cx * CHUNK_DIM + lx, z = cz * CHUNK_DIM + lz;
+						const int top = worldgenHeight(&g, x, z) - 1;
+						for (int y = top - GEN_DIRT_DEPTH - 1; y >= 0; y--) {
+							const BlockId b = worldGet(&s_world, x, y, z);
+							if (b == BLOCK_GRASS || b == BLOCK_DIRT || b == BLOCK_SAND)
+								buried_soil++;
+						}
+					}
+		CHECK(buried_soil == 0);
+
+		// Not flat. A generator whose noise term was dropped would produce one height and a
+		// spread of 0. Measured over these three seeds at 5 x 5 columns: 25, 16 and 8 blocks
+		// of spread, 26, 16 and 9 distinct heights. The bound is set below the smallest of
+		// those rather than at it, so that ordinary retuning of the biome amplitudes does not
+		// have to move the test — but far enough above zero that a flat world cannot pass.
+		CHECK(hmax - hmin >= 5);
+		CHECK(n_distinct >= 5);
+		// And the relief is the noise's, not the biome's. Bound set at 4 against a measured
+		// worst case of 8 and a noise-deleted 1, so retuning the amplitudes need not move the
+		// test, but a generator that has stopped adding noise to the density field cannot pass.
+		CHECK(widest_in_biome >= 4);
+
+		// Not a sponge. Measured 5.1 - 8.1% air under the surface over 13x13 columns; the
+		// bound here is loose because a 3x3 sample is noisier, but a noise-soup field would
+		// be tens of percent and a generator with no caves at all would be zero.
+		CHECK(air_under > 0);
+		CHECK(air_under * 100 < solid_total * 30);
+
+		// Every surface block is one of the four the surface pass can choose. Anything else
+		// on top means the pass ran on a block it should not have.
+		CHECK(surface_mat == 5 * 5 * CHUNK_DIM * CHUNK_DIM);
+		CHECK(grass + dirt + sand + stone_top == surface_mat);
+
+		worldExit(&s_world);
+	}
+
+	// Grass above the waterline, dry land, and bare stone on cliffs — in one world. Seed
+	// 1337 measured 96.6% of its surface above sea level over 13x13 columns.
+	{
+		WorldGen g;
+		CHECK(worldgenInit(&g, 1337u, GEN_VERSION_DENSITY));
+		worldInit(&s_world);
+		for (int32_t cz = -1; cz <= 1; cz++)
+			for (int32_t cx = -1; cx <= 1; cx++)
+				CHECK_QUIET(worldgenColumn(&g, &s_world, cx, cz));
+
+		long above_sea = 0, cols = 0, grass_high = 0, cliff_stone = 0;
+		for (int32_t cz = -1; cz <= 1; cz++)
+			for (int32_t cx = -1; cx <= 1; cx++)
+				for (int lz = 0; lz < CHUNK_DIM; lz++)
+					for (int lx = 0; lx < CHUNK_DIM; lx++) {
+						const int32_t x = cx * CHUNK_DIM + lx, z = cz * CHUNK_DIM + lz;
+						const int h = worldgenHeight(&g, x, z);
+						cols++;
+						if (h > GEN_SEA_LEVEL) above_sea++;
+						const BlockId top = worldGet(&s_world, x, h - 1, z);
+						if (top == BLOCK_GRASS && h > GEN_SEA_LEVEL + GEN_D_BEACH_ABOVE)
+							grass_high++;
+						if (top == BLOCK_STONE) cliff_stone++;
+					}
+
+		// Most of a mountainous seed is dry land. A table whose base heights sat under sea
+		// level would drown the world, and this is the line that says so.
+		CHECK(above_sea * 2 > cols);
+		// Grass only ever appears above the beach band.
+		CHECK(grass_high > 0);
+		// Bare stone on top happens — the slope rule is finding cliffs.
+		CHECK(cliff_stone > 0);
+		worldExit(&s_world);
+	}
+}
+
+// ── Tasks 17 and 19: the sea-level water fill and the tall-grass scatter ──────────────
+//
+// Both passes ADD blocks to a density world and neither may take one away, so the checks
+// below are built on two independent kinds of evidence:
+//
+//   * a pinned TERRAIN FINGERPRINT — the FNV-1a of a generated column with water and tall
+//     grass mapped back to air. The twelve literals were taken from the tree as it stood
+//     BEFORE either pass placed a block, by a probe linking this same worldgen.c, exactly
+//     the way testWorldgenLegacyByteIdentity's numbers were taken. If water ever overwrites
+//     a stone block or a plant ever eats a leaf, the stripped column has an AIR where that
+//     block used to be and the hash moves. This is what makes "never overwrites anything" a
+//     measured fact about generated blocks rather than an argument about the order two
+//     passes run in.
+//   * SHAPE invariants read off a generated world — where the waterline sits, that a body of
+//     water is a run reaching that line and nothing detached from it, and what a plant is
+//     allowed to stand on.
+//
+// The two do different jobs. The fingerprint cannot see a water block placed in the wrong
+// AIR cell (a flooded cave is all air underneath either way); the invariants cannot see a
+// terrain block quietly replaced by one. Neither alone is enough.
+static uint32_t genTestHashColumnTerrain(const World* w, int32_t cx, int32_t cz)
+{
+	uint32_t h = 2166136261u;
+	for (int y = 0; y < WORLD_HEIGHT; y++)
+		for (int lz = 0; lz < CHUNK_DIM; lz++)
+			for (int lx = 0; lx < CHUNK_DIM; lx++) {
+				uint8_t b = (uint8_t)worldGet(w, cx * CHUNK_DIM + lx, y,
+				                             cz * CHUNK_DIM + lz);
+				if (b == BLOCK_WATER || b == BLOCK_TALL_GRASS) b = BLOCK_AIR;
+				h ^= b;
+				h *= 16777619u;
+			}
+	return h;
+}
+
+// The topmost TERRAIN block of one (x, z) — worldgenHeight's answer minus one, read off the
+// world instead of recomputed. Water, plants and trees are stepped over for the same reason
+// worldgenHeight excludes trees: none of them is the ground.
+//
+// Read from the world rather than by calling worldgenHeight because on the density generator
+// that call evaluates a 2 x 2 x 17 corner lattice — 204 fBm3 per cell — and the checks below
+// ask the question for all 6,400 cells of a 5 x 5-column area, twice.
+static int genTestTerrainTop(const World* w, int32_t x, int32_t z)
+{
+	for (int y = WORLD_HEIGHT - 1; y >= 0; y--) {
+		const BlockId b = worldGet(w, x, y, z);
+		if (b == BLOCK_AIR || b == BLOCK_WATER || b == BLOCK_TALL_GRASS ||
+		    b == BLOCK_WOOD || b == BLOCK_LEAVES)
+			continue;
+		return y;
+	}
+	return -1;
+}
+
+static void testWorldgenWaterAndGrass(void)
+{
+	// ── The terrain fingerprint. ──────────────────────────────────────────────────────
+	static const struct { uint32_t seed; int32_t cx, cz; uint32_t hash; } pinned[] = {
+		{1337u,   0,  0, 0x593053f8u}, {1337u,   1,  0, 0xa93c46e7u},
+		{1337u,  -1, -1, 0xc048a199u}, {1337u,   7, -3, 0x479464fdu},
+		{4242u,   0,  0, 0x91359a7fu}, {4242u,   1,  0, 0x22a375f8u},
+		{4242u,  -1, -1, 0xff57462du}, {4242u,   7, -3, 0x7fb8f23fu},
+		{90210u,  0,  0, 0x8bb38a6eu}, {90210u,  1,  0, 0xea29565au},
+		{90210u, -1, -1, 0xdd9c1f34u}, {90210u,  7, -3, 0xe64a8988u},
+	};
+	for (size_t i = 0; i < sizeof(pinned) / sizeof(pinned[0]); i++) {
+		WorldGen g;
+		CHECK(worldgenInit(&g, pinned[i].seed, GEN_VERSION_DENSITY));
+		worldInit(&s_world);
+		CHECK(worldgenColumn(&g, &s_world, pinned[i].cx, pinned[i].cz));
+		CHECK_QUIET(genTestHashColumnTerrain(&s_world, pinned[i].cx, pinned[i].cz)
+		            == pinned[i].hash);
+		worldExit(&s_world);
+	}
+
+	// ── Neither block may reach a LEGACY world. ───────────────────────────────────────
+	// testWorldgenLegacyByteIdentity's twelve hashes already say this, but they say it as
+	// "something changed"; this says which thing, on the two ids that would be changing it.
+	//
+	// **Both seeds, and this is not belt-and-braces.** Run on 90210 alone, `legacy_plants == 0`
+	// was UNFALSIFIABLE. Rerouting the legacy path through the density generator — an arm that
+	// plants grass in a legacy world by construction — reddened 11,650 checks including
+	// `legacy_water == 0` and all twelve byte-identity hashes, and left `legacy_plants == 0`
+	// GREEN: 90210 around the origin is nearly all ocean, so over 3 x 3 columns there was no
+	// grass-topped ground above the waterline for a plant to stand on. Exactly the trap this
+	// same function documents for its determinism check, one assertion further down. 1337 is
+	// the land seed (12,224 eligible cells and 1,166 plants over 7 x 7 columns at the origin),
+	// so it is the one that can actually fail, and `land_eligible > 0` below is what stops that
+	// claim being a comment instead of a check.
+	static const uint32_t legacy_seeds[2] = { 1337u, 90210u };
+	for (int li = 0; li < 2; li++) {
+		WorldGen g;
+		CHECK(worldgenInit(&g, legacy_seeds[li], GEN_VERSION_LEGACY));
+		worldInit(&s_world);
+		for (int32_t cz = -1; cz <= 1; cz++)
+			for (int32_t cx = -1; cx <= 1; cx++)
+				CHECK_QUIET(worldgenColumn(&g, &s_world, cx, cz));
+		long legacy_water = 0, legacy_plants = 0, land_eligible = 0;
+		for (int32_t z = -CHUNK_DIM; z < 2 * CHUNK_DIM; z++)
+			for (int32_t x = -CHUNK_DIM; x < 2 * CHUNK_DIM; x++) {
+				for (int y = 0; y < WORLD_HEIGHT; y++) {
+					const BlockId b = worldGet(&s_world, x, y, z);
+					if (b == BLOCK_WATER)      legacy_water++;
+					if (b == BLOCK_TALL_GRASS) legacy_plants++;
+				}
+				// Ground a plant COULD have stood on, had the scatter reached this world:
+				// grass on top, above the waterline, air over it. Without this the two
+				// zeroes above are satisfied by a region with nowhere to put a plant.
+				const int top = genTestTerrainTop(&s_world, x, z);
+				if (top >= 0 && top + 1 > GEN_SEA_LEVEL && top + 1 < WORLD_HEIGHT &&
+				    worldGet(&s_world, x, top, z) == BLOCK_GRASS &&
+				    worldGet(&s_world, x, top + 1, z) == BLOCK_AIR)
+					land_eligible++;
+			}
+		CHECK(legacy_water == 0);
+		CHECK(legacy_plants == 0);
+		if (legacy_seeds[li] == 1337u)
+			CHECK(land_eligible > 0);
+		worldExit(&s_world);
+	}
+
+	// ── Shape, over two 5 x 5-column areas, each with a real coastline in it. ─────────
+	//
+	// **The two areas were chosen by measurement, not by taking the origin twice.** Over 5 x 5
+	// columns at (0, 0) seed 1337 has 0 ocean columns and seed 90210 has 0 columns of grass
+	// above the waterline — the origin gives an area that is all land on one seed and all sea
+	// on the other, so half of what is asserted below would be vacuously true on each.
+	// Surveyed over five seeds and three areas, these two hold both at once: 1337 around
+	// (-12, 12) is 2,669 ocean columns against 2,942 grass-topped ones with 18 trees standing
+	// on them, and 90210 around (8, -8) is 838 against 3,157 with 19 trees.
+	static const struct { uint32_t seed; int32_t cx, cz; } areas[2] = {
+		{1337u, -12, 12}, {90210u, 8, -8},
+	};
+	long total_water = 0, total_plants = 0;
+
+	for (int si = 0; si < 2; si++) {
+		const int32_t ox = areas[si].cx, oz = areas[si].cz;
+		WorldGen g;
+		CHECK(worldgenInit(&g, areas[si].seed, GEN_VERSION_DENSITY));
+		worldInit(&s_world);
+		for (int32_t cz = oz - 2; cz <= oz + 2; cz++)
+			for (int32_t cx = ox - 2; cx <= ox + 2; cx++)
+				CHECK_QUIET(worldgenColumn(&g, &s_world, cx, cz));
+
+		long water = 0, plants = 0, eligible = 0, sealed_air = 0, trunk_bases = 0;
+		long water_above_line = 0, unfilled_ocean = 0, detached_water = 0;
+		long plant_below_line = 0, plant_off_ground = 0, plant_not_on_grass = 0;
+		long plant_stacked = 0;
+
+		for (int32_t z = (oz - 2) * CHUNK_DIM; z < (oz + 3) * CHUNK_DIM; z++) {
+			for (int32_t x = (ox - 2) * CHUNK_DIM; x < (ox + 3) * CHUNK_DIM; x++) {
+				const int top = genTestTerrainTop(&s_world, x, z);
+
+				// **The waterline.** Walking down from GEN_SEA_LEVEL - 1, a column is water
+				// until the first cell that is not, and never water again below that. That
+				// one sweep is three separate claims at once: the surface sits at
+				// GEN_SEA_LEVEL and not a block either side of it, a body of water is
+				// connected to that surface, and anything sealed under rock — a cave, an
+				// overhang pocket — is left dry.
+				bool still_water = true;
+				bool hit_solid   = false;
+				for (int y = GEN_SEA_LEVEL - 1; y >= 0; y--) {
+					const BlockId b = worldGet(&s_world, x, y, z);
+					if (b == BLOCK_WATER) {
+						water++;
+						if (!still_water) detached_water++;
+					} else {
+						still_water = false;
+						// Air below the first solid of the sweep is exactly a pocket the
+						// fill must not have reached.
+						if (b == BLOCK_AIR) { if (hit_solid) sealed_air++; }
+						else                { hit_solid = true; }
+					}
+				}
+
+				// Nothing above the line, ever.
+				for (int y = GEN_SEA_LEVEL; y < WORLD_HEIGHT; y++)
+					if (worldGet(&s_world, x, y, z) == BLOCK_WATER) water_above_line++;
+
+				// An ocean column — one whose ground never reaches the line — must be full
+				// to the brim. This is the half that catches a fill stopping a block short,
+				// which the sweep above would happily call consistent.
+				if (top >= 0 && top < GEN_SEA_LEVEL - 1 &&
+				    worldGet(&s_world, x, GEN_SEA_LEVEL - 1, z) != BLOCK_WATER)
+					unfilled_ocean++;
+
+				// ── Plants. ───────────────────────────────────────────────────────────
+				int seen_plant = 0;
+				for (int y = 0; y < WORLD_HEIGHT; y++) {
+					if (worldGet(&s_world, x, y, z) != BLOCK_TALL_GRASS) continue;
+					plants++;
+					seen_plant++;
+					if (y <= GEN_SEA_LEVEL)                             plant_below_line++;
+					if (y != top + 1)                                   plant_off_ground++;
+					if (worldGet(&s_world, x, y - 1, z) != BLOCK_GRASS) plant_not_on_grass++;
+				}
+				if (seen_plant > 1) plant_stacked++;
+
+				// Where a plant COULD have gone: grass on top, above the line, room above.
+				if (top >= 0 && top + 1 > GEN_SEA_LEVEL && top + 1 < WORLD_HEIGHT &&
+				    worldGet(&s_world, x, top, z) == BLOCK_GRASS) {
+					const BlockId over = worldGet(&s_world, x, top + 1, z);
+					if (over == BLOCK_AIR || over == BLOCK_TALL_GRASS) eligible++;
+					if (over == BLOCK_WOOD) trunk_bases++;
+				}
+			}
+		}
+
+		CHECK(water_above_line == 0);
+		CHECK(unfilled_ocean == 0);
+		CHECK(detached_water == 0);
+		CHECK(plant_below_line == 0);
+		CHECK(plant_off_ground == 0);
+		CHECK(plant_not_on_grass == 0);
+		CHECK(plant_stacked == 0);
+
+		// The negatives above are only worth having if the world contains the things they
+		// are about. A world with no caves under the sea, no tree standing where a plant
+		// could have gone and no eligible ground satisfies every one of them by being empty.
+		CHECK(sealed_air > 0);
+		CHECK(eligible > 0);
+		CHECK(trunk_bases > 0);
+		CHECK(plants > 0);
+
+		// Scattered, not a lawn, and not a rumour. GEN_GRASS_CHANCE is out of 256 and this
+		// band sits well either side of it, so retuning the number by a few need not move
+		// the test — while a lawn (every eligible cell) and a silent no-op both fail.
+		CHECK(plants * 100 >= eligible * 4);
+		CHECK(plants * 100 <= eligible * 20);
+
+		total_water  += water;
+		total_plants += plants;
+		worldExit(&s_world);
+	}
+
+	// The ocean has to exist at all. Summed across the two seeds rather than asserted per
+	// seed: how much water a given seed has is a property of its biome field, not of the fill.
+	CHECK(total_water > 0);
+	CHECK(total_plants > 0);
+
+	// ── Regenerating the same seed gives the identical world, water and plants included. ──
+	// Forwards and backwards over the same 3 x 3 columns, hashing every block: both passes
+	// have to be pure functions of the seed and the coordinate, exactly as the terrain is.
+	//
+	// **Two seeds, and the counts, because one seed made this vacuous.** Run on 90210 alone
+	// it passed with a deliberately order-dependent plant salt (`salt ^= ++call_counter`)
+	// still in the module: 90210 around the origin is nearly all ocean — 307 grass-eligible
+	// cells and 25 plants over 7 x 7 columns — so over 3 x 3 there was no plant to move and
+	// nothing for the hash to see. 1337 at the origin is the land case (12,224 eligible,
+	// 1,166 plants over the same 7 x 7). Each seed asserts that the thing it is meant to be
+	// proving determinstic is actually present in the hashed region.
+	static const struct { uint32_t seed; bool want_plants; bool want_water; } det[2] = {
+		{1337u, true, false}, {90210u, false, true},
+	};
+	for (int di = 0; di < 2; di++) {
+		WorldGen g;
+		CHECK(worldgenInit(&g, det[di].seed, GEN_VERSION_DENSITY));
+
+		worldInit(&s_world);
+		for (int cz = 0; cz < GEN_TEST_COLS; cz++)
+			for (int cx = 0; cx < GEN_TEST_COLS; cx++)
+				CHECK_QUIET(worldgenColumn(&g, &s_world, cx, cz));
+		const uint32_t forward = genTestHash();
+
+		// Non-vacuity: the hashed region has to contain what this seed is here for.
+		long seen_water = 0, seen_plants = 0;
+		for (int32_t z = 0; z < GEN_TEST_COLS * CHUNK_DIM; z++)
+			for (int32_t x = 0; x < GEN_TEST_COLS * CHUNK_DIM; x++)
+				for (int y = 0; y < WORLD_HEIGHT; y++) {
+					const BlockId b = worldGet(&s_world, x, y, z);
+					if (b == BLOCK_WATER)      seen_water++;
+					if (b == BLOCK_TALL_GRASS) seen_plants++;
+				}
+		if (det[di].want_plants) CHECK(seen_plants > 0);
+		if (det[di].want_water)  CHECK(seen_water > 0);
+		worldExit(&s_world);
+
+		worldInit(&s_world);
+		for (int cz = GEN_TEST_COLS - 1; cz >= 0; cz--)
+			for (int cx = GEN_TEST_COLS - 1; cx >= 0; cx--)
+				CHECK_QUIET(worldgenColumn(&g, &s_world, cx, cz));
+		CHECK(genTestHash() == forward);
+
+		// And the hash can see one block move, or the line above proves nothing.
+		CHECK(worldSet(&s_world, 20, GEN_SEA_LEVEL - 2, 20, BLOCK_SAND));
+		CHECK(genTestHash() != forward);
+		worldExit(&s_world);
+	}
+}
+
 #ifndef __3DS__
 
 #include <dirent.h>
@@ -5751,6 +7033,199 @@ static void testRegionTornDirectory(void)
 	regionTestClean(0, 0);
 }
 
+
+// The generator-version sidecar on a real filesystem. Host-only because it makes and deletes
+// directories, exactly like the region tests above, and it reuses their per-process directory
+// helper for the same reason: two concurrent runs of this suite must not share a path.
+static void genverTestDir(char* out, size_t cap, const char* leaf)
+{
+	testMkdir("build-host");
+	testMkdir(testWorldDir());
+	snprintf(out, cap, "%s/%s", testWorldDir(), leaf);
+	testRmTree(out);
+	testMkdir(out);
+}
+
+static void genverStampPath(char* out, size_t cap, const char* dir)
+{
+	snprintf(out, cap, "%s/%s", dir, GEN_VERSION_FILE);
+}
+
+// Writes `n` bytes over the start of the stamp file, leaving its length alone.
+static void genverPoke(const char* dir, long off, const uint8_t* bytes, size_t n)
+{
+	char p[256];
+	genverStampPath(p, sizeof p, dir);
+	FILE* f = fopen(p, "r+b");
+	if (!f) return;
+	fseek(f, off, SEEK_SET);
+	fwrite(bytes, 1, n, f);
+	fclose(f);
+}
+
+static long genverSize(const char* dir)
+{
+	char p[256];
+	genverStampPath(p, sizeof p, dir);
+	FILE* f = fopen(p, "rb");
+	if (!f) return -1;
+	fseek(f, 0, SEEK_END);
+	const long n = ftell(f);
+	fclose(f);
+	return n;
+}
+
+static void testGenVersionSidecar(void)
+{
+	char dir[256];
+	uint32_t v;
+
+	// ── No world directory at all: a joined server session. ───────────────────────────
+	v = 0xDEADu;
+	CHECK(genVersionResolve(NULL, &v) == GENVER_NO_WORLD_DIR);
+	CHECK(v == GEN_VERSION_LEGACY);
+	v = 0xDEADu;
+	CHECK(genVersionResolve("", &v) == GENVER_NO_WORLD_DIR);
+	CHECK(v == GEN_VERSION_LEGACY);
+
+	// ── A brand-new, empty world directory. ───────────────────────────────────────────
+	// Nothing has ever been saved here, so this is a world being created now and it gets
+	// the newest generator — and gets it written down before anything else can happen.
+	genverTestDir(dir, sizeof dir, "gv-new");
+	v = 0;
+	CHECK(genVersionRead(dir, &v) == GENVER_OK);
+	CHECK(v == GEN_VERSION_LEGACY);              // absent reads as legacy...
+	CHECK(genverSize(dir) == -1);                // ...and reading does not create one
+	v = 0;
+	CHECK(genVersionResolve(dir, &v) == GENVER_OK);
+	CHECK(v == GEN_VERSION_FOR_NEW_WORLDS);
+	CHECK(genverSize(dir) == GEN_VERSION_BYTES); // resolve stamped it
+	// Second resolve reads the stamp rather than re-deriving it, and agrees.
+	v = 0;
+	CHECK(genVersionResolve(dir, &v) == GENVER_OK);
+	CHECK(v == GEN_VERSION_FOR_NEW_WORLDS);
+
+	// **The line the whole prerequisite turns on.** Saving now creates a region file. If the
+	// stamp had not been written first, this world would read as legacy from here on and its
+	// terrain would change under the player on the next boot.
+	{
+		char bsr[320];
+		snprintf(bsr, sizeof bsr, "%s/r.0.0.bsr", dir);
+		FILE* f = fopen(bsr, "wb");
+		CHECK(f != NULL);
+		if (f) { fputc(0, f); fclose(f); }
+		v = 0;
+		CHECK(genVersionResolve(dir, &v) == GENVER_OK);
+		CHECK(v == GEN_VERSION_FOR_NEW_WORLDS);
+	}
+	testRmTree(dir);
+
+	// ── An unstamped directory that HAS been saved: every world in existence today. ────
+	genverTestDir(dir, sizeof dir, "gv-old");
+	{
+		char bsr[320];
+		snprintf(bsr, sizeof bsr, "%s/r.-1.2.bsr", dir);
+		FILE* f = fopen(bsr, "wb");
+		CHECK(f != NULL);
+		if (f) { fputc(0, f); fclose(f); }
+	}
+	v = 0;
+	CHECK(genVersionResolve(dir, &v) == GENVER_OK);
+	CHECK(v == GEN_VERSION_LEGACY);
+	CHECK(genverSize(dir) == GEN_VERSION_BYTES);
+	// And it is now stamped, so it stays legacy for the rest of the world's life.
+	v = 0;
+	CHECK(genVersionRead(dir, &v) == GENVER_OK);
+	CHECK(v == GEN_VERSION_LEGACY);
+	testRmTree(dir);
+
+	// ── Round trip of every known version. ────────────────────────────────────────────
+	genverTestDir(dir, sizeof dir, "gv-rt");
+	for (uint32_t want = GEN_VERSION_LEGACY; want <= GEN_VERSION_NEWEST; want++) {
+		CHECK(genVersionWrite(dir, want));
+		v = 0;
+		CHECK(genVersionRead(dir, &v) == GENVER_OK);
+		CHECK(v == want);
+		v = 0;
+		CHECK(genVersionResolve(dir, &v) == GENVER_OK);   // must not overwrite
+		CHECK(v == want);
+	}
+
+	// ── A save from a NEWER build. Refused, and the value is reported so the caller can
+	//    say what it saw. Not guessed at, not silently run as the newest known.
+	CHECK(genVersionWrite(dir, GEN_VERSION_NEWEST + 1u));
+	v = 0;
+	CHECK(genVersionRead(dir, &v) == GENVER_TOO_NEW);
+	CHECK(v == GEN_VERSION_NEWEST + 1u);
+	v = 0;
+	CHECK(genVersionResolve(dir, &v) == GENVER_TOO_NEW);
+	CHECK(v == GEN_VERSION_NEWEST + 1u);
+	// And worldgenInit will not run it even if a caller ignored the status.
+	{
+		WorldGen g;
+		CHECK(!worldgenInit(&g, 1337u, GEN_VERSION_NEWEST + 1u));
+	}
+
+	CHECK(genVersionWrite(dir, 0xFFFFu));
+	v = 0;
+	CHECK(genVersionRead(dir, &v) == GENVER_TOO_NEW);
+	CHECK(v == 0xFFFFu);
+
+	// ── Damaged, four ways. Each must refuse, and none may fall back to legacy — falling
+	//    back to a DIFFERENT generator than the one that shaped this world is the exact
+	//    harm the file exists to prevent.
+	{
+		// Bad magic.
+		CHECK(genVersionWrite(dir, GEN_VERSION_DENSITY));
+		const uint8_t bad[1] = {'X'};
+		genverPoke(dir, 0, bad, 1);
+		CHECK(genVersionRead(dir, NULL) == GENVER_DAMAGED);
+		CHECK(genVersionResolve(dir, &v) == GENVER_DAMAGED);
+	}
+	{
+		// Good magic, flipped payload: the CRC catches it.
+		CHECK(genVersionWrite(dir, GEN_VERSION_DENSITY));
+		const uint8_t flip[1] = {0x7F};
+		genverPoke(dir, 4, flip, 1);
+		CHECK(genVersionRead(dir, NULL) == GENVER_DAMAGED);
+	}
+	{
+		// Good record, corrupted CRC field.
+		CHECK(genVersionWrite(dir, GEN_VERSION_DENSITY));
+		const uint8_t junk[4] = {0xA5, 0xA5, 0xA5, 0xA5};
+		genverPoke(dir, 8, junk, 4);
+		CHECK(genVersionRead(dir, NULL) == GENVER_DAMAGED);
+	}
+	{
+		// Truncated — a torn write.
+		char p[256];
+		genverStampPath(p, sizeof p, dir);
+		CHECK(genVersionWrite(dir, GEN_VERSION_DENSITY));
+		uint8_t head[GEN_VERSION_BYTES];
+		FILE* f = fopen(p, "rb");
+		CHECK(f != NULL);
+		if (f) { CHECK(fread(head, 1, sizeof head, f) == sizeof head); fclose(f); }
+		f = fopen(p, "wb");
+		CHECK(f != NULL);
+		if (f) { fwrite(head, 1, 6, f); fclose(f); }
+		CHECK(genverSize(dir) == 6);
+		CHECK(genVersionRead(dir, NULL) == GENVER_DAMAGED);
+	}
+	{
+		// Longer than the record: something else wrote here.
+		char p[256];
+		genverStampPath(p, sizeof p, dir);
+		CHECK(genVersionWrite(dir, GEN_VERSION_DENSITY));
+		FILE* f = fopen(p, "ab");
+		CHECK(f != NULL);
+		if (f) { fputc(0x00, f); fclose(f); }
+		CHECK(genverSize(dir) == GEN_VERSION_BYTES + 1);
+		CHECK(genVersionRead(dir, NULL) == GENVER_DAMAGED);
+	}
+
+	testRmTree(dir);
+}
+
 #endif  // !__3DS__
 
 int worldTestRun(char* summary, size_t cap, int* checks_out)
@@ -5785,6 +7260,7 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testMesherFullCubeBytesUnchanged();
 	testBlockShapeRegistry();
 	testMesherCrossShape();
+	testMesherCoreWaterAndTallGrass();
 	testMesherGreedyMerge();
 	testMesherCrossNeverMerges();
 	testCrossShapeCollisionAndRaycast();
@@ -5809,10 +7285,17 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testWorldgenTrees();
 	testWorldgenCaves();
 	testWorldgenMemoryProjection();
+	testWorldgenLegacyByteIdentity();
+	testGenVersionContract();
+	testDensityBiomeTable();
+	testDensityField();
+	testDensityDistribution();
+	testWorldgenWaterAndGrass();
 	testRaycast();
 	testBodyBlocked();
 	testCeilingCollision();
 	testPhysics();
+	testStepUpRefusals();
 	testVisPairIndex();
 	testVisConnectivity();
 	testVisWalk();
@@ -5831,6 +7314,7 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testRegionRoundTrip();
 	testRegionPowerCut();
 	testRegionTornDirectory();
+	testGenVersionSidecar();
 	testRmTree(testWorldDir());   // the per-process directory those three worked in
 #endif
 

@@ -1018,7 +1018,46 @@ static bool genStart(int32_t cx, int32_t cz)
 	(void)networldWorldSeed(&seed);
 	s_seed_used = seed;
 
-	worldgenInit(&s_gen, seed);
+	// v1.7.0. The save directory is resolved HERE, above worldgenInit, rather than at its old
+	// site thirty lines down, because which generator this world uses is read off the card and
+	// a WorldGen cannot be built without it. saveWorldDir() is called exactly once per session
+	// either way — it mkdirs three levels and write-probes the card, which is most of
+	// genStart's measured 117 ms, so calling it twice would be a real cost and not a tidiness
+	// question.
+	//
+	// NULL in a server session, which app/worker.h documents as "no save file at all: every
+	// column is generated and none is ever written". That is exactly the contract a joined
+	// world wants — terrain comes from the server's seed and edits come from its diff store,
+	// so a local copy could only ever be a second, staler answer to a question the server has
+	// already answered. saveWorldDir() is not called at all rather than called and ignored,
+	// because calling it is what creates the directory.
+	const char* const world_dir = s_server_session ? NULL : saveWorldDir();
+
+	// v1.7.0 task 15 prerequisite. Which terrain generator this world belongs to — see
+	// world/genversion.h for the whole rule. A world with no stamp is one that predates
+	// versioning and keeps the legacy generator; a brand-new directory is stamped with this
+	// build's newest; a server session has no directory and takes genVersionForSession().
+	uint32_t gen_version = GEN_VERSION_LEGACY;
+	const GenVersionStatus gv = genVersionResolve(world_dir, &gen_version);
+
+	// A world this build cannot generate must NOT be entered. Refusing is the whole point:
+	// generating a stamped world at the wrong version writes the wrong landscape under the
+	// player's buildings, and there is no way to tell that apart afterwards from the world
+	// corruption it looks exactly like.
+	if (gv == GENVER_TOO_NEW || gv == GENVER_DAMAGED) {
+		printf("world refused: generator %lu %s\n", (unsigned long)gen_version,
+		       gv == GENVER_TOO_NEW ? "is newer than this build" : "stamp is unreadable");
+		return false;
+	}
+
+	if (!worldgenInit(&s_gen, seed, gen_version)) {
+		// Unreachable while genVersionResolve only ever returns OK for a known version — this
+		// is the same predicate asked twice, on purpose, at the one other place a WorldGen can
+		// come into existence.
+		printf("world refused: generator %lu unknown\n", (unsigned long)gen_version);
+		return false;
+	}
+
 	jobqInit(&s_meshq);
 	memset(s_col_queued, 0, sizeof(s_col_queued));
 	memset(s_col_in, 0, sizeof(s_col_in));
@@ -1034,16 +1073,11 @@ static bool genStart(int32_t cx, int32_t cz)
 	s_center_cz = cz;
 	s_col_unloaded = s_col_dropped = 0;
 
-	// Before workerStart, which is where the worker copies it: the worker reads the card on
-	// its very first job, so a directory set afterwards would miss the spawn column.
-	//
-	// NULL in a server session, which app/worker.h documents as "no save file at all: every
-	// column is generated and none is ever written". That is exactly the contract a joined
-	// world wants — terrain comes from the server's seed and edits come from its diff store,
-	// so a local copy could only ever be a second, staler answer to a question the server has
-	// already answered. saveWorldDir() is not called at all rather than called and ignored,
-	// because calling it is what creates the directory.
-	const char* const world_dir = s_server_session ? NULL : saveWorldDir();
+	// `world_dir` is resolved at the top of this function now (v1.7.0) — the generator version
+	// is read off the card and worldgenInit needs it. It is still established before
+	// workerStart, which is the ordering constraint that mattered here: the worker copies the
+	// directory on its very first job, so a directory set afterwards would miss the spawn
+	// column.
 
 	// v1.6.0 Phase A: single-player registry sidecar, applied before any column can be
 	// decoded — the worker that reads region files does not exist until workerStart() below.

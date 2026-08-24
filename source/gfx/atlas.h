@@ -38,11 +38,14 @@ enum {
 	TILE_WOOD_TOP,   // beside sand, because inserting would re-texture everything
 	TILE_LEAVES,     // after the insertion point
 	TILE_PLANKS,     // the first crafted block; the tile that forced the sheet to 128
-	// Ten of ATLAS_TILE_COUNT (15) addressable slots used. Slot 15 exists on the sheet but
+	TILE_WATER,      // roadmap task 17 — opaque art; tools/make_atlas.py's tile_water says why
+	TILE_TALL_GRASS, // roadmap task 19 — the first tile drawn for a BLOCK_SHAPE_CROSS block
+	// Twelve of ATLAS_TILE_COUNT (15) addressable slots used. Slot 15 exists on the sheet but
 	// can never be addressed — its top edge would be v = 256, which does not fit in
 	// MeshVertex's uint8_t v. See world/atlas_uv.h.
 	//
-	// The five spares are NOT blank. Since v1.6.0 F7 tools/make_atlas.py paints every slot
+	// The three spares (12, 13, and the reserved 14) are NOT blank. Since v1.6.0 F7
+	// tools/make_atlas.py paints every slot
 	// this list does not name with the magenta/black missing-texture marker, and
 	// ATLAS_TILE_MISSING (slot 14, world/atlas_uv.h) is reserved as one permanently — it is
 	// where atlasRect() clamps an out-of-range tile id. Before that, tex 10..14 drew the

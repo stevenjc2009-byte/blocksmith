@@ -28,11 +28,13 @@
 // the current one, and it is claimed once at boot. That is not laziness about resizing: the
 // linear heap is the only GPU-visible memory on this console and it cannot be defragmented,
 // so a pool that grew when the player raised the setting would be exactly the
-// allocate-and-free churn the pool exists to avoid. The cost is that an Old 3DS left on the
-// default distance carries slots it never fills — 96 of 150, about 6.0 MB now that step 9.2b
-// folded every slot's index buffer into one shared 24 KB allocation (an unfilled slot wastes
-// only its 64 KB vertex buffer now, not 88 KB) — and the benefit is that the setting can move
-// at any moment, on any model, without an allocation that can fail.
+// allocate-and-free churn the pool exists to avoid. The cost is that a console left on the
+// default distance carries slots it never fills — at the default radius 2 that is 25 columns,
+// so 200 of the 392 slots can be claimed and 192 cannot, and step 9.2b's shared 24 KB index
+// buffer means an unfilled slot now wastes only its vertex buffer (16 KB in the S tier,
+// 65 KB in L) rather than 88 KB. The exact idle cost therefore depends on which tiers stay
+// empty; the pool's total is worked out in scene/render_dist.h. The benefit is that the
+// setting can move at any moment, on any model, without an allocation that can fail.
 #define MESH_SLOTS         (RENDER_DIST_MAX_SLOTS)
 
 // The sky colour, in one place because step 6.4's fog has to be the same colour as the

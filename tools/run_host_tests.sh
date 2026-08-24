@@ -122,6 +122,8 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/world/meshq.c \
 	source/world/visgraph.c \
 	source/world/worldgen.c \
+	source/world/worldgen_density.c \
+	source/world/genversion.c \
 	source/scene/render_dist.c \
 	source/world/world_test.c \
 	-lm \

@@ -46,7 +46,7 @@ static double nowSeconds(void)
 int main(void)
 {
 	worldInit(&s_world);
-	worldgenInit(&s_gen, 1337u);
+	worldgenInit(&s_gen, 1337u, GEN_VERSION_LEGACY);
 
 	const int cols = worldgenArea(&s_gen, &s_world, 0, 0, RADIUS);
 	printf("generated %d columns, %d chunks\n", cols, s_world.chunks);

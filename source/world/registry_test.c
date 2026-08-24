@@ -6,7 +6,7 @@
 //
 // What each probe guards:
 //   testRegistryRoundTrip    - register/find/duplicate/full-range/unknown-id contract
-//   testRegistryCoreIdsStable- ids 1..7 byte-identical after InitCore; every saved
+//   testRegistryCoreIdsStable- ids 1..9 byte-identical after InitCore; every saved
 //                              world and replay depends on these never moving
 //   testRegistryCrcStability - same defs -> same crc16, different defs -> different
 //                              crc16, plus a pinned golden for the core-only table
@@ -55,7 +55,11 @@ static void testRegistryRoundTrip(void)
 	puts("registry: register / find / duplicate / full range / unknown id");
 
 	registryInitCore();
-	check(registryCount() == 8, "a fresh table defines exactly air + the seven core blocks");
+	// Nine core rows since roadmap tasks 17 and 19: grass..planks are the seven that
+	// also carry ITEM ids, plus water (0x08) and tall grass (0x09), which are core
+	// blocks and deliberately NOT items — world/block.h records why BLOCK_COUNT
+	// stayed at 8 while the registry's row count moved to 10.
+	check(registryCount() == 10, "a fresh table defines exactly air + the nine core blocks");
 	check(registryFind("grass") == BLOCK_GRASS, "core rows are findable by name");
 
 	// Five dynamic registrations land on consecutive ids from REG_ID_DYN_LO up.
@@ -106,23 +110,24 @@ static void testRegistryRoundTrip(void)
 	}
 	check(placed == REG_ID_DYN_HI - REG_ID_DYN_LO + 1 - 5,
 	      "the dyn range accepts exactly its remaining capacity, then refuses");
-	check(registryCount() == 1 + 7 + (REG_ID_DYN_HI - REG_ID_DYN_LO + 1),
+	check(registryCount() == 1 + 9 + (REG_ID_DYN_HI - REG_ID_DYN_LO + 1),
 	      "count reflects every defined row once the range is full");
 }
 
 static void testRegistryCoreIdsStable(void)
 {
-	puts("registry: core ids 1..7 are identical after InitCore");
+	puts("registry: core ids 1..9 are identical after InitCore");
 
 	registryInitCore();
 
-	// These eight checks ARE the save-format guarantee: a region file written by
+	// These ten checks ARE the save-format guarantee: a region file written by
 	// any earlier build decodes by raw id, so if grass ever stops being 1 every
 	// old world silently re-textures. Names first, then the texture rows.
 	static const char *const want_names[] = {
 		"air", "grass", "dirt", "stone", "sand", "wood", "leaves", "planks",
+		"water", "tall_grass",
 	};
-	for (BlockId id = 0; id < 8; id++) {
+	for (BlockId id = 0; id < 10; id++) {
 		char what[64];
 		snprintf(what, sizeof what, "id %u is still \"%s\"", (unsigned)id, want_names[id]);
 		check(strcmp(registryGet(id)->name, want_names[id]) == 0, what);
@@ -141,6 +146,34 @@ static void testRegistryCoreIdsStable(void)
 	      "stone stays solid");
 	check(!(registryGet(BLOCK_AIR)->flags & REG_FLAG_SOLID),
 	      "air stays non-solid");
+
+	// Water (0x08) and tall grass (0x09), roadmap tasks 17 and 19. Pinned here for
+	// the same reason as the rows above: they are core ids now, so a saved world
+	// stores them as raw 8 and 9 and they can never move.
+	const BlockDef *water = registryGet((BlockId)BLOCK_WATER);
+	check(!(water->flags & REG_FLAG_SOLID),
+	      "water is not solid: the player walks through it and it occludes nothing");
+	check((water->flags & REG_FLAG_TRANSPARENT) != 0,
+	      "water is transparent, which is what puts it in the mesher's deferred pass");
+	check((water->flags & REG_FLAG_LIQUID) != 0,
+	      "water is a liquid, which is what makes the crosshair refuse to target it");
+	check(regShapeOf(water->flags) == BLOCK_SHAPE_FULL_CUBE,
+	      "water is a full cube, so it culls against its own kind face-for-face");
+	check(water->tex[FACE_TOP] == BTEX_WATER && water->tex[FACE_EAST] == BTEX_WATER
+	      && water->tex[FACE_BOTTOM] == BTEX_WATER,
+	      "water wears the same tile on every face");
+
+	const BlockDef *tg = registryGet((BlockId)BLOCK_TALL_GRASS);
+	check(!(tg->flags & REG_FLAG_SOLID),
+	      "tall grass is not solid: walked through, and it casts no AO");
+	check((tg->flags & REG_FLAG_TRANSPARENT) != 0,
+	      "tall grass is transparent, so its cutout texels are alpha-tested away");
+	check(!(tg->flags & REG_FLAG_LIQUID),
+	      "tall grass is not a liquid, so the crosshair CAN target it");
+	check(regShapeOf(tg->flags) == BLOCK_SHAPE_CROSS,
+	      "tall grass is the first BLOCK_SHAPE_CROSS block in the game");
+	check(tg->tex[FACE_TOP] == BTEX_TALL_GRASS && tg->tex[FACE_EAST] == BTEX_TALL_GRASS,
+	      "tall grass wears its own tile; emitCross reads the east rect");
 }
 
 static void testRegistryCrcStability(void)
@@ -156,8 +189,16 @@ static void testRegistryCrcStability(void)
 	// Pinned golden for the core-only table. If this ever moves WITHOUT a
 	// deliberate core-def edit, something redefined history behind the saved
 	// worlds' backs. (Computed from this exact kCoreDefs layout.)
-	check(base == 0x7E5Bu,
-	      "core-only crc matches the pinned golden 0x7E5B");
+	//
+	// Moved 0x7E5B -> 0x72A8 on 2026-08-23 by roadmap tasks 17 and 19, which append
+	// water (0x08) and tall grass (0x09) to kCoreDefs. Deliberate core-def edit, so
+	// the pin moves with it. The cost of moving it is real and is recorded here: a
+	// client on this build joining a server still built with eight core rows sees
+	// registryMatchesInfo() fail on both count and crc, falls into the bounded
+	// REGISTRY_FETCH retry, and finishes the session with s_reg_synced false.
+	// Degraded, not fatal — and it clears the moment the server ships the same rows.
+	check(base == 0x72A8u,
+	      "core-only crc matches the pinned golden 0x72A8");
 
 	// Content sensitivity: one extra def must move the crc, and re-init must
 	// put it back - proving the crc covers table content, not process state.

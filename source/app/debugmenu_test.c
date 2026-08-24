@@ -387,9 +387,9 @@ static void testMainDebugSaveWritesNewRenderDist(void)
 // any semantics, and this alone would go green against a main.c that never does it.
 //
 // Red-armed: delete the `opts.render_dist = new_radius;` line below and the last CHECK
-// fails with in.render_dist == 1 instead of 2 — the exact reboot symptom.
+// fails with in.render_dist == 1 instead of 3 — the exact reboot symptom.
 //
-// The numbers are RENDER_DIST_MIN (1) and RENDER_DIST_MAX (2), measured from
+// The numbers are RENDER_DIST_MIN (1) and RENDER_DIST_MAX (3), measured from
 // scene/render_dist.h, not picked: options.c:277 clamps render_dist into that range on
 // load, so a bigger "new" value would come back clamped and the test would pass for the
 // wrong reason.

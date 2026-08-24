@@ -110,7 +110,13 @@ static char s_first[512];
 // from gfx/atlas.h's enum rather than included, because that header pulls in <3ds.h>; the
 // coverage loop further down is what stops the two drifting, since every block's face tile
 // has to land below this and the marker check owns everything at or above it.
-#define ATLAS_PAINTED_SLOTS 10
+#define ATLAS_PAINTED_SLOTS 12
+
+// Slots 10 and 11 within that: water and tall grass (roadmap tasks 17 and 19). Named here
+// because the two texel-content checks further down are about what these two tiles ARE, not
+// merely that they are stable - one must have cutout texels and the other must not.
+#define ATLAS_SLOT_WATER      10
+#define ATLAS_SLOT_TALL_GRASS 11
 
 // The shader literals are written to 8 decimal digits, so the tolerance has to be looser than
 // that literal's own rounding while staying far tighter than the gap to any wrong value: the
@@ -768,9 +774,16 @@ int main(void)
 			      "%s's subtexture is %ux%u, not the whole %dx%d sheet",
 			      ATLAS_T3X_PATH, t.sub_w, t.sub_h, ATLAS_W_PX, ATLAS_H_PX);
 
-			// The ten painted slots, pinned. These fingerprints were taken from the t3x built
-			// BEFORE F7 touched tools/make_atlas.py, so they are what says the art did not move
-			// when the generator learned to paint the spares.
+			// The twelve painted slots, pinned. Slots 0..9's fingerprints were taken from the
+			// t3x built BEFORE F7 touched tools/make_atlas.py, so they are what says the art did
+			// not move when the generator learned to paint the spares. They are UNCHANGED by
+			// tasks 17/19: water and tall grass were appended to TILES, and the generator draws
+			// every tile from one seeded stream in TILES order precisely so that appending
+			// cannot disturb art already painted. These ten values not moving IS that proof.
+			//
+			// Slots 10 and 11 are the two new tiles. Their values were computed independently
+			// from gfx/atlas.png (RGBA5551-packed and FNV'd in Python) and match what this
+			// decoder gets out of build/atlas.t3x, so the t3x really carries what was painted.
 			static const uint64_t kPaintedFingerprint[ATLAS_PAINTED_SLOTS] = {
 				0xC8C34C2212D92C86ull,   //  0 grass_top
 				0x1D3D28DFB5E9B829ull,   //  1 grass_side
@@ -782,6 +795,8 @@ int main(void)
 				0xDDF9C5205F2EA5A1ull,   //  7 wood_top
 				0x1D3D3D0320D56934ull,   //  8 leaves
 				0x3E149457CC8AF270ull,   //  9 planks
+				0x55BDFF89F02B7891ull,   // 10 water
+				0x8CD474E09FA7C22Cull,   // 11 tall_grass
 			};
 			for (int slot = 0; slot < ATLAS_PAINTED_SLOTS; slot++) {
 				const int      png_top = ATLAS_H_PX - (slot + 1) * TILE_PX;
@@ -791,6 +806,74 @@ int main(void)
 				      ". tools/make_atlas.py draws from one seeded stream in TILES order, so any "
 				      "change to the order, the seed, or a painter moves this",
 				      slot, got, kPaintedFingerprint[slot]);
+			}
+
+			// ── What the two new tiles ARE, not merely that they are stable ──────────────
+			//
+			// A fingerprint says "these 256 texels are the ones from last time". It cannot say
+			// they are the RIGHT texels, and for a cross block one specific property decides
+			// whether the block renders at all: the engine's RGBA5551 alpha is a single bit and
+			// the transparent pass is an alpha TEST, not blending. A tall-grass tile whose
+			// "gaps" came out alpha=1 does not render as grass with gaps - it renders as a solid
+			// card, twice, at right angles. So the gaps are counted, by value, off the t3x.
+			{
+				const int png_top = ATLAS_H_PX - (ATLAS_SLOT_TALL_GRASS + 1) * TILE_PX;
+				int cutout = 0, opaque = 0;
+				for (int y = 0; y < TILE_PX; y++) {
+					for (int x = 0; x < ATLAS_W_PX; x++) {
+						((s_texel[png_top + y][x] & 1u) == 0u) ? cutout++ : opaque++;
+					}
+				}
+				// Both bounds matter. Zero cutout texels is the solid card above; all-cutout is
+				// an invisible block, which would pass a "has transparency" check and draw
+				// nothing. The real tile measures 152 cutout / 104 opaque - the numbers are not
+				// pinned, only the fact that the tile is genuinely a mix.
+				CHECK(cutout > 0,
+				      "the tall grass tile (slot %d) has NO alpha-0 texels: %d of %d are opaque. "
+				      "RGBA5551 alpha is one bit and the transparent pass is an alpha test, so a "
+				      "cross block with no cutout renders as two solid crossed cards",
+				      ATLAS_SLOT_TALL_GRASS, opaque, TILE_PX * ATLAS_W_PX);
+				CHECK(opaque > 0,
+				      "the tall grass tile (slot %d) is entirely alpha-0: %d of %d texels are "
+				      "cutout, so the block would be invisible rather than grass",
+				      ATLAS_SLOT_TALL_GRASS, cutout, TILE_PX * ATLAS_W_PX);
+			}
+
+			// Water is the opposite claim and needs saying separately, because "transparent" in
+			// the registry means "does not occlude, goes in the deferred pass" - it does not mean
+			// the texture has holes. With one bit of alpha there is no partial coverage: an alpha
+			// -0 texel in the water tile would be a hole you could see the seabed through, not a
+			// see-through sea. Every texel must be opaque.
+			{
+				const int png_top = ATLAS_H_PX - (ATLAS_SLOT_WATER + 1) * TILE_PX;
+				int cutout = 0, fx = -1, fy = -1;
+				for (int y = 0; y < TILE_PX; y++) {
+					for (int x = 0; x < ATLAS_W_PX; x++) {
+						if ((s_texel[png_top + y][x] & 1u) == 0u) {
+							if (cutout == 0) { fx = x; fy = y; }
+							cutout++;
+						}
+					}
+				}
+				CHECK(cutout == 0,
+				      "the water tile (slot %d) has %d alpha-0 texels, first at tile-local "
+				      "(%d,%d). The engine's alpha is one bit tested, not blended, so a cutout "
+				      "texel here is a hole through the sea rather than translucency",
+				      ATLAS_SLOT_WATER, cutout, fx, fy);
+			}
+
+			// And the two new tiles are not each other, nor a copy of a tile that was already
+			// there. The fingerprint loop would catch a duplicate only by accident - it compares
+			// each slot against its own pin, never against its neighbours - so a painter wired
+			// to the wrong function would pin cleanly and ship two identical tiles.
+			for (int a = 0; a < ATLAS_PAINTED_SLOTS; a++) {
+				for (int b = a + 1; b < ATLAS_PAINTED_SLOTS; b++) {
+					const int ta = ATLAS_H_PX - (a + 1) * TILE_PX;
+					const int tb = ATLAS_H_PX - (b + 1) * TILE_PX;
+					CHECK(slotFingerprint(ta) != slotFingerprint(tb),
+					      "slots %d and %d are texel-identical; two painted tiles must not be "
+					      "the same art under two names", a, b);
+				}
 			}
 
 			// Every slot the TILES list does not fill must be the marker, texel for texel. This
@@ -821,9 +904,9 @@ int main(void)
 			}
 
 			// And nothing anywhere on the sheet is still a solid block of background fill. The
-			// check above already covers slots 10..15 by value; this one covers the other ten
-			// too, and it is the one that would catch a future slot painted by a painter that
-			// silently returned nothing.
+			// check above already covers slots 12..15 by value; this one covers the twelve
+			// painted ones too, and it is the one that would catch a future slot painted by a
+			// painter that silently returned nothing.
 			for (int slot = 0; slot < ATLAS_TILE_SLOTS; slot++) {
 				const int png_top = ATLAS_H_PX - (slot + 1) * TILE_PX;
 				int       fill = 0;

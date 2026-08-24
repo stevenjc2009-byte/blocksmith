@@ -305,13 +305,57 @@ static uint16_t* s_shared_indices;
 // reading on record shows free. Minimising bytes subject to those margins is what picks the
 // split: at a fixed 294 slots the cost is 4,816,896 + 16384*M + 49152*L, so every slot moved
 // down a tier is a straight saving and the margins above are the only thing holding it up.
+//
+// ── v1.7.0: re-measured on the density generator, and the TOTAL had gone under ────────────
+//
+// Re-run with the real mesher on the real new worldgen — 4 seeds (1337, 4242, 90210, 5150) x
+// 81 radius-3 ring positions on an 11-column stride, 324 rings, each ring generated in its own
+// world with a one-column margin so no chunk meshes against unloaded-as-air. 90210 is in the
+// sample deliberately: it is the ocean-heavy seed, water does not occlude, and the seabed
+// under an ocean is still meshed, which is the likeliest single way this pool overruns.
+//
+//     all meshed chunks in one radius-3 ring   298   (was 242 — OVER the 294 the pool held)
+//     of those, over  512 faces                 87   (was 103)
+//     of those, over 1024 faces                  3   (was   8)
+//     largest single chunk                    1262   (was 1371; cap is still 2048)
+//     worst meshed chunks in one column          7   (was 5, against a constant of 6)
+//
+// The two directions cancel the wrong way round. Greedy merging made each chunk smaller — both
+// tail buckets FELL, and so did the largest single chunk — but the density field's caves made
+// more chunks non-empty, and the total is what the pool is sized by. 298 > 294, so the
+// released v1.6.0 pool is four slots short of a ring the player will actually walk into, and a
+// slot that cannot be supplied means acquireSlot returns NULL, s_refusals ticks, and the chunk
+// is never meshed: a hole in the terrain, not a slow frame.
+//
+// The total is fixed at the source rather than here — scene/render_dist.h now derives
+// RENDER_DIST_SLOTS_PER_COLUMN from COLUMN_CHUNKS, so MESH_SLOTS is 392 and covers a ring in
+// which every chunk of every column is meshed, for any terrain any future generator produces.
+// That makes TIER_MEASURED_WORST_ALL below a formality rather than the thing holding the roof
+// up, which is the point: it was a measured floor, and a measured floor is what just failed.
+//
+// The two tail buckets keep the OLDER, HIGHER numbers (103 and 8, not 87 and 3), for the same
+// reason the paragraph above keeps the radius-2 figure: a tail is a volume question, 324 rings
+// is a tenth of the 3,240 the old sample walked, and slack in M and L is nearly free here.
+// Deliberately NOT taken: recutting M from 120 to ~100 on the strength of the new 87. It would
+// save 327,680 bytes out of 25.83 MB free while trading away a documented margin, and the
+// standing rule on this project is that a margin is not spent for a saving nobody needs.
+//
+// Hence 256/120/16 out of MESH_SLOTS = 392:
+//
+//     L     = 16  vs   8 (2.0x)     — unchanged, and now 5.3x the new measurement
+//     M + L = 136 vs 103 (1.32x)    — unchanged, and now 1.56x the new measurement
+//     total = 392 vs 298 (1.32x)    — and structurally unbeatable, not a margin
+//
+// Total bytes 9,199,616 (8.77 MB), +1,605,632 on 7,593,984. Every added slot is S tier, the
+// cheapest at 16,384 bytes; the cost formula at a fixed 392 slots is 6,422,528 + 16384*M +
+// 49152*L, so the split arithmetic above is unchanged apart from its constant term.
 #define TIER_S_FACES  512
 #define TIER_M_FACES  1024
 #define TIER_L_FACES  MESH_SLOT_FACES   // 2048 — unchanged absolute worst case
 
-#define TIER_S_SLOTS  158
+#define TIER_S_SLOTS  256
 #define TIER_M_SLOTS  120
-#define TIER_L_SLOTS  (MESH_SLOTS - TIER_S_SLOTS - TIER_M_SLOTS)   // 16 at MESH_SLOTS=294
+#define TIER_L_SLOTS  (MESH_SLOTS - TIER_S_SLOTS - TIER_M_SLOTS)   // 16 at MESH_SLOTS=392
 
 _Static_assert(TIER_S_SLOTS + TIER_M_SLOTS + TIER_L_SLOTS == MESH_SLOTS,
                "tier slot counts must add up to the whole pool");
@@ -327,9 +371,15 @@ _Static_assert(TIER_L_SLOTS > 0, "tier sizes leave nothing for the largest tier"
 // The three numbers are the measured worst radius-3 ring from the host probe described above.
 // Raising RENDER_DIST_MAX again without re-measuring will not fail these — they are a floor on
 // a KNOWN ring, not a prediction about a wider one — so re-measure, then move them.
-#define TIER_MEASURED_WORST_ALL    242   // meshed chunks in one radius-3 ring
-#define TIER_MEASURED_WORST_512    103   // ...of those, over TIER_S_FACES
-#define TIER_MEASURED_WORST_1024     8   // ...of those, over TIER_M_FACES
+//
+// v1.7.0 read that warning the hard way: RENDER_DIST_MAX did not move, the WORLDGEN did, and a
+// floor on a known ring is equally blind to that. ALL is now the v1.7.0 density measurement
+// (298, up from 242); the two tail buckets keep the older higher figures on purpose, see the
+// long comment above. The total no longer depends on any of it — MESH_SLOTS is derived from
+// COLUMN_CHUNKS in scene/render_dist.h and structurally covers every possible ring.
+#define TIER_MEASURED_WORST_ALL    298   // meshed chunks in one radius-3 ring, density gen
+#define TIER_MEASURED_WORST_512    103   // ...of those, over TIER_S_FACES  (density says 87)
+#define TIER_MEASURED_WORST_1024     8   // ...of those, over TIER_M_FACES  (density says  3)
 
 _Static_assert(TIER_L_SLOTS >= TIER_MEASURED_WORST_1024,
                "acquireSlot spills upward only, so a chunk over TIER_M_FACES can be served by "
@@ -645,6 +695,18 @@ bool chunkRenderInit(void)
 {
 	// Fails if the pool ever outgrows DIRTYQ_MAX, at startup, rather than writing past
 	// the flag array the first time a chunk in a high slot is edited.
+	//
+	// "At startup" was too late, and v1.6.0 proved it: DIRTYQ_MAX was left at 150 when
+	// MESH_SLOTS went to 294, so this line returned false on the released build and main.c
+	// printed "shader/atlas/pool init FAILED" instead of starting the game. See the long
+	// comment on DIRTYQ_MAX in world/dirtyq.h. The runtime check below stays, but the
+	// mismatch it guards against is now caught by the compiler in the one translation unit
+	// that can see both constants — dirtyq.h cannot include chunk_render.h (it must stay
+	// free of <3ds.h>), so this is the only place the two can be compared at all.
+	_Static_assert(DIRTYQ_MAX >= MESH_SLOTS,
+	               "the remesh backlog needs one flag per mesh slot: DIRTYQ_MAX in "
+	               "world/dirtyq.h is a hand-maintained copy of MESH_SLOTS and has gone "
+	               "under it, which makes chunkRenderInit fail and the game refuse to boot");
 	if (!dirtyqInit(&s_dirty, MESH_SLOTS))
 		return false;
 
@@ -1594,7 +1656,7 @@ static void cullFrame(const C3D_Mtx* view)
 
 #if BS_SORT
 	// Insertion sort, nearest first. Insertion rather than anything cleverer because n is at
-	// most MESH_SLOTS (150) and in practice a bit over a hundred after the frustum has run,
+	// most MESH_SLOTS (392) and in practice a bit over a hundred after the frustum has run,
 	// and because the order barely changes between frames — a nearly-sorted input is the case
 	// insertion sort is linear on, which is exactly what walking through a world produces.
 	for (int i = 1; i < n; i++) {

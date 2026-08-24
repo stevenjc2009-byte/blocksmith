@@ -29,6 +29,45 @@ enum {
 	BLOCK_COUNT
 };
 
+// Core blocks that are NOT items — roadmap tasks 17 and 19.
+//
+// These are ordinary compiled-in core registry rows (the core id space is
+// REG_ID_CORE_LO..REG_ID_CORE_HI, 0x01..0x7F — see world/registry.h), appended after
+// BLOCK_PLANKS exactly as every id before them was, and frozen for the same reason: an
+// id is written into every saved chunk and every block-edit packet. What is different
+// is that they sit OUTSIDE the enum above, and BLOCK_COUNT does not move.
+//
+// That is deliberate, and it is not a way of dodging a static assert. BLOCK_COUNT has
+// exactly one live use left in this client — inventoryCanHold() in world/inventory.h,
+// the ceiling on what a slot may carry — and one on the server, BS_BLOCK_COUNT in
+// deps/blocksmith-server/game/validate.h, which bounds the ITEM ids in
+// BS_INV_OP_PICKUP/CONSUME and in the armour slots precisely because those index client
+// tables sized BLOCK_COUNT. Every table indexed by a WORLD block id is already sized
+// REGISTRY_MAX or 256 — world/mesher.c's s_rect, world/visgraph.c's openTable,
+// world/light.c's emission table — because dynamic ids 0x80..0xFD have been arriving
+// over the wire since v1.6.0 Phase A. So BLOCK_COUNT is the item-id ceiling and nothing
+// else, and these two ids are strictly less exotic than a dyn id the client already
+// handles.
+//
+// Neither of these is an item. Water must not be minable or placeable until the
+// survival rung says otherwise, and tall grass has no drop yet. Widening BLOCK_COUNT to
+// 10 would make both legal item ids on THIS client while the server still refused them
+// at 8 — a client/server disagreement invented for no gain — and would need
+// deps/blocksmith-server's BS_BLOCK_COUNT to move in step, in a tree this client does
+// not own. Leaving BLOCK_COUNT alone gets the wanted behaviour for free:
+// inventoryCanHold() answers false, so scene/interact.c refuses the break rather than
+// deleting the block, and neither id can reach the hotbar.
+//
+// When the survival rung gives water a bucket and tall grass a seed drop, the move is
+// to widen inventoryCanHold() past BLOCK_COUNT on both sides — the change
+// scene/interact.c's own ⚠ comment already flags — not to slide these two into the enum
+// above, which would renumber nothing but would quietly re-point the server's item
+// ceiling at them.
+enum {
+	BLOCK_WATER      = BLOCK_COUNT,      // 8
+	BLOCK_TALL_GRASS = BLOCK_COUNT + 1,  // 9
+};
+
 // Mirrors the TILE_* enum in gfx/atlas.h. Duplicated rather than included, because
 // that header pulls in <3ds.h> and would break the host build.
 // source/world/block_tiles_check.c static-asserts that the two agree, so the
@@ -44,6 +83,8 @@ enum {
 	BTEX_WOOD_TOP,
 	BTEX_LEAVES,
 	BTEX_PLANKS,
+	BTEX_WATER,
+	BTEX_TALL_GRASS,
 };
 
 // Face order. This is a contract, not a convenience: the registry's tex[] below is

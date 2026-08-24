@@ -7,6 +7,17 @@
 // column boundary. So generation moves off the main thread and the main thread only ever
 // does the cheap half: copying a finished column into the world.
 //
+// v1.7.0: the figure above is the LEGACY generator's, and it still holds — re-measured at
+// 0.757-0.804 ms/column over three seeds at radius 6, twice. The density-field generator
+// new worlds now use (world/worldgen_density.c, including the sea-level fill and the tall
+// grass scatter) costs 1.055-1.310 ms/column on the same runs, a ratio of 1.37-1.64x.
+//
+// That is not a budget being missed. The number is here to justify moving generation off the
+// main thread at all, and the invariant below is what makes that safe: a slower worker fills
+// the streaming ring more slowly, it does not drop a frame. The consequence to watch for on
+// hardware is walking fast at render distance 3 out-running generation and showing
+// ungenerated ground at the ring edge.
+//
 // ── The one invariant that makes this safe ────────────────────────────────────────────
 //
 // **The live World is written by the main thread and by nothing else.** The worker

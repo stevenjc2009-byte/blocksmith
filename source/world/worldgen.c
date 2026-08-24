@@ -1,7 +1,15 @@
 #include "world/worldgen.h"
 
+#include "world/genversion.h"
 #include "world/noise.h"
 #include "world/rng.h"
+#include "world/worldgen_density.h"
+
+// v1.7.0. Everything below that is not explicitly dispatched is the LEGACY generator, and it
+// is deliberately unchanged: a world stamped GEN_VERSION_LEGACY — which is every world that
+// existed on 2026-08-24 — must produce the terrain it produced before this rung, byte for
+// byte. The suite pins that with a hash of generated columns taken from the tree BEFORE the
+// density generator was written. See world/genversion.h for the whole rule.
 
 // Step 9.2a/9.1b. A flat staging buffer for one chunk's worth of cells, built here and then
 // committed in one shot via worldSetChunkAll — never CHUNK_BLOCKS individual worldSet calls,
@@ -49,15 +57,34 @@ static inline fx caveCoordY(int32_t block)
 // sharing the terrain seed would put every desert in the same place as a valley.
 #define SALT_BIOME  0x42494F4DU   // 'BIOM'
 #define SALT_TREE   0x54524545U   // 'TREE'
+#define SALT_GRASS  0x504C4E54U   // 'PLNT'
 #define SALT_CAVE   0x43415645U   // 'CAVE'
 #define SALT_CAVE2  0x43415632U   // 'CAV2'
 
-void worldgenInit(WorldGen* g, uint32_t seed)
+bool worldgenInit(WorldGen* g, uint32_t seed, uint32_t version)
 {
+	// Refused rather than coerced. A WorldGen carrying a version this build cannot generate
+	// would produce *something* at every call site below, and that something would be the
+	// wrong world written into a save that says otherwise — which is the exact failure
+	// world/genversion.h exists to make impossible. Version 0 is not a generator, so a
+	// refused WorldGen cannot be used by accident either.
+	if (!genVersionKnown(version)) {
+		g->seed    = 0;
+		g->version = 0;
+		return false;
+	}
+
 	// The seed is mixed once here rather than used raw, so that the obvious human seeds —
 	// 0, 1, 2 — give unrelated worlds instead of three near-identical ones. rngHash2's
 	// per-axis mixing hides most of that, but not the first octave's low bits.
-	g->seed = rngMix(seed ^ 0x424C4B53U);   // 'BLKS'
+	//
+	// **The mix does not include the version**, deliberately: the same seed on two generators
+	// must be recognisably the same world's noise fields, differently shaped, rather than two
+	// unrelated worlds. It is also what makes the legacy path byte-identical — folding the
+	// version in here would have changed every existing world.
+	g->seed    = rngMix(seed ^ 0x424C4B53U);   // 'BLKS'
+	g->version = version;
+	return true;
 }
 
 fx worldgenBiome(const WorldGen* g, int32_t x, int32_t z)
@@ -93,7 +120,9 @@ bool worldgenIsCave(const WorldGen* g, int32_t x, int y, int32_t z)
 	return inCaveBand(noiseFbm3(rngMix(g->seed ^ SALT_CAVE2), cx, cy, cz, GEN_CAVE_OCTAVES));
 }
 
-int worldgenHeight(const WorldGen* g, int32_t x, int32_t z)
+// The legacy heightmap, moved here verbatim from worldgenHeight when the dispatch was added.
+// Not one operation of it changed; every constant it reads is still the one it read.
+static int legacyHeight(const WorldGen* g, int32_t x, int32_t z)
 {
 	const fx n = noiseFbm2(g->seed, genCoord(x), genCoord(z), GEN_OCTAVES);
 	const fx b = worldgenBiome(g, x, z);
@@ -118,6 +147,12 @@ int worldgenHeight(const WorldGen* g, int32_t x, int32_t z)
 	if (h < 1) return 1;
 	if (h > WORLD_HEIGHT - 1) return WORLD_HEIGHT - 1;
 	return h;
+}
+
+int worldgenHeight(const WorldGen* g, int32_t x, int32_t z)
+{
+	return (g->version == GEN_VERSION_DENSITY) ? wgdHeight(g, x, z)
+	                                           : legacyHeight(g, x, z);
 }
 
 // The block at a given depth below the surface. Kept separate from the fill loop so the
@@ -166,6 +201,19 @@ static Tree treeInCell(const WorldGen* g, int32_t tcx, int32_t tcz)
 		return t;
 
 	t.ground = worldgenHeight(g, t.x, t.z);
+
+	// v1.7.0. Nothing grows at or below the waterline. The legacy generator's whole surface
+	// band sits above GEN_SEA_LEVEL by construction (GEN_SURFACE_MIN 40 + half the range puts
+	// its lowest ground at 40, but its *measured* floor across seeds is 52 and it has no
+	// concept of water at all), so this is gated on the generator rather than applied to both:
+	// an unconditional test could not change a legacy world today, but it would be a rule the
+	// legacy path had never been measured against, and the point of the versioning work is
+	// that nothing new reaches an old world.
+	//
+	// Task 17 fills the oceans; this is what stops it filling them around tree trunks.
+	if (g->version == GEN_VERSION_DENSITY && t.ground <= GEN_SEA_LEVEL)
+		return t;
+
 	t.trunk  = GEN_TREE_MIN_H +
 	           (int)((h >> 18) % (uint32_t)(GEN_TREE_MAX_H - GEN_TREE_MIN_H + 1));
 
@@ -245,7 +293,88 @@ bool worldgenDecorate(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 	return ok;
 }
 
+// v1.7.0 task 19. Tall grass on the exposed surface.
+//
+// Gated on the generator by its only caller, exactly as the tree pass's waterline rule is: a
+// legacy world has no water block, no plant, and no measurement behind either, and the whole
+// point of world/genversion.h is that nothing new reaches an old world.
+bool worldgenScatter(const WorldGen* g, World* w, int32_t cx, int32_t cz)
+{
+	// The surface heights wgdColumn already computed for this column. Refused rather than
+	// recomputed if they belong to somewhere else — see wgdColumnTops() for why asking
+	// worldgenHeight() 256 times instead is not an option.
+	const int16_t* tops = wgdColumnTops(cx, cz);
+	if (!tops)
+		return false;
+
+	const uint32_t salt = rngMix(g->seed ^ SALT_GRASS);
+
+	bool ok = true;
+	for (int lz = 0; lz < CHUNK_DIM; lz++) {
+		for (int lx = 0; lx < CHUNK_DIM; lx++) {
+			// tops[] is worldgenHeight's convention, so this y is the first cell above the
+			// ground — where the plant would stand — and y - 1 is the surface block.
+			const int y = tops[lz * CHUNK_DIM + lx];
+
+			// Above the waterline only. Nothing grows in the sea, and the surface pass has
+			// already made everything up to GEN_SEA_LEVEL + GEN_D_BEACH_ABOVE sand anyway —
+			// this is the rule stated rather than left to be an accident of the beach band.
+			if (y <= GEN_SEA_LEVEL)
+				continue;
+			// No room under the ceiling. Cannot fire at the current biome table, whose
+			// tallest nominal surface is 120 against a 128-block world, but the table is a
+			// tuning constant and this writes without re-checking.
+			if (y >= WORLD_HEIGHT)
+				continue;
+
+			const int32_t x = cx * CHUNK_DIM + lx, z = cz * CHUNK_DIM + lz;
+
+			// The draw first: it rejects ~90 % of cells for one hash, which is cheaper than
+			// the two world lookups below it and makes them the exception rather than the
+			// rule.
+			if ((rngHash2(salt, x, z) & 0xFFu) >= (uint32_t)GEN_GRASS_CHANCE)
+				continue;
+
+			// Grass only — not sand, not the bare stone of a cliff face, not a dirt scar.
+			if (worldGet(w, x, y - 1, z) != BLOCK_GRASS)
+				continue;
+
+			// **The one rule that makes this pass safe.** Air, and nothing else, is written
+			// into. A trunk, a leaf or a block of water occupying this cell is not air, so
+			// the plant is silently not placed — see worldgen.h for why that is the right
+			// direction for the loss to fall in.
+			if (worldGet(w, x, y, z) != BLOCK_AIR)
+				continue;
+
+			ok &= worldSet(w, x, y, z, BLOCK_TALL_GRASS);
+		}
+	}
+
+	return ok;
+}
+
+static bool legacyColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz);
+
 bool worldgenColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz)
+{
+	// v1.7.0. The two generators share the decoration pass and nothing else — the tree rules
+	// are about where a tree may stand, not about how the ground got there, so duplicating
+	// them per generator would be two copies of one answer.
+	if (g->version == GEN_VERSION_DENSITY) {
+		if (!wgdColumn(g, w, cx, cz))
+			return false;
+		// Both are run even if the first fails, and both results are reported: a refused
+		// allocation in the tree pass is a real condition the caller has to see, and
+		// short-circuiting past the scatter would make a half-decorated column look like a
+		// fully decorated one on the next visit.
+		const bool decorated = worldgenDecorate(g, w, cx, cz);
+		return worldgenScatter(g, w, cx, cz) && decorated;
+	}
+
+	return legacyColumn(g, w, cx, cz);
+}
+
+static bool legacyColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 {
 	// 256 heights, computed once for the whole 8-chunk stack. Doing this per chunk would
 	// evaluate the same fBm up to eight times for the same answer, and the fBm is the
