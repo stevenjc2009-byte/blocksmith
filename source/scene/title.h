@@ -28,6 +28,7 @@
 #include <3ds.h>
 
 #include "app/options.h"
+#include "app/whatsnew.h"
 #include "scene/worldlist.h"
 
 // Where the options file lives. Public so main.c can load it once at boot with the same
@@ -90,6 +91,14 @@ typedef struct {
 	// clear it once shown.
 	char status[48];
 	int  status_ttl;
+
+	// Update screen: where the release notes on the TOP screen are scrolled to, and the
+	// held-to-repeat state for each D-pad direction that scrolls them (v1.6.0 task 14b).
+	// Reset on entering the screen; clamped every frame by titleDrawTop, because the notes
+	// can arrive and change length while the player is already looking at the screen.
+	int            notes_scroll;
+	WhatsNewRepeat notes_rep_up;
+	WhatsNewRepeat notes_rep_down;
 } TitleState;
 
 // Zeroes `ts` and puts it on the main screen. Call once, before the first titleUpdateDraw.
@@ -109,8 +118,15 @@ void titleInit(TitleState* ts);
 //              screen existing.
 //   touch_x/y  bottom-screen pixels, the same 320x240 space spriteBegin(320,240) draws in.
 //              Meaningful only when touch_down is true.
+//   keys_held  hidKeysHeld() this frame. Used by exactly one thing: scrolling the update
+//              screen's release notes on the top screen, which repeats while the D-pad is
+//              held (v1.6.0 task 14b). It is a separate word from keys_down on purpose —
+//              app/whatsnew.h's comment on whatsnewRepeatStep records why, and this project
+//              has shipped the two-layers-one-keys_down bug twice. Nothing else in this file
+//              reads it, and no bit is read out of both words on the same screen.
 typedef struct {
 	uint32_t keys_down;
+	uint32_t keys_held;
 	bool     touch_down;
 	int      touch_x, touch_y;
 } TitleInput;
@@ -124,3 +140,16 @@ typedef struct {
 // main screen, so a battery pull mid-menu loses at most the field the player was touching
 // when it happened, never the whole session's changes.
 TitleResult titleUpdateDraw(TitleState* ts, Options* opts, const TitleInput* in);
+
+// The menu's TOP-screen half, drawn onto whatever 400x240 target the caller bound — in
+// practice screenTop(). Reads no input at all; it paints from `ts` and clamps `ts`'s scroll
+// position against the content it just laid out, which is why it takes a mutable pointer.
+//
+// Today it draws exactly one thing: the release notes for the version the update screen is
+// offering (v1.6.0 task 14b). On every other screen it paints the background and nothing
+// else, so the top screen is never left holding uninitialised VRAM.
+//
+// Must be called AFTER titleUpdateDraw in the same frame, with the top target bound. That
+// order is what makes a scroll press visible on the frame it happens rather than the next
+// one: titleUpdateDraw is where the D-pad is read.
+void titleDrawTop(TitleState* ts);

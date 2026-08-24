@@ -23,6 +23,7 @@
 #include <3ds.h>
 #include <stdbool.h>
 
+#include "app/whatsnew.h"
 #include "version.h"
 
 // Where things stand. The front end draws from this and nothing else.
@@ -81,6 +82,17 @@ int updaterProgress(void);
 // The newest release tag GitHub reported, valid from UPDATE_AVAILABLE onward. Empty string
 // before that.
 const char* updaterLatestVersion(void);
+
+// The release notes for the version updaterLatestVersion() names — what the player is about
+// to download — for the top screen to draw before they commit to it (v1.6.0 task 14b).
+//
+// Never NULL. Valid from UPDATE_AVAILABLE onward, under the same ordering rule as everything
+// else here: read updaterState() first. Before that, and whenever a release carries no notes
+// asset or the fetch failed in any way, whatsnewAny() on the result is false and the caller
+// should draw whatsnewPlaceholder() — which whatsnewBuildLayout() already does by itself.
+// There is no failure this reports and no failure it can cause: a release with no notes still
+// installs exactly as it did before this existed.
+const WhatsNew* updaterReleaseNotes(void);
 
 // Points the chainloader back at this title, which after a successful install is the new
 // build. Only meaningful on UPDATE_DONE.

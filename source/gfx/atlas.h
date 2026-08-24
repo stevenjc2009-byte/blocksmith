@@ -1,13 +1,14 @@
 // The block texture atlas.
 //
-// One 64x64 RGBA5551 sheet holding 16x16 tiles in 20x20 cells: 16 pixels of art
-// with 2 pixels of edge-extended padding on every side. The padding is what lets
-// GPU_NEAREST sample tile edges at any distance without pulling in a neighbour,
-// and it is why the grid is 3x3 rather than 4x4.
+// One 16x256 RGBA5551 strip: sixteen 16x16 tile slots stacked vertically with no
+// padding between them, fifteen of them addressable. It is one tile wide so that
+// GPU_REPEAT in U has a period of exactly one tile, which is what lets greedy
+// meshing merge co-planar faces into a single quad and still have the tile repeat
+// across it. world/atlas_uv.h holds the full reasoning and the arithmetic.
 //
-// Step 9.3c trimmed the sheet from 256x256 (12x12 grid, 144 cells) down to the
-// smallest power-of-two sheet that still holds the 9 tiles actually in use
-// (3x3 = 9 cells, zero spare). Step 9.3a moved the format from RGBA8888 to
+// It was a 128x128 sheet of 20x20 cells (16px of art inside 2px of edge-extended
+// padding) up to v1.5.1, 64x64 before TILE_PLANKS needed a tenth cell, and
+// 256x256 before step 9.3. Step 9.3a moved the format from RGBA8888 to
 // RGBA5551: the atlas's only non-opaque tile (leaves) has alpha that is 0 or
 // 255 and nothing between, which RGBA5551's 1-bit alpha stores losslessly —
 // see tools/make_atlas.py for the measurement.
@@ -37,6 +38,18 @@ enum {
 	TILE_WOOD_TOP,   // beside sand, because inserting would re-texture everything
 	TILE_LEAVES,     // after the insertion point
 	TILE_PLANKS,     // the first crafted block; the tile that forced the sheet to 128
+	// Ten of ATLAS_TILE_COUNT (15) addressable slots used. Slot 15 exists on the sheet but
+	// can never be addressed — its top edge would be v = 256, which does not fit in
+	// MeshVertex's uint8_t v. See world/atlas_uv.h.
+	//
+	// The five spares are NOT blank. Since v1.6.0 F7 tools/make_atlas.py paints every slot
+	// this list does not name with the magenta/black missing-texture marker, and
+	// ATLAS_TILE_MISSING (slot 14, world/atlas_uv.h) is reserved as one permanently — it is
+	// where atlasRect() clamps an out-of-range tile id. Before that, tex 10..14 drew the
+	// sheet's near-black background fill and an out-of-range tex drew grass, so a server
+	// shipping a wrong tex byte looked like a rendering bug here. Appending a real tile
+	// below simply overwrites the next spare's marker; slot 14 is the one that cannot be
+	// taken, and tools/make_atlas.py refuses rather than letting it be.
 };
 
 // Uploads the atlas to the GPU and binds it to texture unit 0. Returns false if

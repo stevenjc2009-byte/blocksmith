@@ -28,30 +28,63 @@
 #include "world/world.h"
 
 // Bounds of the setting, in columns. MIN 1 is what steps 5 and 6 shipped: 3x3 columns, a
-// 48x48 block area. MAX 2 is 5x5 columns, 80x80 blocks.
+// 48x48 block area. MAX 3 is 7x7 columns, 112x112 blocks.
 //
-// MAX is 2 because of the mesh pool, which is the binding constraint and not a soft one: a
-// three-tier vertex slab pool (512/1024/2048 face slots, 70/60/20 slots each — see
-// scene/chunk_render.c's TIER_*_FACES/TIER_*_SLOTS) claimed once out of the linear heap at
-// boot for the largest ring the setting allows, and the heap cannot be defragmented. A
-// radius of 3 would be 49 columns, so 294 slots, which at this pool's measured average of
-// ~28.8 KB a slot is roughly 8.7 MB — about twice what the setting costs today, out of a
-// linear heap that also has to hold the atlas, the sprite batch and both framebuffers.
+// v1.6.0 task 12 raised MAX from 2 to 3. The old comment here said MAX was 2 "because of the
+// mesh pool", and that reasoning was wrong on both halves:
+//
+//   * the memory. It compared the pool against the 12 MB world/budget.h heap. The pool is
+//     linearAlloc, a different heap entirely, and the only hardware reading on record shows
+//     25.83 MB of linear free. The re-cut pool for radius 3 is 7,593,984 bytes (7.24 MB)
+//     against today's 4,448,256 (4.24 MB) — see scene/chunk_render.c's TIER_*_SLOTS, which
+//     is where the measurement backing that cut is written down.
+//   * the arithmetic. "~28.8 KB a slot" was the average slot size of the OLD uniform pool;
+//     the tiered pool's average is what the tier split makes it, which is the thing being
+//     chosen, not a constant to multiply by.
+//
+// What actually stops this at 3 is the fog, which is this file's own argument (see the header
+// comment above) finally measured. RENDER_DIST_NEAR_MAX pins the near plane at 0.18, the near
+// plane pins the first LUT knot, and the knot pins how far the fade can be shaped — so the
+// visible distance saturates. Evaluating renderDistFor() with only this clamp moved, half_vis
+// (the distance at which the world is half faded, i.e. what the player can actually see) goes:
+//
+//     radius 2 -> 7.80 blocks
+//     radius 3 -> 9.49 blocks   +21.7 %, and the near plane reaches its cap here
+//     radius 4 -> 9.95 blocks   + 4.8 % for 64 % more columns
+//     radius 5 -> 10.46 blocks
+//
+// So 3 is where the ring stops buying sight and starts buying geometry the fog hides. Radius 4
+// would cost 6.6 MB more pool and 64 % more chunks for under 5 % more visible world.
+//
+// NOT PROVEN, and it cannot be proven here: the GPU cost. Radius 3 submits roughly 1.9x the
+// triangles of radius 2 before culling, and this machine has no GPU to measure on — Azahar's
+// C3D_GetDrawingTime returns a constant 0.249 ms, so the emulator does not model it either.
+// Whether an Old 3DS holds 60 fps at radius 3 is a hardware question. That is exactly why the
+// DEFAULTS below did not move with this ceiling.
 #define RENDER_DIST_MIN  1
-#define RENDER_DIST_MAX  2
+#define RENDER_DIST_MAX  3
 
 // Chunk mesh slots to claim for a given radius. Columns in the ring times the chunks in a
 // column that hold blocks, which is measured rather than assumed: the shipped world meshes
 // 40 chunks across 9 columns, so 4.44 per column, and caves are already counted in that
 // number because cave walls are interior surface that has to be meshed. 6 per column is the
 // margin over it, and a column can only ever have COLUMN_CHUNKS of them anyway.
+//
+// v1.6.0 task 12 re-measured this against the real mesher over 9,000 columns (8 seeds x 5
+// areas far apart in the world, 37,682 chunk meshes): the mean is 4.187 meshed chunks per
+// column and NO column in the whole sample meshed more than 5. So 6 is still margin over the
+// measurement and not a number that has quietly gone tight — it is what makes the widest ring
+// 294 slots against a worst observed simultaneous occupancy of 242.
 #define RENDER_DIST_SLOTS_PER_COLUMN  6
 
 // Slots the widest allowed ring needs. This is what MESH_SLOTS is, and therefore what the
-// tiered pool costs at boot on every model: 150 slots split 70/60/20 across the three tiers,
-// 70*512 + 60*1024 + 20*2048 face slots at 4 vertices of 8 bytes each, plus the one shared
-// index buffer step 9.2b introduced — 4,448,256 bytes, and the console reports the pool as
-// 4.24 MB. It was 9.40 MB when every slot was a uniform 2048-face slab, before step 9.2c.
+// tiered pool costs at boot on every model. At RENDER_DIST_MAX 3 that is 49 columns, so 294
+// slots, split 158/120/16 across the three tiers (see scene/chunk_render.c's TIER_*_SLOTS for
+// the measurement behind that split): 158*512 + 120*1024 + 16*2048 face slots at 4 vertices of
+// 8 bytes each, plus the one shared index buffer step 9.2b introduced — 7,593,984 bytes, 7.24 MB.
+//
+// It was 4,448,256 bytes (4.24 MB) at RENDER_DIST_MAX 2 with 150 slots split 70/60/20, and
+// 9.40 MB when every slot was a uniform 2048-face slab, before step 9.2c.
 #define RENDER_DIST_MAX_COLUMNS  ((2 * RENDER_DIST_MAX + 1) * (2 * RENDER_DIST_MAX + 1))
 #define RENDER_DIST_MAX_SLOTS    (RENDER_DIST_MAX_COLUMNS * RENDER_DIST_SLOTS_PER_COLUMN)
 
@@ -101,6 +134,29 @@ float renderDistLutZ(float index01, float near_plane, float far_plane);
 // first knot there are no samples at all, so this is the function that decides whether the
 // load boundary is hidden, and the exponential is only an input to it.
 float renderDistVisibility(const RenderDist* rd, float blocks);
+
+// The default a New 3DS boots at, and deliberately NOT RENDER_DIST_MAX.
+//
+// This used to be spelled `RENDER_DIST_MAX` inside renderDistDefault(), which meant raising
+// the ceiling silently raised the default with it. v1.6.0 task 12 raised the ceiling to 3 and
+// left this at 2 on purpose. The reasoning, because it is a behaviour choice and not an
+// oversight:
+//
+//   * a default is what ships to everyone unattended; a ceiling is what a player opts into
+//     and can back out of with one shoulder press. They do not carry the same risk and should
+//     not be the same constant.
+//   * the binding cost of the wider ring is GPU time, and GPU time cannot be measured on this
+//     machine at all (see the note on RENDER_DIST_MAX above). Radius 3 has never run on any
+//     hardware. This file's own rule for a default is that it is the value with a measurement
+//     behind it — "the radius that has been running at 59.83 fps all along" is how the Old 3DS
+//     default was justified, and radius 2 is the only New 3DS value with any standing at all.
+//   * raising a ceiling costs an unattended player nothing. Raising a default makes every New
+//     3DS first boot the experiment.
+//
+// So the wider ring is available on both models and automatic on neither. Move this to 3 when
+// there is a frame-time reading from a real New 3DS at radius 3 and not before — it is one
+// constant and one test line (world_test.c's testRenderDist).
+#define RENDER_DIST_DEFAULT_NEW  2
 
 // The default for a console. `new_3ds` comes from APT_CheckNew3DS in main.c.
 //

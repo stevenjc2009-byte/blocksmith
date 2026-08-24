@@ -92,6 +92,17 @@ static void refreshView(BlockId id)
 	v->solid       = (d->flags & REG_FLAG_SOLID) != 0;
 	v->transparent = (d->flags & REG_FLAG_TRANSPARENT) != 0;
 	v->liquid      = (d->flags & REG_FLAG_LIQUID) != 0;
+
+	// Three bits can name eight shapes and only two exist, so a def from a newer or a
+	// tampered peer can carry a value this build has no geometry for. It reads back as
+	// a full cube rather than as an out-of-range shape id: every consumer of
+	// BlockInfo.shape switches on it, and a hole in that switch is a block that draws
+	// nothing at all. Refusing the record instead would be the stricter answer, but it
+	// belongs in registryDefUnpack() with the rest of the wire validation, and nothing
+	// on the wire can produce a non-zero value yet.
+	v->shape = regShapeOf(d->flags);
+	if (v->shape >= BLOCK_SHAPE_COUNT) v->shape = BLOCK_SHAPE_FULL_CUBE;
+
 	for (int f = 0; f < BLOCK_FACES; f++)
 		v->tex[f] = d->tex[f];
 }

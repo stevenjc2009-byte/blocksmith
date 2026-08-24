@@ -1,0 +1,27 @@
+# Release notes shown on the 3DS top screen before the update downloads.
+# Attach this to the v1.6.0 GitHub release alongside blocksmith1.6.0.cia.
+# Checked with: sh tools/make_whatsnew.sh 1.6.0
+#
+# v1.6.0 ONLY. The lid-close save, the battery meter and the removed map screen
+# all shipped in v1.5.1 and were listed there, so they are not repeated here.
+# Player-facing prose only - it wraps at 61 characters on a 400px screen.
+# The developer-facing story lives in CHANGELOG.md.
+
+[features]
+Blocks that a server invents now work online. You can see them and build with them.
+View distance goes one step further in Options. Try it and see if it still runs smoothly.
+The world is drawn as fewer, larger pieces now, which is what makes room for that distance.
+Checking for an update shows you what is in it first, on this screen, before you download.
+
+[fixes]
+Every block texture was rebuilt. Blocks should look like what they are, with no seams.
+A missing texture now looks obviously missing instead of quietly drawing grass.
+Chunks that failed to load left permanent holes in the world. They get queued again now.
+Joining a server waits for its block list, so its blocks are never silently ignored.
+Playing alone, backing out to the title, then joining a server used to break that server's
+blocks until you rebooted the console.
+Backing out to the title and loading a different world used to carry the first world's
+block definitions across.
+Mining a block the server invented used to delete it for everyone. It cannot be carried
+yet, so for now it simply will not break.
+Pressing B while a server's block list is loading no longer drops you into the world.

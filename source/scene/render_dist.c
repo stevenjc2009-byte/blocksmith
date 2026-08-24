@@ -135,5 +135,7 @@ RenderDist renderDistFor(int radius)
 
 int renderDistDefault(bool new_3ds)
 {
-	return new_3ds ? RENDER_DIST_MAX : RENDER_DIST_MIN;
+	// RENDER_DIST_DEFAULT_NEW, not RENDER_DIST_MAX. See that macro for why the two were
+	// separated: written as MAX, this line made every ceiling raise a silent default raise.
+	return new_3ds ? RENDER_DIST_DEFAULT_NEW : RENDER_DIST_MIN;
 }

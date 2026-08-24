@@ -61,12 +61,32 @@ enum {
 	BLOCK_FACES,
 };
 
+// Block shape (v1.6.0 task 13). What geometry a block turns into, as opposed to how
+// it behaves — the two are deliberately separate axes:
+//
+//   shape  says what the mesher draws and what the raycast is aiming at.
+//   solid  says whether it fills its cell for collision, AO and occlusion.
+//
+// A water block is FULL_CUBE and not solid; a plant is CROSS and not solid; every
+// block that exists today is FULL_CUBE and solid, which is why nothing about the
+// current world changes.
+//
+// Values are frozen: they are packed into BlockDef.flags (see registry.h) and so
+// travel on the wire and into registry.bin. Append, never insert. Three bits are
+// reserved there, so slabs and stairs have room without another format change.
+enum {
+	BLOCK_SHAPE_FULL_CUBE = 0,  // the six axis-aligned faces of a unit cube
+	BLOCK_SHAPE_CROSS     = 1,  // two quads on the cell's diagonals, double-sided
+	BLOCK_SHAPE_COUNT,
+};
+
 typedef struct {
 	const char* name;
 	uint8_t     tex[BLOCK_FACES];
 	bool        solid;         // fills its cell: hides the touching neighbour face
 	bool        transparent;   // drawn, but does not hide what is behind it
 	bool        liquid;
+	uint8_t     shape;         // BLOCK_SHAPE_*
 } BlockInfo;
 
 // Never returns NULL — an unknown id reads back as air, because a bad id should
@@ -75,6 +95,30 @@ const BlockInfo* blockInfo(BlockId id);
 
 static inline bool blockIsSolid(BlockId id) { return blockInfo(id)->solid; }
 static inline bool blockIsAir(BlockId id)   { return id == BLOCK_AIR; }
+
+// Whether this block occupies its whole cell geometrically. This is the question the
+// mesher's occlusion and AO tables want, and it is NOT `solid`: a non-cube shape can
+// never hide the face behind it however solid it is, and a cell it only crosses
+// diagonally is not a crevice for AO purposes.
+static inline bool blockIsFullCube(BlockId id)
+{
+	return blockInfo(id)->shape == BLOCK_SHAPE_FULL_CUBE;
+}
+
+// Whether the mesher emits geometry for this block at all.
+//
+// Until v1.6.0 task 13 this question did not exist: `solid` answered it, because every
+// block that was not air was solid. It has to be its own question now because the two
+// shapes this task exists for break that coincidence in opposite directions — a plant
+// draws without colliding, and so does water. Air never draws; neither does an id with
+// no registry row, which is what keeps a corrupt or not-yet-defined id a hole rather
+// than a cell textured with air's tile.
+bool blockIsDrawn(BlockId id);
+
+// Whether a raycast stops here — i.e. whether the player can aim at it, break it, or
+// place against it. Anything drawn and not a liquid: a plant must be breakable even
+// though you walk straight through it, and you must not be able to mine a lake.
+bool blockIsTargetable(BlockId id);
 
 // Atlas tile for one face. Out-of-range faces return the block's first tile.
 uint8_t blockFaceTex(BlockId id, int face);

@@ -147,7 +147,16 @@ PROTO_REPO	:=	https://github.com/stevenjc2009-byte/blocksmith-server.git
 # this client's PLAYER_REPORT is capability-gated on having heard PLAYER_STATE (see
 # net/networld.h), so an old server simply never hears it — but the pose-restore
 # feature needs a server that sends PLAYER_STATE at JOIN.
-PROTO_COMMIT	:=	25ae9674af7ac8f7786dc5c4a0ac53969728982b
+#
+# Bumped again to 05c14fd6 (server v1.6.0). bs_proto.h itself is byte-identical to
+# 25ae9674's — `git diff 25ae9674 05c14fd6 -- proto/` is empty — so this is not a wire
+# change and a clone pinned at either commit compiles the same. It moves so the pin
+# names a RELEASED server rather than an unreleased mid-branch commit. v1.6.0 is the
+# first server that accepts the registry's dynamic block ids (0x80..0xFD) instead of
+# silently dropping every edit placing one, so against an older server a dynamic block
+# still cannot be placed — a server-side ceiling, not a protocol difference, which is
+# why no capability gate can paper over it.
+PROTO_COMMIT	:=	05c14fd6c34bafac280288dfd62ceb3e97acaa6b
 PROTO		:=	deps/blocksmith-server
 
 .PHONY: deps

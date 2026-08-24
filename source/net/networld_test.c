@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "app/session.h"
 #include "net/blockdiff.h"
 #include "net/bsnet_sock.h"
 #include "net/bsnet_transport.h"
@@ -1826,6 +1827,639 @@ static void test_registry_defs_malformed_dropped_whole(void)
           "one inconsistent record refuses the WHOLE batch, not just itself");
 }
 
+/* ------------------------------------------------- registry wiring (v1.6.0 task 8) ---
+ *
+ * The four scenarios below are the wiring the Phase A audit found inert: a FETCH that was
+ * never retried, a synced flag nothing read, and a table nothing reset. They link the REAL
+ * net/networld.c and the REAL world/registry.c — the only fakes in this binary are the
+ * transport and the clock, both link-time doubles for code that cannot exist on a host at
+ * all (see this file's header). Nothing here re-implements a decision networld.c makes. */
+
+static void buildWorldInfoMsg(uint8_t *out /* BS_WORLD_INFO_BYTES */, uint32_t seed)
+{
+    out[0] = BS_APP_WORLD_INFO;
+    bs_put_u32(out + 1, seed);
+}
+
+/* Puts the session exactly where a real join does: seed known, server's fingerprint heard
+ * and disagreeing, first FETCH already on the wire. Leaves the fake clock at `t0`. */
+static void registryJoinWithMismatch(uint64_t t0)
+{
+    registryInitCore();
+    networldInit();
+    fakeTransportReset();
+    fakeNowSet(t0);
+
+    uint8_t wi[BS_WORLD_INFO_BYTES];
+    buildWorldInfoMsg(wi, 4242);
+    networldApplyPayload(wi, sizeof wi);
+
+    uint8_t info[BS_APP_REGISTRY_INFO_BYTES];
+    buildRegistryInfo(info);
+    info[3] ^= 0xFFu;   /* corrupt the crc low byte: guaranteed mismatch */
+    networldApplyPayload(info, sizeof info);
+}
+
+/* The fingerprint a server whose table is the core rows plus `defs` would put in its
+ * BS_APP_REGISTRY_INFO. Built by making that exact table locally and reading world/registry.c's
+ * own registryCount()/registryCrc16() off it, then putting the table back — never by copying a
+ * hash literal into this file, which would only prove the test agrees with itself.
+ *
+ * registryJoinWithMismatch() above corrupts the crc byte instead, which is the right shape for
+ * "does a mismatch draw a FETCH" but the wrong shape for anything about COMPLETING one: no
+ * delivery can ever reproduce a fingerprint that was never any real table's. */
+static void buildRegistryInfoFor(uint8_t *out /* BS_APP_REGISTRY_INFO_BYTES */,
+                                 const BlockDef *defs, unsigned n)
+{
+    registryInitCore();
+    for (unsigned i = 0; i < n; i++) registryRegister(&defs[i]);
+
+    out[0] = BS_APP_REGISTRY_INFO;
+    out[1] = REGISTRY_REV;
+    out[2] = registryCount();
+    bs_put_u16(out + 3, registryCrc16());
+
+    registryInitCore();
+}
+
+/* registryJoinWithMismatch()'s honest sibling: a real join against a server whose table is the
+ * core rows plus `defs`. It still mismatches — this client is core-only until the DEFS land, so
+ * the same single FETCH goes out — but this fingerprint is one a correct delivery can actually
+ * reproduce, which is the whole thing the checks below are about. Leaves the fake clock at t0. */
+static void registryJoinDeclaring(uint64_t t0, const BlockDef *defs, unsigned n)
+{
+    uint8_t info[BS_APP_REGISTRY_INFO_BYTES];
+    buildRegistryInfoFor(info, defs, n);
+
+    registryInitCore();
+    networldInit();
+    fakeTransportReset();
+    fakeNowSet(t0);
+
+    uint8_t wi[BS_WORLD_INFO_BYTES];
+    buildWorldInfoMsg(wi, 4242);
+    networldApplyPayload(wi, sizeof wi);
+    networldApplyPayload(info, sizeof info);
+}
+
+static void test_registry_fetch_retries_a_lost_reply(void)
+{
+    puts("registry: a lost DEFS reply is re-asked for, bounded in tries and in time");
+
+    registryJoinWithMismatch(10000);
+    check(fake_sent_calls == 1 && fake_sent_buf[0] == BS_APP_REGISTRY_FETCH,
+          "the mismatched INFO drew the first FETCH");
+
+    /* The server's reply is lost. Pumping inside the retry interval must not re-ask: a
+     * retry every frame would be 60 FETCHes a second at a server already struggling. */
+    fake_sent_calls = 0;
+    fakeNowAdvance(NETWORLD_REG_FETCH_RETRY_MS - 1);
+    networldUpdate();
+    check(fake_sent_calls == 0, "a pump inside the retry interval sends nothing");
+
+    /* Past the interval, one more goes out — and only one, however many frames run. */
+    fakeNowAdvance(2);
+    networldUpdate();
+    networldUpdate();
+    networldUpdate();
+    check(fake_sent_calls == 1 && fake_sent_buf[0] == BS_APP_REGISTRY_FETCH
+          && fake_sent_buf[1] == REG_ID_DYN_LO,
+          "past the interval exactly one retry goes out, still asking from 0x80");
+
+    /* The attempt bound. Keep the clock inside the deadline and pump for a long time: the
+     * session total must stop at NETWORLD_REG_FETCH_MAX_SENDS, first send included — so
+     * only MAX_SENDS - 2 remain after the first send and the retry just counted. */
+    fake_sent_calls = 0;
+    for (int i = 0; i < 40; i++) {
+        fakeNowAdvance(NETWORLD_REG_FETCH_RETRY_MS / 8);
+        networldUpdate();
+    }
+    check(fake_sent_calls == NETWORLD_REG_FETCH_MAX_SENDS - 2,
+          "the retries stop at MAX_SENDS total, not once per interval forever");
+
+    /* And the time bound, proven independently of the attempt bound: a fresh session whose
+     * clock has jumped past the deadline gets no retry at all, even though it has only ever
+     * sent one FETCH and has three attempts left. */
+    registryJoinWithMismatch(10000);
+    fake_sent_calls = 0;
+    fakeNowAdvance(NETWORLD_REG_SYNC_DEADLINE_MS);
+    networldUpdate();
+    check(fake_sent_calls == 0, "nothing is re-asked past the sync deadline");
+
+    /* A reply that DOES arrive — and that reproduces the fingerprint the server named —
+     * cancels the rest of the retries. The INFO here is the honest one a real server sends
+     * (registryJoinDeclaring), not the corrupted one above, because a delivery that cannot
+     * reproduce the fingerprint is deliberately NOT a completed sync any more and so must
+     * not disarm the retry. */
+    BlockDef defs[1] = { wireDef("retry_done") };
+    registryJoinDeclaring(10000, defs, 1);
+    uint8_t batch[BS_APP_REGISTRY_DEFS_BYTES(1)];
+    size_t len = buildRegistryDefs(batch, REG_ID_DYN_LO, defs, 1, true);
+    networldApplyPayload(batch, len);
+    fake_sent_calls = 0;
+    for (int i = 0; i < 20; i++) {
+        fakeNowAdvance(NETWORLD_REG_FETCH_RETRY_MS);
+        networldUpdate();
+    }
+    check(fake_sent_calls == 0, "once the last batch lands the retry stops immediately");
+
+    /* A retry after a PARTIAL delivery must resume where the table actually got to.
+     * registryRemoteApply() refuses any batch that does not start at the next free slot,
+     * so re-asking from 0x80 here would be refused for the rest of the session. */
+    registryJoinWithMismatch(10000);
+    BlockDef two[2] = { wireDef("part_a"), wireDef("part_b") };
+    uint8_t partial[BS_APP_REGISTRY_DEFS_BYTES(2)];
+    len = buildRegistryDefs(partial, REG_ID_DYN_LO, two, 2, false);   /* not the last */
+    networldApplyPayload(partial, len);
+    check(registryCount() == 10, "the partial batch landed two rows");
+    fake_sent_calls = 0;
+    fakeNowAdvance(NETWORLD_REG_FETCH_RETRY_MS);
+    networldUpdate();
+    check(fake_sent_calls == 1 && fake_sent_buf[1] == REG_ID_DYN_LO + 2u,
+          "the retry resumes from the first id the table is still missing");
+}
+
+/* The invariant the whole feature is allowed to exist under: a server that never speaks
+ * registry must never receive BS_APP_REGISTRY_FETCH, or it kicks this client for an
+ * unknown C->S type. The retry above is a NEW way to reach that sender, so it gets its own
+ * scenario rather than being assumed safe. */
+static void test_registry_fetch_never_reaches_a_silent_server(void)
+{
+    puts("registry: a server that never sent INFO never receives a FETCH, retries included");
+
+    /* An old server: JOIN, WORLD_INFO, a normal session's traffic, and a long stretch of
+     * frames. Not one byte of registry may go back. */
+    registryInitCore();
+    networldInit();
+    fakeTransportReset();
+    fakeNowSet(500);
+
+    uint8_t wi[BS_WORLD_INFO_BYTES];
+    buildWorldInfoMsg(wi, 7);
+    networldApplyPayload(wi, sizeof wi);
+
+    uint8_t pos[BS_POS_UPDATE_S_BYTES];
+    buildPosUpdateS(pos, 3, 1.0f, 2.0f, 3.0f, 0.0f, 0.0f);
+    networldApplyPayload(pos, sizeof pos);
+
+    for (int i = 0; i < 200; i++) {
+        fakeNowAdvance(50);          /* 10 s of frames, five times the sync deadline */
+        networldUpdate();
+    }
+    check(fake_sent_calls == 0,
+          "ten seconds of pumping a pre-registry server sends nothing at all");
+    check(!networldRegistrySynced(), "and the client knows its table is unverified");
+
+    /* A MALFORMED INFO is not a well-formed one: it arms nothing, so it must not arm the
+     * retry either. This is the case a bare length check would let through. */
+    registryInitCore();
+    networldInit();
+    fakeTransportReset();
+    fakeNowSet(500);
+    networldApplyPayload(wi, sizeof wi);
+
+    uint8_t info[BS_APP_REGISTRY_INFO_BYTES];
+    buildRegistryInfo(info);
+    uint8_t short_info[BS_APP_REGISTRY_INFO_BYTES - 1];
+    memcpy(short_info, info, sizeof short_info);
+    networldApplyPayload(short_info, sizeof short_info);
+
+    for (int i = 0; i < 60; i++) {
+        fakeNowAdvance(100);
+        networldUpdate();
+    }
+    check(fake_sent_calls == 0, "a malformed INFO arms no retry either");
+
+    /* Control arm: the same pump against a server that DID send a well-formed mismatching
+     * INFO does send. Without this the two checks above would pass just as well against a
+     * retry that had been wired to nothing at all. */
+    registryJoinWithMismatch(500);
+    fake_sent_calls = 0;
+    fakeNowAdvance(NETWORLD_REG_FETCH_RETRY_MS);
+    networldUpdate();
+    check(fake_sent_calls == 1, "control: the same pump DOES retry after a real INFO");
+}
+
+/* s_reg_synced used to be set and never read. This is what now reads it: the gate that
+ * holds world entry — and therefore main.c's registryFreeze() — open until the table is
+ * settled or provably never going to be. Every arm is bounded, which is the property that
+ * keeps a stalled join from becoming a title screen with no way out. */
+static void test_registry_gate_holds_entry_until_the_table_settles(void)
+{
+    puts("registry: the sync gate holds world entry, and every arm of it is bounded");
+
+    /* Single player / pre-join: never armed, so nothing is ever held. */
+    registryInitCore();
+    networldInit();
+    fakeTransportReset();
+    fakeNowSet(1000);
+    check(!networldRegistryWaiting(), "a client that has not joined anything is never held");
+    check(!networldRegistrySynced(), "and has nothing to be synced with");
+
+    /* Joined. The seed is in, the INFO has not arrived yet — held, inside the grace. */
+    uint8_t wi[BS_WORLD_INFO_BYTES];
+    buildWorldInfoMsg(wi, 99);
+    networldApplyPayload(wi, sizeof wi);
+    check(networldRegistryWaiting(), "the seed alone holds entry while INFO could still land");
+
+    /* An old server never sends one. The grace expires and entry proceeds DEGRADED — not
+     * synced, but not stuck either. */
+    fakeNowAdvance(NETWORLD_REG_INFO_GRACE_MS);
+    check(!networldRegistryWaiting(), "a silent server stops holding entry at the grace");
+    check(!networldRegistrySynced(), "and the client enters knowing the table is unverified");
+
+    /* A matching INFO settles it outright: zero traffic, zero waiting. */
+    registryInitCore();
+    networldInit();
+    fakeTransportReset();
+    fakeNowSet(1000);
+    networldApplyPayload(wi, sizeof wi);
+    uint8_t info[BS_APP_REGISTRY_INFO_BYTES];
+    buildRegistryInfo(info);
+    networldApplyPayload(info, sizeof info);
+    check(networldRegistrySynced(), "a matching fingerprint is a synced table");
+    check(!networldRegistryWaiting(), "which holds entry for no frames at all");
+
+    /* A mismatch holds entry across the whole fetch, then releases the instant the last
+     * batch lands — the case the Phase A code could never reach, because entry happened
+     * one frame after the seed and froze the table before this point. */
+    BlockDef defs[2] = { wireDef("gate_a"), wireDef("gate_b") };
+    registryJoinDeclaring(1000, defs, 2);
+    check(networldRegistryWaiting(), "a mismatched INFO holds entry while the fetch runs");
+    fakeNowAdvance(NETWORLD_REG_FETCH_RETRY_MS);
+    networldUpdate();
+    check(networldRegistryWaiting(), "and keeps holding while a retry is still outstanding");
+
+    uint8_t batch[BS_APP_REGISTRY_DEFS_BYTES(2)];
+    size_t len = buildRegistryDefs(batch, REG_ID_DYN_LO, defs, 2, true);
+    networldApplyPayload(batch, len);
+    check(networldRegistrySynced(), "the completed batch reproduces the server's fingerprint");
+    check(!networldRegistryWaiting(), "and releases entry immediately");
+    check(registryFind("gate_a") == REG_ID_DYN_LO,
+          "the row the old freeze point made uncommittable is committed");
+
+    /* And the give-up arm: a server that answers the INFO but never the FETCH. Held for
+     * the deadline, released after it, still not synced. */
+    registryJoinWithMismatch(1000);
+    fakeNowAdvance(NETWORLD_REG_SYNC_DEADLINE_MS - 1);
+    networldUpdate();
+    check(networldRegistryWaiting(), "still held one millisecond before the deadline");
+    fakeNowAdvance(1);
+    check(!networldRegistryWaiting(), "released at the deadline");
+    check(!networldRegistrySynced(), "entering degraded rather than never entering");
+
+    /* A retransmitted WORLD_INFO must not push the deadline out. A chatty or hostile
+     * server could otherwise hold this console on the title screen forever. */
+    registryJoinWithMismatch(1000);
+    fakeNowAdvance(NETWORLD_REG_SYNC_DEADLINE_MS - 10);
+    networldApplyPayload(wi, sizeof wi);
+    fakeNowAdvance(10);
+    check(!networldRegistryWaiting(), "a repeated WORLD_INFO does not extend the deadline");
+}
+
+/* The table is per-session state and was the one piece of it networldInit() did not clear,
+ * so a second join reused the first server's rows — and, worse, could not accept the second
+ * server's, since registryRemoteApply() requires a batch to start at the table's own next
+ * free slot and the first server had already moved it. */
+static void test_registry_table_resets_between_sessions(void)
+{
+    puts("registry: leaving a session puts the block table back to the core rows");
+
+    registryJoinWithMismatch(1000);
+    BlockDef defs[2] = { wireDef("srv1_a"), wireDef("srv1_b") };
+    uint8_t batch[BS_APP_REGISTRY_DEFS_BYTES(2)];
+    size_t len = buildRegistryDefs(batch, REG_ID_DYN_LO, defs, 2, true);
+    networldApplyPayload(batch, len);
+    check(registryCount() == 10 && registryFind("srv1_a") == REG_ID_DYN_LO,
+          "the first server's two rows are in the table");
+
+    /* netDisconnect() runs networldInit() (net/bsnet.c), which is the whole of leaving a
+     * session as far as this module is concerned. */
+    networldInit();
+    check(registryCount() == 8, "after leaving, only the eight core rows remain");
+    check(registryFind("srv1_a") == 0 && registryFind("srv1_b") == 0,
+          "the first server's names are gone, not merely hidden");
+    check(registryCrc16() == 0x7E5Bu,
+          "and the table hashes as the pinned core-only golden again");
+    check(!networldRegistrySynced() && !networldRegistryWaiting(),
+          "with the sync state cleared alongside it");
+
+    /* The second server's batch is the proof that matters: it starts at 0x80 too, and would
+     * have been refused outright against a table still holding server one's rows. */
+    fakeTransportReset();
+    fakeNowSet(50000);
+    uint8_t wi[BS_WORLD_INFO_BYTES];
+    buildWorldInfoMsg(wi, 777);
+    networldApplyPayload(wi, sizeof wi);
+    uint8_t info[BS_APP_REGISTRY_INFO_BYTES];
+    buildRegistryInfo(info);
+    info[3] ^= 0xFFu;
+    networldApplyPayload(info, sizeof info);
+
+    BlockDef defs2[1] = { wireDef("srv2_only") };
+    uint8_t batch2[BS_APP_REGISTRY_DEFS_BYTES(1)];
+    len = buildRegistryDefs(batch2, REG_ID_DYN_LO, defs2, 1, true);
+    networldApplyPayload(batch2, len);
+    check(registryFind("srv2_only") == REG_ID_DYN_LO,
+          "the second server's row takes 0x80, which server one had been holding");
+    check(registryCount() == 9, "and it is the only dynamic row in the table");
+}
+
+/* v1.6.0 F2, and the scenario the test directly above could not be: it calls networldInit()
+ * itself, so it proves "leaving a session clears the table" and nothing about the path where
+ * NOTHING calls networldInit(). That path is single player. registryFreeze() runs in genStart()
+ * for a single-player world exactly as it does for a joined one — the worker's no-locks
+ * contract needs it there, and app/worker.c's workerSubmitColumn() refuses to generate a column
+ * against an unfrozen table — but `if (quit_to_title) goto session_start;` (source/main.c) went
+ * back to the menu without unfreezing it. So the player's very next act, joining a server, met
+ * registryRemoteApply()'s `if (s_frozen) return 0;` on every batch, and every server-defined
+ * block was an invisible hole for the whole session.
+ *
+ * The lap below is app/session.c's sessionBegin() and nothing else, because sessionBegin() and
+ * nothing else is what main.c runs between the two worlds. The registry-level version of this
+ * lives in app/session_test.c; this one is here because it goes through net/networld.c's real
+ * BS_APP_REGISTRY_DEFS handler and so can also check the flag the HUD's degraded marker reads,
+ * which was the other half of what the player saw. */
+static void test_registry_join_after_a_single_player_quit_to_title(void)
+{
+    puts("registry: a server join right after a single-player quit-to-title still syncs");
+
+    /* The server's fingerprint, built first because buildRegistryInfoFor() rebuilds the local
+     * table to derive it and would otherwise wipe the single-player session set up below. */
+    BlockDef srv[1] = { wireDef("srv_blk") };
+    uint8_t info[BS_APP_REGISTRY_INFO_BYTES];
+    buildRegistryInfoFor(info, srv, 1);
+
+    /* Boot: main.c:2519's networldInit(), next to netInit(). */
+    registryInitCore();
+    networldInit();
+
+    /* A single-player session, in genStart()'s real order: the world's own registry.bin rows
+     * go in first, then the freeze, before workerStart(). */
+    BlockDef sp = wireDef("sp_sidecar");
+    check(registryRegister(&sp) == REG_ID_DYN_LO,
+          "control: the single-player world's sidecar row is really in the table");
+    registryFreeze();
+    check(registryFrozen() && registryCount() == 9,
+          "control: and genStart() has frozen it, in single player exactly as in a session");
+
+    /* Quit to title. This is the whole of it. */
+    sessionBegin();
+
+    /* The join, from the multiplayer screen, one lap later and without a reboot. */
+    fakeTransportReset();
+    fakeNowSet(90000);
+    uint8_t wi[BS_WORLD_INFO_BYTES];
+    buildWorldInfoMsg(wi, 555);
+    networldApplyPayload(wi, sizeof wi);
+    networldApplyPayload(info, sizeof info);
+    check(fake_sent_calls == 1 && fake_sent_buf[0] == BS_APP_REGISTRY_FETCH,
+          "the server's INFO still draws a FETCH, so the table is the only variable");
+
+    uint8_t batch[BS_APP_REGISTRY_DEFS_BYTES(1)];
+    const size_t len = buildRegistryDefs(batch, REG_ID_DYN_LO, srv, 1, true);
+    networldApplyPayload(batch, len);
+
+    check(registryFind("srv_blk") == REG_ID_DYN_LO,
+          "the server's block is committed at 0x80 rather than refused by the stale freeze");
+    check(registryCount() == 9 && registryFind("sp_sidecar") == 0,
+          "and it is the only dynamic row: the last world's is gone");
+    /* The NAME is checked, not just "a defined solid row exists at 0x80". Against the stale
+     * table the single-player world's own row was sitting in that slot, defined and solid, so
+     * an id-only check would have passed while the player was still colliding with the wrong
+     * block — which is the failure, not the absence of one. */
+    check(registryIsDefined(REG_ID_DYN_LO) && registryView(REG_ID_DYN_LO)->solid
+              && strcmp(registryView(REG_ID_DYN_LO)->name, "srv_blk") == 0,
+          "it is the SERVER's solid block at that id, so the player collides with the right "
+          "thing instead of falling through a hole");
+    check(networldRegistrySynced(),
+          "and the table reproduces the server's fingerprint, so no degraded marker is shown");
+    check(!networldRegistryWaiting(), "world entry is not held open waiting for it");
+}
+
+/* ------------------------------------------------- registry fingerprint (v1.6.0 task 8b) ---
+ *
+ * s_reg_synced used to mean "a BS_APP_REGISTRY_DEFS packet with the LAST bit arrived". The
+ * server sends exactly such a packet unconditionally — bsgame.c's fetch loop emits an empty
+ * final batch even when it has nothing to say — so the flag could be set by four bytes that
+ * carried no rows, checked no first index, and were not refused by a frozen table. A client
+ * whose 1 KB data batch was lost in the UDP then declared itself synced with a core-only
+ * table, disarmed its own bounded retry, and spent the whole session rendering every
+ * server-defined block as an air hole while the HUD showed no degraded marker at all.
+ *
+ * It now means "this table demonstrably reproduces the fingerprint the server sent" — the
+ * INFO's rev/count/crc16, retained and re-checked against registryCount()/registryCrc16()
+ * after every batch. The two scenarios below are what holds that meaning in place. */
+static void test_registry_terminator_alone_is_not_a_synced_table(void)
+{
+    puts("registry: an empty terminating batch is not a synced table, frozen or not");
+
+    BlockDef declared[2] = { wireDef("term_a"), wireDef("term_b") };
+
+    /* Trigger (a): the server's reply spans more than one packet, the batch carrying the
+     * rows is lost, and only the four-byte terminator arrives. */
+    registryJoinDeclaring(10000, declared, 2);
+    check(fake_sent_calls == 1 && fake_sent_buf[0] == BS_APP_REGISTRY_FETCH,
+          "the rows the server declared but this table lacks drew a FETCH");
+
+    uint8_t term[BS_APP_REGISTRY_DEFS_BYTES(0)];
+    const size_t tlen = buildRegistryDefs(term, REG_ID_DYN_LO, declared, 0, true);
+    networldApplyPayload(term, tlen);
+
+    check(registryCount() == 8,
+          "the terminator carried no records, so the table is still core-only");
+    check(!networldRegistrySynced(),
+          "and a table that cannot reproduce the server's crc16 is not a synced table");
+    check(networldRegistryWaiting(), "so the entry gate is still holding for the retry");
+
+    fake_sent_calls = 0;
+    fakeNowAdvance(NETWORLD_REG_FETCH_RETRY_MS);
+    networldUpdate();
+    check(fake_sent_calls == 1 && fake_sent_buf[0] == BS_APP_REGISTRY_FETCH
+          && fake_sent_buf[1] == REG_ID_DYN_LO,
+          "the retry is still armed and re-asks from the first id the table is missing");
+
+    /* Trigger (b): the INFO disagrees on the table REVISION while the server holds no dynamic
+     * rows at all, so its fetch loop finds nothing to send and terminates empty on the first
+     * packet. The client used to answer that by declaring itself synced with a table it had
+     * just been told disagrees. */
+    registryInitCore();
+    networldInit();
+    fakeTransportReset();
+    fakeNowSet(10000);
+
+    uint8_t wi[BS_WORLD_INFO_BYTES];
+    buildWorldInfoMsg(wi, 4242);
+    networldApplyPayload(wi, sizeof wi);
+
+    uint8_t info[BS_APP_REGISTRY_INFO_BYTES];
+    buildRegistryInfo(info);
+    info[1] = (uint8_t)(REGISTRY_REV + 1u);   /* a future table revision, dyn rows: none */
+    networldApplyPayload(info, sizeof info);
+    check(fake_sent_calls == 1, "the revision disagreement drew the FETCH");
+
+    networldApplyPayload(term, tlen);
+    check(!networldRegistrySynced(),
+          "an empty terminator does not settle a table the server called another revision");
+    check(networldRegistryWaiting(), "and the gate keeps holding rather than releasing early");
+
+    /* Still bounded in both directions, which is the property that keeps this from becoming a
+     * title screen with no way out. Forwards first — the deadline (or a lid-close sleep that
+     * jumps the wall clock past it) releases the player DEGRADED. */
+    fakeNowAdvance(NETWORLD_REG_SYNC_DEADLINE_MS);
+    check(!networldRegistryWaiting(), "the deadline releases entry, degraded rather than never");
+    check(!networldRegistrySynced(), "with the indicator still honestly reporting unverified");
+
+    /* And backwards: bsSockNowMs() is osGetTime() on hardware, a wall clock that can step
+     * back. Every bound here is `now - base` on uint64_t, so a backwards step underflows to a
+     * huge value and both bounds fire — released, never trapped, and nothing more is sent. */
+    registryJoinDeclaring(10000, declared, 2);
+    networldApplyPayload(term, tlen);
+    check(networldRegistryWaiting(), "held while the clock is behaving");
+    fakeNowSet(9999);                          /* one millisecond backwards */
+    check(!networldRegistryWaiting(), "a clock that steps backwards releases, never traps");
+    fake_sent_calls = 0;
+    networldUpdate();
+    check(fake_sent_calls == 0, "and re-asks nothing of a server it can no longer time");
+
+    /* F4: after registryFreeze() — which is where genStart() leaves the table for the rest of
+     * the session — no row can ever be committed again. The degraded indicator has to read
+     * degraded at exactly that point; it used to read healthy. */
+    registryJoinDeclaring(10000, declared, 2);
+    registryFreeze();
+    check(registryFrozen(), "the table is frozen, as it is for every frame after genStart()");
+
+    uint8_t batch[BS_APP_REGISTRY_DEFS_BYTES(2)];
+    const size_t blen = buildRegistryDefs(batch, REG_ID_DYN_LO, declared, 2, true);
+    networldApplyPayload(batch, blen);
+    check(registryCount() == 8, "the frozen table refused the batch, per registry.h's contract");
+    check(!networldRegistrySynced(),
+          "and a refused batch's LAST flag does not turn the indicator healthy");
+
+    networldApplyPayload(term, tlen);
+    check(!networldRegistrySynced(), "nor does a bare terminator after the freeze");
+
+    registryInitCore();   /* unfreeze: the scenarios after this one register rows of their own */
+
+    /* No INFO at all: DEFS that nobody asked for, from a server that never sent a fingerprint.
+     * There is nothing to check the table against, so nothing can be proved and the answer has
+     * to be no — which is also the case the old LAST-flag test accepted outright. */
+    registryInitCore();
+    networldInit();
+    fakeTransportReset();
+    fakeNowSet(10000);
+    networldApplyPayload(wi, sizeof wi);
+
+    networldApplyPayload(batch, blen);
+    check(registryCount() == 10, "the unsolicited batch's rows did land in the table");
+    check(!networldRegistrySynced(),
+          "but with no INFO there is no fingerprint, so nothing is verified");
+
+    networldApplyPayload(term, tlen);
+    check(!networldRegistrySynced(), "and its terminator settles nothing either");
+}
+
+/* The gap F1 was the exploit of: nothing ever re-ran registryCrc16() once a fetch finished, so
+ * networldRegistrySynced()'s documented "provably agrees with the server's" reduced to "the
+ * server said that was all". These are the checks that make the word "provably" true. */
+static void test_registry_sync_is_proved_by_the_fingerprint(void)
+{
+    puts("registry: a completed fetch is checked against the INFO's fingerprint, not trusted");
+
+    BlockDef declared[3] = { wireDef("fp_a"), wireDef("fp_b"), wireDef("fp_c") };
+
+    /* The whole declared set arrives: rev, count and crc16 all reproduce. This is the only
+     * thing that is a synced table, and it must still be one — a fingerprint check that never
+     * says yes would pass every negative below for the wrong reason. */
+    registryJoinDeclaring(20000, declared, 3);
+    uint8_t all[BS_APP_REGISTRY_DEFS_BYTES(3)];
+    size_t alen = buildRegistryDefs(all, REG_ID_DYN_LO, declared, 3, true);
+    networldApplyPayload(all, alen);
+    check(registryCount() == 11, "all three declared rows landed");
+    check(networldRegistrySynced(), "and the table reproduces the server's whole fingerprint");
+    check(!networldRegistryWaiting(), "which releases world entry immediately");
+
+    /* A SHORT delivery that still carries the LAST flag: two of the three rows, then "that is
+     * all". The count alone already disagrees, and the retry must stay armed for the third. */
+    registryJoinDeclaring(20000, declared, 3);
+    uint8_t two[BS_APP_REGISTRY_DEFS_BYTES(2)];
+    const size_t twolen = buildRegistryDefs(two, REG_ID_DYN_LO, declared, 2, true);
+    networldApplyPayload(two, twolen);
+    check(registryCount() == 10, "two of the three rows landed");
+    check(!networldRegistrySynced(),
+          "a short delivery is not a synced table however the LAST flag is set");
+    fake_sent_calls = 0;
+    fakeNowAdvance(NETWORLD_REG_FETCH_RETRY_MS);
+    networldUpdate();
+    check(fake_sent_calls == 1 && fake_sent_buf[1] == REG_ID_DYN_LO + 2u,
+          "and the retry asks for exactly the row still missing");
+
+    /* Same COUNT, different CONTENT. Only the crc16 catches this one — the number
+     * applyRegistryInfo() used to compute for its own comparison and then throw away. */
+    registryJoinDeclaring(20000, declared, 3);
+    BlockDef impostor[3] = { wireDef("fp_a"), wireDef("fp_b"), wireDef("fp_X") };
+    uint8_t wrong[BS_APP_REGISTRY_DEFS_BYTES(3)];
+    const size_t wlen = buildRegistryDefs(wrong, REG_ID_DYN_LO, impostor, 3, true);
+    networldApplyPayload(wrong, wlen);
+    check(registryCount() == 11, "three rows landed, so rev and count both agree");
+    check(registryFind("fp_X") == REG_ID_DYN_LO + 2u, "with the third row under its own name");
+    check(!networldRegistrySynced(),
+          "but the crc16 disagrees, so this is not the server's table and not synced");
+
+    /* And the flip side of no longer trusting the flag: a delivery that completes the table
+     * with its terminator LOST is synced anyway. A dropped terminator now costs nothing. */
+    registryJoinDeclaring(20000, declared, 3);
+    alen = buildRegistryDefs(all, REG_ID_DYN_LO, declared, 3, false);
+    networldApplyPayload(all, alen);
+    check(networldRegistrySynced(),
+          "a complete table whose terminator was lost is still provably the server's");
+
+    /* Control that cannot pass by luck: the same complete, correct rows against a server that
+     * named a different table REVISION never verify, because this build cannot know what that
+     * revision's rows would have meant. */
+    registryInitCore();
+    networldInit();
+    fakeTransportReset();
+    fakeNowSet(20000);
+
+    uint8_t wi[BS_WORLD_INFO_BYTES];
+    buildWorldInfoMsg(wi, 4242);
+    networldApplyPayload(wi, sizeof wi);
+
+    uint8_t info[BS_APP_REGISTRY_INFO_BYTES];
+    buildRegistryInfoFor(info, declared, 3);
+    info[1] = (uint8_t)(REGISTRY_REV + 1u);
+    networldApplyPayload(info, sizeof info);
+
+    alen = buildRegistryDefs(all, REG_ID_DYN_LO, declared, 3, true);
+    networldApplyPayload(all, alen);
+    check(registryCount() == 11, "control: the rows landed exactly as in the passing case");
+    check(!networldRegistrySynced(), "but a foreign table revision is never verifiable");
+}
+
+/* How many block faces one emitted quad covers. Since v1.6.0 task 11 meshChunk()
+ * merges runs of identical co-planar faces along u into one wide quad, so out.faces
+ * counts QUADS, not block faces: a merged quad w blocks wide spans u0 .. u0+TILE_PX*w.
+ * Block faces are the number that never moves — merging regroups them, it never
+ * creates or destroys one — so the counts below are stated in those. Quad q owns
+ * verts q*4..q*4+3, the four-per-quad-in-order property chunk_render.c's shared
+ * index buffer also rests on. (world/world_test.c owns the merge algorithm itself;
+ * this file only cares that the registry's rect table feeds it the right tiles.) */
+static uint32_t meshFaceCells(const MeshOut *o)
+{
+    uint32_t cells = 0;
+    for (uint32_t q = 0; q < o->faces; q++) {
+        const MeshVertex *v = &o->verts[q * 4];
+        uint8_t lo = v[0].u, hi = v[0].u;
+        for (int i = 1; i < 4; i++) {
+            if (v[i].u < lo) lo = v[i].u;
+            if (v[i].u > hi) hi = v[i].u;
+        }
+        cells += (uint32_t)((hi - lo) / TILE_PX);
+    }
+    return cells;
+}
+
 /* Proves planBuild ordering plus the s_rect resize in one scenario: a solid block
  * registered ABOVE the old [BLOCK_COUNT] rect table meshes correctly. Before the
  * v1.6.0 fix this indexed s_rect[0x80] out of bounds of an 8-row array; today the
@@ -1864,7 +2498,7 @@ static void test_mesher_tables_after_register(void)
 
     meshChunk(&out, &scratch);
     check(!out.overflow, "the mesh completed without overflow");
-    check(out.faces == 6 * CHUNK_DIM * CHUNK_DIM,
+    check(meshFaceCells(&out) == 6 * CHUNK_DIM * CHUNK_DIM,
           "a full chunk of the new solid block emits every face");
     check(out.opaque_faces == out.faces && out.opaque_index_count == out.index_count,
           "and all of it is opaque, since the def carries SOLID without TRANSPARENT");
@@ -1873,7 +2507,15 @@ static void test_mesher_tables_after_register(void)
     for (uint32_t i = 0; i < out.vert_count; i++) {
         const MeshVertex *v = &out.verts[i];
         const AtlasRect r = atlasRect(d.tex[v->nrm]);
-        if ((v->u != r.u0 && v->u != r.u1) || (v->v != r.v0 && v->v != r.v1)) {
+        /* v pins the tile and is the strong half of this claim: the strip atlas
+         * stacks tiles in v, so a wrong rect row shows up here. u is a merge run —
+         * it starts at the tile's u0 and steps a whole tile at a time, up to
+         * ATLAS_MAX_MERGE_BLOCKS of them, deliberately past this tile's own u1
+         * because u is sampled GPU_REPEAT (world/atlas_uv.h). */
+        const int du = (int)v->u - (int)r.u0;
+        const bool u_ok = du >= 0 && (du % TILE_PX) == 0
+                          && du <= TILE_PX * ATLAS_MAX_MERGE_BLOCKS;
+        if (!u_ok || (v->v != r.v0 && v->v != r.v1)) {
             wrong_tile++;
         }
     }
@@ -1885,7 +2527,7 @@ static void test_mesher_tables_after_register(void)
     mesherInvalidateTables();
     memset(out.verts, 0xAB, sizeof(MeshVertex) * out.vert_cap);
     meshChunk(&out, &scratch);
-    check(out.faces == 6 * CHUNK_DIM * CHUNK_DIM && out.vert_count > 0,
+    check(meshFaceCells(&out) == 6 * CHUNK_DIM * CHUNK_DIM && out.vert_count > 0,
           "after invalidation the next meshChunk rebuilds the same geometry");
 
     free(out.verts);
@@ -1951,6 +2593,13 @@ int main(void)
     test_registry_info_mismatch_sends_fetch_once();
     test_registry_defs_converge();
     test_registry_defs_malformed_dropped_whole();
+    test_registry_fetch_retries_a_lost_reply();
+    test_registry_fetch_never_reaches_a_silent_server();
+    test_registry_gate_holds_entry_until_the_table_settles();
+    test_registry_table_resets_between_sessions();
+    test_registry_join_after_a_single_player_quit_to_title();
+    test_registry_terminator_alone_is_not_a_synced_table();
+    test_registry_sync_is_proved_by_the_fingerprint();
     test_mesher_tables_after_register();
 
     printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);

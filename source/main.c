@@ -28,6 +28,7 @@
 #include "app/options.h"
 #include "app/remap.h"
 #include "app/remap_ui.h"
+#include "app/session.h"
 #include "app/sleep.h"
 #include "app/updater.h"
 #include "app/gputest.h"
@@ -59,6 +60,7 @@
 #include "world/jobq.h"
 #include "world/light.h"
 #include "world/mesh_vertex.h"
+#include "world/meshq.h"
 #include "world/region.h"
 #include "world/registry.h"
 #include "world/world.h"
@@ -422,7 +424,7 @@ static DigOutResult digOutCheck(bool run)
 // against nothing along every border.
 // Step 7.7 made both of these a runtime setting rather than a constant. The bound above is
 // what the arrays and the mesh pool are sized for; the current value is what the loops use.
-// See scene/render_dist.h for why RENDER_DIST_MAX is 2 and what else moves with it.
+// See scene/render_dist.h for why RENDER_DIST_MAX is 3 and what else moves with it.
 #define GEN_MESH_RADIUS_MAX  RENDER_DIST_MAX
 #define GEN_AREA_RADIUS_MAX  (GEN_MESH_RADIUS_MAX + 1)
 
@@ -664,31 +666,43 @@ static bool genColumnRingComplete(int32_t cx, int32_t cz)
 	return true;
 }
 
+// Set whenever a column could not be fully queued because the mesh ring was full, and cleared
+// by the pass that finally gets all of them in. Read by genDrainMesh, which is the one function
+// called every frame in both the loading loop and the play loop and therefore the only place
+// that reliably notices the queue has room again.
+//
+// v1.6.0 task 12. Without this, "the column stays re-queueable" is only true in principle:
+// genQueueReadyColumns runs when a column arrives (genInstallOne) or when the ring moves
+// (genRecenter/genSetRadius), so a player standing still in a fully installed world would never
+// trigger another pass and the short column would stay unmeshed until they walked. A flag is
+// enough because the retry is a whole-ring rescan — nothing has to remember WHICH column.
+static bool s_mesh_queue_short;
+
 // Queues every column inside the meshed radius whose ring is now complete and that has not
 // been queued already.
+//
+// v1.6.0 task 12: the per-chunk pushing moved to world/meshq.c so the host suite could link the
+// real thing, and — the actual fix — the column is marked queued only if every push was
+// accepted. It used to be marked first and unconditionally, which made a refused push a
+// permanent hole in the world. See world/meshq.h for the full account.
 static void genQueueReadyColumns(void)
 {
+	bool still_short = false;
+
 	for (int32_t dz = -s_mesh_radius; dz <= s_mesh_radius; dz++) {
 		for (int32_t dx = -s_mesh_radius; dx <= s_mesh_radius; dx++) {
 			const int32_t cx = s_center_cx + dx, cz = s_center_cz + dz;
 			if (genSlotHas(&s_col_queued[0][0], GEN_MESH_SPAN, cx, cz)) continue;
 			if (!genColumnRingComplete(cx, cz)) continue;
-			genSlotSet(&s_col_queued[0][0], GEN_MESH_SPAN, cx, cz);
 
-			for (int cy = 0; cy < COLUMN_CHUNKS; cy++) {
-				// Skipped rather than left to chunkRenderBuild's own all-air early-out,
-				// which claims a slot for the empty chunk it finds. That is right for a
-				// chunk the player dug out — it has to stay queueable — and wrong here,
-				// where three or four sky chunks per column would eat the pool before the
-				// ground was meshed.
-				const Chunk* c = worldChunk(&s_world, cx, cy, cz);
-				if (!c || chunkIsAllAir(c)) continue;
-
-				const Job j = {JOB_MESH, cx, cz, cy};
-				if (!jobqPush(&s_meshq, j)) s_genr.mesh_refused++;
-			}
+			if (meshqPushColumn(&s_meshq, &s_world, cx, cz, &s_genr.mesh_refused))
+				genSlotSet(&s_col_queued[0][0], GEN_MESH_SPAN, cx, cz);
+			else
+				still_short = true;
 		}
 	}
+
+	s_mesh_queue_short = still_short;
 }
 
 // Submits every column of the current area that has neither arrived nor been asked for.
@@ -1009,6 +1023,11 @@ static bool genStart(int32_t cx, int32_t cz)
 	memset(s_col_queued, 0, sizeof(s_col_queued));
 	memset(s_col_in, 0, sizeof(s_col_in));
 	memset(s_col_asked, 0, sizeof(s_col_asked));
+	// With the queue and the queued-column window both cleared, there is nothing outstanding
+	// to retry. Left set from a previous world it would only cost one wasted rescan, but a
+	// flag that survives the thing it describes is how the queued-before-pushed bug happened
+	// in the first place.
+	s_mesh_queue_short = false;
 	s_genr = (GenResult){0};
 	s_genr.ran = true;
 	s_center_cx = cx;
@@ -1042,6 +1061,17 @@ static bool genStart(int32_t cx, int32_t cz)
 	// the sidecar or off the wire during join — so it freezes before the worker exists.
 	// Post-freeze every consumer reads it without locks; workerSubmitColumn() refuses to
 	// run against an unfrozen table.
+	//
+	// v1.6.0 task 8: "complete by now" was a claim, not a fact, and on the join path it was
+	// false. genStart() runs one frame after scene/title.c sees the server's seed, and the
+	// server's BS_APP_REGISTRY_DEFS are a round trip behind that seed — so this line always
+	// slammed shut before the first dynamic row could be committed, and registryRemoteApply()
+	// refused every batch that followed for the whole session. The fix is the second gate at
+	// the bottom of drawMultiplayer() (scene/title.c): world entry is now held open until
+	// networldRegistryWaiting() says the registry question is settled or bounded out, so by
+	// the time control reaches this line the DEFS have either landed or provably are not
+	// coming. Nothing moved here, because the worker's no-locks-after-freeze contract
+	// (world/registry.h) needs the freeze exactly where it is — before workerStart() below.
 	registryFreeze();
 
 	workerSetWorldDir(world_dir);
@@ -1115,8 +1145,16 @@ static bool genInstallOne(void)
 // invisible indefinitely while the world underneath it is perfectly real.
 static int genDrainMesh(float budget_ms, int max_chunks)
 {
-	if (jobqCount(&s_meshq) == 0)
-		return 0;
+	if (jobqCount(&s_meshq) == 0) {
+		// v1.6.0 task 12. Nothing left to drain — so if a column went short of queue space
+		// earlier, now is exactly when to ask again, and this is the one place called every
+		// frame by both the loading loop and the play loop. Gated on the flag AND on an empty
+		// queue so the whole-ring rescan happens once per shortage rather than every frame:
+		// in the normal case (nothing short) this costs one bool test.
+		if (s_mesh_queue_short) genQueueReadyColumns();
+		if (jobqCount(&s_meshq) == 0)
+			return 0;
+	}
 
 	const u64 t0 = svcGetSystemTick();
 	int built = 0;
@@ -2223,9 +2261,16 @@ static bool runTitleScreen(Options* opts, bool returning_from_server)
 		touchPosition tp = {0};
 		hidTouchRead(&tp);
 
+		// keys_held is read for exactly one thing — the update screen's release-notes scroll,
+		// which repeats while the D-pad is held (scene/title.h's own comment on the field, and
+		// app/whatsnew.h on why it is a different HID word from keys_down rather than the same
+		// one read twice).
+		const u32 held = hidKeysHeld();
+
 		const TitleInput in = {
 			.keys_down  = hidKeysDown(),
-			.touch_down = (hidKeysHeld() & KEY_TOUCH) != 0 || tp.px != 0 || tp.py != 0,
+			.keys_held  = held,
+			.touch_down = (held & KEY_TOUCH) != 0 || tp.px != 0 || tp.py != 0,
 			.touch_x    = tp.px,
 			.touch_y    = tp.py,
 		};
@@ -2258,18 +2303,25 @@ static bool runTitleScreen(Options* opts, bool returning_from_server)
 		C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
 		spriteFrameBegin();
 
-		// The top screen is cleared and bound every frame even though the menu draws
-		// nothing on it. C3D_FrameEnd only presents screens with a target bound this frame,
-		// so skipping it would leave the top screen holding whatever was in the framebuffer
-		// at boot — uninitialised VRAM — for as long as the player sits in the menu.
-		C3D_RenderTargetClear(top, C3D_CLEAR_ALL, CLEAR_COLOR, 0);
-		C3D_FrameDrawOn(top);
-
 		// title.c calls spriteBegin(320, 240) itself and assumes the caller has already
 		// bound the target it wants drawn on — see the file comment in scene/title.h.
 		C3D_RenderTargetClear(bottom, C3D_CLEAR_ALL, 0x1A1424FF, 0);
 		C3D_FrameDrawOn(bottom);
 		const TitleResult r = titleUpdateDraw(&ts, opts, &in);
+
+		// The top screen is cleared and bound every frame whether or not the menu puts
+		// anything on it. C3D_FrameEnd only presents screens with a target bound this frame,
+		// so skipping it would leave the top screen holding whatever was in the framebuffer
+		// at boot — uninitialised VRAM — for as long as the player sits in the menu.
+		//
+		// It is drawn AFTER the bottom half rather than before it, which is the order v1.6.0
+		// task 14b needs and the reason this moved: titleUpdateDraw is where the D-pad is
+		// read, and titleDrawTop is what clamps and paints the release-notes scroll position
+		// that reading produced. Drawing the top first showed the previous frame's scroll —
+		// harmless, but a frame of lag on the one control this screen exists for.
+		C3D_RenderTargetClear(top, C3D_CLEAR_ALL, CLEAR_COLOR, 0);
+		C3D_FrameDrawOn(top);
+		titleDrawTop(&ts);
 
 		C3D_FrameEnd(0);
 
@@ -2589,10 +2641,34 @@ int main(void)
 	// past the goto with them, because a second session needs a screen and a chunk renderer
 	// just as much as the first one did.
 session_start:
-	// The previous pass may have left these true. Nothing else survives a lap.
+	// The previous pass may have left these true. Nothing else in THIS file survives a lap.
 	s_server_session = false;
 	s_remap_open     = false;
 	s_debug_open     = false;
+
+	// ...but other modules' per-session state does, and one piece of it was being missed.
+	// v1.6.0 F2: the block registry is per-session — genStart() below calls registryFreeze()
+	// in single player exactly as it does in a session, and registryInitCore() is the only
+	// thing that ever clears that flag. The server exit twenty lines from the bottom of this
+	// function reached it by accident, through netDisconnect() -> networldInit(); the
+	// single-player `if (quit_to_title) goto session_start;` right below it reached nothing,
+	// so a player who played single player, backed out here and then joined a server had
+	// every one of that server's block definitions refused by registryRemoteApply() for the
+	// whole session — each one an invisible hole they walked through and fell into. Only a
+	// reboot cleared it, which is what made it look intermittent.
+	//
+	// Here rather than at either exit, for two reasons. There are two `goto session_start;`
+	// statements and nothing stopping a third, and a rule attached to the exits has to be
+	// remembered once per exit forever; this label is the one place that means "a new
+	// session is beginning", so a future exit gets the reset for free. And it is the only
+	// placement early enough: a joining client's BS_APP_REGISTRY_DEFS arrive while the
+	// player is still on the multiplayer screen inside the title screen below, so a reset
+	// done at world entry would land after the rows it was meant to make room for.
+	//
+	// app/session.c, host-tested by app/session_test.c — which walks this exact sequence and
+	// also reads this file to check the call below is still here. Nothing in main.c can be
+	// linked into a host binary, and that is why this defect had no coverage at all.
+	sessionBegin();
 
 #if BS_TITLE
 	// ui_ok gates it. spriteInit/fontInit failing is survivable for the HUD — a game with no
@@ -3381,10 +3457,19 @@ session_start:
 		//   a remote edits applied   q still queued for unloaded columns   p remote players
 		// Same 32-column console limit as `status` above: "net s99 r999 y999 a999 q99 p9"
 		// is 30.
+		//
+		// The trailing "!" is v1.6.0 task 8's readout of net/networld.h's
+		// networldRegistrySynced(): in a session it means this client's block table never
+		// agreed with the server's, so any dynamic block id in the world is resolving to air
+		// through registryView()'s never-NULL contract. That looks *exactly* like terrain the
+		// server happens to have dug out, which is the same "silently identical to working"
+		// problem the rest of this line exists for. Printed only in a session — single player
+		// has no server table to agree with, so its absence there is not a warning.
 		char netline[33];
-		snprintf(netline, sizeof(netline), "net s%d r%d y%d a%d q%d p%d",
+		snprintf(netline, sizeof(netline), "net s%d r%d y%d a%d q%d p%d%s",
 		         networldSentEdits(), networldRecvMsgs(), networldSyncEntries(),
-		         networldAppliedEdits(), networldPendingCount(), networldRemoteCount());
+		         networldAppliedEdits(), networldPendingCount(), networldRemoteCount(),
+		         (s_server_session && !networldRegistrySynced()) ? "!" : "");
 
 #if BS_CMDBUF_PROBE
 		// Throwaway instrument, not shipped. hang.txt proved the main thread finishes the

@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "world/budget.h"
+#include "world/registry.h"
 
 // The adaptive lighting engine's implementation. This file is NOT compiled
 // standalone: world.c includes it, because tools/run_host_tests.sh names its
@@ -23,7 +24,9 @@ typedef struct {
 static bool    s_enabled;
 static int     s_attached;
 static int     s_queue_dropped;   // BFS refusals this call; must stay zero (see the CAP note)
-static uint8_t s_luminance[256];  // all zeros: no block in the registry emits yet
+// One entry per id in the WHOLE registry id space, core and dynamic alike — not
+// BLOCK_COUNT entries. All zeros today: no block emits yet.
+static uint8_t s_luminance[REGISTRY_MAX];
 
 // The six in-column neighbour offsets, shared by both engines.
 static const int8_t kDirs[6][3] = {
@@ -151,9 +154,22 @@ static void heightMapFill(HeightMap* hm, const Chunk* const chunks[COLUMN_CHUNKS
 	}
 }
 
+// v1.6.0: the bound is REGISTRY_MAX, not BLOCK_COUNT. The table has always been the full
+// id space wide, but this scan stopped at the 8 compiled-in core rows, so a luminance set
+// on a server-registered id (0x80..0xFD) read back as "nothing in this world glows" and
+// both engines skipped the block-light pass entirely — the emitter would have been dark.
+// Dormant until a dynamic block declares luminance, and free either way. It is called
+// exactly ONCE per lightFloodColumn/lightRelightColumn and never inside their cell loops
+// (32768 cells per sweep, several sweeps), and neither of those runs per frame — the
+// callers are one block edit (main.c, scene/interact.c) and one generated/loaded column on
+// the worker thread (app/worker.c). Measured on the host at -O1: the scan costs 79.1 ns at
+// 256 entries against 0.3 ns at 8, i.e. 78.7 ns added once, to a lightRelightColumn that
+// takes 720.1 us — 0.011% of the call it gates. Scaled by instruction count to a 268 MHz
+// ARM11 (248 extra iterations, ~4 instructions each, ~1 IPC) that is roughly 3.7 us per
+// edit, against a relight that is milliseconds there; NOT measured on hardware.
 static bool anyLuminance(void)
 {
-	for (int i = 0; i < BLOCK_COUNT; i++)
+	for (int i = 0; i < REGISTRY_MAX; i++)
 		if (s_luminance[i]) return true;
 	return false;
 }

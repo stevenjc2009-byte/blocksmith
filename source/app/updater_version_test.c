@@ -160,6 +160,37 @@ static void testBuildAssetName(void)
 	CHECK(!strcmp(name, "blocksmith1.2.3.cia"));
 }
 
+// ── updaterBuildNotesName (v1.6.0 task 14b) ───────────────────────────────────────────
+
+static void testBuildNotesName(void)
+{
+	char name[64];
+
+	updaterBuildNotesName("v1.6.0", name, sizeof(name));
+	CHECK(!strcmp(name, "whatsnew1.6.0.txt"));
+
+	// The "v" is tolerated on either side, exactly as it is for the .cia — the two names
+	// share tagNumber() precisely so this cannot drift.
+	updaterBuildNotesName("1.6.0", name, sizeof(name));
+	CHECK(!strcmp(name, "whatsnew1.6.0.txt"));
+
+	updaterBuildNotesName("V0.1.0", name, sizeof(name));
+	CHECK(!strcmp(name, "whatsnew0.1.0.txt"));
+
+	// The pair a release actually publishes, checked side by side: same tag in, the same
+	// version number out of both.
+	char cia[64];
+	updaterBuildAssetName("v1.6.0", cia, sizeof(cia));
+	updaterBuildNotesName("v1.6.0", name, sizeof(name));
+	CHECK(!strcmp(cia, "blocksmith1.6.0.cia"));
+	CHECK(!strcmp(name, "whatsnew1.6.0.txt"));
+
+	// A NULL tag must leave the buffer alone rather than formatting "(null)" into a URL.
+	snprintf(name, sizeof(name), "untouched");
+	updaterBuildNotesName(NULL, name, sizeof(name));
+	CHECK(!strcmp(name, "untouched"));
+}
+
 int main(void)
 {
 	testParseForms();
@@ -169,6 +200,7 @@ int main(void)
 	testCompareMalformedNeverWins();
 	testTagFromRedirect();
 	testBuildAssetName();
+	testBuildNotesName();
 
 	if (s_fails == 0)
 		printf("updater_version self-test: PASS  %d checks\n", s_checks);

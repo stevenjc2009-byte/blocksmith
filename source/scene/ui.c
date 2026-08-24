@@ -161,8 +161,13 @@ static void handleCraftTap(Inventory* inv, int recipe_index)
 // atlasTile) already returns texture-space pixel bounds with the top/bottom flip applied —
 // see atlas_uv.h's own comment: r.v1 is the art's top edge, r.v0 its bottom, both already in
 // the "v grows upward" space gfx/sprite.h's spriteQuad wants. So converting to the 0..1 UVs
-// spriteQuad takes is just a divide by ATLAS_PX; nothing here re-derives the flip the way
-// gfx/font.c has to for its own top-down cell table.
+// spriteQuad takes is just a divide by the sheet size; nothing here re-derives the flip the
+// way gfx/font.c has to for its own top-down cell table.
+//
+// The sheet is a 16x256 strip since v1.6.0, so U and V divide by DIFFERENT numbers — u by
+// ATLAS_W_PX (16), v by ATLAS_H_PX (256). Every icon's u therefore spans the full 0..1, which
+// is fine under the GPU_REPEAT wrap gfx/atlas.c now sets in U: a quad's texel centres
+// interpolate strictly inside (0,1) and never land on the wrapping endpoint itself.
 //
 // FACE_TOP is used for every block's icon — grass shows its green top, wood shows its ring
 // pattern, and every other block in this game's six-block list (world/block.h) is the same
@@ -171,10 +176,10 @@ static void handleCraftTap(Inventory* inv, int recipe_index)
 static void iconUv(BlockId id, float* u0, float* v0, float* u1, float* v1)
 {
 	const AtlasRect r = atlasTile(blockFaceTex(id, FACE_TOP));
-	*u0 = (float)r.u0 / (float)ATLAS_PX;
-	*v0 = (float)r.v1 / (float)ATLAS_PX;   // quad's top edge samples the art's top row
-	*u1 = (float)r.u1 / (float)ATLAS_PX;
-	*v1 = (float)r.v0 / (float)ATLAS_PX;   // quad's bottom edge samples the art's bottom row
+	*u0 = (float)r.u0 / (float)ATLAS_W_PX;
+	*v0 = (float)r.v1 / (float)ATLAS_H_PX;   // quad's top edge samples the art's top row
+	*u1 = (float)r.u1 / (float)ATLAS_W_PX;
+	*v1 = (float)r.v0 / (float)ATLAS_H_PX;   // quad's bottom edge samples the art's bottom row
 }
 
 // ── Slots ──────────────────────────────────────────────────────────────────────────────

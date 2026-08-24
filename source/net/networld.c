@@ -100,19 +100,111 @@ static NetworldPlayerMeters s_player_meters;
 // them and the INFO — but it is what makes sending FETCH legitimate at all.
 static bool s_have_registry_info;
 
-// True when the compiled-in table provably matches the server's (INFO rev+count+crc16 all
-// agree) or the last batch of a fetch has been applied. Diagnostic today; nothing branches on
-// it yet, but it is the honest answer to "can this client trust its own table" and costs one
-// byte. Reset by networldInit() like every other per-session static.
+// True when this client's table provably matches the fingerprint the server sent — INFO
+// rev + count + crc16 all reproduced against the table as it stands right now. That is the
+// WHOLE meaning of this flag and the only thing that may set it; see registryMatchesInfo()
+// below for the one function that decides it.
+//
+// It used to also be set by the LAST flag of a BS_APP_REGISTRY_DEFS batch, i.e. by "the
+// server says that was all" rather than by any property of the table. The server sends such
+// a batch unconditionally — deps/blocksmith-server/game/bsgame.c emits an empty final batch
+// even with nothing to say — so four bytes carrying no records could set it. A client whose
+// data batch was lost in the UDP then declared itself synced with a core-only table, which
+// disarmed the retry below (registryFetchTick() gives up the moment this is true), released
+// the entry gate, and left every server-defined block an air hole for the rest of the
+// session with no degraded marker anywhere on screen. Reset by networldInit() like every
+// other per-session static.
+//
+// Since v1.6.0 task 8 it is load-bearing rather than diagnostic: networldRegistryWaiting()
+// below is what holds world entry open until it is settled, which is the only thing that
+// stops main.c's registryFreeze() from slamming shut before the server's DEFS have had a
+// round trip to arrive in.
+//
+// When it stays false the client is DEGRADED, deliberately and documentedly: an id the table
+// has no row for resolves through registryView()'s never-NULL contract to the air row, so an
+// unsynced dyn block is a hole in the world rather than a crash or a wrong block. That is a
+// designed fallback, not an accident — see networld.h's own comment on
+// networldRegistrySynced() for what a caller is expected to do about it.
 static bool s_reg_synced;
 
-// One FETCH per session: if the server's reply batches are lost or reordered, re-asking from a
-// timer is future work, not something this client improvises inside a decoder.
+// True once this session has sent its first BS_APP_REGISTRY_FETCH. Doubles as the retry's arming
+// flag: it can only ever be set from applyRegistryInfo(), i.e. only after a well-formed INFO,
+// which is what keeps the old-server invariant (a server that never speaks registry never
+// receives a FETCH) true for the retries as well as for the first send.
 static bool s_sent_fetch;
+
+// The server's own fingerprint for its table, retained from the last well-formed
+// BS_APP_REGISTRY_INFO. applyRegistryInfo() used to compare these three against the local
+// table and then drop them on the floor, which is why nothing could re-check the table once
+// a fetch had actually delivered something: "synced" degenerated into "the server said that
+// was all". Meaningful only while s_have_registry_info is true — that flag is what
+// networldInit() clears to make a previous session's fingerprint unreachable, the same way
+// s_have_inv_state does for s_last_inv_state.
+static uint8_t  s_reg_info_rev;
+static uint8_t  s_reg_info_count;
+static uint16_t s_reg_info_crc;
+
+// The single question s_reg_synced is an answer to: does the table, as it stands at this
+// instant, reproduce the fingerprint the server named?
+//
+// Recomputed rather than remembered, because everything it reads can move under it — a DEFS
+// batch commits rows, and networldInit() puts the table back to the core rows. Cheap enough
+// to be called from the two decoders that can change either side of the comparison
+// (applyRegistryInfo, registryApplyRemote) and deliberately NOT from the frame pump, which
+// would run registryCrc16() over the whole table sixty times a second for no new information.
+//
+// No INFO means no fingerprint, so nothing can be proved and the answer is no. That is also
+// what keeps an unsolicited DEFS batch from a server that never sent an INFO — the one case
+// the old LAST-flag test accepted outright — from being able to claim a verified table.
+static bool registryMatchesInfo(void)
+{
+	if (!s_have_registry_info) return false;
+	return s_reg_info_rev   == REGISTRY_REV
+	    && s_reg_info_count == registryCount()
+	    && s_reg_info_crc   == registryCrc16();
+}
+
+// ---- FETCH retry (v1.6.0 task 8) ----------------------------------------------------------
+// One FETCH was not enough. The reply is UDP: a single lost DEFS batch left the client with a
+// permanently degraded table for the whole session, and nothing ever asked again. The retry is
+// bounded in BOTH dimensions on purpose — a client that keeps asking forever is a client that
+// hammers a server which has already decided not to answer.
+//
+//   attempts: NETWORLD_REG_FETCH_MAX_SENDS total sends, first one included
+//   time:     nothing is sent past NETWORLD_REG_SYNC_DEADLINE_MS after the join
+//
+// It is driven from networldUpdate(), the frame pump, and never from inside a decoder — see
+// sendRegistryFetch()'s own comment further down for why a decoder is the wrong place for it.
+//
+// The four numbers themselves live in networld.h next to NETWORLD_POSE_INTERVAL_MS and
+// NETWORLD_REMOTE_TIMEOUT_MS, for the reason those two are there: a timing bound that no test
+// can name is a timing bound no test can prove, and networld_test.c drives all of these
+// against its own fake clock.
+
+// How many FETCHes have gone out this session (the first one counts), and when the last one did.
+static uint8_t  s_reg_fetch_sends;
+static uint64_t s_reg_fetch_last_ms;
+
+// When BS_APP_WORLD_INFO landed — the instant the registry question becomes askable, and the
+// origin both bounds above are measured from. "armed" is separate from the value for the same
+// reason s_pose_sent_once is separate from s_last_pose_send_ms: bsSockNowMs()'s epoch is
+// arbitrary, so 0 is a time it can legitimately return rather than a sentinel for "unset".
+static uint64_t s_reg_gate_ms;
+static bool     s_reg_gate_armed;
 
 // Forward declaration: applyRegistryInfo() answers an INFO mismatch with a FETCH, and the
 // senders live further down this file with every other encoder.
 static void sendRegistryFetch(uint8_t first_index);
+
+// Starts the registry clock, at whichever of BS_APP_WORLD_INFO / BS_APP_REGISTRY_INFO this
+// session hears first. Armed once: a retransmitted packet must not silently extend either
+// bound, or a chatty server could hold the client on the title screen indefinitely.
+static void registryGateArm(void)
+{
+	if (s_reg_gate_armed) return;
+	s_reg_gate_armed = true;
+	s_reg_gate_ms    = bsSockNowMs();
+}
 
 // The single place an applied edit is announced. Called only after the block is really in the
 // world — never for one that is merely queued, which would tell the renderer to rebuild a mesh
@@ -271,6 +363,11 @@ static void applyWorldInfo(const uint8_t* msg, size_t len)
 
 	s_world_seed      = bs_get_u32(msg + 1);
 	s_have_world_seed = true;
+
+	// v1.6.0 task 8: WORLD_INFO is the join's own timestamp as far as the registry is
+	// concerned — the server sends REGISTRY_INFO immediately behind it, so this is the
+	// instant from which "how long have we waited for the table" is measured.
+	registryGateArm();
 }
 
 // BS_APP_INV_STATE: the whole inventory, authoritative, exactly BS_INV_STATE_BYTES or dropped
@@ -362,6 +459,21 @@ static void applyPlayerState(const uint8_t* msg, size_t len)
 // ever travel. The FETCH goes out here, immediately: at join time this lands right after
 // WORLD_INFO, long before any server column can generate or mesh, which is the ordering slot
 // that makes "apply before generating" free (bs_proto.h's REGISTRY_INFO comment).
+// Where a FETCH must ask from: the lowest dyn id this table still has no row for.
+//
+// Derived from the registry every time rather than remembered here, because a RETRY after a
+// partially delivered fetch has to ask for what is actually still missing. registryRemoteApply()
+// refuses any batch whose first id is not the table's own next free slot (world/registry.c: a
+// batch that starts anywhere else is a tampered or reordered stream), so re-asking from
+// REG_ID_DYN_LO once two rows had already landed would be refused for the rest of the session
+// and the retry would achieve nothing at all.
+static uint8_t registryFetchIndex(void)
+{
+	for (int id = REG_ID_DYN_LO; id <= REG_ID_DYN_HI; id++)
+		if (!registryIsDefined((BlockId)id)) return (uint8_t)id;
+	return REG_ID_DYN_LO;   // dyn space full: nothing is missing, the value is moot
+}
+
 static void applyRegistryInfo(const uint8_t* msg, size_t len)
 {
 	if (len != BS_APP_REGISTRY_INFO_BYTES) return;
@@ -369,20 +481,54 @@ static void applyRegistryInfo(const uint8_t* msg, size_t len)
 	// Armed before any content decision, exactly like applyInvState(): a malformed INFO is
 	// dropped without arming, but a well-formed one proves the server speaks registry at all.
 	s_have_registry_info = true;
+	registryGateArm();
 
-	const uint8_t  rev   = msg[1];
-	const uint8_t  count = msg[2];
-	const uint16_t crc   = bs_get_u16(msg + 3);
+	// Retained, not just compared: registryApplyRemote() below re-checks the table against
+	// these three once a batch has landed, which is the only way "synced" can mean anything
+	// after a fetch rather than only before one.
+	s_reg_info_rev   = msg[1];
+	s_reg_info_count = msg[2];
+	s_reg_info_crc   = bs_get_u16(msg + 3);
 
-	if (rev == REGISTRY_REV && count == registryCount() && crc == registryCrc16()) {
+	if (registryMatchesInfo()) {
 		s_reg_synced = true;
 		return;
 	}
 
 	if (!s_sent_fetch) {
-		s_sent_fetch = true;
-		sendRegistryFetch(REG_ID_DYN_LO);
+		s_sent_fetch        = true;
+		s_reg_fetch_sends   = 1;
+		s_reg_fetch_last_ms = bsSockNowMs();
+		sendRegistryFetch(registryFetchIndex());
 	}
+}
+
+// The bounded retry. Called from networldUpdate() once per frame, AFTER the receive drain, so
+// a batch that arrived this frame has already been applied and can cancel the next attempt.
+//
+// Deliberately not called from a decoder. The senders in this file are reached from decoders
+// only where the decode itself is the trigger (applyRegistryInfo()'s first FETCH), and a retry
+// is the opposite of that: it fires precisely because nothing arrived, so hanging it off an
+// arriving packet would make it fire on the traffic of unrelated message types and never fire
+// at all on a session that has gone quiet — which is the only session that needs it.
+static void registryFetchTick(void)
+{
+	// The old-server invariant, restated at the one new place that could break it: s_sent_fetch
+	// is set only by applyRegistryInfo(), only after a well-formed BS_APP_REGISTRY_INFO. A
+	// server that never speaks registry never sets it and therefore never receives a retry,
+	// exactly as it never receives the first send.
+	if (!s_sent_fetch) return;
+	if (s_reg_synced)  return;   // the table is settled; nothing left to ask for
+
+	if (s_reg_fetch_sends >= NETWORLD_REG_FETCH_MAX_SENDS) return;   // attempt bound
+
+	const uint64_t now = bsSockNowMs();
+	if (now - s_reg_gate_ms >= (uint64_t)NETWORLD_REG_SYNC_DEADLINE_MS) return;  // time bound
+	if (now - s_reg_fetch_last_ms < (uint64_t)NETWORLD_REG_FETCH_RETRY_MS) return;
+
+	s_reg_fetch_sends++;
+	s_reg_fetch_last_ms = now;
+	sendRegistryFetch(registryFetchIndex());
 }
 
 // BS_APP_REGISTRY_DEFS: one batch of consecutive dynamic defs {first u8, n u8, last u8,
@@ -397,13 +543,29 @@ static void applyRegistryInfo(const uint8_t* msg, size_t len)
 //
 // A refused batch (duplicate, gap, out-of-range) is dropped whole and s_reg_synced stays
 // false — degraded but safe: unknown ids keep answering air through blockInfo()'s contract.
+//
+// The wire's LAST flag (msg[3]) is deliberately not read at all. It says the SERVER has
+// finished talking, which is a fact about the server and not about this table, and treating
+// it as the end of the sync is exactly what made an empty terminating batch — which bsgame
+// sends unconditionally — able to fake a completed one. What settles the question instead is
+// registryMatchesInfo(): re-run the fingerprint after every batch that changed the table, and
+// let a mismatch leave s_reg_synced false so the bounded retry above stays armed and asks
+// again from registryFetchIndex(), the first id the table is actually still missing.
+//
+// Re-evaluated on every batch rather than only on the last one, which also buys the reverse
+// case for free: a delivery whose terminator was the packet that got lost still verifies the
+// instant its final rows land, instead of leaving a complete, correct table marked degraded.
+//
+// It is an assignment rather than an |=, so a batch that arrives after the table has been
+// frozen (main.c's genStart(), after which world/registry.c refuses every row for the rest of
+// the session) cannot leave the degraded indicator reading healthy at the one moment recovery
+// has become impossible.
 static void registryApplyRemote(const uint8_t* msg, size_t len)
 {
 	if (len < BS_APP_HDR_BYTES + 3u) return;
 
 	const uint8_t first = msg[1];
 	const uint8_t n     = msg[2];
-	const uint8_t last  = msg[3];
 
 	if ((size_t)BS_APP_REGISTRY_DEFS_BYTES(n) != len) return;
 	if (n > BS_APP_REGISTRY_DEFS_MAX_N)               return;
@@ -413,7 +575,7 @@ static void registryApplyRemote(const uint8_t* msg, size_t len)
 		mesherInvalidateTables();
 	}
 
-	if (last & 0x01u) s_reg_synced = true;
+	s_reg_synced = registryMatchesInfo();
 }
 
 // BS_APP_CHUNK_DIFFS: one column's worth of diffs, batched. Same per-entry shape as
@@ -619,6 +781,30 @@ void networldInit(void)
 	s_have_registry_info = false;
 	s_reg_synced         = false;
 	s_sent_fetch         = false;
+	s_reg_info_rev       = 0;
+	s_reg_info_count     = 0;
+	s_reg_info_crc       = 0;
+	s_reg_fetch_sends    = 0;
+	s_reg_fetch_last_ms  = 0;
+	s_reg_gate_armed     = false;
+	s_reg_gate_ms        = 0;
+
+	// v1.6.0 task 8: and the TABLE itself, not just the flags that describe it. The dynamic
+	// rows above REG_ID_DYN_LO were installed by one server's REGISTRY_DEFS; leaving them
+	// standing meant the next server's batch was refused outright (registryRemoteApply()
+	// requires a batch to start at the table's next free slot, and the first server had
+	// already moved it), so the second session of a boot ran with the FIRST server's blocks
+	// under the second server's ids. Everything else per-session in this function is cleared
+	// here, and the table is per-session in exactly the same way.
+	//
+	// Ordering, which is what makes this safe: main.c calls netDisconnect() — the one thing
+	// that reaches networldInit() mid-run — only after workerStop() has joined the worker and
+	// worldExit() has run, so no thread is reading the table when it is rebuilt. The one
+	// exception is app/sleep.c's lid-close leave hook, which disconnects with the worker
+	// still alive; that path tears the world down on the next frame anyway, and a worker that
+	// meshes against a core-only table in the meantime draws air, which is the same degraded
+	// answer an unsynced table gives everywhere else in this file.
+	registryInitCore();
 
 	s_last_pose_send_ms = 0;
 	s_pose_sent_once    = false;
@@ -662,6 +848,11 @@ void networldUpdate(void)
 		if (n <= 0) break;
 		networldApplyPayload(buf, (size_t)n);
 	}
+
+	// After the drain, never before it: a DEFS batch that arrived this frame has already been
+	// applied by the loop above, so a fetch that has just completed cancels the retry instead
+	// of racing it out onto the wire one last time.
+	registryFetchTick();
 }
 
 // blockdiffDrain()'s apply callback (net/blockdiff.h): one already-recorded, already-valid
@@ -719,11 +910,17 @@ bool networldSendInvAction(uint8_t op, uint8_t a, uint8_t b, uint8_t c)
 	return netTransportSend(out, sizeof out);
 }
 
-// The registry counterpart of the capability probe above: applyRegistryInfo() only calls this
-// after a well-formed INFO has arrived, so an old server — one that never speaks registry —
-// never receives this C->S type and never has reason to kick us for it. Fire-and-forget like
-// every sender in this file; if the reply batches are lost the client stays degraded (unknown
-// ids answer air) rather than retrying from inside a decoder.
+// The registry counterpart of the capability probe above, and the invariant this whole feature
+// hangs on: the ONLY two callers are applyRegistryInfo() and registryFetchTick(), and both are
+// reachable only once a well-formed BS_APP_REGISTRY_INFO has arrived — the first directly, the
+// second through s_sent_fetch, which nothing else sets. So an old server — one that never
+// speaks registry — never receives this C->S type and never has reason to kick us for it. Do
+// not add a third caller without carrying that check with it.
+//
+// Fire-and-forget on the wire like every sender in this file. What changed in v1.6.0 task 8 is
+// that a lost reply is no longer permanent: registryFetchTick() re-asks up to
+// NETWORLD_REG_FETCH_MAX_SENDS times within NETWORLD_REG_SYNC_DEADLINE_MS, driven by the frame
+// pump rather than from inside a decoder (see that function for why the distinction matters).
 static void sendRegistryFetch(uint8_t first_index)
 {
 	uint8_t out[BS_APP_REGISTRY_FETCH_BYTES];
@@ -760,6 +957,38 @@ bool networldWorldSeed(uint32_t* out)
 	if (!s_have_world_seed) return false;
 	if (out) *out = s_world_seed;
 	return true;
+}
+
+bool networldRegistrySynced(void)
+{
+	return s_reg_synced;
+}
+
+// See networld.h for the contract. The whole point of this function is that world entry —
+// and therefore main.c's registryFreeze(), which is what makes a dynamic row uncommittable
+// forever after — has something to wait on. Both arms are bounded, so a caller that spins on
+// this is guaranteed to be let through.
+bool networldRegistryWaiting(void)
+{
+	// Not joined at all: single player, or a session that has not reached WORLD_INFO. Nothing
+	// to wait for, and in particular a single-player boot must never be delayed by this.
+	if (!s_reg_gate_armed) return false;
+
+	// Settled: either the compiled-in table already matched the server's fingerprint, or the
+	// last DEFS batch of a fetch has been applied.
+	if (s_reg_synced) return false;
+
+	const uint64_t waited = bsSockNowMs() - s_reg_gate_ms;
+
+	// No INFO heard yet gets only the short grace, not the full deadline: a pre-v1.6.0 server
+	// never sends one at all, and stalling every join against an old server for two seconds to
+	// wait for a packet that does not exist would be a regression the player can feel.
+	if (!s_have_registry_info) return waited < (uint64_t)NETWORLD_REG_INFO_GRACE_MS;
+
+	// INFO heard and still not synced: the fetch is in flight (or being retried). Wait out the
+	// deadline, then give up and let the caller in degraded — a hole in the world beats a
+	// title screen that never ends.
+	return waited < (uint64_t)NETWORLD_REG_SYNC_DEADLINE_MS;
 }
 
 // See networld.h's own comment on this pair: the pose accessors hand the retained join

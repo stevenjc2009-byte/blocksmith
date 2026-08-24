@@ -273,6 +273,63 @@ void networldUnsubscribeColumn(int col_x, int col_z);
 // own, which is why the seed comes back through an out-parameter.
 bool networldWorldSeed(uint32_t* out);
 
+// ---- block registry sync (v1.6.0) ---------------------------------------------------------
+//
+// True when this client's block table provably agrees with the server's, and "provably" is meant
+// literally: the join-time BS_APP_REGISTRY_INFO fingerprint (table revision + defined-row count
+// + crc16 over the canonical table stream) is retained, and this is true exactly while the table
+// as it stands reproduces all three. It is established by recomputing registryCount() and
+// registryCrc16() — when the INFO arrives, and again after every BS_APP_REGISTRY_DEFS batch.
+//
+// It is deliberately NOT established by the LAST flag on a DEFS batch. The server sends an empty
+// terminating batch unconditionally, so that flag can arrive with nothing applied at all — a
+// data batch lost in the UDP, or a fingerprint mismatch the server has no dynamic rows to answer
+// with — and taking it as proof left this client insisting the sync had succeeded while every
+// server-defined block was an air hole. The flag says the server has finished talking; only the
+// fingerprint says the table is right. One consequence worth knowing: a delivery whose
+// terminator is the packet that gets lost still comes out synced, because the table is what is
+// checked and by then the table is correct.
+//
+// False is a real, supported, DEGRADED state, not an error: a block id with no row in the table
+// resolves through registryView()'s never-NULL contract to the air row, so a dynamic block this
+// client never learned about is a hole in the world rather than a crash or a wrong block. Ids
+// are stored raw either way (see editValid() in networld.c), so the hole fills itself in the
+// instant the definitions do arrive. Always false in single player and against a pre-v1.6.0
+// server, neither of which has a server table to agree with — so a caller must read this as
+// "is the multiplayer table trustworthy", never as "may I draw the world".
+bool networldRegistrySynced(void);
+
+// True while world entry should be held open for the registry to settle, and the reason this
+// pair exists at all. main.c's registryFreeze() (in genStart) makes the table permanently
+// read-only, and BS_APP_REGISTRY_DEFS arrive a round trip behind the BS_APP_WORLD_INFO seed
+// that scene/title.c enters the world on — so entering the instant the seed landed froze the
+// table before a single dynamic row could ever be committed, in every session, forever.
+//
+// Bounded in every arm, so a caller that spins on this is guaranteed to be let through:
+//   * never armed (single player, or pre-WORLD_INFO)  -> false immediately
+//   * synced                                          -> false immediately
+//   * joined but no INFO heard (old server)           -> false after a short grace
+//   * INFO heard, fetch still outstanding             -> false at the sync deadline
+// Falling through either of the last two leaves networldRegistrySynced() false, which is the
+// documented degraded state above rather than a failure to report.
+bool networldRegistryWaiting(void);
+
+// The bounds behind both functions above, driven off bsSockNowMs(). They are here rather than
+// private to networld.c for the same reason NETWORLD_POSE_INTERVAL_MS is: a timing bound no
+// test can name is a timing bound no test can prove, and net/networld_test.c exercises every
+// one of these against a fake clock.
+//
+//   RETRY_MS       gap between one BS_APP_REGISTRY_FETCH and the next
+//   MAX_SENDS      total FETCHes per session, the first one included (the attempt bound)
+//   SYNC_DEADLINE  how long after the join the registry question stays open (the time bound)
+//   INFO_GRACE     the much shorter wait for BS_APP_REGISTRY_INFO itself. A pre-v1.6.0 server
+//                  never sends one, and stalling every join against one for the full deadline
+//                  to wait for a packet that does not exist is a regression the player feels.
+#define NETWORLD_REG_FETCH_RETRY_MS    250
+#define NETWORLD_REG_FETCH_MAX_SENDS   4
+#define NETWORLD_REG_SYNC_DEADLINE_MS  2000
+#define NETWORLD_REG_INFO_GRACE_MS     250
+
 // Diagnostics, mirroring net/blockdiff.h's own counters — this module owns the store
 // privately, so a HUD or log line reaches these instead of the store directly.
 int networldPendingCount(void);

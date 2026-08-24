@@ -15,7 +15,8 @@
 // installed once and meshes are built, never unbuilt — so this is monotone, which is what
 // makes "unchanged for N frames" mean "stopped" rather than "went backwards". The 4096
 // multiplier is just wide enough that no plausible mesh count can carry into the column
-// term: the pool holds 150 slots at RENDER_DIST_MAX.
+// term: the pool holds 294 slots at RENDER_DIST_MAX (150 before v1.6.0 task 12 raised the
+// ceiling to 3), so the multiplier still has more than an order of magnitude of headroom.
 static long progressOf(const LoadingSample* s)
 {
 	return (long)s->columns_in * 4096L + (long)s->meshes;

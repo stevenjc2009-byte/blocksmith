@@ -53,6 +53,15 @@ void bodyInit(Body* b, float x, float y, float z)
 	b->on_ground = false;
 }
 
+// blockIsSolid, and that is the whole of v1.6.0 task 13's collision story: nothing here
+// changed and nothing here should. The task split "what shape is drawn" away from "what
+// fills a cell" precisely so that collision could stay a question about `solid` alone —
+// a cross-shaped plant is registered non-solid, so the box walks through it here for the
+// same reason it walks through air, with no shape test in the hot triple loop below.
+//
+// Every solid block is still a full 1.0 cube (see tryStepUp), so the AABB test remains
+// exact. A shape that is solid AND smaller than its cell — a slab, a stair — is the case
+// that would need a real per-shape box here, and it does not exist yet.
 bool bodyBlocked(const World* w, float x, float y, float z)
 {
 	const float half = PLAYER_WIDTH * 0.5f;

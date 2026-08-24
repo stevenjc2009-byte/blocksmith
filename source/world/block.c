@@ -11,6 +11,20 @@ const BlockInfo* blockInfo(BlockId id)
 	return registryView(id);
 }
 
+// "Has a row and is not air." registryIsDefined() rather than a name or tile test,
+// because blockInfo() maps every undefined id onto the air view — so reading the view
+// alone cannot tell an undefined id apart from air, and the mesher must treat both the
+// same way it always has: emit nothing.
+bool blockIsDrawn(BlockId id)
+{
+	return id != BLOCK_AIR && registryIsDefined(id);
+}
+
+bool blockIsTargetable(BlockId id)
+{
+	return blockIsDrawn(id) && !blockInfo(id)->liquid;
+}
+
 uint8_t blockFaceTex(BlockId id, int face)
 {
 	const BlockInfo* info = blockInfo(id);

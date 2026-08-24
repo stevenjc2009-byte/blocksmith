@@ -58,6 +58,16 @@ RayHit worldRaycast(const World* w, float ox, float oy, float oz,
 	// Starting inside a wall is a real situation — the camera clipping into terrain —
 	// and the honest answer is "this block, no face", not a guessed face that the ray
 	// never actually crossed.
+	//
+	// blockIsSolid and NOT blockIsTargetable, deliberately, and this is the half of
+	// v1.6.0 task 13's raycast change that is about what not to do. The rule here is "the
+	// camera is stuck inside something", which only a block that fills its cell can do.
+	// Widening it to everything targetable would mean that standing in a patch of tall
+	// grass — a block the player walks straight through — returns a zero-distance hit on
+	// the camera's own cell every frame, with no entry face, and nothing else could be
+	// aimed at until they stepped out of it. The cost is that the one cell the camera is
+	// already inside cannot be broken from inside it; the walk below starts testing at
+	// the first boundary crossing, so every other cell is reachable exactly as before.
 	if (blockIsSolid(worldGet(w, x, y, z))) {
 		return (RayHit){ .hit = true, .x = x, .y = y, .z = z,
 		                  .face = RAY_FACE_NONE, .px = x, .py = y, .pz = z,
@@ -123,7 +133,17 @@ RayHit worldRaycast(const World* w, float ox, float oy, float oz,
 			face = step_z > 0 ? FACE_NORTH : FACE_SOUTH;
 		}
 
-		if (blockIsSolid(worldGet(w, x, y, z))) {
+		// blockIsTargetable, not blockIsSolid (v1.6.0 task 13). What stops a ray is not
+		// what stops a body: a plant is walked through and still has to be breakable, or
+		// it is scenery that can never be removed. Identical to blockIsSolid for every
+		// block in the registry as it stands — all of them are solid, none is a liquid —
+		// so nothing about aiming at terrain changes.
+		//
+		// The whole cell is the target, not the two quads inside it. A cross fills its
+		// cell's footprint horizontally and reaching only the X itself would mean a DDA
+		// that tests geometry instead of cells, which is a much larger change than the
+		// thing it buys (aiming through the corner of a plant).
+		if (blockIsTargetable(worldGet(w, x, y, z))) {
 			return (RayHit){ .hit = true, .x = x, .y = y, .z = z,
 			                  .face = face, .px = px, .py = py, .pz = pz,
 			                  .distance = t };

@@ -4,6 +4,126 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.6.0] - 2026-08-24
+
+Finishes the master block registry and rebuilds the rendering foundation underneath it.
+
+1.5.1 shipped the registry module dormant — it spoke only to a server that volunteers
+`REGISTRY_INFO`, and no released server did. **blocksmith-server 1.6.0 does.** So this is the
+release where a server-defined block actually becomes a thing you can see, stand on and build
+with, and consequently the release where every place that quietly assumed there are exactly
+eight block types had to be found and fixed. Several of those were live defects rather than
+hypotheticals; each is listed below by what it did, not by what it was.
+
+### Added
+
+- **Server-defined blocks work end to end.** `bsEditValid()` on the server now admits the whole
+  dynamic range `REG_ID_DYN_LO..REG_ID_DYN_HI` (0x80..0xFD) instead of stopping at the eight
+  compiled-in core ids, matching the ceiling the client has always used. Placement, replication
+  and the persisted diff store all carry dynamic ids now.
+- **A bounded registry sync on join.** The client holds world entry open behind a
+  "Joined - syncing block table..." row while `REGISTRY_DEFS` land, retrying a `FETCH` up to four
+  times at 250 ms with a 2000 ms deadline, and resuming from the first id it is actually missing.
+  Both clock-failure directions release the player rather than trapping them — `osGetTime()` is a
+  wall clock that can step backwards, and a lid-close sleep can jump it forwards.
+- **Non-cube block geometry.** Shape is carried in the top three bits of the existing
+  `BlockDef.flags` byte, so `sizeof(BlockDef)` stays 27, the wire record stays 28 bytes, and the
+  DEFS packet, `registry.bin` and the pinned core CRC-16 `0x7E5B` are all unchanged — nothing
+  under `source/net/` needed editing. `BLOCK_SHAPE_FULL_CUBE` is 0, so every existing definition
+  keeps its meaning. Cross-shaped blocks neither cast ambient occlusion nor cull their
+  neighbours' faces, and the raycast treats them as targetable without treating them as walls.
+- **Greedy face merging along the texture's U axis.** Co-planar faces of the same block merge
+  into one quad when all four corners of every face share identical AO *and* identical light —
+  the strictly lossless condition, since four equal corners interpolate to a constant. Measured
+  **15.8% / 17.4% / 21.3%** fewer quads on seeds 1337 / 4242 / 90210 at render radius 3. Runs cap
+  at 15 blocks and stop at chunk edges.
+- **Render distance can reach radius 3.** The mesh pool is re-cut to 158 small / 120 medium /
+  16 large slots (294 total, 7.24 MB, +3.00 MB), sized against 9,000 measured columns and 37,682
+  chunk meshes rather than against a formula. **The New 3DS default deliberately stays at 2** —
+  raising a ceiling is opt-in and one shoulder-press reversible, while raising a default would
+  make every console's first boot the experiment, and radius 3 has never run on hardware.
+- **A "what's new" screen in the updater.** When Options → Check for Update finds a newer
+  release, the top screen shows a short plain-English changelog for the version about to be
+  downloaded — features added, then bugs fixed — scrollable with D-pad up/down and carrying a
+  proportional scrollbar so it is visibly scrollable. The text comes from a
+  `whatsnew<version>.txt` asset on the release, fetched from the same predictable
+  `releases/download/v<ver>/…` path the `.cia` uses. Never from `api.github.com`, which is 60
+  unauthenticated requests per hour per IP and shared, and never from the release body, which the
+  redirect cannot see. Every failure mode — 404, timeout, DNS failure, empty file, garbage —
+  falls through to "No change notes for this version." and the download proceeds.
+
+### Fixed
+
+- **A completed registry sync was never actually verified.** `s_reg_synced` was set by any DEFS
+  packet carrying the LAST bit, outside the branch that applies rows — so the empty terminating
+  batch the server always sends declared the sync finished without applying anything, without
+  checking that the batch started where it should, and without checking whether the table had
+  already been frozen. A dropped data packet or a revision mismatch therefore produced a
+  core-only table that reported itself healthy, with the retry disarmed. It now means what it
+  claims: `rev`, `count` and a recomputed CRC-16 must all match the fingerprint the server sent.
+  A complete delivery whose terminator is lost now verifies anyway, because verification no
+  longer depends on any single packet arriving.
+- **Playing single-player, backing out to the title and joining a server broke that server's
+  blocks.** `registryFreeze()` runs in single player too, and only `registryInitCore()` clears
+  it, which the quit-to-title path never called — so the table stayed frozen and refused every
+  batch the server sent, leaving its blocks as invisible holes for the whole session. Rebooting
+  fixed it, which made it look intermittent. The reset now lives at the top of the session loop,
+  so any future exit path gets it for free. **The same bug had a second, unreported half:**
+  loading a different single-player world after backing out ran it on the first world's block
+  definitions.
+- **Mining a server-defined block deleted it.** The cell was cleared before the inventory add was
+  attempted, and the add then refused on the same eight-id ceiling — so the block vanished from
+  the world for every player, with nothing to show for it. A block that cannot be carried now
+  cannot be broken, guarded before anything is mutated and before the edit is sent.
+- **A chunk whose mesh job was refused was never re-queued.** The column was marked queued
+  *before* the push, so a full job queue left a permanent hole that no amount of walking would
+  fill. Latent at radius 2 because the ring was exactly the queue's capacity; raising the radius
+  would have made it routine. Now push-then-mark, with a retry flag drained on the next pass.
+  `JOBQ_CAP` also goes 128 → 512 and the horizon-culling column table 40 → 65, both of which the
+  radius-3 ring overran.
+- **Server-registered solid blocks read back see-through.** `visgraph.c`'s open-cell table was
+  filled only for the eight core ids and left every dynamic id at its air prefill.
+- **Pressing B while the block table was still syncing could throw you into the world instead of
+  back to the menu.** Leaving and entering were decided by two independent branches in the same
+  frame; the decision is now a single ordered one in which BACK wins outright.
+- **A glowing server-defined block would never have lit anything** — the lighting pass scanned
+  only the first eight entries of a 256-wide luminance table. Dormant until a server declares
+  one; measured at 0.011% of the relight call it gates.
+- **Persisted edits carrying dynamic ids were dropped again on every server restart**, because
+  the diff store replays each record through the same validator that was rejecting them.
+
+### Changed
+
+- **The texture atlas is now a one-tile-wide vertical strip** — 16 × 256 px, sixteen stacked
+  16×16 slots with no padding, replacing the 128 × 128 sheet of 6 × 6 twenty-pixel cells. This is
+  what makes greedy merging possible at all: `GPU_REPEAT`'s period is the whole texture, so on a
+  packed grid a merged quad samples its neighbour's tile, while on a one-tile strip it repeats
+  correctly. Tile pixels are unchanged, proved per tile by SHA-256. Atlas VRAM drops 32 KB → 8 KB,
+  and `atlasRect()` became divide-free and modulo-free, neither of which the ARM11 has an
+  instruction for.
+- **An unpainted or out-of-range texture id now draws an unmistakable missing-texture marker**
+  rather than silently drawing grass or an opaque near-black square. A wrong texture constant
+  still renders *a* texture, so this class of bug otherwise presents as bad art and never as an
+  error — which has cost this project real time before.
+- `PROTO_COMMIT` re-pinned to blocksmith-server 1.6.0. `git diff` over `proto/` between the old
+  and new pins is empty, so `bs_proto.h` is byte-identical and **this is not a wire change**; the
+  pin moved only so it names a released server rather than an unreleased mid-branch commit.
+
+### Known limitations
+
+- **A server-defined block still cannot be picked up.** The eight-id ceiling remains on *item*
+  ids, which index client-side tables that are genuinely that wide on the console, and the server
+  mirrors it for pickup and consume. Registry-aware inventory is a later, cross-repo change; until
+  then such a block is placeable and unbreakable rather than placeable and destructible.
+- **Only 15 of the atlas's 16 slots are addressable and 10 are painted**, because a mesh vertex
+  stores its V coordinate in a byte. Not a constraint on anything today — the registry protocol
+  has no texture upload, so a server-defined block can only reference a tile the client already
+  ships.
+- **Whether an Old 3DS holds 60 fps at radius 3 is unknown.** It submits roughly 1.9× the
+  triangles of radius 2 before culling. This machine has no GPU and the emulator does not model
+  one, so nothing measured here makes radius 3 safe — it makes it available. That is why the
+  default did not move.
+
 ## [1.5.1] - 2026-08-23
 
 A repair release. Everything here fixes a defect that was live in 1.5.0; there are no

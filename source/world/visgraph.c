@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "world/block.h"
+#include "world/registry.h"
 
 // The fill decomposes a linear chunk index with masks and shifts instead of / and %, because
 // the ARM11 has no divide instruction and this runs up to 4,096 times per chunk build. That
@@ -21,15 +22,23 @@ _Static_assert(CHUNK_DIM == 16, "visgraph.c decomposes chunk indices assuming CH
 // link-time optimisation in this build, so every one of those was a real function call. With
 // the table the first measurement of 749 us per chunk fell to the number in the log.
 //
-// 256 entries, not BLOCK_COUNT, so an out-of-range id needs no branch — blockInfo() answers
-// air for those, and air is open.
-static void openTable(uint8_t out[256])
+// REGISTRY_MAX entries, which is the whole BlockId space (256), so an out-of-range id needs no
+// branch — blockInfo() answers air for an id with no row, and air is open.
+//
+// v1.6.0 task 10: the FILL loop used to stop at BLOCK_COUNT (8), even though the array was
+// already the full 256 wide. That was correct only while 8 was every block there is. With the
+// master registry a server can define dynamic rows from REG_ID_DYN_LO (0x80) up, and every one
+// of them read back the air_open prefill instead of its own def — so a solid dynamic block was
+// see-through to the cave cull, and the chunks behind a wall built out of one were culled away
+// while the wall itself still drew. Walking the whole table asks registryView() the same
+// question for every id it can actually be asked about; ids with no row still answer air,
+// which is exactly what the prefill said, so nothing about the core rows changes.
+// The air_open prefill that used to cover ids BLOCK_COUNT..255 is gone with the short loop: the
+// walk below now writes every entry itself, and blockInfo() already answers air for an id with
+// no row, so the prefill and the loop said the same thing about the same slots.
+static void openTable(uint8_t out[REGISTRY_MAX])
 {
-	const BlockInfo* air = blockInfo(BLOCK_AIR);
-	const uint8_t    air_open = (uint8_t)!(air->solid && !air->transparent);
-
-	for (int i = 0; i < 256; i++) out[i] = air_open;
-	for (int i = 0; i < BLOCK_COUNT; i++) {
+	for (int i = 0; i < REGISTRY_MAX; i++) {
 		const BlockInfo* info = blockInfo((BlockId)i);
 		out[i] = (uint8_t)!(info->solid && !info->transparent);
 	}
@@ -65,7 +74,7 @@ static uint16_t pairsOf(uint8_t bits)
 
 uint16_t visChunkConnectivity(const Chunk* c, VisScratch* sc)
 {
-	uint8_t open[256];
+	uint8_t open[REGISTRY_MAX];
 	openTable(open);
 
 	// Step 9.1b. A UNIFORM chunk's answer does not need a flood fill, or even sc, to

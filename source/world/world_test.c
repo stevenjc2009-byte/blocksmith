@@ -12,10 +12,12 @@
 #include "world/jobq.h"
 #include "world/light.h"
 #include "world/mesher.h"
+#include "world/meshq.h"
 #include "world/noise.h"
 #include "world/physics.h"
 #include "world/rng.h"
 #include "world/raycast.h"
+#include "world/registry.h"
 #include "world/remesh.h"
 #include "world/scratch.h"
 #include "scene/render_dist.h"
@@ -458,6 +460,171 @@ static bool fillChunk(int cx, int cy, int cz, BlockId id)
 	return true;
 }
 
+// ── v1.6.0 task 11: reading a greedy-merged mesh ─────────────────────────────
+//
+// The mesher merges runs of co-planar faces along the atlas u axis into one wide quad, so
+// out.faces stopped being "how many block faces are visible" and became "how many quads it
+// took to cover them". Nearly every count in the tests below was asking the first question
+// and reading the second, and every one of them would have gone quietly wrong.
+//
+// So those counts are restated in BLOCK FACES, which is the number that never moves:
+// merging regroups faces, it never creates or destroys one. Anywhere a test used to say
+// `out.faces == N` and meant "N block faces are visible", it now says
+// `meshFaceCells(&out) == N` and means exactly what it always did.
+
+// How many blocks along u one quad covers. Every emitted quad — merged, unmerged, or a
+// cross plane — has its u span running from the tile's u0 to u0 + TILE_PX*width, because a
+// merged quad's u1 is stretched and nothing else about the layout changed. A cross quad
+// spans one tile, so it counts as the single face it is.
+static int quadWidth(const MeshVertex* v)
+{
+	uint8_t lo = v[0].u, hi = v[0].u;
+	for (int i = 1; i < 4; i++) {
+		if (v[i].u < lo) lo = v[i].u;
+		if (v[i].u > hi) hi = v[i].u;
+	}
+	return (hi - lo) / TILE_PX;
+}
+
+// Block faces covered by the quads in [q_lo, q_hi). Quad q owns vertices q*4 .. q*4+3 —
+// every emitter in the mesher writes four vertices per quad, in order, which is the same
+// property scene/chunk_render.c's one shared index buffer rests on.
+static uint32_t meshFaceCellsRange(const MeshOut* o, uint32_t q_lo, uint32_t q_hi)
+{
+	uint32_t n = 0;
+	for (uint32_t q = q_lo; q < q_hi; q++)
+		n += (uint32_t)quadWidth(&o->verts[q * 4]);
+	return n;
+}
+
+static uint32_t meshFaceCells(const MeshOut* o)
+{
+	return meshFaceCellsRange(o, 0, o->faces);
+}
+
+// The same, for one face direction, plus how many quads it took. Two numbers because the
+// whole point of a merge test is the gap between them.
+static uint32_t meshFaceCellsNrm(const MeshOut* o, uint8_t nrm, uint32_t* quads_out)
+{
+	uint32_t cells = 0, quads = 0;
+	for (uint32_t q = 0; q < o->faces; q++) {
+		if (o->verts[q * 4].nrm != nrm) continue;
+		cells += (uint32_t)quadWidth(&o->verts[q * 4]);
+		quads++;
+	}
+	if (quads_out) *quads_out = quads;
+	return cells;
+}
+
+// The widest run any quad in the mesh covers. ATLAS_MAX_MERGE_BLOCKS is the ceiling, and
+// exceeding it wraps MeshVertex.u's uint8_t — see world/atlas_uv.h.
+static int meshWidestQuad(const MeshOut* o)
+{
+	int w = 0;
+	for (uint32_t q = 0; q < o->faces; q++) {
+		const int qw = quadWidth(&o->verts[q * 4]);
+		if (qw > w) w = qw;
+	}
+	return w;
+}
+
+// Vertex positions run 0..CHUNK_DIM inclusive, so the grid is one wider than the chunk.
+static bool s_cover[CHUNK_DIM + 1][CHUNK_DIM + 1][CHUNK_DIM + 1][BLOCK_FACES];
+
+// The claim merging has to earn: the merged mesh covers exactly the block faces the
+// unmerged one did — no gaps, no overlaps, nothing covered twice.
+//
+// Every axis-aligned quad is expanded back into the unit block faces it stands for, keyed
+// by (min corner, face direction), and a key seen twice is a double-cover. Returns false if
+// any quad double-covers or cannot be read as a run at all; `cells_out` is the total, which
+// the caller compares against the number of faces that world is known to have — that half
+// is what catches a GAP, since a missing face lowers the total and nothing else would.
+//
+// Cross quads are not expanded and are counted separately: they are diagonal, so they have
+// extent on all three axes where a block face has extent on exactly two, and four of them
+// share one cell by design. Detected by that geometry rather than by their normal, which
+// emitCross deliberately sets to FACE_TOP.
+static bool meshCoverageOnce(const MeshOut* o, uint32_t* cells_out, uint32_t* crosses_out)
+{
+	memset(s_cover, 0, sizeof s_cover);
+	uint32_t cells = 0, crosses = 0;
+	bool ok = true;
+
+	for (uint32_t q = 0; q < o->faces; q++) {
+		const MeshVertex* v = &o->verts[q * 4];
+		int mn[3] = { v[0].x, v[0].y, v[0].z };
+		int mx[3] = { v[0].x, v[0].y, v[0].z };
+		for (int i = 1; i < 4; i++) {
+			const int p[3] = { v[i].x, v[i].y, v[i].z };
+			for (int a = 0; a < 3; a++) {
+				if (p[a] < mn[a]) mn[a] = p[a];
+				if (p[a] > mx[a]) mx[a] = p[a];
+			}
+		}
+
+		if (mn[0] != mx[0] && mn[1] != mx[1] && mn[2] != mx[2]) { crosses++; continue; }
+
+		const int w = quadWidth(v);
+		if (w < 1 || v[0].nrm >= BLOCK_FACES) { ok = false; continue; }
+
+		// Which axis the run grew down. For w > 1 exactly one axis spans w blocks: the
+		// other in-plane axis is one block and the normal axis is zero. For w == 1 there
+		// is nothing to step and the axis is not needed.
+		int ax = -1;
+		if (w > 1) {
+			for (int a = 0; a < 3; a++)
+				if (mx[a] - mn[a] == w) ax = a;
+			if (ax < 0) { ok = false; continue; }
+		}
+
+		for (int k = 0; k < w; k++) {
+			int c[3] = { mn[0], mn[1], mn[2] };
+			if (ax >= 0) c[ax] += k;
+			if (c[0] < 0 || c[0] > CHUNK_DIM || c[1] < 0 || c[1] > CHUNK_DIM ||
+			    c[2] < 0 || c[2] > CHUNK_DIM) { ok = false; break; }
+			if (s_cover[c[0]][c[1]][c[2]][v[0].nrm]) ok = false;   // covered twice
+			s_cover[c[0]][c[1]][c[2]][v[0].nrm] = true;
+			cells++;
+		}
+	}
+
+	if (cells_out)   *cells_out = cells;
+	if (crosses_out) *crosses_out = crosses;
+	return ok;
+}
+
+// Two meshes cover exactly the same block faces, however differently they grouped them
+// into quads. Needed wherever two arms of the same world can no longer be compared vertex
+// by vertex: a run stops where anything visible about the face changes, so an arm with the
+// lighting engine on merges strictly less than one with it off, and the vertex arrays no
+// longer line up index for index even though the geometry is the same.
+static bool s_cover_b[CHUNK_DIM + 1][CHUNK_DIM + 1][CHUNK_DIM + 1][BLOCK_FACES];
+
+static bool meshCoverageEqual(const MeshOut* a, const MeshOut* b)
+{
+	uint32_t ca = 0, cb = 0;
+	if (!meshCoverageOnce(a, &ca, NULL)) return false;
+	memcpy(s_cover_b, s_cover, sizeof s_cover);
+	if (!meshCoverageOnce(b, &cb, NULL)) return false;
+	return ca == cb && memcmp(s_cover_b, s_cover, sizeof s_cover) == 0;
+}
+
+// A merged quad is still one quad: four vertices and six indices, in the winding the one
+// shared index buffer in scene/chunk_render.c assumes. Checked over the whole mesh because
+// merging changed how many quads there are, not how one is written — if it ever wrote a
+// wide quad as two triangles of its own, this is what would notice.
+static bool meshIndexPatternOk(const MeshOut* o)
+{
+	if (o->vert_count != o->faces * 4 || o->index_count != o->faces * 6) return false;
+	for (uint32_t q = 0; q < o->faces; q++) {
+		const uint16_t  b  = (uint16_t)(q * 4);
+		const uint16_t* ix = &o->indices[q * 6];
+		if (ix[0] != b || ix[1] != b + 1 || ix[2] != b + 2 ||
+		    ix[3] != b || ix[4] != b + 2 || ix[5] != b + 3) return false;
+	}
+	return true;
+}
+
 // Step 7.5's split. The mesher now writes two runs into one index buffer — opaque faces
 // first, then the ones the alpha-tested pass draws — and the renderer trusts the boundary
 // absolutely: it draws [0, opaque_index_count) with one GPU state and the rest with another.
@@ -487,7 +654,7 @@ static void testMesherTransparentSplit(void)
 	CHECK(fillChunk(1, 1, 1, BLOCK_STONE));
 	scratchFill(&s_scratch, &s_world, 1, 1, 1);
 	meshChunk(&out, &s_scratch);
-	CHECK(out.faces == 6 * CHUNK_DIM * CHUNK_DIM);
+	CHECK(meshFaceCells(&out) == 6 * CHUNK_DIM * CHUNK_DIM);
 	CHECK(out.opaque_faces == out.faces);
 	CHECK(out.opaque_index_count == out.index_count);
 
@@ -499,7 +666,7 @@ static void testMesherTransparentSplit(void)
 	CHECK(fillChunk(1, 1, 1, BLOCK_LEAVES));
 	scratchFill(&s_scratch, &s_world, 1, 1, 1);
 	meshChunk(&out, &s_scratch);
-	CHECK(out.faces == 6 * CHUNK_DIM * CHUNK_DIM);
+	CHECK(meshFaceCells(&out) == 6 * CHUNK_DIM * CHUNK_DIM);
 	CHECK(out.opaque_faces == 0);
 	CHECK(out.opaque_index_count == 0);
 
@@ -593,7 +760,12 @@ static void testMesherOpaqueBehindTransparent(void)
 			CHECK_QUIET(worldSet(&s_world, CHUNK_DIM + x, CHUNK_DIM, CHUNK_DIM + z, BLOCK_STONE));
 	scratchFill(&s_scratch, &s_world, 1, 1, 1);
 	meshChunk(&out, &s_scratch);
-	const uint32_t bare_floor_faces = out.opaque_faces;
+	// Counted in BLOCK FACES, not in quads: v1.6.0 task 11 merges runs of faces into wide
+	// quads, and a leaf placed on the floor below breaks the merge of the top faces around it
+	// by darkening their AO. The number of faces is what this test is about and it does not
+	// move; the number of quads it takes to draw them does, for reasons that are nothing to
+	// do with occlusion.
+	const uint32_t bare_floor_faces = meshFaceCellsRange(&out, 0, out.opaque_faces);
 	CHECK(bare_floor_faces > 0);
 
 	// --- Now put a leaf directly on one of those stone blocks. The stone's top face is now
@@ -602,11 +774,11 @@ static void testMesherOpaqueBehindTransparent(void)
 	CHECK(worldSet(&s_world, CHUNK_DIM + 4, CHUNK_DIM + 1, CHUNK_DIM + 4, BLOCK_LEAVES));
 	scratchFill(&s_scratch, &s_world, 1, 1, 1);
 	meshChunk(&out, &s_scratch);
-	CHECK(out.opaque_faces == bare_floor_faces);
+	CHECK(meshFaceCellsRange(&out, 0, out.opaque_faces) == bare_floor_faces);
 
 	// The leaf itself keeps five faces, not six: the one pointing down at the stone is
 	// genuinely hidden, because stone is opaque. The asymmetry is the whole rule.
-	CHECK(out.faces == bare_floor_faces + 5);
+	CHECK(meshFaceCells(&out) == bare_floor_faces + 5);
 
 	// --- The canopy case, which is the one that actually happens. A wood post with leaves
 	// packed around it: every wood face touching a leaf must survive.
@@ -635,7 +807,7 @@ static void testMesherOpaqueBehindTransparent(void)
 	// inward faces around the wood — leaf against wood is leaf against something opaque, so
 	// those six are culled too. 54 exactly, and if same-material culling ever broke this
 	// number would jump.
-	CHECK(out.faces - out.opaque_faces == 54);
+	CHECK(meshFaceCellsRange(&out, out.opaque_faces, out.faces) == 54);
 
 	worldExit(&s_world);
 	free(out.verts);
@@ -681,10 +853,16 @@ static void testMesherFaceBuckets(void)
 	CHECK(out.face_start[BLOCK_FACES] == out.opaque_index_count);
 	CHECK(out.opaque_index_count < out.index_count);   // the leaf is there, after the buckets
 
-	// 16 faces a side, six indices a face.
+	// 16 faces a side, and — since every face of a floating convex cube is unoccluded on all
+	// four corners, so the whole surface is flat AO 3 — v1.6.0 task 11 merges each 4-block
+	// row along u into one quad. Four quads a side, six indices a quad, still covering the
+	// same sixteen block faces. Both numbers are checked: the second is the merge, the first
+	// is what must survive it.
 	for (int f = 0; f < BLOCK_FACES; f++) {
 		const uint32_t len = out.face_start[f + 1] - out.face_start[f];
-		CHECK_QUIET(len == 16 * 6);
+		CHECK_QUIET(len == 4 * 6);
+		const uint32_t q_lo = out.face_start[f] / 6, q_hi = out.face_start[f + 1] / 6;
+		CHECK_QUIET(meshFaceCellsRange(&out, q_lo, q_hi) == 16);
 	}
 
 	// The layout claim itself: every index inside bucket i must land on a vertex whose normal
@@ -758,10 +936,16 @@ static void testMesher(void)
 
 	scratchFill(&s_scratch, &s_world, 1, 1, 1);
 	meshChunk(&out, &s_scratch);
-	CHECK(out.faces == 6 * CHUNK_DIM * CHUNK_DIM);   // 1536, not 24576
-	CHECK(out.vert_count == out.faces * 4);
-	CHECK(out.index_count == out.faces * 6);
+	CHECK(meshFaceCells(&out) == 6 * CHUNK_DIM * CHUNK_DIM);   // 1536, not 24576
+	CHECK(out.vert_count == out.faces * 4);   // still four vertices and six indices a quad,
+	CHECK(out.index_count == out.faces * 6);  // however many block faces the quad covers
 	CHECK(out.overflow == false);
+
+	// v1.6.0 task 11: a chunk of stone in open air is flat AO 3 over its whole surface, so
+	// every 16-long row along u merges — into two quads, not one, because
+	// ATLAS_MAX_MERGE_BLOCKS is 15 and a row is 16 wide. 16 rows x 2 quads x 6 faces.
+	CHECK(out.faces == 6 * CHUNK_DIM * 2);
+	CHECK(meshWidestQuad(&out) == ATLAS_MAX_MERGE_BLOCKS);
 
 	// Every vertex must sit inside the chunk's own 0..16 box, or the chunk will not
 	// line up with its neighbour once a model matrix places it.
@@ -781,7 +965,7 @@ static void testMesher(void)
 	CHECK(fillChunk(0, 0, 0, BLOCK_STONE));
 	scratchFill(&s_scratch, &s_world, 0, 0, 0);
 	meshChunk(&out, &s_scratch);
-	CHECK(out.faces == 5 * CHUNK_DIM * CHUNK_DIM);   // 1280
+	CHECK(meshFaceCells(&out) == 5 * CHUNK_DIM * CHUNK_DIM);   // 1280
 
 	// --- One floating block: exactly six faces, four vertices each, and the right
 	// tile on each face straight out of the registry.
@@ -809,10 +993,16 @@ static void testMesher(void)
 
 	// Grass is the block that proves per-face tiles work at all: three different
 	// tiles on one cube. Top face vertices must carry the grass top tile.
+	//
+	// Discriminates on v, not u. This read `u == top.u0 || u == top.u1` until v1.6.0's
+	// one-tile-wide strip atlas, where EVERY tile's u span is 0..16 — so that condition
+	// became true for every vertex in the mesh and the check collapsed into "four vertices
+	// have nrm == 2", still green while proving nothing about which tile they carry. On a
+	// strip sheet v is the only axis that separates one tile from another.
 	const AtlasRect top = atlasRect(BTEX_GRASS_TOP);
 	int top_verts = 0;
 	for (uint32_t i = 0; i < out.vert_count; i++)
-		if (out.verts[i].nrm == 2 && (out.verts[i].u == top.u0 || out.verts[i].u == top.u1))
+		if (out.verts[i].nrm == 2 && (out.verts[i].v == top.v0 || out.verts[i].v == top.v1))
 			top_verts++;
 	CHECK(top_verts == 4);
 
@@ -1038,6 +1228,815 @@ static void testIncrementalRemesh(void)
 	worldExit(&s_world);
 	free(out.verts);
 	free(out.indices);
+}
+
+// ── v1.6.0 task 13: block shapes ─────────────────────────────────────────────
+
+// FNV-1a over a whole mesh: the counts, the bucket table, every vertex byte and every
+// index. Used by the anchor below. Endian-independent for the vertex bytes (all u8) and
+// little-endian for the u16 indices, which is both hosts this suite runs on.
+static uint32_t meshHash(const MeshOut* out)
+{
+	uint32_t h = 2166136261u;
+	const uint8_t* b;
+	size_t n;
+
+	#define HASH_BYTES(p, len) do {                       \
+			b = (const uint8_t*)(p); n = (len);           \
+			for (size_t i_ = 0; i_ < n; i_++) {           \
+				h ^= b[i_]; h *= 16777619u;               \
+			}                                             \
+		} while (0)
+
+	HASH_BYTES(&out->vert_count, sizeof out->vert_count);
+	HASH_BYTES(&out->index_count, sizeof out->index_count);
+	HASH_BYTES(&out->faces, sizeof out->faces);
+	HASH_BYTES(&out->opaque_index_count, sizeof out->opaque_index_count);
+	HASH_BYTES(&out->opaque_faces, sizeof out->opaque_faces);
+	HASH_BYTES(out->face_start, sizeof out->face_start);
+	HASH_BYTES(out->verts, sizeof(MeshVertex) * out->vert_count);
+	HASH_BYTES(out->indices, sizeof(uint16_t) * out->index_count);
+	#undef HASH_BYTES
+
+	return h;
+}
+
+// The no-regression anchor for the shape work.
+//
+// v1.6.0 task 13 split three questions apart that had been one: what fills a cell
+// (collision, AO), what hides the face behind it (occlusion) and what gets drawn at all.
+// Every block in the registry is a solid full cube, so all three still answer the same
+// for all of them and no existing world may move by a single byte — but "may not move"
+// is exactly the sort of claim that is easy to assert and hard to prove, and there is no
+// screen here to notice if it did.
+//
+// So these four numbers are not invented. They were measured by building the SAME probe
+// twice, once against the pre-task mesher and once against the post-task one, over these
+// four worlds plus a fifth with the lighting engine on, and diffing the two outputs:
+//
+//   random-core-mix        verts= 24344 idx= 36516 faces= 6086 hash=ceb0a3c6
+//   stone-beside-leaves    verts=  6144 idx=  9216 faces= 1536 hash=883aee2f
+//   all-leaves             verts=  6144 idx=  9216 faces= 1536 hash=68875887
+//   all-air                verts=     0 idx=     0 faces=    0 hash=c655ff85
+//   random-core-mix-lit    verts= 24304 idx= 36456 faces= 6076 hash=f0c3f25e
+//
+// identical on both arms. The four unlit cases are pinned here so the property keeps
+// being checked after the probe is gone. A failure here is not "the hash changed", it is
+// "the mesh a cube world produces is no longer the one v1.6.0 shipped" — if that is
+// intended, re-measure it the same way rather than editing the constant to match.
+//
+// ── RE-PINNED, v1.6.0 task 11 (greedy meshing) ───────────────────────────────
+//
+// Merging co-planar faces into wide quads changes every one of those numbers on purpose:
+// fewer quads, fewer vertices, different bytes. The anchor was NOT quietly re-baselined —
+// the old values are kept above, verbatim, and the new ones measured the same way, by
+// running these four worlds against the merged mesher and reading what came out:
+//
+//   random-core-mix
+//     BEFORE verts=24344 idx=36516 faces=6086 hash=ceb0a3c6
+//     AFTER  verts=23676 idx=35514 faces=5919 hash=85132e65   cells=6086
+//   stone-beside-leaves
+//     BEFORE verts= 6144 idx= 9216 faces=1536 hash=883aee2f
+//     AFTER  verts=  936 idx= 1404 faces= 234 hash=c62dfbe6   cells=1536
+//   all-leaves
+//     BEFORE verts= 6144 idx= 9216 faces=1536 hash=68875887
+//     AFTER  verts=  768 idx= 1152 faces= 192 hash=953b53b8   cells=1536
+//   all-air
+//     BEFORE verts=    0 idx=    0 faces=   0 hash=c655ff85
+//     AFTER  unchanged — an empty mesh has nothing to merge
+//
+// A hash is a weak anchor for a change like this: it goes red for any reason at all and
+// says nothing about which. So each case now carries an invariant that merging CANNOT
+// change, checked alongside it — the number of BLOCK FACES covered, which is exactly the
+// pre-merge quad count, together with meshCoverageOnce() proving no face is covered twice.
+// If a future change legitimately moves the hashes again, those two must not move with
+// them; if they do, geometry has been lost or duplicated and the hash was not the story.
+static void testMesherFullCubeBytesUnchanged(void)
+{
+	MeshOut out = {0};
+	out.vert_cap  = MESH_MAX_VERTS;
+	out.index_cap = MESH_MAX_INDICES;
+	out.verts     = (MeshVertex*)malloc(sizeof(MeshVertex) * out.vert_cap);
+	out.indices   = (uint16_t*)malloc(sizeof(uint16_t) * out.index_cap);
+	CHECK(out.verts != NULL && out.indices != NULL);
+	if (!out.verts || !out.indices) { free(out.verts); free(out.indices); return; }
+
+	// Case 1: a pseudo-random mix of every core block, from a fixed LCG so the world is
+	// the same one the A/B probe measured. Exercises both passes, all six buckets, AO
+	// and the same-material cull over geometry no hand-written case would produce.
+	worldInit(&s_world);
+	uint32_t rng = 12345u;
+	for (int y = 0; y < CHUNK_DIM; y++)
+		for (int z = 0; z < CHUNK_DIM; z++)
+			for (int x = 0; x < CHUNK_DIM; x++) {
+				rng = rng * 1664525u + 1013904223u;
+				const BlockId id = (BlockId)((rng >> 16) % BLOCK_COUNT);
+				CHECK_QUIET(worldSet(&s_world, CHUNK_DIM + x, CHUNK_DIM + y,
+				                     CHUNK_DIM + z, id));
+			}
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.vert_count == 23676);
+	CHECK(out.index_count == 35514);
+	CHECK(out.faces == 5919);
+	CHECK(meshHash(&out) == 0x85132e65u);
+	// Merging may not invent or lose a single block face: 6086 is what the pre-merge
+	// mesher emitted, one quad each, and it has to stay 6086 however they are grouped.
+	CHECK(meshFaceCells(&out) == 6086);
+	CHECK(meshCoverageOnce(&out, NULL, NULL));
+	worldExit(&s_world);
+
+	// Case 2: stone with leaves against its east face — the cross-chunk border, where
+	// the scratch's one-block skirt is what the culling reads.
+	worldInit(&s_world);
+	for (int y = 0; y < CHUNK_DIM; y++)
+		for (int z = 0; z < CHUNK_DIM; z++)
+			for (int x = 0; x < CHUNK_DIM; x++) {
+				CHECK_QUIET(worldSet(&s_world, CHUNK_DIM + x, CHUNK_DIM + y,
+				                     CHUNK_DIM + z, BLOCK_STONE));
+				CHECK_QUIET(worldSet(&s_world, 2 * CHUNK_DIM + x, CHUNK_DIM + y,
+				                     CHUNK_DIM + z, BLOCK_LEAVES));
+			}
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.faces == 234);
+	CHECK(meshHash(&out) == 0xc62dfbe6u);
+	CHECK(meshFaceCells(&out) == 1536);
+	CHECK(meshCoverageOnce(&out, NULL, NULL));
+	worldExit(&s_world);
+
+	// Case 3: a solid canopy, i.e. the transparent pass on its own.
+	worldInit(&s_world);
+	for (int y = 0; y < CHUNK_DIM; y++)
+		for (int z = 0; z < CHUNK_DIM; z++)
+			for (int x = 0; x < CHUNK_DIM; x++)
+				CHECK_QUIET(worldSet(&s_world, CHUNK_DIM + x, CHUNK_DIM + y,
+				                     CHUNK_DIM + z, BLOCK_LEAVES));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.faces == 192);
+	CHECK(out.opaque_faces == 0);
+	CHECK(meshHash(&out) == 0x953b53b8u);
+	CHECK(meshFaceCells(&out) == 1536);
+	CHECK(meshCoverageOnce(&out, NULL, NULL));
+	worldExit(&s_world);
+
+	// Case 4: nothing at all. The empty mesh has to stay empty.
+	worldInit(&s_world);
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.faces == 0);
+	CHECK(meshHash(&out) == 0xc655ff85u);
+	worldExit(&s_world);
+
+	free(out.verts);
+	free(out.indices);
+}
+
+// Registers the two dynamic rows the shape tests below work with, through the real
+// registryRegister() the DEFS decoder ends up in — not a fabricated table — so what is
+// exercised is the path a server-defined block actually arrives by. Returns false if
+// either registration was refused, which the caller must check: a missing block would
+// make every count below pass for the wrong reason.
+//
+// BTEX_LEAVES for the cross and BTEX_SAND for the control cube, because both have to be
+// distinguishable from the BLOCK_STONE floor by UV alone.
+// Vertices whose baked ambient occlusion is not full brightness. A whole-mesh count
+// rather than a hunt for particular corners: the claim being tested is "this block
+// darkened nothing, anywhere", and a number that is zero over a flat floor and non-zero
+// once a real cube stands on it separates exactly that.
+static uint32_t countDarkVerts(const MeshOut* o)
+{
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < o->vert_count; i++)
+		if (o->verts[i].ao < 3) n++;
+	return n;
+}
+
+static bool registerShapeBlocks(BlockId* cross_out, BlockId* cube_out)
+{
+	BlockDef def;
+
+	memset(&def, 0, sizeof def);
+	snprintf(def.name, sizeof def.name, "test_cross");
+	for (int f = 0; f < BLOCK_FACES; f++) def.tex[f] = BTEX_LEAVES;
+	// Not solid: a plant is walked through. Transparent: the tile has alpha-0 holes.
+	def.flags = REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS);
+	*cross_out = registryRegister(&def);
+
+	// The control arm. Same dynamic id space, same registration call, everything
+	// identical except the shape — so a check that passes for the cross and fails for
+	// this one is testing the shape and not "high ids behave differently".
+	memset(&def, 0, sizeof def);
+	snprintf(def.name, sizeof def.name, "test_cube");
+	for (int f = 0; f < BLOCK_FACES; f++) def.tex[f] = BTEX_SAND;
+	def.flags = REG_FLAG_SOLID;
+	*cube_out = registryRegister(&def);
+
+	mesherInvalidateTables();   // the mesher caches its per-id tables; these are new ids
+	return *cross_out != 0 && *cube_out != 0;
+}
+
+// Puts the registry and the mesher's derived tables back to the core rows. Every test
+// after these expects a registry nobody has added to, and a mesher whose cached tables
+// agree with it — dropping only one of the two leaves the mesher answering for ids that
+// no longer exist.
+static void restoreCoreRegistry(void)
+{
+	registryInitCore();
+	mesherInvalidateTables();
+}
+
+// The shape a dynamic block declares must survive the registry: the flags byte, the wire
+// record, and the derived view the whole engine reads through blockInfo().
+//
+// The packing is the risky half. The shape rides in the top three bits of BlockDef.flags
+// rather than in a field of its own, precisely so REGISTRY_WIRE_RECORD_BYTES and the
+// pinned core crc16 do not move — and a packing that quietly collided with a behaviour
+// flag would present as a block that is mysteriously solid, not as an error.
+static void testBlockShapeRegistry(void)
+{
+	// Every core row is a full cube, and that is what makes the no-regression anchor
+	// above mean anything.
+	for (int id = 0; id < BLOCK_COUNT; id++)
+		CHECK_QUIET(blockInfo((BlockId)id)->shape == BLOCK_SHAPE_FULL_CUBE);
+	CHECK(blockIsFullCube(BLOCK_STONE));
+	CHECK(blockIsFullCube(BLOCK_AIR));
+
+	// Drawn vs solid, on the blocks that exist today: the two questions still agree, or
+	// the anchor above would be measuring a changed world.
+	CHECK(!blockIsDrawn(BLOCK_AIR));
+	CHECK(blockIsDrawn(BLOCK_STONE) && blockIsDrawn(BLOCK_LEAVES));
+	CHECK(!blockIsDrawn((BlockId)0xC7));          // no registry row: still a hole
+	CHECK(!blockIsTargetable((BlockId)0xC7));
+
+	BlockId cross = 0, cube = 0;
+	CHECK(registerShapeBlocks(&cross, &cube));
+	if (!cross || !cube) { restoreCoreRegistry(); return; }
+
+	CHECK(cross >= REG_ID_DYN_LO && cube >= REG_ID_DYN_LO);   // both really are dynamic
+
+	CHECK(blockInfo(cross)->shape == BLOCK_SHAPE_CROSS);
+	CHECK(blockInfo(cube)->shape == BLOCK_SHAPE_FULL_CUBE);
+	CHECK(!blockIsFullCube(cross));
+	CHECK(blockIsFullCube(cube));
+
+	// The shape bits must not have leaked into the behaviour flags or the other way
+	// round. The cross declares transparent-and-not-solid; the cube solid-and-opaque.
+	CHECK(!blockIsSolid(cross));
+	CHECK(blockInfo(cross)->transparent);
+	CHECK(blockIsSolid(cube));
+	CHECK(!blockInfo(cube)->transparent);
+
+	// Drawn without being solid is the whole point of the split.
+	CHECK(blockIsDrawn(cross));
+	CHECK(blockIsTargetable(cross));
+
+	// And the wire record carries it. registryDefPack/Unpack is what a DEFS batch and
+	// registry.bin both go through, so a shape that did not survive here would arrive at
+	// a joining client as a full cube — two players seeing different geometry.
+	uint8_t rec[REGISTRY_WIRE_RECORD_BYTES];
+	registryDefPack(rec, cross, registryGet(cross));
+	BlockId  back_id = 0;
+	BlockDef back_def;
+	CHECK(registryDefUnpack(&back_id, &back_def, rec));
+	CHECK(back_id == cross);
+	CHECK(regShapeOf(back_def.flags) == BLOCK_SHAPE_CROSS);
+	CHECK((back_def.flags & REG_FLAG_TRANSPARENT) != 0);
+	CHECK((back_def.flags & REG_FLAG_SOLID) == 0);
+
+	// The record is still 28 bytes, which is the reason the shape went into the flags
+	// byte at all. If this ever moves, every saved registry.bin and every peer on the
+	// old protocol is wrong about every block.
+	CHECK(REGISTRY_WIRE_RECORD_BYTES == 28);
+	CHECK(sizeof(BlockDef) == 27);
+
+	restoreCoreRegistry();
+	CHECK(!registryIsDefined(REG_ID_DYN_LO));
+}
+
+// The geometry itself: what a BLOCK_SHAPE_CROSS cell meshes into, and what it does to
+// its neighbours.
+//
+// None of this is checkable by looking at the console. A cross that emitted its quads in
+// the opaque run would draw as an opaque diagonal sheet; one whose UVs ran past the tile
+// rect would draw a stripe of the neighbouring atlas cell; one that still occluded would
+// punch a hole in the wall behind it. All three present as bad art, never as an error —
+// which is the standing trap in this codebase, and the reason these are counts.
+static void testMesherCrossShape(void)
+{
+	MeshOut out = {0};
+	out.vert_cap  = MESH_MAX_VERTS;
+	out.index_cap = MESH_MAX_INDICES;
+	out.verts     = (MeshVertex*)malloc(sizeof(MeshVertex) * out.vert_cap);
+	out.indices   = (uint16_t*)malloc(sizeof(uint16_t) * out.index_cap);
+	CHECK(out.verts != NULL && out.indices != NULL);
+	if (!out.verts || !out.indices) { free(out.verts); free(out.indices); return; }
+
+	BlockId cross = 0, cube = 0;
+	CHECK(registerShapeBlocks(&cross, &cube));
+	if (!cross || !cube) {
+		restoreCoreRegistry();
+		free(out.verts); free(out.indices);
+		return;
+	}
+
+	// --- Baseline: a one-block-thick stone floor across the chunk, nothing on it.
+	worldInit(&s_world);
+	for (int z = 0; z < CHUNK_DIM; z++)
+		for (int x = 0; x < CHUNK_DIM; x++)
+			CHECK_QUIET(worldSet(&s_world, CHUNK_DIM + x, CHUNK_DIM, CHUNK_DIM + z,
+			                     BLOCK_STONE));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	const uint32_t floor_faces = out.faces;
+	CHECK(floor_faces > 0);
+	CHECK(out.opaque_faces == floor_faces);      // nothing transparent yet
+
+	// --- One cross block standing on the floor.
+	CHECK(worldSet(&s_world, CHUNK_DIM + 4, CHUNK_DIM + 1, CHUNK_DIM + 4, cross));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+
+	// Four quads, not six and not two. Two planes, each emitted twice with opposite
+	// winding, because scene/chunk_render.c culls back faces for the whole world pass
+	// and never turns it off — a single-sided X would vanish from three of the four
+	// horizontal quadrants, and nothing that counts quads would notice.
+	CHECK(out.faces == floor_faces + 4);
+	CHECK(out.vert_count == floor_faces * 4 + 16);
+
+	// All four are in the transparent run: non-cube geometry has no face buckets, so it
+	// can never go in the opaque run, which is emitted face-major in six passes.
+	CHECK(out.index_count - out.opaque_index_count == 4 * 6);
+
+	// The stone it stands on keeps its top face. This is the hole-in-the-world check:
+	// an X of two quads does not cover the cell, so it must not cull anything.
+	CHECK(out.opaque_faces == floor_faces);
+
+	// Exactly the sixteen vertices of the cross, in the order emitCross writes them:
+	// plane A forward, plane A backward, plane B forward, plane B backward. Positions
+	// are the cell's own integer corners, because MeshVertex holds int8_t block units
+	// and there is no fractional inset the format could express.
+	const int8_t bx = 4, by = 1, bz = 4;
+	static const int8_t kWant[16][3] = {
+		{0,0,0}, {1,0,1}, {1,1,1}, {0,1,0},   // plane A, front winding
+		{0,1,0}, {1,1,1}, {1,0,1}, {0,0,0},   // plane A, back winding
+		{1,0,0}, {0,0,1}, {0,1,1}, {1,1,0},   // plane B, front winding
+		{1,1,0}, {0,1,1}, {0,0,1}, {1,0,0},   // plane B, back winding
+	};
+	const MeshVertex* cv = &out.verts[floor_faces * 4];
+	bool pos_ok = true;
+	for (int i = 0; i < 16; i++) {
+		if (cv[i].x != (int8_t)(bx + kWant[i][0]) ||
+		    cv[i].y != (int8_t)(by + kWant[i][1]) ||
+		    cv[i].z != (int8_t)(bz + kWant[i][2]))
+			pos_ok = false;
+	}
+	CHECK(pos_ok);
+
+	// The two windings really are opposite: the second quad of each plane is the first
+	// one walked backwards. Emitting the same winding twice would be four quads that are
+	// still invisible from behind, and the quad count alone cannot tell the difference.
+	bool reversed_ok = true;
+	for (int i = 0; i < 4; i++) {
+		if (cv[i].x != cv[7 - i].x || cv[i].y != cv[7 - i].y || cv[i].z != cv[7 - i].z)
+			reversed_ok = false;
+		if (cv[8 + i].x != cv[15 - i].x || cv[8 + i].y != cv[15 - i].y ||
+		    cv[8 + i].z != cv[15 - i].z)
+			reversed_ok = false;
+	}
+	CHECK(reversed_ok);
+
+	// The two planes are genuinely different planes and not the same one twice: plane A
+	// runs corner (0,0)->(1,1) in xz, plane B runs (1,0)->(0,1).
+	CHECK(cv[0].x != cv[8].x);
+
+	// UVs stay inside the block's own 16px tile. The atlas is a 6x6 grid of 20px cells
+	// holding 16px tiles with a 2px edge-extended border (world/atlas_uv.h), sampled with
+	// CLAMP_TO_EDGE — so a UV one pixel past the rect samples the *neighbouring block's
+	// art*, and that bug ships as bad art rather than as an error.
+	const AtlasRect tile  = atlasRect(blockFaceTex(cross, FACE_EAST));
+	const AtlasRect stone = atlasRect(blockFaceTex(BLOCK_STONE, FACE_TOP));
+	CHECK(tile.u0 != stone.u0 || tile.v0 != stone.v0);   // else the check proves nothing
+
+	bool uv_in_tile = true, corners_ok = true, nrm_ok = true, ao_ok = true;
+	for (int i = 0; i < 16; i++) {
+		if (cv[i].u < tile.u0 || cv[i].u > tile.u1 ||
+		    cv[i].v < tile.v0 || cv[i].v > tile.v1)
+			uv_in_tile = false;
+		// and not merely inside it — every UV is one of the rect's four corners.
+		if ((cv[i].u != tile.u0 && cv[i].u != tile.u1) ||
+		    (cv[i].v != tile.v0 && cv[i].v != tile.v1))
+			corners_ok = false;
+		// FACE_TOP, so world.v.pica's faceShade gives the plant full brightness rather
+		// than shading its two planes differently from each other.
+		if (cv[i].nrm != (uint8_t)FACE_TOP) nrm_ok = false;
+		if (cv[i].ao != 3) ao_ok = false;   // an X has no crevice corners to darken
+	}
+	CHECK(uv_in_tile);
+	CHECK(corners_ok);
+	CHECK(nrm_ok);
+	CHECK(ao_ok);
+
+	// --- Two crosses side by side. The same-material cull that keeps a canopy cheap
+	// must not fire between them: they do not cover each other, so each still draws all
+	// four of its quads.
+	CHECK(worldSet(&s_world, CHUNK_DIM + 5, CHUNK_DIM + 1, CHUNK_DIM + 4, cross));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.faces == floor_faces + 8);
+	CHECK(out.opaque_faces == floor_faces);
+	worldExit(&s_world);
+
+	// --- A cross wedged between two stone blocks must not cull either of their faces.
+	// This is the occlusion claim on its own, away from the floor.
+	worldInit(&s_world);
+	CHECK(worldSet(&s_world, CHUNK_DIM + 2, CHUNK_DIM + 2, CHUNK_DIM + 2, BLOCK_STONE));
+	CHECK(worldSet(&s_world, CHUNK_DIM + 4, CHUNK_DIM + 2, CHUNK_DIM + 2, BLOCK_STONE));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	const uint32_t two_stones = out.opaque_faces;
+	CHECK(two_stones == 12);                      // two lone cubes, six faces each
+
+	CHECK(worldSet(&s_world, CHUNK_DIM + 3, CHUNK_DIM + 2, CHUNK_DIM + 2, cross));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.opaque_faces == two_stones);        // neither cube lost a face
+	CHECK(out.faces == two_stones + 4);
+
+	// The control arm. Swap the cross for the dynamic FULL_CUBE block — same dyn id
+	// space, same registration call, only the shape differs — and everything the cross
+	// left alone now happens: the two stones lose the faces they point at, and the new
+	// block emits four of its own (six, less the two its neighbours cover). 12 - 2 + 4.
+	// Without this arm the checks above would also pass for a shape that emitted nothing
+	// at all and culled nothing either.
+	CHECK(worldSet(&s_world, CHUNK_DIM + 3, CHUNK_DIM + 2, CHUNK_DIM + 2, cube));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.opaque_faces == two_stones - 2 + 4);
+	CHECK(out.opaque_faces == 14);
+	CHECK(out.index_count == out.opaque_index_count); // a solid cube is not deferred
+	worldExit(&s_world);
+
+	// --- The mis-declared solid cross. Shape and solidity are separate axes.
+	//
+	// This arm exists because of a hole in the red run. The two `&& cube` terms in
+	// planBuild()'s s_solid and s_occludes tables are what stop a non-cube from darkening
+	// and from culling its neighbours — but the plant above is registered non-solid, so
+	// `info->solid` short-circuits and neither term is ever reached. Sabotaging them left
+	// the suite green, which by this project's own rule proves nothing. A block that
+	// declares SOLID and CROSS together does reach them.
+	//
+	// It is not a block the game will ship. It is the case the tables are defended
+	// against: nothing stops a def — including one arriving from a server — setting both
+	// bits, and the answer must still be that two diagonal quads cover no face and fill no
+	// corner of the cell, however solid the def says it is.
+	BlockDef sdef;
+	memset(&sdef, 0, sizeof sdef);
+	snprintf(sdef.name, sizeof sdef.name, "test_xsolid");
+	for (int f = 0; f < BLOCK_FACES; f++) sdef.tex[f] = BTEX_LEAVES;
+	sdef.flags = REG_FLAG_SOLID | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS);
+	const BlockId xsolid = registryRegister(&sdef);
+	mesherInvalidateTables();
+	CHECK(xsolid != 0);
+	CHECK(blockIsSolid(xsolid));                        // the solid bit really did land
+	CHECK(blockInfo(xsolid)->shape == BLOCK_SHAPE_CROSS);
+
+	if (xsolid) {
+		// Occlusion, in the same two-stone rig as above.
+		worldInit(&s_world);
+		CHECK(worldSet(&s_world, CHUNK_DIM + 2, CHUNK_DIM + 2, CHUNK_DIM + 2, BLOCK_STONE));
+		CHECK(worldSet(&s_world, CHUNK_DIM + 4, CHUNK_DIM + 2, CHUNK_DIM + 2, BLOCK_STONE));
+		CHECK(worldSet(&s_world, CHUNK_DIM + 3, CHUNK_DIM + 2, CHUNK_DIM + 2, xsolid));
+		scratchFill(&s_scratch, &s_world, 1, 1, 1);
+		meshChunk(&out, &s_scratch);
+		CHECK(out.opaque_faces == 12);      // neither cube lost the face it points at
+		CHECK(out.faces == 12 + 4);         // and the cross still drew its own four
+		worldExit(&s_world);
+
+		// Ambient occlusion. A flat floor has no darkened corner anywhere; standing the
+		// solid cross on it must not create one, because an AO tap asks "is that cell
+		// filled" and a cross does not fill one.
+		worldInit(&s_world);
+		for (int z = 0; z < CHUNK_DIM; z++)
+			for (int x = 0; x < CHUNK_DIM; x++)
+				CHECK_QUIET(worldSet(&s_world, CHUNK_DIM + x, CHUNK_DIM, CHUNK_DIM + z,
+				                     BLOCK_STONE));
+		scratchFill(&s_scratch, &s_world, 1, 1, 1);
+		meshChunk(&out, &s_scratch);
+		CHECK(countDarkVerts(&out) == 0);
+
+		CHECK(worldSet(&s_world, CHUNK_DIM + 4, CHUNK_DIM + 1, CHUNK_DIM + 4, xsolid));
+		scratchFill(&s_scratch, &s_world, 1, 1, 1);
+		meshChunk(&out, &s_scratch);
+		CHECK(countDarkVerts(&out) == 0);
+
+		// The control that proves the counter can move at all. Same cell, real cube:
+		// the top faces around it lose corners immediately.
+		CHECK(worldSet(&s_world, CHUNK_DIM + 4, CHUNK_DIM + 1, CHUNK_DIM + 4, BLOCK_STONE));
+		scratchFill(&s_scratch, &s_world, 1, 1, 1);
+		meshChunk(&out, &s_scratch);
+		CHECK(countDarkVerts(&out) > 0);
+		worldExit(&s_world);
+	}
+
+	restoreCoreRegistry();
+	free(out.verts);
+	free(out.indices);
+}
+
+// ── v1.6.0 task 11: greedy meshing, u axis only ──────────────────────────────
+//
+// What merging is allowed to do, and every place it is deliberately stopped. None of this
+// is visible from the console either: a merge that ran one block too far draws a stripe of
+// the next block's art, one that crossed differing AO draws a flat-shaded band where there
+// should be a gradient, and one that ran past 15 blocks wraps MeshVertex.u's uint8_t and
+// draws the tile from the far side of the sheet. All three ship as bad art, never as an
+// error, so each is a count here.
+//
+// The cases are chosen so the answer is arithmetic rather than a measurement copied out of
+// a run: a 16-long row of identical faces is 2 quads because the cap is 15, a checkerboard
+// is as many quads as faces because no two neighbours match, and so on.
+static void testMesherGreedyMerge(void)
+{
+	MeshOut out = {0};
+	out.vert_cap  = MESH_MAX_VERTS;
+	out.index_cap = MESH_MAX_INDICES;
+	out.verts     = (MeshVertex*)malloc(sizeof(MeshVertex) * out.vert_cap);
+	out.indices   = (uint16_t*)malloc(sizeof(uint16_t) * out.index_cap);
+	CHECK(out.verts != NULL && out.indices != NULL);
+	if (!out.verts || !out.indices) { free(out.verts); free(out.indices); return; }
+
+	uint32_t cells = 0, quads = 0, crosses = 0;
+
+	// --- 1. A flat one-block slab of a single material: the best case merging has.
+	//
+	// 576 block faces — 256 top, 256 bottom, 16 on each of the four sides — collapse to 72
+	// quads. That number is arithmetic, not a reading: every direction's run is 16 blocks
+	// long and the cap is 15, so each run costs two quads. Top runs along +z (16 rows of x),
+	// bottom along +x (16 rows of z), and the four side strips are one 16-run each:
+	// 32 + 32 + 4*2 = 72.
+	worldInit(&s_world);
+	for (int z = 0; z < CHUNK_DIM; z++)
+		for (int x = 0; x < CHUNK_DIM; x++)
+			CHECK_QUIET(worldSet(&s_world, CHUNK_DIM + x, CHUNK_DIM, CHUNK_DIM + z,
+			                     BLOCK_STONE));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(meshFaceCells(&out) == 576);
+	CHECK(out.faces == 72);
+	CHECK(meshWidestQuad(&out) == ATLAS_MAX_MERGE_BLOCKS);
+	CHECK(meshIndexPatternOk(&out));
+	CHECK(meshCoverageOnce(&out, &cells, &crosses));
+	CHECK(cells == 576 && crosses == 0);
+	worldExit(&s_world);
+
+	// --- 2. The same slab, checkerboarded between two materials.
+	//
+	// The control arm for case 1: identical geometry, identical face count, but no two
+	// neighbours share a tile in any direction, so nothing may merge at all and the quad
+	// count has to come back equal to the face count. If merging ever ignored the block id
+	// this is what would go red, and case 1 alone would not.
+	worldInit(&s_world);
+	for (int z = 0; z < CHUNK_DIM; z++)
+		for (int x = 0; x < CHUNK_DIM; x++) {
+			// Hoisted out of the CHECK: the stringified condition is what the suite
+			// prints and stores in a fixed 96-byte buffer, and the whole call spelled
+			// out is 101 characters, which -Wformat-truncation rejects under -Werror.
+			const BlockId id = ((x + z) & 1) ? BLOCK_STONE : BLOCK_SAND;
+			const bool    ok = worldSet(&s_world, CHUNK_DIM + x, CHUNK_DIM,
+			                            CHUNK_DIM + z, id);
+			CHECK_QUIET(ok);
+		}
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(meshFaceCells(&out) == 576);
+	CHECK(out.faces == 576);              // one quad per face: nothing merged
+	CHECK(meshWidestQuad(&out) == 1);
+	CHECK(meshCoverageOnce(&out, &cells, NULL));
+	CHECK(cells == 576);
+	worldExit(&s_world);
+
+	// --- 3. Two faces that differ only in baked AO must not merge.
+	//
+	// Two stone blocks side by side along +z, the axis a top face runs down. On their own
+	// the two top faces are identical in every way and become one quad. Adding a single
+	// block diagonally above at (5,1,4) darkens two corners of one top face and one corner
+	// of the other, and nothing else changes — same tile, same direction, still adjacent.
+	// The merge must stop, and the top direction must go from 1 quad to 3 (one per face,
+	// plus the new block's own top).
+	//
+	// This is the check the brief cared most about: ~43% of quads in a real world carry
+	// non-flat AO, so a merge rule that ignored shading would flatten nearly half the
+	// world's contact shadows and no count anywhere else would move.
+	worldInit(&s_world);
+	CHECK_QUIET(worldSet(&s_world, CHUNK_DIM + 4, CHUNK_DIM, CHUNK_DIM + 4, BLOCK_STONE));
+	CHECK_QUIET(worldSet(&s_world, CHUNK_DIM + 4, CHUNK_DIM, CHUNK_DIM + 5, BLOCK_STONE));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	cells = meshFaceCellsNrm(&out, FACE_TOP, &quads);
+	CHECK(cells == 2 && quads == 1);      // identical: one wide quad
+
+	CHECK(worldSet(&s_world, CHUNK_DIM + 5, CHUNK_DIM + 1, CHUNK_DIM + 4, BLOCK_STONE));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	cells = meshFaceCellsNrm(&out, FACE_TOP, &quads);
+	CHECK(cells == 3 && quads == 3);      // AO now differs: no merge survives
+	CHECK(meshCoverageOnce(&out, NULL, NULL));
+	worldExit(&s_world);
+
+	// --- 4. The 15-block cap, from world/atlas_uv.h.
+	//
+	// The strip atlas is one tile wide and sampled GPU_REPEAT in u, which is what lets a
+	// merged quad's u run past the tile edge and still tile correctly. u is a uint8_t, so
+	// 16 blocks is 16*16 = 256 px and wraps to 0 — a 16-wide quad would sample nothing at
+	// all. 15 blocks is 240 and is the last value that fits.
+	//
+	// A run of exactly 15 eligible faces must therefore come back as one quad reaching
+	// u = 240, and a run of 16 as two quads, not one wrapped one.
+	worldInit(&s_world);
+	for (int z = 0; z < ATLAS_MAX_MERGE_BLOCKS; z++)
+		CHECK_QUIET(worldSet(&s_world, CHUNK_DIM + 4, CHUNK_DIM, CHUNK_DIM + z,
+		                     BLOCK_STONE));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	cells = meshFaceCellsNrm(&out, FACE_TOP, &quads);
+	CHECK(cells == ATLAS_MAX_MERGE_BLOCKS && quads == 1);
+
+	uint8_t max_u = 0;
+	for (uint32_t i = 0; i < out.vert_count; i++)
+		if (out.verts[i].u > max_u) max_u = out.verts[i].u;
+	CHECK(max_u == (uint8_t)(TILE_PX * ATLAS_MAX_MERGE_BLOCKS));   // 240, not 0
+
+	// One more block, so 16 are eligible and only 15 may be taken.
+	const int zc = CHUNK_DIM + ATLAS_MAX_MERGE_BLOCKS;
+	CHECK(worldSet(&s_world, CHUNK_DIM + 4, CHUNK_DIM, zc, BLOCK_STONE));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	cells = meshFaceCellsNrm(&out, FACE_TOP, &quads);
+	CHECK(cells == ATLAS_MAX_MERGE_BLOCKS + 1 && quads == 2);
+	CHECK(meshWidestQuad(&out) == ATLAS_MAX_MERGE_BLOCKS);
+	CHECK(meshCoverageOnce(&out, &cells, NULL));
+	CHECK(cells == meshFaceCells(&out));
+	worldExit(&s_world);
+
+	// --- 5. One block on its own is exactly what it was before the task.
+	worldInit(&s_world);
+	CHECK_QUIET(worldSet(&s_world, CHUNK_DIM + 7, CHUNK_DIM + 7, CHUNK_DIM + 7,
+	                     BLOCK_STONE));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.faces == 6);
+	CHECK(meshFaceCells(&out) == 6);
+	CHECK(meshWidestQuad(&out) == 1);
+	worldExit(&s_world);
+
+	free(out.verts);
+	free(out.indices);
+}
+
+// Crosses are not faces and must never be merged. emitCross() bypasses the six-face loop
+// entirely, so the only thing keeping its quads out of a run is that the run is built
+// inside the loop it never enters — which is a structural argument, and structural
+// arguments are what this project's own history says to distrust.
+//
+// A row of crosses along +x, on a floor whose top faces DO merge, is the pair that tells
+// the difference: the floor's quad count has to fall and the crosses' must not. Four quads
+// per cross, exactly, however many stand in a line.
+static void testMesherCrossNeverMerges(void)
+{
+	MeshOut out = {0};
+	out.vert_cap  = MESH_MAX_VERTS;
+	out.index_cap = MESH_MAX_INDICES;
+	out.verts     = (MeshVertex*)malloc(sizeof(MeshVertex) * out.vert_cap);
+	out.indices   = (uint16_t*)malloc(sizeof(uint16_t) * out.index_cap);
+	CHECK(out.verts != NULL && out.indices != NULL);
+	if (!out.verts || !out.indices) { free(out.verts); free(out.indices); return; }
+
+	BlockId cross = 0, cube = 0;
+	CHECK(registerShapeBlocks(&cross, &cube));
+	if (!cross || !cube) {
+		restoreCoreRegistry();
+		free(out.verts); free(out.indices);
+		return;
+	}
+
+	static const int kRow = 8;
+
+	worldInit(&s_world);
+	for (int z = 0; z < CHUNK_DIM; z++)
+		for (int x = 0; x < CHUNK_DIM; x++)
+			CHECK_QUIET(worldSet(&s_world, CHUNK_DIM + x, CHUNK_DIM, CHUNK_DIM + z,
+			                     BLOCK_STONE));
+	for (int x = 0; x < kRow; x++)
+		CHECK_QUIET(worldSet(&s_world, CHUNK_DIM + x, CHUNK_DIM + 1, CHUNK_DIM + 4,
+		                     cross));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+
+	// The transparent run is the crosses and nothing else — the floor is opaque stone.
+	CHECK(out.faces - out.opaque_faces == (uint32_t)(kRow * 4));
+
+	// ...and every one of those quads still spans a single tile. A merged cross would show
+	// up here as a width of 2 or more even if the count above somehow held.
+	bool cross_widths_ok = true;
+	for (uint32_t q = out.opaque_faces; q < out.faces; q++)
+		if (quadWidth(&out.verts[q * 4]) != 1) cross_widths_ok = false;
+	CHECK(cross_widths_ok);
+
+	// The control: the opaque floor under them did merge, so "nothing merged in this world"
+	// cannot be why the two checks above passed.
+	CHECK(out.opaque_faces < meshFaceCellsRange(&out, 0, out.opaque_faces));
+
+	uint32_t crosses = 0;
+	CHECK(meshCoverageOnce(&out, NULL, &crosses));
+	CHECK(crosses == (uint32_t)(kRow * 4));
+
+	worldExit(&s_world);
+	restoreCoreRegistry();
+	free(out.verts);
+	free(out.indices);
+}
+
+// The other two consumers of a block's shape: the player's collision box and the DDA the
+// crosshair aims with. They have to disagree about a cross block — walk through it, but
+// still be able to break it — and that is exactly the pair a single `solid` test cannot
+// express, which is why this task exists.
+static void testCrossShapeCollisionAndRaycast(void)
+{
+	BlockId cross = 0, cube = 0;
+	CHECK(registerShapeBlocks(&cross, &cube));
+	if (!cross || !cube) { restoreCoreRegistry(); return; }
+
+	// A liquid row too: the raycast's other new term. Registered here rather than in
+	// registerShapeBlocks because only this test needs it.
+	BlockDef def;
+	memset(&def, 0, sizeof def);
+	snprintf(def.name, sizeof def.name, "test_water");
+	for (int f = 0; f < BLOCK_FACES; f++) def.tex[f] = BTEX_SAND;
+	def.flags = REG_FLAG_TRANSPARENT | REG_FLAG_LIQUID;   // full cube, drawn, not solid
+	const BlockId water = registryRegister(&def);
+	mesherInvalidateTables();
+	CHECK(water != 0);
+
+	worldInit(&s_world);
+
+	// --- Collision. A floor to stand on, a cross block at (4,5,4) and a stone block at
+	// (8,5,4) as the control: identical test, opposite answer.
+	for (int z = 0; z < 16; z++)
+		for (int x = 0; x < 16; x++)
+			CHECK_QUIET(worldSet(&s_world, x, 4, z, BLOCK_STONE));
+	CHECK(worldSet(&s_world, 4, 5, 4, cross));
+	CHECK(worldSet(&s_world, 8, 5, 4, BLOCK_STONE));
+
+	// The player box centred in each cell. Non-solid means the box is not blocked.
+	CHECK(!bodyBlocked(&s_world, 4.5f, 5.0f, 4.5f));   // the cross: walk straight in
+	CHECK(bodyBlocked(&s_world, 8.5f, 5.0f, 4.5f));    // the stone: blocked
+
+	// And a body actually walks through it. Starting west of the cross and moving east
+	// past it, the body ends up where an unobstructed body would; the same walk into the
+	// stone stops short. Both arms, because a move that failed for some other reason
+	// would otherwise read as "blocked".
+	Body b;
+	bodyInit(&b, 2.5f, 5.0f, 4.5f);
+	int blocked = bodyMove(&b, &s_world, 3.0f, 0.0f, 0.0f);   // 2.5 -> 5.5, through (4,5,4)
+	CHECK((blocked & BLOCKED_X) == 0);
+	CHECK(b.x > 5.4f);                                        // came out the far side
+
+	bodyInit(&b, 6.5f, 5.0f, 4.5f);
+	blocked = bodyMove(&b, &s_world, 3.0f, 0.0f, 0.0f);       // 6.5 -> 9.5, into (8,5,4)
+	CHECK((blocked & BLOCKED_X) != 0);
+	CHECK(b.x < 8.0f);                                        // stopped at the stone
+
+	// --- Raycast. The cross must stop the ray, or it is scenery that can never be
+	// broken. Fired from a cell centre so there is no argument about the origin cell.
+	RayHit h = worldRaycast(&s_world, 0.5f, 5.5f, 4.5f, 1.0f, 0.0f, 0.0f, 16.0f);
+	CHECK(h.hit);
+	CHECK(h.x == 4 && h.y == 5 && h.z == 4);       // the cross, not the stone past it
+	CHECK(h.face == FACE_WEST);
+	CHECK(h.px == 3 && h.py == 5 && h.pz == 4);    // and a sane cell to place into
+
+	// Standing inside it must not jam the crosshair. The "camera is inside a wall"
+	// short-circuit at the top of worldRaycast tests blockIsSolid, not targetability, so
+	// a ray fired from inside the cross still reaches the stone beyond instead of
+	// returning a zero-distance hit on the cell the player is standing in.
+	h = worldRaycast(&s_world, 4.5f, 5.5f, 4.5f, 1.0f, 0.0f, 0.0f, 16.0f);
+	CHECK(h.hit);
+	CHECK(h.x == 8 && h.y == 5 && h.z == 4);
+	CHECK(h.distance > 0.0f);
+
+	// A liquid is drawn but not targetable: the ray goes straight through it to the
+	// stone behind. Without the liquid term this would stop at (4,5,4) exactly like the
+	// cross did, so the two cases genuinely separate.
+	CHECK(worldSet(&s_world, 4, 5, 4, water));
+	CHECK(blockIsDrawn(water));
+	CHECK(!blockIsTargetable(water));
+	h = worldRaycast(&s_world, 0.5f, 5.5f, 4.5f, 1.0f, 0.0f, 0.0f, 16.0f);
+	CHECK(h.hit);
+	CHECK(h.x == 8 && h.y == 5 && h.z == 4);
+
+	worldExit(&s_world);
+	restoreCoreRegistry();
 }
 
 // 4.1 — the DDA raycast. Every case here is one that a naive implementation gets
@@ -3047,16 +4046,22 @@ static void testJobQueue(void)
 	CHECK(jobqPeak(&q) == 3);
 	CHECK(jobqConsistent(&q));
 
-	// Wrap-around. 5 in flight at a time for 500 rounds is four full laps of a 128-slot
-	// ring, so head and tail each pass zero several times while the queue is non-empty —
-	// the case a push/pop pair that only moves one index gets away with when the ring is
-	// drained to zero between operations.
+	// Wrap-around. 5 in flight at a time, for four full laps of the ring, so head and tail
+	// each pass zero several times while the queue is non-empty — the case a push/pop pair
+	// that only moves one index gets away with when the ring is drained to zero between
+	// operations.
+	//
+	// The round count is derived from JOBQ_CAP rather than the literal 500 it used to be.
+	// v1.6.0 task 12 raised JOBQ_CAP from 128 to 512 and 500 rounds silently stopped being
+	// "four laps" — it stopped being even one, so this check would have quietly stopped
+	// testing wrap-around at all while staying green.
+	const int wrap_rounds = 4 * JOBQ_CAP + 5;
 	int wrap_bad = 0;
 	for (int i = 0; i < 5; i++) {
 		const Job j = {JOB_MESH, i, i, i & 7};
 		CHECK_QUIET(jobqPush(&q, j));
 	}
-	for (int i = 5; i < 500; i++) {
+	for (int i = 5; i < wrap_rounds; i++) {
 		CHECK_QUIET(jobqPop(&q, &out));
 		if (out.cx != i - 5 || out.cy != ((i - 5) & 7) || out.type != JOB_MESH) wrap_bad++;
 		const Job j = {JOB_MESH, i, i, i & 7};
@@ -3092,6 +4097,129 @@ static void testJobQueue(void)
 	CHECK(jobqCount(&q) == 0);
 	CHECK(!jobqPop(&q, &out));
 	CHECK(jobqConsistent(&q));
+}
+
+// ---------------------------------------------------------------------------------------
+// v1.6.0 task 12. A refused mesh push has to be RECOVERABLE.
+//
+// The bug this exists for is an ordering bug, not a capacity bug. main.c's
+// genQueueReadyColumns used to mark a column queued and only then push its chunks:
+//
+//     genSlotSet(s_col_queued, cx, cz);
+//     for (cy...) if (!jobqPush(&s_meshq, j)) s_genr.mesh_refused++;
+//
+// so a push the full ring turned down lost its chunk for the rest of the session — the
+// column was already flagged, and the loop's own "if already queued, continue" skipped it
+// forever after. The blocks stay in the World and are simply never meshed: a permanent hole
+// that walking around does not repair.
+//
+// world/meshq.c is the real code that decides this, and it is what this test links — not a
+// copy of the loop. Its return value IS the contract ("true only if every chunk got in"),
+// so the caller's flag can be modelled here in the two lines main.c now spends on it and the
+// whole sequence checked end to end. This project has shipped green suites over hand-copied
+// logic twice (tests/battery_test.c, tests/sleep_test.c) and the rule since is that the test
+// links the module.
+//
+// The check that has to be able to go red is the LAST one: every chunk of the column is
+// eventually queued. Sabotaging meshqPushColumn to `return true` reproduces the old ordering
+// exactly, and that is the measurement recorded in tools/run_host_tests.sh.
+static void testMeshqRefusalIsRecoverable(void)
+{
+	// A column with blocks in five separate chunks, and a sixth chunk left as air so the
+	// all-air skip is exercised too rather than assumed. Chunk cy holds a block at
+	// y = cy * CHUNK_DIM + 1.
+	static const int kFilled[] = { 0, 1, 2, 4, 6 };
+	const int NFILLED = (int)(sizeof(kFilled) / sizeof(kFilled[0]));
+
+	budgetReset();
+	worldInit(&s_world);
+	for (int i = 0; i < NFILLED; i++)
+		CHECK_QUIET(worldSet(&s_world, 3, kFilled[i] * CHUNK_DIM + 1, 5, BLOCK_STONE));
+
+	// Sanity on the fixture itself: a test whose world is empty would pass every line below
+	// while proving nothing at all.
+	int present = 0;
+	for (int cy = 0; cy < COLUMN_CHUNKS; cy++) {
+		const Chunk* c = worldChunk(&s_world, 0, cy, 0);
+		if (c && !chunkIsAllAir(c)) present++;
+	}
+	CHECK(present == NFILLED);
+
+	// ── the control arm: a queue with room takes the whole column in one pass ──────────
+	JobQueue q;
+	jobqInit(&q);
+	int refused = 0;
+	bool queued = false;
+
+	if (meshqPushColumn(&q, &s_world, 0, 0, &refused)) queued = true;
+	CHECK(queued);
+	CHECK(refused == 0);
+	CHECK(jobqCount(&q) == NFILLED);
+	CHECK(jobqConsistent(&q));
+
+	// ── the real arm: only two free slots for five chunks ──────────────────────────────
+	//
+	// Filled with JOB_GENERATE rather than JOB_MESH so the mesh jobs this test cares about
+	// are distinguishable from the padding when the queue is drained below.
+	jobqInit(&q);
+	const int FREE = 2;
+	for (int i = 0; i < JOBQ_CAP - FREE; i++) {
+		const Job pad = {JOB_GENERATE, 1000 + i, 0, 0};
+		CHECK_QUIET(jobqPush(&q, pad));
+	}
+	CHECK(jobqCount(&q) == JOBQ_CAP - FREE);
+
+	refused = 0;
+	queued  = false;
+	if (meshqPushColumn(&q, &s_world, 0, 0, &refused)) queued = true;
+
+	// Three of the five did not fit. The count is the diagnostic main.c reports as
+	// mesh_refused, so it has to be the real shortfall and not just a flag.
+	CHECK(refused == NFILLED - FREE);
+	CHECK(jobqCount(&q) == JOBQ_CAP);
+
+	// THE fix, in one line: the column must NOT be marked queued when anything was refused.
+	// This is the check that goes red against the old ordering.
+	CHECK(!queued);
+
+	// ── and the recovery: drain, ask again, and the column completes ───────────────────
+	//
+	// Draining is what a frame of genDrainMesh does. Which cy values arrived across BOTH
+	// passes is what matters — a retry re-pushes chunks that already got through, which is
+	// harmless (chunkRenderBuild rebuilds a chunk's existing slot in place) and is why this
+	// records a set rather than a count.
+	int meshed_mask = 0;
+	Job j;
+	while (jobqPop(&q, &j))
+		if (j.type == JOB_MESH) meshed_mask |= 1 << j.cy;
+	CHECK(jobqCount(&q) == 0);
+
+	// main.c's guard, verbatim: a column already marked queued is never revisited. If the
+	// mark went on despite the refusal, this pass does nothing and the column stays short.
+	refused = 0;
+	if (!queued && meshqPushColumn(&q, &s_world, 0, 0, &refused)) queued = true;
+	CHECK(queued);
+	CHECK(refused == 0);
+
+	while (jobqPop(&q, &j))
+		if (j.type == JOB_MESH) meshed_mask |= 1 << j.cy;
+
+	// The payoff. Every chunk that had blocks in it got queued for meshing, and no chunk that
+	// was all air did. A hole in the world is precisely this mask coming back short.
+	int expect_mask = 0;
+	for (int i = 0; i < NFILLED; i++) expect_mask |= 1 << kFilled[i];
+	CHECK(meshed_mask == expect_mask);
+
+	// ── the capacity half, stated against the ring it now has to serve ────────────────
+	//
+	// The worst radius-3 ring measured on the host is 242 simultaneous chunk meshes and the
+	// structural bound is 49 columns x COLUMN_CHUNKS = 392. JOBQ_CAP was 128, which is under
+	// both — and under the 150-slot radius-2 ring it was already serving. See world/jobq.h.
+	CHECK(JOBQ_CAP >= 49 * COLUMN_CHUNKS);
+	CHECK(JOBQ_CAP >= RENDER_DIST_MAX_SLOTS);
+
+	worldExit(&s_world);
+	budgetReset();
 }
 
 // ---------------------------------------------------------------------------------------
@@ -3227,6 +4355,57 @@ static void testVisConnectivity(void)
 	chunkClear(c, BLOCK_AIR);
 	CHECK(chunkGetForm(c) == CHUNK_FORM_UNIFORM);
 	CHECK(visChunkConnectivity(c, &s_vis_scratch) == 0x7FFF);
+
+	// v1.6.0 task 10. visgraph.c's openTable() filled only ids 0..BLOCK_COUNT-1 from the
+	// registry and left everything above them at the air prefill, which was correct exactly
+	// while eight was every block there is. A server-registered dynamic block lands at
+	// REG_ID_DYN_LO (0x80) and up, so every one of them read back "see-through" no matter
+	// what its def said — a chunk of solid dynamic stone reported fully connected, the cave
+	// cull believed sight passed straight through it, and everything behind that wall was
+	// culled away while the wall itself still drew.
+	//
+	// A dynamic row registered here rather than a fabricated table: registryRegister() is the
+	// same call the DEFS decoder ends up in, so this exercises the real path an id above 0x7F
+	// gets into the world by. The two halves are the same pair as BLOCK_STONE/BLOCK_AIR at
+	// the top of this function, which is what makes the assertion mean something — the
+	// transparent variant must still read open, or a fix that simply hard-coded "high ids
+	// are solid" would pass.
+	BlockDef dyn;
+	memset(&dyn, 0, sizeof dyn);
+	snprintf(dyn.name, sizeof dyn.name, "vis_solid");
+	for (int f = 0; f < BLOCK_FACES; f++) dyn.tex[f] = BTEX_STONE;
+	dyn.flags = REG_FLAG_SOLID;
+	const BlockId dyn_solid = registryRegister(&dyn);
+	CHECK(dyn_solid == REG_ID_DYN_LO);
+
+	memset(&dyn, 0, sizeof dyn);
+	snprintf(dyn.name, sizeof dyn.name, "vis_glass");
+	for (int f = 0; f < BLOCK_FACES; f++) dyn.tex[f] = BTEX_LEAVES;
+	dyn.flags = REG_FLAG_SOLID | REG_FLAG_TRANSPARENT;
+	const BlockId dyn_clear = registryRegister(&dyn);
+	CHECK(dyn_clear == REG_ID_DYN_LO + 1);
+
+	CHECK(blockIsSolid(dyn_solid) && !blockInfo(dyn_solid)->transparent);
+	chunkClear(c, dyn_solid);
+	CHECK(visChunkConnectivity(c, &s_vis_scratch) == 0);
+
+	chunkClear(c, dyn_clear);
+	CHECK(visChunkConnectivity(c, &s_vis_scratch) == 0x7FFF);
+
+	// Non-uniform too, so the answer comes out of the flood fill rather than the UNIFORM
+	// short-circuit: an east-west tunnel bored through the dynamic solid must join exactly
+	// the one pair, the same as the stone case above.
+	chunkClear(c, dyn_solid);
+	for (int x = 0; x < CHUNK_DIM; x++)
+		chunkSet(c, chunkIndex(x, 8, 8), BLOCK_AIR);
+	CHECK(chunkGetForm(c) != CHUNK_FORM_UNIFORM);
+	const uint16_t dyn_tunnel = visChunkConnectivity(c, &s_vis_scratch);
+	CHECK(dyn_tunnel == (1u << visPairIndex(FACE_EAST, FACE_WEST)));
+
+	// Put the process-wide table back to the core rows: every test after this one expects a
+	// registry nobody has added to.
+	registryInitCore();
+	CHECK(!registryIsDefined(REG_ID_DYN_LO));
 }
 
 // Fills a walk box of nx x 1 x 1 chunks, every cell drawable, and returns how many the walk
@@ -3375,7 +4554,23 @@ static void testRenderDist(void)
 
 	// Defaults differ by console, which is the whole point of the step's second half.
 	CHECK(renderDistDefault(false) == RENDER_DIST_MIN);
-	CHECK(renderDistDefault(true) == RENDER_DIST_MAX);
+	CHECK(renderDistDefault(true) == RENDER_DIST_DEFAULT_NEW);
+
+	// v1.6.0 task 12. renderDistDefault used to return RENDER_DIST_MAX verbatim for a New 3DS,
+	// so raising the ceiling raised the New 3DS default with it — a behaviour change nobody
+	// asked for, hidden inside a constant change. These three lines are the deliberate choice
+	// made instead, written down where it can go red: the ceiling moved to 3, the New 3DS
+	// default stayed at 2, and the Old 3DS default stayed at 1.
+	//
+	// The middle one is the load-bearing check. If someone later re-spells renderDistDefault as
+	// `new_3ds ? RENDER_DIST_MAX : RENDER_DIST_MIN` it goes red, which is exactly the mistake
+	// being guarded against — see scene/render_dist.h's RENDER_DIST_DEFAULT_NEW for why the
+	// wider ring is offered on both models and automatic on neither (GPU cost is the binding
+	// constraint and cannot be measured anywhere in this project).
+	CHECK(renderDistDefault(true) != RENDER_DIST_MAX);
+	CHECK(renderDistDefault(true) >= RENDER_DIST_MIN && renderDistDefault(true) <= RENDER_DIST_MAX);
+	CHECK(renderDistDefault(false) == 1);
+	CHECK(RENDER_DIST_MAX == 3);
 
 	const RenderDist lo = renderDistFor(RENDER_DIST_MIN);
 	const RenderDist hi = renderDistFor(RENDER_DIST_MAX);
@@ -3385,11 +4580,17 @@ static void testRenderDist(void)
 	CHECK(lo.area_radius == lo.radius + 1);
 	CHECK(hi.area_radius == hi.radius + 1);
 
-	// Slots: 9 columns and 25 columns at six chunks each. The pool is claimed for the maximum
+	// Slots: 9 columns and 49 columns at six chunks each. The pool is claimed for the maximum
 	// at boot, so this number is what decides whether the setting is affordable at all.
 	CHECK(lo.slots == 9 * RENDER_DIST_SLOTS_PER_COLUMN);
-	CHECK(hi.slots == 25 * RENDER_DIST_SLOTS_PER_COLUMN);
+	CHECK(hi.slots == 49 * RENDER_DIST_SLOTS_PER_COLUMN);
+	CHECK(hi.slots == 294);
 	CHECK(hi.slots > lo.slots);
+
+	// The slot count the pool is actually cut against, kept in step with the setting's own
+	// arithmetic. scene/chunk_render.c splits exactly this many slots across its three tiers.
+	CHECK(RENDER_DIST_MAX_COLUMNS == 49);
+	CHECK(RENDER_DIST_MAX_SLOTS == hi.slots);
 
 	// Radius 1 keeps the near plane it has always had, so raising the setting is the only
 	// thing that can change the view near the camera.
@@ -3402,11 +4603,25 @@ static void testRenderDist(void)
 	CHECK(hi.near_plane <= RENDER_DIST_NEAR_MAX);
 	CHECK(RENDER_DIST_NEAR_MAX * 1.5917f < 0.3f);
 
+	// v1.6.0 task 12: the near plane SATURATES at the top of the range. NEAR_BASE 0.10 plus
+	// NEAR_STEP 0.05 per column reaches 0.20 at radius 3 and the cap holds it at 0.18 — which
+	// is the entire reason the ceiling is 3 and not 4. Past here a wider ring cannot move the
+	// first fog knot, so it cannot buy visible distance; it only buys geometry the fog hides.
+	// If this ever stops being true the argument in render_dist.h no longer holds and the
+	// ceiling should be revisited, which is what makes it worth a check rather than a comment.
+	//
+	// Stated behaviourally — radius 2 is still below the cap, radius 3 is AT it — rather than
+	// by re-deriving NEAR_BASE + NEAR_STEP * n here. Those two constants are private to
+	// render_dist.c, and a copy of them in this file would be checking the copy.
+	CHECK(renderDistFor(2).near_plane < RENDER_DIST_NEAR_MAX);
+	CHECK(hi.near_plane >= RENDER_DIST_NEAR_MAX - 1e-6f);
+	CHECK(hi.near_plane <= RENDER_DIST_NEAR_MAX + 1e-6f);
+
 	// The load boundary is radius x 16 blocks in the worst case, and the fog must reach the
 	// target by then at every setting. This is the criterion step 6.4 established and it has
 	// to survive the setting becoming variable.
 	CHECK(lo.boundary > 15.9f && lo.boundary < 16.1f);
-	CHECK(hi.boundary > 31.9f && hi.boundary < 32.1f);
+	CHECK(hi.boundary > 47.9f && hi.boundary < 48.1f);   // radius 3 x 16 blocks
 	CHECK(lo.fog_hides);
 	CHECK(hi.fog_hides);
 	CHECK(renderDistVisibility(&lo, lo.boundary) <= RENDER_DIST_TARGET_VIS * 1.01f);
@@ -3422,18 +4637,27 @@ static void testRenderDist(void)
 
 	// Fog is monotone: nearer is always clearer, at both settings. A LUT built from a curve
 	// that folded back on itself would read as a bright ring at a fixed distance.
-	for (float z = 1.0f; z < 40.0f; z += 0.5f) {
+	// Past hi.boundary (48 blocks at radius 3) rather than the old 40, which stopped short of
+	// the new load boundary — the one distance the fog absolutely has to be monotone at.
+	for (float z = 1.0f; z < 56.0f; z += 0.5f) {
 		CHECK_QUIET(renderDistVisibility(&lo, z) >= renderDistVisibility(&lo, z + 0.5f) - 1e-6f);
 		CHECK_QUIET(renderDistVisibility(&hi, z) >= renderDistVisibility(&hi, z + 0.5f) - 1e-6f);
 	}
 
 	// And the payoff, such as it is: a wider ring does let the player see further, because
-	// `near` moved with it. Sublinear by a long way — the ring doubles and the half-fade
-	// distance goes up by about half — which is the LUT's shape, not a bug, and is why
-	// RENDER_DIST_MAX is 2 rather than 4.
+	// `near` moved with it. Sublinear by a long way — which is the LUT's shape, not a bug, and
+	// is why RENDER_DIST_MAX is 3 rather than 5.
 	CHECK(hi.half_vis > lo.half_vis * 1.2f);
 	CHECK(hi.half_vis < hi.boundary);
 	CHECK(lo.half_vis < lo.boundary);
+
+	// v1.6.0 task 12's actual argument for stopping at 3, as a check rather than a paragraph:
+	// each extra column buys less than the one before it, and the step from 2 to 3 is the last
+	// one worth paying for. Radius 3 is a large gain over radius 2; the near plane saturates
+	// there (checked above), so radius 4 and 5 cannot repeat it — which is exactly what makes
+	// the ceiling defensible. Both ends measured on the host, not asserted from the comment.
+	CHECK(renderDistFor(3).half_vis > renderDistFor(2).half_vis * 1.15f);
+	CHECK(renderDistFor(2).half_vis > renderDistFor(1).half_vis);
 
 	// Zero density is "no fog" through this same code path, which is what makes the
 	// -DFOG_DENSITY=0.0f check able to go red rather than merely different.
@@ -3959,6 +5183,79 @@ static void testLightBlockChannel(void)
 	lightEngineInit(false);
 }
 
+// The same room, lit by a SERVER-REGISTERED block instead of a core one.
+//
+// v1.6.0: light.c's anyLuminance() — the gate both engines ask before running the block
+// channel at all — looped `i < BLOCK_COUNT` over a table that is the full 256-id space
+// wide. So a luminance set on a dynamic id (0x80..0xFD) read back as "nothing in this
+// world glows", the block-seed pass was skipped entirely, and the emitter sat dark with no
+// error anywhere. Dormant in production (no dynamic block declares luminance yet) and the
+// same class of bug as visgraph.c's openTable(), inventory's ceiling and the mesher's
+// per-id tables.
+//
+// Deliberately a near-copy of testLightBlockChannel above rather than a parameterised
+// merge: the two differ in exactly one thing — which half of the id space the emitter
+// lives in — and that is the whole claim. A shared body would let a change to the core
+// arm silently move the dynamic one too.
+static void testLightBlockChannelFromDynamicId(void)
+{
+	// Registered through the real call the DEFS path ends in, so the id really is a
+	// dynamic one and not a hand-picked constant.
+	BlockDef def;
+	memset(&def, 0, sizeof def);
+	snprintf(def.name, sizeof def.name, "test_lamp");
+	for (int f = 0; f < BLOCK_FACES; f++) def.tex[f] = BTEX_STONE;
+	def.flags     = REG_FLAG_SOLID | REG_FLAG_LUMINOUS;
+	def.luminance = 7;
+	const BlockId lamp = registryRegister(&def);
+	mesherInvalidateTables();
+
+	CHECK(lamp >= REG_ID_DYN_LO);          // over the BLOCK_COUNT ceiling, which is the point
+	if (lamp < REG_ID_DYN_LO) { restoreCoreRegistry(); return; }
+
+	lightEngineInit(true);
+	worldInit(&s_world);
+
+	for (int y = 39; y <= 45; y++)
+		for (int z = 0; z < CHUNK_DIM; z++)
+			for (int x = 0; x < CHUNK_DIM; x++) {
+				const bool room = (y >= 40 && y <= 44 && x >= 4 && x <= 11 &&
+				                   z >= 4 && z <= 11);
+				CHECK_QUIET(worldSet(&s_world, x, y, z,
+				                     room ? BLOCK_AIR : BLOCK_STONE));
+			}
+	CHECK(worldSet(&s_world, 7, 42, 7, lamp));
+
+	// light.c's table is still filled by hand — wiring it from BlockDef.luminance is a
+	// separate piece of work. What is under test here is the SCAN, not the wiring.
+	lightSetLuminanceForTest(lamp, 7);
+
+	LightQueue* q = (LightQueue*)malloc(sizeof(LightQueue));
+	CHECK(q != NULL);
+	if (!q) { worldExit(&s_world); restoreCoreRegistry(); return; }
+	lightQueueInit(q);
+
+	CHECK(lightPropagateColumn(&s_world, 0, 0, q));
+
+	Column* col = worldColumn(&s_world, 0, 0);
+	CHECK(col != NULL);
+	CHECK(lightGetBlock(col, 7, 42, 7) == 7);   // the emitter holds its own level
+	CHECK(lightGetBlock(col, 8, 42, 7) == 6);   // -1 per air cell outward
+	CHECK(lightGetBlock(col, 11, 42, 7) == 3);  // four steps east along the room
+	CHECK(lightGetBlock(col, 11, 44, 11) == 0); // past the emitter's reach
+	CHECK(lightGetBlock(col, 7, 46, 7) == 0);   // beyond the sealed shell: nothing
+
+	// Both engines, same as the core arm: the relaxation sweeps read the same table
+	// through the same gate, so a bound that is wrong in one is wrong in both.
+	lightEnginesAgree(0, 0);
+
+	lightSetLuminanceForTest(lamp, 0);          // restore production truth
+	worldExit(&s_world);
+	free(q);
+	lightEngineInit(false);
+	restoreCoreRegistry();
+}
+
 // The design doc's classic drift check: a long sequence of single-block edits,
 // each followed by the edit-path relight, must land exactly where a fresh full
 // recompute of the final terrain lands. Two independent engines have to agree.
@@ -4063,23 +5360,26 @@ static void testMesherO3DSParity(void)
 	scratchFillLight(&s_scratch, &s_world, 0, 2, 0);
 	meshChunk(&lit, &s_scratch);
 
-	CHECK(lit.vert_count == ref.vert_count);
-	CHECK(lit.index_count == ref.index_count);
-	CHECK(memcmp(lit.indices, ref.indices,
-	             sizeof(uint16_t) * ref.index_count) == 0);
+	// v1.6.0 task 11: the two arms are no longer byte-identical and cannot be. A greedy
+	// run stops wherever anything visible about the next face differs, and baked light is
+	// one of those things — so the lit arm merges strictly less than the unlit one and the
+	// vertex arrays stop lining up index for index. "Nothing but pad moved" is therefore
+	// restated as "the same block faces, in the same places, differently grouped", which is
+	// the claim that was always meant. Comparing bytes here would only be testing that the
+	// merge rule happens to agree between the arms, which is exactly what it must not do.
+	CHECK(meshFaceCells(&lit) == meshFaceCells(&ref));
+	CHECK(meshCoverageEqual(&ref, &lit));
+	CHECK(lit.faces >= ref.faces);        // extra shading detail can only split runs
+	CHECK(meshIndexPatternOk(&lit));
+	CHECK(meshIndexPatternOk(&ref));
 
-	bool pads_differ = false, all_fields_else_equal = true;
-	int  shadowed = 0;
-	for (uint32_t i = 0; i < ref.vert_count; i++) {
-		MeshVertex a = ref.verts[i], b = lit.verts[i];
-		const uint8_t ra = a.pad, rb = b.pad;   // captured before the wipe below
-		a.pad = b.pad = 0;
-		if (memcmp(&a, &b, sizeof(a)) != 0) all_fields_else_equal = false;
-		if (ra != rb) pads_differ = true;
-		if ((rb >> 4) < 15) shadowed++;
+	int pads_set = 0, shadowed = 0;
+	for (uint32_t i = 0; i < lit.vert_count; i++) {
+		const uint8_t p = (uint8_t)lit.verts[i].pad;
+		if (p != 0) pads_set++;
+		if ((p >> 4) < 15) shadowed++;
 	}
-	CHECK(all_fields_else_equal);   // nothing but pad moved
-	CHECK(pads_differ);             // ...and pad really carries the light
+	CHECK(pads_set > 0);            // pad really carries the light
 	CHECK(shadowed > 0);            // the overhang's shade reached vertices
 
 	// Fully sunlit corners average four taps of 15 and pack to exactly 0xF0:
@@ -4482,10 +5782,17 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testMesherOpaqueBehindTransparent();
 	testMesherFaceBuckets();
 	testMesherAO();
+	testMesherFullCubeBytesUnchanged();
+	testBlockShapeRegistry();
+	testMesherCrossShape();
+	testMesherGreedyMerge();
+	testMesherCrossNeverMerges();
+	testCrossShapeCollisionAndRaycast();
 	testRemeshList();
 	testIncrementalRemesh();
 	testDirtyQueue();
 	testJobQueue();
+	testMeshqRefusalIsRecoverable();
 	testHandbuiltHeight();
 	testHandbuiltFillShape();
 	testHandbuiltWalkable();
@@ -4515,6 +5822,7 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testLightSkySunColumns();
 	testLightSkyOverhang();
 	testLightBlockChannel();
+	testLightBlockChannelFromDynamicId();
 	testLightIncrementalEqualsFull();
 	testMesherO3DSParity();
 	testChunkCodec();

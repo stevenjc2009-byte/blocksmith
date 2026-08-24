@@ -33,3 +33,13 @@ bool updaterTagFromRedirect(const char* url, char* out, size_t out_size);
 // both to build the download URL (updater.c) and as the fallback filename compared against
 // what a real release's browser_download_url carries.
 void updaterBuildAssetName(const char* tag, char* out, size_t out_size);
+
+// The same idea for the release-notes asset v1.6.0 task 14b added — "v1.6.0" (or "1.6.0")
+// becomes "whatsnew1.6.0.txt", the second file every release carries alongside its .cia.
+// Kept next to updaterBuildAssetName rather than in app/whatsnew.c so the "a leading v is
+// tolerated" rule lives in exactly one place; the two names differ only in their affixes and
+// drifting apart would give one of them a URL nothing is published at.
+//
+// Every release published before 14b existed has no such asset, and that is fine by design:
+// app/updater.c treats the 404 as "no notes" and the update proceeds normally.
+void updaterBuildNotesName(const char* tag, char* out, size_t out_size);

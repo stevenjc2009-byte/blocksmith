@@ -7,16 +7,34 @@
 # `make -f Makefile.networld-test test`   build and run the suite
 # `make -f Makefile.networld-test clean`  remove the built artefacts
 #
+# tools/run_host_tests.sh is the runner that HAS to pass — it builds this same suite as its
+# tenth binary and is what a default `sh tools/run_host_tests.sh` executes. This Makefile is
+# not a second copy of the suite and not a substitute for that one: it exists only for the
+# much finer warning set below (-Wconversion/-Wsign-conversion/-Wcast-qual/-Wshadow and the
+# rest), which the runner does not carry and which is a review tool for code that parses
+# attacker-controlled bytes. Run it when networld.c's decoders change.
+#
+# It had rotted into a lie before v1.6.0 task 8b: the link line named six objects while the
+# suite had grown to need eleven, so `make -f Makefile.networld-test test` died with roughly
+# 25 undefined references while this header still presented it as the way to run the tests.
+# The link line below is now the runner's own file list, kept in the same order, so a
+# divergence is visible by reading the two side by side.
+#
 # Unlike blockdiff.c, networld.c is not header-only against world/ — it calls worldSet(),
 # worldColumn() and friends for real, and world.c's own worldSet() calls back into
 # networldOnColumnLoad() (see world/world.c's "new_column" branch). Proving that hook fires
 # for real means linking the actual world/world.c, world/chunk.c and world/budget.c, not a
 # stand-in for any of them — the same three files a host gcc probe already confirmed are
 # pure C with no <3ds.h> dependency (see world/block.h's own header comment on why that is
-# true by design). net/bsnet_transport.c is the one real dependency NOT linked here: it is
-# Noise XX over a UDP socket via libhydrogen, none of it host-portable, so
-# networld_test.c#file provides netTransportRecv()/netTransportSend() test doubles itself and
-# satisfies those two symbols at link time instead.
+# true by design). world/registry.c, world/block.c, world/mesher.c and world/scratch.c join
+# them for the same reason: v1.6.0 put the block registry under this binary, and the tests
+# apply real BS_APP_REGISTRY_DEFS batches through the real table and then mesh against it.
+#
+# net/bsnet_transport.c is the one real dependency NOT linked here: it is Noise XX over a UDP
+# socket via libhydrogen, none of it host-portable, so networld_test.c provides
+# netTransportRecv()/netTransportSend() test doubles itself and satisfies those two symbols at
+# link time instead. net/bsnet_sock.c is absent for the same reason — its clock_gettime()/
+# osGetTime() bsSockNowMs() is replaced by the test file's fake clock.
 
 CC ?= cc
 
@@ -28,12 +46,33 @@ CC ?= cc
 # The second -I is the pinned wire-format checkout that `make deps` fetches into deps/ at
 # the repo root (see mc/Makefile) — it is what resolves "proto/bs_proto.h", and this test
 # does not build until that has been run at least once.
+#
+# -DBS_CLIENT_HAS_METERS=1 flips net/networld.h's compile-honest meter gate so
+# test_send_player_report_encodes() can reach the PLAYER_REPORT encoder at all — the same
+# flag, for the same reason, that tools/run_host_tests.sh passes on its networld_test line.
+# Without it that scenario's checks fail rather than being skipped.
 CFLAGS := -std=c11 -O2 -g \
           -Wall -Wextra -Werror \
           -Wformat=2 -Wconversion -Wsign-conversion -Wshadow \
           -Wstrict-prototypes -Wmissing-prototypes -Wpointer-arith \
           -Wvla -Wcast-qual -Wundef \
+          -DBS_CLIENT_HAS_METERS=1 \
           -I.. -I../../deps/blocksmith-server
+
+# world/mesher.c is the one file this build relaxes, and only by the two flags it trips:
+#
+#   mesher.c:341  conversion to int8_t   from int may change the sign of the result
+#   mesher.c:493  conversion to uint32_t from int may change the sign of the result
+#   mesher.c:574  conversion to int8_t   from int may change the sign of the result
+#
+# Measured, not assumed — those three are the complete list under the flags above. mesher.c is
+# a LINK DEPENDENCY here, not a subject: this binary needs it because applying a registry batch
+# calls mesherInvalidateTables() and one scenario meshes a freshly registered block, and none
+# of the bytes it touches came off the wire. The strict set exists for net/networld.c's
+# decoders, and every file that is a subject still gets it. The alternative — editing mesher.c
+# to satisfy a warning set the console build does not use — would be changing shipped rendering
+# code to make a review tool happy, which is the wrong way round.
+MESHER_CFLAGS := $(filter-out -Wconversion -Wsign-conversion,$(CFLAGS))
 
 # Never beside the sources — see Makefile.blockdiff-test's own comment on why: mc/Makefile
 # puts source/net (and source/world) on VPATH, so a host-built .o left next to its source is
@@ -46,17 +85,33 @@ BUILD := build-networld
 $(BUILD):
 	mkdir -p $(BUILD)
 
-$(BUILD)/networld_test: $(BUILD)/world.o $(BUILD)/chunk.o $(BUILD)/budget.o \
+$(BUILD)/networld_test: $(BUILD)/world.o $(BUILD)/block.o $(BUILD)/registry.o \
+                         $(BUILD)/chunk.o $(BUILD)/budget.o $(BUILD)/mesher.o \
+                         $(BUILD)/scratch.o \
                          $(BUILD)/blockdiff.o $(BUILD)/networld.o $(BUILD)/networld_test.o
 	$(CC) $^ -o $@
 
 $(BUILD)/world.o: ../world/world.c ../world/world.h networld.h | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD)/block.o: ../world/block.c ../world/block.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/registry.o: ../world/registry.c ../world/registry.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(BUILD)/chunk.o: ../world/chunk.c ../world/chunk.h | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/budget.o: ../world/budget.c ../world/budget.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# The one relaxed translation unit — see MESHER_CFLAGS above for the three warnings and why
+# they are not this binary's business to fix.
+$(BUILD)/mesher.o: ../world/mesher.c ../world/mesher.h | $(BUILD)
+	$(CC) $(MESHER_CFLAGS) -c $< -o $@
+
+$(BUILD)/scratch.o: ../world/scratch.c ../world/scratch.h | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/blockdiff.o: blockdiff.c blockdiff.h | $(BUILD)

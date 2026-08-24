@@ -89,7 +89,7 @@ InvAddResult invBridgeAdd(Inventory* inv, ItemId item, uint8_t count, uint8_t* o
 	// inventory is now actually holding, and that is the only number the server should be told
 	// about. INV_ADD_REFUSED means leftover == count, so `landed` is 0 and nothing goes out.
 	const uint8_t landed = (uint8_t)(count - leftover);
-	if (landed > 0 && (uint32_t)item < BLOCK_COUNT)
+	if (landed > 0 && inventoryCanHold(item))
 		(void)networldSendInvAction(BS_INV_OP_PICKUP, (uint8_t)item, landed, 0);
 
 	return r;
@@ -99,7 +99,7 @@ uint8_t invBridgeRemove(Inventory* inv, ItemId item, uint8_t count)
 {
 	const uint8_t removed = inventoryRemove(inv, item, count);
 
-	if (removed > 0 && (uint32_t)item < BLOCK_COUNT)
+	if (removed > 0 && inventoryCanHold(item))
 		(void)networldSendInvAction(BS_INV_OP_CONSUME, (uint8_t)item, removed, 0);
 
 	return removed;
@@ -114,7 +114,12 @@ bool invBridgeApplyState(Inventory* inv, const NetworldInvState* state)
 	// cap; the item id against *this build's* block table is the part it structurally cannot
 	// check, so it is the only part re-checked here rather than a duplicate of its work.
 	for (uint32_t i = 0; i < NETWORLD_INV_SLOT_COUNT; i++) {
-		if ((uint32_t)state->slots[i].item >= BLOCK_COUNT) return false;
+		// ITEM_NONE is a *legal* slot value here (an empty slot), which is the one place
+		// inventoryCanHold's "not air" half must not be applied — an empty slot is not an
+		// item the bag has to be able to carry. The id ceiling itself still comes from
+		// that one predicate rather than a second copy of BLOCK_COUNT.
+		const ItemId item = (ItemId)state->slots[i].item;
+		if (item != ITEM_NONE && !inventoryCanHold(item)) return false;
 	}
 
 	for (uint32_t i = 0; i < NETWORLD_INV_SLOT_COUNT; i++) {

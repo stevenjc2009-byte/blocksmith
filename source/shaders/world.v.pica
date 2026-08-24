@@ -11,7 +11,8 @@
 ;        8-byte vertex, and that unaligned attribute fetch is what froze the
 ;        console on the first world frame from v1.1.0 to v1.2.4.
 ;   v1 = (u, v, normal index, ao), 4x u8
-;        u/v are atlas pixel coordinates 0..127, scaled to 0..1 here
+;        u is an atlas pixel coordinate 0..255 (it exceeds 16 on a merged quad and
+;        GPU_REPEAT wraps it), v is 0..240; both are scaled to 0..1 here
 ;        normal index 0..5 selects a baked face brightness
 ;        ao is 0..3, 3 meaning unoccluded
 
@@ -21,28 +22,27 @@
 ; array is 8 long because relative addressing wants a power of two to be safe.
 .fvec faceShade[8]
 
-; uvScale MUST be 1/ATLAS_PX, with ATLAS_PX from source/world/atlas_uv.h. It was 1/256 —
-; left behind when step 9.3c shrank the sheet from 256x256 to 64x64 — and a mismatch renders
-; no error at all, because a wrong scale still produces valid UVs and so still draws *a*
-; texture. At 1/256 every tile's rect (spanning atlas pixels 2..62 of 64) divided by 256
-; landed inside UV 0..0.2422, i.e. all nine tiles collapsed into the same ~14x14 px corner of
-; the sheet — the wood row. Measured on screen: every block in the world drew with pale
-; wood_top rings on top and wood_side bark grooves on the sides, so the whole world was one
-; flat brown, with no grass green and no stone grey anywhere.
+; The atlas is a one-tile-wide strip (v1.6.0 task 11), so U and V no longer divide by the
+; same number: x MUST be 1/ATLAS_W_PX and y MUST be 1/ATLAS_H_PX, both from
+; source/world/atlas_uv.h. It was one scalar, consts.zzzz, while the sheet was square.
 ;
-; It is 1/128 now, because adding TILE_PLANKS grew the sheet to 128x128 (there was no tenth
-; cell in 64x64). Left at 1/64 it would have been the same failure in the other direction:
-; tile rects computed against a 128px sheet but divided by 64 reach UV up to 1.9375, so every
-; tile would wrap twice and each face would show four squashed copies of the wrong art.
+; A mismatch here renders no error at all, because a wrong scale still produces valid UVs
+; and so still draws *a* texture. It has already happened once: step 9.3c shrank the sheet
+; from 256x256 to 64x64 and left this at 1/256, which divided every tile's rect (atlas pixels
+; 2..62 of 64) down into UV 0..0.2422 — all nine tiles collapsed into the same ~14x14px
+; corner, the wood row. Measured on screen: every block drew with pale wood_top rings on top
+; and wood_side bark grooves on the sides, so the whole world was one flat brown, with no
+; grass green and no stone grey anywhere.
 ;
-; This is the third copy of the atlas size — here, source/world/atlas_uv.h and
-; tools/make_atlas.py. source/world/atlas_uv_shader_test.c parses this line and fails the host
-; suite when it disagrees with the header, which is the only reason the duplication is safe;
-; it is what caught this change. Update all three together.
-.constf consts(0.0, 1.0, 0.0078125, 0.33333333)   ; 0, 1, 1/128, 1/3
+; This is one of four copies of the layout — here, source/shaders/world_dynamic.v.pica,
+; source/world/atlas_uv.h and tools/make_atlas.py. source/world/atlas_uv_shader_test.c parses
+; this line out of BOTH shaders and fails the host suite when either component disagrees with
+; the header, which is the only reason the duplication is safe. Update all four together.
+.constf uvScale(0.0625, 0.00390625, 0.0, 0.0)     ; 1/ATLAS_W_PX = 1/16, 1/ATLAS_H_PX = 1/256
+
+.constf consts(0.0, 1.0, 0.0, 0.33333333)         ; 0, 1, spare (was uvScale), 1/3
 .alias  zeros consts.xxxx
 .alias  ones  consts.yyyy
-.alias  uvScale consts.zzzz
 .alias  aoScale consts.wwww
 
 ; How much of the brightness AO is allowed to take away: a fully occluded corner
@@ -74,8 +74,10 @@
 	dp4 outpos.w, projection[3], r1
 
 	; --- texture coordinates ---------------------------------------------
-	; Atlas pixel coords come in unnormalised (0..63) because PICA byte
-	; attributes are not scaled, so 1/128 converts them.
+	; Atlas pixel coords come in unnormalised because PICA byte attributes are not
+	; scaled. uvScale is a vec4 now, not a broadcast scalar: .x divides u by the sheet
+	; WIDTH (16) and .y divides v by its HEIGHT (256). .z/.w are zero and multiply the
+	; normal index and ao into r2.zw, which the swizzle below throws away.
 	mul r2, uvScale, inpack
 	mov outtc0, r2.xyxy
 

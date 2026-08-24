@@ -256,22 +256,96 @@ static uint16_t* s_shared_indices;
 // Cut points and slot counts are measured, not round numbers picked by eye: the same host
 // sample put 58–64 % of live chunks under 512 faces, 97.6–99.2 % under 1024, and never above
 // 1409 of the 2048-face absolute cap (worldgen's cave carving is what keeps any single chunk
-// from ever reaching the pathological checkerboard MESH_SLOT_FACES is sized against). Slot
-// counts (70/60/20) carry roughly 25–40 % margin over the worst tier occupancy seen across
-// six seeds (64/56/9), the same style of headroom MESH_SLOT_FACES itself already uses over a
-// fully exposed chunk surface. Tier L's cap is MESH_SLOT_FACES itself, so a pathological
-// world is refused exactly as before — nothing about the absolute worst case regresses.
+// from ever reaching the pathological checkerboard MESH_SLOT_FACES is sized against). Tier L's
+// cap is MESH_SLOT_FACES itself, so a pathological world is refused exactly as before —
+// nothing about the absolute worst case regresses.
+//
+// ── v1.6.0 task 12: re-cut for RENDER_DIST_MAX 3 ────────────────────────────────────────
+//
+// Sizing a tier at a time is WRONG here, and the old 70/60/20 comment above hid that by
+// quoting a per-tier occupancy (64/56/9). acquireSlot() below spills UPWARD ONLY: a chunk
+// needing more than 1024 faces can only be served by L, one needing more than 512 by M or L,
+// and any chunk at all by S, M or L. So what the pool has to satisfy is a SUFFIX constraint —
+//
+//     L      >= max simultaneous chunks over 1024 faces
+//     M + L  >= max simultaneous chunks over  512 faces
+//     S+M+L  >= max simultaneous meshed chunks
+//
+// — and that is also sufficient, because smallest-fit with upward spill is optimal against it
+// (it is Hall's condition on the tier suffixes: if every suffix's capacity covers its own
+// demand, no arrival order can strand a chunk).
+//
+// Measured with the REAL mesher and the REAL worldgen on the host, the way step 9.2c's own
+// numbers were taken and the way tools/run_greedy_probe.sh links: 8 seeds (1337, 2026, 42,
+// 99991, 7, 123456, 8675309, 55) x 5 area centres far apart in the world (0,0 / 400,-270 /
+// -1130,640 / 2900,3100 / -4210,-1750), 17x17 columns generated at each so every measured
+// column has all eight neighbours present, then the radius-3 ring slid over the resulting
+// face-count grid at 81 positions per area. 9,000 columns, 37,682 chunk meshes, 3,240 ring
+// positions. Worst case over all of them:
+//
+//     all meshed chunks in one radius-3 ring   242
+//     of those, over  512 faces                103
+//     of those, over 1024 faces                  8
+//     largest single chunk                    1371 faces  (cap is 2048)
+//
+// The radius-2 control from the same run is 125 / 59 / 6, against the 129 / 65 / 9 implied by
+// the 64/56/9 this file used to record. SAID OUT LOUD rather than overridden: the older figure
+// is HIGHER than this one in every bucket, its raw sample could not be reconstructed, and a
+// tail is a volume question — so it is treated here as evidence that the true tail is at least
+// as long as measured, and the margins below are set against the older number, not this one.
+//
+// Hence 158/120/16 out of MESH_SLOTS = 294:
+//
+//     L     = 16  vs   8 measured (2.0x), vs ~12 scaling the older radius-2 figure to 49 columns
+//     M + L = 136 vs 103 measured (1.32x)
+//     total = 294 vs 242 measured (1.21x)
+//
+// Total bytes 7,593,984 (7.24 MB) including the shared index buffer, against 4,448,256
+// (4.24 MB) before — +3.00 MB exactly, out of the 25.83 MB of linear heap the one hardware
+// reading on record shows free. Minimising bytes subject to those margins is what picks the
+// split: at a fixed 294 slots the cost is 4,816,896 + 16384*M + 49152*L, so every slot moved
+// down a tier is a straight saving and the margins above are the only thing holding it up.
 #define TIER_S_FACES  512
 #define TIER_M_FACES  1024
 #define TIER_L_FACES  MESH_SLOT_FACES   // 2048 — unchanged absolute worst case
 
-#define TIER_S_SLOTS  70
-#define TIER_M_SLOTS  60
-#define TIER_L_SLOTS  (MESH_SLOTS - TIER_S_SLOTS - TIER_M_SLOTS)   // 20 at MESH_SLOTS=150
+#define TIER_S_SLOTS  158
+#define TIER_M_SLOTS  120
+#define TIER_L_SLOTS  (MESH_SLOTS - TIER_S_SLOTS - TIER_M_SLOTS)   // 16 at MESH_SLOTS=294
 
 _Static_assert(TIER_S_SLOTS + TIER_M_SLOTS + TIER_L_SLOTS == MESH_SLOTS,
                "tier slot counts must add up to the whole pool");
 _Static_assert(TIER_L_SLOTS > 0, "tier sizes leave nothing for the largest tier");
+
+// v1.6.0 task 12. The suffix constraint above, asserted HERE — next to the constants it
+// constrains — rather than in a test. The tier counts are file-private #defines, so a test
+// could only check its own copy of them, which is the exact failure this project has recorded
+// twice (tests/battery_test.c and tests/sleep_test.c both passed with the real module
+// deleted). A _Static_assert cannot be checked against a copy and cannot be forgotten to run:
+// it is the console build.
+//
+// The three numbers are the measured worst radius-3 ring from the host probe described above.
+// Raising RENDER_DIST_MAX again without re-measuring will not fail these — they are a floor on
+// a KNOWN ring, not a prediction about a wider one — so re-measure, then move them.
+#define TIER_MEASURED_WORST_ALL    242   // meshed chunks in one radius-3 ring
+#define TIER_MEASURED_WORST_512    103   // ...of those, over TIER_S_FACES
+#define TIER_MEASURED_WORST_1024     8   // ...of those, over TIER_M_FACES
+
+_Static_assert(TIER_L_SLOTS >= TIER_MEASURED_WORST_1024,
+               "acquireSlot spills upward only, so a chunk over TIER_M_FACES can be served by "
+               "tier L alone: L must cover every such chunk the widest ring can hold at once");
+_Static_assert(TIER_M_SLOTS + TIER_L_SLOTS >= TIER_MEASURED_WORST_512,
+               "a chunk over TIER_S_FACES can only be served by M or L, so their combined "
+               "count must cover every such chunk the widest ring can hold at once");
+_Static_assert(TIER_S_SLOTS + TIER_M_SLOTS + TIER_L_SLOTS >= TIER_MEASURED_WORST_ALL,
+               "the whole pool must cover every meshed chunk the widest ring can hold at once");
+
+// And the cut points themselves, because the measured numbers above are counts of chunks
+// "over TIER_S_FACES" and "over TIER_M_FACES" — they mean nothing if those two move without
+// the measurement being redone.
+_Static_assert(TIER_S_FACES == 512 && TIER_M_FACES == 1024,
+               "the tier occupancy measurement is stated against these two cut points; "
+               "re-measure before changing either");
 
 static const int kTierFaces[3] = { TIER_S_FACES, TIER_M_FACES, TIER_L_FACES };
 static const int kTierSlots[3] = { TIER_S_SLOTS, TIER_M_SLOTS, TIER_L_SLOTS };
@@ -335,12 +409,26 @@ static VisWalk    s_walk;
 static VisScratch s_vis_scratch;
 
 // Step 9.1e's working memory: one entry per column currently holding a live slot. Sized off
-// RENDER_DIST_MAX_COLUMNS (25 at RENDER_DIST_MAX=2) with margin rather than exactly at it,
-// because a slot in flight during a distance change can briefly belong to a column outside the
-// current radius. A column past the cap simply does not participate as a blocker — the safe
-// direction, per the file-header rule every cull here follows: this may under-cull, it must
-// never over-cull.
-#define HZN_MAX_COLUMNS  40
+// RENDER_DIST_MAX_COLUMNS with margin rather than exactly at it, because a slot in flight
+// during a distance change can briefly belong to a column outside the current radius. A column
+// past the cap simply does not participate as a blocker — the safe direction, per the
+// file-header rule every cull here follows: this may under-cull, it must never over-cull.
+//
+// v1.6.0 task 12. This was the literal 40, hand-derived from the 25 columns of
+// RENDER_DIST_MAX 2. At MAX 3 the ring is 49 columns, so the literal was BELOW the ring it is
+// supposed to cover — every ring position would have silently dropped at least nine columns
+// from the blocker set. It degrades safely (that is the whole point of the paragraph above),
+// which is exactly why it would never have been noticed: horizon culling would just have got
+// quietly weaker at the render distance where it matters most, with nothing to see and no
+// counter to read.
+//
+// Derived from RENDER_DIST_MAX_COLUMNS now rather than restated, so the next ceiling change
+// cannot leave it behind the same way. +16 keeps the old margin's intent (40 was 25 + 15).
+#define HZN_MAX_COLUMNS  (RENDER_DIST_MAX_COLUMNS + 16)
+
+_Static_assert(HZN_MAX_COLUMNS > RENDER_DIST_MAX_COLUMNS,
+               "the horizon blocker set must cover the whole widest ring, with room for a "
+               "slot still in flight from a distance change");
 
 typedef struct {
 	int   cx, cz;

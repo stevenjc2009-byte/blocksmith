@@ -54,8 +54,11 @@ const uint8_t kFaceOrder[BLOCK_FACES] = {
 //
 //   * blockIsSolid() is a call into block.c, so it could not be inlined: about 48,000
 //     function calls per chunk, one per neighbour read.
-//   * atlasRect() divides and modulos by ATLAS_GRID, and the ARM11 has no divide
-//     instruction — that is a libgcc __aeabi_idivmod call per emitted face.
+//   * atlasRect() used to divide and modulo by the atlas grid width, and the ARM11 has no
+//     divide instruction — that was a libgcc __aeabi_idivmod call per emitted face. (The
+//     v1.6.0 strip atlas removed the arithmetic entirely: the sheet is one tile wide, so
+//     atlasRect() is now four assignments and no division at all. The table below is kept
+//     because it is still two byte loads instead of a call into block.c per face.)
 //   * the AO taps rebuilt two int8_t[3] direction vectors on the stack per corner and
 //     passed them by pointer, then turned them back into a scratch index with two
 //     multiplies.
@@ -72,6 +75,16 @@ typedef struct {
 
 typedef struct {
 	int16_t    neighbour;   // scratch index delta to the cell this face faces
+
+	// v1.6.0 task 11. The world axis the face's TEXTURE u runs along — the only axis a
+	// greedy run may grow down, because the strip atlas repeats in u and only in u (see
+	// world/atlas_uv.h). Derived from kFaces below rather than typed out, so the merge and
+	// the UVs can never disagree about which way "along the tile" points.
+	int16_t    u_step;      // scratch index delta of one block along +u
+	int8_t     ux, uy, uz;  // the same step in world block units
+	uint8_t    u_axis;      // 0=x, 1=y, 2=z: which chunk-local coordinate u_step moves
+	bool       u_merge;     // the step really is +1 on one axis, so a forward run is safe
+
 	CornerPlan corner[4];
 } FacePlan;
 
@@ -93,8 +106,18 @@ static uint8_t  s_cell_solid[SCRATCH_BLOCKS];
 // face, about 24,000 times a chunk, and it has to stay a single byte load.
 static uint8_t  s_cell_occl[SCRATCH_BLOCKS];
 
+// v1.6.0 task 13. Whether each cell emits geometry at all. Until this task that was the
+// same question as s_cell_solid — every block that was not air was solid — and
+// emitCollect's scan below read the solidity table for it. It is its own table now
+// because the shapes this task exists for split the two apart: a plant draws and does
+// not collide, and so will water. Air is 0 here exactly as it is 0 in s_cell_solid, so
+// the four-at-a-time word scan is unaffected.
+static uint8_t  s_cell_draw[SCRATCH_BLOCKS];
+
 static FacePlan s_plan[BLOCK_FACES];
 static uint8_t  s_solid[256];                       // indexed by a raw BlockId byte
+static uint8_t  s_draws[256];                       // emits geometry: see s_cell_draw
+static uint8_t  s_shape[256];                       // BLOCK_SHAPE_*
 
 // Step 7.5: does this block's geometry belong in the transparent pass? Solid *and*
 // transparent — air is transparent and never drawn, so both flags have to be read.
@@ -127,9 +150,31 @@ static void planBuild(void)
 	// this table answers for all 256 byte values and the mesher never bounds-checks.
 	for (int i = 0; i < 256; i++) {
 		const BlockInfo* info = blockInfo((BlockId)i);
-		s_solid[i]    = (uint8_t)info->solid;
-		s_deferred[i] = (uint8_t)(info->solid && info->transparent);
-		s_occludes[i] = (uint8_t)(info->solid && !info->transparent);
+		const bool cube = info->shape == BLOCK_SHAPE_FULL_CUBE;
+
+		s_shape[i] = info->shape;
+		s_draws[i] = (uint8_t)blockIsDrawn((BlockId)i);
+
+		// v1.6.0 task 13 narrowed the three tables below by one term each, and every one
+		// of those terms is false for nothing in the registry as it stands — all eight
+		// core rows are solid-or-air full cubes, so all three tables come out byte-for-byte
+		// what they were. What each term buys:
+		//
+		//   s_solid    "fills its cell", which is what the AO taps mean by solid. A shape
+		//              that only crosses its cell diagonally is not a crevice wall, so a
+		//              non-cube must never darken the corners of its neighbours even if
+		//              something registers it solid.
+		//   s_deferred which of the two passes it belongs in. Non-cube geometry has no
+		//              per-face buckets, and the opaque run is emitted face-major (six
+		//              walks, one per direction) — so a non-cube in the opaque list would
+		//              be emitted six times over. Forcing it deferred is structural, not
+		//              a stylistic choice about alpha.
+		//   s_occludes what may hide the face behind it. This is the one that makes holes
+		//              in the world if it is wrong: an X of two quads does not cover the
+		//              cell's faces, so it can never cull its neighbour's.
+		s_solid[i]    = (uint8_t)(info->solid && cube);
+		s_deferred[i] = (uint8_t)(s_draws[i] && (info->transparent || !cube));
+		s_occludes[i] = (uint8_t)(info->solid && !info->transparent && cube);
 	}
 
 	// Every raw byte value gets a row: blockInfo() maps undefined ids to air,
@@ -147,6 +192,22 @@ static void planBuild(void)
 		FacePlan*       p = &s_plan[face];
 
 		p->neighbour = SCRATCH_DELTA(f->dir[0], f->dir[1], f->dir[2]);
+
+		// The u axis. Below, c->u_hi is set from `side`, which is b when vertical_is_t1 and
+		// a otherwise — and a scales t1 while b scales t2 — so the tangent that carries u is
+		// t2 for a vertical_is_t1 face and t1 for the others. That makes u run +Z for +X, -X
+		// and +Y, and +X for -Y, +Z and -Z: always a POSITIVE unit step, which is what lets
+		// mergeRun below walk forward and bound itself with CHUNK_DIM minus one coordinate.
+		// u_merge records that rather than assuming it, so a future face table with a
+		// negative or diagonal tangent loses merging instead of running off the chunk.
+		const int8_t* ut = f->vertical_is_t1 ? f->t2 : f->t1;
+		p->ux     = ut[0];
+		p->uy     = ut[1];
+		p->uz     = ut[2];
+		p->u_step = SCRATCH_DELTA(ut[0], ut[1], ut[2]);
+		p->u_axis = (uint8_t)(ut[0] ? 0 : (ut[1] ? 1 : 2));
+		p->u_merge = (ut[0] + ut[1] + ut[2]) == 1 &&
+		             (ut[0] >= 0) && (ut[1] >= 0) && (ut[2] >= 0);
 
 		for (int i = 0; i < 4; i++) {
 			const int   a = kCorners[i][0];
@@ -197,6 +258,49 @@ static inline int avgByCnt(int sum, int cnt)
 	}
 }
 
+// Ambient occlusion for one corner, the standard three-neighbour rule: the two blocks
+// flanking the corner in the face's own plane and the one diagonally across it, all
+// *outside* the face.
+//
+//   both flanks solid            -> 0, fully dark: the corner is a crevice
+//   otherwise 3 - (s1 + s2 + c)  -> 1..3
+//
+// This is why the scratch is 18³ and filled from all 26 neighbours: the diagonal read steps
+// one block sideways *and* one block out, so a six-neighbour border would leave chunk-edge
+// corners guessing. The shader maps 0..3 to 0.45 .. 1.0.
+//
+// It is a function of its own, rather than the four lines emitFace used to carry inline,
+// because v1.6.0 task 11 needs to ask the SAME question before emitting: two faces may only
+// be merged into one quad if their AO is flat and equal, and a merge rule computing AO its
+// own way would drift from the rule that bakes it. One copy, two callers.
+static inline uint8_t cornerAO(int si, const CornerPlan* c)
+{
+	const int s1 = s_cell_solid[si + c->ao1];
+	const int s2 = s_cell_solid[si + c->ao2];
+	return (s1 && s2) ? 0 : (uint8_t)(3 - s1 - s2 - s_cell_solid[si + c->aoc]);
+}
+
+// Smooth per-corner light: average the four cells touching this corner from outside the
+// face — the neighbour cell plus the same two flanks and diagonal the AO rule already walks
+// — skipping occluding ones. The neighbour cell is never occluding (the face would not have
+// been emitted), so at least one tap always counts.
+//
+// Split out for the same reason as cornerAO above: the merge test has to agree with the
+// baker exactly, or a merged quad would carry light its own halves never had.
+static inline uint8_t cornerLight(const MeshScratch* s, int si, const FacePlan* p,
+                                  const CornerPlan* c)
+{
+	const int taps[4] = { si + p->neighbour, si + c->ao1, si + c->ao2, si + c->aoc };
+	int ssum = 0, bsum = 0, cnt = 0;
+	for (int t = 0; t < 4; t++) {
+		if (s_cell_occl[taps[t]]) continue;
+		ssum += s->light[taps[t]] >> 4;
+		bsum += s->light[taps[t]] & 15;
+		cnt++;
+	}
+	return (uint8_t)((avgByCnt(ssum, cnt) << 4) | avgByCnt(bsum, cnt));
+}
+
 // Writes one quad: four vertices and the six indices of its two triangles. Refuses
 // to write past the caller's buffers and says so, rather than trusting a size
 // argument — an overflowing mesher would corrupt the linear heap.
@@ -231,40 +335,10 @@ static void emitFace(MeshOut* o, const MeshScratch* s, int si, int lx, int ly, i
 		v->v   = c->v_hi ? r->v1 : r->v0;
 		v->nrm = (uint8_t)face;
 
-		// Ambient occlusion, the standard three-neighbour rule: the two blocks flanking
-		// the corner in the face's own plane and the one diagonally across it, all
-		// *outside* the face.
-		//
-		//   both flanks solid            -> 0, fully dark: the corner is a crevice
-		//   otherwise 3 - (s1 + s2 + c)  -> 1..3
-		//
-		// This is why the scratch is 18³ and filled from all 26 neighbours: the diagonal
-		// read steps one block sideways *and* one block out, so a six-neighbour border
-		// would leave chunk-edge corners guessing. The shader maps 0..3 to 0.45 .. 1.0.
-		const int s1 = s_cell_solid[si + c->ao1];
-		const int s2 = s_cell_solid[si + c->ao2];
-		v->ao = (s1 && s2) ? 0
-		                   : (uint8_t)(3 - s1 - s2 - s_cell_solid[si + c->aoc]);
-
-		if (!lit) {
-			v->pad = 0;
-		} else {
-			// Smooth per-corner light: average the four cells touching this corner
-			// from outside the face — the neighbour cell plus the same two flanks
-			// and diagonal the AO rule already walks — skipping occluding ones.
-			// The neighbour cell is never occluding (the face would not have been
-			// emitted), so at least one tap always counts.
-			const int taps[4] = { si + p->neighbour, si + c->ao1, si + c->ao2,
-			                      si + c->aoc };
-			int ssum = 0, bsum = 0, cnt = 0;
-			for (int t = 0; t < 4; t++) {
-				if (s_cell_occl[taps[t]]) continue;
-				ssum += s->light[taps[t]] >> 4;
-				bsum += s->light[taps[t]] & 15;
-				cnt++;
-			}
-			v->pad = (uint8_t)((avgByCnt(ssum, cnt) << 4) | avgByCnt(bsum, cnt));
-		}
+		// See cornerAO/cornerLight above — the rules live there because the greedy merge
+		// has to ask exactly the same questions before it groups two faces into one quad.
+		v->ao  = cornerAO(si, c);
+		v->pad = lit ? cornerLight(s, si, p, c) : 0;
 	}
 
 	// Two triangles round the quad, keeping the counter-clockwise order the corners
@@ -277,6 +351,243 @@ static void emitFace(MeshOut* o, const MeshScratch* s, int si, int lx, int ly, i
 	o->indices[o->index_count++] = (uint16_t)(base + 3);
 
 	o->faces++;
+}
+
+// ── v1.6.0 task 11: greedy meshing, U only ───────────────────────────────────
+//
+// Merges runs of co-planar block faces along the face's own texture-u axis into one wide
+// quad. Four vertices and six indices either way, so a 15-block run costs a fifteenth of
+// the vertices it used to and draws in one triangle pair instead of fifteen.
+//
+// THREE LIMITS, all deliberate, none of them a shortcut:
+//
+//  * U ONLY. gfx/atlas.c samples the sheet GPU_REPEAT in u and GPU_CLAMP_TO_EDGE in v, and
+//    the sheet is exactly one tile wide (world/atlas_uv.h), so the repeat period in u is
+//    exactly one tile and u may run as far as a merge needs. v has no such period: the
+//    slots are stacked directly on top of each other, so extending v walks into the next
+//    block's art and CLAMP_TO_EDGE does not save it. A 2D merge would need a different
+//    sheet layout and is not what this task is.
+//
+//  * AT MOST ATLAS_MAX_MERGE_BLOCKS (15). MeshVertex.u is a uint8_t and a run w blocks wide
+//    emits u1 = 16*w; 16*15 = 240 fits and 16*16 = 256 wraps to 0, which would silently
+//    draw a zero-width slice of *a* texture rather than fail. The arithmetic is spelled out
+//    in world/atlas_uv.h; the cap is read from there, never restated.
+//
+//  * FLAT, EQUAL SHADING ONLY. Two faces merge only when each has the same AO at all four
+//    of its corners, the same light at all four, and the two agree with each other. That is
+//    the only rule under which the merged quad is pixel-identical to the quads it replaces:
+//    four equal corners interpolate to a constant, so nothing on screen moves. The looser
+//    "equal at the shared edge" rule would let a merged quad ramp linearly across a span
+//    that used to be flat-then-ramped, and a measurement on real terrain found 43% of quads
+//    carry flat AO — dropping AO to merge more would flatten the world's shading visibly.
+//
+// Crosses never reach here at all: meshPass sends every non-cube shape to emitCross and
+// skips the six-face loop, and a run only ever extends into cells holding the SAME block
+// id, so a cube run can never absorb one.
+
+// Which faces have already been eaten by an earlier run, one bit per face direction. A
+// cell consumed as the middle of a run must not emit that face again when the walk reaches
+// it. Cleared once per meshChunk; the opaque pass walks each direction separately and the
+// two passes never share a cell, so one table serves all seven walks.
+static uint8_t s_face_done[SCRATCH_BLOCKS];
+
+// May cell `nb` join a run of `id` for this face? Everything meshPass would have tested for
+// the cell in its own right, in the same order and against the same tables — same block (so
+// same tile, same shape, same pass), not already consumed, not covered by its neighbour,
+// and not culled against a same-material neighbour in the transparent pass.
+static inline bool mergeCandidate(const MeshScratch* s, int nb, int face, uint8_t id,
+                                  bool deferred)
+{
+	if (s->blocks[nb] != id) return false;
+	if (s_face_done[nb] & (uint8_t)(1u << face)) return false;
+
+	const int ni = nb + s_plan[face].neighbour;
+	if (s_cell_occl[ni]) return false;
+	if (deferred && s_cell_draw[ni] && s->blocks[ni] == id) return false;
+	return true;
+}
+
+// The shading signature of one face, or 0 if it may not be merged at all.
+//
+// Non-zero means "all four corners carry the same AO, and the same light", and the value
+// identifies which. Two faces merge iff their keys are equal and non-zero. The bit above
+// the payload is what keeps a legitimate all-zero corner (AO 0, light 0 — a fully dark
+// crevice) from reading as "unmergeable".
+static uint32_t faceFlatKey(const MeshScratch* s, int si, int face, bool lit)
+{
+	const FacePlan* p  = &s_plan[face];
+	const uint8_t   ao = cornerAO(si, &p->corner[0]);
+
+	for (int i = 1; i < 4; i++)
+		if (cornerAO(si, &p->corner[i]) != ao) return 0;
+
+	uint8_t pad = 0;
+	if (lit) {
+		pad = cornerLight(s, si, p, &p->corner[0]);
+		for (int i = 1; i < 4; i++)
+			if (cornerLight(s, si, p, &p->corner[i]) != pad) return 0;
+	}
+
+	return 0x10000u | ((uint32_t)ao << 8) | pad;
+}
+
+// How far a run starting at this cell may reach: the merge cap, the chunk edge, and then
+// the actual cells. Returns 1 when nothing merges, which is the ordinary case and costs
+// only the single cheap mergeCandidate() probe — faceFlatKey is not computed at all unless
+// there is a geometrically eligible neighbour to merge with.
+static int mergeRun(const MeshScratch* s, int si, int uc, int face, uint8_t id,
+                    bool deferred, bool lit)
+{
+	const FacePlan* p = &s_plan[face];
+	if (!p->u_merge) return 1;
+
+	// The run must stay inside this chunk: cells past the edge belong to a neighbour's
+	// mesh and are only in the scratch to be read for culling and AO.
+	int max_w = CHUNK_DIM - uc;
+	if (max_w > ATLAS_MAX_MERGE_BLOCKS) max_w = ATLAS_MAX_MERGE_BLOCKS;
+	if (max_w < 2) return 1;
+
+	if (!mergeCandidate(s, si + p->u_step, face, id, deferred)) return 1;
+
+	const uint32_t key = faceFlatKey(s, si, face, lit);
+	if (!key) return 1;
+
+	int w  = 1;
+	int nb = si;
+	while (w < max_w) {
+		nb += p->u_step;
+		if (!mergeCandidate(s, nb, face, id, deferred)) break;
+		if (faceFlatKey(s, nb, face, lit) != key) break;
+		w++;
+	}
+	return w;
+}
+
+// One quad covering `width` blocks along u, starting at the cell emitFace would have used.
+//
+// emitFace itself is untouched — it is the piece the console's vertex format and the byte
+// anchor in world_test.c both rest on, and every merged quad is still exactly the four
+// vertices and six indices it writes. Only two things differ, and both are applied from
+// outside it: the tile rect handed in has u1 stretched to 16*width (GPU_REPEAT tiles the
+// art across the span), and the two corners emitFace marked u_hi are pushed width-1 blocks
+// further along u. Which corners those are is read from the same CornerPlan emitFace used,
+// so the geometry and the UVs cannot disagree.
+static void emitFaceRun(MeshOut* o, const MeshScratch* s, int si, int lx, int ly, int lz,
+                        int face, const AtlasRect* r, bool lit, int width)
+{
+	if (width <= 1) {
+		emitFace(o, s, si, lx, ly, lz, face, r, lit);
+		return;
+	}
+
+	AtlasRect wide = *r;
+	wide.u1 = (uint8_t)(r->u0 + TILE_PX * width);
+
+	const uint32_t base = o->vert_count;
+	emitFace(o, s, si, lx, ly, lz, face, &wide, lit);
+	if (o->vert_count != base + 4) return;   // refused for want of room; nothing to widen
+
+	const FacePlan* p = &s_plan[face];
+	for (int i = 0; i < 4; i++) {
+		if (!p->corner[i].u_hi) continue;
+		MeshVertex* v = &o->verts[base + i];
+		v->x = (int8_t)(v->x + p->ux * (width - 1));
+		v->y = (int8_t)(v->y + p->uy * (width - 1));
+		v->z = (int8_t)(v->z + p->uz * (width - 1));
+	}
+}
+
+// ── BLOCK_SHAPE_CROSS ────────────────────────────────────────────────────────
+//
+// Two quads on the cell's two diagonals, forming an X — the shape a plant is drawn as.
+//
+// Corner to corner, with no inset. That is not a look decision, it is the vertex format:
+// MeshVertex positions are int8_t in whole block units (world/mesh_vertex.h), and that
+// header is not to be changed, so the only positions a quad can have are the cell's own
+// integer corners. A narrower X would need fractional coordinates the format cannot
+// express.
+//
+// u_hi/v_hi select which end of the tile rect each corner takes, exactly as CornerPlan
+// does for a cube face: the two corners at one end of the diagonal take u0, the two at
+// the other take u1, and the top pair takes v1. So every UV this emits is a corner of
+// the block's own AtlasRect and can never stray into the neighbouring 20px cell.
+typedef struct {
+	int8_t  x, y, z;
+	uint8_t u_hi, v_hi;
+} CrossCorner;
+
+static const CrossCorner kCross[2][4] = {
+	// Plane A: the (x=0,z=0) → (x=1,z=1) diagonal.
+	{ {0,0,0, 0,0}, {1,0,1, 1,0}, {1,1,1, 1,1}, {0,1,0, 0,1} },
+	// Plane B: the (x=1,z=0) → (x=0,z=1) diagonal.
+	{ {1,0,0, 0,0}, {0,0,1, 1,0}, {0,1,1, 1,1}, {1,1,0, 0,1} },
+};
+
+// Four quads, not two: each plane is emitted twice, the second time with its corners
+// walked backwards so the triangles wind the other way.
+//
+// The renderer culls back faces for the whole world pass and never turns it off —
+// scene/chunk_render.c sets C3D_CullFace(GPU_CULL_BACK_CCW) once and the transparent
+// pass only adds the alpha test — so a single-sided X would be invisible from three of
+// the four horizontal quadrants. Disabling culling around the transparent run instead
+// would double the overdraw of every leaf in every canopy to fix plants, which is the
+// wrong trade on this hardware; and it would make the plant's visibility depend on my
+// getting the handedness of a diagonal quad right in a build nobody can look at.
+// Emitting both windings is correct whichever way round the projection turns out to be.
+#define CROSS_QUADS  4
+
+// Cross quads carry FACE_TOP as their normal index, so world.v.pica's faceShade lookup
+// gives them 1.00 — full brightness, the same as a grass top. Any other choice shades
+// the two planes of one plant differently from each other, or shades a plant darker than
+// the ground it stands on, and neither is a thing a plant does.
+#define CROSS_NRM  ((uint8_t)FACE_TOP)
+
+// AO is fixed at 3 (unoccluded) for the same reason the shape is not solid: an X is not
+// a wall, so there are no crevices at its corners to darken. Light, when the engine is
+// on, is the cell's own — a cross never occludes, so its cell always carries the light
+// that reaches it.
+static void emitCross(MeshOut* o, const MeshScratch* s, int si, int lx, int ly, int lz,
+                      const AtlasRect* r, bool lit)
+{
+	if (o->vert_count + 4 * CROSS_QUADS > o->vert_cap ||
+	    o->index_count + 6 * CROSS_QUADS > o->index_cap) {
+		o->overflow = true;
+		return;
+	}
+
+	for (int plane = 0; plane < 2; plane++) {
+		for (int back = 0; back < 2; back++) {
+			const uint16_t base = (uint16_t)o->vert_count;
+
+			for (int i = 0; i < 4; i++) {
+				const CrossCorner* c = &kCross[plane][back ? 3 - i : i];
+				MeshVertex*        v = &o->verts[o->vert_count++];
+
+				v->x = (int8_t)(lx + c->x);
+				v->y = (int8_t)(ly + c->y);
+				v->z = (int8_t)(lz + c->z);
+
+				v->u   = c->u_hi ? r->u1 : r->u0;
+				v->v   = c->v_hi ? r->v1 : r->v0;
+				v->nrm = CROSS_NRM;
+				v->ao  = 3;
+				v->pad = lit ? s->light[si] : 0;
+			}
+
+			// The same six values per quad emitFace writes, in the same order — see the
+			// comment on MeshSlot in scene/chunk_render.c, which builds ONE shared index
+			// buffer for every slot on the strength of that pattern holding for every
+			// quad any pass emits.
+			o->indices[o->index_count++] = base;
+			o->indices[o->index_count++] = (uint16_t)(base + 1);
+			o->indices[o->index_count++] = (uint16_t)(base + 2);
+			o->indices[o->index_count++] = base;
+			o->indices[o->index_count++] = (uint16_t)(base + 2);
+			o->indices[o->index_count++] = (uint16_t)(base + 3);
+
+			o->faces++;
+		}
+	}
 }
 
 // Step 9.2. One cell that is going to emit something: where it is, and what it is.
@@ -328,20 +639,29 @@ static void emitCollect(const MeshScratch* s)
 		for (int lz = 0; lz < CHUNK_DIM; lz++) {
 			int si = scratchIndex(1, ly + 1, lz + 1);
 
-			// Step 9.4b. BLOCK_AIR == 0 and s_cell_solid[BLOCK_AIR] is false by
-			// construction, so four consecutive s_cell_solid bytes reading back as the
-			// word 0 mean four consecutive non-solid cells in this row — currently that
-			// can only be air, since air is the only non-solid block in the registry
-			// (see block.c) — and nothing in a run of four cells like that can ever
-			// emit. A 16-wide chunk row is exactly four uint32_t words, so testing the
-			// word first turns "4 byte loads + 4 branches" into "1 word load + 1
-			// branch" for every such run, which is most of an open-sky chunk.
+			// Step 9.4b. BLOCK_AIR == 0 and s_cell_draw[BLOCK_AIR] is false by
+			// construction, so four consecutive s_cell_draw bytes reading back as the
+			// word 0 mean four consecutive cells that draw nothing at all, and nothing
+			// in a run of four cells like that can ever emit. A 16-wide chunk row is
+			// exactly four uint32_t words, so testing the word first turns "4 byte loads
+			// + 4 branches" into "1 word load + 1 branch" for every such run, which is
+			// most of an open-sky chunk.
 			//
-			// This is the loop that SCANS FOR solid cells to build the emit list — the
+			// v1.6.0 task 13 moved this off s_cell_solid. The two tables agree on every
+			// block in the registry today — air draws nothing and everything else is a
+			// solid cube — so the scan skips exactly the runs it has always skipped; what
+			// changes is that a block which draws without colliding (a plant now, water
+			// next) reaches the emit list instead of being passed over as "not solid".
+			//
+			// This is the loop that SCANS FOR drawable cells to build the emit list — the
 			// only place in this file eligible for an air-skip. meshPass() below tests
 			// a single neighbour cell per face, not a run, so there is nothing to skip
 			// four of; skipping there would also risk stepping over the exact
 			// transparent-neighbour check step 9.1 added. Not touched.
+			//
+			// (The array the cast note below is about is s_cell_draw now, not
+			// s_cell_solid; both are plain uint8_t[SCRATCH_BLOCKS] and the argument is
+			// unchanged in every other respect.)
 			//
 			// si is NOT provably 4-byte aligned: it is scratchIndex(1, ly+1, lz+1) + lx,
 			// and SCRATCH_DIM (18, world/scratch.h:17) is not a multiple of 4, so the
@@ -358,12 +678,12 @@ static void emitCollect(const MeshScratch* s)
 			// cast plus an alignment attribute.
 			for (int lx = 0; lx < CHUNK_DIM; lx += 4, si += 4) {
 				uint32_t word;
-				memcpy(&word, &s_cell_solid[si], sizeof(word));
-				if (word == 0) continue;   // four non-solid cells: nothing to emit
+				memcpy(&word, &s_cell_draw[si], sizeof(word));
+				if (word == 0) continue;   // four cells that draw nothing
 
 				for (int k = 0; k < 4; k++) {
 					const int sik = si + k;
-					if (!s_cell_solid[sik]) continue;
+					if (!s_cell_draw[sik]) continue;
 
 					const BlockId id = s->blocks[sik];
 					EmitCell*     e  = s_deferred[id] ? &s_emit[--alpha] : &s_emit[opaque++];
@@ -389,15 +709,47 @@ static void emitCollect(const MeshScratch* s)
 static void meshPass(MeshOut* out, const MeshScratch* s, const EmitCell* cells, int n,
                      bool deferred, int face_first, int face_end, bool lit)
 {
-	for (int i = 0; i < n; i++) {
-		const EmitCell* e  = &cells[i];
+	for (int k = 0; k < n; k++) {
+		// Forwards through the opaque list, backwards through the transparent one — which
+		// is the SAME spatial order, because emitCollect fills the transparent half from the
+		// back of the array and it therefore comes out reversed. Greedy merging needs the
+		// low-u end of a run to be reached first (a run that starts in the middle is still
+		// correct, it just splits into more quads than it had to), and the collect order —
+		// y, then z, then x — puts the smallest coordinate on every axis first. Walking the
+		// transparent half in list order would have met every run from its far end and
+		// merged almost nothing. Emission order inside the transparent run is free: it is
+		// one alpha-tested cutout draw, order-independent within itself.
+		const EmitCell* e  = &cells[deferred ? n - 1 - k : k];
 		const int       si = e->si;
 
-		// Solid implies a real registry row, since s_solid says no for every id past the
-		// registry — so s_rect is safe to index without a check.
+		// Drawable implies a real registry row, since s_draws says no for every id with
+		// no row — so s_rect is safe to index without a check.
 		const AtlasRect* rects = s_rect[e->id];
 
+		// Non-cube geometry. It has no faces to bucket and no neighbour that can hide it,
+		// so it skips the whole six-face loop below and is emitted whole, exactly once.
+		//
+		// `deferred` is what guarantees the "exactly once": the opaque run is walked six
+		// times, once per face direction, and planBuild forces every non-cube shape into
+		// the deferred list, which is walked once. Testing it here rather than trusting
+		// that is what keeps a mis-set flag a missing plant instead of six stacked copies
+		// of one.
+		if (s_shape[e->id] != BLOCK_SHAPE_FULL_CUBE) {
+			if (deferred) {
+				// One tile for the whole shape, the block's FACE_EAST entry — the same
+				// slot blockFaceTex() falls back to for a face that does not exist. A
+				// cross block's def should set all six to it.
+				emitCross(out, s, si, e->lx, e->ly, e->lz, &rects[FACE_EAST], lit);
+			}
+			continue;
+		}
+
 		for (int face = face_first; face < face_end; face++) {
+			// Already emitted, as the middle of a run some earlier cell started. Tested
+			// first because it is one byte load and it is the only test that can be true
+			// for a cell that would otherwise pass every check below.
+			if (s_face_done[si] & (uint8_t)(1u << face)) continue;
+
 			const int ni = si + s_plan[face].neighbour;
 
 			// A face is hidden only by a neighbour that actually covers it. That is the
@@ -413,9 +765,29 @@ static void meshPass(MeshOut* out, const MeshScratch* s, const EmitCell* cells, 
 			// The two halves are deliberately not one test on `solid`. Culling on solidity
 			// alone is what hid the trunk faces inside a canopy — see
 			// testMesherOpaqueBehindTransparent.
-			if (deferred && s_cell_solid[ni] && s->blocks[ni] == e->id) continue;
+			//
+			// s_cell_draw, not s_cell_solid: the pair of blocks this rule is about is
+			// "two of the same thing touching", which is a question about geometry and
+			// not about collision. Identical today — leaves are the only transparent
+			// block and they are solid — and it is what will keep a body of water from
+			// meshing every internal face when water arrives non-solid.
+			if (deferred && s_cell_draw[ni] && s->blocks[ni] == e->id) continue;
 
-			emitFace(out, s, si, e->lx, e->ly, e->lz, face, &rects[face], lit);
+			// v1.6.0 task 11. How many blocks along u this face can swallow, and then one
+			// quad for the lot. width 1 is the ordinary case and emits exactly what the
+			// pre-task mesher emitted, byte for byte.
+			const FacePlan* p  = &s_plan[face];
+			const int       uc = p->u_axis == 0 ? e->lx : (p->u_axis == 1 ? e->ly : e->lz);
+			const int       w  = mergeRun(s, si, uc, face, e->id, deferred, lit);
+
+			emitFaceRun(out, s, si, e->lx, e->ly, e->lz, face, &rects[face], lit, w);
+
+			// Claim the cells behind the first one. The first needs no mark: this walk is
+			// past it and will not return to it.
+			for (int j = 1, nb = si; j < w; j++) {
+				nb += p->u_step;
+				s_face_done[nb] |= (uint8_t)(1u << face);
+			}
 		}
 	}
 }
@@ -433,7 +805,12 @@ void meshChunk(MeshOut* out, const MeshScratch* s)
 		const BlockId id = s->blocks[i];
 		s_cell_solid[i] = s_solid[id];
 		s_cell_occl[i]  = s_occludes[id];
+		s_cell_draw[i]  = s_draws[id];
 	}
+
+	// v1.6.0 task 11. No face has been claimed by a greedy run yet. One memset of 5,832
+	// bytes per chunk, against the ~24,000 face tests the passes below are about to do.
+	memset(s_face_done, 0, sizeof s_face_done);
 
 	// Which cells emit at all, and which half of the frame each belongs to. One sweep for both.
 	emitCollect(s);

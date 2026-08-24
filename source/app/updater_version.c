@@ -52,10 +52,23 @@ bool updaterTagFromRedirect(const char* url, char* out, size_t out_size)
 	return true;
 }
 
+// The one place a tag becomes the version number a release asset is named after. Both
+// builders below go through it so a "v" cannot be tolerated by one and not the other.
+static const char* tagNumber(const char* tag)
+{
+	return (tag[0] == 'v' || tag[0] == 'V') ? tag + 1 : tag;
+}
+
 void updaterBuildAssetName(const char* tag, char* out, size_t out_size)
 {
 	if (!tag || !out || out_size == 0) return;
 
-	const char* number = (tag[0] == 'v' || tag[0] == 'V') ? tag + 1 : tag;
-	snprintf(out, out_size, "blocksmith%s.cia", number);
+	snprintf(out, out_size, "blocksmith%s.cia", tagNumber(tag));
+}
+
+void updaterBuildNotesName(const char* tag, char* out, size_t out_size)
+{
+	if (!tag || !out || out_size == 0) return;
+
+	snprintf(out, out_size, "whatsnew%s.txt", tagNumber(tag));
 }

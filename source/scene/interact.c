@@ -1,12 +1,26 @@
 #include "scene/interact.h"
 
-#include <math.h>
-
 #include "app/input_map.h"
 #include "net/networld.h"
-#include "scene/chunk_render.h"
 #include "world/block.h"
+#include "world/inventory.h"
 #include "world/light.h"
+
+// ── the edit decision and the world write ───────────────────────────────────────────────
+//
+// No <3ds.h> and no <citro3d.h> above the __3DS__ guard further down, which is the whole
+// point: tools/run_host_tests.sh links THIS file into interact_test, so the break/place
+// ordering it checks is the ordering that ships. See the header for why an ordering bug is
+// the one thing a diff cannot be read for.
+#ifdef __3DS__
+#include "scene/chunk_render.h"
+#else
+// scene/chunk_render.c is GPU code (<citro3d.h>) and cannot compile on the host, but
+// interactEdit's *call* to it is unconditional in both builds and must stay that way — the
+// absence belongs in the link, not in an #ifdef inside the function. tests/interact_stub.c
+// supplies the symbol, exactly as tests/net_stub.c does for networldOnColumnLoad().
+int chunkRenderTouch(const World* w, int x, int y, int z);
+#endif
 
 // Does the player's box overlap the unit cube at (bx,by,bz)? This is a plain geometric
 // test rather than a call into physics.c's bodyBlocked, because the block in question has
@@ -32,21 +46,6 @@ void interactInit(Interact* it)
 	it->prev_keys = 0;
 	it->broke_id  = BLOCK_AIR;
 	it->placed_id = BLOCK_AIR;
-}
-
-void interactAim(Interact* it, const World* w, const Camera* cam)
-{
-	// The same forward vector cameraUpdate walks along, and it has to stay the same one:
-	// if the ray and the movement disagree about which way "forward" is, the highlight
-	// sits somewhere off to the side of the crosshair and no amount of staring at
-	// raycast.c explains why. The view matrix is Rx(pitch) * Ry(yaw) * T(-pos), so
-	// positive pitch looks down and -Z is forward at zero yaw.
-	const float cp = cosf(cam->pitch);
-	const float fx = sinf(cam->yaw) * cp;
-	const float fy = -sinf(cam->pitch);
-	const float fz = -cosf(cam->yaw) * cp;
-
-	it->target = worldRaycast(w, cam->x, cam->y, cam->z, fx, fy, fz, INTERACT_REACH);
 }
 
 int interactEdit(Interact* it, World* w, const Body* body, u32 keys_down)
@@ -96,9 +95,42 @@ int interactEdit(Interact* it, World* w, const Body* body, u32 keys_down)
 		// captured here — after worldSet the cell is air and the information is gone.
 		const BlockId broken = worldGet(w, t->x, t->y, t->z);
 
+		// A block the bag cannot hold is not breakable — and this is asked BEFORE anything
+		// is mutated, which is the whole fix.
+		//
+		// Until v1.6.0 the order was the other way round: worldSet wrote air, the id went
+		// to invBridgeAdd, and world/inventory.h refused it because a server-registered
+		// dynamic id (0x80..0xFD) is over the BLOCK_COUNT ceiling every slot-indexed array
+		// in this client is built to. The block was then in neither place — deleted from
+		// the world, absent from the bag, with no message. An unbreakable block is at least
+		// legible to the player; a vanishing one reads as save corruption.
+		//
+		// The rule lives in inventoryCanHold() and nowhere else, so the "can this be
+		// carried" ceiling has exactly one home. Guarding here rather than at the pickup
+		// also covers the multiplayer path for free: this function is the ONLY origin of a
+		// player-initiated break in the client (main.c is its only caller, and
+		// networldSendBlockEdit is called nowhere else), so refusing before the write also
+		// refuses the BS_APP_BLOCK_EDIT — which matters, because the server would have
+		// honoured the removal and then dropped the matching BS_INV_OP_PICKUP
+		// (deps/blocksmith-server/game/bsgame.c mirrors the same ceiling), destroying the
+		// block for every player on the server, not just this one.
+		//
+		// ⚠ Delete this branch when inventory becomes registry-aware — i.e. when
+		// inventoryCanHold() widens past BLOCK_COUNT on both this client and the server.
+		// It exists only because the bag cannot hold the id, not because the block is
+		// special in any other way.
+		if (!inventoryCanHold(broken)) {
+			// `refused` is the module's existing idiom for "the press did nothing", already
+			// counted for a miss, an occupied cell and an empty hand, and already surfaced
+			// on the debug overlay as `r`. Nothing louder is invented here: this client has
+			// no toast or status line for a refused action (world/inventory.h says so in
+			// as many words), and a silent refusal is a far smaller lie than a silent
+			// deletion.
+			it->refused++;
+		}
 		// worldSet refuses y outside the world, which is exactly what should happen when
 		// the ray hit the solid floor below y == 0 — that is not a block anyone owns.
-		if (worldSet(w, t->x, t->y, t->z, BLOCK_AIR)) {
+		else if (worldSet(w, t->x, t->y, t->z, BLOCK_AIR)) {
 			// Step 8.1. Only edits mark a column for saving — see the note on Column.dirty.
 			worldMarkDirty(w, t->x, t->z);
 			// Adaptive lighting: recompute the edited column's channels before the remesh
@@ -167,3 +199,29 @@ int interactEdit(Interact* it, World* w, const Body* body, u32 keys_down)
 
 	return queued;
 }
+
+// ── aiming — console build only ─────────────────────────────────────────────────────────
+//
+// Below the guard because it takes a Camera, and scene/camera.h includes <citro3d.h>.
+// Nothing about the raycast itself is console-specific (world/raycast.c is host-tested in
+// its own right); it is the camera type that cannot cross.
+#ifdef __3DS__
+
+#include <math.h>
+
+void interactAim(Interact* it, const World* w, const Camera* cam)
+{
+	// The same forward vector cameraUpdate walks along, and it has to stay the same one:
+	// if the ray and the movement disagree about which way "forward" is, the highlight
+	// sits somewhere off to the side of the crosshair and no amount of staring at
+	// raycast.c explains why. The view matrix is Rx(pitch) * Ry(yaw) * T(-pos), so
+	// positive pitch looks down and -Z is forward at zero yaw.
+	const float cp = cosf(cam->pitch);
+	const float fx = sinf(cam->yaw) * cp;
+	const float fy = -sinf(cam->pitch);
+	const float fz = -cosf(cam->yaw) * cp;
+
+	it->target = worldRaycast(w, cam->x, cam->y, cam->z, fx, fy, fz, INTERACT_REACH);
+}
+
+#endif  // __3DS__

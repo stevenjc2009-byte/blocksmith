@@ -41,10 +41,28 @@ typedef struct {
 	int32_t cy;       // chunk within the column, JOB_MESH only; 0 otherwise
 } Job;
 
-// 128 slots = 2 KB. The boot submission is 25 generate jobs and the meshed 3x3 columns are
-// at most 72 chunks, so nothing in this phase comes close; Phase 6 pushes per frame and
-// drains per frame, which keeps the live count small rather than growing it.
-#define JOBQ_CAP 128
+// 512 slots = 8 KB.
+//
+// This was 128 ("= 2 KB"), justified against Phase 5's 25 generate jobs and 3x3 columns of at
+// most 72 chunks. That justification stopped being true at RENDER_DIST_MAX 2 without anybody
+// noticing: main.c's genQueueReadyColumns pushes one JOB_MESH per non-air chunk of every
+// column whose neighbour ring has just completed, and a radius-2 ring is 25 columns —
+// which at the pool's own 6 chunks a column is exactly 150, already over 128, and measured at
+// 125 simultaneous meshed chunks. The queue was one bad seed from refusing, and "Phase 6
+// pushes per frame and drains per frame" only holds once the world is streaming; at boot and
+// at every distance change the whole ring queues in a burst.
+//
+// At RENDER_DIST_MAX 3 the ring is 49 columns. The structural upper bound on one burst is
+// therefore 49 * COLUMN_CHUNKS = 392 mesh jobs (every chunk of every column non-air), and the
+// measured worst simultaneous occupancy is 242 (see scene/chunk_render.c's TIER_*_SLOTS for
+// the measurement). 512 clears the structural bound, not just the measured one, and is the
+// next power of two above it — which on ARM11 also keeps the ring's index wrap a mask rather
+// than a multiply-and-shift, since the part has no integer divide instruction.
+//
+// The capacity is only half of what made this dangerous. See main.c's genQueueReadyColumns and
+// world/meshq.h for the other half: a refused push used to leave the column marked queued, so
+// the chunks it lost were never asked for again.
+#define JOBQ_CAP 512
 
 typedef struct {
 	Job slots[JOBQ_CAP];

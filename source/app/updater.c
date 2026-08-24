@@ -8,6 +8,7 @@
 #include <curl/curl.h>
 
 #include "app/updater_version.h"
+#include "app/whatsnew.h"
 
 // The socket buffer libctru hands to the network stack. It has to be aligned to 0x1000 and
 // a multiple of 0x1000, and 1MB is the size every devkitPro socket example is written
@@ -52,6 +53,15 @@ static volatile int  s_progress = -1;
 static char s_msg[192];
 static char s_latest[32];
 static char s_assetUrl[512];
+
+// The release notes shown on the top screen before the player commits to the download
+// (v1.6.0 task 14b). Written by the worker inside runCheck(), *before* it moves s_state to
+// UPDATE_AVAILABLE, so it obeys the same ordering rule as everything above it: the main
+// thread reads s_state first and only then touches this.
+//
+// Static rather than heap for the reason app/whatsnew.h gives: nothing about a file arriving
+// off the network should be able to make a 12 MB console reserve memory. ~3 KB of .bss.
+static WhatsNew s_notes;
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -258,6 +268,98 @@ static void buildAssetUrl(const char* tag, char* out, size_t outSize)
 	         BLOCKSMITH_REPO_OWNER, BLOCKSMITH_REPO_NAME, tag, assetName);
 }
 
+// ---------------------------------------------------------------------------
+// The release notes shown before the download (v1.6.0 task 14b)
+// ---------------------------------------------------------------------------
+//
+// Same predictable path the .cia comes from, a tag away: whatsnew1.6.0.txt sits next to
+// blocksmith1.6.0.cia on the release. Deliberately NOT api.github.com and deliberately not
+// the release body — see the block comment above checkViaRedirect for what the sixty-an-hour
+// ceiling did to this updater once already, and app/whatsnew.h for the rest of the reasoning.
+//
+// Every failure here is soft, without exception. A release with no notes asset (which is
+// every release published before this feature existed), a 404, a timeout, a TLS failure, a
+// file of binary garbage: all of them leave s_notes empty, the screen draws
+// whatsnewPlaceholder() and the download is offered exactly as it was before. There is no
+// error dialog and no path where missing notes can block an update.
+
+// Past this many bytes the transfer is abandoned rather than followed wherever it leads.
+// Four times the keep-cap: enough slack that a slightly over-long file is still read to its
+// natural end, small enough that a hostile one cannot stream at this console indefinitely.
+#define NOTES_HARD_CEILING (4 * WHATSNEW_BYTES_MAX)
+
+typedef struct
+{
+	char   data[WHATSNEW_BYTES_MAX + 1];
+	size_t length;   ///< bytes actually kept
+	size_t seen;     ///< bytes curl has offered, kept or not
+} notesSink;
+
+// File-scope rather than a local: 4 KB is not something to put on a worker stack that an
+// mbedtls handshake is already sharing. Only the worker thread touches it.
+static notesSink s_notesSink;
+
+static size_t writeNotes(char* chunk, size_t size, size_t count, void* userData)
+{
+	notesSink* sink = (notesSink*)userData;
+	const size_t incoming = size * count;
+
+	if (sink->length < WHATSNEW_BYTES_MAX)
+	{
+		const size_t room = WHATSNEW_BYTES_MAX - sink->length;
+		const size_t take = (incoming < room) ? incoming : room;
+		memcpy(sink->data + sink->length, chunk, take);
+		sink->length += take;
+		sink->data[sink->length] = '\0';
+	}
+
+	sink->seen += incoming;
+
+	// Returning short of `incoming` is how a curl write callback says stop. The bytes already
+	// banked are kept and parsed by the caller: truncated notes beat no notes, and
+	// whatsnewParse marks the truncation so the screen says so.
+	return (sink->seen > NOTES_HARD_CEILING) ? 0 : incoming;
+}
+
+static void fetchReleaseNotes(const char* tag)
+{
+	whatsnewClear(&s_notes);
+
+	char name[64];
+	updaterBuildNotesName(tag, name, sizeof(name));
+
+	char url[512];
+	snprintf(url, sizeof(url), "https://github.com/%s/%s/releases/download/%s/%s",
+	         BLOCKSMITH_REPO_OWNER, BLOCKSMITH_REPO_NAME, tag, name);
+
+	CURL* curl = curl_easy_init();
+	if (!curl) return;
+
+	memset(&s_notesSink, 0, sizeof(s_notesSink));
+
+	applyCommonOptions(curl, url);
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeNotes);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &s_notesSink);
+
+	// A hard ceiling on the whole request, which the .cia download deliberately does not have.
+	// Nobody should wait on the notes: at worst this delays the "a newer version is available"
+	// report by twenty seconds, and the front end is still drawing at 60 Hz throughout because
+	// this runs on the worker thread like everything else in this file.
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
+
+	const CURLcode result = curl_easy_perform(curl);
+	long status = 0;
+	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+	curl_easy_cleanup(curl);
+
+	// CURLE_WRITE_ERROR with bytes banked is the size ceiling above firing, not a real
+	// failure, so what did arrive is still parsed.
+	const bool stopped_for_size = (result == CURLE_WRITE_ERROR && s_notesSink.length > 0);
+
+	if ((result == CURLE_OK || stopped_for_size) && status == 200)
+		whatsnewParse(s_notesSink.data, s_notesSink.length, &s_notes);
+}
+
 // Returns true only if GitHub redirected and the tag could be read out of it. Anything else
 // - no redirect, a transport error, a shape that has changed - falls through to the API,
 // which still works; it is only rationed.
@@ -299,6 +401,10 @@ static void runCheck(void)
 {
 	s_progress = -1;
 
+	// Cleared up front so a second check that fails cannot leave the previous release's
+	// notes on screen next to the new version number.
+	whatsnewClear(&s_notes);
+
 	// Nothing to compare against. Said plainly and stopped here, because the alternative -
 	// reading a blank version as 0.0.0 - would make every release on GitHub look newer and
 	// offer an update that is not one.
@@ -328,6 +434,14 @@ static void runCheck(void)
 		}
 
 		buildAssetUrl(redirectTag, s_assetUrl, sizeof(s_assetUrl));
+
+		// Before UPDATE_AVAILABLE, never after: the ordering rule at the top of this file is
+		// that the worker finishes writing everything the main thread will read and only then
+		// moves the state. The message is updated first so a slow notes fetch says what it is
+		// waiting on instead of sitting on "Asking GitHub for the latest release...".
+		setMessage("Reading the change notes...");
+		fetchReleaseNotes(redirectTag);
+
 		setMessage("A newer version is available.");
 		s_state = UPDATE_AVAILABLE;
 		return;
@@ -424,6 +538,13 @@ static void runCheck(void)
 	free(buffer.data);
 
 	snprintf(s_latest, sizeof(s_latest), "%s", tag);
+
+	// Same two lines as the redirect path above, for the same reason. Both routes reach
+	// UPDATE_AVAILABLE, so notes fetched on only one of them would be a changelog that
+	// appears or not depending on which one answered.
+	setMessage("Reading the change notes...");
+	fetchReleaseNotes(tag);
+
 	setMessage("A newer version is available.");
 	s_state = UPDATE_AVAILABLE;
 }
@@ -671,6 +792,11 @@ int updaterProgress(void)
 const char* updaterLatestVersion(void)
 {
 	return s_latest;
+}
+
+const WhatsNew* updaterReleaseNotes(void)
+{
+	return &s_notes;
 }
 
 void updaterRelaunch(void)

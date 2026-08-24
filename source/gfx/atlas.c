@@ -9,13 +9,14 @@ static C3D_Tex s_tex;
 
 bool atlasInit(void)
 {
-	// vram = true. The atlas is 128x128 RGBA5551 (2 bytes/texel), so it costs 32 KB of
-	// the ~6 MB VRAM budget. It was 64x64 (8 KB) until TILE_PLANKS needed a tenth cell
-	// and there was no room; before step 9.3 it was 256x256 RGBA8888 (4 bytes/texel) and
-	// cost 256 KB. All three figures are computed from the sheet, not measured on-device.
-	// The size itself is not read from here — it comes out of the .t3x — but ATLAS_PX in
-	// world/atlas_uv.h and uvScale in shaders/world.v.pica must both match the PNG that
-	// tools/make_atlas.py writes. Texture reads out of VRAM are the cheap ones on this GPU.
+	// vram = true. The atlas is a 16x256 strip at RGBA5551 (2 bytes/texel), so it costs
+	// 8 KB of the ~6 MB VRAM budget. It was 128x128 (32 KB) up to v1.5.1, 64x64 (8 KB)
+	// before TILE_PLANKS needed a tenth cell, and 256x256 RGBA8888 (256 KB) before step
+	// 9.3. All four figures are computed from the sheet, not measured on-device. The size
+	// itself is not read from here — it comes out of the .t3x — but ATLAS_W_PX/ATLAS_H_PX
+	// in world/atlas_uv.h and uvScale in BOTH shaders/world.v.pica and
+	// shaders/world_dynamic.v.pica must match the PNG that tools/make_atlas.py writes.
+	// Texture reads out of VRAM are the cheap ones on this GPU.
 	// The 30,936 -> 30,680 KB linear-free delta this comment used to quote was
 	// measured with vram=false at the old 256x256 RGBA8888 size; it has NOT been
 	// re-measured at the new size — that needs an actual boot.
@@ -27,11 +28,24 @@ bool atlasInit(void)
 	// C3D_Tex, so it can go straight away.
 	Tex3DS_TextureFree(t3x);
 
-	// Nearest on both filters, and no mipmaps: this is pixel art and the whole
-	// look depends on the pixels staying square. Mipmaps would also need padding
-	// far wider than 2px to stay bleed-free.
+	// Nearest on both filters, and no mipmaps: this is pixel art and the whole look
+	// depends on the pixels staying square. Neither filter here is a GPU_*_MIPMAP_*
+	// mode, and gfx/atlas.t3s asks tex3ds for none (-f rgba5551 -z auto, no -m), so the
+	// built build/atlas.t3x carries mipmapLevels = 0 — measured out of its header. That
+	// is load-bearing now the 2px inter-tile border is gone: with the strip layout the
+	// slots are directly adjacent in V, and a mip chain would average across the seam
+	// and bleed one tile into the next at distance, which is exactly what the border
+	// used to prevent.
 	C3D_TexSetFilter(&s_tex, GPU_NEAREST, GPU_NEAREST);
-	C3D_TexSetWrap(&s_tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+
+	// GPU_REPEAT in U, GPU_CLAMP_TO_EDGE in V. This is the whole point of the strip: the
+	// sheet is exactly one tile wide, so the U repeat period IS one tile and a greedy-
+	// merged quad can run u past 16 and have every block of the run show a complete,
+	// correct tile. On the old 128px-wide grid REPEAT wrapped over eight tiles instead,
+	// which is why merging was impossible there. V stays clamped — the slots are stacked,
+	// so wrapping v would show the next block's art, and merging is U-only for that
+	// reason. See world/atlas_uv.h.
+	C3D_TexSetWrap(&s_tex, GPU_REPEAT, GPU_CLAMP_TO_EDGE);
 	atlasBind();
 	return true;
 }

@@ -42,6 +42,39 @@ enum {
 	REG_FLAG_FLAMMABLE  = 1u << 4,
 };
 
+// Geometry shape, packed into the top three bits of BlockDef.flags (v1.6.0 task 13).
+//
+// In the flags byte and not a field of its own, deliberately. BlockDef is packed at
+// exactly 27 bytes and REGISTRY_WIRE_RECORD_BYTES is 28; a new field would move both,
+// which changes the DEFS packet layout, the registry.bin format and the pinned core
+// crc16 all at once — for three bits, in a byte that had three spare. Every record ever
+// written has zeros up there, and BLOCK_SHAPE_FULL_CUBE is 0, so every existing save,
+// packet and core row reads back as the full cube it has always been.
+//
+// Three bits, so eight shapes: FULL_CUBE and CROSS today, room for the slab and stair
+// variants without touching the format again. The values themselves are BLOCK_SHAPE_*
+// in world/block.h — this is only where they sit in the byte.
+#define REG_SHAPE_SHIFT 5
+#define REG_SHAPE_BITS  3
+#define REG_SHAPE_MASK  ((uint8_t)((((1u << REG_SHAPE_BITS) - 1u)) << REG_SHAPE_SHIFT))
+
+// Builds the flags bits for a shape, for a def initialiser: .flags = REG_FLAG_SOLID |
+// REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS).
+#define REG_FLAG_SHAPE(s)  ((uint8_t)(((uint8_t)(s) << REG_SHAPE_SHIFT) & REG_SHAPE_MASK))
+
+// The behaviour flags must never grow into the shape field. This fails the build
+// rather than letting a sixth flag bit silently re-shape every block that sets it.
+_Static_assert((REG_FLAG_SOLID | REG_FLAG_TRANSPARENT | REG_FLAG_LIQUID |
+                REG_FLAG_LUMINOUS | REG_FLAG_FLAMMABLE) & REG_SHAPE_MASK ? 0 : 1,
+               "a behaviour flag has run into the shape bits of BlockDef.flags");
+_Static_assert(BLOCK_SHAPE_COUNT <= (1 << REG_SHAPE_BITS),
+               "more shapes than the flags byte has room for");
+
+static inline uint8_t regShapeOf(uint8_t flags)
+{
+	return (uint8_t)((flags & REG_SHAPE_MASK) >> REG_SHAPE_SHIFT);
+}
+
 // Fluid classes (Phase B grows this; NONE is the only value core rows use).
 enum {
 	REG_FLUID_NONE  = 0,

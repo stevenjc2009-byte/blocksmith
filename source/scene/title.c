@@ -8,6 +8,7 @@
 #include "gfx/sprite.h"
 #include "net/bsnet.h"
 #include "net/networld.h"
+#include "scene/title_nav.h"
 #include "world/region.h"
 #include "world/registry.h"
 
@@ -102,6 +103,41 @@
 #define OPT_BTN1_Y  (LIST_TOP_Y + 4 * LIST_ROW_H + 6)
 #define OPT_BTN2_Y  (OPT_BTN1_Y + OPT_BTN_H + 4)
 #define OPT_BTN3_Y  (OPT_BTN2_Y + OPT_BTN_H + 4)
+
+// ── Top screen: the release notes (v1.6.0 task 14b) ────────────────────────────────────
+//
+// The one thing this file draws on the top screen, and the only place in it that is 400 px
+// wide rather than 320. Every number below is derived from the panel rather than eyeballed,
+// the same way the bottom screen's are.
+//
+// Text is scale 1 for the same reason every other body of text in this file is: at 1x a
+// glyph is exactly its texels (gfx/font.h), and the point of this screen is to fit a
+// paragraph of prose, not to shout.
+#define TOP_W  400
+#define TOP_H  240
+
+#define NOTES_PANEL_X   6
+#define NOTES_PANEL_Y   20                                   // under the heading row
+#define NOTES_PANEL_W   (TOP_W - 2 * NOTES_PANEL_X)          // 388
+#define NOTES_PANEL_H   (TOP_H - NOTES_PANEL_Y - 20)         // 200, leaving a footer hint row
+
+// The scrollbar steve asked for by name — "a slider ... to show that you can actually scroll
+// down to see more" — pinned to the right-hand edge inside the panel. 6 px wide is 1.0 mm on
+// the top screen's pixel pitch: it is never touched (the top screen is not a touch panel), so
+// it only has to be *seen*, which is a different budget from the bottom screen's buttons.
+#define NOTES_BAR_W     6
+#define NOTES_BAR_X     (NOTES_PANEL_X + NOTES_PANEL_W - NOTES_BAR_W - 4)
+#define NOTES_TRACK_Y   (NOTES_PANEL_Y + 4)
+#define NOTES_TRACK_H   (NOTES_PANEL_H - 8)                  // 192
+#define NOTES_THUMB_MIN 12                                    // never shrinks below visible
+
+// The text column: panel left edge in, and stopping short of the bar with a gap. 366 px at
+// FONT_ADVANCE 6 is 61 characters a line, which is what whatsnewBuildLayout is handed — in
+// pixels, so moving this moves the wrap with it.
+#define NOTES_TEXT_X    (NOTES_PANEL_X + 6)
+#define NOTES_TEXT_Y    (NOTES_PANEL_Y + 5)
+#define NOTES_TEXT_W    (NOTES_BAR_X - 6 - NOTES_TEXT_X)     // 366
+#define NOTES_VISIBLE   ((NOTES_PANEL_H - 10) / FONT_LINE)   // 21 lines
 
 // ── Palette ────────────────────────────────────────────────────────────────────────────
 
@@ -512,6 +548,12 @@ static void drawOptionsGeneral(TitleState* ts, Options* opts, const TitleInput* 
 	if (uiButton(update_r, "CHECK FOR UPDATE", ts->cursor == 5, tap, in->touch_x, in->touch_y, a)) {
 		ts->screen = TITLE_SCR_UPDATE;
 		ts->cursor = 0;
+		// The updater's state survives a trip out of this screen and back, so notes from a
+		// previous visit can still be there; the scroll position that went with them must
+		// not be. Starting anywhere but the top of a changelog reads as a missing first line.
+		ts->notes_scroll               = 0;
+		ts->notes_rep_up.held_frames   = 0;
+		ts->notes_rep_down.held_frames = 0;
 	}
 
 	const TRect back_r = {10, (float)OPT_BTN3_Y, SCR_W - 20, OPT_BTN_H};
@@ -732,6 +774,14 @@ static TitleResult drawMultiplayer(TitleState* ts, const TitleInput* in, bool ta
 		fontDraw(8, MP_ROW_ERROR, 1, COL_WARN, err);
 	} else if (netJustEnrolled()) {
 		fontDraw(8, MP_ROW_ERROR, 1, COL_ACCENT, "Enrolled - you're on the list now");
+	} else if (connected && networldWorldSeed(NULL) && networldRegistryWaiting()) {
+		// v1.6.0 task 8. The seed is in, so the row below no longer describes what is being
+		// waited for, but the block table is not settled and the gate at the bottom of this
+		// function is holding entry open for it. Bounded — see networld.h on
+		// networldRegistryWaiting() — so this is on screen for at most the sync deadline and
+		// usually for a single round trip. It says something different from the row below
+		// because it IS something different: the world is known, the blocks in it are not.
+		fontDraw(8, MP_ROW_ERROR, 1, COL_TEXT_DIM, "Joined - syncing block table...");
 	} else if (connected) {
 		// Only ever on screen between the handshake completing and the server naming its
 		// world, which is one round trip — the seed arrives in BS_APP_WORLD_INFO, the first
@@ -797,11 +847,9 @@ static TitleResult drawMultiplayer(TitleState* ts, const TitleInput* in, bool ta
 	}
 
 	const TRect back_r = {10, (float)MP_BTN2_Y, SCR_W - 20, MP_BTN_H};
-	if (uiButton(back_r, "BACK", ts->cursor == back_idx, tap, in->touch_x, in->touch_y, a)
-	    || (in->keys_down & KEY_B)) {
-		ts->screen = TITLE_SCR_MAIN;
-		ts->cursor = 1;   // land back on the MULTIPLAYER button
-	}
+	const bool back =
+		uiButton(back_r, "BACK", ts->cursor == back_idx, tap, in->touch_x, in->touch_y, a)
+		|| (in->keys_down & KEY_B) != 0;
 
 	// A server hosts the world, so joining one *is* entering it. This is the only place that
 	// happens: there is deliberately no name prompt, no NEW WORLD and no trip through world
@@ -815,7 +863,46 @@ static TitleResult drawMultiplayer(TitleState* ts, const TitleInput* in, bool ta
 	// client's own BS_WORLD_SEED constant: a world that looks like a successful join and is
 	// a different world from the one everybody else is standing in. Waiting visibly (see the
 	// "waiting for the world" row above) is the better failure.
-	if (connected && networldWorldSeed(NULL)) r.action = TITLE_START_SERVER;
+	//
+	// v1.6.0 task 8 added the second gate, for a near-identical reason one layer down. Entering
+	// runs main.c's genStart(), and genStart() calls registryFreeze() before it starts the
+	// worker — after which world/registry.c refuses every remote row for the rest of the
+	// session. BS_APP_REGISTRY_DEFS are a full round trip behind the BS_APP_WORLD_INFO seed
+	// this line already waits for, so without this the freeze always won and a server's
+	// dynamic blocks could never be committed by anybody, ever: they arrived microseconds
+	// after the only door they could have gone through was bolted. Holding entry here rather
+	// than moving the freeze itself is what keeps the worker's no-locks-after-freeze contract
+	// (world/registry.h) intact — this loop already draws a frame and pumps netUpdate() and
+	// networldUpdate() every pass, so the wait costs nothing but the frames it takes.
+	//
+	// networldRegistryWaiting() is bounded in every arm (see networld.h), including the
+	// pre-v1.6.0-server case where no BS_APP_REGISTRY_INFO is ever coming, so this cannot
+	// become a second "waits forever" gate.
+	//
+	// Both halves of that gate, and BACK above it, now go through scene/title_nav.h rather than
+	// sitting as two unrelated `if`s twenty lines apart. They were never independent: BACK set
+	// the screen and fell straight through into this line, so pressing B on the one frame the
+	// registry settled — or the frame the deadline expired, anywhere in a two-second wait this
+	// screen explicitly invites the player to give up on — backed out AND entered the server's
+	// world, and main.c acts on the action. See title_nav.h for why leaving wins, and
+	// scene/title_nav_test.c for the frames that prove it.
+	//
+	// The two network reads are gathered here, AFTER this frame's buttons: that ordering is
+	// what has always made DISCONNECT safe (netDisconnect() -> networldInit() clears the seed
+	// on the same frame), and moving them above the button row would quietly break it.
+	const TitleMpNav nav = {
+		.back             = back,
+		.connected        = connected,
+		.have_world_seed  = networldWorldSeed(NULL),
+		.registry_waiting = networldRegistryWaiting(),
+	};
+	const TitleMpNavOut nav_out = titleMpNav(nav);
+
+	if (nav_out.leave_to_main) {
+		ts->screen = TITLE_SCR_MAIN;
+		ts->cursor = 1;   // land back on the MULTIPLAYER button
+	}
+	if (nav_out.start_server) r.action = TITLE_START_SERVER;
 
 	return r;
 }
@@ -853,12 +940,55 @@ static TitleResult drawUpdate(TitleState* ts, const TitleInput* in, bool tap)
 	const int back_idx    = show_back ? (action_label ? 1 : 0) : -1;
 	const int item_count  = (action_label ? 1 : 0) + (show_back ? 1 : 0);
 
+	// ── Who owns the D-pad on this screen ─────────────────────────────────────────────
+	//
+	// steve asked for Up/Down to scroll the release notes on the top screen, and Up/Down is
+	// also what moved the button cursor here before. Both cannot have it, so ownership is
+	// decided once, here, in one place, and the two halves read *different HID words on
+	// different bits*: the scroll reads keys_held (Up/Down), the cursor reads keys_down
+	// (Left/Right). That is deliberate belt and braces against the bug this project has
+	// shipped twice — one hidKeysDown() word consumed by two UI layers in the same loop
+	// iteration (tools/run_host_tests.sh records the debugmenu_ui case: the A press that
+	// opened the menu also stepped the render-distance slider).
+	//
+	// Left/Right for a two-item choice costs a controller user nothing — INSTALL and BACK sit
+	// one press apart either way — and both buttons stay tappable and stay obvious, so the
+	// accept path and the decline path are exactly as reachable as they were.
+	//
+	// The swap is tied to UPDATE_AVAILABLE rather than to "are the notes long enough to
+	// scroll", so the D-pad does not change meaning under the player's thumb depending on how
+	// many lines a release happened to write.
+	const bool notes_visible = available && st == UPDATE_AVAILABLE;
+
 	// Guarded rather than always taken: item_count is 0 for the whole of CHECKING/
 	// DOWNLOADING/INSTALLING, and a modulo by 0 there would crash the console the first time
 	// a player pressed D-pad down mid-download.
 	if (item_count > 0) {
-		if (in->keys_down & KEY_DDOWN) ts->cursor = (ts->cursor + 1) % item_count;
-		if (in->keys_down & KEY_DUP)   ts->cursor = (ts->cursor + item_count - 1) % item_count;
+		const uint32_t next = notes_visible ? KEY_DRIGHT : KEY_DDOWN;
+		const uint32_t prev = notes_visible ? KEY_DLEFT  : KEY_DUP;
+
+		if (in->keys_down & next) ts->cursor = (ts->cursor + 1) % item_count;
+		if (in->keys_down & prev) ts->cursor = (ts->cursor + item_count - 1) % item_count;
+	}
+
+	if (notes_visible) {
+		// Repeat rate is app/whatsnew.h's WHATSNEW_REPEAT_DELAY/PERIOD, not a feel: one line
+		// on the press, then ~15 a second after a third of a second held. Both directions keep
+		// their own counter so holding one does not arm the other.
+		ts->notes_scroll += whatsnewRepeatStep(&ts->notes_rep_down,
+		                                        (in->keys_held & KEY_DDOWN) != 0);
+		ts->notes_scroll -= whatsnewRepeatStep(&ts->notes_rep_up,
+		                                        (in->keys_held & KEY_DUP) != 0);
+		// The upper bound needs the laid-out line count, which only titleDrawTop has; it
+		// clamps both ends there. This end is clamped here as well so the value never goes
+		// negative even for the one frame between the two calls.
+		if (ts->notes_scroll < 0) ts->notes_scroll = 0;
+	} else {
+		// Leaving the notes behind resets both counters, so a direction still held when the
+		// state changes cannot carry a mid-repeat cadence into the next visit.
+		ts->notes_rep_up.held_frames   = 0;
+		ts->notes_rep_down.held_frames = 0;
+		ts->notes_scroll               = 0;
 	}
 
 	fontDraw(8, 4, 1, COL_TEXT_DIM, "UPDATE");
@@ -896,6 +1026,18 @@ static TitleResult drawUpdate(TitleState* ts, const TitleInput* in, bool tap)
 			y += 4;
 			const TRect bar_r = {10, y, SCR_W - 20, 14};
 			uiProgressBar(bar_r, pct);
+			y += 14;
+		}
+
+		// The player is looking at the bottom screen when the check lands, so the bottom
+		// screen is where they have to be told the changelog exists and how to work it.
+		if (notes_visible) {
+			y += 6;
+			fontDraw(10, y, 1, COL_ACCENT, "WHAT'S NEW IS ON THE TOP SCREEN");
+			y += FONT_LINE;
+			fontDraw(10, y, 1, COL_TEXT_DIM, "D-PAD UP/DOWN SCROLLS IT");
+			y += FONT_LINE;
+			fontDraw(10, y, 1, COL_TEXT_DIM, "LEFT/RIGHT PICKS A BUTTON");
 		}
 	}
 
@@ -931,6 +1073,89 @@ static TitleResult drawUpdate(TitleState* ts, const TitleInput* in, bool tap)
 	}
 
 	return r;
+}
+
+// ── Top screen: the release notes ──────────────────────────────────────────────────────
+
+// Re-laid out every frame rather than cached. The wrap is a few kilobytes of memcpy over at
+// most 64 lines, which is nothing next to the 16.71 ms frame this menu has entirely to
+// itself, and a cache here would need invalidating the moment the worker thread finished a
+// fetch — a staleness bug in exchange for time nobody is short of.
+static WhatsNewLayout s_notes_layout;
+
+static void drawUpdateTop(TitleState* ts)
+{
+	const char* latest = updaterLatestVersion();
+
+	char heading[64];
+	if (latest[0] != '\0')
+		snprintf(heading, sizeof(heading), "WHAT'S NEW IN %s", latest);
+	else
+		snprintf(heading, sizeof(heading), "WHAT'S NEW");
+	fontDraw(NOTES_PANEL_X + 2, 6, 1, COL_ACCENT, heading);
+
+	// Real pixels and the real font advance, not a guessed character count — see
+	// app/whatsnew.h. FONT_ADVANCE is per font pixel, so at scale 1 it is the advance.
+	whatsnewBuildLayout(updaterReleaseNotes(), NOTES_TEXT_W, FONT_ADVANCE, &s_notes_layout);
+
+	const int lines = s_notes_layout.count;
+	ts->notes_scroll = whatsnewClampScroll(ts->notes_scroll, lines, NOTES_VISIBLE);
+
+	spriteRect(NOTES_PANEL_X, NOTES_PANEL_Y, NOTES_PANEL_W, NOTES_PANEL_H, COL_PANEL_LO);
+
+	for (int row = 0; row < NOTES_VISIBLE; row++) {
+		const int i = ts->notes_scroll + row;
+		if (i >= lines) break;
+
+		const float ly = (float)(NOTES_TEXT_Y + row * FONT_LINE);
+
+		uint32_t colour;
+		switch (s_notes_layout.kind[i]) {
+		case WN_LINE_HEADING: colour = COL_ACCENT;   break;
+		case WN_LINE_NOTE:    colour = COL_TEXT_DIM; break;
+		case WN_LINE_CONT:    colour = COL_TEXT_DIM; break;
+		default:              colour = COL_TEXT;     break;
+		}
+
+		fontDraw(NOTES_TEXT_X, ly, 1, colour, s_notes_layout.lines[i]);
+	}
+
+	// The slider. Track always drawn, so the bar reads as a bar even when there is nothing
+	// below the fold; the thumb fills the whole track in that case (whatsnewThumb's own
+	// contract) and is drawn in the dimmer colour, which is the entire visual difference
+	// between "that is all of it" and "there is more down there".
+	const bool more = whatsnewScrollable(lines, NOTES_VISIBLE);
+
+	WhatsNewThumb thumb;
+	whatsnewThumb(lines, NOTES_VISIBLE, ts->notes_scroll, NOTES_TRACK_H, NOTES_THUMB_MIN,
+	              &thumb);
+
+	spriteRect(NOTES_BAR_X, NOTES_TRACK_Y, NOTES_BAR_W, NOTES_TRACK_H, COL_PANEL);
+	spriteRect(NOTES_BAR_X, (float)(NOTES_TRACK_Y + thumb.y), NOTES_BAR_W, (float)thumb.h,
+	           more ? COL_ACCENT : COL_PANEL_HI);
+
+	const char* footer = more ? "D-PAD UP/DOWN TO SCROLL"
+	                          : "THAT IS THE WHOLE CHANGELOG";
+	fontDraw(NOTES_PANEL_X + 2, (float)(NOTES_PANEL_Y + NOTES_PANEL_H + 5), 1,
+	         COL_TEXT_DIM, footer);
+}
+
+void titleDrawTop(TitleState* ts)
+{
+	spriteBegin(TOP_W, TOP_H);
+	spriteTexture(fontTexture());
+	spriteRect(0, 0, TOP_W, TOP_H, COL_BG);
+
+	// Exactly the condition drawUpdate() calls `notes_visible`, and it has to stay exactly
+	// that: it is what decides whether the D-pad scrolls or moves the button cursor, so a
+	// panel on screen with the other input mapping live would be a screen that ignores its
+	// own scrollbar. Anything else leaves the top screen as it has always been — cleared,
+	// so it never holds uninitialised VRAM, and otherwise empty.
+	if (ts->screen == TITLE_SCR_UPDATE && updaterAvailable() &&
+	    updaterState() == UPDATE_AVAILABLE)
+		drawUpdateTop(ts);
+
+	spriteEnd();
 }
 
 // ── Entry points ───────────────────────────────────────────────────────────────────────
