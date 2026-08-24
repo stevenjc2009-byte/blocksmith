@@ -1,0 +1,20 @@
+# Release notes shown on the 3DS top screen before the update downloads.
+# Attach this to the v1.7.1 GitHub release alongside blocksmith1.7.1.cia.
+# Checked with: sh tools/make_whatsnew.sh 1.7.1
+#
+# v1.7.1 ONLY. This is a repair release for the four things steve reported playing
+# v1.7.0, so [fixes] leads and [features] is deliberately short.
+# Player-facing prose only - it wraps at 61 characters on a 400px screen.
+# Items are capped at 95 characters each by source/app/whatsnew.h.
+# The developer-facing story lives in CHANGELOG.md.
+
+[fixes]
+Reloading a world dropped you inside your own blocks, so the ground looked like it had gone.
+You now come back exactly where you were standing, facing the same way.
+Tall grass can be broken now. Before, swinging at it did nothing at all.
+Frame rate drops while walking are much smaller. The worst stutters are down by half.
+Worlds with saved changes open faster. The save file is no longer reread for every column.
+Water no longer holds you under. You sink slowly, swim up, and move slower in it.
+
+[features]
+Nothing new to look at in this one. It is a repair release.

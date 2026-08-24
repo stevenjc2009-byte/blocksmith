@@ -73,45 +73,83 @@ void scratchFill(MeshScratch* s, const World* w, int cx, int cy, int cz)
 // are resolved once and every cell then reads straight out of its owning
 // column's two nibble channels. y stays inside those columns whatever cy does,
 // which is why no chunk-level walk is needed here.
+//
+// v1.8.0 task 49h rewrote the walk without changing a byte of what it produces.
+// The old shape asked every one of the 5,832 cells the same three questions the
+// cell before it had already answered:
+//
+//   * lightChannelSky/lightChannelBlock are declared in world/light.h and defined
+//     in world/light.c, and this project does not build with -flto, so they are
+//     real out-of-line calls the compiler cannot hoist across the TU boundary —
+//     11,664 of them per chunk build, of which 11,658 returned what the previous
+//     call returned, because the owning column only changes at three values of sx.
+//     They are now resolved 18 times, once per (dz,dx) neighbour, before the walk.
+//   * `wy >= WORLD_HEIGHT` and `wy < 0` are constant across a whole sy plane, so
+//     they are answered once per plane instead of 324 times inside it.
+//   * lightIndex() rebuilt a multiply chain per cell for an index that simply
+//     increments across the middle 16 cells of an sx run — x is the contiguous
+//     axis in BOTH the scratch and the light channel, which is what makes the run
+//     a run. Same shape as the emitCollect fix in world/mesher.c.
+//
+// This became live on an Old 3DS in v1.8.0 task 24, when the lighting gate went on
+// for both models (see world/light.h) — so it is new cost on the streaming drain,
+// on the hardware that has the least to spend.
 void scratchFillLight(MeshScratch* s, const World* w, int cx, int cy, int cz)
 {
-	const Column* cols[3][3];
-	for (int dz = -1; dz <= 1; dz++)
-		for (int dx = -1; dx <= 1; dx++)
-			cols[dz + 1][dx + 1] = worldColumn(w, cx + dx, cz + dz);
+	// One resolve per neighbour column, not one per cell. Indexed [dz+1][dx+1],
+	// which is exactly the ci_z / ci_x pair the old per-cell arithmetic derived.
+	const uint8_t* skych[3][3];
+	const uint8_t* blkch[3][3];
+	for (int dz = -1; dz <= 1; dz++) {
+		for (int dx = -1; dx <= 1; dx++) {
+			const Column* c = worldColumn(w, cx + dx, cz + dz);
+			skych[dz + 1][dx + 1] = lightChannelSky(c);
+			blkch[dz + 1][dx + 1] = lightChannelBlock(c);
+		}
+	}
+
+	// The three x runs of an 18-wide row, in scratch order: the low border cell
+	// (owned by the -1 neighbour, whose local x is 15), the sixteen middle cells
+	// (this column, local x 0..15), and the high border cell (the +1 neighbour,
+	// local x 0). Derived once here rather than re-derived per cell.
+	static const int kRunSx[3]    = { 0, 1, CHUNK_DIM + 1 };
+	static const int kRunCount[3] = { 1, CHUNK_DIM, 1 };
+	static const int kRunLx[3]    = { CHUNK_DIM - 1, 0, 0 };
 
 	for (int sy = 0; sy < SCRATCH_DIM; sy++) {
 		const int wy = cy * CHUNK_DIM + sy - 1;
 
+		// Invariant across the whole plane, so it is decided here and not 324 times.
+		const bool above = (wy >= WORLD_HEIGHT);
+		const bool below = (wy < 0);
+
 		for (int sz = 0; sz < SCRATCH_DIM; sz++) {
-			const int wz = cz * CHUNK_DIM + sz - 1;
+			const int wz   = cz * CHUNK_DIM + sz - 1;
 			const int ci_z = (wz >> 4) - cz + 1;
+			const int lz   = wz & (CHUNK_DIM - 1);
 
-			for (int sx = 0; sx < SCRATCH_DIM; sx++) {
-				const int wx = cx * CHUNK_DIM + sx - 1;
-				const Column* c = cols[ci_z][(wx >> 4) - cx + 1];
-				const uint8_t* sky = lightChannelSky(c);
-				const uint8_t* blk = lightChannelBlock(c);
+			uint8_t* row = &s->light[scratchIndex(0, sy, sz)];
 
-				uint8_t v;
-				if (!sky) {
-					// No light data yet: full sky, today's brightness — a column
-					// still streaming in must not paint black seams at the ring's
-					// edge while its own propagation is still in flight.
-					v = 0xF0;
-				} else {
-					int sv, bv;
-					if (wy >= WORLD_HEIGHT) { sv = 15; bv = 0; }
-					else if (wy < 0)        { sv = 0;  bv = 0; }
-					else {
-						const int ci = lightIndex(wx & 15, wy, wz & 15);
-						sv = lightNibble(sky, ci);
-						bv = blk ? lightNibble(blk, ci) : 0;
-					}
-					v = (uint8_t)((sv << 4) | bv);
+			for (int r = 0; r < 3; r++) {
+				uint8_t* dst        = row + kRunSx[r];
+				const int count     = kRunCount[r];
+				const uint8_t* sky  = skych[ci_z][r];
+
+				// No light data yet: full sky, today's brightness — a column still
+				// streaming in must not paint black seams at the ring's edge while
+				// its own propagation is still in flight. Asked before the y range,
+				// exactly as it was before.
+				if (!sky || above) { memset(dst, 0xF0, (size_t)count); continue; }
+				if (below)         { memset(dst, 0x00, (size_t)count); continue; }
+
+				const uint8_t* blk = blkch[ci_z][r];
+				int ci = lightIndex(kRunLx[r], wy, lz);
+
+				for (int k = 0; k < count; k++, ci++) {
+					const int sv = lightNibble(sky, ci);
+					const int bv = blk ? lightNibble(blk, ci) : 0;
+					dst[k] = (uint8_t)((sv << 4) | bv);
 				}
-
-				s->light[scratchIndex(sx, sy, sz)] = v;
 			}
 		}
 	}

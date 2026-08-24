@@ -10,12 +10,23 @@
 
 typedef struct {
 	int8_t  x, y, z;   // position in block units, chunk-local 0..16
-	int8_t  pad;       // unread by the GPU. See below - its POSITION is load-bearing.
+	int8_t  pad;       // packed light: sky * 16 + block. See below - its POSITION also matters.
 	uint8_t u, v;      // atlas pixel coordinates, texture space (v grows upwards)
 	uint8_t nrm;       // face index 0..5, resolved to a baked brightness in the shader
 	uint8_t ao;        // ambient occlusion 0..3, 3 being unoccluded
 } MeshVertex;
 
+// The name `pad` is historical and is now actively wrong: this field is READ by the GPU.
+// shaders/world_dynamic.v.pica:99-106 takes it as inpos.wwww and unpacks it as sky * 16 +
+// block, scales the sky half by the dayLevel uniform, and takes max(daySky, block) as the
+// luminance every fragment's colour is multiplied by. Since v1.8.0 that shader is bound on
+// Old 3DS as well as New (scene/chunk_render.c:750 calls lightEngineInit(true)
+// unconditionally), so there is no build in which this byte is dead. Until v1.7.1 the line
+// above claimed it was "unread by the GPU" — anyone who believed it and reused the byte, or
+// stopped filling it, would have deleted smooth lighting everywhere with the compiler
+// raising no objection at all, because a vertex attribute the shader reads and the mesher
+// never writes is not a type error.
+//
 // Why pad sits in the MIDDLE, at offset 3, and must never be moved back to the end.
 //
 // citro3d has no per-attribute offset: AttrInfo_AddLoader appends, and the PICA200 computes

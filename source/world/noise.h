@@ -43,3 +43,9 @@ fx noiseFbm2(uint32_t seed, fx x, fx z, int octaves);
 // 3D value noise, for caves in step 5.4. Same contract, eight lattice corners.
 fx noiseValue3(uint32_t seed, fx x, fx y, fx z);
 fx noiseFbm3(uint32_t seed, fx x, fx y, fx z, int octaves);
+
+// The final `total / amplitude-sum` step of the two fBms above, exposed only so the tests
+// can brute-force it against the plain division it replaces. Not part of the noise API —
+// nothing outside noise.c and the test suite should call it. `octaves` is clamped 1..8 as
+// above, and `total` must be a sum of in-range samples, i.e. 0 <= total <= 65535 * norm.
+fx noiseFbmNormalise(int64_t total, int octaves);

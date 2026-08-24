@@ -48,8 +48,19 @@
 // range rather than returning a wrapped rect. TILE_* in gfx/atlas.h enumerates 10, so 5
 // addressable slots are spare — and since v1.6.0 F7 every one of them, slot 15 included,
 // is painted with the missing-texture marker instead of left as background fill. See
-// ATLAS_TILE_MISSING below. The next step up is ATLAS_H_PX 512: 32 slots, 31
-// addressable, 16 KB of VRAM instead of 8 KB.
+// ATLAS_TILE_MISSING below. Widening ATLAS_H_PX alone does NOT raise this ceiling: v0/v1
+// are a raw uint8_t pixel offset (tile * TILE_PX, atlasRect() below), never scaled to the
+// sheet height, so a taller sheet does not change how far that cast can count before it
+// wraps. At a hypothetical ATLAS_H_PX=512, tile 15's v1 (256) already overflows uint8_t -
+// the SAME failure this file guards at ATLAS_TILE_COUNT today - and every tile above it
+// silently aliases an earlier one's rect instead of addressing new geometry (tile 30, for
+// instance, truncates onto tile 14's own v1). world/atlas_uv_shader_test.c's task-13a
+// checks prove this: looping the claimed range 0..30 goes red starting at tile 15, not at
+// 30 or 31. The real ceiling is 15 addressable slots (0..14) at any ATLAS_H_PX, because it
+// is set by MeshVertex's uint8_t v, not by the sheet's height. Getting past 15 needs the
+// vertex format itself to change - MeshVertex.v holding a slot index instead of a raw
+// pixel offset, scaled by TILE_PX in the shader - which is unstarted work (roadmap task
+// 13b), not a side effect of a bigger sheet.
 #define ATLAS_TILE_SLOTS   (ATLAS_H_PX / TILE_PX)   // 16 slots exist on the sheet
 #define ATLAS_TILE_COUNT   (ATLAS_TILE_SLOTS - 1)   // 15 of them addressable: indices 0..14
 

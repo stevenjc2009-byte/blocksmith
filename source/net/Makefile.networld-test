@@ -87,7 +87,7 @@ $(BUILD):
 
 $(BUILD)/networld_test: $(BUILD)/world.o $(BUILD)/block.o $(BUILD)/registry.o \
                          $(BUILD)/chunk.o $(BUILD)/budget.o $(BUILD)/mesher.o \
-                         $(BUILD)/scratch.o \
+                         $(BUILD)/visgraph.o $(BUILD)/scratch.o \
                          $(BUILD)/blockdiff.o $(BUILD)/networld.o $(BUILD)/networld_test.o
 	$(CC) $^ -o $@
 
@@ -110,6 +110,13 @@ $(BUILD)/budget.o: ../world/budget.c ../world/budget.h | $(BUILD)
 # they are not this binary's business to fix.
 $(BUILD)/mesher.o: ../world/mesher.c ../world/mesher.h | $(BUILD)
 	$(CC) $(MESHER_CFLAGS) -c $< -o $@
+
+# v1.7.1: joined the link when net/networld.c's registryApplyRemote() started calling
+# visgraphInvalidateTables() beside mesherInvalidateTables(), for the same reason mesher.o is
+# here — visgraph.c caches a per-id openness table off the registry this binary really does
+# apply DEFS batches through.
+$(BUILD)/visgraph.o: ../world/visgraph.c ../world/visgraph.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/scratch.o: ../world/scratch.c ../world/scratch.h | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@

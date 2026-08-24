@@ -119,7 +119,14 @@ int interactEdit(Interact* it, World* w, const Body* body, u32 keys_down)
 		// inventoryCanHold() widens past BLOCK_COUNT on both this client and the server.
 		// It exists only because the bag cannot hold the id, not because the block is
 		// special in any other way.
-		if (!inventoryCanHold(broken)) {
+		// v1.7.1 task 47. A plant breaks and gives you nothing; it is not refused. Splitting
+		// this off is the whole fix — see world/block.h's blockDropsNothing for why the two
+		// questions had been one, and what it cost. Nothing about the ceiling rule below
+		// changes: a block the bag cannot hold is still unbreakable, and inventoryCanHold is
+		// still the only home for that rule.
+		const bool no_drop = blockDropsNothing(broken);
+
+		if (!no_drop && !inventoryCanHold(broken)) {
 			// `refused` is the module's existing idiom for "the press did nothing", already
 			// counted for a miss, an occupied cell and an empty hand, and already surfaced
 			// on the debug overlay as `r`. Nothing louder is invented here: this client has
@@ -135,8 +142,14 @@ int interactEdit(Interact* it, World* w, const Body* body, u32 keys_down)
 			worldMarkDirty(w, t->x, t->z);
 			// Adaptive lighting: recompute the edited column's channels before the remesh
 			// is queued, so the drained mesh bakes the new light in the same frame. The
-			// sweep engine is queue-free and column-local, so this is exactly a full
-			// reflood of that one column — no neighbour can go stale behind it.
+			// relight is column-local and idempotent — it memsets and recomputes from the
+			// blocks — so this is exactly a full reflood of that one column, and no
+			// neighbour can go stale behind it.
+			//
+			// This used to say "the sweep engine is queue-free", which v1.8.0 made false:
+			// task 23 moved the edit path off relaxation sweeps onto flood fill (0.141 ms
+			// per block against 4.064 ms, measured on the host), and world/relightq.h now
+			// coalesces the multi-edit case. Neither changes what this call site does.
 			if (lightEnabled())
 				lightRelightColumn(w, t->x >> 4, t->z >> 4);
 			queued += chunkRenderTouch(w, t->x, t->y, t->z);
@@ -144,7 +157,12 @@ int interactEdit(Interact* it, World* w, const Body* body, u32 keys_down)
 			// authoritative for this client's own view, so nothing here waits on it.
 			networldSendBlockEdit(t->x, t->y, t->z, BLOCK_AIR);
 			it->broke++;
-			it->broke_id = broken;
+			// Left as BLOCK_AIR for a plant, which is exactly how main.c already spells "this
+			// break earned nothing" — it adds to the bag only when broke_id != BLOCK_AIR. So
+			// the plant is removed from the world, the edit goes to the server as an ordinary
+			// air write (id 0, legal on the wire and below every ceiling on both sides), and no
+			// unholdable id is ever offered to the inventory.
+			it->broke_id = no_drop ? BLOCK_AIR : broken;
 		} else {
 			it->refused++;
 		}

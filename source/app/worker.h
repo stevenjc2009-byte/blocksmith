@@ -162,6 +162,19 @@ int   workerQueued(void);           // jobs still waiting to be picked up
 float workerBusyMs(void);           // wall time the worker spent inside the generator
 float workerInstallMs(void);        // wall time the main thread spent copying columns
 
+// v1.7.1 task 48b. The save-slot wait inside workerSubmitSave, which blocks the MAIN thread
+// on a worker sharing the same core. Since-launch totals, like the two above.
+//
+// These exist because `save_ms` alone cannot answer the question it was added for: a frame
+// that never had a dirty column to save reports 0.0 ms, and so does a frame that submitted
+// three and never once had to wait. Only "submits > 0 with waits == 0" says the path was
+// exercised and did not block — which is the measured negative worth having. A capture with
+// both at zero says nothing at all, and must not be read as a clean bill of health.
+int   workerSaveSubmits(void);      // columns handed to the save ring
+int   workerSaveWaits(void);        // ...of which this many blocked the main thread
+float workerSaveWaitMs(void);       // total main-thread time lost to that wait
+float workerSaveWaitMaxMs(void);    // the worst single wait, which is the frame spike
+
 // Which CPU core the worker actually ended up on, not which one it asked for: 1 only if
 // APT_SetAppCpuTimeLimit and the thread creation both succeeded, 0 otherwise, -1 before
 // workerStart. Reported rather than assumed, because the second core is a request the

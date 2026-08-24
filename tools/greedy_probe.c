@@ -145,6 +145,12 @@ int main(void)
 	WorldGen gen;
 
 	worldInit(&world);
+	// GEN_VERSION_LEGACY on purpose, and it must stay that way to keep this probe's recorded
+	// numbers meaningful: they were taken on the 2D-heightmap terrain, and v1.6.0's greedy
+	// meshing decision rests on them. Re-running this against GEN_VERSION_DENSITY would
+	// measure a different world and produce a figure that looks comparable and is not - the
+	// density field's caves change both the quad count and the AO variation this counts.
+	// If the prize needs re-measuring on Beta terrain, that is a NEW probe, not an edit here.
 	worldgenInit(&gen, PROBE_SEED, GEN_VERSION_LEGACY);
 	const int failed = worldgenArea(&gen, &world, 0, 0, PROBE_RADIUS);
 

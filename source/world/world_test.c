@@ -18,6 +18,8 @@
 #include "world/rng.h"
 #include "world/raycast.h"
 #include "world/registry.h"
+#include "world/relightq.h"
+#include "world/tick.h"
 #include "world/remesh.h"
 #include "world/scratch.h"
 #include "scene/render_dist.h"
@@ -2207,6 +2209,165 @@ static void testMesherCrossNeverMerges(void)
 	free(out.indices);
 }
 
+// v1.7.1 task 49. The emit list no longer carries a cell with nothing exposed — see
+// s_emit_face in world/mesher.c for the measurement that made that the shape of the fix.
+// The filter is exact by construction; this is what proves it stayed exact.
+//
+// THE GAP THIS CLOSES. Every mesher test above starts from geometry that is visible: a
+// floor, a wall, a tree, a row of plants. Not one of them asks what happens to a block that
+// CANNOT be seen, because until this task nothing in the mesher treated such a block
+// differently — it walked the same path as every other cell and was rejected six times over
+// by the neighbour test. It is now rejected once, earlier, and by a different piece of code,
+// and there are exactly two ways for that to be wrong:
+//
+//   * too greedy — drop a cell that should have emitted. The one shape where "no exposed
+//     face" does not mean "emits nothing" is BLOCK_SHAPE_CROSS, which emitCross draws whole
+//     regardless of its neighbours. A plant walled in on all six sides is not a contrived
+//     case: it is a sapling with a block placed on top of it, or a flower in a hole the
+//     player fills in. Nothing above would have noticed one vanishing.
+//   * too shy — keep the filter honest but read the exposure from the wrong place. The mask
+//     is built from the padded scratch, so a cell on the chunk's own boundary is judged
+//     against the NEIGHBOURING CHUNK's block and not against air. Getting that wrong would
+//     wall off every chunk seam in the world, or open every seam that should be closed.
+//
+// Both are checked below, each with a control arm that has to move the other way.
+static void testMesherExposureFilter(void)
+{
+	MeshOut out = {0};
+	out.vert_cap  = MESH_MAX_VERTS;
+	out.index_cap = MESH_MAX_INDICES;
+	out.verts     = (MeshVertex*)malloc(sizeof(MeshVertex) * out.vert_cap);
+	out.indices   = (uint16_t*)malloc(sizeof(uint16_t) * out.index_cap);
+	CHECK(out.verts != NULL && out.indices != NULL);
+	if (!out.verts || !out.indices) { free(out.verts); free(out.indices); return; }
+
+	static const int8_t kSix[6][3] = {
+		{1,0,0}, {-1,0,0}, {0,1,0}, {0,-1,0}, {0,0,1}, {0,0,-1}
+	};
+
+	// --- 1. A single stone block alone in a chunk: six faces, nothing hidden. The control
+	// arm for everything below — if this is not 6 the harness itself is wrong and no
+	// conclusion drawn from the other cases means anything.
+	worldInit(&s_world);
+	CHECK(worldSet(&s_world, CHUNK_DIM + 8, CHUNK_DIM + 8, CHUNK_DIM + 8, BLOCK_STONE));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.faces == 6);
+	worldExit(&s_world);
+
+	// --- 2. The same block with all six neighbours filled in. Every face is covered, so it
+	// emits nothing — and the six neighbours each keep the five faces the middle one does
+	// not touch. 6 x 5 = 30 quads, none of them the middle cell's.
+	worldInit(&s_world);
+	CHECK(worldSet(&s_world, CHUNK_DIM + 8, CHUNK_DIM + 8, CHUNK_DIM + 8, BLOCK_STONE));
+	for (int i = 0; i < 6; i++) {
+		const int nx = CHUNK_DIM + 8 + kSix[i][0];
+		const int ny = CHUNK_DIM + 8 + kSix[i][1];
+		const int nz = CHUNK_DIM + 8 + kSix[i][2];
+		CHECK_QUIET(worldSet(&s_world, nx, ny, nz, BLOCK_STONE));
+	}
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.faces == 30);
+
+	// ...and no quad sits on the buried cell. A count alone cannot tell "the middle emitted
+	// nothing" from "the middle emitted one face and a neighbour lost one", so the positions
+	// are read: no quad may have all four corners inside the middle cell's own 1x1x1 box.
+	{
+		bool none_on_middle = true;
+		for (uint32_t q = 0; q < out.faces; q++) {
+			const MeshVertex* v = &out.verts[q * 4];
+			bool all_inside = true;
+			for (int i = 0; i < 4; i++)
+				if (v[i].x < 8 || v[i].x > 9 || v[i].y < 8 || v[i].y > 9 ||
+				    v[i].z < 8 || v[i].z > 9)
+					all_inside = false;
+			if (all_inside) none_on_middle = false;
+		}
+		CHECK(none_on_middle);
+	}
+	worldExit(&s_world);
+
+	// --- 3. The chunk seam. A stone block at local x = 15 with the cell across the border
+	// left as air: the +X face must still be emitted, because the mask is built from the
+	// padded scratch and the scratch's border holds the real neighbour.
+	worldInit(&s_world);
+	CHECK(worldSet(&s_world, CHUNK_DIM + 15, CHUNK_DIM + 8, CHUNK_DIM + 8, BLOCK_STONE));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.faces == 6);
+
+	// The control arm: fill that one cell in the NEXT CHUNK ALONG and the same block drops
+	// to five. Without this, the check above would pass just as well for a mesher that
+	// ignored the border entirely and assumed air.
+	CHECK(worldSet(&s_world, CHUNK_DIM + 16, CHUNK_DIM + 8, CHUNK_DIM + 8, BLOCK_STONE));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.faces == 5);
+	worldExit(&s_world);
+
+	// --- 4. A cross block walled in on all six sides still draws its four quads.
+	//
+	// The one case where "nothing exposed" must NOT mean "emits nothing". emitCross runs
+	// before the six-face loop and no neighbour can hide an X, so the filter has to exempt
+	// every shape that is not a full cube. A filter written without that exemption passes
+	// cases 1-3 and every other mesher test in this file, and silently deletes plants.
+	BlockId cross = 0, cube = 0;
+	CHECK(registerShapeBlocks(&cross, &cube));
+	if (cross && cube) {
+		worldInit(&s_world);
+		CHECK(worldSet(&s_world, CHUNK_DIM + 8, CHUNK_DIM + 8, CHUNK_DIM + 8, cross));
+		for (int i = 0; i < 6; i++) {
+			const int nx = CHUNK_DIM + 8 + kSix[i][0];
+			const int ny = CHUNK_DIM + 8 + kSix[i][1];
+			const int nz = CHUNK_DIM + 8 + kSix[i][2];
+			CHECK_QUIET(worldSet(&s_world, nx, ny, nz, BLOCK_STONE));
+		}
+		scratchFill(&s_scratch, &s_world, 1, 1, 1);
+		meshChunk(&out, &s_scratch);
+
+		// The four cross quads are the whole transparent run and the stone shell is the
+		// opaque one, so reading them apart rather than as a total is what makes this a
+		// check on the plant and not on the shell around it.
+		CHECK(out.faces - out.opaque_faces == 4);
+
+		// And the shell reads 36, not case 2's 30. A cross occludes nothing, so each of the
+		// six stone blocks keeps the inward face that a plain cube in the middle would have
+		// covered: 6 x 6. Measured, not assumed — the first draft of this test asserted 30 on
+		// the reasoning that only the middle cell had changed, and the run came back 36.
+		// Writing the real number down is what makes this a control: it stops the check above
+		// from passing because the whole neighbourhood got louder, and it fails just as loudly
+		// if a future change lets a cross start occluding.
+		CHECK(out.opaque_faces == 36);
+
+		worldExit(&s_world);
+	}
+	restoreCoreRegistry();
+
+	// --- 5. The buried case at chunk scale, which is what the measurement was actually
+	// about: a chunk of solid stone inside solid stone meshes to nothing at all.
+	worldInit(&s_world);
+	for (int y = 0; y < 3 * CHUNK_DIM; y++)
+		for (int z = 0; z < 3 * CHUNK_DIM; z++)
+			for (int x = 0; x < 3 * CHUNK_DIM; x++)
+				CHECK_QUIET(worldSet(&s_world, x, y, z, BLOCK_STONE));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.faces == 0);
+
+	// The control: carve one cell out of the neighbouring chunk, right against the middle
+	// chunk's face, and exactly one quad comes back. A mesher that emitted nothing because
+	// it had stopped emitting anything at all would fail here.
+	CHECK(worldSet(&s_world, 2 * CHUNK_DIM, CHUNK_DIM + 8, CHUNK_DIM + 8, BLOCK_AIR));
+	scratchFill(&s_scratch, &s_world, 1, 1, 1);
+	meshChunk(&out, &s_scratch);
+	CHECK(out.faces == 1);
+	worldExit(&s_world);
+
+	free(out.verts);
+	free(out.indices);
+}
+
 // The other two consumers of a block's shape: the player's collision box and the DDA the
 // crosshair aims with. They have to disagree about a cross block — walk through it, but
 // still be able to break it — and that is exactly the pair a single `solid` test cannot
@@ -3662,11 +3823,15 @@ static void testEditPersistence(void)
 // ⚠ Not covered here, because it lives in `source/scene/` behind `<3ds.h>` and cannot be
 // linked into a host build: which way the D-pad and circle pad actually point. That is
 // verified separately on the emulator.
-#define TICK_HZ  59.83f   // measured 3DS VBlank rate, not the nominal 60
+// v1.8.0 task 21 renamed this from TICK_HZ. It was never a tick rate — it is the measured 3DS
+// VBlank rate, and player physics runs on the render frame, not on the simulation tick. The old
+// name collided with world/tick.h's real TICK_HZ (20) the moment a tick existed, which is a fair
+// summary of why the rest of this rung was needed: "tick" and "frame" had been the same word.
+#define FRAME_HZ  59.83f   // measured 3DS VBlank rate, not the nominal 60
 
 static void testControlFeel(void)
 {
-	const float dt = 1.0f / TICK_HZ;
+	const float dt = 1.0f / FRAME_HZ;
 
 	worldInit(&s_world);
 	for (int x = 0; x < 12; x++)
@@ -3730,6 +3895,279 @@ static void testControlFeel(void)
 
 	worldExit(&s_world);
 }
+
+// v1.8.0 task 25 — buoyancy. The probe first (bodySubmerged), then the two things water
+// does to a falling body: a weaker pull, and a much lower terminal speed.
+//
+// Every case here is written as TWO ARMS over the same fixture — an identical body in air
+// and in water, stepped with the same dt — because "a body in water fell 0.13 blocks" is
+// not a claim that can go red on its own. The difference between the arms is.
+static void testBuoyancy(void)
+{
+	const float dt = 1.0f / 60.0f;
+
+	// A pool of water from y=4..9 sitting on a stone floor at y=3, and a matching dry
+	// column of air beside it. Same floor, same height, so the only difference between
+	// the two arms is what fills the cells.
+	worldInit(&s_world);
+	for (int x = 0; x < 16; x++)
+		for (int z = 0; z < 16; z++)
+			CHECK(worldSet(&s_world, x, 3, z, BLOCK_STONE));
+	for (int y = 4; y <= 9; y++)
+		for (int x = 0; x < 8; x++)
+			for (int z = 0; z < 16; z++)
+				CHECK_QUIET(worldSet(&s_world, x, y, z, BLOCK_WATER));
+
+	// --- The probe. Feet, eyes, and the two cases that are why the eye cell is asked
+	// about at all rather than the feet alone.
+	{
+		Body wet;  bodyInit(&wet, 4.5f, 6.0f, 4.5f);    // both cells inside the pool
+		Body dry;  bodyInit(&dry, 12.5f, 6.0f, 12.5f);  // both cells in open air
+		CHECK(bodySubmerged(&s_world, &wet) == true);
+		CHECK(bodySubmerged(&s_world, &dry) == false);
+
+		// Feet in the pool's top cell (y=9), eyes at 10.62 which is open air above it.
+		Body wading; bodyInit(&wading, 4.5f, 9.0f, 4.5f);
+		CHECK(bodySubmerged(&s_world, &wading) == true);
+
+		// The opposite: feet in air at y=3.2 under an overhanging water cell, head at
+		// 4.82 inside it. A feet-only probe reads this as dry.
+		CHECK(worldSet(&s_world, 12, 4, 12, BLOCK_WATER));
+		Body headfirst; bodyInit(&headfirst, 12.5f, 3.2f, 12.5f);
+		CHECK(bodySubmerged(&s_world, &headfirst) == true);
+		CHECK(worldSet(&s_world, 12, 4, 12, BLOCK_AIR));
+
+		// And a body standing on the floor beside the pool is dry, which is the control
+		// that says the probe is not simply answering true.
+		Body onfloor; bodyInit(&onfloor, 12.5f, 4.0f, 12.5f);
+		CHECK(bodySubmerged(&s_world, &onfloor) == false);
+	}
+
+	// --- One tick of gravity, from rest, in each medium. Water must pull less.
+	{
+		Body wet;  bodyInit(&wet, 4.5f, 7.0f, 4.5f);
+		Body dry;  bodyInit(&dry, 12.5f, 7.0f, 12.5f);
+		bodyStep(&wet, &s_world, dt);
+		bodyStep(&dry, &s_world, dt);
+
+		const float wet_vy = wet.vy < 0.0f ? -wet.vy : wet.vy;
+		const float dry_vy = dry.vy < 0.0f ? -dry.vy : dry.vy;
+		CHECK(wet_vy < dry_vy);          // the load-bearing one
+		CHECK(dry.vy < 0.0f);            // control: the dry arm really is falling
+		CHECK(wet.vy < 0.0f);            // and the wet arm sinks, it does not float up
+
+		// The exact numbers, so a change to either constant has to be deliberate.
+		// -28 * 1/60 = -0.4667 ; -8 * 1/60 = -0.1333.
+		CHECK(dry.vy > -0.47f && dry.vy < -0.46f);
+		CHECK(wet.vy > -0.14f && wet.vy < -0.13f);
+	}
+
+	// --- Terminal speed. Sixty ticks of free fall in each medium; the dry arm is heading
+	// for PLAYER_TERMINAL, the wet arm must be pinned at PLAYER_WATER_TERMINAL. Started
+	// high enough in each column that neither reaches the floor inside the run.
+	{
+		Body wet;  bodyInit(&wet, 4.5f, 9.0f, 4.5f);
+		Body dry;  bodyInit(&dry, 12.5f, 40.0f, 12.5f);
+		for (int i = 0; i < 60; i++) {
+			bodyStep(&wet, &s_world, dt);
+			bodyStep(&dry, &s_world, dt);
+		}
+		CHECK(wet.vy == PLAYER_WATER_TERMINAL);
+		CHECK(dry.vy < PLAYER_WATER_TERMINAL * 4.0f);   // control: nothing clamped the dry arm
+		CHECK(wet.y > 4.0f);                            // still in the pool, not resting on the floor
+	}
+
+	// --- Entering water at speed. A body plunging at terminal must be caught on the
+	// first submerged tick, not carry its dry momentum to the bottom. This is the case
+	// that a gravity-only change (no terminal branch) would not catch.
+	{
+		Body b; bodyInit(&b, 4.5f, 9.5f, 4.5f);
+		b.vy = PLAYER_TERMINAL;                 // falling at -60, about to touch the surface
+		CHECK(bodySubmerged(&s_world, &b) == true);
+		bodyStep(&b, &s_world, dt);
+		CHECK(b.vy == PLAYER_WATER_TERMINAL);
+	}
+
+	worldExit(&s_world);
+}
+
+// v1.8.0 task 25 — swimming. bodyJump()'s truth table, then the thing it exists for:
+// rising through water with nothing under the feet.
+static void testSwimming(void)
+{
+	const float dt = 1.0f / 60.0f;
+
+	worldInit(&s_world);
+	for (int x = 0; x < 16; x++)
+		for (int z = 0; z < 16; z++)
+			CHECK(worldSet(&s_world, x, 3, z, BLOCK_STONE));
+	for (int y = 4; y <= 12; y++)
+		for (int x = 0; x < 8; x++)
+			for (int z = 0; z < 16; z++)
+				CHECK_QUIET(worldSet(&s_world, x, y, z, BLOCK_WATER));
+
+	// --- bodyJump's truth table, with no stepping at all, so each row is about the
+	// decision and nothing else.
+	{
+		// Land, grounded, edge press: the ordinary jump, unchanged by this task.
+		Body b; bodyInit(&b, 12.5f, 4.0f, 12.5f);
+		b.on_ground = true;
+		bodyJump(&b, false, true, true);
+		CHECK(b.vy == PLAYER_JUMP_SPEED);
+
+		// Land, grounded, button merely HELD with no fresh press: nothing. This is the
+		// half that stops a held button flying, and it must survive the new branch.
+		bodyInit(&b, 12.5f, 4.0f, 12.5f);
+		b.on_ground = true;
+		bodyJump(&b, false, true, false);
+		CHECK(b.vy == 0.0f);
+
+		// Land, airborne, edge press: nothing. No double jump.
+		bodyInit(&b, 12.5f, 8.0f, 12.5f);
+		b.on_ground = false;
+		bodyJump(&b, false, true, true);
+		CHECK(b.vy == 0.0f);
+
+		// Water, airborne, button held: rises. NOT gated on on_ground — a swimmer has
+		// nothing under it, and a land-jump gate copied onto this branch is the whole
+		// reason the check above and this one are stated separately.
+		bodyInit(&b, 4.5f, 8.0f, 4.5f);
+		b.on_ground = false;
+		bodyJump(&b, true, true, false);
+		CHECK(b.vy == PLAYER_SWIM_UP_SPEED);
+
+		// Water, button released: no rise, and the sink is left alone.
+		bodyInit(&b, 4.5f, 8.0f, 4.5f);
+		b.vy = -1.0f;
+		bodyJump(&b, true, false, false);
+		CHECK(b.vy == -1.0f);
+
+		// Water, already rising faster than the swim speed (kicked off the bottom):
+		// holding the button must not SLOW it down to the cap.
+		bodyInit(&b, 4.5f, 8.0f, 4.5f);
+		b.vy = PLAYER_SWIM_UP_SPEED + 4.0f;
+		bodyJump(&b, true, true, true);
+		CHECK(b.vy == PLAYER_SWIM_UP_SPEED + 4.0f);
+	}
+
+	// --- Swimming up, mid-water, nothing under the feet. Sixty frames of held jump.
+	{
+		Body b; bodyInit(&b, 4.5f, 6.0f, 4.5f);
+		const float y0 = b.y;
+		float prev = b.y;
+		bool  monotonic = true;
+		for (int i = 0; i < 60; i++) {
+			CHECK_QUIET(b.on_ground == false);   // never touched anything to rise off
+			bodyJump(&b, bodySubmerged(&s_world, &b), true, i == 0);
+			bodyStep(&b, &s_world, dt);
+			if (b.y <= prev) monotonic = false;
+			prev = b.y;
+		}
+		CHECK(monotonic);
+		CHECK(b.y > y0 + 2.0f);    // a real rise, not a twitch
+		CHECK(b.y < y0 + 4.0f);    // and bounded — roughly SWIM_UP_SPEED for one second
+	}
+
+	// --- The control arm that proves the rise above is the water branch and not the
+	// input: the identical loop in the dry column, starting mid-air, must FALL.
+	{
+		Body b; bodyInit(&b, 12.5f, 20.0f, 12.5f);
+		const float y0 = b.y;
+		for (int i = 0; i < 60; i++) {
+			bodyJump(&b, bodySubmerged(&s_world, &b), true, i == 0);
+			bodyStep(&b, &s_world, dt);
+		}
+		CHECK(b.y < y0);
+	}
+
+	// --- Sinking. Released button in water: the body drifts down, and slowly. Sixty
+	// frames at PLAYER_WATER_TERMINAL is at most 1.5 blocks, against 60-odd dry.
+	{
+		Body wet; bodyInit(&wet, 4.5f, 11.0f, 4.5f);
+		const float y0 = wet.y;
+		for (int i = 0; i < 60; i++) {
+			bodyJump(&wet, bodySubmerged(&s_world, &wet), false, false);
+			bodyStep(&wet, &s_world, dt);
+		}
+		CHECK(wet.y < y0);                 // it does sink
+		CHECK(wet.y > y0 - 1.6f);          // but no faster than the water terminal allows
+	}
+
+	// --- Horizontal speed. bodyWalkSpeed's own answer, and then the displacement it
+	// actually produces, so an ordering mistake at the call site cannot hide behind a
+	// correct-looking constant.
+	{
+		CHECK(bodyWalkSpeed(false) == PLAYER_WALK_SPEED);
+		CHECK(bodyWalkSpeed(true) < PLAYER_WALK_SPEED);
+		CHECK(bodyWalkSpeed(true) == PLAYER_WALK_SPEED * PLAYER_WATER_SPEED_MUL);
+
+		Body wet;  bodyInit(&wet, 1.5f, 6.0f, 4.5f);
+		Body dry;  bodyInit(&dry, 9.5f, 6.0f, 12.5f);
+		const float wx0 = wet.x, dx0 = dry.x;
+		for (int i = 0; i < 30; i++) {
+			wet.vx = bodyWalkSpeed(bodySubmerged(&s_world, &wet));
+			dry.vx = bodyWalkSpeed(bodySubmerged(&s_world, &dry));
+			bodyStep(&wet, &s_world, dt);
+			bodyStep(&dry, &s_world, dt);
+		}
+		const float wet_dx = wet.x - wx0;
+		const float dry_dx = dry.x - dx0;
+		CHECK(dry_dx > 2.1f);              // control: the dry arm really did walk
+		CHECK(wet_dx > 0.0f);              // control: the wet arm moved at all
+		CHECK(wet_dx < dry_dx * 0.6f);     // and got measurably less far
+	}
+
+	worldExit(&s_world);
+}
+
+#ifndef __3DS__
+// The half of task 25 that lives in source/scene/player.c, which includes <3ds.h> through
+// app/input_map.h and so cannot be linked into this binary at all.
+//
+// This is not belt-and-braces. Every behavioural check above passes against a game in
+// which playerUpdate never asks bodySubmerged() anything — the swimmer would be a body
+// with correct water physics that no button can drive. That is precisely the failure
+// app/session_test.c was written for ("`sessionBegin();` deleted from main.c's lap ->
+// only the two source-text checks go red"), and it uses this same technique on main.c.
+//
+// Run from the project root, which is where the relative path resolves and where
+// tools/run_host_tests.sh puts the working directory.
+static void testPlayerWiresSwimming(void)
+{
+	FILE* f = fopen("source/scene/player.c", "rb");
+	CHECK(f != NULL);
+	if (!f) return;
+
+	static char src[65536];
+	const size_t n = fread(src, 1, sizeof(src) - 1, f);
+	fclose(f);
+	src[n] = '\0';
+	CHECK(n > 0 && n < sizeof(src) - 1);   // read whole, not truncated
+
+	// It must ask the question...
+	const char* ask = strstr(src, "bodySubmerged(");
+	CHECK(ask != NULL);
+
+	// ...and hand the answer to both consumers. A build that computes submersion and
+	// then ignores it is the exact defect this file cannot otherwise see.
+	CHECK(strstr(src, "bodyWalkSpeed(") != NULL);
+	CHECK(strstr(src, "bodyJump(") != NULL);
+
+	// The old inline jump must be GONE, not merely shadowed by a new branch below it:
+	// two writers to vy on the same frame is a race decided by line order.
+	CHECK(strstr(src, "PLAYER_JUMP_SPEED") == NULL);
+
+	// And the speed must be applied through bodyWalkSpeed: the literal PLAYER_WALK_SPEED
+	// that used to scale ix/iz must no longer be there either, or the walk would silently
+	// keep its dry speed while bodyWalkSpeed's answer went unused.
+	CHECK(strstr(src, "PLAYER_WALK_SPEED") == NULL);
+
+	// Ordering: the submersion answer has to exist before the step that consumes it.
+	const char* step = strstr(src, "bodyStep(");
+	CHECK(step != NULL);
+	if (ask && step) CHECK(ask < step);
+}
+#endif
 
 // The invariant scene/chunk_render.c's all-air early-out rests on: a chunk containing no
 // solid block meshes to nothing *no matter what surrounds it*. If that were ever false —
@@ -4985,6 +5423,100 @@ static void testVisConnectivity(void)
 	CHECK(!registryIsDefined(REG_ID_DYN_LO));
 }
 
+// v1.7.1 task 49. visgraph.c stopped rebuilding its 256-entry see-through table on every call
+// and started keeping it, which creates a state the old code could never be in: a live table
+// that was derived from a registry which has since changed. The failure that produces is
+// silent and is the bad direction — a solid block whose cached row still says "see-through"
+// makes the cave cull believe sight passes through a wall, and everything behind it is thrown
+// away while the wall still draws. That is a hole in the world, not a cosmetic wobble.
+//
+// The gap this closes, precisely. testVisConnectivity above already registers dynamic rows
+// half way through and re-asks, so it catches a cache that never rebuilds at all. What it
+// cannot catch is the case where the registry changes without registryCount() changing,
+// because every registration it makes strictly increases the count — a cache keyed on the
+// count alone sails through every check in it. This is that case, and it is not hypothetical:
+// app/session.c calls registryInitCore() when a session is left and net/networld.c applies
+// the next server's DEFS when the next one is joined, both in the same process. Two servers
+// that define the same NUMBER of blocks put a different block on the same id at the same
+// count. Verified red: with visgraph.c's stamp reduced to the count alone, this function is
+// the only thing in the suite that fails.
+static void testVisTableFollowsRegistry(void)
+{
+	Chunk* c = visChunk();
+
+	registryInitCore();
+
+	// Warm the table on the core rows, so what follows is a change *under a live cache*
+	// rather than a first build.
+	chunkClear(c, BLOCK_STONE);
+	CHECK(visChunkConnectivity(c, &s_vis_scratch) == 0);
+
+	BlockDef def;
+	memset(&def, 0, sizeof def);
+	snprintf(def.name, sizeof def.name, "vis_aba_solid");
+	for (int f = 0; f < BLOCK_FACES; f++) def.tex[f] = BTEX_STONE;
+	def.flags = REG_FLAG_SOLID;
+	const BlockId first = registryRegister(&def);
+	CHECK(first == REG_ID_DYN_LO);
+
+	chunkClear(c, first);
+	CHECK(visChunkConnectivity(c, &s_vis_scratch) == 0);
+	const uint8_t count_after_first = registryCount();
+
+	// Leave the session and join another one that defines the same number of blocks. Same
+	// id, same count — a see-through block where an opaque one used to be.
+	registryInitCore();
+	memset(&def, 0, sizeof def);
+	snprintf(def.name, sizeof def.name, "vis_aba_glass");
+	for (int f = 0; f < BLOCK_FACES; f++) def.tex[f] = BTEX_LEAVES;
+	def.flags = REG_FLAG_SOLID | REG_FLAG_TRANSPARENT;
+	const BlockId second = registryRegister(&def);
+	CHECK(second == first);
+	CHECK(registryCount() == count_after_first);
+
+	chunkClear(c, second);
+	CHECK(visChunkConnectivity(c, &s_vis_scratch) == 0x7FFF);
+
+	// And back the other way on the same id and the same count, so this cannot be passed by
+	// a table that has simply decided everything is open.
+	registryInitCore();
+	memset(&def, 0, sizeof def);
+	snprintf(def.name, sizeof def.name, "vis_aba_rock");
+	for (int f = 0; f < BLOCK_FACES; f++) def.tex[f] = BTEX_STONE;
+	def.flags = REG_FLAG_SOLID;
+	const BlockId third = registryRegister(&def);
+	CHECK(third == first);
+	CHECK(registryCount() == count_after_first);
+
+	chunkClear(c, third);
+	CHECK(visChunkConnectivity(c, &s_vis_scratch) == 0);
+
+	// The same question through the flood fill rather than the UNIFORM short-circuit. The
+	// fill indexes the cached table 28,672 times for a chunk this size and would read a
+	// stale row just as happily as the one-line shortcut does.
+	for (int x = 0; x < CHUNK_DIM; x++)
+		chunkSet(c, chunkIndex(x, 8, 8), BLOCK_AIR);
+	CHECK(chunkGetForm(c) != CHUNK_FORM_UNIFORM);
+	const uint16_t ew = (uint16_t)(1u << visPairIndex(FACE_EAST, FACE_WEST));
+	CHECK(visChunkConnectivity(c, &s_vis_scratch) == ew);
+
+	// visgraphInvalidateTables() is the counterpart of mesherInvalidateTables() and is
+	// exported for callers that have just changed the registry. Dropping the table must not
+	// change any answer — a rebuild from the same registry has to produce the same bits.
+	const uint16_t before_drop = visChunkConnectivity(c, &s_vis_scratch);
+	visgraphInvalidateTables();
+	CHECK(visChunkConnectivity(c, &s_vis_scratch) == before_drop);
+
+	registryInitCore();
+	CHECK(!registryIsDefined(REG_ID_DYN_LO));
+
+	// The core rows must still read the way they always did after all of that.
+	chunkClear(c, BLOCK_AIR);
+	CHECK(visChunkConnectivity(c, &s_vis_scratch) == 0x7FFF);
+	chunkClear(c, BLOCK_STONE);
+	CHECK(visChunkConnectivity(c, &s_vis_scratch) == 0);
+}
+
 // Fills a walk box of nx x 1 x 1 chunks, every cell drawable, and returns how many the walk
 // reached. `middle_mask` is the connectivity of the cell between the camera and the far end.
 static int visLineWalk(uint16_t middle_mask, bool set_middle)
@@ -5614,7 +6146,11 @@ static void lightEnginesAgree(int cx, int cz)
 	memcpy(bfs_sky, lightChannelSky(col), LIGHT_COL_BYTES);
 	memcpy(bfs_blk, lightChannelBlock(col), LIGHT_COL_BYTES);
 
-	CHECK(lightRelightColumn(&s_world, cx, cz));
+	// lightRelightColumnSweeps, NOT lightRelightColumn. Since v1.8.0 the latter IS the flood
+	// fill — it was swapped onto it for the 26x — so calling it here would diff the BFS against
+	// itself and pass unconditionally, which is precisely the tautology this helper was already
+	// caught in once (see testLightIncrementalEqualsFull). The sweeps are the second engine.
+	CHECK(lightRelightColumnSweeps(&s_world, cx, cz));
 
 	const int diff = memcmp(bfs_sky, lightChannelSky(col), LIGHT_COL_BYTES) ||
 	                 memcmp(bfs_blk, lightChannelBlock(col), LIGHT_COL_BYTES);
@@ -5887,11 +6423,380 @@ static void testLightIncrementalEqualsFull(void)
 	}
 
 	// The BFS run now must reproduce the edited-and-relit state exactly.
+	//
+	// v1.8.0: this call used to be the bare lightEnginesAgree() below, and it could
+	// not fail. That helper snapshots whatever is in the column, runs the SWEEPS, and
+	// diffs — so it only compares the engines when the state it snapshots came from
+	// the BFS. Here the state came from the last lightRelightColumn of the loop above,
+	// making it sweeps-vs-sweeps: deterministic, memset-first, identical by
+	// construction. The header comment above has claimed "two independent engines have
+	// to agree" since v1.5.0 and this test never once checked it. Running the flood
+	// fill first is what makes the snapshot the BFS's answer.
+	CHECK(lightPropagateColumn(&s_world, 0, 0, q));
 	lightEnginesAgree(0, 0);
 
 	worldExit(&s_world);
 	free(q);
 	lightEngineInit(false);
+}
+
+// v1.8.0: a transparent block on TOP of its strip — leaves, water, tall grass — is the
+// case that split the two engines, and every fixture above misses it because they cap
+// their columns with stone. heightMapFill records the highest NON-AIR cell; opaqueAt is
+// solid && !transparent. So such a block sits AT hm.top (the BFS's sky seeding starts at
+// top+1 and never reaches it) while still passing light (the sweeps read the 15 above it
+// and store 14). Measured before the fix: an 8x8x2 lake read 0 on all 128 of its cells
+// from lightPropagateColumn and 13-14 from lightRelightColumn. A generated lake was black
+// until an edit anywhere in that column relit it and it snapped bright.
+//
+// The fix is one extra seeding condition in lightPropagateColumn: the LOWEST sky cell of a
+// strip is a border seed when the cell beneath it is not opaque. Only the lowest — every
+// cell above it has open sky below and testing those would enqueue the whole sky.
+static void testLightTransparentTopStrip(void)
+{
+	lightEngineInit(true);
+
+	LightQueue* q = (LightQueue*)malloc(sizeof(LightQueue));
+	CHECK(q != NULL);
+	if (!q) return;
+
+	// A lake: a stone bed with two layers of water on it, no relief anywhere, so the
+	// horizontal border tests find nothing and the vertical one is the only seed.
+	worldInit(&s_world);
+	lightFloor(38);
+	for (int z = 4; z <= 11; z++)
+		for (int x = 4; x <= 11; x++) {
+			CHECK_QUIET(worldSet(&s_world, x, 39, z, BLOCK_WATER));
+			CHECK_QUIET(worldSet(&s_world, x, 40, z, BLOCK_WATER));
+		}
+	// The shore has to be as tall as the water or the lake gets a lit edge to spread
+	// from and the vertical seed stops being the thing under test.
+	for (int z = 0; z < CHUNK_DIM; z++)
+		for (int x = 0; x < CHUNK_DIM; x++)
+			if (x < 4 || x > 11 || z < 4 || z > 11) {
+				CHECK_QUIET(worldSet(&s_world, x, 39, z, BLOCK_STONE));
+				CHECK_QUIET(worldSet(&s_world, x, 40, z, BLOCK_STONE));
+			}
+
+	lightQueueInit(q);
+	CHECK(lightPropagateColumn(&s_world, 0, 0, q));
+
+	Column* col = worldColumn(&s_world, 0, 0);
+	CHECK(col != NULL);
+	CHECK(lightGetSky(col, 8, 41, 8) == 15);   // open sky over the middle of the lake
+	CHECK(lightGetSky(col, 8, 40, 8) == 14);   // the surface itself — 0 before the fix
+	CHECK(lightGetSky(col, 8, 39, 8) == 13);   // and one deeper
+	CHECK(lightGetSky(col, 8, 38, 8) == 0);    // the bed is stone: still dark
+
+	lightEnginesAgree(0, 0);
+	worldExit(&s_world);
+
+	// A leaf canopy, where the failure was subtler: the crown's INTERIOR was reachable
+	// sideways from the edge, so it came out one short rather than black.
+	worldInit(&s_world);
+	lightFloor(40);
+	for (int z = 6; z <= 10; z++)
+		for (int x = 6; x <= 10; x++)
+			CHECK_QUIET(worldSet(&s_world, x, 42, z, BLOCK_LEAVES));
+
+	lightQueueInit(q);
+	CHECK(lightPropagateColumn(&s_world, 0, 0, q));
+
+	col = worldColumn(&s_world, 0, 0);
+	CHECK(col != NULL);
+	CHECK(lightGetSky(col, 8, 42, 8) == 14);   // crown centre — 13 before the fix
+	CHECK(lightGetSky(col, 6, 42, 6) == 14);   // and its corner, lit from above alike
+	CHECK(lightGetSky(col, 8, 41, 8) == 13);   // the shade under the crown
+
+	lightEnginesAgree(0, 0);
+	worldExit(&s_world);
+
+	// Tall grass on a flat plain: one cell tall, so it was already reachable sideways
+	// and always agreed. It is here as the control — this case must stay green whether
+	// the vertical seed exists or not, which is what makes the two above mean something.
+	worldInit(&s_world);
+	lightFloor(40);
+	for (int z = 0; z < CHUNK_DIM; z += 3)
+		for (int x = 0; x < CHUNK_DIM; x += 3)
+			CHECK_QUIET(worldSet(&s_world, x, 41, z, BLOCK_TALL_GRASS));
+
+	lightQueueInit(q);
+	CHECK(lightPropagateColumn(&s_world, 0, 0, q));
+	lightEnginesAgree(0, 0);
+	worldExit(&s_world);
+
+	free(q);
+	lightEngineInit(false);
+}
+
+// v1.8.0 world/relightq.h: the coalescing set that stopped main.c's onRemoteEdit paying for
+// one whole-column relight per remote edit. The property that matters is that N edits on one
+// column produce exactly ONE entry — that is the entire reason the file exists.
+static void testRelightQueue(void)
+{
+	RelightQueue q;
+	relightqInit(&q);
+	CHECK(relightqCount(&q) == 0);
+	CHECK(relightqCoalesced(&q) == 0);
+	CHECK(relightqOverflows(&q) == 0);
+
+	// The rejoin shape: a burst of diffs, all on the same column, as
+	// networldOnColumnLoad's drain produces.
+	for (int i = 0; i < 500; i++) CHECK_QUIET(relightqPush(&q, 3, -7));
+	CHECK(relightqCount(&q) == 1);          // 500 edits, one relight
+	CHECK(relightqCoalesced(&q) == 499);
+
+	// Distinct columns each earn their own entry, negatives included — column indices are
+	// signed and int16_t has to carry them intact.
+	CHECK(relightqPush(&q, -7, 3));         // not the same column as (3,-7)
+	CHECK(relightqPush(&q, -300, 20000));
+	CHECK(relightqCount(&q) == 3);
+
+	int cx = 0, cz = 0;
+	bool saw_far = false;
+	int popped = 0;
+	while (relightqPop(&q, &cx, &cz)) {
+		if (cx == -300 && cz == 20000) saw_far = true;
+		popped++;
+	}
+	CHECK(popped == 3);
+	CHECK(saw_far);                          // round-tripped, not truncated
+	CHECK(relightqCount(&q) == 0);
+	CHECK(!relightqPop(&q, &cx, &cz));       // empty pop reports empty
+
+	// Overflow refuses rather than dropping silently: false is the caller's instruction to
+	// relight inline. Only loaded columns are ever pushed and there are at most
+	// RENDER_DIST_MAX_COLUMNS of those, so this cannot happen in the client — it is here
+	// because "cannot happen" is how the dirtyq bug that stopped v1.6.0 booting was argued.
+	relightqInit(&q);
+	for (int i = 0; i < RELIGHTQ_CAP; i++) CHECK_QUIET(relightqPush(&q, i, 0));
+	CHECK(relightqCount(&q) == RELIGHTQ_CAP);
+	CHECK(!relightqPush(&q, 9999, 9999));    // full: refused
+	CHECK(relightqOverflows(&q) == 1);
+	CHECK(relightqPush(&q, 0, 0));           // but an already-listed column still succeeds
+	CHECK(relightqCount(&q) == RELIGHTQ_CAP);
+
+	// The set is wide enough for every column the render distance can load, which is the
+	// bound the drain-to-empty in main.c relies on for its frame cost.
+	CHECK(RELIGHTQ_CAP >= RENDER_DIST_MAX_COLUMNS);
+
+	// NULL is safe on every entry point — the hook path can be reached before init.
+	relightqInit(NULL);
+	CHECK(!relightqPush(NULL, 0, 0));
+	CHECK(!relightqPop(NULL, &cx, &cz));
+	CHECK(relightqCount(NULL) == 0);
+	CHECK(relightqCoalesced(NULL) == 0);
+	CHECK(relightqOverflows(NULL) == 0);
+}
+
+// v1.7.1 task 46. Where the player's feet go on entering a world.
+//
+// The shipped bug: spawn y came from worldgenHeight() alone, a pure function of the seed that
+// cannot know what anyone has built. Reload a world with a block laid on the spawn cell and the
+// player was placed inside it, unable to move (the physics resolvers snap back on a blocked
+// move) and seeing back-faces — which reads as "the chunk I'm in didn't load".
+//
+// Every case below is a real thing a player does at spawn, not a synthetic edge. The one that
+// would have caught the bug is the second.
+static void testSpawnStandingY(void)
+{
+	const int X = 8, Z = 8, GROUND = 40;   // GROUND = the generator's answer: first air above dirt
+
+	// 1. Untouched terrain — the overwhelmingly common case, and the one a fix must not move.
+	//    Air all the way up, so the guess is returned unchanged and a fresh world spawns exactly
+	//    where it always did.
+	worldInit(&s_world);
+	CHECK(worldStandingY(&s_world, X, Z, GROUND) == GROUND);
+	worldExit(&s_world);
+
+	// 2. THE BUG. One block laid on the spawn cell — a floor, a path, the corner of a house.
+	//    The generator still says GROUND, and GROUND is now solid.
+	worldInit(&s_world);
+	CHECK(worldSet(&s_world, X, GROUND, Z, BLOCK_STONE));
+	CHECK(worldStandingY(&s_world, X, Z, GROUND) == GROUND + 1);
+	worldExit(&s_world);
+
+	// 3. A tower. Five blocks stacked on the spawn cell puts the player on top of the fifth,
+	//    not part way up it — the loop has to keep stepping, not step once.
+	worldInit(&s_world);
+	for (int i = 0; i < 5; i++)
+		CHECK(worldSet(&s_world, X, GROUND + i, Z, BLOCK_STONE));
+	CHECK(worldStandingY(&s_world, X, Z, GROUND) == GROUND + 5);
+	worldExit(&s_world);
+
+	// 4. Head clearance is really two blocks. A single block at GROUND+1 with air at GROUND
+	//    leaves a 1-block gap the 1.8-tall body does not fit in, so standing at GROUND would
+	//    put the player's head inside it.
+	worldInit(&s_world);
+	CHECK(worldSet(&s_world, X, GROUND + 1, Z, BLOCK_STONE));
+	CHECK(worldStandingY(&s_world, X, Z, GROUND) == GROUND + 2);
+	worldExit(&s_world);
+
+	// 5. A roof with air underneath. The player built a ceiling five blocks up and lived under
+	//    it; they must come back where they were, on the ground, NOT on top of the roof. This is
+	//    the case that rules out "scan down from the sky for the highest surface".
+	worldInit(&s_world);
+	CHECK(worldSet(&s_world, X, GROUND + 5, Z, BLOCK_PLANKS));
+	CHECK(worldStandingY(&s_world, X, Z, GROUND) == GROUND);
+	worldExit(&s_world);
+
+	// 6. Dug down. The cell below the guess is gone, but the guess itself was already air, so
+	//    nothing moves and the player falls the short distance into their own hole — which is
+	//    what happened before this function existed and is correct.
+	worldInit(&s_world);
+	CHECK(worldSet(&s_world, X, GROUND - 1, Z, BLOCK_AIR));
+	CHECK(worldStandingY(&s_world, X, Z, GROUND) == GROUND);
+	worldExit(&s_world);
+
+	// 7. Tall grass is not a floor. A plant is drawn and targetable but not solid, so it must
+	//    not push the spawn up — otherwise every generated meadow would spawn the player one
+	//    block in the air. Shares the predicate with physics, which is why it is one check.
+	worldInit(&s_world);
+	CHECK(worldSet(&s_world, X, GROUND, Z, (BlockId)BLOCK_TALL_GRASS));
+	CHECK(worldStandingY(&s_world, X, Z, GROUND) == GROUND);
+	worldExit(&s_world);
+
+	// 8. Solid to the ceiling. A pillar the player built all the way up must terminate the loop
+	//    at the top of the world instead of walking off it. WORLD_HEIGHT - 2 is the highest y a
+	//    1.8-tall body still fits at.
+	worldInit(&s_world);
+	for (int y = GROUND; y < WORLD_HEIGHT; y++)
+		CHECK(worldSet(&s_world, X, y, Z, BLOCK_STONE));
+	CHECK(worldStandingY(&s_world, X, Z, GROUND) == WORLD_HEIGHT - 2);
+	worldExit(&s_world);
+
+	// 9. A negative or absurd guess is clamped rather than trusted. worldGet answers
+	//    WORLD_FLOOR_BLOCK below y 0, so an unclamped start would loop up through solid rock
+	//    from wherever it began.
+	worldInit(&s_world);
+	CHECK(worldStandingY(&s_world, X, Z, -5) == 0);
+	worldExit(&s_world);
+}
+
+// v1.8.0 task 21. The 20 TPS clock.
+//
+// The claim being tested is a RATE, so most of this feeds the clock a realistic stream of real
+// time and counts what comes out, rather than poking the struct. A clock that returns plausible
+// numbers per call and still drifts is exactly the bug that would ship otherwise, and it is
+// invisible to any single-call assertion.
+static void testTickClock(void)
+{
+	TickClock c;
+	tickClockInit(&c, TICK_MAX_CATCHUP_DEFAULT);
+	CHECK(tickClockCount(&c) == 0);
+	CHECK(tickClockDropped(&c) == 0);
+	CHECK(tickClockUntilNextUs(&c) == TICK_PERIOD_US);
+
+	// Time shorter than a tick banks and produces nothing.
+	CHECK(tickClockAdvance(&c, TICK_PERIOD_US - 1) == 0);
+	CHECK(tickClockCount(&c) == 0);
+	CHECK(tickClockUntilNextUs(&c) == 1);
+
+	// ...and the very next microsecond completes it, which is only true because the remainder
+	// was kept.
+	CHECK(tickClockAdvance(&c, 1) == 1);
+	CHECK(tickClockCount(&c) == 1);
+	CHECK(tickClockUntilNextUs(&c) == TICK_PERIOD_US);
+
+	// THE RATE. 60 frames of 16,667 us is one second of a console holding 60 fps, and one
+	// second must be 20 ticks — not 19, not 21. The frame time deliberately does not divide the
+	// tick period: 50,000 / 16,667 is 2.9999, so a clock that rounded per frame instead of
+	// accumulating would land here.
+	tickClockInit(&c, TICK_MAX_CATCHUP_DEFAULT);
+	for (int f = 0; f < 60; f++) CHECK_QUIET(tickClockAdvance(&c, 16667) >= 0);
+	CHECK(tickClockCount(&c) == 20);
+	CHECK(tickClockDropped(&c) == 0);
+
+	// The real measured console frame time is 59.83 fps = 16,714 us, and ten seconds of it must
+	// still be 200 ticks. This is the drift check: an error of one part in 600 per frame would
+	// be invisible above but shows up as a whole missing tick here.
+	tickClockInit(&c, TICK_MAX_CATCHUP_DEFAULT);
+	for (int f = 0; f < 599; f++) CHECK_QUIET(tickClockAdvance(&c, 16714) >= 0);
+	CHECK(tickClockCount(&c) == 200);
+
+	// The server's shape: sleep exactly as long as the clock says, then bank exactly that. Every
+	// wake must be worth exactly one tick, and a second must be 20 of them.
+	tickClockInit(&c, TICK_MAX_CATCHUP_DEFAULT);
+	int64_t slept_us = 0;
+	for (int i = 0; i < 20; i++) {
+		const int64_t sleep_us = tickClockUntilNextUs(&c);
+		slept_us += sleep_us;
+		CHECK_QUIET(tickClockAdvance(&c, sleep_us) == 1);
+	}
+	CHECK(tickClockCount(&c) == 20);
+	CHECK(slept_us == 1000000);              // exactly one second of sleeping, no more, no less
+
+	// The death-spiral clamp. A one-second stall asks for 20 ticks and gets max_catchup.
+	tickClockInit(&c, TICK_MAX_CATCHUP_DEFAULT);
+	CHECK(tickClockAdvance(&c, 1000000) == TICK_MAX_CATCHUP_DEFAULT);
+	CHECK(tickClockCount(&c) == (uint64_t)TICK_MAX_CATCHUP_DEFAULT);
+	CHECK(tickClockDropped(&c) == (uint64_t)(20 - TICK_MAX_CATCHUP_DEFAULT));
+
+	// ...and the very next ordinary advance is ordinary again. If the clamp left the surplus in
+	// the accumulator, this would return max_catchup forever and the game would never recover
+	// from one bad frame — which is the whole failure the clamp exists to prevent.
+	CHECK(tickClockAdvance(&c, TICK_PERIOD_US) == 1);
+	CHECK(tickClockDropped(&c) == (uint64_t)(20 - TICK_MAX_CATCHUP_DEFAULT));   // no new drops
+
+	// A backwards clock rewinds nothing.
+	tickClockInit(&c, TICK_MAX_CATCHUP_DEFAULT);
+	CHECK(tickClockAdvance(&c, 30000) == 0);
+	CHECK(tickClockAdvance(&c, -1000000) == 0);
+	CHECK(tickClockUntilNextUs(&c) == TICK_PERIOD_US - 30000);   // the bank is untouched
+	CHECK(tickClockAdvance(&c, 20000) == 1);                     // and still completes normally
+
+	// max_catchup can never be zero, whatever it is handed.
+	tickClockInit(&c, 0);
+	CHECK(tickClockAdvance(&c, 1000000) == 1);
+	tickClockInit(&c, -5);
+	CHECK(tickClockAdvance(&c, 1000000) == 1);
+
+	// NULL is safe everywhere.
+	tickClockInit(NULL, 4);
+	CHECK(tickClockAdvance(NULL, 50000) == 0);
+	CHECK(tickClockUntilNextUs(NULL) == TICK_PERIOD_US);
+	CHECK(tickClockCount(NULL) == 0);
+	CHECK(tickClockDropped(NULL) == 0);
+
+	// ---- the spec's distance decimation ----
+
+	CHECK(TICK_NEAR_DIST_SQ == 576);                     // 24 blocks, squared
+	CHECK(tickPeriodForDistSq(0) == 1);
+	CHECK(tickPeriodForDistSq(575) == 1);
+	CHECK(tickPeriodForDistSq(576) == 1);                // exactly 24 blocks is still "within"
+	CHECK(tickPeriodForDistSq(577) == TICK_FAR_PERIOD);  // one block-unit further is not
+	CHECK(tickPeriodForDistSq(1 << 20) == TICK_FAR_PERIOD);
+	CHECK(TICK_HZ / TICK_FAR_PERIOD == 2);               // the far rate really is 2 Hz
+
+	// Period 1 is always due; that is the near case and it must cost nothing.
+	for (uint64_t t = 0; t < 40; t++) CHECK_QUIET(tickDue(t, 1, 12345));
+	for (uint64_t t = 0; t < 40; t++) CHECK_QUIET(tickDue(t, 0, 12345));
+
+	// A decimated thing fires exactly twice a second and no more: 200 ticks is ten seconds, so
+	// 20 firings.
+	int fired = 0;
+	for (uint64_t t = 0; t < 200; t++)
+		if (tickDue(t, TICK_FAR_PERIOD, 7)) fired++;
+	CHECK(fired == 20);
+
+	// The stagger, which is the reason `id` is in the signature at all. Ten entities with ten
+	// consecutive ids must land on ten DIFFERENT ticks — one apiece per period, never all ten
+	// on the same tick. Without this the 2 Hz saving is a 2 Hz spike.
+	for (uint64_t t = 0; t < TICK_FAR_PERIOD; t++) {
+		int due_here = 0;
+		for (uint32_t id = 0; id < (uint32_t)TICK_FAR_PERIOD; id++)
+			if (tickDue(t, TICK_FAR_PERIOD, id)) due_here++;
+		CHECK_QUIET(due_here == 1);
+	}
+
+	// And every one of those ten is due exactly once across the period — the stagger spreads the
+	// work, it does not drop any of it.
+	for (uint32_t id = 0; id < (uint32_t)TICK_FAR_PERIOD; id++) {
+		int due_across = 0;
+		for (uint64_t t = 0; t < TICK_FAR_PERIOD; t++)
+			if (tickDue(t, TICK_FAR_PERIOD, id)) due_across++;
+		CHECK_QUIET(due_across == 1);
+	}
 }
 
 // Constraint 1 made executable: with the engine off, meshChunk's vertex bytes are
@@ -7033,6 +7938,601 @@ static void testRegionTornDirectory(void)
 	regionTestClean(0, 0);
 }
 
+// v1.7.1 task 48. The load-side region cache (regionReadColumnCached), and specifically the
+// one way it can be wrong.
+//
+// The cache keeps a region file open and its parsed directory in memory between calls, which
+// is what stops an 81-column genRequestArea paying 81 opens and 162 directory reads for one
+// region's worth of answers. The whole risk in that is staleness: a directory parsed BEFORE a
+// column was saved reports that column as never saved, regionReadColumnCached returns 0, and
+// app/worker.c's JOB_GENERATE falls through to worldgenColumn and rebuilds it from the seed.
+// The player's build is not corrupted, it is deleted — silently, with no error anywhere — and
+// that is a far worse outcome than the load time this cache exists to shorten. So every check
+// below marked "stale" is written to go red the moment the invalidation in region.c's
+// openRegion is weakened.
+//
+// The crash tests above deliberately do NOT go through this path: they rewrite the region file
+// behind region.c's back, truncating it and scribbling sectors into it, and a cache is by
+// definition wrong about a file that changed without it being told. regionReadColumn is
+// unchanged and still theirs.
+static void testRegionCache(void)
+{
+	static uint8_t a_bytes[REGION_COL_MAX];
+	static uint8_t b_bytes[REGION_COL_MAX];
+	static uint8_t got[REGION_COL_MAX];
+	static uint8_t plain[REGION_COL_MAX];
+
+	regionTestDir();
+	regionCacheClose();
+	regionTestClean(0, 0);
+	regionTestClean(1, 0);
+	regionTestClean(2, 0);
+
+	// Two states of one column, differing by a single block, so the two encodings are the
+	// same length and only their contents tell them apart — the same trick testRegionPowerCut
+	// uses, and for the same reason: a length comparison alone could not see a stale read.
+	worldInit(&s_world);
+	regionTestBuild(&s_world, 2, 3, BLOCK_WOOD);
+	const uint32_t a_n = regionEncodeColumn(worldColumn(&s_world, 2, 3), a_bytes, sizeof(a_bytes));
+	worldExit(&s_world);
+
+	worldInit(&s_world);
+	regionTestBuild(&s_world, 2, 3, BLOCK_SAND);
+	const uint32_t b_n = regionEncodeColumn(worldColumn(&s_world, 2, 3), b_bytes, sizeof(b_bytes));
+	worldExit(&s_world);
+
+	CHECK(a_n > 0);
+	CHECK(b_n == a_n);
+	CHECK(memcmp(a_bytes, b_bytes, a_n) != 0);
+
+	// ── The negative entry ────────────────────────────────────────────────────────────
+	//
+	// A region with no file is cached as "no file", because a fresh world has none and every
+	// column of the first view would otherwise pay two failed opens for nothing. The first
+	// save into that region has to make the answer change on the very next call.
+	CHECK(regionReadColumnCached(testWorldDir(), 2, 3, got, sizeof(got)) == 0);
+	CHECK(regionWriteColumn(testWorldDir(), 2, 3, a_bytes, a_n));
+
+	uint32_t n = regionReadColumnCached(testWorldDir(), 2, 3, got, sizeof(got));
+	CHECK(n == a_n);                                // stale: a kept "no file" answers 0 here
+	CHECK(memcmp(got, a_bytes, a_n) == 0);
+
+	// ── The one that would cost a player their blocks ─────────────────────────────────
+	//
+	// The read above left this region's directory parsed and in memory. Overwrite the column
+	// and read it straight back, which is exactly what the worker does when a player edits a
+	// column, walks far enough away to unload it, and walks back.
+	CHECK(regionWriteColumn(testWorldDir(), 2, 3, b_bytes, b_n));
+
+	n = regionReadColumnCached(testWorldDir(), 2, 3, got, sizeof(got));
+	CHECK(n == b_n);
+	CHECK(memcmp(got, b_bytes, b_n) == 0);          // stale: the old column comes back
+
+	// The repeat read: the cache HIT this whole change exists for, answering a second time
+	// without touching the card.
+	//
+	// This is NOT a control, and it was written as one by mistake — the comment here first
+	// claimed it stayed green while the invalidation was sabotaged, and the arm measured
+	// otherwise (FAIL L8015/L8016 in arm C). Obvious once seen: a stale entry stays stale, so
+	// the second read is stale too. The real controls in this test are the checks that do not
+	// depend on invalidation at all — the never-saved column below, and every read through an
+	// entry filled after the last write — and those stay green in every arm, which is what
+	// says the red above is about staleness and not about the cache simply not working.
+	n = regionReadColumnCached(testWorldDir(), 2, 3, got, sizeof(got));
+	CHECK(n == b_n);
+	CHECK(memcmp(got, b_bytes, b_n) == 0);
+
+	// And it answers identically to the uncached function it stands in for. Nothing else in
+	// this file compares the two directly, and "faster" is only worth something if it is also
+	// "the same".
+	const uint32_t pn = regionReadColumn(testWorldDir(), 2, 3, plain, sizeof(plain));
+	CHECK(pn == n);
+	CHECK(memcmp(plain, got, pn) == 0);
+
+	// A column that shares the cached directory but was never saved still reads as 0. Slot
+	// arithmetic done against a cached directory rather than a fresh parse would show here.
+	CHECK(regionReadColumnCached(testWorldDir(), 5, 7, got, sizeof(got)) == 0);
+
+	// ── Keyed by region, and by world ─────────────────────────────────────────────────
+	//
+	// cx 17 is region 1, so this is a different file with a different directory. Serving it
+	// from region 0's cached directory would read slot 1 of the wrong file.
+	CHECK(regionWriteColumn(testWorldDir(), 17, 3, a_bytes, a_n));
+	n = regionReadColumnCached(testWorldDir(), 17, 3, got, sizeof(got));
+	CHECK(n == a_n);
+	CHECK(memcmp(got, a_bytes, a_n) == 0);
+
+	n = regionReadColumnCached(testWorldDir(), 2, 3, got, sizeof(got));
+	CHECK(n == b_n);
+	CHECK(memcmp(got, b_bytes, b_n) == 0);
+
+	// Three regions through a two-entry cache, so the least recently used one is evicted and
+	// then has to come back from disk *correctly*, not merely come back.
+	CHECK(regionWriteColumn(testWorldDir(), 33, 3, b_bytes, b_n));
+	n = regionReadColumnCached(testWorldDir(), 33, 3, got, sizeof(got));
+	CHECK(n == b_n);
+	CHECK(memcmp(got, b_bytes, b_n) == 0);
+
+	n = regionReadColumnCached(testWorldDir(), 2, 3, got, sizeof(got));
+	CHECK(n == b_n);
+	CHECK(memcmp(got, b_bytes, b_n) == 0);
+
+	n = regionReadColumnCached(testWorldDir(), 17, 3, got, sizeof(got));
+	CHECK(n == a_n);
+	CHECK(memcmp(got, a_bytes, a_n) == 0);
+
+	// Same region coordinates, different world directory. Every world has an r.0.0.bsr, so
+	// the directory path is part of the key or one world serves another world's blocks.
+	char other[256];
+	snprintf(other, sizeof(other), "%s/cacheworld2", testWorldDir());
+	testMkdir(other);
+
+	CHECK(regionWriteColumn(other, 2, 3, a_bytes, a_n));
+	n = regionReadColumnCached(other, 2, 3, got, sizeof(got));
+	CHECK(n == a_n);
+	CHECK(memcmp(got, a_bytes, a_n) == 0);
+
+	n = regionReadColumnCached(testWorldDir(), 2, 3, got, sizeof(got));
+	CHECK(n == b_n);
+	CHECK(memcmp(got, b_bytes, b_n) == 0);
+
+	// Closing has to leave the next read working, and has to be safe when there is nothing to
+	// close — workerStop and workerSetWorldDir can both run against an empty cache.
+	regionCacheClose();
+	regionCacheClose();
+	n = regionReadColumnCached(testWorldDir(), 2, 3, got, sizeof(got));
+	CHECK(n == b_n);
+	CHECK(memcmp(got, b_bytes, b_n) == 0);
+
+	// The handles have to be gone before the files are: on Windows an open FILE* makes a file
+	// undeletable, and this remove() failing is the visible form of a leaked handle. That is
+	// the concrete reason workerSetWorldDir drops the cache instead of leaving entries to be
+	// evicted on their own.
+	regionCacheClose();
+
+	char p[320];
+	snprintf(p, sizeof(p), "%s/r.0.0.bsr", other);
+	CHECK(remove(p) == 0);
+	testRmdir(other);
+
+	regionTestClean(0, 0);
+	regionTestClean(1, 0);
+	regionTestClean(2, 0);
+}
+
+// ── v1.7.1 task 48c: regionCompact ────────────────────────────────────────────────────
+//
+// regionCompact() had no caller and no test. region.h's header comment said it "reclaims the
+// waste when a world is closed", which was not true of any build — the arena is append-only
+// and nothing ever reclaimed it. Before anything could be decided about wiring it up, the
+// function had to be proved, and it touches the only bytes on the card the player cannot
+// regenerate. Three things are proved here and one defect was found by proving them.
+//
+// The fixture below is shared by all four tests: eight columns in region (0,0), six of them
+// rewritten three more times, so 26 payloads sit in the arena and only 8 are live. That is
+// ~69 % dead, comfortably past regionCompact's own "half wasted" gate — a fixture that did
+// not clear that gate would make every test below vacuous, because regionCompact declines and
+// returns false when there is nothing worth reclaiming.
+
+#define CC_COLS 8
+
+static uint8_t  s_cc_bytes[CC_COLS][REGION_COL_MAX];
+static uint32_t s_cc_len[CC_COLS];
+
+// All inside region (0,0) and all in distinct directory slots — 0, 81, 178, 243, 40, 121,
+// 158, 223 — so no column can be masked by another and a slot-arithmetic error cannot hide.
+static const int32_t s_cc_cx[CC_COLS] = { 0, 1,  2,  3, 8, 9, 14, 15 };
+static const int32_t s_cc_cz[CC_COLS] = { 0, 5, 11, 15, 2, 7,  9, 13 };
+
+// Builds that fixture and leaves the LAST written encoding of every column in s_cc_bytes.
+static void compactFixture(void)
+{
+	static const BlockId tags[4] = { BLOCK_WOOD, BLOCK_SAND, BLOCK_DIRT, BLOCK_STONE };
+
+	regionCacheClose();
+	regionTestClean(0, 0);
+
+	for (int round = 0; round < 4; round++) {
+		// Round 0 saves all eight; later rounds rewrite only the first six, so the arena
+		// fills with superseded copies while the live set stays the same size.
+		const int n = (round == 0) ? CC_COLS : 6;
+
+		worldInit(&s_world);
+		for (int i = 0; i < n; i++)
+			regionTestBuild(&s_world, s_cc_cx[i], s_cc_cz[i], tags[(round + i) & 3]);
+
+		for (int i = 0; i < n; i++) {
+			const uint32_t len = regionEncodeColumn(worldColumn(&s_world, s_cc_cx[i], s_cc_cz[i]),
+			                                        s_cc_bytes[i], sizeof(s_cc_bytes[i]));
+			CHECK(len > 0);
+			s_cc_len[i] = len;
+			CHECK(regionWriteColumn(testWorldDir(), s_cc_cx[i], s_cc_cz[i],
+			                        s_cc_bytes[i], len));
+		}
+		worldExit(&s_world);
+	}
+}
+
+// Every fixture column read back from `dir`, byte for byte against what was written. Returns
+// how many did not match, so a sweep can count instead of asserting thousands of times.
+static int compactReadAll(const char* dir)
+{
+	static uint8_t got[REGION_COL_MAX];
+	int bad = 0;
+
+	for (int i = 0; i < CC_COLS; i++) {
+		const uint32_t n = regionReadColumn(dir, s_cc_cx[i], s_cc_cz[i], got, sizeof(got));
+		if (n != s_cc_len[i] || memcmp(got, s_cc_bytes[i], n) != 0) bad++;
+	}
+	return bad;
+}
+
+// Cut offsets for the sweeps below. Dense over both directory copies and the first bytes of
+// the arena, which is where every structural boundary in the format is, and coarse over the
+// payload tail, which is thousands of interchangeable bytes — sweeping that at one-byte steps
+// costs minutes and finds the same three answers.
+static long compactCutStep(long keep, long total)
+{
+	const bool dense = keep < 64
+	                || (keep > (long)REGION_DIR_BYTES - 64 && keep < (long)REGION_DIR_BYTES + 64)
+	                || (keep > (long)REGION_ARENA_OFF - 64 && keep < (long)REGION_ARENA_OFF + 64)
+	                || keep > total - 64;
+	return dense ? 1 : 64;
+}
+
+// **The first criterion.** Compacting must reclaim real bytes and lose nothing.
+static void testRegionCompactPreservesColumns(void)
+{
+	static uint8_t got[REGION_COL_MAX];
+	static uint8_t post[REGION_COL_MAX];
+
+	regionTestDir();
+	compactFixture();
+
+	char path[256];
+	snprintf(path, sizeof(path), "%s/r.0.0.bsr", testWorldDir());
+
+	const long before = fileBytes(path);
+	CHECK(before > (long)REGION_ARENA_OFF);
+
+	// Readable BEFORE the rewrite, or "still readable after" says nothing about the rewrite.
+	CHECK(compactReadAll(testWorldDir()) == 0);
+
+	CHECK(regionCompact(testWorldDir(), 0, 0));
+
+	const long after = fileBytes(path);
+
+	// Without this the whole test would pass for a regionCompact that copied the file
+	// unchanged, which is the one implementation that cannot possibly lose a column.
+	CHECK(after < before);
+	CHECK(after >= (long)REGION_ARENA_OFF);
+
+	// ...and every column survived it byte for byte.
+	CHECK(compactReadAll(testWorldDir()) == 0);
+
+	// Same bytes is also the same world: each one still decodes into chunks.
+	for (int i = 0; i < CC_COLS; i++) {
+		const uint32_t n = regionReadColumn(testWorldDir(), s_cc_cx[i], s_cc_cz[i],
+		                                    got, sizeof(got));
+		worldInit(&s_world);
+		CHECK(regionDecodeColumn(&s_world, s_cc_cx[i], s_cc_cz[i], got, n));
+		worldExit(&s_world);
+	}
+
+	// A slot nothing ever wrote is still empty, rather than pointing into the repacked arena
+	// at whatever now happens to live at its old offset.
+	CHECK(regionReadColumn(testWorldDir(), 6, 6, got, sizeof(got)) == 0);
+
+	// Nothing left to reclaim, so the second call declines instead of rewriting again.
+	CHECK(!regionCompact(testWorldDir(), 0, 0));
+
+	// And it is still a live region file afterwards: a save appends past the repacked arena,
+	// outranks the seq-1 directory compaction wrote, and reads back — while the columns it
+	// did not touch stay exactly as compaction left them.
+	worldInit(&s_world);
+	regionTestBuild(&s_world, s_cc_cx[0], s_cc_cz[0], BLOCK_WOOD);
+	const uint32_t pn = regionEncodeColumn(worldColumn(&s_world, s_cc_cx[0], s_cc_cz[0]),
+	                                       post, sizeof(post));
+	worldExit(&s_world);
+	CHECK(pn > 0);
+	CHECK(!(pn == s_cc_len[0] && memcmp(post, s_cc_bytes[0], pn) == 0));   // non-vacuity
+	CHECK(regionWriteColumn(testWorldDir(), s_cc_cx[0], s_cc_cz[0], post, pn));
+
+	CHECK(regionReadColumn(testWorldDir(), s_cc_cx[0], s_cc_cz[0], got, sizeof(got)) == pn);
+	CHECK(memcmp(got, post, pn) == 0);
+
+	int others_bad = 0;
+	for (int i = 1; i < CC_COLS; i++) {
+		const uint32_t n = regionReadColumn(testWorldDir(), s_cc_cx[i], s_cc_cz[i],
+		                                    got, sizeof(got));
+		if (n != s_cc_len[i] || memcmp(got, s_cc_bytes[i], n) != 0) others_bad++;
+	}
+	CHECK(others_bad == 0);
+
+	regionTestClean(0, 0);
+}
+
+// **The second criterion.** Interrupting the compaction at each of its stages must leave
+// either the complete old region or the complete new one, never a half-written file.
+//
+// regionCompact's sequence is: write a whole .tmp and close it, remove the .bsr, rename the
+// .tmp onto it. regionRecover() runs before every open and resolves what it finds — a .tmp
+// beside a .bsr is a compaction that did not finish, so the .tmp is dropped; a .tmp with no
+// .bsr is a compaction that finished all but the rename, so the .tmp is promoted.
+//
+// Compaction preserves every column's bytes, so the old and the new region give the same
+// answers and no content check can tell which one served a read. The stages are therefore
+// separated by what is left on disk afterwards as well as by what was read.
+static void testRegionCompactPowerCut(void)
+{
+	static uint8_t got[REGION_COL_MAX];
+
+	regionTestDir();
+	compactFixture();
+
+	char live[256], pristine[256], repacked[256], tmp[256];
+	snprintf(live,     sizeof(live),     "%s/r.0.0.bsr",  testWorldDir());
+	snprintf(tmp,      sizeof(tmp),      "%s/r.0.0.tmp",  testWorldDir());
+	snprintf(pristine, sizeof(pristine), "%s/pristine.bin", testWorldDir());
+	snprintf(repacked, sizeof(repacked), "%s/repacked.bin", testWorldDir());
+
+	const long pre = fileBytes(live);
+	CHECK(pre > (long)REGION_ARENA_OFF);
+	CHECK(truncCopy(live, pristine, pre));
+
+	CHECK(regionCompact(testWorldDir(), 0, 0));
+
+	const long post = fileBytes(live);
+	CHECK(post < pre);
+	CHECK(post > (long)REGION_ARENA_OFF);
+	CHECK(truncCopy(live, repacked, post));
+
+	// A completed compaction leaves nothing behind for regionRecover to resolve.
+	CHECK(fileBytes(tmp) < 0);
+
+	// The two files above are byte-exact copies of what a power cut would find on the card:
+	// pristine.bin is the .bsr before the rewrite, repacked.bin is the .tmp the rewrite
+	// produces (the rename does not change a byte of it).
+	// Wider than cutdir by more than the file names, or -Wformat-truncation refuses the build.
+	char cutdir[256], cutbsr[320], cuttmp[320];
+	snprintf(cutdir, sizeof(cutdir), "%s/cutcompact", testWorldDir());
+	testMkdir(cutdir);
+	snprintf(cutbsr, sizeof(cutbsr), "%s/r.0.0.bsr", cutdir);
+	snprintf(cuttmp, sizeof(cuttmp), "%s/r.0.0.tmp", cutdir);
+
+	// ── Stage 1: cut while the .tmp is being written. The .bsr is still there ──────────
+	//
+	// Every cut, including the one where the .tmp is complete, must serve the OLD region in
+	// full and must drop the .tmp. This is the stage that goes red if the loader ever
+	// prefers a .tmp it cannot know is finished.
+	int s1_bad = 0, s1_dropped = 0, s1_cuts = 0;
+
+	for (long keep = 0; keep <= post; keep += compactCutStep(keep, post)) {
+		remove(cutbsr);
+		remove(cuttmp);
+		if (!truncCopy(pristine, cutbsr, pre))    { s1_bad++; break; }
+		if (!truncCopy(repacked, cuttmp, keep))   { s1_bad++; break; }
+
+		s1_cuts++;
+		if (compactReadAll(cutdir) != 0) s1_bad++;
+		if (fileBytes(cuttmp) < 0)       s1_dropped++;
+		if (fileBytes(cutbsr) != pre)    s1_bad++;      // the good file was not touched
+	}
+
+	CHECK(s1_bad == 0);
+	CHECK(s1_cuts > 64);                 // the sweep actually ran
+	CHECK(s1_dropped == s1_cuts);        // and every one of them dropped the .tmp
+
+	// ── Stage 2: cut between the remove and the rename. No .bsr, complete .tmp ────────
+	//
+	// The one window regionCompact leaves open, and the reason regionRecover exists at all.
+	remove(cutbsr);
+	remove(cuttmp);
+	CHECK(truncCopy(repacked, cuttmp, post));
+	CHECK(fileBytes(cutbsr) < 0);                       // there really is no .bsr going in
+	CHECK(compactReadAll(cutdir) == 0);
+	CHECK(fileBytes(cutbsr) == post);                   // promoted
+	CHECK(fileBytes(cuttmp) < 0);
+
+	// ── Stage 3: no .bsr and a SHORT .tmp ─────────────────────────────────────────────
+	//
+	// regionCompact's own sequence cannot reach this on a filesystem that honours the close
+	// before the remove, but a card that has not flushed the .tmp's sectors when the power
+	// goes can, and that is the state regionRecover promotes blind. Swept anyway: every
+	// column must read as itself or as nothing. "Decodes but is a different column" is the
+	// outcome the whole format exists to prevent, and it is the one that would silently
+	// rearrange a player's world.
+	int s3_bad = 0, s3_full = 0, s3_none = 0;
+
+	for (long keep = 0; keep < post; keep += compactCutStep(keep, post)) {
+		remove(cutbsr);
+		remove(cuttmp);
+		if (!truncCopy(repacked, cuttmp, keep)) { s3_bad++; break; }
+
+		for (int i = 0; i < CC_COLS; i++) {
+			const uint32_t n = regionReadColumn(cutdir, s_cc_cx[i], s_cc_cz[i],
+			                                    got, sizeof(got));
+			if (n == 0)                                                      s3_none++;
+			else if (n == s_cc_len[i] && memcmp(got, s_cc_bytes[i], n) == 0) s3_full++;
+			else                                                             s3_bad++;
+		}
+	}
+
+	CHECK(s3_bad == 0);
+	CHECK(s3_full > 0);      // a nearly-complete .tmp still serves its columns
+	CHECK(s3_none > 0);      // and a badly cut one serves nothing rather than guessing
+
+	testRmTree(cutdir);
+	remove(pristine);
+	remove(repacked);
+	regionTestClean(0, 0);
+}
+
+// **The third criterion.** regionCompact against the load-side region cache.
+//
+// regionCompact is the one writer that does not go through openRegion(create=true), so it
+// carries its own regionCacheClose() calls — one at the top and one before the remove/rename.
+//
+// The hard part of testing that is that compaction preserves every column's bytes, so a cache
+// entry left pointing at the pre-compaction file returns exactly the right answer and hides
+// itself completely. The check that discriminates is at the bottom: the compacted file's
+// directory is destroyed behind region.c's back, so a cache that was dropped has to re-read
+// the file and finds nothing, while a stale entry answers from the handle it still holds on
+// the file compaction replaced.
+static void testRegionCompactCache(void)
+{
+	static uint8_t got[REGION_COL_MAX];
+	static uint8_t plain[REGION_COL_MAX];
+
+	regionTestDir();
+	compactFixture();
+
+	char path[256];
+	snprintf(path, sizeof(path), "%s/r.0.0.bsr", testWorldDir());
+
+	// Warm the cache, so an entry holding this region's pre-compaction directory AND an open
+	// handle on the pre-compaction file exists when regionCompact runs.
+	regionCacheClose();
+	uint32_t n = regionReadColumnCached(testWorldDir(), s_cc_cx[0], s_cc_cz[0],
+	                                    got, sizeof(got));
+	CHECK(n == s_cc_len[0]);
+	CHECK(memcmp(got, s_cc_bytes[0], n) == 0);
+
+	// remove(src) is inside regionCompact. An entry still holding the file open makes that
+	// remove fail on Windows and on the console's FAT card, so the return value is itself a
+	// check on the invalidation — on POSIX it is not, and this line is green either way there.
+	CHECK(regionCompact(testWorldDir(), 0, 0));
+
+	// The cached answer after the rewrite is the uncached answer.
+	n = regionReadColumnCached(testWorldDir(), s_cc_cx[1], s_cc_cz[1], got, sizeof(got));
+	const uint32_t pn = regionReadColumn(testWorldDir(), s_cc_cx[1], s_cc_cz[1],
+	                                     plain, sizeof(plain));
+	CHECK(n == s_cc_len[1]);
+	CHECK(pn == n);
+	CHECK(memcmp(got, plain, n) == 0);
+
+	// The discriminating check. Warm the cache again, compact again, then destroy the file
+	// compaction produced. A dropped cache re-reads it and finds nothing; a stale one still
+	// answers from the file that was replaced.
+	compactFixture();
+	regionCacheClose();
+	n = regionReadColumnCached(testWorldDir(), s_cc_cx[2], s_cc_cz[2], got, sizeof(got));
+	CHECK(n == s_cc_len[2]);
+	CHECK(regionCompact(testWorldDir(), 0, 0));
+
+	FILE* f = fopen(path, "r+b");
+	CHECK(f != NULL);
+	if (f) {
+		uint8_t junk[64];
+		memset(junk, 0xA5, sizeof(junk));
+		fseek(f, 0, SEEK_SET);                    // directory copy A, the only live one
+		fwrite(junk, 1, sizeof(junk), f);
+		fclose(f);
+	}
+
+	// Copy B of a compacted file has never been written, so with A destroyed there is no
+	// readable directory left and the honest answer is nothing at all.
+	CHECK(regionReadColumn(testWorldDir(), s_cc_cx[2], s_cc_cz[2], plain, sizeof(plain)) == 0);
+	CHECK(regionReadColumnCached(testWorldDir(), s_cc_cx[2], s_cc_cz[2], got, sizeof(got)) == 0);
+
+	regionCacheClose();
+	regionTestClean(0, 0);
+}
+
+// **The defect this exercise found.** regionCompact against a region file that has already
+// survived a power cut.
+//
+// region.c's dirLoadPair makes an explicit promise about that state: a card can flush the
+// directory sectors before the payload sectors, so "the newest directory points at a payload
+// that is not all there" is reachable, the previous directory still describes a complete
+// older world, and regionReadColumn falls back to it — "the difference between a power cut
+// costing the last save and a power cut costing the whole column".
+//
+// regionCompact rewrites the file wholesale, and it read only the newer directory. A column
+// in that state was dropped from the repack: unreadable in the newer copy, and the older copy
+// that could still have served it thrown away with the old file. Before the fix this test's
+// last two checks failed — the column that read correctly one line earlier read as nothing.
+// It would have happened at world close, unprompted, on a save the player could still have
+// had. The fix gives regionCompact the same two-entry fallback regionReadColumn already has.
+static void testRegionCompactKeepsPowerCutFallback(void)
+{
+	static uint8_t a_bytes[REGION_COL_MAX];
+	static uint8_t b_bytes[REGION_COL_MAX];
+	static uint8_t got[REGION_COL_MAX];
+
+	regionTestDir();
+
+	// The waste is created FIRST. Every save copies the live directory forward into the copy
+	// it writes, so a save after the torn one below would carry the broken entry into both
+	// copies and destroy the fallback before compaction ever got the chance.
+	compactFixture();
+
+	const int32_t cx = 6, cz = 6;          // slot 102, which compactFixture does not use
+
+	worldInit(&s_world);
+	regionTestBuild(&s_world, cx, cz, BLOCK_WOOD);
+	const uint32_t a_n = regionEncodeColumn(worldColumn(&s_world, cx, cz),
+	                                        a_bytes, sizeof(a_bytes));
+	worldExit(&s_world);
+
+	worldInit(&s_world);
+	regionTestBuild(&s_world, cx, cz, BLOCK_SAND);
+	const uint32_t b_n = regionEncodeColumn(worldColumn(&s_world, cx, cz),
+	                                        b_bytes, sizeof(b_bytes));
+	worldExit(&s_world);
+
+	CHECK(a_n > 0);
+	CHECK(b_n > 0);
+
+	char path[256];
+	snprintf(path, sizeof(path), "%s/r.0.0.bsr", testWorldDir());
+
+	// Version A then version B, as the last two writes: the newer directory copy carries B's
+	// entry and the older one still carries A's. Payloads are appended, so each one ends at
+	// the file's new end.
+	CHECK(regionWriteColumn(testWorldDir(), cx, cz, a_bytes, a_n));
+	const long a_at = fileBytes(path) - (long)a_n;
+	CHECK(regionWriteColumn(testWorldDir(), cx, cz, b_bytes, b_n));
+	const long b_at = fileBytes(path) - (long)b_n;
+	CHECK(b_at > a_at);
+
+	// The power cut: the directory that points at B is on the card, B's payload sectors are
+	// stale. Right length, wrong bytes — only the per-payload CRC can see this.
+	FILE* f = fopen(path, "r+b");
+	CHECK(f != NULL);
+	if (f) {
+		uint8_t junk[16];
+		memset(junk, 0x5A, sizeof(junk));
+		fseek(f, b_at, SEEK_SET);
+		fwrite(junk, 1, sizeof(junk), f);
+		fclose(f);
+	}
+	regionCacheClose();
+
+	// The guarantee as it stands before compaction: B is unreadable, so A is served.
+	memset(got, 0, sizeof(got));
+	uint32_t n = regionReadColumn(testWorldDir(), cx, cz, got, sizeof(got));
+	CHECK(n == a_n);
+	CHECK(memcmp(got, a_bytes, a_n) == 0);
+
+	// The same read after compaction. Anything else is a column the player could still have
+	// had, destroyed by the reclaim pass.
+	//
+	// The buffer is cleared first for a reason: without it the read above leaves A's bytes
+	// sitting in `got`, a failing read leaves them there untouched, and the memcmp below
+	// passes on the previous answer instead of this one — a check that could not go red.
+	CHECK(regionCompact(testWorldDir(), 0, 0));
+	memset(got, 0, sizeof(got));
+	n = regionReadColumn(testWorldDir(), cx, cz, got, sizeof(got));
+	CHECK(n == a_n);
+	CHECK(memcmp(got, a_bytes, a_n) == 0);
+
+	// And the rest of the region is untouched by a repack that had to take a fallback.
+	CHECK(compactReadAll(testWorldDir()) == 0);
+
+	regionTestClean(0, 0);
+}
+
 
 // The generator-version sidecar on a real filesystem. Host-only because it makes and deletes
 // directories, exactly like the region tests above, and it reuses their per-process directory
@@ -7228,6 +8728,98 @@ static void testGenVersionSidecar(void)
 
 #endif  // !__3DS__
 
+// v1.7.1 task 49 (install half). chunkPlanAll + chunkLoadPlanned are the one-pass
+// replacement for chunkFormForAll + chunkLoadAll, and world.c's worldSetChunkAll — the
+// function app/worker.c's workerInstall calls once per chunk of every column the generator
+// hands the main thread — now calls the new pair.
+//
+// The old pair walked the 4096-cell buffer three times: once in chunkFormForAll to size the
+// budget claim, once in chunkLoadAll to rebuild the same palette, and once more to pack the
+// nibbles, that third walk searching the palette linearly (up to 16 compares) for every
+// cell. Measured on the host over a real 7x7-column streaming pass, paired and interleaved
+// four rounds each: 4513.7 / 4733.8 / 4121.9 / 4201.0 us per pass before against
+// 1049.6 / 971.1 / 1107.4 / 1061.1 us after — 15.05 -> 3.50 us per chunk, 4.2x.
+//
+// What this test defends is that the speed cost nothing:
+//
+//  * the form chosen is the same one, for 1, 2, 16 and 17 distinct ids;
+//  * every cell reads back the id that was written — the arm that catches the packing loop
+//    getting its nibble parity wrong, which is why every buffer here alternates ids so
+//    adjacent cells DIFFER (a buffer of runs would survive a swapped pair);
+//  * the encoded bytes are identical to chunkLoadAll's, which pins the palette's first-seen
+//    ORDER as well as its contents — a reordered palette decodes to the same blocks and
+//    would otherwise pass every check above it;
+//  * ids at the top of the byte range (0xF0..) work, because slot_of is indexed by BlockId
+//    and must be the full 256 entries wide. Sizing it BLOCK_COUNT is the exact bug
+//    world/visgraph.c's openTable() and world/light.c's anyLuminance() each shipped with.
+static void testChunkPlanAllMatchesLoadAll(void)
+{
+	static BlockId in[CHUNK_BLOCKS];
+	static uint8_t enc_a[CHUNK_BLOCKS * 2 + 64];
+	static uint8_t enc_b[CHUNK_BLOCKS * 2 + 64];
+
+	const int     counts[4] = {1, 2, 16, 17};
+	const BlockId bases[2]  = {1, 0xF0};   // core-range ids, and the top of the byte range
+
+	for (int bi = 0; bi < 2; bi++)
+	for (int ci = 0; ci < 4; ci++) {
+		const int n = counts[ci];
+		// 0xF0..0xFF is exactly 16 ids, so the high-base family skips the 17-id case
+		// rather than aliasing back down onto 0x00 and quietly testing 16 again.
+		if ((int)bases[bi] + n - 1 > 0xFF) continue;
+
+		for (int i = 0; i < CHUNK_BLOCKS; i++)
+			in[i] = (BlockId)(bases[bi] + (i % n));
+
+		ChunkPlan plan;
+		const ChunkForm form = chunkPlanAll(in, &plan);
+		CHECK(form == chunkFormForAll(in));
+		CHECK(plan.count == (n <= 16 ? n : -1));
+
+		Chunk* a = chunkAlloc(BLOCK_AIR);
+		Chunk* b = chunkAlloc(BLOCK_AIR);
+		CHECK(a != NULL);
+		CHECK(b != NULL);
+		if (!a || !b) { chunkFree(a); chunkFree(b); continue; }
+
+		CHECK(chunkLoadPlanned(a, in, &plan));
+		CHECK(chunkLoadAll(b, in));
+		CHECK(chunkGetForm(a) == form);
+		CHECK(chunkGetForm(b) == form);
+		CHECK(chunkGetBytes(a) == chunkGetBytes(b));
+
+		bool cells_a = true, cells_b = true;
+		for (int i = 0; i < CHUNK_BLOCKS; i++) {
+			if (chunkGet(a, i) != in[i]) cells_a = false;
+			if (chunkGet(b, i) != in[i]) cells_b = false;
+		}
+		CHECK(cells_a);
+		CHECK(cells_b);
+
+		const size_t la = chunkEncode(a, enc_a, sizeof enc_a);
+		const size_t lb = chunkEncode(b, enc_b, sizeof enc_b);
+		CHECK(la > 0);
+		CHECK(la == lb);
+		CHECK(la == lb && memcmp(enc_a, enc_b, la) == 0);
+
+		// First-seen palette order, stated directly rather than only through the encode.
+		if (form == CHUNK_FORM_PALETTE4) {
+			BlockId pal[16];
+			uint8_t pal_n = 0;
+			static uint8_t idx[CHUNK_BLOCKS];
+			CHECK(chunkGetPalette4(a, pal, &pal_n, idx));
+			CHECK(pal_n == (uint8_t)n);
+			CHECK(pal[0] == in[0]);
+			CHECK(pal[1] == in[1]);
+			CHECK(idx[0] == 0);
+			CHECK(idx[1] == 1);
+		}
+
+		chunkFree(a);
+		chunkFree(b);
+	}
+}
+
 int worldTestRun(char* summary, size_t cap, int* checks_out)
 {
 	s_checks = 0;
@@ -7263,6 +8855,7 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testMesherCoreWaterAndTallGrass();
 	testMesherGreedyMerge();
 	testMesherCrossNeverMerges();
+	testMesherExposureFilter();
 	testCrossShapeCollisionAndRaycast();
 	testRemeshList();
 	testIncrementalRemesh();
@@ -7296,8 +8889,14 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testCeilingCollision();
 	testPhysics();
 	testStepUpRefusals();
+	testBuoyancy();
+	testSwimming();
+#ifndef __3DS__
+	testPlayerWiresSwimming();
+#endif
 	testVisPairIndex();
 	testVisConnectivity();
+	testVisTableFollowsRegistry();
 	testVisWalk();
 	testVisWalkNeverHidesOpenSky();
 	testRenderDist();
@@ -7307,15 +8906,25 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testLightBlockChannel();
 	testLightBlockChannelFromDynamicId();
 	testLightIncrementalEqualsFull();
+	testLightTransparentTopStrip();
+	testRelightQueue();
+	testTickClock();
+	testSpawnStandingY();
 	testMesherO3DSParity();
 	testChunkCodec();
 	testChunkCodecPaletteUnify();
+	testChunkPlanAllMatchesLoadAll();
 #ifndef __3DS__
 	testRegionRoundTrip();
 	testRegionPowerCut();
 	testRegionTornDirectory();
+	testRegionCache();
+	testRegionCompactPreservesColumns();
+	testRegionCompactPowerCut();
+	testRegionCompactCache();
+	testRegionCompactKeepsPowerCutFallback();
 	testGenVersionSidecar();
-	testRmTree(testWorldDir());   // the per-process directory those three worked in
+	testRmTree(testWorldDir());   // the per-process directory those eight worked in
 #endif
 
 	// Every allocation the world made must have been given back.

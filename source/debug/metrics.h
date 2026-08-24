@@ -76,6 +76,40 @@ void metricsSetSelfTest(const char* summary);
 // that target took (measured across the allocation, see screenRightEyeBytes).
 void metricsSetStereo(bool on, float slider, size_t vram_free, size_t right_eye_bytes);
 
+// v1.7.1 task 49. What the main thread actually did this frame, pushed in by main.c once per
+// frame and written into the same CSV row as that frame's time.
+//
+// steve's report is "whenever I'm walking around in certain spots, my game FPS will just drop
+// randomly". The frame-time column alone cannot answer that: it says a frame was slow, never
+// where the player was or which piece of work made it slow, and a hitch that only happens in
+// "certain spots" is exactly the shape of work that is triggered by *position* — a column
+// boundary crossed, a column saved, a chunk of dense geometry meshed. Each field below is one
+// of those suspects, so one CSV settles it by correlation instead of by argument. This lands
+// BEFORE any fix on purpose: §12's "build the check first", and the project's own habit of
+// plausible fixes that turn out to have addressed the wrong thing.
+//
+// Cost on the main thread is one struct copy per frame. Nothing here allocates, formats, or
+// touches the filesystem — the writer thread does that, exactly as it already did.
+typedef struct {
+	// The streaming ring's centre, from the player's feet. This is the "certain spots" axis:
+	// if the spikes line up with particular columns, or with the frame a column changes, the
+	// answer is in this pair.
+	int32_t player_cx, player_cz;
+
+	float recenter_ms;   // inside genRecenter — nonzero ONLY on a boundary-crossing frame
+	float relight_ms;    // inside the relight drain, which is deliberately unbudgeted
+	float mesh_ms;       // inside both mesh drains, to be read against DRAIN_BUDGET_MS (4.0)
+	float save_ms;       // blocked in workerSubmitSave waiting for one of two save slots
+
+	u16 built;   // chunks meshed this frame, against DRAIN_MAX_CHUNKS (3)
+	u16 meshq;   // chunks still waiting after the drain — stream queue plus edit queue
+} MetricsWork;
+
+// Call once per frame, any time before metricsFrameEnd. metricsFrameBegin clears it, so a
+// frame that never calls this records zeros rather than repeating the previous frame's spike
+// — which would make one recentre look like a permanent regression.
+void metricsSetWork(const MetricsWork* w);
+
 // Most recent per-frame figures, for callers that want to react to them.
 float metricsFrameMs(void);
 

@@ -34,10 +34,51 @@
 // The cost of append-only is a file that grows every time a column is saved. That is a
 // deliberate trade: steve's instruction for this phase was explicitly not to worry about
 // storage, and the alternative — writing a column back over its old bytes — is exactly the
-// thing that makes a torn write unrecoverable. regionCompact() reclaims the waste when a
-// world is closed, and is the only operation in here that is not crash-safe by itself,
-// which is why it writes a new file and only removes the old one once the new one is
-// complete on the card.
+// thing that makes a torn write unrecoverable.
+//
+// ── Nothing reclaims that waste. Read this before wiring regionCompact() up ───────────
+//
+// This paragraph used to say regionCompact() "reclaims the waste when a world is closed".
+// It never did, in any build. The function has no caller and never has had one, so a
+// heavily edited world's region file grows on the card until the player deletes the world.
+// The claim is corrected here rather than made true, and v1.7.1 task 48c is the measurement
+// that decided which of the two to do.
+//
+// What was proved about it (host suite, world_test.c's four testRegionCompact* tests, and
+// tools/run_host_tests.sh carries the sabotage arms for every claim):
+//
+//   * It preserves every column byte for byte and the file really does get smaller. Measured
+//     on the task-48c fixture (eight columns, six of them rewritten three more times, so 26
+//     payloads in the arena and 8 of them live): 9289 bytes down to 7134. The arena itself —
+//     the part compaction can actually touch — goes 3113 down to 958, i.e. 69 % reclaimed;
+//     the whole-file figure is smaller only because the two fixed 3088-byte directory copies
+//     are 6176 bytes that never move, and they dominate a region this lightly filled.
+//   * Interrupted at each of its stages it leaves either the complete old region or the
+//     complete new one. regionRecover() resolves what a cut leaves behind: a .tmp beside a
+//     .bsr is a rewrite that did not finish, so the .tmp is dropped; a .tmp with no .bsr is
+//     a rewrite that finished all but the rename, so the .tmp is promoted.
+//   * Its two regionCacheClose() calls are together sufficient against the load-side cache,
+//     and are deliberately redundant — neither is red on its own.
+//   * It had a real defect, found by writing those tests and fixed in region.c: it read only
+//     the live directory copy, so a column whose newest payload was torn by an earlier power
+//     cut — the exact case dirLoadPair's fallback exists to survive — was dropped from the
+//     repack and its recoverable older copy deleted along with the old file. It now takes the
+//     same two-entry fallback reads take.
+//
+// Why it is still not wired up, which is the part that matters: wiring it into world close
+// creates a window that does not exist today. Between remove(src) and rename(tmp, src) there
+// is no .bsr at all, and everything in this file flushes with fflush() — nothing here fsyncs,
+// and nothing here knows whether libctru's sdmc devoptab has put the .tmp's sectors on the
+// card by then. If it has not, a battery pull in that window costs the whole 256-column
+// region file, not one save. The same window depends on rename() working on that devoptab,
+// which is also unverified. Both are hardware properties; the host suite runs on ext4 through
+// WSL and cannot test either, and every number above is a host number.
+//
+// So the trade as it stands is: leave it unwired and pay SD card space, or wire it up and
+// risk a region file on a power cut at exactly the moment players quit. That is steve's call,
+// not a maintenance decision. What would make it his to take safely: a durability step before
+// the remove that can be checked on hardware, or a sequence that never leaves the path with
+// no file on it.
 #pragma once
 
 #include <stdbool.h>
@@ -95,10 +136,69 @@ bool regionWriteColumn(const char* world_dir, int32_t cx, int32_t cz,
 uint32_t regionReadColumn(const char* world_dir, int32_t cx, int32_t cz,
                           uint8_t* out, uint32_t cap);
 
-// Rewrites a region file with the dead payloads dropped. Safe to interrupt: the original is
-// removed only after the replacement is closed. False if there was nothing to do or the
-// rewrite failed, in which case the original is still there and still correct.
+// Rewrites a region file with the dead payloads dropped, carrying forward exactly what
+// regionReadColumn would have served for every slot — including the older directory copy's
+// version of a column whose newest payload an earlier power cut tore. Safe to interrupt: the
+// original is removed only after the replacement is closed, and regionRecover() resolves
+// whichever pair of files a cut leaves behind. False if there was nothing worth reclaiming
+// (below half the arena wasted) or the rewrite failed, in which case the original is still
+// there and still correct.
+//
+// **Nothing calls this.** It is proved by world_test.c's four testRegionCompact* tests and
+// left unwired on purpose — see the header comment at the top of this file for the measured
+// reasons, which come down to one hardware property the host suite cannot test.
 bool regionCompact(const char* world_dir, int32_t rx, int32_t rz);
+
+// ── v1.7.1 task 48: the load-side region cache ────────────────────────────────────────
+//
+// The same answer as regionReadColumn, but it keeps the region file open and its parsed
+// directory in memory between calls instead of re-deriving both every time. That matters
+// because the cost regionReadColumn pays is per *column* while the thing it pays for is per
+// *region*: filling the view at RENDER_DIST_MAX submits 81 columns, and all 81 land in one
+// or two region files, so 79 of those 81 opens and 158 of those 162 directory reads are the
+// same bytes read again.
+//
+// Measured on the host at -O1 over 16200 column reads (the 81-column area, 200 times), all 81
+// columns saved so both arms do the payload read as well and differ only by the open and the
+// parse: 39.2 / 43.5 / 56.0 us per column uncached across three runs against 3.34 / 3.34 /
+// 3.64 cached, i.e. one 81-column area falling from 3.2-4.5 ms to 0.27-0.29 ms. The counts
+// are not noisy at all and are the honest half of the claim: 32400 fopen and 32400 dirRead
+// uncached, 2 and 2 cached. The host has a page cache and the console has a FAT32 SD card, on
+// which the open is the more expensive half — so this understates the saving rather than
+// overstating it, and none of it is a hardware measurement.
+//
+// This is why loading a world that has been *edited* took roughly twice as long as creating
+// one: a fresh world has no region file at all, so none of this ran.
+//
+// Only the worker's load-before-generate path uses this. regionReadColumn is left exactly as
+// it was and every crash test still goes through it, because those tests rewrite the region
+// file behind region.c's back — truncating it, scribbling sectors into it — and a cache is by
+// definition wrong about a file that changed without it being told.
+//
+// The cache is a file-static inside region.c rather than something the caller owns, so that
+// invalidation cannot be forgotten: every writer in region.c goes through one place that
+// drops it, and there is no way to write a region file from outside that translation unit.
+//
+// Not thread-safe, and it does not need to be: both callers (the load path and the save
+// path) run on the worker thread, and regionCacheClose is called from the main thread only
+// once the worker has been joined.
+uint32_t regionReadColumnCached(const char* world_dir, int32_t cx, int32_t cz,
+                                uint8_t* out, uint32_t cap);
+
+// Drops every cached entry and closes the handles. Call it when the world directory changes
+// or the worker is stopped: an entry left behind holds a FILE* open on a world nobody is
+// playing, which on a FAT card is a handle that can stop the directory being removed. Safe
+// to call when nothing is cached, and safe to call twice.
+void regionCacheClose(void);
+
+#ifdef BS_REGION_PROBE
+// Probe build only (tools/t48_region_probe.c). These count the two operations the cache
+// exists to remove, so "the cache skipped the open and both directory reads" can be measured
+// rather than argued from the diff. Never compiled into the game or the host suite.
+extern unsigned long g_region_fopens;
+extern unsigned long g_region_dirreads;
+extern const unsigned long g_region_cache_bytes;
+#endif
 
 // Region coordinate for a column coordinate. Arithmetic shift, so it floors on the negative
 // side — plain division would fold -1 and 0 into the same region and put two different

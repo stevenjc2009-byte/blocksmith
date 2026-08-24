@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "debug/loadprof.h"
 #include "world/jobq.h"
 #include "world/light.h"
 #include "world/region.h"
@@ -75,6 +76,14 @@ static int      s_save_tail;        // next slot the worker writes
 static int      s_save_count;       // slots full; guarded by s_lock
 static int      s_saved, s_save_failed, s_loaded;
 
+// v1.7.1 task 48b. The save-slot wait, made visible — see workerSubmitSave for why a timing
+// alone could not answer the question. Written only by the main thread inside
+// workerSubmitSave, read by the debug overlay on the same thread, so they need no lock.
+static int      s_save_submits;         // calls that got as far as wanting a slot
+static int      s_save_waits;           // ...of which this many had to sleep at least once
+static u64      s_save_wait_ticks;      // total slept
+static u64      s_save_wait_max_ticks;  // worst single wait
+
 // Empty means "no save file": every column is generated and nothing is written. Sized for a
 // path under REGION_ROOT plus a world name.
 static char s_world_dir[128];
@@ -118,14 +127,33 @@ static bool workerLightQueue(void)
 // before the generator is allowed to run over the top of it. Skipping that would blend a
 // corrupt saved column into freshly generated terrain, which is exactly the "neither state"
 // outcome the save format is built to make impossible.
+//
+// v1.7.1 task 48. regionReadColumnCached rather than regionReadColumn, because this is the
+// one place in the game that reads a column and it is called once per JOB_GENERATE — 81 of
+// them for a single genRequestArea at RENDER_DIST_MAX. Uncached, each one re-opened the
+// region file and re-parsed both 3088-byte directory copies to answer a question about one
+// 12-byte slot, which is the whole reason a world with a region file took roughly twice as
+// long to load as a fresh one. Correctness is unchanged: the cache is dropped by every writer
+// in region.c, including workerWriteSave's regionWriteColumn below, so a column saved a
+// moment ago is never answered from a directory that predates it.
 static bool workerLoadColumn(int32_t cx, int32_t cz)
 {
 	if (!s_world_dir[0]) return false;
 
-	const uint32_t n = regionReadColumn(s_world_dir, cx, cz, s_load_buf, sizeof(s_load_buf));
+	// v1.7.1 task 48b. The two halves of a load are timed apart because they answer different
+	// questions: region_io is the card (an open, a directory parse, a payload read) and decode
+	// is the codec (eight chunks unpacked into the staging world). A world with a region file
+	// pays region_io for EVERY column of the ring and decode only for the ones that were
+	// actually saved, so the pair is what tells "the card is slow" from "there is a lot saved".
+	const uint64_t t_io = loadprofMark();
+	const uint32_t n = regionReadColumnCached(s_world_dir, cx, cz, s_load_buf, sizeof(s_load_buf));
+	loadprofSince(LOAD_STAGE_REGION_IO, t_io);
 	if (n == 0) return false;
 
-	if (!regionDecodeColumn(&s_staging, cx, cz, s_load_buf, n)) {
+	const uint64_t t_dec = loadprofMark();
+	const bool decoded = regionDecodeColumn(&s_staging, cx, cz, s_load_buf, n);
+	loadprofSince(LOAD_STAGE_DECODE, t_dec);
+	if (!decoded) {
 		worldColumnRemove(&s_staging, cx, cz);
 		return false;
 	}
@@ -206,7 +234,14 @@ static void workerMain(void* arg)
 			// the fallback for everything the card does not have, which on a fresh world is
 			// every column.
 			ok = workerLoadColumn(job.cx, job.cz);
-			if (!ok) ok = worldgenColumn(s_gen, &s_staging, job.cx, job.cz);
+			if (!ok) {
+				// v1.7.1 task 48b. Timed only when it actually runs, so `generate`'s call
+				// count IS the number of columns the card did not have — the other half of
+				// the fresh-versus-reloaded question region_io/decode opens above.
+				const uint64_t t_gen = loadprofMark();
+				ok = worldgenColumn(s_gen, &s_staging, job.cx, job.cz);
+				loadprofSince(LOAD_STAGE_GENERATE, t_gen);
+			}
 
 			// v1.5.0 adaptive lighting: light the staged column while it is here, before
 			// install can queue it ready — the jobq ordering is what guarantees light
@@ -216,8 +251,10 @@ static void workerMain(void* arg)
 			// from the BFS falls back to the sweep engine so a dropped entry can never
 			// ship half-lit terrain.
 			if (ok && lightEnabled() && workerLightQueue()) {
+				const uint64_t t_light = loadprofMark();
 				if (!lightPropagateColumn(&s_staging, job.cx, job.cz, s_lightq))
 					lightRelightColumn(&s_staging, job.cx, job.cz);
+				loadprofSince(LOAD_STAGE_LIGHT, t_light);
 			}
 			break;
 		// JOB_MESH is the main thread's — it writes GPU-visible memory, which belongs to
@@ -248,6 +285,14 @@ static void workerMain(void* arg)
 
 void workerSetWorldDir(const char* dir)
 {
+	// v1.7.1 task 48. The region cache keys on the world directory, so a stale entry could
+	// never be *served* to a different world — but it would still hold a FILE* open on the
+	// world being left, and an open handle on a FAT card is what stops that world's directory
+	// being removed later. Dropped here rather than relying on eviction. Safe at this point
+	// for the same reason workerStop's call is: main.c only changes the world directory
+	// between sessions, with no worker running.
+	regionCacheClose();
+
 	if (!dir || !dir[0]) { s_world_dir[0] = '\0'; return; }
 
 	// Truncated rather than refused, and then checked: a path that does not fit is a
@@ -268,6 +313,12 @@ bool workerStart(const WorldGen* g)
 	s_busy_ticks = s_install_ticks = 0;
 	s_save_head = s_save_tail = s_save_count = 0;
 	s_saved = s_save_failed = s_loaded = 0;
+
+	// Cleared with the rest, so the counters describe THIS world rather than every world
+	// entered since the app launched. Without this a second world would inherit the first
+	// one's waits and the capture would be unattributable.
+	s_save_submits = s_save_waits = 0;
+	s_save_wait_ticks = s_save_wait_max_ticks = 0;
 
 	LightLock_Init(&s_lock);
 	// Sticky rather than one-shot: the worker clears it itself before each check, so a
@@ -325,6 +376,13 @@ void workerStop(void)
 	s_thread = NULL;
 	s_started = false;
 
+	// v1.7.1 task 48. After the join, never before it: the region cache is worker-thread
+	// state and closing its handles while that thread could still be reading through them is
+	// a use-after-free of a FILE*. The saves have already been drained by the loop above —
+	// quitting does not break out until the ring is empty — so nothing is left to write and
+	// the entries here are pure read state.
+	regionCacheClose();
+
 	// Whatever was staged is dropped, not installed: stopping happens on the way out of
 	// the game, and a half-installed column in a world about to be freed is worse than no
 	// column at all.
@@ -361,12 +419,48 @@ bool workerSubmitSave(const Column* col)
 	// one priority step *below* this one: a spin here would keep the worker off the CPU
 	// altogether on core 0 and the wait would never end. 1 ms is far below the SD write it
 	// is waiting for, so the granularity costs nothing.
-	for (;;) {
-		LightLock_Lock(&s_lock);
-		const bool room = s_save_count < SAVE_SLOTS;
-		LightLock_Unlock(&s_lock);
-		if (room) break;
-		svcSleepThread(1000000ULL);
+	//
+	// ── v1.7.1 task 48b: this wait is COUNTED, not just timed ──────────────────────────
+	//
+	// main.c already times the call (s_frame_save_ms → the `save_ms` CSV column), but a
+	// total of 0.0 ms cannot be told apart from a frame that never reached this branch at
+	// all — and the difference is the entire question. The `col->dirty` gate means an
+	// unedited world never enters it, so every clean capture ever taken is silent about
+	// this path rather than evidence against it.
+	//
+	// Why it is worth counting. SAVE_SLOTS is 2, and the comment on it says a third slot
+	// would only buy "three edited columns unloading in the same frame, which needs the
+	// player to have built in three columns and then crossed a boundary DIAGONALLY". That
+	// understates the geometry. genInArea is a square window of half-width s_area_radius,
+	// so ONE ordinary axis-aligned step of the ring unloads a whole edge — 2*4+1 = 9
+	// columns at RENDER_DIST_MAX, and 17 on a diagonal step. Three of those nine being
+	// dirty needs a base three columns wide and a walk out of it, not a rarity. Whether
+	// the resulting wait is milliseconds or microseconds depends on the SD card, which
+	// cannot be measured anywhere but on the console.
+	//
+	// So: submits, how many of them slept at all, the total slept and the worst single
+	// wait. Four counters, read through worker.h. A capture on a world with a base in it
+	// now answers the question outright instead of leaving it open.
+	s_save_submits++;
+	{
+		const u64 t_wait = svcGetSystemTick();
+		bool slept = false;
+
+		for (;;) {
+			LightLock_Lock(&s_lock);
+			const bool room = s_save_count < SAVE_SLOTS;
+			LightLock_Unlock(&s_lock);
+			if (room) break;
+			slept = true;
+			svcSleepThread(1000000ULL);
+		}
+
+		if (slept) {
+			const u64 waited = svcGetSystemTick() - t_wait;
+			s_save_waits++;
+			s_save_wait_ticks += waited;
+			if (waited > s_save_wait_max_ticks) s_save_wait_max_ticks = waited;
+		}
 	}
 
 	SaveSlot* s = &s_save[s_save_head];
@@ -425,6 +519,11 @@ bool workerInstall(World* w, int32_t* cx, int32_t* cz, bool* ok)
 	// The worker is parked until s_ready is cleared below, so the staging world is ours
 	// for the duration of this function and needs no lock of its own.
 	const u64 t0 = svcGetSystemTick();
+	// v1.7.1 task 48b. The same bracket s_install_ticks already keeps, reported per world load
+	// instead of per session: workerInstallMs() is a since-launch total and cannot say what one
+	// world entry cost. Both are kept because they are read in different places — the gen
+	// overlay reads the running total, load.csv reads the per-load one.
+	const uint64_t t_inst = loadprofMark();
 
 	bool all = gen_ok;
 	const Column* src = worldColumn(&s_staging, rx, rz);
@@ -459,6 +558,7 @@ bool workerInstall(World* w, int32_t* cx, int32_t* cz, bool* ok)
 	worldExit(&s_staging);
 
 	s_install_ticks += svcGetSystemTick() - t0;
+	loadprofSince(LOAD_STAGE_INSTALL, t_inst);
 
 	LightLock_Lock(&s_lock);
 	s_ready = false;
@@ -503,3 +603,14 @@ int workerDropped(void)
 
 float workerBusyMs(void)    { return (float)((double)s_busy_ticks / CPU_TICKS_PER_MSEC); }
 float workerInstallMs(void) { return (float)((double)s_install_ticks / CPU_TICKS_PER_MSEC); }
+
+int   workerSaveSubmits(void) { return s_save_submits; }
+int   workerSaveWaits(void)   { return s_save_waits; }
+float workerSaveWaitMs(void)
+{
+	return (float)((double)s_save_wait_ticks / CPU_TICKS_PER_MSEC);
+}
+float workerSaveWaitMaxMs(void)
+{
+	return (float)((double)s_save_wait_max_ticks / CPU_TICKS_PER_MSEC);
+}

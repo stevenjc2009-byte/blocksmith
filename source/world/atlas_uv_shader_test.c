@@ -938,6 +938,80 @@ int main(void)
 		}
 	}
 
+	// ── Task 13a: does bumping ATLAS_H_PX to 512 actually buy "31 addressable" slots? ────
+	//
+	// world/atlas_uv.h's own comment, just above ATLAS_TILE_MISSING, used to claim "the
+	// next step up is ATLAS_H_PX 512: 32 slots, 31 addressable". A scout flagged that as
+	// wrong because atlasRect() computes v0/v1 as a plain
+	// `(uint8_t)(tile * TILE_PX [+ TILE_PX])` cast - a raw pixel offset, never scaled to
+	// the sheet height - so nothing about a taller sheet changes how far that cast can
+	// count before it wraps.
+	//
+	// Proved directly: looping tiles 0..30 (the comment's own claimed count) and checking
+	// each for an intact, distinct v0/v1 pair goes RED starting at tile 15, not 31 -
+	// measured verbatim from this file before the fix below:
+	//
+	//   FAIL L979  at a hypothetical ATLAS_H_PX=512, tile 15's rect (v0=240 v1=256, full
+	//   pixel values) does not fit uint8_t and truncates - world/atlas_uv.h's '31
+	//   addressable' claim for that width is false under MeshVertex's uint8_t v
+	//   ...
+	//   atlas uv shader self-test: FAIL 16/2267  L979 [tile 15 as above]
+	//
+	// Tiles 0..14 (15 of them) stayed green throughout that run; every one of 15..30 (16
+	// tiles) failed the same way, confirming the truncation is not a one-off at the
+	// scout's cited tile 30 - it starts at 15 and every index above it is affected. Tile
+	// 30 specifically truncates to v1=240, exactly tile 14's own v1, matching the scout's
+	// cited alias by value.
+	//
+	// So the claim is REFUTED, and not by the mechanism the scout named (a single
+	// aliasing collision at index 30) - the real ceiling under this vertex format is 15
+	// addressable slots (0..14) no matter what ATLAS_H_PX is set to, which is exactly what
+	// ATLAS_TILE_COUNT already enforces above in this file. Getting past 15 needs the
+	// vertex format itself to change (MeshVertex.v holding a slot index instead of a raw
+	// pixel offset, scaled by TILE_PX in the shader) - unstarted work, not a side effect
+	// of a bigger sheet. See world/atlas_uv.h's corrected comment.
+	//
+	// What ships below is the permanent, GREEN form: the real ceiling asserted as a
+	// regression check (would go red if TILE_PX, ATLAS_TILE_COUNT or the uint8_t vertex
+	// format ever drifted), plus the two specific facts above stated as their own checks
+	// so a future change to any of those numbers is caught here rather than only in a
+	// comment.
+	{
+		for (int t = 0; t < ATLAS_TILE_COUNT; t++) {
+			const int     v0_full = t * TILE_PX;
+			const int     v1_full = t * TILE_PX + TILE_PX;
+			const uint8_t v0_u8   = (uint8_t)v0_full;
+			const uint8_t v1_u8   = (uint8_t)v1_full;
+			CHECK(v0_full == (int)v0_u8 && v1_full == (int)v1_u8,
+			      "tile %d's rect (v0=%d v1=%d) does not fit uint8_t intact - the addressable "
+			      "ceiling ATLAS_TILE_COUNT=%d claims every one of 0..%d does, regardless of "
+			      "ATLAS_H_PX",
+			      t, v0_full, v1_full, ATLAS_TILE_COUNT, ATLAS_TILE_COUNT - 1);
+		}
+
+		// The first tile past the real ceiling must still be broken - if this ever goes
+		// green, the ceiling moved and the comment above atlasRect() needs re-deriving,
+		// not just re-reading.
+		const int     v15_v1_full = 15 * TILE_PX + TILE_PX;
+		const uint8_t v15_v1_u8   = (uint8_t)v15_v1_full;
+		CHECK(v15_v1_full != (int)v15_v1_u8,
+		      "tile 15's v1 (full value %d) now fits in uint8_t (%d) instead of truncating - "
+		      "the addressable ceiling this file enforces (ATLAS_TILE_COUNT=%d) needs "
+		      "re-deriving before trusting any comment about it",
+		      v15_v1_full, (int)v15_v1_u8, ATLAS_TILE_COUNT);
+
+		// The scout's own cited example, checked by value: tile 30's v1 does not merely go
+		// out of range, it truncates to exactly tile 14's own v1 - silently rendering as
+		// already-painted geometry rather than failing loudly.
+		const int     t14_v1_full = 14 * TILE_PX + TILE_PX;
+		const int     t30_v1_full = 30 * TILE_PX + TILE_PX;
+		const uint8_t t30_v1_u8   = (uint8_t)t30_v1_full;
+		CHECK((int)t30_v1_u8 == t14_v1_full,
+		      "tile 30's v1 (full value %d) no longer truncates to %d, tile 14's own v1 (%d) - "
+		      "the scout's cited alias no longer holds; re-check before trusting this comment",
+		      t30_v1_full, (int)t30_v1_u8, t14_v1_full);
+	}
+
 	if (s_fails == 0)
 		printf("atlas uv shader self-test: PASS  %d checks\n", s_checks);
 	else

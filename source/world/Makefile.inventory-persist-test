@@ -1,0 +1,61 @@
+# Makefile.inventory-persist-test — host-only build for world/inventory.c's on-disk
+# save format.
+#
+# Not part of the 3DS build (mc/Makefile, devkitARM). This compiles world/inventory.c
+# and world/inventory_persist_test.c with a host gcc so the suite runs in a second under
+# WSL, exactly as source/world/Makefile.playerpose-test does for the pose sidecar it was
+# modelled on.
+#
+# `make -f Makefile.inventory-persist-test test`   build and run the suite
+# `make -f Makefile.inventory-persist-test clean`  remove the built artefacts
+#
+# Kept alongside the stanza in tools/run_host_tests.sh rather than instead of it, for the
+# same division of labour Makefile.playerpose-test, Makefile.blockdiff-test and
+# Makefile.networld-test all give: the stanza is what makes the suite the single thing
+# that has to pass; this file is the finer warning set — -Wconversion, -Wsign-conversion,
+# -Wcast-qual, -Wshadow and the rest — on code that parses a file off an SD card that a
+# power cut may have torn in half. Keep the file list below in step with the stanza's
+# when one changes.
+#
+# No world.c/chunk.c/registry.c in the link, unlike Makefile.playerpose-test: inventory.c
+# has no equivalent of playerPoseUnstick() that calls into a real World, and
+# inventory.h's only other dependency is world/block.h, which is header-only. crc32.c is
+# in the link because the save file is checksummed the same way a region file is.
+
+CC ?= cc
+
+# Run from source/world, so the tree root is two levels up — that is what -I../.. resolves
+# this module's own "world/inventory.h" includes against, the same root the 3DS build uses.
+ROOT := ../..
+
+CFLAGS := -std=c11 -O2 -g \
+          -Wall -Wextra -Werror \
+          -Wformat=2 -Wconversion -Wsign-conversion -Wshadow \
+          -Wstrict-prototypes -Wmissing-prototypes -Wpointer-arith \
+          -Wvla -Wcast-qual -Wundef \
+          -I$(ROOT)/source
+
+# Everything lands in BUILD, never beside the sources, for the reason
+# Makefile.blockdiff-test spells out: mc/Makefile puts source/world on VPATH, so a
+# host-built .o sitting in this directory is found by the console build's implicit rules,
+# which then skip compiling it into build/ and hand ld a name it cannot resolve. A whole
+# 3DS link died that way once.
+BUILD := build-inventory-persist
+
+SRCS := $(ROOT)/source/world/inventory.c \
+        $(ROOT)/source/world/inventory_persist_test.c \
+        $(ROOT)/source/world/crc32.c
+
+.PHONY: test clean
+
+$(BUILD):
+	mkdir -p $(BUILD)
+
+$(BUILD)/inventory_persist_test: $(SRCS) | $(BUILD)
+	$(CC) $(CFLAGS) $(SRCS) -o $@
+
+test: $(BUILD)/inventory_persist_test
+	cd $(ROOT) && ./source/world/$(BUILD)/inventory_persist_test
+
+clean:
+	rm -rf $(BUILD)

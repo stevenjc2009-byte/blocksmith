@@ -15,7 +15,7 @@ _Static_assert(CHUNK_DIM == 16, "visgraph.c decomposes chunk indices assuming CH
 // See-through for the purposes of sight, which is not the same question the mesher asks.
 // The mesher wants "does this hide the face behind it"; this wants "can I see past it".
 //
-// Built as a 256-entry table once per chunk rather than called per cell, and that is not
+// Built as a 256-entry table rather than called per cell, and that is not
 // micro-optimisation for its own sake — it is the difference the step was measured at. The
 // fill asks this question about a cell and about each of its six neighbours, so a 16^3 chunk
 // makes up to 28,672 of them; blockInfo() lives in another translation unit and there is no
@@ -36,12 +36,86 @@ _Static_assert(CHUNK_DIM == 16, "visgraph.c decomposes chunk indices assuming CH
 // The air_open prefill that used to cover ids BLOCK_COUNT..255 is gone with the short loop: the
 // walk below now writes every entry itself, and blockInfo() already answers air for an id with
 // no row, so the prefill and the loop said the same thing about the same slots.
-static void openTable(uint8_t out[REGISTRY_MAX])
+//
+// v1.7.1 task 49: built ONCE and kept, instead of once per chunk. The table above was a
+// local rebuilt at the top of every visChunkConnectivity() call — 256 blockInfo() calls per
+// chunk meshed, measured on the host probe at 256.00 calls per call, for a table whose
+// contents cannot change while a session is running. That is the same waste world/mesher.c
+// removed from its own per-id tables (s_solid/s_deferred/s_occludes/s_rect, mesher.c:120-134),
+// and this follows mesher.c's shape deliberately rather than inventing a second one:
+//
+//   * static storage, not a caller's local;
+//   * built LAZILY on first use, never at load time or from an init hook. That timing is the
+//     part that matters: world/registry.c's table is populated at runtime by registryInitCore()
+//     and then added to by the server's DEFS batch at join, so a table built any earlier than
+//     first use would be a table built before the blocks exist;
+//   * an exported invalidate, visgraphInvalidateTables(), that is the exact counterpart of
+//     mesherInvalidateTables().
+//
+// The one addition on top of mesher's shape is s_open_stamp, and it is here because visgraph
+// has no owned call site to invalidate it from. mesher.c is invalidated by net/networld.c
+// after every DEFS batch; nothing calls into visgraph at that moment, and a cave-culling table
+// that goes stale does not produce a wrong-looking block, it produces a *hole in the world* —
+// a solid dynamic block read back as see-through culls everything behind it. So the cache
+// carries a key that says which registry it was built from, and rebuilds when that key moves,
+// which makes a missed invalidate call cost a rebuild instead of a hole.
+//
+// What the key has to cover, and why it is cheap. Every entry of this table is one bit,
+// `!(solid && !transparent)`, and only two things can change it:
+//   * the core rows (0x00..0x7F) — they come from registry.c's compiled-in kCoreDefs and are
+//     reinstalled byte-identically by every registryInitCore(), so within one build they can
+//     never differ. Nothing to hash.
+//   * the dynamic rows (0x80 up) — registered lowest-free-first and never removed, and both
+//     paths that create them (registryRegister and registryRemoteApply, the latter refusing
+//     any batch whose first id is not the next free slot) fill them contiguously from
+//     REG_ID_DYN_LO. So walking up from REG_ID_DYN_LO until an undefined id is the whole of
+//     the mutable half, and in single player, where there are no dynamic rows at all, that is
+//     one registryIsDefined() call per chunk instead of 256 blockInfo() calls.
+// registryCount() is folded in as well so that adding a row is detected even in the case where
+// its openness bit happens to match, and so that leaving a session (registryInitCore, which
+// drops the count back to the core rows) is detected without walking anything.
+static uint8_t  s_open[REGISTRY_MAX];
+static bool     s_open_ready;
+static uint32_t s_open_stamp;
+
+// FNV-1a over registryCount() and the openness of every defined dynamic row. FNV rather than
+// anything cleverer because this is a change detector, not a security fingerprint, and it has
+// to be cheaper than the 256 calls it replaces or the whole exercise is pointless.
+static uint32_t openStamp(void)
 {
+	uint32_t h = 2166136261u;
+	h = (h ^ registryCount()) * 16777619u;
+
+	for (int id = REG_ID_DYN_LO; id <= REG_ID_DYN_HI; id++) {
+		if (!registryIsDefined((BlockId)id)) break;   // contiguous, so the first gap is the end
+		const BlockInfo* info = blockInfo((BlockId)id);
+		const uint32_t   bit  = (uint32_t)!(info->solid && !info->transparent);
+		h = (h ^ ((uint32_t)id | (bit << 8))) * 16777619u;
+	}
+	return h;
+}
+
+void visgraphInvalidateTables(void)
+{
+	s_open_ready = false;
+}
+
+// Returns the cached table, building it if the registry it was built from has moved.
+//
+// Main thread only, like mesher.c's planBuild(): the sole caller is
+// scene/chunk_render.c's mesh step, and app/worker.c never reaches this file.
+static const uint8_t* openTable(void)
+{
+	const uint32_t stamp = openStamp();
+	if (s_open_ready && stamp == s_open_stamp) return s_open;
+
 	for (int i = 0; i < REGISTRY_MAX; i++) {
 		const BlockInfo* info = blockInfo((BlockId)i);
-		out[i] = (uint8_t)!(info->solid && !info->transparent);
+		s_open[i] = (uint8_t)!(info->solid && !info->transparent);
 	}
+	s_open_stamp = stamp;
+	s_open_ready = true;
+	return s_open;
 }
 
 // Which of the six faces this local coordinate sits on, as a bit mask. A corner cell is on
@@ -74,8 +148,7 @@ static uint16_t pairsOf(uint8_t bits)
 
 uint16_t visChunkConnectivity(const Chunk* c, VisScratch* sc)
 {
-	uint8_t open[REGISTRY_MAX];
-	openTable(open);
+	const uint8_t* open = openTable();
 
 	// Step 9.1b. A UNIFORM chunk's answer does not need a flood fill, or even sc, to
 	// compute: every one of its 4,096 cells reads the same open[] answer, so either none of
@@ -259,6 +332,53 @@ static inline int oppositeFace(int face)
 // face is a legal exit.
 #define ENTRY_ORIGIN  0x40u
 
+// A queue entry carries the cell's local x/y/z, four bits per axis, instead of its linear
+// index. Both fit in the uint16_t the queue was already made of, so this costs no memory and
+// no extra per-frame setup — but it is the difference between the pop loop doing three
+// integer divisions and doing none.
+//
+// Why not just divide. The pop loop used to recover the coordinates from the linear index
+// with `i % nx`, `(i / nx) % nz` and `i / (nx * nz)`. nx/ny/nz are the *runtime* extent of
+// the loaded box — they follow the render distance and the clamping in scene/chunk_render.c,
+// so they are ordinary values like 9 or 7, not powers of two, and no shift is equivalent to
+// them. The ARM11 has no divide instruction at all, so each of those became a call to a
+// division helper: compiling this file with the real devkitARM flags (-O3 -march=armv6k)
+// emitted three of them, two `bl __aeabi_idivmod` and one `bl __aeabi_idiv`. After this
+// change the same compile emits none — that count is checked by compiling to assembly, not
+// inferred from the C.
+//
+// How many that is per frame, measured rather than assumed: over a 9x8x9 box (render
+// distance 4, the full world column) the walk pops 1,222 entries a frame, of which 561 get
+// past the duplicate-push early-out and reach the arithmetic. Three helper calls each is
+// **1,684 division calls per frame** gone, replaced by two multiplies on all 1,222 pops —
+// cellIndex() is now on the near side of that early-out, which is the one thing this costs.
+// On a host x86 that has a hardware divider the trade is roughly a wash (an interleaved A/B
+// of both versions in one process measured 17.2 us/frame against 15.4); on the console it is
+// not close, because there the divisor side of that trade is a function call into a software
+// division loop and the multiply side is one instruction.
+//
+// Why not a precomputed reciprocal. That is the usual answer when a divisor is fixed for the
+// duration, and it would have worked — but it still costs a multiply-high plus a correction
+// per component, and it would be arithmetic nobody can read. The coordinates are already in
+// hand at every push site (the seed has lx/ly/lz, and a neighbour step has jx/jy/jz), so
+// carrying them costs literally nothing and the loop gets them back with three masks. The
+// linear index the rest of the loop needs comes back from cellIndex(), which is two
+// multiplies — an instruction the ARM11 does have.
+//
+// Four bits per axis is enough for every box VisWalk can hold: VIS_BOX_MAX_XZ is 16 and
+// VIS_BOX_MAX_Y is COLUMN_CHUNKS. Asserted rather than assumed, because widening either of
+// those is a one-line edit in the header and would otherwise silently alias two cells onto
+// one queue entry — which would not crash, it would quietly mark the wrong chunk visible.
+#define VIS_Q_SHIFT  4
+#define VIS_Q_MASK   ((1u << VIS_Q_SHIFT) - 1u)
+#define VIS_Q_PACK(x, y, z) \
+	((uint16_t)((unsigned)(x) | ((unsigned)(y) << VIS_Q_SHIFT) | \
+	            ((unsigned)(z) << (2 * VIS_Q_SHIFT))))
+
+_Static_assert(VIS_BOX_MAX_XZ <= (1 << VIS_Q_SHIFT) && VIS_BOX_MAX_Y <= (1 << VIS_Q_SHIFT),
+               "visgraph.c packs a walk queue entry as 4 bits per axis; a box axis has "
+               "outgrown that and would alias two cells onto one entry");
+
 int visWalkRun(VisWalk* w, float cam_x, float cam_y, float cam_z)
 {
 	const size_t cells = (size_t)w->nx * (size_t)w->ny * (size_t)w->nz;
@@ -280,12 +400,18 @@ int visWalkRun(VisWalk* w, float cam_x, float cam_y, float cam_z)
 	const int start = cellIndex(w, lx, ly, lz);
 	w->entered[start] = (uint8_t)ENTRY_ORIGIN;
 	w->pending[start] = (uint8_t)ENTRY_ORIGIN;
-	w->queue[tail++]  = (uint16_t)start;
+	w->queue[tail++]  = VIS_Q_PACK(lx, ly, lz);
 
 	int reached = 0;
 
 	while (head < tail) {
-		const int i = w->queue[head++];
+		// Coordinates out of the packed entry, index back from them. See VIS_Q_PACK above
+		// for why this is not `i % nx` and friends any more.
+		const unsigned q  = w->queue[head++];
+		const int      ix = (int)(q & VIS_Q_MASK);
+		const int      iy = (int)((q >> VIS_Q_SHIFT) & VIS_Q_MASK);
+		const int      iz = (int)((q >> (2 * VIS_Q_SHIFT)) & VIS_Q_MASK);
+		const int      i  = cellIndex(w, ix, iy, iz);
 
 		const uint8_t fin = w->pending[i];
 		w->pending[i] = 0;
@@ -295,10 +421,6 @@ int visWalkRun(VisWalk* w, float cam_x, float cam_y, float cam_z)
 			w->visible[i] = true;
 			reached++;
 		}
-
-		const int ix = i % w->nx;
-		const int iz = (i / w->nx) % w->nz;
-		const int iy = i / (w->nx * w->nz);
 
 		// Every face reachable from any of the entry faces still waiting on this cell.
 		uint8_t exits = 0;
@@ -336,7 +458,7 @@ int visWalkRun(VisWalk* w, float cam_x, float cam_y, float cam_z)
 
 			w->entered[j] |= opp;
 			w->pending[j] |= opp;
-			w->queue[tail++] = (uint16_t)j;
+			w->queue[tail++] = VIS_Q_PACK(jx, jy, jz);
 		}
 	}
 

@@ -170,6 +170,40 @@ ChunkForm chunkFormForAll(const BlockId in[CHUNK_BLOCKS]);
 // difference the same way it does around chunkClear.
 bool chunkLoadAll(Chunk* c, const BlockId in[CHUNK_BLOCKS]);
 
+// v1.7.1 task 49 (install half). One analysis of a flat buffer, reusable by both halves of
+// the pre-flight/commit pair above, so the buffer is walked ONCE per chunk instead of three
+// times.
+//
+// chunkFormForAll and chunkLoadAll each built the palette from scratch, and chunkLoadAll's
+// PALETTE4 commit then searched that palette linearly for every one of the 4096 cells. On
+// the install path that is the whole cost: app/worker.c's workerInstall calls
+// worldSetChunkAll once per chunk of every column the generator hands over, and
+// worldSetChunkAll calls both. Measured on the host over a real 7x7-column streaming pass
+// (49 columns, 300 chunks): worldSetChunkAll was 93.3 us/column of a 104.5 us/column
+// install, split chunkFormForAll 22.5 and chunkLoadAll 65.3.
+//
+// `slot_of` is what removes the linear search: BlockId is one byte, so a 256-entry
+// id -> palette-slot table is exact and needs no bounds test. It is meaningful only when
+// `count` is 1..16; `count` is -1 for "more than 16 distinct ids", i.e. RAW, and the scan
+// stops tracking at that point exactly as it always did.
+//
+// A caller that wants only one of the two answers can still use chunkFormForAll/chunkLoadAll
+// — they are now thin wrappers around this pair and behave identically.
+typedef struct {
+	BlockId palette[16];
+	int     count;            // 1..16 distinct ids, or -1 for RAW
+	uint8_t slot_of[256];     // id -> palette slot; meaningful iff count > 0
+} ChunkPlan;
+
+// Fills *plan and reports the form it implies — the same answer chunkFormForAll gives.
+// Pure apart from writing *plan; allocates nothing.
+ChunkForm chunkPlanAll(const BlockId in[CHUNK_BLOCKS], ChunkPlan* plan);
+
+// chunkLoadAll's commit half, taking the analysis instead of redoing it. `plan` MUST be the
+// one chunkPlanAll filled from this same `in`; passing a plan built from a different buffer
+// is a programming error and is not checked for.
+bool chunkLoadPlanned(Chunk* c, const BlockId in[CHUNK_BLOCKS], const ChunkPlan* plan);
+
 // Step 9.2d, both added so chunk_codec.c's encoder/decoder can stop routing a chunk that is
 // already (or is about to become) CHUNK_FORM_PALETTE4 through a decompress-to-BlockId-array
 // and rebuild-the-palette-from-scratch round trip when the palette already exists, or is

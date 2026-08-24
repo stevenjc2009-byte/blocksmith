@@ -8,6 +8,7 @@
 #include "world/block.h"
 #include "world/mesher.h"
 #include "world/registry.h"
+#include "world/visgraph.h"
 
 #include "proto/bs_proto.h"
 
@@ -573,6 +574,14 @@ static void registryApplyRemote(const uint8_t* msg, size_t len)
 	if (n > 0) {
 		if (registryRemoteApply(first, msg + BS_APP_HDR_BYTES + 3u, n) != n) return;
 		mesherInvalidateTables();
+
+		// v1.7.1: world/visgraph.c caches an openness table off the same registry the mesher
+		// does, so it has to be dropped here for the same reason and at the same moment. Its
+		// own contents-stamp already catches this batch on its own — this call is the belt to
+		// that stamp's braces, and it earns its place because the two failures are not
+		// comparable: a stale mesher table draws a face wrong, while a stale visgraph table
+		// culls a chunk that should have been drawn and puts a hole in the world.
+		visgraphInvalidateTables();
 	}
 
 	s_reg_synced = registryMatchesInfo();

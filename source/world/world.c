@@ -197,6 +197,22 @@ BlockId worldGet(const World* w, int x, int y, int z)
 	return chunkGet(c, chunkIndex(x & 15, y & 15, z & 15));
 }
 
+int worldStandingY(const World* w, int x, int z, int base)
+{
+	int y = base;
+	if (y < 0) y = 0;
+
+	// Bounded by the world, not by "it cannot take many steps": a column solid all the way to
+	// the ceiling — a wall the player built, or a pillar — must end this loop rather than walk
+	// off the top. WORLD_HEIGHT - 2 is the highest y at which a 1.8-tall body still fits.
+	while (y < WORLD_HEIGHT - 2 &&
+	       (blockIsSolid(worldGet(w, x, y,     z)) ||
+	        blockIsSolid(worldGet(w, x, y + 1, z))))
+		y++;
+
+	return y;
+}
+
 bool worldSet(World* w, int x, int y, int z, BlockId id)
 {
 	if (y < 0 || y >= WORLD_HEIGHT) return false;
@@ -253,6 +269,15 @@ bool worldSetChunkAll(World* w, int cx, int cy, int cz, const BlockId in[CHUNK_B
 	Column* col = worldColumnCreate(w, cx, cz);
 	if (!col) return false;
 
+	// v1.7.1 task 49 (install half). Both halves of the pre-flight/commit pair below need
+	// `in`'s palette, and both used to derive it from scratch: chunkFormForAll walked the
+	// 4096 cells to size the budget claim and chunkLoadAll walked them again to commit.
+	// One walk, one plan, both answers — see chunk.h's ChunkPlan for the measurement that
+	// made this worth doing. 276 bytes of stack; the deepest caller of this function is
+	// worldgen on the 32 KB worker thread.
+	ChunkPlan plan;
+	const ChunkForm form = chunkPlanAll(in, &plan);
+
 	Chunk* c = col->chunks[cy];
 	if (!c) {
 		// No existing chunk to size a delta against — this is exactly worldChunkCreate's
@@ -262,17 +287,17 @@ bool worldSetChunkAll(World* w, int cx, int cy, int cz, const BlockId in[CHUNK_B
 		// after, for no reason other than code reuse. worldgen.c calls this once per chunk
 		// specifically to avoid paying for cell-by-cell promotion; doing it here anyway
 		// would defeat the point.
-		const size_t bytes = chunkFormBytes(chunkFormForAll(in));
+		const size_t bytes = chunkFormBytes(form);
 		if (!budgetClaim(bytes)) return false;
 
 		c = chunkAlloc(BLOCK_AIR);
 		if (!c) { budgetRelease(bytes); return false; }
 
-		if (!chunkLoadAll(c, in)) {
+		if (!chunkLoadPlanned(c, in, &plan)) {
 			// chunkAlloc succeeded (it is UNIFORM, which cannot fail its own claim logic
-			// here since chunkLoadAll only fails on a promotion's malloc) but chunkLoadAll
-			// itself failed on its allocation — free the still-UNIFORM shell and give the
-			// claim back.
+			// here since chunkLoadPlanned only fails on a promotion's malloc) but
+			// chunkLoadPlanned itself failed on its allocation — free the still-UNIFORM
+			// shell and give the claim back.
 			budgetRelease(bytes);
 			chunkFree(c);
 			return false;
@@ -284,23 +309,23 @@ bool worldSetChunkAll(World* w, int cx, int cy, int cz, const BlockId in[CHUNK_B
 	}
 
 	// Replacing an existing chunk's content: the same pre-flight/claim/commit/release shape
-	// worldSet uses, except chunkLoadAll may also SHRINK c (it is a wholesale replace, not
+	// worldSet uses, except chunkLoadPlanned may also SHRINK c (it is a wholesale replace, not
 	// an incremental edit — see chunk.h), so bytes_after can be smaller than bytes_before.
 	// That is not refused; it is not claimed either. Nothing here releases the shrink until
 	// after the commit actually happens, because chunkGetBytes(c) has to be read again
 	// afterward to know how much the form actually changed by — reading it before commit and
-	// assuming chunkFormForAll's answer is what will be installed is correct today (nothing
+	// assuming chunkPlanAll's answer is what will be installed is correct today (nothing
 	// else can be running between the query and the commit, single-threaded), but computing
 	// the release from the post-commit form rather than the pre-flight query keeps this
 	// function honest even if that ever changes.
 	const size_t bytes_before = chunkGetBytes(c);
-	const size_t bytes_after_query = chunkFormBytes(chunkFormForAll(in));
+	const size_t bytes_after_query = chunkFormBytes(form);
 
 	if (bytes_after_query > bytes_before) {
 		if (!budgetClaim(bytes_after_query - bytes_before)) return false;
 	}
 
-	if (!chunkLoadAll(c, in)) {
+	if (!chunkLoadPlanned(c, in, &plan)) {
 		if (bytes_after_query > bytes_before)
 			budgetRelease(bytes_after_query - bytes_before);
 		return false;

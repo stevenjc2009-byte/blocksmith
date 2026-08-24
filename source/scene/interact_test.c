@@ -183,6 +183,62 @@ static void testABreakOnACarryUnholdableBlockChangesNothing(void)
 	CHECK(s_edits_sent == 0);
 }
 
+// v1.7.1 task 47. THE case nobody had: aim at tall grass, press break, assert the cell is air.
+//
+// Two green suites straddled this without covering it. world_test.c asserted the plant is
+// targetable; the ceiling test above asserted ids >= BLOCK_COUNT are refused. Both true, both
+// passing, and the bug steve hit sat in the gap between them — BLOCK_TALL_GRASS is 9, past the
+// ceiling, so the break was refused and the plant could not be mined at all. The refusal test
+// directly above deliberately uses a freshly registered DYNAMIC id, so the one test exercising
+// this guard never touched the one block a player actually meets.
+static void testTallGrassBreaksAndDropsNothing(void)
+{
+	// The premise, pinned first: this really is an id the bag cannot hold. If tall grass ever
+	// moves below the ceiling this goes red, and the rest stops proving what it claims.
+	CHECK(!inventoryCanHold((ItemId)BLOCK_TALL_GRASS));
+	CHECK(blockDropsNothing(BLOCK_TALL_GRASS));
+	CHECK(!blockDropsNothing(BLOCK_STONE));          // control: an ordinary block still drops
+
+	Interact it;
+	freshAimedAt(&it, BLOCK_TALL_GRASS);
+	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_TALL_GRASS);
+
+	const Body body = farAwayBody();
+	interactEdit(&it, &s_world, &body, breakKey());
+
+	// It is GONE. This is the check that was red before the fix.
+	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_AIR);
+	CHECK(it.broke == 1);
+	CHECK(it.refused == 0);
+
+	// ...and it gave nothing to carry. broke_id stays BLOCK_AIR, which is how main.c already
+	// spells "add nothing to the bag", so no unholdable id is ever offered to the inventory.
+	CHECK(it.broke_id == BLOCK_AIR);
+
+	// Multiplayer: the edit DOES go out this time, and it is an ordinary air write — id 0,
+	// below every ceiling on both client and server, so nothing can refuse it half way.
+	CHECK(s_edits_sent == 1);
+	CHECK(s_last_block == BLOCK_AIR);
+}
+
+// An ordinary holdable block must be unaffected by the split above: it still breaks AND still
+// hands its id to the bag. Without this, writing blockDropsNothing as `return true` would pass
+// every check in the test above.
+static void testAnOrdinaryBlockStillDropsItself(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_STONE);
+
+	const Body body = farAwayBody();
+	interactEdit(&it, &s_world, &body, breakKey());
+
+	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_AIR);
+	CHECK(it.broke == 1);
+	CHECK(it.refused == 0);
+	CHECK(it.broke_id == BLOCK_STONE);   // the drop survived the change
+	CHECK(s_edits_sent == 1);
+}
+
 // The refusal must not be a one-shot that quietly gives up: hold the button, press it again,
 // and the block is still there. A guard that only worked the first time would still lose the
 // block on the second press.
@@ -351,6 +407,8 @@ int main(void)
 {
 	testTheCarryCeilingIsWhereItSays();
 	testABreakOnACarryUnholdableBlockChangesNothing();
+	testTallGrassBreaksAndDropsNothing();
+	testAnOrdinaryBlockStillDropsItself();
 	testRepeatedBreakAttemptsStillChangeNothing();
 	testACoreBlockStillBreaks();
 	testEveryCoreBlockStillBreaks();

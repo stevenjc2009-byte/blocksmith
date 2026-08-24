@@ -1,11 +1,18 @@
 // Adaptive lighting engine (v1.5.0): per-column sky/block light channels.
 //
 // Two nibble channels per column — sky and block — over the full 16x16x128 cells,
-// 4 KiB each, hanging off the owning Column as an opaque pointer. The engine is
-// gated behind a global flag that defaults to off: an Old 3DS never allocates
-// light data, never runs propagation, and its mesher writes pad = 0 exactly as
-// before, so today's baked vertex-colour lighting comes out byte-for-byte
-// identical. A New 3DS turns the gate on at boot and every stage below goes live.
+// 16 KiB each, hanging off the owning Column as an opaque pointer. The engine is
+// gated behind a global flag that defaults to off; nothing allocates light data,
+// runs propagation, or writes anything but pad = 0 until lightEngineInit(true).
+//
+// v1.8.0 task 24: BOTH console models now turn that gate on at boot. From v1.5.0
+// to v1.7.0 only a New 3DS did, so an Old 3DS had baked face shade and AO but no
+// light LEVEL — a sealed cave was as bright as open ground. The split was always
+// about CPU and memory rather than the GPU, and both were measured before it went:
+// 1.53 MB of light at radius 3 (12.8% of WORLD_BUDGET_BYTES) against 295,646 B of
+// measured block storage, and an edit-path relight cut from 4.001 ms to 0.141 ms
+// by the engine swap below. The gate itself stays, because the host suite and the
+// dedicated server both run with it off.
 //
 // The channels are Minecraft-shaped: sky light is seeded straight down through
 // air at 15 and spreads outward with -1 falloff; block light is seeded from
@@ -23,16 +30,26 @@
 // world's own column, and an edit relights only the edited column.
 //
 // Two independent engines compute the same answer, and the host suite asserts
-// they agree byte-for-byte on random fixtures:
+// they agree byte-for-byte:
 //
-//   * lightPropagateColumn — a breadth-first flood fill used on the generation
-//     path. Seeds are assigned up front and a cell is enqueued only when its
-//     stored value strictly improves, so the first assignment is final and the
-//     queue can never hold more than one entry per cell.
-//   * lightRelightColumn — fixed-order relaxation sweeps used on the edit path,
-//     where determinism matters more than speed and no queue may be allocated on
-//     the main thread. Each pass raises every cell towards its neighbours until
-//     a full pass changes nothing.
+//   * lightPropagateColumn — a breadth-first flood fill. Seeds are assigned up
+//     front and a cell is enqueued only when its stored value strictly improves,
+//     so the first assignment is final and the queue can never hold more than one
+//     entry per cell. Since v1.8.0 this is what BOTH the generation path and the
+//     edit path run.
+//   * lightRelightColumnSweeps — fixed-order relaxation sweeps, reaching the same
+//     fixpoint by pulling where the flood fill pushes. Each pass raises every cell
+//     towards its neighbours until a full pass changes nothing. It shares nothing
+//     with the flood fill but opaqueAt and the height map, which is what makes
+//     diffing the two a real check rather than a restatement.
+//
+// v1.8.0 note, because the claim above was false for three releases and the test that was
+// meant to prove it could not fail: the two DID disagree, on every transparent block sitting
+// at the top of its strip — leaves, water, tall grass. heightMapFill records the highest
+// non-air cell while opaqueAt is solid && !transparent, so such a cell was below the flood
+// fill's sky seeding and still passed light for the sweeps. A generated lake read 0 on all
+// 128 of its cells from the flood fill and 13-14 from the sweeps. Fixed by seeding downward
+// as well as sideways; see the seeding loop in light.c and testLightTransparentTopStrip.
 //
 // No <3ds.h>: this file is host-testable like the rest of source/world.
 #pragma once
@@ -46,7 +63,18 @@
 // One channel of one column: 16*16*128 nibbles packed two to a byte along x,
 // cell index in chunk order extended over height (y major, then z, then x).
 #define LIGHT_COL_CELLS   (CHUNK_DIM * CHUNK_DIM * WORLD_HEIGHT)   // 32768
-#define LIGHT_COL_BYTES   (LIGHT_COL_CELLS / 2)                    // 4096
+#define LIGHT_COL_BYTES   (LIGHT_COL_CELLS / 2)                    // 16384
+
+// v1.8.0: the two figures above read 32768 and 4096 from v1.5.0 to v1.7.0. The cell
+// count was right and the byte count was a quarter of the truth — 32768/2 is 16384, not
+// 4096 — and the same 4x understatement was repeated in the prose here, in light.c's
+// LightColumn comment and in lightColumnAttach's doc below. The CODE was always correct
+// (every allocation, budget claim, release and memcpy uses sizeof(LightColumn)), so
+// nothing was mis-allocated; what was wrong was the number anyone reasoning about the
+// world budget would have read. Measured on the host: sizeof(LightColumn) is 32768 = 32
+// KiB, and at RENDER_DIST_MAX_COLUMNS (49) that is 1,605,632 B = 1.53 MB, 12.8% of
+// WORLD_BUDGET_BYTES — against the 0.38 MB the old comments implied.
+_Static_assert(LIGHT_COL_BYTES == 16384, "light column channel size drifted from its comment");
 
 static inline int lightIndex(int lx, int y, int lz)
 {
@@ -81,7 +109,7 @@ void  lightQueueInit(LightQueue* q);
 void  lightEngineInit(bool enable);
 bool  lightEnabled(void);
 
-// Attaches 8 KiB of zeroed light to a column (budget-claimed). Idempotent.
+// Attaches 32 KiB of zeroed light to a column (budget-claimed). Idempotent.
 // False only if the budget refused or the allocator failed — the column then has
 // no light and every consumer must treat that as "unlit", never as an error.
 bool  lightColumnAttach(Column* col);
@@ -109,11 +137,21 @@ const uint8_t* lightChannelBlock(const Column* col);
 // could not be attached, or q rejected an entry (counted, never expected).
 bool  lightPropagateColumn(World* w, int cx, int cz, LightQueue* q);
 
-// Full recompute of one column from its blocks, sweep engine. Same result as
-// lightPropagateColumn by construction-and-test, no queue needed. Edit path:
-// called after worldSet, before the remesh, so remeshed vertices bake the new
-// light in the same frame.
+// Full recompute of one column from its blocks, no queue needed from the caller. Edit path:
+// called after worldSet, before the remesh, so remeshed vertices bake the new light in the same
+// frame.
+//
+// v1.8.0: this runs the flood fill over a queue the engine owns. It used to run the sweeps
+// below, which measured 4.064 ms against the flood fill's 0.156 ms on one real generated column
+// — 26x, on every block broken or placed, on both consoles. See light.c's s_edit_queue.
 bool  lightRelightColumn(World* w, int cx, int cz);
+
+// The sweep engine, direct. Kept as the INDEPENDENT SECOND IMPLEMENTATION rather than as a code
+// path anything ships on: it reaches the same fixpoint by pulling where the flood fill pushes,
+// with no shared code beyond opaqueAt and the height map, so the host suite diffing the two is a
+// real check on both. Nothing outside the tests should call this — lightRelightColumn is the
+// edit path, and it only falls back here if the engine could not take its queue.
+bool  lightRelightColumnSweeps(World* w, int cx, int cz);
 
 int    lightColumnsAttached(void);
 size_t lightBytesUsed(void);   // budget bytes currently held by attached columns

@@ -4,6 +4,131 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.7.1] - 2026-08-24
+
+A repair release for the four things steve reported playing 1.7.0, plus the optimisation pass
+he asked for alongside them. No new terrain, no save-format break: worlds made in 1.7.0 open
+in 1.7.1 unchanged.
+
+One of the four did not survive contact with a measurement, and the entry below says so rather
+than claiming a fix that was never made.
+
+### Fixed
+
+- **Reloading a world dropped you inside your own blocks.** Reported as "the chunk I'm in
+  doesn't get loaded in… the other chunks do", and it looked exactly like that, but nothing was
+  failing to load. `worldgenHeight()` predicts terrain from the seed and the generator version
+  alone and never reads the live world, so a player who had built anything at the spawn cell was
+  placed back at the *original* ground height — inside their own blocks, camera included, with
+  back-face culling drawing nothing for the geometry immediately around them while columns
+  further out drew normally. `worldStandingY()` now steps the spawn up until it clears solid
+  blocks, capped at `WORLD_HEIGHT - 2`. A second, independent defect found in the same place:
+  `chunkRenderReleaseAll()` now clears the per-world mesh-slot table on world exit, which was
+  being carried into the next world.
+- **You now return to where you actually were, facing the way you were facing.** A 32-byte pose
+  sidecar per world (magic, version, CRC32, x/y/z/yaw/pitch), written on exit and read on entry.
+  It is loaded *before* the streaming ring starts, and the ring is centred on the pose's column —
+  the obvious ordering, with the ring started first, silently does nothing, because `worldGet()`
+  returns air for a chunk that is not resident yet and the un-stick step then has nothing to
+  stand on.
+- **Tall grass could not be broken.** Swinging at it did nothing at all, silently. The break was
+  gated on `inventoryCanHold()`, and `BLOCK_TALL_GRASS` is deliberately outside `BLOCK_COUNT` so
+  it can never become a hotbar item. Breaking and dropping are now two separate questions:
+  the plant breaks to air and drops nothing until the survival rung gives it a drop. No change to
+  `BLOCK_COUNT`, none to the server's block ceiling, and no protocol change.
+- **Worlds with saved changes reread the same region file once per column.** A two-entry region
+  and directory cache. Per-column read 39.2/43.5/56.0 µs to 3.34/3.34/3.64 µs; one 81-column area
+  3.2-4.5 ms to 0.27-0.29 ms; `fopen` calls 32,400 to 2, `dirRead` 32,400 to 2, across 81 columns
+  with zero mismatches. Costs 12,656 bytes of `.bss`. A host page cache flatters this — a real SD
+  card will show more.
+- **Frame-rate drops while walking.** Four separate costs, each measured before and after,
+  paired and interleaved in one process rather than as two runs:
+  - The mesher tested each cell's six neighbours once per pass and made seven passes. Exposure
+    is now computed once per cell into a face mask. Mean per-chunk mesh cost 69.14/68.42/75.64 µs
+    to 36.67/32.70/32.36 µs; worst chunk 145-157 µs to 74-92 µs; geometry hash `5bf6000fd3e99fab`
+    identical across 719 chunks, 245,820 faces, 983,280 vertices.
+  - Installing a generated column cost ~4.36 ms and had been hiding inside the mesh timer, so
+    every previous investigation attributed it to meshing. Since `Chunk` became opaque, install
+    walked the 4,096-cell buffer three times, the last with a linear palette search per cell. One
+    walk now builds the palette and a 256-entry lookup together. Whole install path 104.5 to
+    29.8 µs/column; `worldSetChunkAll` 4.2x. Contents hash `a8ed2826ea80538c` identical in both
+    arms across eight runs.
+  - `horizonHidden()` called `atan2f` roughly 5,800 times a frame, on a console with no hardware
+    transcendentals, and was timed by nothing. Every one of those results fed a comparison, and
+    an angle comparison is a cross-multiply, so all four are gone. 4.6x on x86 — a floor, not the
+    console figure, because x86 has hardware `atan2f` and an ARM11 at 268 MHz runs newlib's
+    software one.
+  - `scratchFillLight()` made 11,664 out-of-line light-channel calls per chunk build, 11,658 of
+    which returned the previous value. 2.9x, output byte-identical (hash `B7506C73` both arms).
+
+  Measured end to end on the emulator over an identical world snapshot restored before each arm,
+  same starting chunk: main-thread `cpu_ms` median 2.230 to 1.799, p95 3.330 to 2.476, p99 3.634
+  to 2.678, max 3.951 to 2.905, with median triangles drawn unchanged at 16,642 — the work was
+  removed, not the geometry. Over-budget mesh frames 26.2% to 11.3% against 1.7.0.
+- **A culling bug nobody had noticed**, found while proving the horizon rewrite equivalent. Over
+  697,968 enumerated configurations the old and new predicates disagree six times, and in all six
+  the *old* one is wrong: it culled a chunk that is genuinely inside the cone, because subtracting
+  two ~2.76 radian `atan2f` results loses the 1.5e-6 that decides it. Six holes in 139,514 culls.
+- **A save-corruption path in region compaction.** `regionCompact()` read only the live directory
+  copy, so a column whose newest payload had been torn by a power cut was dropped from the repack
+  *and* its recoverable older copy deleted. It now falls back to the older entry exactly as the
+  reader does. Compaction remains deliberately unwired — see below.
+- **`visgraphInvalidateTables()` shipped with no caller.** Added beside `mesherInvalidateTables()`
+  where a remote registry batch lands. A stale mesher table draws a face wrong; a stale visgraph
+  table culls a chunk that should have been drawn, which is a hole in the world.
+- **Every visibility timing this project has ever printed was wrong.** `chunkRenderProfileReset()`
+  reset the build count but not the tick accumulator, so `chunkRenderVisUs()` reported
+  ticks-since-boot as though they belonged to one build.
+- **Water no longer holds you under.** Reduced gravity and terminal velocity while submerged, a
+  swim-up impulse on jump, and half movement speed in water. `bodyStep()` asks whether it is in
+  water itself rather than taking a flag, because a flag every caller must remember to compute is
+  a flag one of them will not.
+
+### Added
+
+- **A 20 TPS simulation clock**, shared verbatim by the client and the dedicated server from one
+  file, so fluid spread, growth and smelting can be defined in ticks rather than in frames.
+  Nothing is on it yet. It also fixed a real server bug on the way: that server's tick rate rose
+  with network traffic, because it ticked once per `poll()` return.
+- **A coalescing relight worklist.** Rejoining a multiplayer world drained every stored diff for
+  a column the instant it installed, and every one fired a full 32,768-cell column relight of the
+  same column. Each column is now relit once per frame at most.
+- **A world-load profiler**, because the number everyone had been quoting was an artefact. The
+  emulator CSV's `frame_ms` is wall clock between two *in-world* frame boundaries, so across a
+  reload it spans the pause menu, the title screen, the world list and the test harness's own
+  sleeps and screenshots; the row reporting a 20,481 ms "frame" also reports 3.2 ms of CPU and
+  4 µs of meshing. `debug/loadprof.c` now times eleven named stages of world entry to
+  `sdmc:/blocksmith/load.csv`.
+
+### Measured and not fixed
+
+- **World loading does not double when a world has saved changes.** With the profiler in, a
+  reloaded edited world is *faster* than a fresh one — 104.0 ms against 135.4 ms on the host,
+  because 25 of its columns come off the card at 92 µs each instead of being generated at
+  1,388 µs each. The uncached region path fixed above is the only thing that fits the reported
+  symptom, and it is fixed.
+- **What world loading actually costs is terrain generation.** On the emulator, entering a world
+  takes 8,719 ms, of which 6,906 ms is generating 75 columns at 92 ms each — 79% of the load,
+  against 71.6 ms of region I/O for all 81. No fix here: the cheap approaches were tried and
+  measured worse. Hand-factoring the noise lattice's eight corner hashes is bit-correct and
+  slower (ARM11 codegen 508 to 535 instructions, 94 to 101 multiplies, host -10.5%), so it was
+  reverted with the numbers left at the call site. What did land is one integer division removed
+  from the fBm inner loop, taking `__aeabi_ldivmod` from 2 calls to 0 in the shipped ARM object —
+  8.1 million library calls per load, though what that is worth in cycles is unmeasured.
+- **Region compaction is still not wired to anything**, and that is deliberate rather than
+  forgotten. It is proven correct and crash-safe on the host (9,289 to 7,134 bytes, arena 3,113 to
+  958, 69% reclaimed), but its `remove()` then `rename()` window depends on `.tmp` durability on
+  an SD card and on `rename()` behaving on libctru's sdmc devoptab. Nothing in the region writer
+  fsyncs, and neither property can be tested anywhere except on the console.
+- **Whether the main thread stalls waiting for a save slot is now observable, not answered.**
+  `workerSubmitSave()` sleeps the main thread in 1 ms steps waiting for one of two slots, on a
+  worker pinned to the same core. The geometry that justified two slots is wrong — one
+  axis-aligned ring step unloads nine columns, not the three a diagonal crossing was said to need
+  — but the wait duration is worker-thread time plus an SD write and cannot be measured off the
+  console. Rather than change an untestable save path, the wait is now counted and shown on the
+  debug overlay. Building across three or more columns and walking sideways out of them will
+  settle it in one capture.
+
 ## [1.7.0] - 2026-08-24
 
 **If you installed 1.6.0, it did not start. This release fixes that, and you should install it.**

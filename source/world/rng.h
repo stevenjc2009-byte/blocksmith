@@ -49,6 +49,22 @@ static inline uint32_t rngHash3(uint32_t seed, int32_t x, int32_t y, int32_t z)
 	return h;
 }
 
+// **Do not hand-factor the corners of a lattice cell here.** Task 48b tried exactly that —
+// an rngHash3Cell() returning all eight corners of one cell by sharing the x and (x,z)
+// stages that the eight separate rngHash3 calls appear to recompute, 14 rngMix and 6
+// multiplies on paper instead of 24 and 24. It was bit-for-bit correct and it was SLOWER.
+//
+// The reason is that the sharing is not there to be won: with rngHash2 and rngHash3 both
+// `static inline`, GCC already common-subexpression-eliminates the shared stages across the
+// eight call sites in value3At. Measured on the ARM11 toolchain the game actually ships
+// with (-march=armv6k -mtune=mpcore -O2), world/noise.c compiled to 94 multiplies in 508
+// instructions BEFORE the factoring and 101 in 535 after it. On the host, timed against the
+// unfactored build in the same process, the factored form ran 0.974 ms against 0.881 ms
+// over 24,576 samples — 10.5 % worse, because writing the corners out through an array
+// costs more scheduling freedom than the arithmetic it saves.
+//
+// The optimiser sees this one. Spend the effort on calling the noise fewer times instead.
+
 // xorshift32. Period 2^32-1, and 0 is a fixed point — so seeding is forced away from it
 // rather than left as a trap for the caller.
 typedef struct {

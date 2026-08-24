@@ -1,0 +1,69 @@
+# Makefile.playerpose-test — host-only build for the single-player pose sidecar's unit test.
+#
+# Not part of the 3DS build (mc/Makefile, devkitARM). This compiles world/playerpose.c and
+# world/playerpose_test.c with a host gcc so task 46b's suite runs in a second under WSL,
+# exactly as source/net/Makefile.blockdiff-test does for the pending block-diff store.
+#
+# `make -f Makefile.playerpose-test test`   build and run the suite
+# `make -f Makefile.playerpose-test clean`  remove the built artefacts
+#
+# Kept alongside the stanza in tools/run_host_tests.sh rather than instead of it. The stanza
+# is what makes the suite the single thing that has to pass; this file is the finer warning
+# set — -Wconversion, -Wsign-conversion, -Wcast-qual, -Wshadow and the rest — on code that
+# parses a file off an SD card that a power cut may have torn in half. Same division of
+# labour Makefile.blockdiff-test and Makefile.networld-test have, and the same obligation:
+# keep the file list below in step with the stanza's when one changes.
+#
+# The link is wider than playerpose.c alone because playerPoseUnstick() calls the REAL
+# worldStandingY() — this project's rule is that a test links the real module rather than a
+# copy of it, and the un-stick is the one part of task 46b whose bug (a restored player
+# buried inside their own blocks) is invisible in a copy. world.c drags in block.c,
+# registry.c, chunk.c and budget.c, and tests/net_stub.c supplies networldOnColumnLoad,
+# which is the same set tools/run_host_tests.sh's interact stanza links for the same reason.
+
+CC ?= cc
+
+# Run from source/world, so the tree root is two levels up — that is what -I../.. resolves
+# this module's own "world/playerpose.h" includes against, the same root the 3DS build uses.
+ROOT := ../..
+
+CFLAGS := -std=c11 -O2 -g \
+          -Wall -Wextra -Werror \
+          -Wformat=2 -Wconversion -Wsign-conversion -Wshadow \
+          -Wstrict-prototypes -Wmissing-prototypes -Wpointer-arith \
+          -Wvla -Wcast-qual -Wundef \
+          -I$(ROOT)/source
+
+# Everything lands in BUILD, never beside the sources, for the reason
+# Makefile.blockdiff-test spells out: mc/Makefile puts source/world on VPATH, so a
+# host-built .o sitting in this directory is found by the console build's implicit rules,
+# which then skip compiling it into build/ and hand ld a name it cannot resolve. A whole 3DS
+# link died that way once.
+BUILD := build-playerpose
+
+SRCS := $(ROOT)/source/world/playerpose.c \
+        $(ROOT)/source/world/playerpose_test.c \
+        $(ROOT)/source/world/world.c \
+        $(ROOT)/source/world/block.c \
+        $(ROOT)/source/world/registry.c \
+        $(ROOT)/source/world/chunk.c \
+        $(ROOT)/source/world/budget.c \
+        $(ROOT)/source/world/crc32.c \
+        $(ROOT)/tests/net_stub.c
+
+.PHONY: test clean
+
+$(BUILD):
+	mkdir -p $(BUILD)
+
+$(BUILD)/playerpose_test: $(SRCS) | $(BUILD)
+	$(CC) $(CFLAGS) $(SRCS) -o $@
+
+# Run from the repository root, not from here: playerpose_test.c's last scenario reads
+# source/main.c's text to prove main.c is wired, and it names that path relative to the root
+# the way app/session_test.c does.
+test: $(BUILD)/playerpose_test
+	cd $(ROOT) && ./source/world/$(BUILD)/playerpose_test
+
+clean:
+	rm -rf $(BUILD)

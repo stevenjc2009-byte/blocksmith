@@ -42,6 +42,15 @@ void playerUpdate(Player* p, const World* w, float dt_ms)
 	const u32 held = hidKeysHeld();
 	float ix = 0.0f, iz = 0.0f;
 
+	// v1.8.0 task 25. Asked once, here, and used by all three of the movement decisions
+	// below — the walk speed, the vertical input, and (asked again inside bodyStep, which
+	// owns its own answer so every caller of it gets water physics) the fall. Every rule
+	// it feeds lives in world/physics.c: this file includes <3ds.h> through input_map.h
+	// and cannot be linked into the host suite, so a decision left here is a decision
+	// nothing checks. world_test.c's testPlayerWiresSwimming reads this file as text for
+	// exactly that reason.
+	const bool submerged = bodySubmerged(w, &p->body);
+
 	// Step 8.4. The four directions come from the player's bindings rather than from KEY_DUP
 	// and friends directly. app/input_map.c answers with exactly those defaults until an
 	// options.ini says otherwise, so an unconfigured console walks on the D-pad as it always
@@ -55,19 +64,21 @@ void playerUpdate(Player* p, const World* w, float dt_ms)
 	// Two directions at once must not be faster than one. The D-pad only ever produces
 	// unit or 45-degree vectors, so this is a single normalise rather than a special case
 	// per diagonal.
+	const float speed = bodyWalkSpeed(submerged);
 	const float len = sqrtf(ix * ix + iz * iz);
 	if (len > 0.0001f) {
-		ix = ix / len * PLAYER_WALK_SPEED;
-		iz = iz / len * PLAYER_WALK_SPEED;
+		ix = ix / len * speed;
+		iz = iz / len * speed;
 	}
 
 	p->body.vx = ix;
 	p->body.vz = iz;
 
-	// Grounded only: holding jump must not fly. on_ground is set by bodyMove when a
-	// downward move is stopped, so it is already false on the frame after a jump.
-	if ((hidKeysDown() & inputKey(ACTION_JUMP)) && p->body.on_ground)
-		p->body.vy = PLAYER_JUMP_SPEED;
+	// Grounded single impulse on land, sustained rise in water. Both rules are in
+	// world/physics.c's bodyJump; this passes it the level and the edge and lets it
+	// decide, so the whole truth table is covered by the host suite.
+	const u32 jump_bit = inputKey(ACTION_JUMP);
+	bodyJump(&p->body, submerged, (held & jump_bit) != 0, (hidKeysDown() & jump_bit) != 0);
 
 	bodyStep(&p->body, w, dt);
 

@@ -95,6 +95,17 @@ static inline bool visConnected(uint16_t mask, int a, int b)
 // silently occluding half a forest.
 uint16_t visChunkConnectivity(const Chunk* c, VisScratch* sc);
 
+// Drops the derived per-block-id table so the next visChunkConnectivity() rebuilds it — the
+// exact counterpart of world/mesher.h's mesherInvalidateTables(), and for the same reason:
+// the table is derived from the block registry, and the registry gains rows at join.
+//
+// Calling it is optional rather than load-bearing, which is the one place this differs from
+// the mesher's version. visgraph.c keys its cache on the registry's own contents as well, so
+// a call site that forgets pays for a rebuild instead of reading a stale table. It is exported
+// anyway because "I have just changed the registry, drop what you derived from it" is a thing
+// a caller should be able to say without knowing how the cache decides.
+void visgraphInvalidateTables(void);
+
 // ---------------------------------------------------------------------------------------
 // The per-frame walk.
 
@@ -122,6 +133,13 @@ typedef struct {
 	// A cell is pushed once per new entry face, so six pushes per cell is the ceiling — plus
 	// one for the camera's own cell, which is seeded through no face at all and can still be
 	// entered through all six later.
+	//
+	// An entry is the cell's *local coordinates* packed four bits per axis (see VIS_Q_PACK in
+	// visgraph.c), NOT its linear index. Both fit in the same uint16_t, and the packed form is
+	// what lets the pop loop recover x/y/z with masks and shifts. The linear index is the one
+	// thing the loop can produce cheaply from the coordinates (two multiplies via cellIndex);
+	// going the other way costs three integer divisions, and the ARM11 has no divide
+	// instruction — see the comment on visWalkRun's pop loop for the measurement.
 	uint16_t queue[VIS_BOX_CELLS * BLOCK_FACES + 1];
 } VisWalk;
 

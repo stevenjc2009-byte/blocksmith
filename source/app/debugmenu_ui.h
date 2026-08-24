@@ -29,6 +29,13 @@ typedef struct {
 	uint32_t    tris;
 	int         culled;
 
+	// Simulation clock (v1.8.0 task 21). `tps` is measured against the system tick counter, not
+	// asserted from the constant, so a console that cannot keep up shows a number below 20 here
+	// instead of lying. `ticks_dropped` is the catch-up clamp's count: nonzero means simulation
+	// time has fallen behind wall-clock time and stayed there.
+	float       tps;
+	uint64_t    ticks_dropped;
+
 	// World stats
 	int         columns;
 	int         chunks;

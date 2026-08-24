@@ -252,10 +252,55 @@ int bodyMove(Body* b, const World* w, float dx, float dy, float dz)
 	return blocked;
 }
 
+// v1.8.0 task 25. Only the CENTRE column is probed, not the whole box the way
+// bodyBlocked() sweeps it, and that is deliberate rather than an economy: water is not
+// solid, so there is no overlap to resolve — the question is "is the player in the water",
+// and a body whose centre line is in a water cell is in the water. Probing the corners
+// would make a body standing with 0.05 of its width over a shoreline cell count as
+// swimming, which is the wrong answer and a more expensive way to get it.
+bool bodySubmerged(const World* w, const Body* b)
+{
+	const int bx = floorToInt(b->x);
+	const int bz = floorToInt(b->z);
+
+	if (blockInfo(worldGet(w, bx, floorToInt(b->y), bz))->liquid) return true;
+	return blockInfo(worldGet(w, bx, floorToInt(b->y + PLAYER_EYE), bz))->liquid;
+}
+
+float bodyWalkSpeed(bool submerged)
+{
+	return submerged ? PLAYER_WALK_SPEED * PLAYER_WATER_SPEED_MUL : PLAYER_WALK_SPEED;
+}
+
+void bodyJump(Body* b, bool submerged, bool jump_held, bool jump_pressed)
+{
+	if (submerged) {
+		// Raised TO the swim speed, never set to it: a body that entered the water
+		// already rising faster -- kicked off the bottom, or swum up out of a current --
+		// must not be slowed down by holding the button that is supposed to lift it.
+		if (jump_held && b->vy < PLAYER_SWIM_UP_SPEED) b->vy = PLAYER_SWIM_UP_SPEED;
+		return;
+	}
+
+	// Unchanged from before task 25, and stated as the ELSE of the branch above rather
+	// than as a second independent `if`: two writers to vy on one frame would make the
+	// outcome depend on line order, which is the bug shape scene/title_nav.c was extracted
+	// over. On land the jump is an edge, not a level, or holding the button flies.
+	if (jump_pressed && b->on_ground) b->vy = PLAYER_JUMP_SPEED;
+}
+
 int bodyStep(Body* b, const World* w, float dt_s)
 {
-	b->vy += PLAYER_GRAVITY * dt_s;
-	if (b->vy < PLAYER_TERMINAL) b->vy = PLAYER_TERMINAL;
+	// Buoyancy: a much weaker pull and a much lower terminal, chosen together in
+	// physics.h. The terminal is the half that makes hitting the surface at speed feel
+	// like water rather than like a slower kind of air -- a body arriving at -60 is
+	// snapped to the water terminal on this very tick, before it moves.
+	const bool  submerged = bodySubmerged(w, b);
+	const float gravity   = submerged ? PLAYER_WATER_GRAVITY  : PLAYER_GRAVITY;
+	const float terminal  = submerged ? PLAYER_WATER_TERMINAL : PLAYER_TERMINAL;
+
+	b->vy += gravity * dt_s;
+	if (b->vy < terminal) b->vy = terminal;
 
 	return bodyMove(b, w, b->vx * dt_s, b->vy * dt_s, b->vz * dt_s);
 }

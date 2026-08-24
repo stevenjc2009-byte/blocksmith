@@ -81,6 +81,14 @@ bool chunkRenderBuild(const World* w, int cx, int cy, int cz);
 // entirely has nothing to stay queueable for.
 int chunkRenderReleaseColumn(int cx, int cz);
 
+// v1.7.1 task 46. Hands the WHOLE pool back, arenas and shader untouched. Call this when a
+// world is torn down but the process lives on — i.e. quit-to-title, which is the one path that
+// frees the World and then goes back to the menu. Without it the slot table carries the
+// previous world's chunks into the next one: their geometry is still drawn at those
+// coordinates, and their slots are unavailable to the new world's meshing. See the definition
+// for why this is not chunkRenderExit + chunkRenderInit.
+void chunkRenderReleaseAll(void);
+
 // One block changed: marks what that can have altered as needing a remesh and returns
 // immediately — it does no meshing itself. Not just the owning chunk — see world/remesh.h
 // for why a corner edit reaches eight. Chunks with no mesh yet are left alone, so this

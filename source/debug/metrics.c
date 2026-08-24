@@ -5,6 +5,11 @@
 #include <string.h>
 #include <sys/stat.h>
 
+// For BS_BOTTOM_UI, which decides whether this file has a console to print the overlay
+// into at all — gfx/screen.c's consoleInit is inside the same switch. See the comment on
+// metricsDrawOverlay below.
+#include "gfx/screen.h"
+
 #define CSV_PATH        "sdmc:/blocksmith/frames.csv"
 #define CSV_DIR         "sdmc:/blocksmith"
 #define CSV_RING        1024  // samples the writer thread can fall behind by
@@ -31,6 +36,9 @@ typedef struct {
 	u32   linear_free;
 	u32   draws;       // draw calls this frame
 	u32   tris;        // triangles handed to the GPU this frame
+	// v1.7.1 task 49. What the main thread spent the frame on, so a slow row says why and
+	// where instead of only how slow. See MetricsWork in the header.
+	MetricsWork work;
 } Sample;
 
 // How many identical readings in a row mean the console is not timing the GPU at
@@ -38,6 +46,10 @@ typedef struct {
 #define GPU_STUCK_FRAMES 120
 
 static FILE*  s_csv;
+
+// v1.7.1 task 49. This frame's work annotation, filled by main.c through metricsSetWork and
+// copied into the sample at metricsFrameEnd. Main thread only, like every other counter here.
+static MetricsWork s_work;
 
 // Frame samples are handed to a writer thread through a single-producer,
 // single-consumer ring. The frame loop never touches the filesystem.
@@ -111,14 +123,22 @@ static void csvDrain(void)
 	while (tail != s_head) {
 		const Sample* s = &s_ring[tail & (CSV_RING - 1)];
 		n += snprintf(buf + n, sizeof(buf) - (size_t)n,
-		              "%lu,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%lu,%lu,%lu\n",
+		              "%lu,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%lu,%lu,%lu"
+		              ",%ld,%ld,%.3f,%.3f,%.3f,%.3f,%u,%u\n",
 		              (unsigned long)s->frame, s->frame_ms, s->cpu_ms, s->gpu_ms,
 		              s->sync_ms, s->submit_ms, s->cmdbuf,
 		              (unsigned long)s->linear_free,
-		              (unsigned long)s->draws, (unsigned long)s->tris);
+		              (unsigned long)s->draws, (unsigned long)s->tris,
+		              (long)s->work.player_cx, (long)s->work.player_cz,
+		              s->work.recenter_ms, s->work.relight_ms,
+		              s->work.mesh_ms, s->work.save_ms,
+		              (unsigned)s->work.built, (unsigned)s->work.meshq);
 		tail++;
 
-		if (n > (int)sizeof(buf) - 160) {
+		// Raised from 160 with the eight task-49 columns: the reserve has to cover the
+		// LONGEST row this loop can emit, not a typical one, or the last row before a flush
+		// gets truncated mid-number and every column after it in that row shifts left.
+		if (n > (int)sizeof(buf) - 260) {
 			fwrite(buf, 1, (size_t)n, s_csv);
 			n = 0;
 		}
@@ -151,7 +171,9 @@ void metricsInit(void)
 	s_csv = fopen(CSV_PATH, "w");
 	if (s_csv) {
 		fprintf(s_csv, "frame,frame_ms,cpu_ms,gpu_ms,sync_ms,submit_ms,"
-		               "cmdbuf_usage,linear_free_bytes,draws,tris\n");
+		               "cmdbuf_usage,linear_free_bytes,draws,tris,"
+		               "player_cx,player_cz,recenter_ms,relight_ms,mesh_ms,save_ms,"
+		               "built,meshq\n");
 		fflush(s_csv);
 	}
 
@@ -196,6 +218,17 @@ void metricsFrameBegin(void)
 
 	s_draws = 0;
 	s_tris  = 0;
+
+	// v1.7.1 task 49. Cleared here rather than left standing, so a frame that never calls
+	// metricsSetWork records zeros. Carrying the last value forward would smear one
+	// boundary-crossing recentre across every frame after it, and the CSV would say the
+	// spike never ended.
+	memset(&s_work, 0, sizeof s_work);
+}
+
+void metricsSetWork(const MetricsWork* w)
+{
+	s_work = *w;
 }
 
 void metricsCountDraw(u32 tris)
@@ -230,6 +263,7 @@ void metricsFrameEnd(void)
 	s_now.linear_free = (u32)linearSpaceFree();
 	s_now.draws       = s_draws;
 	s_now.tris        = s_tris;
+	s_now.work        = s_work;
 
 	if (s_now.frame > 0 && s_now.gpu_ms == gpu_prev) s_gpu_same++;
 	else                                             s_gpu_same = 0;
@@ -259,6 +293,31 @@ void metricsFrameEnd(void)
 		else          csvDrain();   // no thread: fall back to writing inline
 	}
 }
+
+// v1.7.1 task 49. Everything from here to the end of metricsDrawOverlay is compiled only
+// into a build that actually has a text console to print into, and the default build does
+// not have one.
+//
+// The two are the same switch because they are the same fact. gfx/screen.c calls consoleInit
+// exactly once, inside `#if !BS_BOTTOM_UI` (screen.c:21-35); a BS_BOTTOM_UI build never calls
+// it, because consoleInit claims the bottom framebuffer and the bottom screen is the game's
+// UI in that build. BS_BOTTOM_UI defaults to 1 (gfx/screen.h:36-38), so in every shipped CIA
+// these seventeen printf calls — with about ten float conversions among them, on every
+// fifteenth frame, forever — formatted a screen of text into a stream with no console behind
+// it. newlib still runs the formatting and still makes a write syscall per line for that.
+//
+// It is gated rather than deleted because the output is not dead in every build: the project's
+// probe and measurement builds are built with `-DBS_BOTTOM_UI=0` precisely so this overlay
+// comes back (see the ⚠ note in gfx/screen.h), and it is the only way a number gets read back
+// out of the emulator. Deleting it would have quietly cost every future probe its instrument.
+//
+// What this is NOT: a frame-time fix. Bucketing 3,522 real captured frames by `frame % 15`
+// gives medians of 1.796, 1.827, 1.840, 1.827, 1.821, 1.791, 1.798, 1.798, 1.798, 1.797,
+// 1.826, 1.791, 1.810, 1.845 and 1.835 ms — flat, with the overlay frames indistinguishable
+// from the other fourteen. Whatever this costs, Azahar was not charging for it, and no
+// speed-up is claimed here. What is claimed is narrower and certain: work that produces
+// nothing anyone can read is not done any more in the build the player runs.
+#if !BS_BOTTOM_UI
 
 // Oldest-to-newest ASCII bar of recent frame times, scaled so a full-height bar
 // is twice the 60 fps budget. '|' marks a frame that missed the budget.
@@ -339,6 +398,18 @@ void metricsDrawOverlay(const char* status)
 	printf("X break  Y place  SELECT 3D    \n");
 	printf("L/R render dist  START exit    \n");
 }
+
+#else   // BS_BOTTOM_UI: there is no console, so there is nothing to draw the overlay on
+
+// Kept as a real function rather than a macro in the header so main.c's call site, its
+// rate-limit comment and the `status` string it builds all stay exactly as they are — the
+// only thing that changes between the two builds is whether anything is printed.
+void metricsDrawOverlay(const char* status)
+{
+	(void)status;
+}
+
+#endif  // !BS_BOTTOM_UI
 
 void metricsWorstReset(void)
 {

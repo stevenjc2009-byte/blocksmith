@@ -272,56 +272,74 @@ void chunkDecompressAll(const Chunk* c, BlockId out[CHUNK_BLOCKS])
 	chunkCopyRun(c, 0, CHUNK_BLOCKS, out);
 }
 
-// Shared by chunkFormForAll and chunkLoadAll so the two can never disagree about what a
+// Shared by chunkPlanAll and chunkLoadPlanned so the two can never disagree about what a
 // flat buffer's distinct-id count is: builds the palette in first-seen order and stops
 // tracking, reporting -1, the moment a 17th distinct id shows up -- RAW is coming
 // regardless at that point, so there is no reason to keep scanning for more of them.
-static int buildPalette16(const BlockId in[CHUNK_BLOCKS], BlockId pal[16])
+//
+// v1.7.1 task 49: the "have I seen this id" test was a linear walk of the palette built so
+// far, i.e. up to 16 compares for every one of the 4096 cells. BlockId is a single byte, so
+// a 256-entry slot table answers it in one load and doubles as the id -> slot map the
+// PALETTE4 commit needs -- which is how chunkLoadPlanned below drops its own 16-way search
+// as well. The palette this produces is identical, entry for entry and in the same
+// first-seen order.
+static int buildPlan(const BlockId in[CHUNK_BLOCKS], ChunkPlan* plan)
 {
+	memset(plan->slot_of, 0xFF, sizeof(plan->slot_of));
+
 	int n = 0;
 	for (int i = 0; i < CHUNK_BLOCKS; i++) {
 		const BlockId id = in[i];
-		bool seen = false;
-		for (int j = 0; j < n; j++)
-			if (pal[j] == id) { seen = true; break; }
-		if (seen) continue;
-		if (n == 16) return -1;
-		pal[n++] = id;
+		if (plan->slot_of[id] != 0xFF) continue;
+		if (n == 16) { plan->count = -1; return -1; }
+		plan->slot_of[id] = (uint8_t)n;
+		plan->palette[n++] = id;
 	}
+
+	plan->count = n;
 	return n;
 }
 
-ChunkForm chunkFormForAll(const BlockId in[CHUNK_BLOCKS])
+ChunkForm chunkPlanAll(const BlockId in[CHUNK_BLOCKS], ChunkPlan* plan)
 {
-	BlockId pal[16];
-	const int n = buildPalette16(in, pal);
+	const int n = buildPlan(in, plan);
 	if (n < 0) return CHUNK_FORM_RAW;
 	if (n == 1) return CHUNK_FORM_UNIFORM;
 	return CHUNK_FORM_PALETTE4;
 }
 
-bool chunkLoadAll(Chunk* c, const BlockId in[CHUNK_BLOCKS])
+ChunkForm chunkFormForAll(const BlockId in[CHUNK_BLOCKS])
 {
-	BlockId pal[16];
-	const int n = buildPalette16(in, pal);
+	ChunkPlan plan;
+	return chunkPlanAll(in, &plan);
+}
+
+bool chunkLoadPlanned(Chunk* c, const BlockId in[CHUNK_BLOCKS], const ChunkPlan* plan)
+{
+	const int n = plan->count;
 
 	if (n == 1) {
 		// Never fails: chunkClear only ever shrinks or holds steady.
-		chunkClear(c, pal[0]);
+		chunkClear(c, plan->palette[0]);
 		return true;
 	}
 
 	if (n > 0) {
 		Palette4* p = (Palette4*)malloc(sizeof(Palette4));
 		if (!p) return false;   // c untouched
-		memcpy(p->palette, pal, (size_t)n * sizeof(BlockId));
+		memcpy(p->palette, plan->palette, (size_t)n * sizeof(BlockId));
 		p->pal_n = (uint8_t)n;
-		for (int i = 0; i < CHUNK_BLOCKS; i++) {
-			int slot = 0;
-			for (int j = 0; j < n; j++)
-				if (pal[j] == in[i]) { slot = j; break; }
-			setNibble(p->indices, i, (uint8_t)slot);
-		}
+
+		// Two cells per byte, written once. setNibble is a load, a mask and a store per
+		// CELL -- so the same byte was fetched, half-cleared and written back twice. After
+		// the alignment CHUNK_BLOCKS guarantees (it is even, and this run starts at 0) the
+		// low nibble is always the even cell and the high nibble always the odd one, which
+		// is setNibble's convention exactly, unrolled rather than changed.
+		const uint8_t* lut = plan->slot_of;
+		uint8_t*       ind = p->indices;
+		for (int i = 0; i < CHUNK_BLOCKS; i += 2)
+			ind[i >> 1] = (uint8_t)(lut[in[i]] | (uint8_t)(lut[in[i + 1]] << 4));
+
 		freePayload(c);
 		c->form = CHUNK_FORM_PALETTE4;
 		c->payload.p4 = p;
@@ -336,6 +354,13 @@ bool chunkLoadAll(Chunk* c, const BlockId in[CHUNK_BLOCKS])
 	c->form = CHUNK_FORM_RAW;
 	c->payload.raw = raw;
 	return true;
+}
+
+bool chunkLoadAll(Chunk* c, const BlockId in[CHUNK_BLOCKS])
+{
+	ChunkPlan plan;
+	chunkPlanAll(in, &plan);
+	return chunkLoadPlanned(c, in, &plan);
 }
 
 // Step 9.2d. See chunk.h for the contract -- this is a plain copy out of the Palette4 struct

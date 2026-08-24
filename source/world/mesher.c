@@ -610,6 +610,43 @@ static EmitCell s_emit[CHUNK_BLOCKS];
 static int      s_emit_opaque_n;   // opaque cells, [0, s_emit_opaque_n)
 static int      s_emit_alpha_lo;   // transparent cells, [s_emit_alpha_lo, CHUNK_BLOCKS)
 
+// v1.7.1 task 49. Which of a listed cell's six faces is NOT covered by the neighbour it looks
+// at, one bit per FACE_* index, parallel to s_emit by list position. Written once here, read
+// by the seven walks in meshPass instead of each of them re-reading s_cell_occl at its own
+// neighbour offset.
+//
+// This is the measured fix for task 49, so the reasoning belongs next to it. The opaque
+// geometry is emitted face-major (see meshChunk), which means the emit list is walked SIX
+// times, and until this task every one of those walks visited every drawable cell in the
+// chunk — 4,096 of them in buried rock — only to discover for 22 of every 24 faces that the
+// neighbour covers it. A host profile over 719 real generated chunks (seed 1337,
+// GEN_VERSION_DENSITY, scratchpad/t49m_meshprofile.c) put 86 % of meshChunk's time inside
+// those six walks, and showed the cost tracking the number of CELLS rather than the number of
+// quads actually emitted: chunks holding 3,584-4,096 drawable cells averaged 83.5 us in the
+// opaque passes while emitting 239 quads, and chunks holding 2,048-2,559 cells averaged
+// 69.4 us while emitting 734. Three times the geometry for less time — so what was being paid
+// for was the traversal, not the emission.
+//
+// Two things follow, and both are done below. A cell with no exposed face at all can never
+// emit anything from any of the six walks, so it is not put on the list; in buried rock that
+// is the overwhelming majority of it. And a cell that IS on the list carries its answer as a
+// bit, so the walk for one direction tests a byte it is already streaming through rather than
+// making an indirect load into the 5,832-byte occlusion table at a ±1 / ±18 / ±324 offset.
+//
+// A parallel byte array rather than a sixth field in EmitCell, deliberately. EmitCell is
+// 6 bytes and padding a seventh out to 8 would take s_emit from 24 KB of .bss to 32 KB on a
+// console where that is real memory. More to the point, most iterations of a per-direction
+// walk do not want the EmitCell at all — they want to look at one bit and move on — so
+// keeping the bits in their own array means such an iteration touches one byte instead of
+// six, and both arrays are still walked strictly forwards, which is what the cache wants.
+//
+// 4 KB of .bss, on top of s_emit's 24 KB, static for the same reason that one is.
+static uint8_t  s_emit_face[CHUNK_BLOCKS];
+
+// Every face uncovered: what a cell is given when the six-neighbour test does not decide
+// whether it emits. See the non-cube case in emitCollect.
+#define EMIT_ALL_FACES  ((uint8_t)((1u << BLOCK_FACES) - 1))
+
 // Both halves in one sweep, growing towards each other from the two ends of one array. They
 // cannot collide: together they are at most the 4,096 cells of a chunk.
 //
@@ -686,8 +723,43 @@ static void emitCollect(const MeshScratch* s)
 					if (!s_cell_draw[sik]) continue;
 
 					const BlockId id = s->blocks[sik];
-					EmitCell*     e  = s_deferred[id] ? &s_emit[--alpha] : &s_emit[opaque++];
 
+					// v1.7.1 task 49. The cell's exposure, decided once here instead of six
+					// times over in the walks below — see s_emit_face for the measurement
+					// that made this the shape of the fix.
+					//
+					// The six offsets are s_plan[face].neighbour, read from the same table
+					// meshPass reads, so the two can never disagree about which cell a face
+					// looks at. They are not spelled out as ±1 / ±SCRATCH_DIM / ±SCRATCH_DIM²
+					// here for exactly that reason: kFaces is the source of truth for face
+					// geometry and this must not become a second copy of it.
+					uint8_t mask = 0;
+					for (int face = 0; face < BLOCK_FACES; face++)
+						if (!s_cell_occl[sik + s_plan[face].neighbour])
+							mask |= (uint8_t)(1u << face);
+
+					// A shape that is not a full cube is emitted whole by emitCross and never
+					// through the six-face loop, so no neighbour can hide it and the mask
+					// above is not the question for it. It is listed unconditionally with
+					// every bit set: a plant walled in on all six sides still draws, exactly
+					// as it did before this task, and a mask of 0 must not be allowed to drop
+					// it off the list.
+					const bool cube = s_shape[id] == BLOCK_SHAPE_FULL_CUBE;
+					if (cube) {
+						// Nothing exposed: every one of the six walks would reach this cell,
+						// test the neighbour, and skip. Leaving it off the list is exact, not
+						// an approximation — mergeRun cannot pull it back in either, because
+						// mergeCandidate applies the same s_cell_occl test to a run's next
+						// cell before absorbing it.
+						if (!mask) continue;
+					} else {
+						mask = EMIT_ALL_FACES;
+					}
+
+					const int   at = s_deferred[id] ? --alpha : opaque++;
+					EmitCell*   e  = &s_emit[at];
+
+					s_emit_face[at] = mask;
 					e->si = (uint16_t)sik;
 					e->id = (uint8_t)id;
 					e->lx = (uint8_t)(lx + k);
@@ -706,9 +778,17 @@ static void emitCollect(const MeshScratch* s)
 // whether same-material culling applies, and it is constant for the whole pass, so the opaque
 // pass pays nothing for it. [face_first, face_end) selects which face directions to emit, so
 // the caller can lay the opaque run out face-major — see meshChunk.
-static void meshPass(MeshOut* out, const MeshScratch* s, const EmitCell* cells, int n,
+static void meshPass(MeshOut* out, const MeshScratch* s, const EmitCell* cells,
+                     const uint8_t* masks, int n,
                      bool deferred, int face_first, int face_end, bool lit)
 {
+	// v1.7.1 task 49. Which bits of a cell's s_emit_face byte this pass could possibly act
+	// on — one bit for an opaque pass, all six for the transparent one. Built once, outside
+	// the loop, so the rejection below is a single AND against a value already in a register.
+	uint8_t want = 0;
+	for (int face = face_first; face < face_end; face++)
+		want |= (uint8_t)(1u << face);
+
 	for (int k = 0; k < n; k++) {
 		// Forwards through the opaque list, backwards through the transparent one — which
 		// is the SAME spatial order, because emitCollect fills the transparent half from the
@@ -719,7 +799,18 @@ static void meshPass(MeshOut* out, const MeshScratch* s, const EmitCell* cells, 
 		// transparent half in list order would have met every run from its far end and
 		// merged almost nothing. Emission order inside the transparent run is free: it is
 		// one alpha-tested cutout draw, order-independent within itself.
-		const EmitCell* e  = &cells[deferred ? n - 1 - k : k];
+		const int idx = deferred ? n - 1 - k : k;
+
+		// v1.7.1 task 49, and this is the whole point of the step: a cell with nothing
+		// exposed in the direction THIS pass emits costs one byte load and one test, and the
+		// six-byte EmitCell beside it is never touched. An opaque pass over a buried chunk is
+		// almost entirely this branch. Correctness is unchanged — the bit is exactly the
+		// `!s_cell_occl[si + s_plan[face].neighbour]` the loop below used to compute for
+		// itself, written once by emitCollect from the same s_plan table.
+		const uint8_t fm = masks[idx];
+		if (!(fm & want)) continue;
+
+		const EmitCell* e  = &cells[idx];
 		const int       si = e->si;
 
 		// Drawable implies a real registry row, since s_draws says no for every id with
@@ -745,18 +836,22 @@ static void meshPass(MeshOut* out, const MeshScratch* s, const EmitCell* cells, 
 		}
 
 		for (int face = face_first; face < face_end; face++) {
-			// Already emitted, as the middle of a run some earlier cell started. Tested
-			// first because it is one byte load and it is the only test that can be true
-			// for a cell that would otherwise pass every check below.
-			if (s_face_done[si] & (uint8_t)(1u << face)) continue;
-
-			const int ni = si + s_plan[face].neighbour;
-
 			// A face is hidden only by a neighbour that actually covers it. That is the
 			// test which removes 22 of every 24 faces in solid rock, and it reads the
 			// border of the scratch, so chunk seams are culled against the real neighbour
 			// instead of guessing air.
-			if (s_cell_occl[ni]) continue;
+			//
+			// Since v1.7.1 task 49 it is read out of the cell's exposure byte rather than
+			// out of s_cell_occl at the neighbour's offset. Same answer, from the same
+			// table, computed once per cell by emitCollect instead of once per cell per
+			// walk — see s_emit_face. It stays first because it is now a test against a
+			// value already in hand, so it is the cheapest of the three.
+			if (!(fm & (uint8_t)(1u << face))) continue;
+
+			// Already emitted, as the middle of a run some earlier cell started. One byte
+			// load, and the only test that can be true for a cell that would otherwise pass
+			// every check below.
+			if (s_face_done[si] & (uint8_t)(1u << face)) continue;
 
 			// ...and, in the transparent pass only, by a neighbour of the same material.
 			// This is what keeps a canopy cheap: leaf against leaf is culled, so the pass
@@ -771,7 +866,14 @@ static void meshPass(MeshOut* out, const MeshScratch* s, const EmitCell* cells, 
 			// not about collision. Identical today — leaves are the only transparent
 			// block and they are solid — and it is what will keep a body of water from
 			// meshing every internal face when water arrives non-solid.
-			if (deferred && s_cell_draw[ni] && s->blocks[ni] == e->id) continue;
+			//
+			// The neighbour index is resolved inside this branch since task 49, because the
+			// occlusion test above no longer needs it and the opaque pass — six of the seven
+			// walks — never reaches here at all.
+			if (deferred) {
+				const int ni = si + s_plan[face].neighbour;
+				if (s_cell_draw[ni] && s->blocks[ni] == e->id) continue;
+			}
 
 			// v1.6.0 task 11. How many blocks along u this face can swallow, and then one
 			// quad for the lot. width 1 is the ordinary case and emits exactly what the
@@ -826,7 +928,7 @@ void meshChunk(MeshOut* out, const MeshScratch* s)
 	out->face_start[0] = 0;
 	for (int slot = 0; slot < BLOCK_FACES; slot++) {
 		const int face = kFaceOrder[slot];
-		meshPass(out, s, s_emit, s_emit_opaque_n, false, face, face + 1, lit);
+		meshPass(out, s, s_emit, s_emit_face, s_emit_opaque_n, false, face, face + 1, lit);
 		out->face_start[slot + 1] = out->index_count;
 	}
 
@@ -841,6 +943,8 @@ void meshChunk(MeshOut* out, const MeshScratch* s)
 	// The transparent pass. Not bucketed by face: it is a few percent of the geometry, and it
 	// is drawn back-to-front as one ordered sequence. A chunk with no transparent blocks — most
 	// of them — passes a count of zero here and the call returns immediately.
-	meshPass(out, s, &s_emit[s_emit_alpha_lo], CHUNK_BLOCKS - s_emit_alpha_lo,
-	         true, 0, BLOCK_FACES, lit);
+	// The exposure bytes are parallel to s_emit by list position, so the transparent half's
+	// slice of them starts at the same index its cells do.
+	meshPass(out, s, &s_emit[s_emit_alpha_lo], &s_emit_face[s_emit_alpha_lo],
+	         CHUNK_BLOCKS - s_emit_alpha_lo, true, 0, BLOCK_FACES, lit);
 }

@@ -34,6 +34,7 @@
 #include "app/gputest.h"
 #include "app/watchdog.h"
 #include "app/worker.h"
+#include "debug/loadprof.h"
 #include "debug/metrics.h"
 #include "gfx/atlas.h"
 #include "gfx/font.h"
@@ -61,8 +62,11 @@
 #include "world/light.h"
 #include "world/mesh_vertex.h"
 #include "world/meshq.h"
+#include "world/playerpose.h"
 #include "world/region.h"
 #include "world/registry.h"
+#include "world/relightq.h"
+#include "world/tick.h"
 #include "world/world.h"
 #include "world/world_test.h"
 #include "world/worldgen.h"
@@ -79,6 +83,25 @@
 #define REPORT_SPAN 17
 
 static World s_world;
+
+// v1.8.0. Columns whose light a remote edit has invalidated, coalesced. Pushed by
+// onRemoteEdit, drained once per frame ahead of the mesh drain — see world/relightq.h for
+// why the relight cannot stay inline in the hook.
+static RelightQueue s_relightq;
+
+// v1.8.0 task 21. The simulation clock. Everything the spec defines per-tick — fluid spread,
+// redstone, crop growth, smelting, hunger, mob AI — is phased against this and not against the
+// render frame, so a mechanic runs at the same speed whether the console is holding 59.83 fps or
+// struggling at 30. See world/tick.h.
+static TickClock s_tickclock;
+
+// Measured ticks per second, for the debug menu. Deliberately timed against svcGetSystemTick
+// rather than against the same metricsFrameMs that feeds the clock: a readout derived from the
+// clock's own time source would print 20.0 even if the clock were running against a wrong idea
+// of what a second is, which is the one thing this readout exists to catch on hardware.
+static float s_tps;
+static u64   s_tps_mark_tick;
+static u64   s_tps_mark_count;
 
 // Fills the worst-case grid and returns the number of allocations that were
 // refused, which must be zero.
@@ -506,6 +529,11 @@ static const char* saveWorldDir(void)
 {
 	static char dir[128];
 
+	// v1.7.1 task 48b. Timed here rather than at the call sites because there are two of them
+	// on the world-entry path — main()'s boot_dir and genStart()'s world_dir — and the whole
+	// point of a stage count is that it says how many times the card was made to do this.
+	const uint64_t t_dir = loadprofMark();
+
 	// Each level in turn: mkdir does not create parents, and the two above the world are
 	// shared with the metrics CSV and the server address file, so either may already exist.
 	// EEXIST is the expected answer and is not distinguished — the only thing that matters
@@ -523,10 +551,14 @@ static const char* saveWorldDir(void)
 	char probe[160];
 	snprintf(probe, sizeof(probe), "%s/.wtest", dir);
 	FILE* f = fopen(probe, "wb");
-	if (!f) return NULL;
+	if (!f) {
+		loadprofSince(LOAD_STAGE_WORLDDIR, t_dir);
+		return NULL;
+	}
 	const bool wrote = fwrite("bs", 1, 2, f) == 2;
 	fclose(f);
 	remove(probe);
+	loadprofSince(LOAD_STAGE_WORLDDIR, t_dir);
 	return wrote ? dir : NULL;
 }
 
@@ -544,8 +576,17 @@ static bool worldHasBeenPlayed(const char* dir)
 {
 	if (!dir) return false;
 
+	// v1.7.1 task 48b. A whole directory listing of the world folder, and it is on the entry
+	// path of every single-player world, so it gets its own stage rather than being folded into
+	// the setup total: it is the one piece of card work whose cost grows with how much the
+	// player has built, which is exactly the shape of the complaint this task is chasing.
+	const uint64_t t_played = loadprofMark();
+
 	DIR* d = opendir(dir);
-	if (!d) return false;
+	if (!d) {
+		loadprofSince(LOAD_STAGE_PLAYED, t_played);
+		return false;
+	}
 
 	bool found = false;
 	const struct dirent* e;
@@ -554,6 +595,7 @@ static bool worldHasBeenPlayed(const char* dir)
 		found = dot && strcmp(dot, ".bsr") == 0;
 	}
 	closedir(d);
+	loadprofSince(LOAD_STAGE_PLAYED, t_played);
 	return found;
 }
 
@@ -678,6 +720,17 @@ static bool genColumnRingComplete(int32_t cx, int32_t cz)
 // enough because the retry is a whole-ring rescan — nothing has to remember WHICH column.
 static bool s_mesh_queue_short;
 
+// v1.7.1 task 49. Two per-frame accumulators for debug/metrics.h's MetricsWork. They live here
+// rather than in the frame loop because the work they measure happens several call levels down
+// — genFollow -> genRecenter -> genUnloadColumn -> workerSubmitSave — and threading a timer
+// through four signatures to instrument them would be a worse change than two file statics.
+//
+// Reset by the frame loop immediately after it publishes the previous frame's figures, and
+// accumulated with += because genUnloadColumn is called once per column dropped and a single
+// recentre drops a whole row of them.
+static float s_frame_recenter_ms;
+static float s_frame_save_ms;
+
 // Queues every column inside the meshed radius whose ring is now complete and that has not
 // been queued already.
 //
@@ -745,7 +798,17 @@ static void genUnloadColumn(int32_t cx, int32_t cz)
 	// here on the main thread because this thread owns the World; only the bytes cross to
 	// the worker. See app/worker.h.
 	const Column* col = worldColumn(&s_world, cx, cz);
-	if (col && col->dirty) workerSubmitSave(col);
+	if (col && col->dirty) {
+		// v1.7.1 task 49. Timed because workerSubmitSave can BLOCK: there are two save slots,
+		// and with both busy it spin-sleeps the main thread in 1 ms steps until one frees, on a
+		// worker that shares core 0 with this thread. That only ever happens where the player
+		// has built — which is exactly the "certain spots" in steve's report, and is invisible
+		// to every other column in this CSV.
+		const u64 t0 = svcGetSystemTick();
+		workerSubmitSave(col);
+		s_frame_save_ms +=
+			(float)((double)(svcGetSystemTick() - t0) / CPU_TICKS_PER_MSEC);
+	}
 
 	if (worldColumnRemove(&s_world, cx, cz)) s_col_unloaded++;
 	genSlotClear(&s_col_in[0][0], GEN_AREA_SPAN, cx, cz);
@@ -918,6 +981,17 @@ static const char* bsDbgInfoCull(char* buf, int cap, void* ctx)
 	return buf;
 }
 
+// v1.8.0 task 21. The measured simulation rate, and the ticks the catch-up clamp refused. Both
+// on one line because the second number is only ever interesting next to the first: "20.0 TPS"
+// with a rising drop count means the clock is right and the console is not.
+static const char* bsDbgInfoTick(char* buf, int cap, void* ctx)
+{
+	const DebugContext* d = (const DebugContext*)ctx;
+	snprintf(buf, (size_t)cap, "%.1f tps %lu drop", (double)d->tps,
+	         (unsigned long)d->ticks_dropped);
+	return buf;
+}
+
 static const char* bsDbgInfoWorld(char* buf, int cap, void* ctx)
 {
 	const DebugContext* d = (const DebugContext*)ctx;
@@ -984,6 +1058,7 @@ static void bsDebugRegister(void)
 		{ "Frame",   bsDbgInfoFrame  },
 		{ "Draws",   bsDbgInfoDraw   },
 		{ "Culled",  bsDbgInfoCull   },
+		{ "Tick",    bsDbgInfoTick   },
 		{ "World",   bsDbgInfoWorld  },
 		{ "Memory",  bsDbgInfoMem    },
 		{ "Player",  bsDbgInfoPlayer },
@@ -1033,6 +1108,13 @@ static bool genStart(int32_t cx, int32_t cz)
 	// because calling it is what creates the directory.
 	const char* const world_dir = s_server_session ? NULL : saveWorldDir();
 
+	// v1.7.1 task 48b. Opened AFTER saveWorldDir rather than at the top of the function, so the
+	// two do not nest: saveWorldDir times itself into LOAD_STAGE_WORLDDIR, and a setup bracket
+	// wrapped round it would charge the same milliseconds to two stages and make the per-stage
+	// figures stop adding up to the wall time. The handful of microseconds above this line
+	// (networldWorldSeed) fall into `other` instead, which is the honest place for them.
+	const uint64_t t_setup = loadprofMark();
+
 	// v1.7.0 task 15 prerequisite. Which terrain generator this world belongs to — see
 	// world/genversion.h for the whole rule. A world with no stamp is one that predates
 	// versioning and keeps the legacy generator; a brand-new directory is stamped with this
@@ -1047,6 +1129,7 @@ static bool genStart(int32_t cx, int32_t cz)
 	if (gv == GENVER_TOO_NEW || gv == GENVER_DAMAGED) {
 		printf("world refused: generator %lu %s\n", (unsigned long)gen_version,
 		       gv == GENVER_TOO_NEW ? "is newer than this build" : "stamp is unreadable");
+		loadprofSince(LOAD_STAGE_SETUP, t_setup);
 		return false;
 	}
 
@@ -1055,6 +1138,7 @@ static bool genStart(int32_t cx, int32_t cz)
 		// is the same predicate asked twice, on purpose, at the one other place a WorldGen can
 		// come into existence.
 		printf("world refused: generator %lu unknown\n", (unsigned long)gen_version);
+		loadprofSince(LOAD_STAGE_SETUP, t_setup);
 		return false;
 	}
 
@@ -1110,13 +1194,16 @@ static bool genStart(int32_t cx, int32_t cz)
 
 	workerSetWorldDir(world_dir);
 
-	if (!workerStart(&s_gen))
+	if (!workerStart(&s_gen)) {
+		loadprofSince(LOAD_STAGE_SETUP, t_setup);
 		return false;
+	}
 
 	if (workerSubmitColumn(cx, cz)) genSlotSet(&s_col_asked[0][0], GEN_AREA_SPAN, cx, cz);
 	else                            s_genr.submit_failed++;
 	genRequestArea();
 
+	loadprofSince(LOAD_STAGE_SETUP, t_setup);
 	return true;
 }
 
@@ -1165,7 +1252,13 @@ static bool genInstallOne(void)
 	// server broadcasting edits for terrain this console no longer has.
 	networldSubscribeColumn(cx, cz);
 
+	// v1.7.1 task 48b. Its own stage because it is the one piece of per-column main-thread work
+	// that is O(ring) rather than O(column): it rescans the mesh window every time a column
+	// lands, so its total grows with the square of the render distance while everything else on
+	// this path grows linearly with the column count.
+	const uint64_t t_queue = loadprofMark();
 	genQueueReadyColumns();
+	loadprofSince(LOAD_STAGE_QUEUE, t_queue);
 	return true;
 }
 
@@ -1194,8 +1287,13 @@ static int genDrainMesh(float budget_ms, int max_chunks)
 	int built = 0;
 	Job j;
 	while (jobqPop(&s_meshq, &j)) {
+		// v1.7.1 task 48b. Per chunk, not per drain call, so mesh_n is the chunk count the
+		// loading screen actually built and mesh/us-per-call is directly comparable with the
+		// DRAIN_BUDGET_MS the drain is trying to stay inside.
+		const uint64_t t_mesh = loadprofMark();
 		if (chunkRenderBuild(&s_world, j.cx, j.cy, j.cz)) s_genr.meshed++;
 		else                                              s_genr.mesh_refused++;
+		loadprofSince(LOAD_STAGE_MESH, t_mesh);
 		built++;
 
 		if (built >= max_chunks) break;
@@ -1308,6 +1406,14 @@ static bool runLoadingScreen(bool draw, const char* heading, const char* world_n
 		}
 
 		watchdogPhase(WD_PHASE_LOAD_DRAW);
+		// v1.7.1 task 48b. This bracket is the VBlank wait as much as it is the drawing:
+		// C3D_FrameBegin(C3D_FRAME_SYNCDRAW) blocks until the previous frame's GPU work is
+		// done, and on a screen that draws one flat panel that is almost all of it. It is timed
+		// anyway — in fact especially — because a load whose `present` total is roughly
+		// frames * 16.71 ms is a load bound by the number of frames it takes, and no stage
+		// below it can be optimised into a faster world entry until that changes.
+		const uint64_t t_present = loadprofMark();
+		loadprofFrame();
 		if (bottom) {
 			C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
 			spriteFrameBegin();
@@ -1326,6 +1432,7 @@ static bool runLoadingScreen(bool draw, const char* heading, const char* world_n
 		} else {
 			gspWaitForVBlank();
 		}
+		loadprofSince(LOAD_STAGE_PRESENT, t_present);
 
 		// This loop beats the watchdog for the same reason the game loop does, and it is not
 		// optional here: a world that legitimately takes longer than WD_TIMEOUT_MS to build
@@ -1365,7 +1472,16 @@ static int32_t genColumnOf(float v)
 
 static void genFollow(float x, float z)
 {
+	// v1.7.1 task 49. Timed, not just called. genRecenter is the one piece of streaming work
+	// that fires on a *position* rather than on a clock — it does nothing at all on 220 frames
+	// out of 221 and then unloads a row of columns, requests a new one, and queues every
+	// newly-ready chunk, all on the main thread with no budget. That is precisely the shape of
+	// "my FPS drops in certain spots", so the CSV has to be able to say whether the slow frames
+	// are the recentre frames. Two tick reads on a frame that does nothing.
+	const u64 t0 = svcGetSystemTick();
 	genRecenter(genColumnOf(x), genColumnOf(z));
+	s_frame_recenter_ms +=
+		(float)((double)(svcGetSystemTick() - t0) / CPU_TICKS_PER_MSEC);
 }
 
 // ── Step 8.1's verification probe ─────────────────────────────────────────────────────
@@ -2102,6 +2218,19 @@ static void worldReportDraw(int refused, bool built,
 		       gen->columns_in, gen->columns_failed + gen->submit_failed, gen->meshed);
 		printf("wk %6.0f inst %5.1f ms q%-2d d%d \n", workerBusyMs(), workerInstallMs(),
 		       workerQueued(), workerDropped());
+
+		// v1.7.1 task 48b. The save-slot wait, on the overlay because it is the one main-thread
+		// stall that only appears where the player has BUILT — every capture taken on a clean
+		// world leaves this path untouched, and `save_ms` reads 0.0 either way.
+		//
+		// How to read it: `sv` is columns handed to the save ring, `w` how many of those made
+		// this thread sleep waiting for one of the two slots, then the total and worst wait in
+		// ms. `sv 0` means the branch was never entered and the line says NOTHING about
+		// whether it stalls — walk out of somewhere you have built to make it say something.
+		// `sv` large with `w 0` is the measured negative. `w` climbing with a `max` of several
+		// ms is the positional hitch it was added to catch.
+		printf("save sv%-3d w%-3d %5.1f max %4.1f ms\n", workerSaveSubmits(),
+		       workerSaveWaits(), workerSaveWaitMs(), workerSaveWaitMaxMs());
 #if BS_WORLD_GEN
 		// Step 6.1's line. `at` is the column the ring is centred on, `unl` the columns
 		// freed because they left it, and `stale` the columns that finished generating for
@@ -2176,8 +2305,42 @@ static void saveDirtyColumns(void)
 #if BS_WORLD_GEN
 static int s_sleep_flush_cursor;
 
+// v1.7.1 task 46b. What the lid-close flush needs to write the pose, and the only reason
+// these are file statics rather than locals: sleepFlushOneColumn() is a hook app/sleep.c
+// calls, so it cannot see main()'s `player` or `inv_dir`. Set once at world entry, cleared
+// in the same teardown that clears the hooks — a stale Player pointer read after the world
+// has been left is the one way this could be worse than not saving at all.
+//
+// s_sleep_pose_done makes it a ONE-SHOT. sleepFlushOneColumn is a step function: sleep.c
+// calls it repeatedly until the budget runs out or it returns false, and writing the pose
+// on every one of those calls would spend the whole SLEEP_FLUSH_BUDGET_MS rewriting 32
+// bytes instead of flushing the columns the budget exists for. Reset beside
+// s_sleep_flush_cursor when the hook is registered, so a new world starts owing a write.
+static const Player* s_sleep_player   = NULL;
+static const char*   s_sleep_pose_dir = NULL;
+static bool          s_sleep_pose_done;
+
 static bool sleepFlushOneColumn(void)
 {
+	// The pose first, before any column, and this is the ordering to prefer on purpose: it
+	// is 32 bytes against a column's kilobytes, and it is the field the player would most
+	// notice losing. app/sleep.h budgets 500 ms and a card write is 5-20 ms, so spending one
+	// of roughly 25-100 slots on it costs at most 4% of the budget.
+	//
+	// Returns true, like a column write does, so the budget is checked between this and the
+	// first column rather than after both — sleep.c drives one step at a time.
+	if (!s_sleep_pose_done) {
+		s_sleep_pose_done = true;
+		if (s_sleep_pose_dir && s_sleep_player) {
+			const PlayerPose pose = {
+				s_sleep_player->body.x, s_sleep_player->body.y, s_sleep_player->body.z,
+				s_sleep_player->cam.yaw, s_sleep_player->cam.pitch
+			};
+			(void)playerPoseSave(&pose, s_sleep_pose_dir);
+			return true;
+		}
+	}
+
 	while (s_sleep_flush_cursor < WORLD_MAP_SLOTS) {
 		const Column* col = s_world.slots[s_sleep_flush_cursor++];
 		if (!col || !col->dirty) continue;
@@ -2205,6 +2368,15 @@ static bool sleepFlushOneColumn(void)
 // ours runs while the lid is shut to stop it.
 static void sleepLeaveSession(void)
 {
+	// v1.7.1 task 46b. This is also the per-lid-close signal the pose write needs, and the
+	// only one available: app/sleep.c calls the leave hook exactly once at ONSLEEP, before
+	// sleepFlushBounded() starts stepping the flush. Rearming here rather than where the
+	// flush cursor rewinds is what makes the pose written once per LID CLOSE instead of once
+	// per world — the cursor only rewinds when the whole slot table has been walked, so a
+	// lid-close that ran out of budget halfway would otherwise leave the next one owing
+	// nothing and the player's later position unsaved.
+	s_sleep_pose_done = false;
+
 	if (s_server_session) netDisconnect();
 }
 #endif  // BS_WORLD_GEN
@@ -2500,7 +2672,17 @@ static void onRemoteEdit(void* userdata, int x, int y, int z)
 	// v1.5.0: remote edits relight before remeshing, same as scene/interact.c does for
 	// local break/place — otherwise another player's torch-adjacent or shade-casting
 	// change lands with stale light until the column happens to regenerate.
-	if (lightEnabled())
+	//
+	// v1.8.0: QUEUED, not run here. lightRelightColumn recomputes the whole column and
+	// this hook is called once per edit — so a rejoin, where networldOnColumnLoad drains
+	// every diff the server holds for a column the moment that column installs, paid for
+	// one full relight per diff on a single column instead of one relight for all of them.
+	// world/relightq.h dedups by column and the main loop drains it below, ahead of the
+	// mesh drain so nothing bakes stale light. A full set (never expected: only loaded
+	// columns can be pushed, and there are at most RENDER_DIST_MAX_COLUMNS of those)
+	// falls back to relighting inline, which is the old behaviour rather than a dropped
+	// relight.
+	if (lightEnabled() && !relightqPush(&s_relightq, x >> 4, z >> 4))
 		lightRelightColumn(&s_world, x >> 4, z >> 4);
 	chunkRenderTouch(&s_world, x, y, z);
 }
@@ -2801,6 +2983,21 @@ session_start:
 	// version of it to have to reproduce. Harmless in single player: nothing ever fires it.
 	networldSetEditHook(onRemoteEdit, NULL);
 
+	// v1.8.0, and cleared on the same schedule and for the same reason: a column index left
+	// over from the previous session names a column in a world that no longer exists, and the
+	// first frame of the new one would relight whatever now happens to sit at that index.
+	relightqInit(&s_relightq);
+
+	// v1.8.0 task 21, reset here for a third version of the same reason: tick 0 must be the
+	// first tick of THIS world. Carrying a count over from the previous session would hand every
+	// periodic mechanic a phase inherited from a world that no longer exists, and carrying the
+	// accumulator over would spend the loading screen's worth of banked real time as a burst of
+	// catch-up ticks on the first frame the player can see.
+	tickClockInit(&s_tickclock, TICK_MAX_CATCHUP_DEFAULT);
+	s_tps            = 0.0f;
+	s_tps_mark_tick  = svcGetSystemTick();
+	s_tps_mark_count = 0;
+
 	// The inventory hook is NOT registered here alongside the edit hook, though it was in the
 	// v1.3.0 release and that is exactly what made the feature do nothing. It is registered
 	// further down, immediately after s_inv is loaded or initialised — see that call site for
@@ -2851,14 +3048,55 @@ session_start:
 	// a server session has none by design, and saveWorldDir() would create the directory just
 	// to be told it is empty. The caption below reads "JOINING WORLD" on that path instead, so
 	// the false here is never shown as "CREATING WORLD".
-	BOOT_BEGIN();
-	const bool world_played_before = !s_server_session && worldHasBeenPlayed(saveWorldDir());
-	BOOT_END("worldHasBeenPlayed");
+	// v1.7.1 task 48b. The world-load instrument is armed HERE, which is as close as this file
+	// gets to "the player picked a world": the title screen has returned, the name is in
+	// s_world_name, and nothing on the card has been touched for this world yet. Everything
+	// from this line to the frame runLoadingScreen hands over on is inside the wall time.
+	// See debug/loadprof.h, and note that it replaces a measurement that was never valid —
+	// the CSV's frame_ms across a world entry is wall clock across the whole menu, not a load.
+	loadprofBegin(s_world_name, 0);
 
-	// Centred on the spawn column, which is (0, 0) — the same column playerInit puts the
-	// feet in below. From here on the ring follows the player (genFollow).
 	BOOT_BEGIN();
-	const bool worker_ok = genStart(0, 0);
+	// One saveWorldDir() call answering both questions below, rather than two. It mkdirs
+	// three levels and write-probes the card — most of genStart's measured 117 ms — so a
+	// second call to ask the same directory a second question is a real cost, not a
+	// tidiness point. NULL in a server session, which worldHasBeenPlayed() reads as "new"
+	// and playerPoseLoad() refuses outright: the server owns that world and this console
+	// gains no file from it.
+	const char* const boot_dir = s_server_session ? NULL : saveWorldDir();
+	const bool world_played_before = worldHasBeenPlayed(boot_dir);
+	BOOT_END("worldHasBeenPlayed");
+	// v1.7.1 task 48b. The distinction steve's report turns on — "creating a world" against
+	// coming back to one that has been changed — recorded on the row rather than inferred from
+	// it, so a load.csv full of rows can be sorted by it without guessing.
+	loadprofSetReloaded(world_played_before);
+
+	// v1.7.1 task 46b. The saved pose is read HERE, before genStart, and not down beside the
+	// networldSavedPose() replay where it is finally used. That is not a preference; it is
+	// what makes the restore correct at all.
+	//
+	// genStart() centres the streaming ring, runLoadingScreen() fills exactly that ring, and
+	// worldGet() answers BLOCK_AIR for a chunk that is not resident. So worldStandingY() over
+	// a column outside the ring returns the y it was given and silently does nothing. With
+	// the ring centred on the spawn column the way this line used to read — genStart(0, 0) —
+	// a pose restored anywhere but spawn would have been un-stuck against air and the player
+	// would have come back inside their own blocks: exactly the bug task 46 just fixed,
+	// wearing a new hat, and with a green test suite over it.
+	//
+	// Reading the pose first and centring the ring on ITS column is the fix. Nothing else
+	// changes: the loading screen already waits for the whole ring and its geometry, so by
+	// the time the un-stick runs below, the restored column is installed on the same
+	// guarantee the spawn column has always had. A world with no pose file — every world on
+	// the card today — falls back to (0, 0) and takes a byte-for-byte identical path.
+	PlayerPose saved_pose;
+	const bool have_saved_pose = playerPoseLoad(&saved_pose, boot_dir);
+
+	// Centred on the restored column, or on the spawn column (0, 0) when there is no pose to
+	// restore — the same column playerInit puts the feet in below. From here on the ring
+	// follows the player (genFollow).
+	BOOT_BEGIN();
+	const bool worker_ok = genStart(have_saved_pose ? genColumnOf(saved_pose.x) : 0,
+	                                have_saved_pose ? genColumnOf(saved_pose.z) : 0);
 	BOOT_END("genStart");
 
 	// v1.6.0. From here until workerStop() below there is a world in memory and a worker
@@ -2869,6 +3107,7 @@ session_start:
 	// on the title screen or the world list safe.
 	if (worker_ok) {
 		s_sleep_flush_cursor = 0;
+		s_sleep_pose_done    = false;   // v1.7.1 task 46b: a new world starts owing a pose write
 		sleepSetFlushHook(sleepFlushOneColumn);
 		sleepSetLeaveHook(sleepLeaveSession);
 	}
@@ -2896,6 +3135,22 @@ session_start:
 	                       : world_played_before ? "LOADING WORLD" : "CREATING WORLD",
 	                       s_server_session ? netServerAddress() : s_world_name))
 		quit_requested = true;
+
+	// v1.7.1 task 48b. The load is over: the ring is full, its geometry is built and the next
+	// frame is one the player can move in. Stopped and written here rather than at the top of
+	// the game loop so nothing the first playable frame does is charged to the load.
+	//
+	// Two outputs, deliberately. The CSV row goes beside frames.csv and is what gets read off
+	// the card afterwards with no emulator involved; the printf is what a -DBS_BOTTOM_UI=0
+	// probe build shows on the console. Neither can fail in a way that matters — loadprofWrite
+	// ignores card errors, and a build with no console prints into a stream nobody reads.
+	loadprofEnd();
+	loadprofWrite(LOADPROF_PATH);
+	{
+		char lp[768];
+		loadprofFormat(lp, sizeof lp);
+		printf("%s", lp);
+	}
 
 	// From here to the game loop's first watchdogPhase call is the handoff, and it is watched
 	// in three pieces. Until these existed it was watched in none: runLoadingScreen's last act
@@ -2988,7 +3243,39 @@ session_start:
 	// block, so the whole generated surface is walkable by the measured one-block auto-step.
 #if BS_WORLD_GEN
 	const int spawn_x = 8, spawn_z = 8;
-	const int spawn_y = worldgenHeight(&s_gen, spawn_x, spawn_z);
+	// v1.7.1 task 46. The generator's height is the STARTING guess, not the answer.
+	//
+	// steve, 2026-08-24: "whenever I create a world, make a bunch of changes, exit quick to
+	// title, and then try reload the world — it loads in, but the chunk I'm in doesn't get
+	// loaded in. The other chunks do."
+	//
+	// Nothing was failing to load. worldgenHeight() is a pure function of seed and generator
+	// version and never reads s_world, so it returns the surface the terrain would have if
+	// nobody had ever edited it. A player who built anything at the spawn cell and came back was
+	// therefore placed at the ORIGINAL ground height — inside their own blocks. physics.c has no
+	// un-stick (resolveX/Y/Z each move and snap back on bodyBlocked), so they could not walk
+	// out; player.c put the camera at body.y + 1.62, also inside solid blocks; and back-face
+	// culling drew nothing for the geometry around them while the columns further out rendered
+	// normally. That is exactly what "the chunk I'm in doesn't get loaded in" looks like from
+	// inside it.
+	//
+	// worldStandingY steps UP from the guess rather than scanning down from the sky. On an
+	// unedited world the first test passes and the result is identical to what this line used to
+	// be, so a fresh world cannot regress — where a top-down scan would put the player on the
+	// canopy of any tree that grew at (8,8), which worldgenHeight deliberately ignores. Built a
+	// tower at spawn: on top of it. Built a roof five blocks up: still on the ground under it,
+	// where they were. Dug down: unblocked at the guess, and falls into their own hole, which is
+	// what already happened.
+	//
+	// Safe to read the world here: runLoadingScreen has returned, so the spawn column is
+	// installed and worldGet is answering from real blocks rather than from an absent column.
+	//
+	// NOT done: persisting the player's real pose in single player, the way a server session
+	// already does through networldSavedPose(). Better long-term — you should come back where
+	// you left, not at spawn — but it is a save-format change and would do nothing for the
+	// worlds steve already has. On the roadmap as its own task.
+	const int spawn_y = worldStandingY(&s_world, spawn_x, spawn_z,
+	                                   worldgenHeight(&s_gen, spawn_x, spawn_z));
 #else
 	const int spawn_x = 18, spawn_z = 18;
 	const int spawn_y = handbuiltHeight(spawn_x, spawn_z);
@@ -3013,10 +3300,36 @@ session_start:
 	// the server immediately after JOIN, so anything slow enough to lose them never made the
 	// handshake usable in the first place. False — single player, old server, fresh spawn —
 	// leaves the playerInit above untouched.
+	//
+	// v1.7.1 task 46b hangs the single-player restore off the same decision, as its other
+	// arm, so there is one place in this file that answers "where does the player start"
+	// rather than two that can disagree. The server arm stays first and stays authoritative:
+	// in a session the card holds no pose for this world by construction (boot_dir is NULL
+	// above), so the two can never actually compete — the ordering is stated rather than
+	// relied on.
 	{
 		float px, py, pz, pyaw, ppitch;
-		if (networldSavedPose(&px, &py, &pz, &pyaw, &ppitch))
+		if (networldSavedPose(&px, &py, &pz, &pyaw, &ppitch)) {
 			playerInit(&player, px, py, pz, pyaw, ppitch);
+		}
+#if BS_WORLD_GEN
+		else if (have_saved_pose) {
+			// The un-stick, and it runs LAST and on the restored y only — task 46's fix
+			// applied to task 46b's new input. A pose written at y=40 whose y=40 has since
+			// been filled in (a generator-version change, a region file that failed its CRC
+			// and regenerated, or a falling block that landed after the write) would put the
+			// player inside solid blocks with no way to walk out, which is the failure this
+			// whole pair of tasks exists to stop.
+			//
+			// Safe to read the world here for the same reason the spawn line above is, and
+			// only because genStart() was centred on this pose's column: runLoadingScreen()
+			// has returned, so the column is installed and worldGet() is answering from real
+			// blocks. x and z keep their fractional parts — only y moves.
+			PlayerPose p = saved_pose;
+			playerPoseUnstick(&s_world, &p);
+			playerInit(&player, p.x, p.y, p.z, p.yaw, p.pitch);
+		}
+#endif
 	}
 
 	Interact it;
@@ -3037,6 +3350,17 @@ session_start:
 	const char* const inv_dir = s_server_session ? NULL : saveWorldDir();
 	if (inv_dir) inventoryLoad(&s_inv, inv_dir);
 	else         inventoryInit(&s_inv);
+
+	// v1.7.1 task 46b. What the lid-close flush hook needs to write a pose, handed over now
+	// that both halves exist — the Player was built above and the directory on the line
+	// above that. Pointers, not a copy: the hook fires at an arbitrary moment during play and
+	// must read where the player IS, not where they were when the world opened. Both are
+	// cleared in the teardown beside sleepSetFlushHook(NULL), which is what stops the hook
+	// from ever reaching a Player that has gone out of scope.
+#if BS_WORLD_GEN
+	s_sleep_player   = &player;
+	s_sleep_pose_dir = inv_dir;
+#endif
 
 	// Registered HERE, and not up with the edit hook, because both halves of the order matter and
 	// v1.3.0 got both of them wrong.
@@ -3289,7 +3613,47 @@ session_start:
 		// (app/worker.h). Meshing what that made ready happens further down, with the
 		// edit queue, so the two share one budget rather than one each — see
 		// DRAIN_BUDGET_MS. Install stays here because it is what puts ground under the
-		// player, and it is a memcpy, not a mesh: 15.3 ms over 125 columns, 0.12 ms each.
+		// player.
+		//
+		// v1.7.1 task 49 (install half). This comment used to end "it is a memcpy, not a
+		// mesh: 15.3 ms over 125 columns, 0.12 ms each", and that sentence was wrong twice
+		// over. It has not been a memcpy since step 9.2a made Chunk opaque — app/worker.c's
+		// workerInstall now DECOMPRESSES each chunk of the staged column into a flat buffer
+		// and hands it to worldSetChunkAll, which used to re-derive the buffer's palette
+		// from scratch twice and then pack it with a linear palette search per cell. And
+		// 0.12 ms was about 36x under: the 3522-frame Azahar capture that opened this task
+		// found mesh_ms over its 4.0 ms budget on 25% of frames in two distinct classes,
+		// and of the 207 frames in the expensive 8-14 ms class, 173 were frames where the
+		// mesh queue grew by exactly 5 or 6 — the signature of one column install queueing
+		// its chunks. Of the 683 cheap-class frames the queue grew on ZERO. The install is
+		// ~4.36 ms of those frames, and because install_ms is folded into work_ms below
+		// (see the work_ms line further down) it has been published as the CSV's mesh_ms
+		// all along, which is why it read as mesh cost and hid here behind this comment.
+		//
+		// Where that time went, profiled on the host over a real 7x7-column streaming pass
+		// (49 columns, 300 chunks, medians of 5 passes, us per installed COLUMN):
+		// worldSetChunkAll 93.3 (89.3%), chunkDecompressAll 9.4 (9.0%), worldExit of the
+		// staging world 1.2, genQueueReadyColumns 0.6, lightColumnCopy 0.1 — total 104.5.
+		// Nothing outside worldSetChunkAll was worth touching.
+		//
+		// world/chunk.h's ChunkPlan is the fix: one walk of the 4096-cell buffer instead of
+		// three. Paired and interleaved against the unchanged code, four rounds each, the
+		// worldSetChunkAll total per pass went 4513.7 / 4733.8 / 4121.9 / 4201.0 us before
+		// against 1049.6 / 971.1 / 1107.4 / 1061.1 us after (4.2x), and the whole install
+		// path 104.5 -> 29.8 us per column (3.5x). The stored chunks are identical: an
+		// FNV-1a over the form byte, all 4096 decompressed cells, the chunkEncode payload
+		// bytes and the byte count of every chunk of the pass, plus the budget peak, is
+		// a8ed2826ea80538c in both arms.
+		//
+		// So the honest console figure is: MEASURED ~4.36 ms per install frame before,
+		// PROJECTED ~1.4 ms after (4.36 x 0.31, the host ratio). The projection has NOT
+		// been measured on hardware — that needs another Azahar or console capture, and
+		// until one is taken this number is arithmetic, not evidence.
+		//
+		// None of this touches genDrainMesh's guarantee that at least one chunk is built
+		// per drain whatever the budget says (see DRAIN_BUDGET_MS at the top of this file).
+		// Install has never been inside that budget: it is timed here, separately, before
+		// the drain runs, and the fix only makes the same call cheaper.
 		watchdogPhase(WD_PHASE_INSTALL);
 		const u64 t_install = svcGetSystemTick();
 		if (!paused) genInstallOne();
@@ -3434,6 +3798,55 @@ session_start:
 		}
 #endif
 
+		// v1.8.0 task 21. The simulation clock, advanced once per frame by however much real
+		// time the last frame actually took. It sits HERE, ahead of both drains below, because
+		// a tick that changes blocks — which is what task 22's fluid step will be — has to have
+		// changed them before this frame relights and remeshes, or the change is a frame late
+		// and, worse, is lit by the previous frame's light.
+		//
+		// Nothing consumes the tick count yet; water is the first customer and adds the
+		// `for (int t = 0; t < ticks; t++)` body. Until then this is the clock running, being
+		// measured, and being visible in the debug menu — which is the only way the 20 TPS
+		// claim can be checked on hardware at all.
+		const int ticks_now = tickClockAdvance(&s_tickclock,
+		                                       (int64_t)(metricsFrameMs() * 1000.0f));
+		(void)ticks_now;
+
+		// The measured rate, recomputed about once a second against the system tick counter.
+		{
+			const u64   now_st  = svcGetSystemTick();
+			const double win_ms = (double)(now_st - s_tps_mark_tick) / CPU_TICKS_PER_MSEC;
+			if (win_ms >= 1000.0) {
+				const u64 now_count = tickClockCount(&s_tickclock);
+				s_tps            = (float)((double)(now_count - s_tps_mark_count)
+				                           * 1000.0 / win_ms);
+				s_tps_mark_tick  = now_st;
+				s_tps_mark_count = now_count;
+			}
+		}
+
+		// v1.8.0. Every column a remote edit invalidated this frame, relit once each. This
+		// MUST come before the mesh drain below: chunkRenderTouch has already queued those
+		// chunks, and a chunk meshed before its column is relit bakes the old light into
+		// its vertices and keeps it until something else touches it.
+		//
+		// Drained to empty rather than budgeted, because the set is bounded by the loaded
+		// column count (RENDER_DIST_MAX_COLUMNS = 49) however many edits arrived, and a
+		// partial drain would be exactly the stale-light case above. The old code ran one
+		// full relight per EDIT, with no bound at all.
+		// v1.7.1 task 49: timed. This drain is deliberately unbudgeted (see above), which is
+		// correct and also means it is the one piece of per-frame work that has no ceiling at
+		// all. It is multiplayer-only, so it should read 0.000 in single player — and if it
+		// does not, that is itself the finding.
+		const u64 t_relight = svcGetSystemTick();
+		if (lightEnabled()) {
+			int rx, rz;
+			while (relightqPop(&s_relightq, &rx, &rz))
+				lightRelightColumn(&s_world, rx, rz);
+		}
+		const float relight_ms =
+			(float)((double)(svcGetSystemTick() - t_relight) / CPU_TICKS_PER_MSEC);
+
 		// All of this frame's meshing, under one budget. Edits first: a broken block that
 		// takes two frames to disappear is felt, and a chunk of scenery that takes two
 		// frames to arrive at the edge of the render distance is not.
@@ -3460,6 +3873,35 @@ session_start:
 		if (edit_built + stream_built > s_genr.worst_built)
 			s_genr.worst_built = edit_built + stream_built;
 #endif
+
+		// v1.7.1 task 49. Publish this frame's annotation into the CSV row metricsFrameEnd is
+		// about to write, then clear the two accumulators for the next frame. Done here, after
+		// both drains, so `meshq` is the backlog that SURVIVED the budget rather than the one
+		// that went into it — a queue that is always empty afterwards means the budget is not
+		// what is costing the frame, and a queue that only grows means it is.
+		{
+			MetricsWork mw;
+			memset(&mw, 0, sizeof mw);
+			mw.player_cx  = s_center_cx;
+			mw.player_cz  = s_center_cz;
+			mw.recenter_ms = s_frame_recenter_ms;
+			mw.relight_ms  = relight_ms;
+			mw.save_ms     = s_frame_save_ms;
+#if BS_WORLD_GEN
+			mw.mesh_ms = work_ms;
+			mw.built   = (u16)(edit_built + stream_built);
+			mw.meshq   = (u16)(jobqCount(&s_meshq) + chunkRenderDirtyCount());
+#else
+			// No streaming build: the edit queue is the only queue there is.
+			mw.mesh_ms = edit_ms;
+			mw.built   = (u16)edit_built;
+			mw.meshq   = (u16)chunkRenderDirtyCount();
+#endif
+			metricsSetWork(&mw);
+
+			s_frame_recenter_ms = 0.0f;
+			s_frame_save_ms     = 0.0f;
+		}
 
 		// Phase 4's status line. Every field answers a question a screenshot would
 		// otherwise leave open: whether the ray found anything (`aim` block and face),
@@ -3707,6 +4149,8 @@ session_start:
 				s_dctx.meshes          = chunkRenderMeshes();
 				s_dctx.tris            = chunkRenderTris();
 				s_dctx.culled          = chunkRenderCulled();
+				s_dctx.tps             = s_tps;
+				s_dctx.ticks_dropped   = tickClockDropped(&s_tickclock);
 				s_dctx.columns         = s_world.columns;
 				s_dctx.chunks          = s_world.chunks;
 				s_dctx.blocks_bytes    = (uint32_t)worldBytes(&s_world);
@@ -3842,6 +4286,28 @@ session_start:
 	// losing the last session's pickups.
 	if (inv_dir) inventorySave(&s_inv, inv_dir);
 
+	// v1.7.1 task 46b, and deliberately on this exact line rather than anywhere else on the
+	// main thread. app/worker.h:92-97 allows exactly one thread inside the SD's FS service
+	// session at a time and names the worker as the owner of every byte; this call is legal
+	// here only because saveDirtyColumns() above ends in workerFlushSaves(), so the worker is
+	// provably parked, and workerStop() below has not run yet. Inside the frame loop it would
+	// be neither.
+	//
+	// Gated on the same inv_dir the inventory is, and not on a second opinion about the card:
+	// NULL is a server session, where the server owns the pose and this console must write
+	// nothing. A failed save is not retried and not reported, for inventory.h's reason — the
+	// cost of losing a pose is landing at spawn, and stalling the quit to retry is worse.
+	//
+	// This one line covers every ordinary way a session ends, because they all funnel through
+	// here: "Quit to title" from the pause menu, a HOME exit, a power-off, and a lost server
+	// session. The lid-close case is the one that does not, and sleepFlushOneColumn() above
+	// is where that one is answered.
+	if (inv_dir) {
+		const PlayerPose pose = { player.body.x, player.body.y, player.body.z,
+		                          player.cam.yaw, player.cam.pitch };
+		(void)playerPoseSave(&pose, inv_dir);
+	}
+
 	// The v1.4.0 explored-fog map was saved here on the way out. Gone with the feature in
 	// v1.6.0; existing sdmc:/blocksmith/fog/*.bin files are left orphaned by design.
 
@@ -3859,6 +4325,13 @@ session_start:
 	// back at the title screen rather than anything visible here.
 	sleepSetFlushHook(NULL);
 	sleepSetLeaveHook(NULL);
+#if BS_WORLD_GEN
+	// v1.7.1 task 46b. Cleared with the hooks and for the same reason: `player` is about to
+	// go out of scope, and a hook that could still fire holding a pointer into it is a crash
+	// on lid-close rather than anything visible here.
+	s_sleep_player   = NULL;
+	s_sleep_pose_dir = NULL;
+#endif
 
 	// Before worldExit: the worker holds a staging world of its own and must be joined
 	// before anything it could still be writing into is freed.
@@ -3876,6 +4349,15 @@ session_start:
 	// function's own early return — and puts arriving diffs back in the pending store where
 	// they wait for whatever world comes next.
 	networldSetWorld(NULL);
+
+	// v1.7.1 task 46, and it has to be here rather than in app_shutdown with chunkRenderExit:
+	// both paths below can jump back to session_start with the process still alive, and the
+	// mesh slot table is per-WORLD state living in a module whose arenas are per-process. Left
+	// standing, session 1's slots stay `used` at session 1's coordinates — the next world draws
+	// the previous one's geometry there, and cannot claim those slots for its own chunks.
+	// Beside worldExit because it is the same act: this world's blocks and this world's meshes
+	// stop existing together.
+	chunkRenderReleaseAll();
 
 	worldExit(&s_world);
 	highlightExit();

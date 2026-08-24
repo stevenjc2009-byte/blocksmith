@@ -45,8 +45,15 @@ typedef struct {
 
 	// v1.5.0 adaptive lighting: the column's sky/block channels, owned end-to-end by
 	// world/light.c (attach/copy/detach) and opaque here. NULL whenever the lighting
-	// engine is off — which is every Old 3DS build and every host test by default — so
-	// this field costs one pointer and nothing else on those paths.
+	// engine is off, so this field costs one pointer and nothing else on those paths.
+	//
+	// v1.7.1: that used to read "which is every Old 3DS build and every host test by
+	// default", and the Old 3DS half has been wrong since v1.8.0. scene/chunk_render.c
+	// now calls lightEngineInit(true) unconditionally (chunk_render.c:750) on both
+	// consoles, because v1.8.0 moved the edit path off the relaxation sweeps and onto the
+	// flood fill and measured it at 0.141 ms per block against the old 4.064 ms. Host
+	// tests still leave it off by default — they never call chunkRenderInit, which owns
+	// the shader program's lifetime and is where the gate is published.
 	void* light;
 } Column;
 
@@ -100,6 +107,23 @@ bool worldSet(World* w, int x, int y, int z, BlockId id);
 // refused the bytes the chosen form needs; on a refusal nothing already loaded is
 // disturbed — a chunk that existed before the call still holds what it held before.
 bool worldSetChunkAll(World* w, int cx, int cy, int cz, const BlockId in[CHUNK_BLOCKS]);
+
+// v1.7.1 task 46. Where a player's feet can stand at (x, z), starting from `base` and stepping
+// UP while the body would be inside something solid. Returns `base` unchanged when nothing is
+// in the way, and never walks past the top of the world.
+//
+// `base` is the surface the generator predicts — worldgenHeight(), whose convention this shares
+// exactly: the y of the first air block, so the top solid block is at y-1. That prediction is a
+// pure function of the seed and knows nothing about what a player has built since, which is the
+// bug this exists for. Spawn was placed from the prediction alone, so reloading a world with
+// anything built at the spawn cell put the player INSIDE their own blocks — unable to move,
+// because the physics resolvers snap back on a blocked move, and looking at back-faces, which
+// reads exactly like the chunk they are standing in having failed to load.
+//
+// Stepping up from `base` rather than scanning down from the sky is deliberate — see the note
+// at the call site in main.c. Two blocks of clearance, because PLAYER_HEIGHT is 1.8 and a body
+// with its feet at integer y occupies y .. y+1.8.
+int worldStandingY(const World* w, int x, int z, int base);
 
 // Bytes of block data currently held, for the budget report. Walks every live chunk and
 // sums chunkGetBytes(c) rather than assuming a fixed per-chunk cost, because since step
