@@ -423,6 +423,15 @@ atlas.t3x: atlas.png
 # to be right about than one clever pattern.
 font.t3x: font.png
 
+# v1.8.1 task 50. The same trap a third time, and it bites exactly as hard: gfx/crackatlas.t3s
+# names gfx/crackatlas.png, tex3ds writes build/crackatlas.d, and the compiler's deps for
+# source/gfx/crackatlas.c overwrite it — both stems are "crackatlas". tools/make_crack_atlas.py
+# regenerates the .png; without this line that regeneration would never reach the build, and the
+# console would go on drawing the previous eight stages. On a progressive animation that reads
+# as the break TIMING being wrong rather than as the texture being stale, which is a much longer
+# way round to the same one-line fix.
+crackatlas.t3x: crackatlas.png
+
 -include $(DEPSDIR)/*.d
 
 #---------------------------------------------------------------------------------------

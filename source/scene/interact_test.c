@@ -131,6 +131,54 @@ static Body farAwayBody(void)
 static u32 breakKey(void) { return inputKey(ACTION_BREAK); }
 static u32 placeKey(void) { return inputKey(ACTION_PLACE); }
 
+// ── driving the v1.8.1 held break ───────────────────────────────────────────────────────
+//
+// Since task 50 a break is a hold, not a press, so every case below has to drive a LOOP.
+// These three helpers are the whole vocabulary: one frame of holding, one frame of not
+// holding, and "hold until it goes".
+//
+// They deliberately pass the break bit in BOTH masks. In the real frame loop `keys_down` is
+// a one-frame pulse and `keys_held` stays high, so fresh is set on the first call either
+// way; passing it in both here keeps the press-edge accounting (which is what `refused`
+// counts against) identical to the console's without the fixtures having to model
+// hidKeysDown's pulse shape.
+
+// One frame of holding break, worth `ticks` simulation ticks.
+static void holdBreakFrame(Interact* it, const Body* body, int ticks)
+{
+	interactEdit(it, &s_world, body, breakKey(), breakKey(), ticks);
+}
+
+// One frame with nothing held. Ticks still pass — the world's clock does not stop because
+// the player let go, and a state machine that only cancels on a zero-tick frame would pass
+// a test that never gave it one.
+static void releaseFrame(Interact* it, const Body* body, int ticks)
+{
+	interactEdit(it, &s_world, body, 0, 0, ticks);
+}
+
+// Hold break, one tick per frame, until the break lands. Returns the tick it landed on, or
+// -1 if it never did within `max_ticks`.
+//
+// The cap is not decoration: without it, a state machine that banks no progress would hang
+// the suite instead of failing it, and a hung suite in CI reads as an infrastructure
+// problem rather than as the bug it is.
+static int holdBreakUntilDone(Interact* it, const Body* body, int max_ticks)
+{
+	const int before = it->broke;
+
+	for (int t = 1; t <= max_ticks; t++) {
+		holdBreakFrame(it, body, 1);
+		if (it->broke > before)
+			return t;
+	}
+	return -1;
+}
+
+// Longer than any hardness in the registry (the hardest is stone at 45 ticks), so a case
+// that says "this never breaks" has genuinely waited rather than given up early.
+#define NEVER_TICKS 200
+
 // ── the ceiling itself ──────────────────────────────────────────────────────────────────
 
 // world/inventory.h's inventoryCanHold() is the single home of the rule; if it ever says
@@ -166,7 +214,13 @@ static void testABreakOnACarryUnholdableBlockChangesNothing(void)
 	// anywhere in this file: tests/interact_stub.c's chunkRenderTouch always answers 0, so a
 	// check on it could not go red and would prove nothing.
 	const Body body = farAwayBody();
-	interactEdit(&it, &s_world, &body, breakKey());
+	// Held for far longer than any block takes, so this is "it refuses to break", not "it
+	// had not finished yet".
+	CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) == -1);
+	// v1.8.1: and no crack was ever drawn on it either. Letting the animation run on a block
+	// that was never going to go would read as the game being broken rather than as the
+	// block being unbreakable.
+	CHECK(interactBreakStage(&it) == -1);
 
 	// The block is still there. This is the whole point: losing it silently is worse than
 	// not being able to remove it.
@@ -204,7 +258,10 @@ static void testTallGrassBreaksAndDropsNothing(void)
 	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_TALL_GRASS);
 
 	const Body body = farAwayBody();
-	interactEdit(&it, &s_world, &body, breakKey());
+	// One tick. Tall grass is the softest thing in the registry and comes out on the first
+	// tick of the hold — a plant that took two seconds to pull up would be worse than the
+	// v1.7.1 bug where it could not be pulled up at all.
+	CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) == 1);
 
 	// It is GONE. This is the check that was red before the fix.
 	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_AIR);
@@ -230,7 +287,7 @@ static void testAnOrdinaryBlockStillDropsItself(void)
 	freshAimedAt(&it, BLOCK_STONE);
 
 	const Body body = farAwayBody();
-	interactEdit(&it, &s_world, &body, breakKey());
+	CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) > 0);
 
 	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_AIR);
 	CHECK(it.broke == 1);
@@ -253,8 +310,8 @@ static void testRepeatedBreakAttemptsStillChangeNothing(void)
 	const Body body = farAwayBody();
 
 	for (int press = 0; press < 3; press++) {
-		interactEdit(&it, &s_world, &body, breakKey());
-		interactEdit(&it, &s_world, &body, 0);   // release, so the next call is a fresh edge
+		holdBreakFrame(&it, &body, 1);
+		releaseFrame(&it, &body, 1);   // release, so the next call is a fresh edge
 	}
 
 	CHECK(worldGet(&s_world, TX, TY, TZ) == dyn);
@@ -272,7 +329,7 @@ static void testACoreBlockStillBreaks(void)
 	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_STONE);
 
 	const Body body = farAwayBody();
-	interactEdit(&it, &s_world, &body, breakKey());
+	CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) > 0);
 
 	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_AIR);
 	CHECK(it.broke_id == BLOCK_STONE);   // this is what main.c puts in the bag
@@ -291,7 +348,7 @@ static void testEveryCoreBlockStillBreaks(void)
 		Interact it;
 		freshAimedAt(&it, id);
 		const Body body = farAwayBody();
-		interactEdit(&it, &s_world, &body, breakKey());
+		CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) > 0);
 
 		CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_AIR);
 		CHECK(it.broke_id == id);
@@ -307,7 +364,7 @@ static void testACoreBlockStillPlaces(void)
 	it.holding = BLOCK_PLANKS;
 
 	const Body body = farAwayBody();
-	interactEdit(&it, &s_world, &body, placeKey());
+	interactEdit(&it, &s_world, &body, placeKey(), 0, 0);
 
 	CHECK(worldGet(&s_world, TX, TY + 1, TZ) == BLOCK_PLANKS);
 	CHECK(it.placed_id == BLOCK_PLANKS);
@@ -336,7 +393,7 @@ static void testADynamicBlockStillPlaces(void)
 	it.holding = dyn2;
 
 	const Body body = farAwayBody();
-	interactEdit(&it, &s_world, &body, placeKey());
+	interactEdit(&it, &s_world, &body, placeKey(), 0, 0);
 
 	CHECK(worldGet(&s_world, TX, TY + 1, TZ) == dyn2);
 	CHECK(it.placed_id == dyn2);
@@ -359,7 +416,7 @@ static void testAimingAtNothingIsStillARefusal(void)
 	it.target.hit = false;
 
 	const Body body = farAwayBody();
-	interactEdit(&it, &s_world, &body, breakKey());
+	holdBreakFrame(&it, &body, 1);
 
 	CHECK(it.refused == 1);
 	CHECK(it.broke == 0);
@@ -374,7 +431,7 @@ static void testPlacingWithAnEmptyHandIsStillARefusal(void)
 	it.holding = BLOCK_AIR;
 
 	const Body body = farAwayBody();
-	interactEdit(&it, &s_world, &body, placeKey());
+	interactEdit(&it, &s_world, &body, placeKey(), 0, 0);
 
 	CHECK(it.refused == 1);
 	CHECK(it.placed == 0);
@@ -395,12 +452,263 @@ static void testPlacingIntoTheOwnBodyIsStillARefusal(void)
 	body.y = (float)(TY + 1);
 	body.z = TZ + 0.5f;
 
-	interactEdit(&it, &s_world, &body, placeKey());
+	interactEdit(&it, &s_world, &body, placeKey(), 0, 0);
 
 	CHECK(it.refused == 1);
 	CHECK(it.placed == 0);
 	CHECK(worldGet(&s_world, TX, TY + 1, TZ) == BLOCK_AIR);
 	CHECK(s_edits_sent == 0);
+}
+
+// ── v1.8.1 task 50: a break takes time ──────────────────────────────────────────────────
+//
+// The hardness values themselves belong to world/registry.c and are pinned there by
+// world/mining_test.c. These three are the ones the cases below quote, restated in one
+// place so that if the table is ever retuned (task 32 will, when tools arrive) exactly
+// three lines move and every case stays honest about what it is claiming.
+#define TICKS_STONE   45
+#define TICKS_DIRT    12
+#define TICKS_LEAVES   4
+
+// THE case task 50 exists for. Every check here is red against the pre-v1.8.1 code, where
+// one frame of the button being down took the block away.
+static void testABreakDoesNotHappenOnThePressEdge(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_STONE);
+	const Body body = farAwayBody();
+
+	holdBreakFrame(&it, &body, 1);
+
+	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_STONE);
+	CHECK(it.broke == 0);
+	// Not a refusal either. A press that started a break did something; counting it as a
+	// refusal would make the overlay's `r` figure meaningless the moment anyone mined.
+	CHECK(it.refused == 0);
+	CHECK(s_edits_sent == 0);
+	// It IS in progress, which is what separates "takes time" from "does nothing".
+	CHECK(it.breaking);
+	CHECK(interactBreakStage(&it) == 0);
+}
+
+// Each block takes its OWN time, and takes all of it. Both halves matter: without the
+// one-tick-short half, a machine that broke everything on the first tick would pass the
+// completion half by accident; without the completion half, a machine that never finished
+// would pass the first.
+static void testEachBlockTakesItsOwnHardness(void)
+{
+	const struct { BlockId id; int ticks; } cases[] = {
+		{ BLOCK_STONE,  TICKS_STONE  },
+		{ BLOCK_DIRT,   TICKS_DIRT   },
+		{ BLOCK_LEAVES, TICKS_LEAVES },
+	};
+
+	for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+		Interact it;
+		freshAimedAt(&it, cases[i].id);
+		const Body body = farAwayBody();
+
+		for (int t = 0; t < cases[i].ticks - 1; t++)
+			holdBreakFrame(&it, &body, 1);
+		CHECK(worldGet(&s_world, TX, TY, TZ) == cases[i].id);
+		CHECK(it.broke == 0);
+
+		holdBreakFrame(&it, &body, 1);
+		CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_AIR);
+		CHECK(it.broke == 1);
+		CHECK(it.broke_id == cases[i].id);
+	}
+}
+
+// Letting go throws the progress away. Anything else needs a decay rule, and a decay rule
+// is a mechanic nobody asked for.
+static void testReleasingTheButtonThrowsAwayProgress(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_STONE);
+	const Body body = farAwayBody();
+
+	for (int t = 0; t < TICKS_STONE - 1; t++)
+		holdBreakFrame(&it, &body, 1);
+	CHECK(it.breaking);
+	CHECK(it.broke == 0);
+
+	releaseFrame(&it, &body, 1);
+	CHECK(!it.breaking);
+	CHECK(interactBreakStage(&it) == -1);
+
+	// One tick of holding again is the FIRST tick, not the forty-fourth.
+	holdBreakFrame(&it, &body, 1);
+	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_STONE);
+	CHECK(interactBreakStage(&it) == 0);
+
+	// ...and a whole requirement still has to be paid, less the one tick just banked.
+	CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) == TICKS_STONE - 1);
+}
+
+// Progress belongs to a block, not to the button. Moving the crosshair mid-hold starts
+// again on the new block and abandons the old one.
+static void testLookingAtAnotherBlockThrowsAwayProgress(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_STONE);
+	worldSet(&s_world, TX + 1, TY, TZ, BLOCK_STONE);   // a second block to look at
+	const Body body = farAwayBody();
+
+	for (int t = 0; t < TICKS_STONE - 1; t++)
+		holdBreakFrame(&it, &body, 1);
+
+	// The crosshair moves one cell, without the button ever coming up.
+	it.target.x = TX + 1;
+	holdBreakFrame(&it, &body, 1);
+
+	CHECK(worldGet(&s_world, TX,     TY, TZ) == BLOCK_STONE);
+	CHECK(worldGet(&s_world, TX + 1, TY, TZ) == BLOCK_STONE);
+	CHECK(it.broke == 0);
+	CHECK(it.break_x == TX + 1);
+	CHECK(it.break_ticks == 1u);
+
+	// Look back. The original is at zero too: progress does not sit waiting for the
+	// crosshair to come home.
+	it.target.x = TX;
+	holdBreakFrame(&it, &body, 1);
+	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_STONE);
+	CHECK(it.break_ticks == 1u);
+}
+
+// A remote edit swapping the block under the crosshair must restart the timer. Without the
+// id being part of the progress identity, a 44-tick stone break would finish on the very
+// next tick against the dirt that replaced it.
+static void testTheBlockChangingUnderTheCrosshairRestarts(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_STONE);
+	const Body body = farAwayBody();
+
+	for (int t = 0; t < TICKS_STONE - 1; t++)
+		holdBreakFrame(&it, &body, 1);
+	CHECK(it.break_ticks == (uint32_t)(TICKS_STONE - 1));
+
+	worldSet(&s_world, TX, TY, TZ, BLOCK_DIRT);
+
+	holdBreakFrame(&it, &body, 1);
+	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_DIRT);
+	CHECK(it.broke == 0);
+	CHECK(it.break_id == BLOCK_DIRT);
+	CHECK(it.break_ticks == 1u);
+
+	// And it now takes DIRT's time from that restart, not stone's.
+	CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) == TICKS_DIRT - 1);
+	CHECK(it.broke_id == BLOCK_DIRT);
+}
+
+// The overlay's input. Stage must start at nothing to draw, begin at 0, never go backwards,
+// never leave the addressable range, reach the last picture before the block goes, and go
+// back to nothing to draw the instant it does.
+static void testTheCrackStageTracksProgress(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_STONE);
+	const Body body = farAwayBody();
+
+	CHECK(interactBreakStage(&it) == -1);
+
+	int prev     = 0;
+	int in_range = 1;
+	int monotone = 1;
+	int saw_last = 0;
+
+	for (int t = 1; t < TICKS_STONE; t++) {
+		holdBreakFrame(&it, &body, 1);
+		const int stage = interactBreakStage(&it);
+
+		// Accumulated into flags rather than CHECKed inside the loop: 44 iterations of four
+		// checks would put 176 near-identical lines into the count and drown the summary.
+		if (stage < 0 || stage >= INTERACT_BREAK_STAGES) in_range = 0;
+		if (stage < prev)                                monotone = 0;
+		if (stage == INTERACT_BREAK_STAGES - 1)          saw_last = 1;
+		prev = stage;
+	}
+
+	CHECK(in_range == 1);
+	CHECK(monotone == 1);   // cracks never heal
+	CHECK(saw_last == 1);   // the animation does not jump from half-cracked to gone
+	CHECK(it.broke == 0);   // ...and none of that finished the break early
+
+	holdBreakFrame(&it, &body, 1);
+	CHECK(it.broke == 1);
+	CHECK(interactBreakStage(&it) == -1);
+}
+
+// tickClockAdvance hands out up to TICK_MAX_CATCHUP_DEFAULT ticks in one frame after a
+// chunk-load stall, so the requirement can be stepped straight over rather than landed on.
+static void testCatchUpTicksStillLandTheBreak(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_STONE);
+	const Body body = farAwayBody();
+
+	int in_range = 1;
+	int frames   = 0;
+
+	for (; frames < 20 && it.broke == 0; frames++) {
+		holdBreakFrame(&it, &body, 4);
+		if (it.broke)
+			break;
+		const int stage = interactBreakStage(&it);
+		if (stage < 0 || stage >= INTERACT_BREAK_STAGES) in_range = 0;
+	}
+
+	CHECK(in_range == 1);
+	CHECK(it.broke == 1);
+	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_AIR);
+	// 4 ticks a frame against 45: the twelfth frame banks 48 and is the one that lands it.
+	// Asserted exactly, because ">= sooner or later" would also pass a machine that
+	// overshot by a hundred frames.
+	CHECK(frames == 11);
+}
+
+// At 60 fps the 20 TPS clock produces no tick on two frames out of three. Those frames must
+// not cancel the hold, and a clock that appears to run backwards must not rewind it.
+static void testZeroAndNegativeTicksKeepTheHold(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_STONE);
+	const Body body = farAwayBody();
+
+	for (int f = 0; f < 10; f++)
+		holdBreakFrame(&it, &body, 0);
+	CHECK(it.breaking);
+	CHECK(it.break_ticks == 0u);
+	CHECK(interactBreakStage(&it) == 0);
+
+	holdBreakFrame(&it, &body, 5);
+	CHECK(it.break_ticks == 5u);
+	holdBreakFrame(&it, &body, -100);
+	CHECK(it.break_ticks == 5u);
+
+	CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) == TICKS_STONE - 5);
+}
+
+// control: place was deliberately left edge-triggered and must be completely indifferent to
+// the clock. Green in every arm of every sabotage of the break machine — if this goes red,
+// the sabotage hit something wider than task 50 and the red is not evidence about it.
+static void testPlaceIsStillOnePressAndIgnoresTheClock(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_STONE);
+	it.holding = BLOCK_PLANKS;
+	const Body body = farAwayBody();
+
+	interactEdit(&it, &s_world, &body, placeKey(), placeKey(), 0);
+
+	CHECK(it.placed == 1);
+	CHECK(worldGet(&s_world, TX, TY + 1, TZ) == BLOCK_PLANKS);
+
+	// Holding it down for a hundred more frames puts down exactly nothing more.
+	for (int f = 0; f < 100; f++)
+		interactEdit(&it, &s_world, &body, placeKey(), placeKey(), 1);
+	CHECK(it.placed == 1);
 }
 
 int main(void)
@@ -417,6 +725,17 @@ int main(void)
 	testAimingAtNothingIsStillARefusal();
 	testPlacingWithAnEmptyHandIsStillARefusal();
 	testPlacingIntoTheOwnBodyIsStillARefusal();
+
+	// v1.8.1 task 50.
+	testABreakDoesNotHappenOnThePressEdge();
+	testEachBlockTakesItsOwnHardness();
+	testReleasingTheButtonThrowsAwayProgress();
+	testLookingAtAnotherBlockThrowsAwayProgress();
+	testTheBlockChangingUnderTheCrosshairRestarts();
+	testTheCrackStageTracksProgress();
+	testCatchUpTicksStillLandTheBreak();
+	testZeroAndNegativeTicksKeepTheHold();
+	testPlaceIsStillOnePressAndIgnoresTheClock();
 
 	if (s_fails == 0)
 		printf("interact self-test: PASS  %d checks\n", s_checks);

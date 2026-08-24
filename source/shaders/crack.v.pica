@@ -1,0 +1,62 @@
+; Blocksmith — the block-breaking crack overlay vertex shader.
+;
+; Roadmap task 50 part 3. This is source/shaders/world.v.pica with everything the
+; overlay does not have taken out: no baked face shade, no ambient occlusion, no
+; relative-addressed faceShade table, and no water height offset. What is left is a
+; textured quad — which is exactly the one thing source/shaders/highlight.v.pica
+; cannot do, since the cage it draws carries no UV attribute at all.
+;
+; Attributes (see CrackVertex in source/scene/crackoverlay.c):
+;   v0 = position, 3x float, in block units, relative to the block's own corner.
+;        Float rather than the world's packed bytes for the same reason highlight's
+;        v0 is: the overlay sits CRACK_MARGIN (a few thousandths of a block) outside
+;        the block's faces, and a value that small does not survive an 8-bit attribute.
+;   v1 = texture coordinate, 2x float, ALREADY NORMALISED to 0..1.
+;
+; There is deliberately no uvScale constant here, which is the one place this shader
+; departs from world.v.pica's shape. The world's UVs arrive as raw atlas pixel bytes
+; and have to be divided by the sheet size in the shader, so the sheet's dimensions
+; exist in four places at once and world/atlas_uv_shader_test.c has to parse this very
+; file to keep them honest. The crack overlay's vertex buffer is built once on the CPU
+; from CRACK_W_PX/CRACK_H_PX in source/gfx/crackatlas.h and baked as normalised floats,
+; so the sheet size lives in exactly two places (that header and the generator script)
+; and this shader cannot disagree with it — it never sees the number.
+
+.fvec projection[4], modelView[4]
+
+.constf consts(0.0, 1.0, 0.0, 0.0)
+.alias  ones consts.yyyy
+
+.out outpos position
+.out outtc0 texcoord0
+.out outclr color
+
+.alias inpos v0
+.alias inuv  v1
+
+.proc main
+	mov r0.xyz, inpos
+	mov r0.w,   ones
+
+	dp4 r1.x, modelView[0], r0
+	dp4 r1.y, modelView[1], r0
+	dp4 r1.z, modelView[2], r0
+	dp4 r1.w, modelView[3], r0
+
+	dp4 outpos.x, projection[0], r1
+	dp4 outpos.y, projection[1], r1
+	dp4 outpos.z, projection[2], r1
+	dp4 outpos.w, projection[3], r1
+
+	; Straight through. Same .xyxy idiom as world.v.pica: texcoord0 is a two-component
+	; output, so the duplicated z/w go nowhere.
+	mov outtc0, inuv.xyxy
+
+	; Unused by TEV — crackOverlayDraw's stage 0 is GPU_REPLACE from GPU_TEXTURE0, so
+	; the primary colour is never read — but left defined rather than omitted, exactly
+	; as highlight.v.pica leaves it, so every output the fixed-function pipeline expects
+	; has a value.
+	mov outclr, ones
+
+	end
+.end

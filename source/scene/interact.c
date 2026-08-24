@@ -5,6 +5,7 @@
 #include "world/block.h"
 #include "world/inventory.h"
 #include "world/light.h"
+#include "world/mining.h"
 
 // ── the edit decision and the world write ───────────────────────────────────────────────
 //
@@ -36,6 +37,46 @@ static bool boxOverlapsCell(const Body* b, int bx, int by, int bz)
 	       (b->z - hw) < (float)(bz + 1) && (b->z + hw) > (float)bz;
 }
 
+// ── held-break progress (v1.8.1 task 50) ────────────────────────────────────────────────
+//
+// Forget whatever block was part-way broken. Called whenever the hold ends, the crosshair
+// leaves the block, the block changes under the crosshair, or a break finishes — i.e. every
+// exit from "a break is in progress", so there is one place that has to be right rather
+// than five. Zeroing the coordinates as well as the flag is deliberate: `breaking` is the
+// only field anything is allowed to read as "is there progress", and leaving stale
+// coordinates behind invites a later reader to test the wrong one.
+static void breakCancel(Interact* it)
+{
+	it->breaking    = false;
+	it->break_x     = 0;
+	it->break_y     = 0;
+	it->break_z     = 0;
+	it->break_id    = BLOCK_AIR;
+	it->break_ticks = 0;
+	it->break_need  = 0;
+}
+
+int interactBreakStage(const Interact* it)
+{
+	// break_need == 0 is a block with no hardness, which completes on the same call that
+	// starts it and so is never left in progress. Guarding it here is still not optional:
+	// it is also the divisor two lines down.
+	if (!it->breaking || it->break_need == 0)
+		return -1;
+
+	uint32_t stage = (it->break_ticks * INTERACT_BREAK_STAGES) / it->break_need;
+
+	// Clamp rather than trust the arithmetic. break_ticks can exceed break_need by up to
+	// one frame's worth of catch-up ticks (tickClockAdvance hands out as many as four at
+	// once) on the very frame the break completes, and this project has already paid for a
+	// texture read that ran past its rows: a wrong texture constant still renders A
+	// texture, so the bug shows up as bad art and never as an error.
+	if (stage >= INTERACT_BREAK_STAGES)
+		stage = INTERACT_BREAK_STAGES - 1;
+
+	return (int)stage;
+}
+
 void interactInit(Interact* it)
 {
 	it->target    = (RayHit){0};
@@ -46,9 +87,127 @@ void interactInit(Interact* it)
 	it->prev_keys = 0;
 	it->broke_id  = BLOCK_AIR;
 	it->placed_id = BLOCK_AIR;
+	breakCancel(it);
 }
 
-int interactEdit(Interact* it, World* w, const Body* body, u32 keys_down)
+// The world write, once the hold has earned it. Everything here is the pre-v1.8.1 break
+// path verbatim; the only change is that it is now reached by running out of ticks instead
+// of by a button edge.
+static int breakComplete(Interact* it, World* w, int x, int y, int z, BlockId broken)
+{
+	// v1.7.1 task 47. A plant breaks and gives you nothing; it is not refused. See
+	// world/block.h's blockDropsNothing for why this had been tangled up with the bag
+	// ceiling below, and what that cost.
+	const bool no_drop = blockDropsNothing(broken);
+	int queued = 0;
+
+	// worldSet refuses y outside the world, which is exactly what should happen when the
+	// ray hit the solid floor below y == 0 — that is not a block anyone owns.
+	if (worldSet(w, x, y, z, BLOCK_AIR)) {
+		// Step 8.1. Only edits mark a column for saving — see the note on Column.dirty.
+		worldMarkDirty(w, x, z);
+		// Adaptive lighting: recompute the edited column's channels before the remesh is
+		// queued, so the drained mesh bakes the new light in the same frame. The relight is
+		// column-local and idempotent — it memsets and recomputes from the blocks — so this
+		// is exactly a full reflood of that one column, and no neighbour can go stale
+		// behind it.
+		if (lightEnabled())
+			lightRelightColumn(w, x >> 4, z >> 4);
+		queued += chunkRenderTouch(w, x, y, z);
+		// Fire-and-forget to the server: the local write above is already done and is
+		// authoritative for this client's own view, so nothing here waits on it.
+		networldSendBlockEdit(x, y, z, BLOCK_AIR);
+		it->broke++;
+		// Left as BLOCK_AIR for a plant, which is exactly how main.c already spells "this
+		// break earned nothing" — it adds to the bag only when broke_id != BLOCK_AIR. So the
+		// plant is removed from the world, the edit goes to the server as an ordinary air
+		// write (id 0, legal on the wire and below every ceiling on both sides), and no
+		// unholdable id is ever offered to the inventory.
+		it->broke_id = no_drop ? BLOCK_AIR : broken;
+	} else {
+		it->refused++;
+	}
+
+	// Whether it landed or the world vetoed it, this hold is spent. A veto that left the
+	// progress standing would re-fire the same doomed worldSet on every following frame of
+	// the hold and count a refusal each time; restarting the timer instead costs the player
+	// nothing they can feel and bounds the noise to one refusal per full break time.
+	breakCancel(it);
+	return queued;
+}
+
+// One frame of holding the break button with something under the crosshair. `pressed` is
+// true only on the frame the hold began, and exists so a refusal is counted once per press
+// rather than sixty times a second.
+static int breakProgress(Interact* it, World* w, const RayHit* t, int ticks, bool pressed)
+{
+	const BlockId here = worldGet(w, t->x, t->y, t->z);
+
+	// Start, or restart. The block id is part of the identity, not just the coordinates:
+	// a server edit can swap what is in the cell mid-hold, and a stone that is 90% mined
+	// must not finish instantly as the dirt that replaced it.
+	if (!it->breaking ||
+	    it->break_x != t->x || it->break_y != t->y || it->break_z != t->z ||
+	    it->break_id != here) {
+
+		// A block the bag cannot hold is not breakable — and the question is asked BEFORE
+		// anything is mutated, which is the whole of the v1.6.0 fix. Until then the order
+		// was the other way round: worldSet wrote air, the id went to invBridgeAdd, and
+		// world/inventory.h refused it because a server-registered dynamic id (0x80..0xFD)
+		// is over the BLOCK_COUNT ceiling every slot-indexed array in this client is built
+		// to. The block was then in neither place — deleted from the world, absent from the
+		// bag, with no message. An unbreakable block is at least legible to the player; a
+		// vanishing one reads as save corruption.
+		//
+		// v1.8.1 moves the question earlier still, from the moment of the break to the
+		// moment the hold starts. That is not just tidiness: with a timed break, asking at
+		// the end would have the player watch a full crack animation play out on a block
+		// that was never going to go, which reads as the game being broken rather than as
+		// the block being unbreakable.
+		//
+		// The rule lives in inventoryCanHold() and nowhere else. Guarding here rather than
+		// at the pickup also covers the multiplayer path for free: this function is the ONLY
+		// origin of a player-initiated break in the client, so refusing before the write
+		// also refuses the BS_APP_BLOCK_EDIT — which matters, because the server would have
+		// honoured the removal and then dropped the matching BS_INV_OP_PICKUP
+		// (deps/blocksmith-server/game/bsgame.c mirrors the same ceiling), destroying the
+		// block for every player on the server, not just this one.
+		//
+		// ⚠ Delete this branch when inventory becomes registry-aware — i.e. when
+		// inventoryCanHold() widens past BLOCK_COUNT on both this client and the server.
+		if (!blockDropsNothing(here) && !inventoryCanHold(here)) {
+			breakCancel(it);
+			// `refused` is the module's existing idiom for "the press did nothing", already
+			// counted for a miss, an occupied cell and an empty hand, and already surfaced
+			// on the debug overlay as `r`. Nothing louder is invented here: this client has
+			// no toast or status line for a refused action (world/inventory.h says so in as
+			// many words), and a silent refusal is a far smaller lie than a silent deletion.
+			if (pressed)
+				it->refused++;
+			return 0;
+		}
+
+		it->breaking    = true;
+		it->break_x     = t->x;
+		it->break_y     = t->y;
+		it->break_z     = t->z;
+		it->break_id    = here;
+		it->break_ticks = 0;
+		it->break_need  = breakTicksRequired(here, it->holding);
+	}
+
+	it->break_ticks += (uint32_t)ticks;
+
+	// >= rather than ==: the clock hands out up to TICK_MAX_CATCHUP_DEFAULT ticks in one
+	// go, so the exact requirement can be stepped straight over.
+	if (it->break_ticks < it->break_need)
+		return 0;
+
+	return breakComplete(it, w, t->x, t->y, t->z, it->break_id);
+}
+
+int interactEdit(Interact* it, World* w, const Body* body,
+                 u32 keys_down, u32 keys_held, int ticks)
 {
 	// Internal edge detection: act only on bits newly set since the last call, no matter
 	// what the caller passes. With hidKeysDown() (already a one-frame pulse) this is a
@@ -75,7 +234,20 @@ int interactEdit(Interact* it, World* w, const Body* body, u32 keys_down)
 	const u32 key_break = inputKey(ACTION_BREAK);
 	const u32 key_place = inputKey(ACTION_PLACE);
 
+	// The one asymmetry in this function, and it is the point of task 50: place reads the
+	// edge computed above, break reads the raw level. A break is a process now, so it needs
+	// to know the button is STILL down, which an edge cannot say.
+	const bool holding_break = (keys_held & key_break) != 0;
+
+	// A clock that appears to run backwards must never rewind a break, for the same reason
+	// tickClockAdvance clamps negative elapsed time to zero.
+	if (ticks < 0)
+		ticks = 0;
+
 	if (!it->target.hit) {
+		// Aiming at nothing abandons the break in progress. Progress is anchored to a
+		// specific block and there is no longer one.
+		breakCancel(it);
 		// A press with nothing to aim at is still a refusal, not a no-op: `refused` is
 		// documented (interact.h) as counting edits the world, the body, or a miss
 		// rejected, and a press that found no target was rejected same as one the world
@@ -89,83 +261,13 @@ int interactEdit(Interact* it, World* w, const Body* body, u32 keys_down)
 	const RayHit* t = &it->target;
 	int queued = 0;
 
-	if (fresh & key_break) {
-		// Read before the write, obviously, but worth saying why it is read at all: step
-		// 8.2's inventory is filled from what the player actually broke, so the id has to be
-		// captured here — after worldSet the cell is air and the information is gone.
-		const BlockId broken = worldGet(w, t->x, t->y, t->z);
-
-		// A block the bag cannot hold is not breakable — and this is asked BEFORE anything
-		// is mutated, which is the whole fix.
-		//
-		// Until v1.6.0 the order was the other way round: worldSet wrote air, the id went
-		// to invBridgeAdd, and world/inventory.h refused it because a server-registered
-		// dynamic id (0x80..0xFD) is over the BLOCK_COUNT ceiling every slot-indexed array
-		// in this client is built to. The block was then in neither place — deleted from
-		// the world, absent from the bag, with no message. An unbreakable block is at least
-		// legible to the player; a vanishing one reads as save corruption.
-		//
-		// The rule lives in inventoryCanHold() and nowhere else, so the "can this be
-		// carried" ceiling has exactly one home. Guarding here rather than at the pickup
-		// also covers the multiplayer path for free: this function is the ONLY origin of a
-		// player-initiated break in the client (main.c is its only caller, and
-		// networldSendBlockEdit is called nowhere else), so refusing before the write also
-		// refuses the BS_APP_BLOCK_EDIT — which matters, because the server would have
-		// honoured the removal and then dropped the matching BS_INV_OP_PICKUP
-		// (deps/blocksmith-server/game/bsgame.c mirrors the same ceiling), destroying the
-		// block for every player on the server, not just this one.
-		//
-		// ⚠ Delete this branch when inventory becomes registry-aware — i.e. when
-		// inventoryCanHold() widens past BLOCK_COUNT on both this client and the server.
-		// It exists only because the bag cannot hold the id, not because the block is
-		// special in any other way.
-		// v1.7.1 task 47. A plant breaks and gives you nothing; it is not refused. Splitting
-		// this off is the whole fix — see world/block.h's blockDropsNothing for why the two
-		// questions had been one, and what it cost. Nothing about the ceiling rule below
-		// changes: a block the bag cannot hold is still unbreakable, and inventoryCanHold is
-		// still the only home for that rule.
-		const bool no_drop = blockDropsNothing(broken);
-
-		if (!no_drop && !inventoryCanHold(broken)) {
-			// `refused` is the module's existing idiom for "the press did nothing", already
-			// counted for a miss, an occupied cell and an empty hand, and already surfaced
-			// on the debug overlay as `r`. Nothing louder is invented here: this client has
-			// no toast or status line for a refused action (world/inventory.h says so in
-			// as many words), and a silent refusal is a far smaller lie than a silent
-			// deletion.
-			it->refused++;
-		}
-		// worldSet refuses y outside the world, which is exactly what should happen when
-		// the ray hit the solid floor below y == 0 — that is not a block anyone owns.
-		else if (worldSet(w, t->x, t->y, t->z, BLOCK_AIR)) {
-			// Step 8.1. Only edits mark a column for saving — see the note on Column.dirty.
-			worldMarkDirty(w, t->x, t->z);
-			// Adaptive lighting: recompute the edited column's channels before the remesh
-			// is queued, so the drained mesh bakes the new light in the same frame. The
-			// relight is column-local and idempotent — it memsets and recomputes from the
-			// blocks — so this is exactly a full reflood of that one column, and no
-			// neighbour can go stale behind it.
-			//
-			// This used to say "the sweep engine is queue-free", which v1.8.0 made false:
-			// task 23 moved the edit path off relaxation sweeps onto flood fill (0.141 ms
-			// per block against 4.064 ms, measured on the host), and world/relightq.h now
-			// coalesces the multi-edit case. Neither changes what this call site does.
-			if (lightEnabled())
-				lightRelightColumn(w, t->x >> 4, t->z >> 4);
-			queued += chunkRenderTouch(w, t->x, t->y, t->z);
-			// Fire-and-forget to the server: the local write above is already done and is
-			// authoritative for this client's own view, so nothing here waits on it.
-			networldSendBlockEdit(t->x, t->y, t->z, BLOCK_AIR);
-			it->broke++;
-			// Left as BLOCK_AIR for a plant, which is exactly how main.c already spells "this
-			// break earned nothing" — it adds to the bag only when broke_id != BLOCK_AIR. So
-			// the plant is removed from the world, the edit goes to the server as an ordinary
-			// air write (id 0, legal on the wire and below every ceiling on both sides), and no
-			// unholdable id is ever offered to the inventory.
-			it->broke_id = no_drop ? BLOCK_AIR : broken;
-		} else {
-			it->refused++;
-		}
+	if (!holding_break) {
+		// Released, or never held. Progress does not survive letting go — a break the player
+		// walked away from and came back to must start again, which is both what the genre
+		// does and the only rule that does not need a decay timer nobody asked for.
+		breakCancel(it);
+	} else {
+		queued += breakProgress(it, w, t, ticks, (fresh & key_break) != 0);
 	}
 
 	if (fresh & key_place) {

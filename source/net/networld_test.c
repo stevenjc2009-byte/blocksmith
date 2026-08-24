@@ -1782,7 +1782,7 @@ static void test_registry_defs_converge(void)
     check(blockIsSolid(REG_ID_DYN_LO), "after sync the same id resolves to the real def");
     check(worldGet(&w, 5, 10, 7) == REG_ID_DYN_LO,
           "the stored raw byte needed no rewrite — tables agree around it");
-    check(registryCrc16() != 0x72A8u,
+    check(registryCrc16() != 0x4066u,
           "the converged table no longer hashes like the core-only one");
 }
 
@@ -2139,7 +2139,7 @@ static void test_registry_table_resets_between_sessions(void)
     check(registryCount() == 10, "after leaving, only the ten core rows remain");
     check(registryFind("srv1_a") == 0 && registryFind("srv1_b") == 0,
           "the first server's names are gone, not merely hidden");
-    check(registryCrc16() == 0x72A8u,
+    check(registryCrc16() == 0x4066u,
           "and the table hashes as the pinned core-only golden again");
     check(!networldRegistrySynced() && !networldRegistryWaiting(),
           "with the sync state cleared alongside it");

@@ -4,6 +4,58 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.8.1] - 2026-08-24
+
+Breaking a block takes time. Until now every block came out on the frame the button went down,
+which made stone and dirt and wood indistinguishable and made a mis-aimed press instantly
+destructive. From 1.8.1 the break button is HELD, each block has its own hardness, and a crack
+spreads across the face while you work at it.
+
+Worlds made in 1.8.0 open unchanged and no block id moved. One thing DID move and it matters for
+multiplayer — see Compatibility.
+
+### Added
+
+- **Per-block break times.** Hardness in ticks at 20 TPS, so the same block takes the same real
+  time on a console holding 60 fps and one at 30 — a frame-counted timer would have made stone
+  quicker to mine on an emptier screen, which is the exact defect the tick clock exists to
+  prevent. Tall grass 1 tick, leaves 4, sand 10, grass and dirt 12, wood and planks 40, stone 45.
+  Tuned for a game that has no tools in it yet; `world/mining.c` carries the multiplier seam they
+  will slot into, deliberately empty until then.
+- **A crack overlay.** Eight progressive stages drawn on the block being mined, on their own
+  small texture (16x128, RGBA5551, about 4 KB) and their own draw pass — never through the chunk
+  mesher, because break progress advances twenty times a second and a chunk rebuild costs about
+  2.1 ms, which would spend the whole Old 3DS frame budget rebuilding geometry that is already
+  correct.
+- **Breaking is now interruptible.** Let go, look away, or have the block change under your
+  crosshair mid-hold, and the progress is thrown away rather than carried over to whatever you
+  look at next. The block's id is part of the progress identity, not just its coordinates, so a
+  90%-mined stone cannot finish instantly as the dirt a remote player put in its place.
+
+### Changed
+
+- **Break is level-triggered, place is still edge-triggered.** One press still puts down exactly
+  one block however long the button is held; only the break reads the button's state rather than
+  its edge.
+- **The simulation clock now advances before the edit rather than after it.** A held break
+  consumes those same ticks, and advancing afterwards would hand every frame the previous frame's
+  tick count. Water is indifferent to which side of the edit it steps on, so the whole block moved
+  rather than being split in two.
+- **A block the bag cannot hold is refused at the START of the hold**, not at the end. Watching a
+  full crack animation play out on a block that was never going to move reads as the game being
+  broken rather than as the block being unbreakable.
+
+### Compatibility
+
+- **The core block registry's CRC moved, 0x72A8 to 0x4066.** The wire layout did NOT change —
+  `hardness` has been byte 25 of the 28-byte record since the field was added, and there are still
+  ten core rows — but the values in that byte went from ten zeroes to real numbers, and the
+  registry hash covers content. A 1.8.1 client joining a server older than 1.8.1 fails the
+  registry match, falls into the bounded fetch retry and finishes the session unsynced: degraded,
+  not fatal, and it clears the moment the server is updated. **The matching server release is
+  1.8.1 — update both.**
+- No save-format break. `BLOCK_COUNT` is unchanged at 8 and no block id moved.
+
 ## [1.8.0] - 2026-08-24
 
 Water moves. 1.7.0 put water in the world and 1.7.1 taught the player to swim in it, but until

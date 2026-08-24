@@ -197,8 +197,20 @@ static void testRegistryCrcStability(void)
 	// registryMatchesInfo() fail on both count and crc, falls into the bounded
 	// REGISTRY_FETCH retry, and finishes the session with s_reg_synced false.
 	// Degraded, not fatal — and it clears the moment the server ships the same rows.
-	check(base == 0x72A8u,
-	      "core-only crc matches the pinned golden 0x72A8");
+	//
+	// Moved 0x72A8 -> 0x4066 on 2026-08-24 by roadmap task 50, which gives every core row a
+	// non-zero `hardness`. Worth being precise about what moved and what did not: the wire
+	// LAYOUT is untouched — `hardness` has been byte 25 of the 28-byte record since the field
+	// was added, and registryCount() is still 10. What changed is the VALUES in that byte,
+	// from ten zeroes to 12/12/45/10/40/4/40 (and 0 for air and water), and registryCrc16()
+	// hashes the records' contents. So this is a deliberate core-def edit like the two above
+	// and the pin moves with it, with the identical cost: a client on this build joining a
+	// server whose kCoreDefs still has no hardness fails registryMatchesInfo() on crc, falls
+	// into the bounded REGISTRY_FETCH retry, and finishes with s_reg_synced false. v1.8.1
+	// therefore ships the server in lockstep — deps/blocksmith-server/game/world/registry.c is
+	// a byte-identical vendored copy and tools/sync-world-sources.sh is what keeps it so.
+	check(base == 0x4066u,
+	      "core-only crc matches the pinned golden 0x4066");
 
 	// Content sensitivity: one extra def must move the crc, and re-init must
 	// put it back - proving the crc covers table content, not process state.

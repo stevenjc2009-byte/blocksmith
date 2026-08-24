@@ -1,0 +1,17 @@
+# Release notes shown on the 3DS top screen before the update downloads.
+# Attach this to the v1.8.1 GitHub release alongside blocksmith1.8.1.cia.
+# Checked with: sh tools/make_whatsnew.sh 1.8.1
+#
+# v1.8.1 ONLY. This release is the timed block break and its crack animation.
+# Player-facing prose only - it wraps at 61 characters on a 400px screen.
+# Items are capped at 95 characters each by source/app/whatsnew.h.
+# The developer-facing story lives in CHANGELOG.md.
+
+[features]
+Breaking a block takes time now. Hold the break button instead of tapping it.
+Cracks spread across the block while you mine it, so you can see how far along you are.
+Every block has its own hardness. Tall grass comes out at once, stone takes a while.
+Let go or look away and the block heals. Progress does not follow your crosshair around.
+
+[fixes]
+A block you cannot carry is refused as soon as you start, not after the whole animation.

@@ -45,6 +45,7 @@
 #include "net/networld.h"
 #include "scene/camera.h"
 #include "scene/chunk_render.h"
+#include "scene/crackoverlay.h"
 #include "scene/crosshair.h"
 #include "scene/highlight.h"
 #include "scene/playermodel.h"
@@ -234,6 +235,12 @@ static int worldReportBuild(void)
 // startup gap (world build, self-test, and on an instrumented build a five-second remesh
 // stress), so an edit on it would be measuring that instead.
 #define DEMO_START_FRAME 60
+
+// v1.8.1 task 50. How long BS_INTERACT_DEMO holds the break button. 240 frames is four
+// seconds at 60 fps against a hardest-block requirement of 45 ticks (2.25 s), so the probe
+// completes its break whatever it happens to be aimed at, and still completes it if the
+// frame rate has halved — which on this console it can.
+#define DEMO_BREAK_FRAMES 240
 
 // Meshes the hand-built area. Returns the number of chunks the mesh pool refused,
 // which must be zero — a refusal is a hole in the world, not a slow frame.
@@ -2027,7 +2034,7 @@ static void drawStage(int stage, int k)
 #endif
 
 static void drawEye(C3D_RenderTarget* target, const C3D_Mtx* view, const RayHit* hit,
-                    float iod, int eye)
+                    int crack_stage, float iod, int eye)
 {
 	drawStage(WD_DRAW_EYE_SETUP, eye);
 	(void)eye;   // the markers are the only reader; a non-probe build has none
@@ -2047,6 +2054,23 @@ static void drawEye(C3D_RenderTarget* target, const C3D_Mtx* view, const RayHit*
 	// It reads chunkRenderProjection(), so it gets this eye's matrix for free.
 	drawStage(WD_DRAW_HIGHLIGHT, eye);
 	highlightDraw(view, hit);
+
+	// v1.8.1 task 50. The spreading fracture on the block being mined.
+	//
+	// Gated HERE and not inside crackOverlayDraw, because scene/crackoverlay.h states that it
+	// carries no "is anything happening" flag on purpose: stage 0 already draws visible
+	// cracks, so calling it unconditionally would paint a permanent fracture on whatever the
+	// player happens to look at. -1 from interactBreakStage is the whole of that signal.
+	//
+	// hit->x/y/z rather than Interact's break_x/y/z, and they are the same coordinates by
+	// construction: scene/interact.c restarts progress the moment the crosshair leaves the
+	// block, so a stage of 0 or more already means the target IS the block being broken.
+	// Passing the target keeps drawEye's parameter list to one added int.
+	//
+	// After the highlight so the cage's bars sit in front of the fracture, and inside drawEye
+	// rather than beside it so a stereo frame cracks the same block in both eyes.
+	if (crack_stage >= 0 && hit->hit)
+		crackOverlayDraw(view, hit->x, hit->y, hit->z, crack_stage);
 
 	// The other people in the session, from the pose table net/networld.c fills. Both calls
 	// are unconditional: each returns immediately when nobody else has sent a pose, which
@@ -3279,6 +3303,13 @@ session_start:
 	// stays identical across builds.
 	(void)highlight_ok;
 
+	// v1.8.1 task 50. The crack overlay, on exactly the same not-load-bearing footing as the
+	// highlight above: a break still takes its time and still completes without it, the
+	// player just cannot see how far along it is. crackOverlayDraw is a no-op when this
+	// fails, so nothing downstream needs the answer. It loads its own texture — do not call
+	// crackAtlasInit here as well, crackOverlayInit already has.
+	(void)crackOverlayInit();
+
 	// Remote player bodies, on the same not-load-bearing footing as the highlight above: a
 	// failure here costs the ability to see other players, which is worse in a session and
 	// completely irrelevant in single player, and either way is not a reason to refuse to
@@ -3681,6 +3712,11 @@ session_start:
 		watchdogPhase(WD_PHASE_INPUT);
 		hidScanInput();
 		u32 down = hidKeysDown();
+		// v1.8.1 task 50. Read here beside `down` rather than at the edit, so both masks come
+		// from the same hidScanInput() and cannot describe two different instants. Held is what
+		// a timed break needs: the edge only says the button went down, not that it is still
+		// down two seconds later.
+		u32 held = hidKeysHeld();
 		// quit_requested comes from the loading screen (a stalled load the player gave up on,
 		// or the system closing us while it was up). Taken here rather than skipping the loop
 		// entirely so the exit runs exactly the path a START quit runs — inventory saved, dirty
@@ -3959,13 +3995,49 @@ session_start:
 		if (rc_ms > s_genr.worst_recenter_ms) s_genr.worst_recenter_ms = rc_ms;
 #endif
 
+		// v1.8.0 task 21. The simulation clock, advanced once per frame by however much real
+		// time the last frame actually took. It sits ahead of both drains further down, because
+		// a tick that changes blocks — task 22's fluid step — has to have changed them before
+		// this frame relights and remeshes, or the change is a frame late and, worse, is lit by
+		// the previous frame's light.
+		//
+		// v1.8.1 task 50 moved it from just below the edit to just above it. A held break now
+		// consumes these same ticks, and interactEdit is handed `ticks_now` directly: advancing
+		// the clock after the edit would hand every frame the PREVIOUS frame's tick count, so a
+		// break would finish one frame late and, on the frame the player let go, would bank
+		// ticks against a hold that had already ended. Water does not care which side of the
+		// edit it is stepped on — the drains are what it has to precede — so the whole block
+		// moves rather than being split in two.
+		//
+		// Water is stepped once per tick, never once per frame: a pour that spread faster on a
+		// console holding 60 fps than on one at 30 would be a different game on the two
+		// machines, which is the whole reason the clock exists. Each step is capped at
+		// WATER_TICK_BUDGET cells, so the catch-up clamp handing four ticks to one frame costs
+		// at most four budgets and not an unbounded drain.
+		const int ticks_now = tickClockAdvance(&s_tickclock,
+		                                       (int64_t)(metricsFrameMs() * 1000.0f));
+		//
+		// Not separately timed into the CSV row below: MetricsWork lives in app/metrics.h,
+		// which this task does not own, and the cost is bounded by construction and measured
+		// directly in world/water_test.c against a real body of water.
+		for (int t = 0; t < ticks_now; t++)
+			(void)waterTick(&s_water, &s_world, WATER_TICK_BUDGET, onWaterChange, NULL);
+
 		// Aim first, then edit, so the highlight and the edit in the same frame cannot
 		// disagree about which block was being pointed at.
 		interactAim(&it, &s_world, &player.cam);
 
 #if BS_INTERACT_DEMO
-		if (frame == DEMO_START_FRAME)     down |= INTERACT_KEY_BREAK;
-		if (frame == DEMO_START_FRAME + 30) down |= INTERACT_KEY_PLACE;
+		// v1.8.1 task 50. Break is a HOLD now, so the demo has to hold it: a single frame of
+		// the bit being set banks one tick and then reads as a release, and the probe would
+		// report a break that never happened. DEMO_BREAK_FRAMES is four seconds at 60 fps,
+		// comfortably past the 2.25 s of the hardest block in the registry, so the demo does
+		// not have to know what it is aimed at. The break bit goes into `held` and the place
+		// bit into `down`, because that is now which mask each verb reads.
+		if (frame >= DEMO_START_FRAME && frame < DEMO_START_FRAME + DEMO_BREAK_FRAMES)
+			held |= INTERACT_KEY_BREAK;
+		if (frame == DEMO_START_FRAME + DEMO_BREAK_FRAMES + 30)
+			down |= INTERACT_KEY_PLACE;
 #endif
 
 		// Step 8.2. Refreshed every frame rather than written once when the player taps a
@@ -3976,7 +4048,7 @@ session_start:
 		// long-range break.
 		it.holding = inventoryHeldItem(&s_inv);
 
-		interactEdit(&it, &s_world, &player.body, down);
+		interactEdit(&it, &s_world, &player.body, down, held, ticks_now);
 
 		// Read once, straight after the call that sets them, because interactEdit clears both
 		// at the top of its next call — see Interact.broke_id. A block that does not fit is
@@ -4022,26 +4094,6 @@ session_start:
 			chunkRenderTouch(&s_world, sx, sy, sz);
 		}
 #endif
-
-		// v1.8.0 task 21. The simulation clock, advanced once per frame by however much real
-		// time the last frame actually took. It sits HERE, ahead of both drains below, because
-		// a tick that changes blocks — which is what task 22's fluid step will be — has to have
-		// changed them before this frame relights and remeshes, or the change is a frame late
-		// and, worse, is lit by the previous frame's light.
-		//
-		// v1.8.0 task 22 is that first customer. Water is stepped once per tick, never once
-		// per frame: a pour that spread faster on a console holding 60 fps than on one at 30
-		// would be a different game on the two machines, which is the whole reason the clock
-		// exists. Each step is capped at WATER_TICK_BUDGET cells, so the catch-up clamp handing
-		// four ticks to one frame costs at most four budgets and not an unbounded drain.
-		const int ticks_now = tickClockAdvance(&s_tickclock,
-		                                       (int64_t)(metricsFrameMs() * 1000.0f));
-		//
-		// Not separately timed into the CSV row below: MetricsWork lives in app/metrics.h,
-		// which this task does not own, and the cost is bounded by construction and measured
-		// directly in world/water_test.c against a real body of water.
-		for (int t = 0; t < ticks_now; t++)
-			(void)waterTick(&s_water, &s_world, WATER_TICK_BUDGET, onWaterChange, NULL);
 
 		// The measured rate, recomputed about once a second against the system tick counter.
 		{
@@ -4314,9 +4366,12 @@ session_start:
 			// framebuffer holding whatever was in it when the slider was last open, and the
 			// moment the player nudged the slider a stale frame would flash.
 			const float iod = s_stereo ? osGet3DSliderState() * chunkRenderMaxIod() : 0.0f;
-			drawEye(screenTop(), &view, &it.target, s_stereo ? -iod : 0.0f, 0);
+			// v1.8.1 task 50. Read once, outside the two calls, so both eyes cannot possibly
+			// disagree about how cracked the block is.
+			const int crack_stage = interactBreakStage(&it);
+			drawEye(screenTop(), &view, &it.target, crack_stage, s_stereo ? -iod : 0.0f, 0);
 			if (s_stereo)
-				drawEye(screenTopRight(), &view, &it.target, iod, 1);
+				drawEye(screenTopRight(), &view, &it.target, crack_stage, iod, 1);
 #if BS_BOTTOM_UI
 			// Step 8.3. Last in the frame, and deliberately so: the sprite batch sets its
 			// own render state and does not restore it (see gfx/sprite.h), while
@@ -4592,6 +4647,7 @@ session_start:
 
 	worldExit(&s_world);
 	highlightExit();
+	crackOverlayExit();
 	playerModelExit();
 
 	// Leaving a server session hangs up, and it has to happen before the menu is drawn again

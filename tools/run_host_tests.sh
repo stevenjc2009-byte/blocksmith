@@ -911,6 +911,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/world/budget.c \
 	source/app/options.c \
 	source/app/input_map.c \
+	source/world/mining.c \
 	source/scene/interact.c \
 	source/scene/interact_test.c \
 	tests/interact_stub.c \
@@ -1623,3 +1624,69 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 "./$BHWM/water_mesh_test"
 
 rm -rf "$BHWM"
+
+# world/mining_test.c -- how long a block takes to break (roadmap task 50, part 1). Own binary,
+# own main(), appended rather than merged into any stanza above it for the reason every stanza
+# in this file is appended: an append is the one edit shape that cannot drop another session's
+# work, and this file is shared.
+#
+# The link is deliberately tiny -- block.c, registry.c, mining.c -- because mining.c is a pure
+# function of the registry and nothing else. The REAL registry.c is in it, not a table of
+# hand-copied hardness values: this suite exists partly to prove that refreshView() actually
+# copies BlockDef.hardness into the BlockInfo the game reads, and a test carrying its own copy
+# of the ten numbers would stay green with that copy deleted. That is the exact failure mode
+# recorded against app/battery.c and app/sleep.c further up this file.
+#
+# What it settles: that each of the ten core rows reads back the hardness it was given, BY NAME
+# and through blockInfo() rather than through the def; that breakTicksRequired() at bare hands
+# is the hardness itself, because the only multiplier in the game is 1x; that a block with any
+# hardness never breaks in zero ticks; and that the division rounds UP rather than truncating.
+#
+# That last claim is driven through miningCeilDiv() directly and not through breakTicksRequired(),
+# on purpose and with the reason written at the probe: at 1x every division is exact, so no
+# fractional case can be reached through the public entry point until roadmap task 32 adds a
+# tool with a multiplier that is not 1. Testing rounding through the entry point today would be
+# testing nothing and printing green.
+#
+# Sabotaged in the REAL source and measured, each arm restored afterwards and the restore
+# confirmed by md5 (registry.c back to a140f3bcdd79ef3c90cb2bed79fd9237, mining.c to
+# 5213b00a8ffbb448713dfd8f0577c6a0, block.h to 2f159a6a1d1ddccdf284689a408c596e). Green arm
+# before and after the whole run: "PASS 44 checks, 0 failed", exit 0.
+#
+#  * BLOCK_STONE's .hardness put to 44 in registry.c's kCoreDefs -> "FAIL 44 checks, 2 failed":
+#    "L67 stone is 45 ticks (2.25 s)" and "L101 stone takes 45 ticks". Exactly the two checks
+#    written for stone's value, and nothing else -- the other nine rows and the whole rounding
+#    probe stay GREEN, which is what says these checks discriminate one row rather than
+#    collapsing the fixture.
+#  * miningCeilDiv() made to truncate (`? q : q` in place of `? q : q + 1`)
+#    -> "FAIL 44 checks, 7 failed", first "L157 ceil of 1/1000000 is 1, not 0: a truncating
+#    divide would make a break instant", then all six rounding cases (L175, L180-L184).
+#    Every hardness read and every bare-hand break time stays GREEN, because at 1x every
+#    division is exact -- which is precisely why the rounding claim has to be driven through
+#    the helper and cannot be reached through breakTicksRequired() today.
+#  * refreshView()'s `v->hardness = d->hardness;` deleted -> "FAIL 44 checks, 20 failed", first
+#    "L65 grass is 12 ticks (0.60 s)". Every named hardness with a non-zero value, both
+#    def-vs-view agreement checks, every non-zero break time, and both never-instant checks.
+#    Air and water stay green (0 either way), and so does the entire rounding probe -- the
+#    arithmetic is fine, the game simply cannot see the data.
+#
+# The controls that stayed green in EVERY arm, red ones included: "control: the registry still
+# answers about solidity, which task 50 did not touch", "control: an undefined id reads back as
+# air, so hardness 0", and the three exact-division controls in the rounding probe ("control: an
+# exact 8/4 is 2, not 3", "control: an exact 12/4 is 3, not 4", "control: an exact 45x at 1x is
+# 45, not 46") -- the ones that separate "rounds up" from "always adds one", and which the
+# truncating arm also passes.
+BHMN="build-host/run-$$-mining"
+mkdir -p "$BHMN"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/mining.c \
+	source/world/mining_test.c \
+	-o "$BHMN/mining_test"
+
+"./$BHMN/mining_test"
+
+rm -rf "$BHMN"

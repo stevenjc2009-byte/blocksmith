@@ -30,6 +30,12 @@
 typedef uint32_t u32;
 #endif
 
+// Named outright rather than leaned on: <3ds.h> drags both in on the console, but the
+// break-progress fields below are bool and uint32_t in BOTH builds and must not depend on
+// which branch of the guard above ran.
+#include <stdbool.h>
+#include <stdint.h>
+
 #include "world/physics.h"
 #include "world/raycast.h"
 #include "world/world.h"
@@ -57,12 +63,46 @@ typedef struct {
 	// each kind can happen per call, because the press that triggers it is edge-detected.
 	BlockId broke_id;
 	BlockId placed_id;
+
+	// ── v1.8.1 task 50: a break takes time ──────────────────────────────────────────────
+	//
+	// Progress against ONE block, measured in simulation ticks rather than frames. Frames
+	// were never an option: world/tick.h exists precisely because the Old 3DS renders at
+	// whatever rate the GPU manages, so a frame-counted timer would make stone quicker to
+	// mine on an emptier screen. The caller hands interactEdit the tick count the shared
+	// 20 TPS clock produced this frame and the arithmetic below is the same on every
+	// machine.
+	//
+	// break_x/y/z name the block the progress belongs to, and break_id what was there when
+	// it started. Either changing — the player looked away, or the server replaced the
+	// block under the crosshair — abandons the progress and starts again, because a
+	// half-mined stone must not finish as a half-mined dirt.
+	bool     breaking;      // is a hold in progress at all
+	int      break_x, break_y, break_z;
+	BlockId  break_id;      // what was in that cell when the hold began
+	uint32_t break_ticks;   // ticks banked so far
+	uint32_t break_need;    // ticks required, from breakTicksRequired, cached at the start
 } Interact;
+
+// How many crack pictures the overlay has. The progress bar is quantised to this many
+// steps, so it is the count of stages the artwork must supply and nothing else depends on
+// the number. Eight is what the genre trained people on and it is also the point past
+// which a 16x16 tile has no pixels left to say anything new with.
+#define INTERACT_BREAK_STAGES  8
 
 void interactInit(Interact* it);
 
-// Applies this frame's presses to the world: INTERACT_KEY_BREAK sets the targeted block
-// to air, INTERACT_KEY_PLACE puts `holding` in the empty cell the ray entered from.
+// Which crack picture to draw over Interact.target right now, 0..INTERACT_BREAK_STAGES-1,
+// or -1 when nothing is being broken and the overlay should draw nothing at all.
+//
+// Derived rather than stored so there is exactly one definition of "how far along is this
+// break", and so a caller cannot render a stage that disagrees with the progress that will
+// actually complete the break.
+int interactBreakStage(const Interact* it);
+
+// Applies this frame's input to the world: INTERACT_KEY_BREAK held long enough sets the
+// targeted block to air, INTERACT_KEY_PLACE pressed puts `holding` in the empty cell the
+// ray entered from.
 // Returns the number of chunks newly queued for a remesh, so a caller can see that an
 // edit reached the renderer at all.
 //
@@ -74,7 +114,24 @@ void interactInit(Interact* it);
 // `keys_down` may be either hidKeysDown() or hidKeysHeld(): interactEdit tracks which
 // bits were already set on the previous call internally (see Interact.prev_keys) and
 // acts only on newly-set bits, so a held button still fires once per press either way.
-int interactEdit(Interact* it, World* w, const Body* body, u32 keys_down);
+// That is the PLACE path, and it is unchanged — a placement is a single instantaneous act
+// and one press must put down exactly one block.
+//
+// `keys_held` is hidKeysHeld() and drives BREAK, which since v1.8.1 is not an act but a
+// process: the button has to stay down for breakTicksRequired() ticks before the block
+// goes. Break therefore reads a LEVEL and place reads an EDGE, and the two masks are
+// separate parameters rather than one because collapsing them would force one of the two
+// verbs to be wrong. Passing the same mask for both is legal and is what the host tests do
+// for the place cases; it just means a break can never make progress, since a level that
+// is only ever high for one call banks one tick and then releases.
+//
+// `ticks` is how many 20 TPS simulation ticks elapsed this frame — the return of
+// tickClockAdvance, not a frame count. Zero is the ordinary case (the clock produces a
+// tick roughly every third frame at 60 fps) and is not a no-op: a hold still has to be
+// registered, and a completed break still has to be able to happen on a zero-tick frame if
+// the requirement was already met.
+int interactEdit(Interact* it, World* w, const Body* body,
+                 u32 keys_down, u32 keys_held, int ticks);
 
 // ── aiming and the button constants — console build only ────────────────────────────────
 #ifdef __3DS__
