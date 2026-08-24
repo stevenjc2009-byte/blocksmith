@@ -2508,14 +2508,16 @@ static void test_mesher_tables_after_register(void)
         const MeshVertex *v = &out.verts[i];
         const AtlasRect r = atlasRect(d.tex[v->nrm]);
         /* v pins the tile and is the strong half of this claim: the strip atlas
-         * stacks tiles in v, so a wrong rect row shows up here. u is a merge run —
+         * stacks tiles in v, so a wrong rect row shows up here. Since task 13b v
+         * is a slot-EDGE index (tile or tile+1), not a pixel row, which is why it
+         * compares against vslot0/vslot1 with no TILE_PX factor. u is a merge run —
          * it starts at the tile's u0 and steps a whole tile at a time, up to
          * ATLAS_MAX_MERGE_BLOCKS of them, deliberately past this tile's own u1
          * because u is sampled GPU_REPEAT (world/atlas_uv.h). */
         const int du = (int)v->u - (int)r.u0;
         const bool u_ok = du >= 0 && (du % TILE_PX) == 0
                           && du <= TILE_PX * ATLAS_MAX_MERGE_BLOCKS;
-        if (!u_ok || (v->v != r.v0 && v->v != r.v1)) {
+        if (!u_ok || (v->v != r.vslot0 && v->v != r.vslot1)) {
             wrong_tile++;
         }
     }

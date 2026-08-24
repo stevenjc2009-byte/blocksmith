@@ -714,13 +714,13 @@ static void testMesherTransparentSplit(void)
 	// and they must carry the leaf tile rather than stone's.
 	const AtlasRect leaf  = atlasRect(blockFaceTex(BLOCK_LEAVES, FACE_TOP));
 	const AtlasRect stone = atlasRect(blockFaceTex(BLOCK_STONE, FACE_TOP));
-	CHECK(leaf.u0 != stone.u0 || leaf.v0 != stone.v0);   // else the check below proves nothing
+	CHECK(leaf.u0 != stone.u0 || leaf.vslot0 != stone.vslot0);   // else the check below proves nothing
 
 	bool all_leaf_tile = true;
 	for (uint32_t i = out.opaque_index_count; i < out.index_count; i++) {
 		const MeshVertex* v = &out.verts[out.indices[i]];
 		const bool in_tile = (v->u >= leaf.u0 && v->u <= leaf.u1 &&
-		                      v->v >= leaf.v0 && v->v <= leaf.v1);
+		                      v->v >= leaf.vslot0 && v->v <= leaf.vslot1);
 		if (!in_tile) all_leaf_tile = false;
 	}
 	CHECK(all_leaf_tile);
@@ -729,7 +729,7 @@ static void testMesherTransparentSplit(void)
 	bool any_leaf_in_opaque = false;
 	for (uint32_t i = 0; i < out.opaque_index_count; i++) {
 		const MeshVertex* v = &out.verts[out.indices[i]];
-		if (v->u >= leaf.u0 && v->u <= leaf.u1 && v->v >= leaf.v0 && v->v <= leaf.v1)
+		if (v->u >= leaf.u0 && v->u <= leaf.u1 && v->v >= leaf.vslot0 && v->v <= leaf.vslot1)
 			any_leaf_in_opaque = true;
 	}
 	CHECK(!any_leaf_in_opaque);
@@ -1003,7 +1003,7 @@ static void testMesher(void)
 		const MeshVertex* v = &out.verts[i];
 		if (v->nrm < BLOCK_FACES) per_face[v->nrm]++;
 		const AtlasRect r = atlasRect(blockFaceTex(BLOCK_GRASS, v->nrm));
-		if ((v->u != r.u0 && v->u != r.u1) || (v->v != r.v0 && v->v != r.v1)) wrong_tile++;
+		if ((v->u != r.u0 && v->u != r.u1) || (v->v != r.vslot0 && v->v != r.vslot1)) wrong_tile++;
 	}
 	CHECK(wrong_tile == 0);
 	int faces_with_four = 0;
@@ -1021,7 +1021,7 @@ static void testMesher(void)
 	const AtlasRect top = atlasRect(BTEX_GRASS_TOP);
 	int top_verts = 0;
 	for (uint32_t i = 0; i < out.vert_count; i++)
-		if (out.verts[i].nrm == 2 && (out.verts[i].v == top.v0 || out.verts[i].v == top.v1))
+		if (out.verts[i].nrm == 2 && (out.verts[i].v == top.vslot0 || out.verts[i].v == top.vslot1))
 			top_verts++;
 	CHECK(top_verts == 4);
 
@@ -1330,6 +1330,33 @@ static uint32_t meshHash(const MeshOut* out)
 // pre-merge quad count, together with meshCoverageOnce() proving no face is covered twice.
 // If a future change legitimately moves the hashes again, those two must not move with
 // them; if they do, geometry has been lost or duplicated and the hash was not the story.
+//
+// ── RE-PINNED AGAIN, v1.8.2 task 13b (atlas ceiling 15 -> 64 slots) ──────────
+//
+// The mesher's vertex `v` byte changed UNITS, not width: it held an atlas PIXEL ROW
+// (tile * TILE_PX) and now holds a slot-EDGE INDEX (tile, or tile + 1), with the TILE_PX
+// factor moved into both shaders' uvScale.y. MeshVertex is still 8 bytes and not one
+// vertex moved in space — but every `v` byte in every mesh now holds a different number,
+// so the hashes had to move and the geometry had to not.
+//
+// That is exactly what the paragraph above demands be proved rather than assumed, and it
+// is why the counts below are pinned as tightly as the hashes are. Measured by running
+// these four worlds against the post-13b mesher and reading the printed values, with the
+// pre-13b numbers left standing above, verbatim:
+//
+//   random-core-mix        verts=23676 idx=35514 faces=5919  hash 85132e65 -> cf4cf785
+//   stone-beside-leaves    verts=  936 idx= 1404 faces= 234  hash c62dfbe6 -> 6a24313e
+//   all-leaves             verts=  768 idx= 1152 faces= 192  hash 953b53b8 -> ef2164b8
+//   all-air                verts=    0 idx=    0 faces=   0  hash c655ff85 -> UNCHANGED
+//
+// Every count is identical on both arms — not asserted, read off the same run — and the
+// suite went from 4821 green to exactly 3 red, one per non-empty world. all-air did not
+// move because an empty mesh has no `v` byte to change, which is the fourth case earning
+// its keep: a hash that moved there would have meant something else had changed too.
+//
+// The vert_count/index_count CHECKs on cases 2, 3 and 4 were ADDED here. They were the
+// arm that made the claim provable, so they stay: a future units change that also lost
+// geometry would otherwise show up as three moved hashes and look identical to this one.
 static void testMesherFullCubeBytesUnchanged(void)
 {
 	MeshOut out = {0};
@@ -1358,7 +1385,7 @@ static void testMesherFullCubeBytesUnchanged(void)
 	CHECK(out.vert_count == 23676);
 	CHECK(out.index_count == 35514);
 	CHECK(out.faces == 5919);
-	CHECK(meshHash(&out) == 0x85132e65u);
+	CHECK(meshHash(&out) == 0xcf4cf785u);
 	// Merging may not invent or lose a single block face: 6086 is what the pre-merge
 	// mesher emitted, one quad each, and it has to stay 6086 however they are grouped.
 	CHECK(meshFaceCells(&out) == 6086);
@@ -1378,8 +1405,10 @@ static void testMesherFullCubeBytesUnchanged(void)
 			}
 	scratchFill(&s_scratch, &s_world, 1, 1, 1);
 	meshChunk(&out, &s_scratch);
+	CHECK(out.vert_count == 936);
+	CHECK(out.index_count == 1404);
 	CHECK(out.faces == 234);
-	CHECK(meshHash(&out) == 0xc62dfbe6u);
+	CHECK(meshHash(&out) == 0x6a24313eu);
 	CHECK(meshFaceCells(&out) == 1536);
 	CHECK(meshCoverageOnce(&out, NULL, NULL));
 	worldExit(&s_world);
@@ -1393,9 +1422,11 @@ static void testMesherFullCubeBytesUnchanged(void)
 				                     CHUNK_DIM + z, BLOCK_LEAVES));
 	scratchFill(&s_scratch, &s_world, 1, 1, 1);
 	meshChunk(&out, &s_scratch);
+	CHECK(out.vert_count == 768);
+	CHECK(out.index_count == 1152);
 	CHECK(out.faces == 192);
 	CHECK(out.opaque_faces == 0);
-	CHECK(meshHash(&out) == 0x953b53b8u);
+	CHECK(meshHash(&out) == 0xef2164b8u);
 	CHECK(meshFaceCells(&out) == 1536);
 	CHECK(meshCoverageOnce(&out, NULL, NULL));
 	worldExit(&s_world);
@@ -1404,6 +1435,8 @@ static void testMesherFullCubeBytesUnchanged(void)
 	worldInit(&s_world);
 	scratchFill(&s_scratch, &s_world, 1, 1, 1);
 	meshChunk(&out, &s_scratch);
+	CHECK(out.vert_count == 0);
+	CHECK(out.index_count == 0);
 	CHECK(out.faces == 0);
 	CHECK(meshHash(&out) == 0xc655ff85u);
 	worldExit(&s_world);
@@ -1641,16 +1674,16 @@ static void testMesherCrossShape(void)
 	// art*, and that bug ships as bad art rather than as an error.
 	const AtlasRect tile  = atlasRect(blockFaceTex(cross, FACE_EAST));
 	const AtlasRect stone = atlasRect(blockFaceTex(BLOCK_STONE, FACE_TOP));
-	CHECK(tile.u0 != stone.u0 || tile.v0 != stone.v0);   // else the check proves nothing
+	CHECK(tile.u0 != stone.u0 || tile.vslot0 != stone.vslot0);   // else the check proves nothing
 
 	bool uv_in_tile = true, corners_ok = true, nrm_ok = true, ao_ok = true;
 	for (int i = 0; i < 16; i++) {
 		if (cv[i].u < tile.u0 || cv[i].u > tile.u1 ||
-		    cv[i].v < tile.v0 || cv[i].v > tile.v1)
+		    cv[i].v < tile.vslot0 || cv[i].v > tile.vslot1)
 			uv_in_tile = false;
 		// and not merely inside it — every UV is one of the rect's four corners.
 		if ((cv[i].u != tile.u0 && cv[i].u != tile.u1) ||
-		    (cv[i].v != tile.v0 && cv[i].v != tile.v1))
+		    (cv[i].v != tile.vslot0 && cv[i].v != tile.vslot1))
 			corners_ok = false;
 		// FACE_TOP, so world.v.pica's faceShade gives the plant full brightness rather
 		// than shading its two planes differently from each other.
@@ -1835,7 +1868,7 @@ static void testMesherCoreWaterAndTallGrass(void)
 	{
 		const AtlasRect w = atlasRect(blockFaceTex((BlockId)BLOCK_WATER, FACE_TOP));
 		const AtlasRect g = atlasRect(blockFaceTex((BlockId)BLOCK_TALL_GRASS, FACE_EAST));
-		CHECK(w.v0 != g.v0);
+		CHECK(w.vslot0 != g.vslot0);
 	}
 
 	// ── Tall grass is a cross ────────────────────────────────────────────────────
@@ -1872,14 +1905,14 @@ static void testMesherCoreWaterAndTallGrass(void)
 	{
 		const AtlasRect tile  = atlasRect(blockFaceTex((BlockId)BLOCK_TALL_GRASS, FACE_EAST));
 		const AtlasRect stone = atlasRect(blockFaceTex(BLOCK_STONE, FACE_TOP));
-		CHECK(tile.v0 != stone.v0);   // else the UV check below proves nothing
+		CHECK(tile.vslot0 != stone.vslot0);   // else the UV check below proves nothing
 		const MeshVertex* cv = &out.verts[floor_faces * 4];
 		bool nrm_ok = true, ao_ok = true, uv_ok = true;
 		for (int i = 0; i < 16; i++) {
 			if (cv[i].nrm != (uint8_t)FACE_TOP) nrm_ok = false;
 			if (cv[i].ao != 3) ao_ok = false;
 			if ((cv[i].u != tile.u0 && cv[i].u != tile.u1) ||
-			    (cv[i].v != tile.v0 && cv[i].v != tile.v1))
+			    (cv[i].v != tile.vslot0 && cv[i].v != tile.vslot1))
 				uv_ok = false;
 		}
 		CHECK(nrm_ok);

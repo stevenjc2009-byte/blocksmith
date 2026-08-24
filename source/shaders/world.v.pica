@@ -37,8 +37,12 @@
 .fvec faceShade[64]
 
 ; The atlas is a one-tile-wide strip (v1.6.0 task 11), so U and V no longer divide by the
-; same number: x MUST be 1/ATLAS_W_PX and y MUST be 1/ATLAS_H_PX, both from
-; source/world/atlas_uv.h. It was one scalar, consts.zzzz, while the sheet was square.
+; same number. x MUST be 1/ATLAS_W_PX. y is NOT 1/ATLAS_H_PX any more: since task 13b the
+; vertex's v byte carries a SLOT-EDGE INDEX (tile, or tile+1), not an atlas pixel row, so
+; y MUST be TILE_PX/ATLAS_H_PX — one slot's worth of texture space per unit of v. That is
+; what lets a uint8_t address a 64-slot sheet: 64 fits in a byte, 1024 pixel rows do not.
+; Both numbers come from source/world/atlas_uv.h. It was one scalar, consts.zzzz, while the
+; sheet was square.
 ;
 ; A mismatch here renders no error at all, because a wrong scale still produces valid UVs
 ; and so still draws *a* texture. It has already happened once: step 9.3c shrank the sheet
@@ -52,7 +56,7 @@
 ; source/world/atlas_uv.h and tools/make_atlas.py. source/world/atlas_uv_shader_test.c parses
 ; this line out of BOTH shaders and fails the host suite when either component disagrees with
 ; the header, which is the only reason the duplication is safe. Update all four together.
-.constf uvScale(0.0625, 0.00390625, 0.0, 0.0)     ; 1/ATLAS_W_PX = 1/16, 1/ATLAS_H_PX = 1/256
+.constf uvScale(0.0625, 0.015625, 0.0, 0.0)       ; 1/ATLAS_W_PX = 1/16, TILE_PX/ATLAS_H_PX = 16/1024
 
 .constf consts(0.0, 1.0, 0.0, 0.33333333)         ; 0, 1, spare (was uvScale), 1/3
 .alias  zeros consts.xxxx
@@ -108,10 +112,11 @@
 	dp4 outpos.w, projection[3], r1
 
 	; --- texture coordinates ---------------------------------------------
-	; Atlas pixel coords come in unnormalised because PICA byte attributes are not
-	; scaled. uvScale is a vec4 now, not a broadcast scalar: .x divides u by the sheet
-	; WIDTH (16) and .y divides v by its HEIGHT (256). .z/.w are zero and multiply the
-	; normal index and ao into r2.zw, which the swizzle below throws away.
+	; Atlas coords come in unnormalised because PICA byte attributes are not scaled.
+	; uvScale is a vec4, not a broadcast scalar: .x divides u — still an atlas PIXEL
+	; column — by the sheet WIDTH (16), while .y multiplies v — a SLOT-EDGE INDEX since
+	; task 13b, 0..64 — by one slot's height in texture space (16/1024). .z/.w are zero
+	; and multiply the normal index and ao into r2.zw, which the swizzle below throws away.
 	mul r2, uvScale, inpack
 	mov outtc0, r2.xyxy
 

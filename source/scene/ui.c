@@ -158,16 +158,22 @@ static void handleCraftTap(Inventory* inv, int recipe_index)
 // ── Icon UVs ───────────────────────────────────────────────────────────────────────────
 
 // The block atlas's arithmetic (world/atlas_uv.h's atlasRect, wrapped by gfx/atlas.h's
-// atlasTile) already returns texture-space pixel bounds with the top/bottom flip applied —
-// see atlas_uv.h's own comment: r.v1 is the art's top edge, r.v0 its bottom, both already in
-// the "v grows upward" space gfx/sprite.h's spriteQuad wants. So converting to the 0..1 UVs
-// spriteQuad takes is just a divide by the sheet size; nothing here re-derives the flip the
-// way gfx/font.c has to for its own top-down cell table.
+// atlasTile) already returns bounds with the top/bottom flip applied — see atlas_uv.h's own
+// comment: r.vslot1 is the art's top edge, r.vslot0 its bottom, both already in the
+// "v grows upward" space gfx/sprite.h's spriteQuad wants. Nothing here re-derives the flip
+// the way gfx/font.c has to for its own top-down cell table.
 //
-// The sheet is a 16x256 strip since v1.6.0, so U and V divide by DIFFERENT numbers — u by
-// ATLAS_W_PX (16), v by ATLAS_H_PX (256). Every icon's u therefore spans the full 0..1, which
-// is fine under the GPU_REPEAT wrap gfx/atlas.c now sets in U: a quad's texel centres
-// interpolate strictly inside (0,1) and never land on the wrapping endpoint itself.
+// The two axes are NOT in the same units, which is the whole point of task 13b's rename.
+// r.u0/r.u1 are atlas PIXEL columns and divide by ATLAS_W_PX (16). r.vslot0/r.vslot1 are
+// SLOT-EDGE INDICES — 0..64, one per tile boundary, not pixel rows — so they must be
+// multiplied up by TILE_PX before dividing by ATLAS_H_PX. Skipping that factor is not a
+// visible error: it yields a valid UV inside the sheet, so every icon would quietly draw
+// the top 1/16th of slot 0 (grass) instead of its own art. The field rename is what turns
+// that silent mis-draw into a compile failure; keep the names, do not re-alias them.
+//
+// Every icon's u spans the full 0..1, which is fine under the GPU_REPEAT wrap gfx/atlas.c
+// sets in U: a quad's texel centres interpolate strictly inside (0,1) and never land on the
+// wrapping endpoint itself.
 //
 // FACE_TOP is used for every block's icon — grass shows its green top, wood shows its ring
 // pattern, and every other block in this game's six-block list (world/block.h) is the same
@@ -177,9 +183,9 @@ static void iconUv(BlockId id, float* u0, float* v0, float* u1, float* v1)
 {
 	const AtlasRect r = atlasTile(blockFaceTex(id, FACE_TOP));
 	*u0 = (float)r.u0 / (float)ATLAS_W_PX;
-	*v0 = (float)r.v1 / (float)ATLAS_H_PX;   // quad's top edge samples the art's top row
+	*v0 = (float)(r.vslot1 * TILE_PX) / (float)ATLAS_H_PX;  // quad's top edge = art's top row
 	*u1 = (float)r.u1 / (float)ATLAS_W_PX;
-	*v1 = (float)r.v0 / (float)ATLAS_H_PX;   // quad's bottom edge samples the art's bottom row
+	*v1 = (float)(r.vslot0 * TILE_PX) / (float)ATLAS_H_PX;  // quad's bottom edge = art's bottom
 }
 
 // ── Slots ──────────────────────────────────────────────────────────────────────────────

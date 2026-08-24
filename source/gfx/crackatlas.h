@@ -3,15 +3,20 @@
 // One 16x128 RGBA5551 strip: eight 16x16 crack stages stacked vertically with no padding
 // between them, stage 0 the faintest and stage 7 nearly shattered. 4,096 bytes of VRAM.
 //
-// Why it is not part of gfx/atlas.h's sheet. That one is FULL for this purpose:
-// world/atlas_uv.h makes it 16 slots of which 15 are addressable (MeshVertex.v is a
-// uint8_t, so the top slot's v1 = 256 does not fit) and ATLAS_TILE_MISSING (slot 14) is
-// permanently reserved for the missing-texture marker, while gfx/atlas.h's TILE_* enum
-// already names twelve painted tiles. Two free slots, eight stages needed. Growing the
-// shared sheet does not help either — the 15-slot ceiling comes from the uint8_t, not from
-// the sheet height (see the long note in world/atlas_uv.h). A separate 4 KB texture is
-// cheaper than changing the locked vertex format, and it leaves the world's slot budget
-// exactly as it was.
+// Why it is not part of gfx/atlas.h's sheet. When this was written, in v1.8.1, that sheet
+// was FULL for this purpose: it held 16 slots of which only 15 were addressable, and with
+// twelve painted tiles plus the reserved missing-texture marker there were two free slots
+// and eight stages to fit. Growing the shared sheet did not help, because that ceiling came
+// from MeshVertex.v being a uint8_t holding an atlas PIXEL row, not from the sheet height.
+//
+// v1.8.2's task 13b lifted that: v now holds a slot-EDGE index, the sheet is 1024 px tall,
+// and there are 52 free slots. So the original reason has expired — but the sheet stays
+// separate anyway, for reasons that have nothing to do with slot budget. The overlay is a
+// second textured pass over the SAME triangles (scene/crackoverlay.c binds its own shader
+// and its own texture unit state); folding it into the block sheet would mean rebinding one
+// texture mid-pass or sampling two regions of one sheet from a shader that has one uvScale.
+// Eight stages that are only ever drawn on one block at a time are also the wrong thing to
+// pay a permanent 8/64 of the world's slot budget for. 4 KB of VRAM is the cheaper answer.
 //
 // Every stage is drawn by tools/make_crack_atlas.py — original art for this project. That
 // script verifies the sheet it wrote before exiting: binary alpha, every stage a superset

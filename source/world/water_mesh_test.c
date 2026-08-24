@@ -475,6 +475,17 @@ static void testNoMergeAcrossLevels(void)
 
 // The anchor. A fixed staircase of levels, hashed, so any change to the emitted bytes shows
 // up here as a one-line diff instead of as a screenshot argument.
+//
+// RE-PINNED, v1.8.2 task 13b: 0x6f5d4219 -> 0x11ff64ad. The mesher's vertex `v` byte changed
+// UNITS — an atlas pixel row (tile * TILE_PX) became a slot-edge index (tile, or tile + 1),
+// with the TILE_PX factor moved into both shaders' uvScale.y — so every `v` byte in every
+// mesh holds a different number while no vertex moved and MeshVertex is still 8 bytes.
+//
+// The re-pin is only legitimate because the three checks around it did NOT move: faces stayed
+// 51, all eight drop levels still appear, and every quad's corners are still consistent. The
+// printf above line 521 reported `faces=51 verts=204` on the post-change run, matching the
+// count this test derives by hand. A hash that moved while any of those moved with it would
+// have been a geometry regression wearing a re-pin's clothes.
 static void testPinnedGeometry(void)
 {
 	puts("water mesh: the pinned geometry of a fixed staircase");
@@ -521,7 +532,7 @@ static void testPinnedGeometry(void)
 	CHECK(g_out.faces == 51, "the staircase is the 51 quads counted out above");
 	CHECK(distinct == WATER_LEVEL_SOURCE, "all eight heights 0/8 .. 7/8 appear in it");
 	CHECK(quadsConsistent(), "and every one of the 51 has consistent corners");
-	CHECK(meshHash(&g_out) == 0x6f5d4219u, "its bytes hash to the pinned value");
+	CHECK(meshHash(&g_out) == 0x11ff64adu, "its bytes hash to the pinned value");
 	CHECK(!g_out.overflow, "with no overflow");
 }
 

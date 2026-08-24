@@ -359,7 +359,7 @@ static void emitFace(MeshOut* o, const MeshScratch* s, int si, int lx, int ly, i
 		v->z = (int8_t)(lz + c->pz);
 
 		v->u   = c->u_hi ? r->u1 : r->u0;
-		v->v   = c->v_hi ? r->v1 : r->v0;
+		v->v   = c->v_hi ? r->vslot1 : r->vslot0;
 
 		// The drop applies to the cell's TOP plane and to nothing else, so a shortened cube
 		// keeps its floor where it was and only its lid comes down. c->py is the corner's own
@@ -639,7 +639,7 @@ static void emitCross(MeshOut* o, const MeshScratch* s, int si, int lx, int ly, 
 				v->z = (int8_t)(lz + c->z);
 
 				v->u   = c->u_hi ? r->u1 : r->u0;
-				v->v   = c->v_hi ? r->v1 : r->v0;
+				v->v   = c->v_hi ? r->vslot1 : r->vslot0;
 				v->nrm = CROSS_NRM;
 				v->ao  = 3;
 				v->pad = lit ? s->light[si] : 0;

@@ -36,11 +36,13 @@
 .fvec dayLevel[1]
 
 ; Same layout constant as world.v.pica, and it must move with it — see the long note there.
-; The atlas is a one-tile-wide strip, so x = 1/ATLAS_W_PX and y = 1/ATLAS_H_PX, both from
-; source/world/atlas_uv.h. source/world/atlas_uv_shader_test.c parses this line out of THIS
-; file too, not just world.v.pica: a New 3DS binds this program instead, so a drift here
-; would go unseen on every Old 3DS the suite happens to be checked against.
-.constf uvScale(0.0625, 0.00390625, 0.0, 0.0)     ; 1/ATLAS_W_PX = 1/16, 1/ATLAS_H_PX = 1/256
+; The atlas is a one-tile-wide strip, so x = 1/ATLAS_W_PX; and since task 13b the vertex's v
+; byte is a slot-edge index rather than a pixel row, so y = TILE_PX/ATLAS_H_PX, not
+; 1/ATLAS_H_PX. Both from source/world/atlas_uv.h.
+; source/world/atlas_uv_shader_test.c parses this line out of THIS file too, not just
+; world.v.pica: a New 3DS binds this program instead, so a drift here would go unseen on
+; every Old 3DS the suite happens to be checked against.
+.constf uvScale(0.0625, 0.015625, 0.0, 0.0)       ; 1/ATLAS_W_PX = 1/16, TILE_PX/ATLAS_H_PX = 16/1024
 
 .constf consts(0.0, 1.0, 0.0, 0.33333333)         ; 0, 1, spare (was uvScale), 1/3
 .alias  zeros consts.xxxx
@@ -92,8 +94,9 @@
 	dp4 outpos.w, projection[3], r1
 
 	; --- texture coordinates ---------------------------------------------
-	; uvScale is a vec4, not a broadcast scalar: .x divides u by the sheet WIDTH (16),
-	; .y divides v by its HEIGHT (256). Same as world.v.pica.
+	; uvScale is a vec4, not a broadcast scalar: .x divides u (an atlas pixel column) by
+	; the sheet WIDTH (16), .y multiplies v (a slot-edge index) by one slot's height in
+	; texture space (16/1024). Same as world.v.pica.
 	mul r2, uvScale, inpack
 	mov outtc0, r2.xyxy
 

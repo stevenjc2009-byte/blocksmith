@@ -6,19 +6,26 @@ by this script — nothing is traced, sampled or copied from another game.
 
 Why this is a SEPARATE sheet from gfx/atlas.png
 -----------------------------------------------
-The world atlas is full for this purpose. source/world/atlas_uv.h makes it a
-16x256 one-tile-wide strip: ATLAS_TILE_SLOTS is 16, only 15 are addressable
-(MeshVertex.v is a uint8_t, so the top slot's v1 = 256 does not fit), and
-ATLAS_TILE_MISSING (slot 14) is permanently reserved for the missing-texture
-marker. source/gfx/atlas.h's TILE_* enum already names twelve painted tiles
-(0..11), which leaves exactly two free slots. Eight crack stages cannot fit,
-and growing the shared strip to 16x512 would NOT help — the uint8_t v ceiling
-is 15 addressable slots at any sheet height (see atlas_uv.h's long note).
+When this was written, in v1.8.1, the world atlas was full for this purpose: a
+16x256 strip of 16 slots of which only 15 were addressable (MeshVertex.v was a
+uint8_t holding an atlas PIXEL row, so the top slot's v = 256 did not fit), with
+twelve painted tiles and one slot reserved for the missing-texture marker. Two
+free slots, eight stages needed. Growing the strip would not have helped: the
+ceiling came from the byte, not from the sheet height.
 
-So the crack stages get their own small texture: 16 px wide by 128 px tall,
-eight 16x16 stages stacked vertically, no padding. At RGBA5551 that is 2 bytes
-a texel, 4,096 bytes of VRAM — trivial beside the 8 KB the world atlas already
-costs, and it keeps the shared strip's slot budget untouched.
+v1.8.2's task 13b removed that ceiling — v now holds a slot-EDGE index, the sheet
+is 16x1024, and 52 slots are free. So the original reason has expired. The crack
+stages keep their own sheet anyway, for reasons that never depended on the slot
+budget: the overlay is a SECOND textured pass over the same triangles
+(source/scene/crackoverlay.c binds its own shader and its own texture state), so
+folding it into the world sheet would mean rebinding a texture mid-pass or
+sampling two regions of one sheet from a shader that has a single uvScale. Eight
+stages only ever drawn on one block at a time are also the wrong thing to spend a
+permanent eighth of the world's remaining slot budget on.
+
+The sheet is 16 px wide by 128 px tall, eight 16x16 stages stacked vertically, no
+padding. At RGBA5551 that is 2 bytes a texel, 4,096 bytes of VRAM — trivial beside
+the 32 KB the world atlas now costs.
 
 Layout, and the V flip
 ----------------------

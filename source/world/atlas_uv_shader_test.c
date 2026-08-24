@@ -2,12 +2,17 @@
 // atlasRect() produces, and the sheet the generator actually wrote.
 //
 // THE SHADER HALF. Both source/shaders/world.v.pica and source/shaders/world_dynamic.v.pica
-// carry a `uvScale` constant that must equal (1/ATLAS_W_PX, 1/ATLAS_H_PX), with both defined
-// in world/atlas_uv.h. world/block_tiles_check.c's trick for the same kind of problem
-// (duplicate a value on both sides, then _Static_assert the two copies agree) is not
-// available here: the picasso shader compiler has no #include and no _Static_assert, so there
-// is no way to make a .pica file read ATLAS_W_PX at all. This test parses the shader source
-// text instead, at host-test time, and checks the literals against the one C definition.
+// carry a `uvScale` constant that must equal (1/ATLAS_W_PX, TILE_PX/ATLAS_H_PX), with all
+// three of those defined in world/atlas_uv.h. world/block_tiles_check.c's trick for the same
+// kind of problem (duplicate a value on both sides, then _Static_assert the two copies agree)
+// is not available here: the picasso shader compiler has no #include and no _Static_assert, so
+// there is no way to make a .pica file read ATLAS_W_PX at all. This test parses the shader
+// source text instead, at host-test time, and checks the literals against the one C definition.
+//
+// The .y component is NOT 1/ATLAS_H_PX, and that asymmetry is the whole of task 13b. u is still
+// an atlas PIXEL column, so it is divided by the sheet width; v is a SLOT-EDGE INDEX, so it is
+// multiplied by TILE_PX/ATLAS_H_PX — the tile height as a fraction of the sheet. The shader
+// carries the TILE_PX factor that used to live in the vertex byte.
 //
 // The bug this guards against already happened once. Step 9.3c shrank the atlas sheet from
 // 256x256 to 64x64 and updated the header, but the shader's uvScale constant was left at
@@ -15,8 +20,8 @@
 // rendered every tile as the same ~14x14px corner of the sheet (the wood tile), so the whole
 // world drew flat brown with no grass green and no stone grey anywhere.
 //
-// Two things widened this in v1.6.0, both because the sheet became a 16x256 one-tile-wide
-// strip and stopped being square:
+// Two things widened this in v1.6.0, both because the sheet became a one-tile-wide strip and
+// stopped being square:
 //
 //   * uvScale is two numbers now, not one broadcast scalar, so BOTH components are checked.
 //     Getting u right and v wrong would slide every tile vertically into its neighbour -
@@ -28,12 +33,28 @@
 //
 // THE GEOMETRY HALF (new in v1.6.0). atlasRect() is now the only place the strip layout is
 // written down, which is what lets the mesher stay unmodified across the change - so it is
-// where the layout has to be proven. Every addressable tile must return a 16x16 rect that
-// lies wholly inside the sheet and shares no TEXEL with any other tile; the rect is half-open
-// (it covers rows v0..v1-1), so adjacent slots legitimately share the coordinate v1==v0 while
-// sharing no pixel, and a test written on coordinate overlap instead of texel overlap would
-// fail on a correct sheet. The U-repeat property greedy meshing depends on is proven
-// arithmetically here as well, since no host test can sample a texture.
+// where the layout has to be proven. Every addressable tile must return a rect covering one
+// 16x16 block of texels that lies wholly inside the sheet and shares no TEXEL with any other
+// tile; the rect is half-open (slot t covers slot rows vslot0..vslot1-1, i.e. exactly one
+// slot), so adjacent slots legitimately share the edge index vslot1==vslot0 while sharing no
+// pixel, and a test written on coordinate overlap instead of texel overlap would fail on a
+// correct sheet. The U-repeat property greedy meshing depends on is proven arithmetically here
+// as well, since no host test can sample a texture.
+//
+// THE UNITS, which task 13b (v1.8.2) changed and this file has to state exactly once:
+//
+//   AtlasRect.u0, u1          atlas PIXEL columns (0 and 16; widened to TILE_PX*width by a
+//                             greedy merge, which is why they stayed in pixels)
+//   AtlasRect.vslot0, vslot1  SLOT-EDGE INDICES (tile and tile+1). NOT pixels. Slot t's texels
+//                             are texture rows t*TILE_PX .. (t+1)*TILE_PX-1, and this file has
+//                             to do that multiply itself before it can talk about texels.
+//
+// Until v1.8.1 the v fields were named v0/v1 and held raw pixel offsets, which is what capped
+// the sheet at 16 slots (slot 15's top edge needed v=256 and MeshVertex.v is a uint8_t, so 15
+// slots were addressable at ANY sheet height). Task 13b changed the field's UNITS, not its
+// width: the byte now holds 0..64 instead of 0..1024, the sheet grew to 16x1024 with all 64
+// slots addressable, and MeshVertex is still 8 bytes. Every "v" in this file means a slot edge
+// unless it says PIXEL.
 //
 // THE SHEET HALF (new in v1.6.0). world/atlas_uv.h's own comment used to say the duplication
 // with tools/make_atlas.py was unguarded because "the PNG carries no dimensions the C side
@@ -42,16 +63,17 @@
 // last unguarded copy of the layout.
 //
 // THE PIXEL HALF (new in v1.6.0 F7). Everything above is geometry, and geometry cannot tell
-// you whether a slot has any ART in it. Two slots' worth of that was exactly the F7 defect:
-// tex 10..14 addressed real, addressable slots that tools/make_atlas.py never painted, so they
+// you whether a slot has any ART in it. Several slots' worth of that was exactly the F7 defect:
+// tex bytes addressed real, addressable slots that tools/make_atlas.py never painted, so they
 // drew the sheet's background fill as an opaque near-black solid, and an out-of-range tex
 // clamped to slot 0 and drew grass. Neither is an error at any level a geometry test can see -
-// both are a block with a texture on it. So this file now DECODES build/atlas.t3x, the actual
+// both are a block with a texture on it. So this file DECODES build/atlas.t3x, the actual
 // object the GPU is handed (LZ11, then the PICA200's 8x8-tile Morton swizzle), and asserts on
 // texel values: that every slot the TILES list does not fill is the magenta/black missing-
 // texture marker, that no slot anywhere is still a solid block of background fill, and that
-// each of the ten painted slots still fingerprints to what it did before F7 touched the
-// generator. This is as close to looking at the sheet as a host test can get.
+// each of the twelve painted slots still fingerprints to what it did before F7 touched the
+// generator. This is as close to looking at the sheet as a host test can get. Since task 13b
+// that sweep covers 64 slots rather than 16.
 //
 // A parse that finds nothing must not read as "nothing wrong": a test that silently passed
 // whenever it failed to even locate the constant would stay green forever regardless of what
@@ -119,15 +141,19 @@ static char s_first[512];
 #define ATLAS_SLOT_TALL_GRASS 11
 
 // The shader literals are written to 8 decimal digits, so the tolerance has to be looser than
-// that literal's own rounding while staying far tighter than the gap to any wrong value: the
-// historical bug value 1/256 = 0.00390625 is ~0.0117 away from 1/64, over 100000x this.
+// that literal's own rounding while staying far tighter than the gap to any wrong value. The
+// near-miss to guard against is the pre-13b form of the SAME constant: uvScale.y used to be
+// 1/ATLAS_H_PX = 0.00097656 and is now TILE_PX/ATLAS_H_PX = 0.01562500, a difference of
+// 0.01464844 - over 140000x this tolerance. That wrong value is not a typo anybody would
+// invent; it is what the file said one commit ago, which is exactly why it has to be excluded
+// by a margin rather than by hoping nobody reverts it.
 #define UV_TOLERANCE 1e-7
 
 static double absd(double v) { return v < 0.0 ? -v : v; }
 
 // Reads `path` looking for the ".constf uvScale(a, b, c, d)" line and extracts components a
-// and b - the U and V divisors. Returns true and fills *outU/*outV only when every step
-// succeeds (file opens, the line is found, it has exactly four comma-separated components,
+// and b - the U divisor and the V scale. Returns true and fills *outU/*outV only when every
+// step succeeds (file opens, the line is found, it has exactly four comma-separated components,
 // and the first two parse cleanly as numbers with nothing left over). Otherwise fills errbuf
 // with which step failed and returns false, so the caller can turn that into a real failure
 // instead of silently passing.
@@ -214,6 +240,11 @@ static bool readShaderUvScale(const char* path, double* outU, double* outV,
 
 // Both components of one shader's uvScale, against the header. Also hands the values back so
 // the two shaders can be compared with each other.
+//
+// The two components are NOT the same formula, and that is the point of task 13b:
+//   .x = 1/ATLAS_W_PX        because u is an atlas PIXEL column
+//   .y = TILE_PX/ATLAS_H_PX  because v is a SLOT-EDGE INDEX, so the shader supplies the
+//                            TILE_PX factor the vertex byte no longer carries
 static void checkShader(const char* path, double* outU, double* outV)
 {
 	double u = -1.0, v = -1.0;
@@ -224,14 +255,18 @@ static void checkShader(const char* path, double* outU, double* outV)
 	if (!ok) { *outU = *outV = -1.0; return; }
 
 	const double want_u = 1.0 / (double)ATLAS_W_PX;
-	const double want_v = 1.0 / (double)ATLAS_H_PX;
+	const double want_v = (double)TILE_PX / (double)ATLAS_H_PX;
 
 	CHECK(absd(u - want_u) < UV_TOLERANCE,
 	      "%s uvScale.x=%.8f but %s ATLAS_W_PX=%d means 1/ATLAS_W_PX=%.8f (diff %.8f)",
 	      path, u, ATLAS_HEADER_PATH, ATLAS_W_PX, want_u, absd(u - want_u));
 	CHECK(absd(v - want_v) < UV_TOLERANCE,
-	      "%s uvScale.y=%.8f but %s ATLAS_H_PX=%d means 1/ATLAS_H_PX=%.8f (diff %.8f)",
-	      path, v, ATLAS_HEADER_PATH, ATLAS_H_PX, want_v, absd(v - want_v));
+	      "%s uvScale.y=%.8f but %s TILE_PX=%d / ATLAS_H_PX=%d means TILE_PX/ATLAS_H_PX=%.8f "
+	      "(diff %.8f). v is a SLOT-EDGE INDEX since task 13b, so the shader multiplies by a "
+	      "whole tile's height; the pre-13b 1/ATLAS_H_PX=%.8f would draw every face as the "
+	      "bottom 1/16th of its own tile, stretched",
+	      path, v, ATLAS_HEADER_PATH, TILE_PX, ATLAS_H_PX, want_v, absd(v - want_v),
+	      1.0 / (double)ATLAS_H_PX);
 
 	*outU = u;
 	*outV = v;
@@ -281,11 +316,13 @@ static bool isPowerOfTwo(unsigned v) { return v != 0 && (v & (v - 1)) == 0; }
 //   3. The PICA200's texture swizzle: 8x8 tiles in raster order, and inside a tile the texels
 //      are Morton (Z-order) interleaved. Undoing it gives back rows in the PNG's own top-down
 //      order, which is the order slot_png_y() in tools/make_atlas.py writes and the opposite
-//      of texture-space v. Verified against gfx/atlas.png with an independent decoder: all
-//      4096 texels matched with no flip, and all 4096 mismatched with one, so the orientation
+//      of texture-space v. Verified against gfx/atlas.png with an independent decoder: every
+//      texel matched with no flip, and every texel mismatched with one, so the orientation
 //      below is measured rather than assumed.
 //
-// s_texel is indexed [png_row][x], row 0 being the TOP of the sheet.
+// s_texel is indexed [png_row][x], row 0 being the TOP of the sheet. It sizes itself from
+// ATLAS_H_PX, so it grew from 8 KB to 32 KB with the sheet in task 13b with no edit here -
+// static, so that is .bss and not 32 KB of stack.
 static uint16_t s_texel[ATLAS_H_PX][ATLAS_W_PX];
 
 // RGBA5551 exactly as the PICA200 packs it: red in the top five bits, then green, then blue,
@@ -299,6 +336,12 @@ static uint16_t s_texel[ATLAS_H_PX][ATLAS_W_PX];
 // left showing it: an opaque near-black solid on a block face reads as a dark block, which is
 // the entire F7 defect.
 #define TEXEL_OLD_FILL RGBA5551(24, 20, 28, 255)    // 0x1887
+
+// PNG row of the TOP of slot `slot`, i.e. where slot_png_y() in tools/make_atlas.py puts it.
+// Texture v grows upwards and PNG rows run downwards, so slot 0 is the LAST TILE_PX rows of
+// the image and the top slot is the first. Written once, here, because every texel loop below
+// needs it and the flip is the thing most worth not re-deriving by hand each time.
+#define SLOT_PNG_TOP(slot) (ATLAS_H_PX - ((slot) + 1) * TILE_PX)
 
 typedef struct {
 	bool     ok;
@@ -407,6 +450,8 @@ static T3xInfo readT3x(char* err, size_t errsz)
 	memset(&t, 0, sizeof(t));
 
 	static unsigned char raw[256 * 1024];
+	// Sized from the macros, never from a literal, so a sheet resize cannot leave this reader
+	// silently short: at 16x1024 RGBA5551 this is 32 KB, four times what it was before 13b.
 	static unsigned char pixels[ATLAS_W_PX * ATLAS_H_PX * 2];
 
 	FILE* f = fopen(ATLAS_T3X_PATH, "rb");
@@ -443,8 +488,9 @@ static T3xInfo readT3x(char* err, size_t errsz)
 		// Bail before decoding: the untile loop below indexes s_texel by this size, so a
 		// disagreement has to stop here rather than run off the end of the array.
 		snprintf(err, errsz, "%s says the texture is %ux%u, but ATLAS_W_PX/ATLAS_H_PX say %dx%d "
-		         "- the sheet and the code disagree about the layout", ATLAS_T3X_PATH, t.w, t.h,
-		         ATLAS_W_PX, ATLAS_H_PX);
+		         "- the sheet and the code disagree about the layout. A t3x built before the "
+		         "sheet grew is STALE, not merely different: rebuild it from gfx/atlas.png",
+		         ATLAS_T3X_PATH, t.w, t.h, ATLAS_W_PX, ATLAS_H_PX);
 		return t;
 	}
 
@@ -512,9 +558,11 @@ int main(void)
 	checkShader(WORLD_SHADER_PATH, &wu, &wv);
 	checkShader(DYNAMIC_SHADER_PATH, &du, &dv);
 
-	// The two shaders against each other, not only against the header. An Old 3DS binds one
-	// and a New 3DS the other, so they have to agree or the same world looks different on the
-	// two consoles - and that is a difference nobody would attribute to a texture constant.
+	// H2. The two shaders against each other, not only against the header. An Old 3DS binds
+	// one and a New 3DS the other, so they have to agree or the same world looks different on
+	// the two consoles - and that is a difference nobody would attribute to a texture constant.
+	// Still worth its own pair of checks after task 13b: uvScale.y changed in BOTH files, and
+	// updating one and not the other is precisely the edit this catches.
 	CHECK(absd(wu - du) < UV_TOLERANCE, "the two shaders disagree on uvScale.x: %.8f vs %.8f", wu, du);
 	CHECK(absd(wv - dv) < UV_TOLERANCE, "the two shaders disagree on uvScale.y: %.8f vs %.8f", wv, dv);
 
@@ -538,21 +586,57 @@ int main(void)
 	      ATLAS_W_PX, TILE_PX, ATLAS_W_PX / TILE_PX);
 	CHECK(ATLAS_TILE_SLOTS * TILE_PX == ATLAS_H_PX, "ATLAS_TILE_SLOTS=%d x %d != ATLAS_H_PX=%d",
 	      ATLAS_TILE_SLOTS, TILE_PX, ATLAS_H_PX);
-	// The top slot is unaddressable because its v1 would be ATLAS_H_PX, which is 256 and does
-	// not fit in MeshVertex's uint8_t v. Both halves are checked: the last addressable slot
-	// must fit, and the slot after it must not - otherwise ATLAS_TILE_COUNT is simply wrong.
-	CHECK((ATLAS_TILE_COUNT) * TILE_PX <= 255,
-	      "the last addressable slot's top edge is v=%d, which does not fit in uint8_t",
-	      ATLAS_TILE_COUNT * TILE_PX);
-	CHECK((ATLAS_TILE_COUNT + 1) * TILE_PX > 255,
-	      "slot %d's top edge is v=%d and DOES fit in uint8_t, so ATLAS_TILE_COUNT=%d is leaving an addressable slot unused",
-	      ATLAS_TILE_COUNT, (ATLAS_TILE_COUNT + 1) * TILE_PX, ATLAS_TILE_COUNT);
+	// The PICA200's own limit on a texture dimension, which is what the slot count is now
+	// bounded BY rather than by the vertex byte. citro3d's C3D_TexInitWithParams refuses
+	// anything outside 8..1024 (see world/atlas_uv.h), so a sheet taller than this would not
+	// fail to look right, it would fail to load at all.
+	CHECK(ATLAS_H_PX <= 1024, "ATLAS_H_PX=%d is past the PICA200's 1024 px maximum texture "
+	      "dimension; C3D_TexInitWithParams would refuse the atlas outright", ATLAS_H_PX);
 
-	// ── Every tile's rect, and the no-shared-pixel property ─────────────────────────────
+	// H5. Every slot on the sheet is addressable. This check used to assert the OPPOSITE - it
+	// read `ATLAS_TILE_COUNT * TILE_PX <= 255` together with `(ATLAS_TILE_COUNT+1) * TILE_PX
+	// > 255`, i.e. "the last slot's top edge fits in the vertex byte AS PIXELS and the next
+	// one's does not", which pinned ATLAS_TILE_COUNT at SLOTS-1 and left the top slot
+	// permanently unreachable. Task 13b changed vslot0/vslot1 from pixels to slot-edge indices,
+	// so the pixel arithmetic those two checks did no longer describes anything the code does,
+	// and the unaddressable slot they justified no longer exists. Asserting the new fact rather
+	// than deleting them, because SLOTS-1 is exactly what a careless revert would restore.
+	CHECK(ATLAS_TILE_COUNT == ATLAS_TILE_SLOTS,
+	      "ATLAS_TILE_COUNT=%d but the sheet holds ATLAS_TILE_SLOTS=%d. Since task 13b every "
+	      "slot is addressable; a count below the slot count means %d slots of painted sheet "
+	      "that no tex byte can reach",
+	      ATLAS_TILE_COUNT, ATLAS_TILE_SLOTS, ATLAS_TILE_SLOTS - ATLAS_TILE_COUNT);
+
+	// H6. The vertex byte still bounds the sheet, just far higher than it did. MeshVertex.v is
+	// a uint8_t holding a slot EDGE - `tile + 1` for a rect's top - so the real requirement is
+	// ATLAS_TILE_SLOTS + 1 <= 256, i.e. ATLAS_TILE_SLOTS <= 255.
 	//
-	// A per-texel ownership map, not a rect-overlap comparison: the rects are half-open, so
-	// adjacent slots share the coordinate v1==v0 while sharing no pixel, and a coordinate
-	// test would go red on a perfectly correct sheet.
+	// mesh_vertex.h's _Static_assert(sizeof(MeshVertex) == 8) is BLIND to this. Task 13b
+	// changed the field's UNITS and not its width, so the struct is still exactly 8 bytes and
+	// that assert stays green through any sheet height at all - which is precisely why this
+	// check has to exist here, in the file that knows what the byte is counting.
+	CHECK(ATLAS_TILE_SLOTS <= 255,
+	      "the sheet holds %d slots, so a rect's top edge index reaches %d - past what "
+	      "MeshVertex.v's uint8_t can hold. sizeof(MeshVertex)==8 cannot see this: a units "
+	      "change keeps the struct 8 bytes",
+	      ATLAS_TILE_SLOTS, ATLAS_TILE_SLOTS);
+
+	// ── Every tile's rect, and the no-shared-texel property ─────────────────────────────
+	//
+	// H3/H4. Two separate claims, and they are separate on purpose:
+	//
+	//   H3 is about the SLOT UNITS: vslot0 is the tile index itself and vslot1 is tile+1. That
+	//      is the whole of what task 13b changed, and the checks it replaced (v1-v0 == TILE_PX,
+	//      v0 == t*TILE_PX) now assert the opposite of the truth - a rect whose vslot1-vslot0
+	//      were 16 would be sixteen slots tall.
+	//   H4 is about TEXELS, which needs the slot units converted back to pixels first. Slot t
+	//      owns texture rows t*TILE_PX .. (t+1)*TILE_PX-1; texture v runs upwards and PNG rows
+	//      run downwards, so those are PNG rows ATLAS_H_PX-(t+1)*TILE_PX .. ATLAS_H_PX-t*TILE_PX-1.
+	//      A per-texel ownership map, not a rect-overlap comparison: the rect is half-open in
+	//      slots, so adjacent slots share the edge index vslot1==vslot0 while sharing no pixel,
+	//      and a coordinate test would go red on a perfectly correct sheet.
+	//
+	// 16 KB of .bss, not stack - it is static deliberately, and it grew with ATLAS_H_PX.
 	static unsigned char owner[ATLAS_H_PX][ATLAS_W_PX];   // 0 = unclaimed, tile+1 otherwise
 	memset(owner, 0, sizeof(owner));
 	int claimed = 0;
@@ -561,15 +645,38 @@ int main(void)
 		const AtlasRect r = atlasRect(t);
 
 		CHECK(r.u1 - r.u0 == TILE_PX, "tile %d spans %d px in u, not %d", t, r.u1 - r.u0, TILE_PX);
-		CHECK(r.v1 - r.v0 == TILE_PX, "tile %d spans %d px in v, not %d", t, r.v1 - r.v0, TILE_PX);
 		CHECK(r.u1 <= ATLAS_W_PX, "tile %d's u1=%d runs past the %d px sheet width", t, r.u1, ATLAS_W_PX);
-		CHECK(r.v1 <= ATLAS_H_PX, "tile %d's v1=%d runs past the %d px sheet height", t, r.v1, ATLAS_H_PX);
-		// v0/v1 are uint8_t, so a v1 that should have been >255 comes back wrapped and small
-		// rather than out of range. Comparing against the arithmetic in int catches that.
-		CHECK((int)r.v0 == t * TILE_PX, "tile %d's v0=%d, expected %d (a wrapped uint8_t looks like this)",
-		      t, r.v0, t * TILE_PX);
 
-		for (int y = r.v0; y < r.v1; y++) {
+		// H3, the slot-unit claims.
+		CHECK((int)r.vslot0 == t,
+		      "tile %d's vslot0=%d, expected %d. vslot0 is the SLOT INDEX itself since task 13b, "
+		      "not t*TILE_PX - if this reads like a pixel offset the units have been reverted",
+		      t, r.vslot0, t);
+		CHECK((int)r.vslot1 == t + 1,
+		      "tile %d's vslot1=%d, expected %d (the slot edge ABOVE it)", t, r.vslot1, t + 1);
+		CHECK((int)r.vslot1 - (int)r.vslot0 == 1,
+		      "tile %d spans %d slots, not 1 - a rect covers exactly one slot",
+		      t, (int)r.vslot1 - (int)r.vslot0);
+		CHECK((int)r.vslot1 <= ATLAS_TILE_SLOTS,
+		      "tile %d's top edge index vslot1=%d runs past the sheet's %d slots",
+		      t, r.vslot1, ATLAS_TILE_SLOTS);
+
+		// H4, the texel claims. The multiply back to pixels happens HERE and nowhere else in
+		// this loop, so a wrong conversion shows up as overlap or as unclaimed rows rather than
+		// as a comment nobody reads.
+		const int png_top = ATLAS_H_PX - (int)r.vslot1 * TILE_PX;
+		const int ok_rows = (png_top >= 0 && png_top + TILE_PX <= ATLAS_H_PX);
+		CHECK(ok_rows, "slot %d maps to PNG rows %d..%d, outside the %d row image - the slot "
+		      "-> pixel conversion is wrong", t, png_top, png_top + TILE_PX - 1, ATLAS_H_PX);
+		if (!ok_rows) continue;   // indexing owner[] with it would run off the array
+
+		CHECK(png_top == ATLAS_H_PX - (t + 1) * TILE_PX,
+		      "slot %d's PNG top row is %d, expected %d - the v flip tools/make_atlas.py's "
+		      "slot_png_y() implements is reversed, which puts every tile on the wrong slot "
+		      "with no error at all",
+		      t, png_top, ATLAS_H_PX - (t + 1) * TILE_PX);
+
+		for (int y = png_top; y < png_top + TILE_PX; y++) {
 			for (int x = r.u0; x < r.u1; x++) {
 				if (owner[y][x] != 0) {
 					CHECK(false, "texel (%d,%d) is claimed by both tile %d and tile %d",
@@ -584,13 +691,34 @@ int main(void)
 	CHECK(claimed == ATLAS_TILE_COUNT * TILE_PX * TILE_PX,
 	      "%d texels claimed, expected %d - some tile overlapped another",
 	      claimed, ATLAS_TILE_COUNT * TILE_PX * TILE_PX);
-	// The unaddressable top slot must genuinely be untouched, or ATLAS_TILE_COUNT is a lie.
+	// And the slots together must claim the WHOLE sheet, which is the same number said the
+	// other way round. Stated separately because the two can only agree when the sheet's area
+	// and the slot count's area are the same thing.
+	CHECK(ATLAS_TILE_COUNT * TILE_PX * TILE_PX == ATLAS_W_PX * ATLAS_H_PX,
+	      "%d addressable slots of %dx%d cover %d texels, but the sheet is %d - the slots do "
+	      "not tile the sheet", ATLAS_TILE_COUNT, TILE_PX, TILE_PX,
+	      ATLAS_TILE_COUNT * TILE_PX * TILE_PX, ATLAS_W_PX * ATLAS_H_PX);
+	// This block INVERTED in task 13b. It used to assert that the rows above the last
+	// addressable slot were UNCLAIMED, because the top slot could not be reached by a uint8_t
+	// pixel offset and had to stay empty. There is no unaddressable slot any more, so the same
+	// sweep now asserts the opposite: not one texel anywhere on the sheet is left unowned. The
+	// old form would pass trivially today (there are no rows past the last slot to sweep), so
+	// leaving it renamed rather than rewritten would have been a check that cannot go red.
 	{
-		int stray = 0;
-		for (int y = ATLAS_TILE_COUNT * TILE_PX; y < ATLAS_H_PX; y++)
-			for (int x = 0; x < ATLAS_W_PX; x++)
-				if (owner[y][x] != 0) stray++;
-		CHECK(stray == 0, "%d texels above the last addressable slot were claimed by a tile", stray);
+		int stray = 0, fx = -1, fy = -1;
+		for (int y = 0; y < ATLAS_H_PX; y++) {
+			for (int x = 0; x < ATLAS_W_PX; x++) {
+				if (owner[y][x] == 0) {
+					if (stray == 0) { fx = x; fy = y; }
+					stray++;
+				}
+			}
+		}
+		CHECK(stray == 0,
+		      "%d texels of the %d px sheet are owned by no slot, first at PNG (%d,%d). Every "
+		      "one of the %d slots is addressable now, so an unowned texel is sheet the game "
+		      "paid for and cannot draw",
+		      stray, ATLAS_W_PX * ATLAS_H_PX, fx, fy, ATLAS_TILE_COUNT);
 	}
 
 	// ── The U-repeat property greedy meshing depends on ─────────────────────────────────
@@ -599,7 +727,8 @@ int main(void)
 	// does: with GPU_REPEAT and a sheet TILE_PX wide, texture coordinate u maps to texel
 	// u mod TILE_PX. A merged quad `k+1` blocks wide emits u1 = u0 + TILE_PX*k, and the
 	// property that makes the merge legal is that every one of those lands back on the
-	// same column of the same tile.
+	// same column of the same tile. u is the one field task 13b left in PIXELS, deliberately -
+	// see ATLAS_MAX_MERGE_BLOCKS in world/atlas_uv.h - so this half is unchanged.
 	for (int t = 0; t < ATLAS_TILE_COUNT; t++) {
 		const AtlasRect r = atlasRect(t);
 		for (int k = 1; k <= ATLAS_MAX_MERGE_BLOCKS; k++) {
@@ -622,23 +751,30 @@ int main(void)
 
 	// ── Out-of-range tiles land somewhere defined ───────────────────────────────────────
 	//
-	// world/mesher.c builds its rect table for all 256 registry ids, and a dynamic block
+	// H7. world/mesher.c builds its rect table for all 256 registry ids, and a dynamic block
 	// registered over the wire carries an arbitrary tile byte, so this is reachable in
 	// production, not a theoretical edge.
 	//
 	// It must land on the MISSING-TEXTURE MARKER, not on tile 0 (v1.6.0 F7). Clamping to 0
 	// drew grass: a block declared with a wrong tex byte came out as a perfectly plausible
 	// grass block, and the player - and the server author - had nothing to see. Checked as
-	// "identical to atlasRect(ATLAS_TILE_MISSING)", not merely as "in range", because without
-	// the clamp the arithmetic wraps mod 256 and for some out-of-range indices the wrap lands
-	// on a perfectly in-range-looking rect: 200*16 mod 256 = 128, i.e. the leaves slot. An
-	// in-range test alone therefore CANNOT go red for those, and a case that cannot go red is
-	// not cover.
+	// "identical to atlasRect(ATLAS_TILE_MISSING)", not merely as "in range".
 	//
-	// ATLAS_TILE_SLOTS (16) used to be the one index no test here could discriminate on:
-	// 16 * 16 = 256 wraps to exactly 0, so with a clamp-to-0 the wrapped rect IS the clamped
-	// rect. Clamping to slot 14 instead gives it a distinct answer (v0 224, not 0), so it now
-	// goes red with the rest of them.
+	// THE ALIASING HAZARD MOVED IN TASK 13b, and the old reasoning here has to be discarded
+	// rather than re-read. It used to be about a PIXEL wrap: vslot0 was tile*TILE_PX, so index
+	// 16 gave 256 which wrapped to exactly 0, and a clamp-to-0 was indistinguishable from no
+	// clamp at all for that one index. There is no *TILE_PX left in atlasRect(), so no index
+	// below 256 wraps any more. What replaces it:
+	//
+	//   * 64..255 are now all perfectly VALID uint8_t values that are out of range for the
+	//     sheet. Nothing about the byte rejects them; only the explicit clamp does. That is a
+	//     far wider hole than the single index 16 used to be - 192 values instead of one.
+	//   * 256 and up are what a raw `(uint8_t)tile` would alias, and 256 aliases to 0, i.e.
+	//     to GRASS. So 256 is in the list below specifically: it is the one value for which a
+	//     dropped clamp still produces a plausible-looking block rather than anything odd.
+	//
+	// ATLAS_TILE_SLOTS is NOT in the list any more. It equals ATLAS_TILE_COUNT since task 13b,
+	// so it would be a duplicate entry proving nothing separate.
 	{
 		const AtlasRect zero    = atlasRect(0);
 		const AtlasRect missing = atlasRect(ATLAS_TILE_MISSING);
@@ -652,42 +788,50 @@ int main(void)
 		      "on purpose: that is the last slot a growing TILES list would reach, so reserving "
 		      "any lower one would collide with the next block added",
 		      ATLAS_TILE_MISSING, ATLAS_TILE_COUNT - 1);
-		CHECK((int)missing.v0 == ATLAS_TILE_MISSING * TILE_PX,
-		      "atlasRect(ATLAS_TILE_MISSING) gave v0=%d, expected %d", missing.v0,
-		      ATLAS_TILE_MISSING * TILE_PX);
+		CHECK((int)missing.vslot0 == ATLAS_TILE_MISSING,
+		      "atlasRect(ATLAS_TILE_MISSING) gave vslot0=%d, expected the slot index %d itself",
+		      missing.vslot0, ATLAS_TILE_MISSING);
 		// If the marker rect were tile 0's rect, every check below would pass for the OLD
 		// clamp as well and none of them would be cover at all.
-		CHECK(missing.v0 != zero.v0,
+		CHECK(missing.vslot0 != zero.vslot0,
 		      "the marker slot's rect is tile 0's rect, so no check here can tell the F7 clamp "
 		      "from the one it replaced");
 
-		const int bad[] = { -1, ATLAS_TILE_COUNT, ATLAS_TILE_SLOTS, 200, 255, 1000 };
+		// -1                    negative, which atlasRect() sees as a huge unsigned
+		// ATLAS_TILE_COUNT      the first index past the sheet
+		// ATLAS_TILE_COUNT + 1  and the one after it
+		// 100, 200, 255         valid bytes, invalid slots - the 192-value hole described above
+		// 256                   the one value a raw (uint8_t) cast aliases onto slot 0, i.e. grass
+		// 1000                  well past anything a byte could hold
+		const int bad[] = { -1, ATLAS_TILE_COUNT, ATLAS_TILE_COUNT + 1, 100, 200, 255, 256, 1000 };
 		for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
 			const AtlasRect r = atlasRect(bad[i]);
-			CHECK(r.u0 == missing.u0 && r.u1 == missing.u1 && r.v0 == missing.v0 && r.v1 == missing.v1,
-			      "atlasRect(%d) gave u %d..%d v %d..%d; an unaddressable tile must clamp to the "
-			      "missing-texture marker at slot %d (u %d..%d v %d..%d) - clamping to tile 0's "
-			      "u %d..%d v %d..%d draws GRASS for a wrong tex byte, and wrapping the uint8_t "
-			      "draws whatever slot the wrap lands on",
-			      bad[i], r.u0, r.u1, r.v0, r.v1, ATLAS_TILE_MISSING,
-			      missing.u0, missing.u1, missing.v0, missing.v1,
-			      zero.u0, zero.u1, zero.v0, zero.v1);
+			CHECK(r.u0 == missing.u0 && r.u1 == missing.u1
+			      && r.vslot0 == missing.vslot0 && r.vslot1 == missing.vslot1,
+			      "atlasRect(%d) gave u %d..%d vslot %d..%d; an unaddressable tile must clamp to "
+			      "the missing-texture marker at slot %d (u %d..%d vslot %d..%d) - clamping to "
+			      "tile 0's u %d..%d vslot %d..%d draws GRASS for a wrong tex byte, and a raw "
+			      "uint8_t cast draws whatever slot the value happens to name",
+			      bad[i], r.u0, r.u1, r.vslot0, r.vslot1, ATLAS_TILE_MISSING,
+			      missing.u0, missing.u1, missing.vslot0, missing.vslot1,
+			      zero.u0, zero.u1, zero.vslot0, zero.vslot1);
 		}
 	}
 
 	// ── Every real block, every face ────────────────────────────────────────────────────
 	//
-	// The REAL block.c and registry.c are linked, so this is a claim about what blockFaceTex()
-	// returns rather than about a table copied into this file. Every id the mesher can ask
-	// about - all 256 raw byte values, exactly as world/mesher.c's planBuild does - must map
-	// to an addressable slot, or the atlas silently renders that block as tile 0.
+	// H8. The REAL block.c and registry.c are linked, so this is a claim about what
+	// blockFaceTex() returns rather than about a table copied into this file. Every id the
+	// mesher can ask about - all 256 raw byte values, exactly as world/mesher.c's planBuild
+	// does - must map into 0..ATLAS_TILE_COUNT-1, which is 0..63 since task 13b, or the atlas
+	// silently renders that block as the missing-texture marker.
 	registryInitCore();
 	for (int id = 0; id < 256; id++) {
 		for (int face = 0; face < BLOCK_FACES; face++) {
 			const int tile = blockFaceTex((BlockId)id, face);
 			CHECK(tile >= 0 && tile < ATLAS_TILE_COUNT,
-			      "block %d face %d maps to tile %d, outside the %d addressable slots",
-			      id, face, tile, ATLAS_TILE_COUNT);
+			      "block %d face %d maps to tile %d, outside the %d addressable slots (0..%d)",
+			      id, face, tile, ATLAS_TILE_COUNT, ATLAS_TILE_COUNT - 1);
 		}
 	}
 	// ...and none of them may land on the slot reserved for the missing-texture marker. That
@@ -713,8 +857,8 @@ int main(void)
 	// And the named blocks specifically, whose tiles must be distinct where the art is: grass
 	// is the block that proves per-face tiles work at all, with three different tiles on one
 	// cube. On a one-tile-wide sheet u can no longer tell two tiles apart - every tile's u is
-	// 0..16 - so v is the only discriminator left, and any test that still separates tiles by
-	// u has been neutralised by the strip layout.
+	// 0..16 - so the slot index is the only discriminator left, and any test that still
+	// separates tiles by u has been neutralised by the strip layout.
 	{
 		const AtlasRect top  = atlasRect(blockFaceTex(BLOCK_GRASS, FACE_TOP));
 		const AtlasRect side = atlasRect(blockFaceTex(BLOCK_GRASS, FACE_EAST));
@@ -722,33 +866,29 @@ int main(void)
 		CHECK(top.u0 == side.u0 && side.u0 == bot.u0,
 		      "every tile shares one u span on a one-tile-wide sheet, but grass's are %d/%d/%d",
 		      top.u0, side.u0, bot.u0);
-		CHECK(top.v0 != side.v0 && side.v0 != bot.v0 && top.v0 != bot.v0,
-		      "grass's three faces must land on three different slots, got v0 %d/%d/%d",
-		      top.v0, side.v0, bot.v0);
+		CHECK(top.vslot0 != side.vslot0 && side.vslot0 != bot.vslot0 && top.vslot0 != bot.vslot0,
+		      "grass's three faces must land on three different slots, got vslot0 %d/%d/%d",
+		      top.vslot0, side.vslot0, bot.vslot0);
 	}
 
-	// ── The V flip, which the generator has to implement in reverse ─────────────────────
+	// ── The V flip, at the two ends of the sheet ────────────────────────────────────────
 	//
-	// Texture v grows upwards and the PNG's rows run downwards, so slot t - which owns
-	// texture rows [t*16, t*16+16) - is written to PNG rows ATLAS_H_PX-v1 .. ATLAS_H_PX-v0-1.
-	// Slot 0 is therefore the LAST 16 rows of the image, not the first. That reversal is what
-	// tools/make_atlas.py's slot_png_y() implements, and getting it backwards would put every
-	// tile on the wrong slot with no error at all - the sheet would still be a valid sheet.
-	for (int t = 0; t < ATLAS_TILE_COUNT; t++) {
-		const AtlasRect r = atlasRect(t);
-		const int png_top = ATLAS_H_PX - (int)r.v1;
-		CHECK(png_top == ATLAS_H_PX - (t + 1) * TILE_PX,
-		      "slot %d's PNG top row is %d, expected %d", t, png_top, ATLAS_H_PX - (t + 1) * TILE_PX);
-		CHECK(png_top >= 0 && png_top + TILE_PX <= ATLAS_H_PX,
-		      "slot %d maps to PNG rows %d..%d, outside the image", t, png_top, png_top + TILE_PX - 1);
-	}
-	CHECK(ATLAS_H_PX - (int)atlasRect(0).v1 == ATLAS_H_PX - TILE_PX,
+	// The per-slot form of this check lives in the ownership loop above, where the conversion
+	// from slot units to PNG rows is actually performed. What is left here is the two ends,
+	// because those are the ones a reversed flip swaps and they are worth naming: slot 0 is the
+	// LAST TILE_PX rows of the image and the top slot is the FIRST. Getting that backwards puts
+	// every tile on the wrong slot with no error at all - the sheet is still a valid sheet.
+	CHECK(ATLAS_H_PX - (int)atlasRect(0).vslot1 * TILE_PX == ATLAS_H_PX - TILE_PX,
 	      "slot 0 must be the LAST %d PNG rows - the v flip is backwards", TILE_PX);
+	CHECK(ATLAS_H_PX - (int)atlasRect(ATLAS_TILE_COUNT - 1).vslot1 * TILE_PX == 0,
+	      "the top slot (%d) must be the FIRST %d PNG rows, got row %d",
+	      ATLAS_TILE_COUNT - 1, TILE_PX,
+	      ATLAS_H_PX - (int)atlasRect(ATLAS_TILE_COUNT - 1).vslot1 * TILE_PX);
 
 	// ── The built sheet's actual texels ─────────────────────────────────────────────────
 	//
-	// Everything above this line is arithmetic, and the F7 defect was not arithmetic: slots
-	// 10..14 produced perfectly valid rects over pixels nobody had painted. So this decodes
+	// Everything above this line is arithmetic, and the F7 defect was not arithmetic: unpainted
+	// slots produced perfectly valid rects over pixels nobody had painted. So this decodes
 	// build/atlas.t3x - the object atlasInit() hands the GPU - and looks at what is in them.
 	{
 		char    t3x_err[300] = {0};
@@ -774,16 +914,24 @@ int main(void)
 			      "%s's subtexture is %ux%u, not the whole %dx%d sheet",
 			      ATLAS_T3X_PATH, t.sub_w, t.sub_h, ATLAS_W_PX, ATLAS_H_PX);
 
-			// The twelve painted slots, pinned. Slots 0..9's fingerprints were taken from the
-			// t3x built BEFORE F7 touched tools/make_atlas.py, so they are what says the art did
-			// not move when the generator learned to paint the spares. They are UNCHANGED by
-			// tasks 17/19: water and tall grass were appended to TILES, and the generator draws
-			// every tile from one seeded stream in TILES order precisely so that appending
-			// cannot disturb art already painted. These ten values not moving IS that proof.
+			// H11. The twelve painted slots, pinned. Slots 0..9's fingerprints were taken from
+			// the t3x built BEFORE F7 touched tools/make_atlas.py; slots 10 and 11 were added by
+			// tasks 17/19 and computed independently from gfx/atlas.png. The generator draws
+			// every tile from ONE seeded stream in TILES order precisely so that appending to
+			// TILES cannot disturb art already painted.
 			//
-			// Slots 10 and 11 are the two new tiles. Their values were computed independently
-			// from gfx/atlas.png (RGBA5551-packed and FNV'd in Python) and match what this
-			// decoder gets out of build/atlas.t3x, so the t3x really carries what was painted.
+			// THESE VALUES MUST NOT MOVE, AND TASK 13b IS NOT A REASON TO RE-PIN THEM. The sheet
+			// went from 16 slots to 64 and every one of these tiles is drawn from the same
+			// stream, in the same order, at the same size, and lands - via slot_png_y()'s flip -
+			// at a DIFFERENT absolute PNG row than it did before. That is exactly why the pins
+			// are per-slot and taken through SLOT_PNG_TOP(): the art is addressed by slot, so a
+			// taller sheet moves where a slot IS without changing what is in it.
+			//
+			// So if one of these goes red after a sheet resize, the correct response is NOT to
+			// re-pin it. It means the generator's slot addressing is wrong - the art has been
+			// painted into a different slot than before, or the flip has been re-derived
+			// incorrectly for the new height - and the sheet is shipping tiles under the wrong
+			// tex bytes. Re-pinning would make that permanent and green.
 			static const uint64_t kPaintedFingerprint[ATLAS_PAINTED_SLOTS] = {
 				0xC8C34C2212D92C86ull,   //  0 grass_top
 				0x1D3D28DFB5E9B829ull,   //  1 grass_side
@@ -799,12 +947,13 @@ int main(void)
 				0x8CD474E09FA7C22Cull,   // 11 tall_grass
 			};
 			for (int slot = 0; slot < ATLAS_PAINTED_SLOTS; slot++) {
-				const int      png_top = ATLAS_H_PX - (slot + 1) * TILE_PX;
-				const uint64_t got     = slotFingerprint(png_top);
+				const uint64_t got = slotFingerprint(SLOT_PNG_TOP(slot));
 				CHECK(got == kPaintedFingerprint[slot],
 				      "slot %d's art changed: fingerprint 0x%016" PRIX64 ", pinned 0x%016" PRIX64
 				      ". tools/make_atlas.py draws from one seeded stream in TILES order, so any "
-				      "change to the order, the seed, or a painter moves this",
+				      "change to the order, the seed, or a painter moves this. A SHEET RESIZE "
+				      "must not: if this moved because ATLAS_H_PX changed, the generator's slot "
+				      "addressing is wrong and re-pinning would ship it",
 				      slot, got, kPaintedFingerprint[slot]);
 			}
 
@@ -817,7 +966,7 @@ int main(void)
 			// "gaps" came out alpha=1 does not render as grass with gaps - it renders as a solid
 			// card, twice, at right angles. So the gaps are counted, by value, off the t3x.
 			{
-				const int png_top = ATLAS_H_PX - (ATLAS_SLOT_TALL_GRASS + 1) * TILE_PX;
+				const int png_top = SLOT_PNG_TOP(ATLAS_SLOT_TALL_GRASS);
 				int cutout = 0, opaque = 0;
 				for (int y = 0; y < TILE_PX; y++) {
 					for (int x = 0; x < ATLAS_W_PX; x++) {
@@ -845,7 +994,7 @@ int main(void)
 			// -0 texel in the water tile would be a hole you could see the seabed through, not a
 			// see-through sea. Every texel must be opaque.
 			{
-				const int png_top = ATLAS_H_PX - (ATLAS_SLOT_WATER + 1) * TILE_PX;
+				const int png_top = SLOT_PNG_TOP(ATLAS_SLOT_WATER);
 				int cutout = 0, fx = -1, fy = -1;
 				for (int y = 0; y < TILE_PX; y++) {
 					for (int x = 0; x < ATLAS_W_PX; x++) {
@@ -862,25 +1011,27 @@ int main(void)
 				      ATLAS_SLOT_WATER, cutout, fx, fy);
 			}
 
-			// And the two new tiles are not each other, nor a copy of a tile that was already
-			// there. The fingerprint loop would catch a duplicate only by accident - it compares
-			// each slot against its own pin, never against its neighbours - so a painter wired
-			// to the wrong function would pin cleanly and ship two identical tiles.
+			// H12. And the painted tiles are not each other. The fingerprint loop would catch a
+			// duplicate only by accident - it compares each slot against its own pin, never
+			// against its neighbours - so a painter wired to the wrong function would pin
+			// cleanly and ship two identical tiles. Bounded by ATLAS_PAINTED_SLOTS, not by the
+			// slot count: the 52 unpainted slots are all the marker and ARE deliberately
+			// identical to each other, which the marker sweep below owns instead.
 			for (int a = 0; a < ATLAS_PAINTED_SLOTS; a++) {
 				for (int b = a + 1; b < ATLAS_PAINTED_SLOTS; b++) {
-					const int ta = ATLAS_H_PX - (a + 1) * TILE_PX;
-					const int tb = ATLAS_H_PX - (b + 1) * TILE_PX;
-					CHECK(slotFingerprint(ta) != slotFingerprint(tb),
+					CHECK(slotFingerprint(SLOT_PNG_TOP(a)) != slotFingerprint(SLOT_PNG_TOP(b)),
 					      "slots %d and %d are texel-identical; two painted tiles must not be "
 					      "the same art under two names", a, b);
 				}
 			}
 
-			// Every slot the TILES list does not fill must be the marker, texel for texel. This
-			// is the check the F7 defect exists in: before it, slots 10..14 were a flat
-			// near-black fill and every geometry test in this file was green over them.
+			// H9. Every slot the TILES list does not fill must be the marker, texel for texel.
+			// This is the check the F7 defect exists in: before it, the spare slots were a flat
+			// near-black fill and every geometry test in this file was green over them. Since
+			// task 13b that is slots 12..63 - 52 of them rather than 4 - and the bound is
+			// ATLAS_TILE_SLOTS so it follows the sheet rather than a number written here.
 			for (int slot = ATLAS_PAINTED_SLOTS; slot < ATLAS_TILE_SLOTS; slot++) {
-				const int png_top = ATLAS_H_PX - (slot + 1) * TILE_PX;
+				const int png_top = SLOT_PNG_TOP(slot);
 				int       wrong = 0, fx = -1, fy = -1;
 				uint16_t  got = 0, want = 0;
 				for (int y = 0; y < TILE_PX; y++) {
@@ -903,12 +1054,12 @@ int main(void)
 				      slot, wrong, TILE_PX * ATLAS_W_PX, fx, fy, got, want);
 			}
 
-			// And nothing anywhere on the sheet is still a solid block of background fill. The
-			// check above already covers slots 12..15 by value; this one covers the twelve
+			// H10. And no slot ANYWHERE on the sheet is a solid block of background fill. The
+			// check above already covers slots 12..63 by value; this one covers the twelve
 			// painted ones too, and it is the one that would catch a future slot painted by a
 			// painter that silently returned nothing.
 			for (int slot = 0; slot < ATLAS_TILE_SLOTS; slot++) {
-				const int png_top = ATLAS_H_PX - (slot + 1) * TILE_PX;
+				const int png_top = SLOT_PNG_TOP(slot);
 				int       fill = 0;
 				for (int y = 0; y < TILE_PX; y++)
 					for (int x = 0; x < ATLAS_W_PX; x++)
@@ -938,78 +1089,64 @@ int main(void)
 		}
 	}
 
-	// ── Task 13a: does bumping ATLAS_H_PX to 512 actually buy "31 addressable" slots? ────
+	// ── The ceiling task 13b actually moved, kept as a regression check ─────────────────
 	//
-	// world/atlas_uv.h's own comment, just above ATLAS_TILE_MISSING, used to claim "the
-	// next step up is ATLAS_H_PX 512: 32 slots, 31 addressable". A scout flagged that as
-	// wrong because atlasRect() computes v0/v1 as a plain
-	// `(uint8_t)(tile * TILE_PX [+ TILE_PX])` cast - a raw pixel offset, never scaled to
-	// the sheet height - so nothing about a taller sheet changes how far that cast can
-	// count before it wraps.
-	//
-	// Proved directly: looping tiles 0..30 (the comment's own claimed count) and checking
-	// each for an intact, distinct v0/v1 pair goes RED starting at tile 15, not 31 -
-	// measured verbatim from this file before the fix below:
+	// This block used to prove the OPPOSITE, and the measurement it recorded is worth keeping
+	// because it is what justified the change. Task 13a asked whether bumping ATLAS_H_PX to 512
+	// would buy "31 addressable" slots, as world/atlas_uv.h's comment then claimed. It did not:
+	// atlasRect() computed v0/v1 as `(uint8_t)(tile * TILE_PX [+ TILE_PX])`, a raw PIXEL offset
+	// never scaled to the sheet height, so nothing about a taller sheet changed how far that
+	// cast could count. Looping tiles 0..30 and checking each for an intact, distinct v0/v1 pair
+	// went RED starting at tile 15, not 31 - measured verbatim from this file at the time:
 	//
 	//   FAIL L979  at a hypothetical ATLAS_H_PX=512, tile 15's rect (v0=240 v1=256, full
-	//   pixel values) does not fit uint8_t and truncates - world/atlas_uv.h's '31
-	//   addressable' claim for that width is false under MeshVertex's uint8_t v
-	//   ...
-	//   atlas uv shader self-test: FAIL 16/2267  L979 [tile 15 as above]
+	//   pixel values) does not fit uint8_t and truncates
 	//
-	// Tiles 0..14 (15 of them) stayed green throughout that run; every one of 15..30 (16
-	// tiles) failed the same way, confirming the truncation is not a one-off at the
-	// scout's cited tile 30 - it starts at 15 and every index above it is affected. Tile
-	// 30 specifically truncates to v1=240, exactly tile 14's own v1, matching the scout's
-	// cited alias by value.
+	// Tiles 0..14 stayed green; every one of 15..30 failed the same way. Tile 30 truncated to
+	// v1=240, which is tile 14's own v1 - it would have rendered as already-painted geometry
+	// rather than failing loudly.
 	//
-	// So the claim is REFUTED, and not by the mechanism the scout named (a single
-	// aliasing collision at index 30) - the real ceiling under this vertex format is 15
-	// addressable slots (0..14) no matter what ATLAS_H_PX is set to, which is exactly what
-	// ATLAS_TILE_COUNT already enforces above in this file. Getting past 15 needs the
-	// vertex format itself to change (MeshVertex.v holding a slot index instead of a raw
-	// pixel offset, scaled by TILE_PX in the shader) - unstarted work, not a side effect
-	// of a bigger sheet. See world/atlas_uv.h's corrected comment.
+	// Task 13b fixed the UNITS instead of the width, which is what the refutation pointed at:
+	// vslot0/vslot1 hold `tile` and `tile + 1`, the shader's uvScale.y carries the TILE_PX
+	// factor, and MeshVertex is still 8 bytes. The ceiling is now the PICA200's 1024 px texture
+	// limit, i.e. 64 slots, and all 64 are addressable.
 	//
-	// What ships below is the permanent, GREEN form: the real ceiling asserted as a
-	// regression check (would go red if TILE_PX, ATLAS_TILE_COUNT or the uint8_t vertex
-	// format ever drifted), plus the two specific facts above stated as their own checks
-	// so a future change to any of those numbers is caught here rather than only in a
-	// comment.
+	// What ships below is the permanent, GREEN form of that: the new bound asserted directly,
+	// plus the old formula stated as arithmetic so the check can still tell the two units apart.
 	{
 		for (int t = 0; t < ATLAS_TILE_COUNT; t++) {
-			const int     v0_full = t * TILE_PX;
-			const int     v1_full = t * TILE_PX + TILE_PX;
-			const uint8_t v0_u8   = (uint8_t)v0_full;
-			const uint8_t v1_u8   = (uint8_t)v1_full;
-			CHECK(v0_full == (int)v0_u8 && v1_full == (int)v1_u8,
-			      "tile %d's rect (v0=%d v1=%d) does not fit uint8_t intact - the addressable "
-			      "ceiling ATLAS_TILE_COUNT=%d claims every one of 0..%d does, regardless of "
-			      "ATLAS_H_PX",
-			      t, v0_full, v1_full, ATLAS_TILE_COUNT, ATLAS_TILE_COUNT - 1);
+			const AtlasRect r = atlasRect(t);
+			// The whole point of the change: both edge indices survive the uint8_t intact, for
+			// every slot on a sheet four times taller than the one that used to overflow at 15.
+			CHECK((int)r.vslot0 == t && (int)r.vslot1 == t + 1,
+			      "slot %d's edge indices came back %d/%d, not %d/%d - a value that does not "
+			      "survive MeshVertex.v's uint8_t looks exactly like this",
+			      t, r.vslot0, r.vslot1, t, t + 1);
 		}
 
-		// The first tile past the real ceiling must still be broken - if this ever goes
-		// green, the ceiling moved and the comment above atlasRect() needs re-deriving,
-		// not just re-reading.
-		const int     v15_v1_full = 15 * TILE_PX + TILE_PX;
-		const uint8_t v15_v1_u8   = (uint8_t)v15_v1_full;
-		CHECK(v15_v1_full != (int)v15_v1_u8,
-		      "tile 15's v1 (full value %d) now fits in uint8_t (%d) instead of truncating - "
-		      "the addressable ceiling this file enforces (ATLAS_TILE_COUNT=%d) needs "
-		      "re-deriving before trusting any comment about it",
-		      v15_v1_full, (int)v15_v1_u8, ATLAS_TILE_COUNT);
-
-		// The scout's own cited example, checked by value: tile 30's v1 does not merely go
-		// out of range, it truncates to exactly tile 14's own v1 - silently rendering as
-		// already-painted geometry rather than failing loudly.
-		const int     t14_v1_full = 14 * TILE_PX + TILE_PX;
-		const int     t30_v1_full = 30 * TILE_PX + TILE_PX;
-		const uint8_t t30_v1_u8   = (uint8_t)t30_v1_full;
-		CHECK((int)t30_v1_u8 == t14_v1_full,
-		      "tile 30's v1 (full value %d) no longer truncates to %d, tile 14's own v1 (%d) - "
-		      "the scout's cited alias no longer holds; re-check before trusting this comment",
-		      t30_v1_full, (int)t30_v1_u8, t14_v1_full);
+		// The old pixel formula, computed here rather than by atlasRect(), showing that it
+		// would still overflow at slot 15 on this very sheet. This is what says the two units
+		// are genuinely different and that the ceiling moved because of the UNITS change and
+		// not because the sheet grew: the sheet growing is what the refuted claim proposed, and
+		// it would not have helped.
+		const int     old_v1_at_15 = 15 * TILE_PX + TILE_PX;      // 256, the pre-13b top edge
+		const uint8_t old_v1_u8    = (uint8_t)old_v1_at_15;
+		CHECK(old_v1_at_15 != (int)old_v1_u8,
+		      "the pre-task-13b pixel formula for slot 15's top edge (%d) now fits in a uint8_t "
+		      "(%d). If that is true, TILE_PX has changed and this file's account of why the "
+		      "units had to change needs re-deriving rather than re-reading",
+		      old_v1_at_15, (int)old_v1_u8);
+		// And the new formula for the SAME slot fits with room to spare - 16 against 256.
+		CHECK((int)atlasRect(15).vslot1 == 16,
+		      "slot 15's top edge index is %d, not 16 - the slot-unit form is what lifted the "
+		      "ceiling past the pixel form's overflow at exactly this slot",
+		      atlasRect(15).vslot1);
+		// The top slot of the sheet, which under the old units was unreachable at ANY height.
+		CHECK((int)atlasRect(ATLAS_TILE_COUNT - 1).vslot1 == ATLAS_TILE_COUNT,
+		      "the top slot's edge index is %d, not %d - the slot the old pixel units could "
+		      "never address is the one reserved for the missing-texture marker, so losing it "
+		      "loses the error indicator itself",
+		      atlasRect(ATLAS_TILE_COUNT - 1).vslot1, ATLAS_TILE_COUNT);
 	}
 
 	if (s_fails == 0)

@@ -39,19 +39,20 @@ really spare at all. The next step up is a 16x512 sheet: 32 slots, 31
 addressable, 16 KB of VRAM instead of 8 KB.
 
 Why every unused slot is painted (v1.6.0 F7). It used to be left at the sheet's
-background fill, and that was a defect: tex 10..14 address REAL, addressable
-slots, so a block declared with one drew an opaque near-black solid. On a 240px
+background fill, and that was a defect: the slots above the painted ones are REAL,
+addressable slots, so a block declared with one drew an opaque near-black solid.
+At the time that meant tex 10..14; since task 13b it would mean 12..62. On a 240px
 screen that reads as a dark block, not as an error. The block registry lets a
 SERVER define block types over the wire, so a server shipping a wrong or
 unsupported tex looked like a Blocksmith rendering bug instead of a server
 misconfiguration — and this project has already lost days to exactly that, since
 a wrong texture constant still renders *a* texture and never raises anything.
 
-So every slot TILES does not fill — 12..14 today, and the unaddressable 15 as
-well — is painted with tile_missing()'s magenta/black quadrant checker before art
-goes down. Those spares are not wasted by this: the marker is simply the DEFAULT
-content of an unclaimed slot, and each one gets overwritten by real art as TILES
-grows. MARKER_SLOT (14) is the one exception and stays a marker forever, which
+So every slot TILES does not fill — 12..63 since task 13b lifted the ceiling — is
+painted with tile_missing()'s magenta/black quadrant checker before art goes down.
+Those spares are not wasted by this: the marker is simply the DEFAULT content of
+an unclaimed slot, and each one gets overwritten by real art as TILES
+grows. MARKER_SLOT (63) is the one exception and stays a marker forever, which
 is what source/world/atlas_uv.h's ATLAS_TILE_MISSING clamps out-of-range tile ids
 onto. It is the TOP of the addressable range on purpose: that is the last slot a
 growing TILES list would ever reach, so reserving it costs nothing until the
@@ -86,16 +87,23 @@ from PIL import Image
 
 TILE_PX = 16
 ATLAS_W_PX = TILE_PX             # exactly one tile wide, so GPU_REPEAT's U period is one tile
-ATLAS_H_PX = 256                 # 16 slots; both dimensions must stay powers of two
-SLOTS = ATLAS_H_PX // TILE_PX    # 16
-# The top slot in texture space would need v1 = 256, which does not fit in MeshVertex's
-# uint8_t v. So it is never addressed and never painted. Mirrors ATLAS_TILE_SLOTS in
-# source/world/atlas_uv.h.
-ADDRESSABLE_SLOTS = SLOTS - 1    # 15
+ATLAS_H_PX = 1024                # 64 slots; both dimensions must stay powers of two.
+                                 # 1024 is the hardware maximum, not a round number:
+                                 # citro3d's checkTexSize rejects any dimension outside
+                                 # 8..1024 inclusive, and each dimension is checked on its
+                                 # own, so a 64:1 strip is legal.
+SLOTS = ATLAS_H_PX // TILE_PX    # 64
+# Since task 13b (v1.8.2) EVERY slot is addressable. MeshVertex's uint8_t v holds a
+# SLOT-EDGE INDEX (tile, or tile+1 for the top edge) instead of a raw pixel offset, so the
+# topmost slot's edge is 64 rather than 1024 and nothing overflows. Mirrors
+# ATLAS_TILE_COUNT in source/world/atlas_uv.h, which is now ATLAS_TILE_SLOTS itself rather
+# than SLOTS - 1. Before that change this had to be SLOTS - 1, because the top slot's pixel
+# edge would have been 256 and did not fit in the byte.
+ADDRESSABLE_SLOTS = SLOTS        # 64
 # The slot reserved for the missing-texture marker, forever. Mirrors ATLAS_TILE_MISSING in
 # source/world/atlas_uv.h, which is where out-of-range tile ids clamp to. place() refuses to
 # paint art here, so TILES may fill 0..MARKER_SLOT-1 and no further.
-MARKER_SLOT = ADDRESSABLE_SLOTS - 1   # 14
+MARKER_SLOT = ADDRESSABLE_SLOTS - 1   # 63
 
 # Tile slot indices. These are the numbers the C side uses, so the order here is
 # the contract — append, never reorder.
@@ -539,7 +547,7 @@ def slot_png_y(index: int) -> int:
     Slot `index` owns texture rows [index*16, index*16+16), and texture v grows
     upwards while PNG rows run downwards, so the slot's PNG top row is
     ATLAS_H_PX - (index + 1) * TILE_PX. Slot 0 is therefore the LAST 16 rows of
-    the image and slot 14 the first painted ones. This is the same flip
+    the image and slot 63 the FIRST. This is the same flip
     atlasRect() applies in source/world/atlas_uv.h; the two must agree or every
     face draws the wrong tile without erroring.
     """
@@ -550,16 +558,18 @@ def place(atlas: Image.Image, tile: Image.Image, index: int) -> None:
     """Blits a tile into its slot. No padding: see the module docstring."""
     if index >= ADDRESSABLE_SLOTS:
         raise ValueError(
-            f"tile {index} has no addressable slot: only {ADDRESSABLE_SLOTS} of "
-            f"{SLOTS} fit in MeshVertex's uint8_t v. Grow ATLAS_H_PX to 512 "
-            f"(and ATLAS_H_PX in source/world/atlas_uv.h and both shaders' uvScale with it)."
+            f"tile {index} is off the sheet: it holds {SLOTS} slots, 0..{SLOTS - 1}."
         )
     if index >= MARKER_SLOT:
         raise ValueError(
             f"tile {index} would take slot {MARKER_SLOT}, which is reserved for the "
             f"missing-texture marker (ATLAS_TILE_MISSING in source/world/atlas_uv.h — it is "
-            f"where out-of-range tile ids clamp to). The sheet is full: grow ATLAS_H_PX to 512 "
-            f"(and ATLAS_H_PX in source/world/atlas_uv.h and both shaders' uvScale with it)."
+            f"where out-of-range tile ids clamp to). The sheet is FULL, and it cannot simply "
+            f"be made taller: ATLAS_H_PX is already 1024, which is the PICA200's maximum "
+            f"texture dimension (citro3d's checkTexSize rejects anything outside 8..1024). "
+            f"The next tile has to come from reclaiming a slot, from a second sheet the way "
+            f"gfx/crackatlas.png is one, or from widening the sheet in U — which would mean "
+            f"re-deriving the greedy mesher's GPU_REPEAT u trick, not just editing a constant."
         )
     # A painter that returned the wrong size would otherwise be SILENT: Image.paste places
     # whatever it is given at the offset and leaves the rest of the slot as whatever was
