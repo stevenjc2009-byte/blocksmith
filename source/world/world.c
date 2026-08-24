@@ -213,9 +213,24 @@ int worldStandingY(const World* w, int x, int z, int base)
 	return y;
 }
 
+// v1.8.0 task 22. See world.h for why there is one of these and why it lives here.
+static WorldEditFn s_edit_fn;
+static void*       s_edit_ud;
+
+void worldSetEditHook(WorldEditFn fn, void* ud)
+{
+	s_edit_fn = fn;
+	s_edit_ud = ud;
+}
+
 bool worldSet(World* w, int x, int y, int z, BlockId id)
 {
 	if (y < 0 || y >= WORLD_HEIGHT) return false;
+
+	// Read only when somebody is listening. worldSet is on the streaming path via
+	// net/blockdiff and on the water simulation's own write path, and an unconditional
+	// chunkGet here would put a decompress on both for a value nothing looks at.
+	const BlockId prev = s_edit_fn ? worldGet(w, x, y, z) : (BlockId)BLOCK_AIR;
 
 	Chunk* c = worldChunk(w, x >> 4, y >> 4, z >> 4);
 	if (!c) {
@@ -259,6 +274,8 @@ bool worldSet(World* w, int x, int y, int z, BlockId id)
 		if (bytes_after > bytes_before) budgetRelease(bytes_after - bytes_before);
 		return false;
 	}
+
+	if (s_edit_fn && prev != id) s_edit_fn(s_edit_ud, x, y, z, prev, id);
 	return true;
 }
 

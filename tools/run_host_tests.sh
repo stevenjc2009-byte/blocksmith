@@ -1541,3 +1541,85 @@ rm -rf "$BHN"
 # The scan that raised this flagged it as an inference from source constants, not a
 # measurement. It still is. What changed is that the geometry half of it is now checked and
 # the timing half is now instrumented.
+
+# world/water.c -- the water simulation (v1.8.0 task 22). Own binary, own main(), appended
+# below rather than merged into the world stanza for the reason the playerpose stanza above
+# gives: an append is the one edit shape that cannot silently drop another session's work.
+#
+# The link is the world stanza's minimum plus water.c: world.c drags in block.c, registry.c,
+# chunk.c and budget.c, tests/net_stub.c supplies networldOnColumnLoad, and chunk_codec.c
+# plus crc32.c are there because the save-compatibility probe encodes a column the way the
+# region writer does and compares the bytes from before the simulation ran against the
+# bytes from after it.
+#
+# What this suite settles that nothing else can: the exact shape of a pour (a manhattan ball
+# of radius 7, level 8-d at distance d, 112 flow cells), that a source in mid-air makes a
+# one-block-wide fall and a pool rather than a solid block of water, that a settled body
+# examines ZERO cells per tick for ever, that the same pour settles to a byte-identical
+# world at four different per-tick budgets and with two sources disturbed in either order,
+# that a v1.7.1 world opens with every generated water cell reading as a source and no work
+# queued, and the real per-tick cost of a settled and of a saturated tick, measured in one
+# process with the two arms interleaved.
+BHW="build-host/run-$$-water"
+mkdir -p "$BHW"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	tests/net_stub.c \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/chunk_codec.c \
+	source/world/crc32.c \
+	source/world/budget.c \
+	source/world/world.c \
+	source/world/water.c \
+	source/world/water_test.c \
+	-lm \
+	-o "$BHW/water_test"
+
+"./$BHW/water_test"
+
+rm -rf "$BHW"
+
+# world/water_mesh_test.c -- the SHAPE of flowing water (v1.8.0 task 22b). Own binary, own
+# main(), appended rather than merged into the water stanza above for the reason every stanza
+# in this file is appended: an append is the one edit shape that cannot drop another session's
+# work, and this file is shared.
+#
+# Separate from water_test.c on purpose. That suite owns the SIMULATION -- where water goes and
+# what level it ends up at -- and this one owns what the mesher does with those levels. The two
+# have different link sets (this one drags in scratch.c and mesher.c) and a failure in one
+# should not be able to hide behind the other's totals.
+#
+# What this suite settles that nothing else can: that a flow cell of level L is emitted L/8 of a
+# block tall and its floor does not move, that a cell with water directly above it is drawn FULL
+# height (water.c gives a falling cell level 7, not 8, so without that rule a waterfall is a
+# stack of slabs), that every one of the 64 ordered pairs of levels standing side by side leaves
+# exactly one quad on the plane between them spanning the floor to the TALLER surface -- the
+# level-boundary hole is the failure this task was most likely to ship -- that a greedy run stops
+# where the height changes while cells at one level still merge, that waterFillScratch agrees
+# with waterLevelAt over the whole 18-cube window, and that a world of SOURCES and a world of
+# ordinary terrain still mesh byte-identically to v1.7.1 with the band switched on. That last one
+# is the control, and it is the check that must stay green while any of the others is sabotaged.
+BHWM="build-host/run-$$-watermesh"
+mkdir -p "$BHWM"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	tests/net_stub.c \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/budget.c \
+	source/world/world.c \
+	source/world/scratch.c \
+	source/world/mesher.c \
+	source/world/water.c \
+	source/world/water_mesh_test.c \
+	-lm \
+	-o "$BHWM/water_mesh_test"
+
+"./$BHWM/water_mesh_test"
+
+rm -rf "$BHWM"

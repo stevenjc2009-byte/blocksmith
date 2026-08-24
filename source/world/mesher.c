@@ -114,6 +114,27 @@ static uint8_t  s_cell_occl[SCRATCH_BLOCKS];
 // the four-at-a-time word scan is unaffected.
 static uint8_t  s_cell_draw[SCRATCH_BLOCKS];
 
+// v1.8.0 task 22b. How far below its cell's top a flowing water surface sits, in eighths of a
+// block, per scratch cell. 0 is a full cube, which is every block in the game except a flowing
+// water cell — so the table is built only when the scratch actually carries flow levels, and
+// s_any_drop gates every read of it so a stale table from a previous chunk can never be read.
+//
+// A table and not a call into world/water.c, for two reasons that are both structural. The
+// mesher is linked into six host binaries and the simulation into one, so a direct call would
+// drag the whole of water.c into all of them; and meshChunk() is handed a scratch, not a chunk
+// coordinate, so it could not name the cells to ask about even if it wanted to. The levels
+// arrive the same way the light does — copied into the scratch by the owner of that data, once,
+// before the mesh runs. See world/scratch.h's water band.
+static uint8_t  s_cell_drop[SCRATCH_BLOCKS];
+static bool     s_any_drop;
+
+// Every read of the drop table goes through here. When no cell in the scratch is flowing, the
+// table is not rebuilt at all and this answers 0 without touching it.
+static inline uint8_t cellDrop(int si)
+{
+	return s_any_drop ? s_cell_drop[si] : 0;
+}
+
 static FacePlan s_plan[BLOCK_FACES];
 static uint8_t  s_solid[256];                       // indexed by a raw BlockId byte
 static uint8_t  s_draws[256];                       // emits geometry: see s_cell_draw
@@ -312,8 +333,14 @@ static inline uint8_t cornerLight(const MeshScratch* s, int si, const FacePlan* 
 // was and the vertex bytes are identical to the pre-lighting mesher's. On, pad
 // carries the corner's smooth light (sky in the high nibble, block in the low)
 // for the dynamic shader to unpack.
+//
+// `drop` is the water height, in eighths of a block, that this cell's TOP-PLANE corners are
+// pulled down by — 0 for everything that is not a flowing water cell, which is everything the
+// mesher emitted before v1.8.0 task 22b. It rides in the nrm byte (see mesher.h): the shader
+// already fetches a per-vertex table row from that byte for the face brightness, so the offset
+// comes along for one extra `add` and no extra fetch, and a row for face 0..5 carries 0.0.
 static void emitFace(MeshOut* o, const MeshScratch* s, int si, int lx, int ly, int lz,
-                     int face, const AtlasRect* r, bool lit)
+                     int face, const AtlasRect* r, bool lit, uint8_t drop)
 {
 	if (o->vert_count + 4 > o->vert_cap || o->index_count + 6 > o->index_cap) {
 		o->overflow = true;
@@ -333,7 +360,14 @@ static void emitFace(MeshOut* o, const MeshScratch* s, int si, int lx, int ly, i
 
 		v->u   = c->u_hi ? r->u1 : r->u0;
 		v->v   = c->v_hi ? r->v1 : r->v0;
-		v->nrm = (uint8_t)face;
+
+		// The drop applies to the cell's TOP plane and to nothing else, so a shortened cube
+		// keeps its floor where it was and only its lid comes down. c->py is the corner's own
+		// y within the cell, 0 or 1, straight out of the face table — so this asks the same
+		// question kFaces already answers and does not become a second copy of it. A top face
+		// has py == 1 at all four corners, a bottom face 0 at all four, and a side face two of
+		// each, which is exactly the wall that has to shrink with the surface it holds up.
+		v->nrm = (uint8_t)(face | (c->py > 0 ? (int)drop << MESH_NRM_FACE_BITS : 0));
 
 		// See cornerAO/cornerLight above — the rules live there because the greedy merge
 		// has to ask exactly the same questions before it groups two faces into one quad.
@@ -395,15 +429,52 @@ static uint8_t s_face_done[SCRATCH_BLOCKS];
 // the cell in its own right, in the same order and against the same tables — same block (so
 // same tile, same shape, same pass), not already consumed, not covered by its neighbour,
 // and not culled against a same-material neighbour in the transparent pass.
+// Does a same-material neighbour actually cover this face? This is the transparent pass's
+// self-cull — leaf against leaf, water against water — and it is one function with two callers
+// so that the merge test and the emit test can never answer it differently.
+//
+// v1.8.0 task 22b split it off from the single line it used to be. Two blocks of water are the
+// same material and are no longer necessarily the same SHAPE, so "same id" stopped being enough:
+//
+//   * A HORIZONTAL face is covered only while the neighbour's surface is at least as high as
+//     this cell's. When the neighbour is shorter, the band between the two surfaces is open air
+//     that a player can see straight through, and culling it leaves a hole in the side of the
+//     water exactly one step of level tall. The taller cell emits its whole wall — 0 up to its
+//     own surface — rather than just the exposed band, because the submerged part of it sits
+//     inside a neighbour that is drawn opaque (the pass is alpha-TESTED, not blended, and it
+//     writes depth: scene/chunk_render.c), so it is hidden by the neighbour's own outward faces
+//     and costs one quad instead of a second, differently-shaped quad type.
+//
+//   * A VERTICAL face is always covered, and that is provable rather than assumed: a cell with
+//     water directly above it is a column interior and world/mesher.c's dropBuild gives it drop
+//     0, so its lid is at the cell boundary and so is the floor of the cell above. Neither can
+//     be short, so no gap can open between them. The explicit test is what stops a full cell
+//     under a SHORT one from emitting a lid that is buried inside that short cell's water.
+static inline bool sameMaterialCovers(const MeshScratch* s, int ni, uint8_t id, int face,
+                                      uint8_t drop)
+{
+	if (!s_cell_draw[ni] || s->blocks[ni] != id) return false;
+	if (!s_any_drop) return true;
+	if (face == FACE_TOP || face == FACE_BOTTOM) return true;
+	return s_cell_drop[ni] <= drop;
+}
+
 static inline bool mergeCandidate(const MeshScratch* s, int nb, int face, uint8_t id,
-                                  bool deferred)
+                                  bool deferred, uint8_t drop)
 {
 	if (s->blocks[nb] != id) return false;
 	if (s_face_done[nb] & (uint8_t)(1u << face)) return false;
 
+	// v1.8.0 task 22b. Same block id is no longer the same GEOMETRY: two flowing water cells at
+	// different levels are both BLOCK_WATER and are different heights, and one quad cannot be
+	// two heights. Without this a level-6 cell beside a level-3 one would merge and the whole
+	// run would be drawn at whichever height the first cell happened to have — a step in the
+	// surface silently flattened, with the face count and the coverage test both still perfect.
+	if (cellDrop(nb) != drop) return false;
+
 	const int ni = nb + s_plan[face].neighbour;
 	if (s_cell_occl[ni]) return false;
-	if (deferred && s_cell_draw[ni] && s->blocks[ni] == id) return false;
+	if (deferred && sameMaterialCovers(s, ni, id, face, drop)) return false;
 	return true;
 }
 
@@ -436,7 +507,7 @@ static uint32_t faceFlatKey(const MeshScratch* s, int si, int face, bool lit)
 // only the single cheap mergeCandidate() probe — faceFlatKey is not computed at all unless
 // there is a geometrically eligible neighbour to merge with.
 static int mergeRun(const MeshScratch* s, int si, int uc, int face, uint8_t id,
-                    bool deferred, bool lit)
+                    bool deferred, bool lit, uint8_t drop)
 {
 	const FacePlan* p = &s_plan[face];
 	if (!p->u_merge) return 1;
@@ -447,7 +518,7 @@ static int mergeRun(const MeshScratch* s, int si, int uc, int face, uint8_t id,
 	if (max_w > ATLAS_MAX_MERGE_BLOCKS) max_w = ATLAS_MAX_MERGE_BLOCKS;
 	if (max_w < 2) return 1;
 
-	if (!mergeCandidate(s, si + p->u_step, face, id, deferred)) return 1;
+	if (!mergeCandidate(s, si + p->u_step, face, id, deferred, drop)) return 1;
 
 	const uint32_t key = faceFlatKey(s, si, face, lit);
 	if (!key) return 1;
@@ -456,7 +527,7 @@ static int mergeRun(const MeshScratch* s, int si, int uc, int face, uint8_t id,
 	int nb = si;
 	while (w < max_w) {
 		nb += p->u_step;
-		if (!mergeCandidate(s, nb, face, id, deferred)) break;
+		if (!mergeCandidate(s, nb, face, id, deferred, drop)) break;
 		if (faceFlatKey(s, nb, face, lit) != key) break;
 		w++;
 	}
@@ -473,10 +544,10 @@ static int mergeRun(const MeshScratch* s, int si, int uc, int face, uint8_t id,
 // further along u. Which corners those are is read from the same CornerPlan emitFace used,
 // so the geometry and the UVs cannot disagree.
 static void emitFaceRun(MeshOut* o, const MeshScratch* s, int si, int lx, int ly, int lz,
-                        int face, const AtlasRect* r, bool lit, int width)
+                        int face, const AtlasRect* r, bool lit, int width, uint8_t drop)
 {
 	if (width <= 1) {
-		emitFace(o, s, si, lx, ly, lz, face, r, lit);
+		emitFace(o, s, si, lx, ly, lz, face, r, lit, drop);
 		return;
 	}
 
@@ -484,7 +555,7 @@ static void emitFaceRun(MeshOut* o, const MeshScratch* s, int si, int lx, int ly
 	wide.u1 = (uint8_t)(r->u0 + TILE_PX * width);
 
 	const uint32_t base = o->vert_count;
-	emitFace(o, s, si, lx, ly, lz, face, &wide, lit);
+	emitFace(o, s, si, lx, ly, lz, face, &wide, lit, drop);
 	if (o->vert_count != base + 4) return;   // refused for want of room; nothing to widen
 
 	const FacePlan* p = &s_plan[face];
@@ -813,6 +884,12 @@ static void meshPass(MeshOut* out, const MeshScratch* s, const EmitCell* cells,
 		const EmitCell* e  = &cells[idx];
 		const int       si = e->si;
 
+		// v1.8.0 task 22b. This cell's water surface height, once per cell rather than once per
+		// face: it is the same for all six, and when nothing in the scratch is flowing —
+		// which is every chunk of every world that has not been dug into — cellDrop() answers 0
+		// without reading the table at all.
+		const uint8_t   drop = cellDrop(si);
+
 		// Drawable implies a real registry row, since s_draws says no for every id with
 		// no row — so s_rect is safe to index without a check.
 		const AtlasRect* rects = s_rect[e->id];
@@ -830,6 +907,8 @@ static void meshPass(MeshOut* out, const MeshScratch* s, const EmitCell* cells,
 				// One tile for the whole shape, the block's FACE_EAST entry — the same
 				// slot blockFaceTex() falls back to for a face that does not exist. A
 				// cross block's def should set all six to it.
+				// Crosses are never water and never short, so they carry no drop and their
+				// nrm byte is the bare CROSS_NRM it always was.
 				emitCross(out, s, si, e->lx, e->ly, e->lz, &rects[FACE_EAST], lit);
 			}
 			continue;
@@ -870,9 +949,14 @@ static void meshPass(MeshOut* out, const MeshScratch* s, const EmitCell* cells,
 			// The neighbour index is resolved inside this branch since task 49, because the
 			// occlusion test above no longer needs it and the opaque pass — six of the seven
 			// walks — never reaches here at all.
+			//
+			// Since v1.8.0 task 22b the "same material" half is sameMaterialCovers(), because
+			// two flowing water cells of different level are the same id and different heights
+			// — see that function for why culling between them opens a hole and why the taller
+			// one emits its whole wall.
 			if (deferred) {
 				const int ni = si + s_plan[face].neighbour;
-				if (s_cell_draw[ni] && s->blocks[ni] == e->id) continue;
+				if (sameMaterialCovers(s, ni, e->id, face, drop)) continue;
 			}
 
 			// v1.6.0 task 11. How many blocks along u this face can swallow, and then one
@@ -880,9 +964,9 @@ static void meshPass(MeshOut* out, const MeshScratch* s, const EmitCell* cells,
 			// pre-task mesher emitted, byte for byte.
 			const FacePlan* p  = &s_plan[face];
 			const int       uc = p->u_axis == 0 ? e->lx : (p->u_axis == 1 ? e->ly : e->lz);
-			const int       w  = mergeRun(s, si, uc, face, e->id, deferred, lit);
+			const int       w  = mergeRun(s, si, uc, face, e->id, deferred, lit, drop);
 
-			emitFaceRun(out, s, si, e->lx, e->ly, e->lz, face, &rects[face], lit, w);
+			emitFaceRun(out, s, si, e->lx, e->ly, e->lz, face, &rects[face], lit, w, drop);
 
 			// Claim the cells behind the first one. The first needs no mark: this walk is
 			// past it and will not return to it.
@@ -891,6 +975,46 @@ static void meshPass(MeshOut* out, const MeshScratch* s, const EmitCell* cells,
 				s_face_done[nb] |= (uint8_t)(1u << face);
 			}
 		}
+	}
+}
+
+// ── v1.8.0 task 22b: how tall each water cell is drawn ───────────────────────
+//
+// Turns the scratch's water band (world/scratch.h — 0 for a full cube, 1..7 for a flow level)
+// into the per-cell drop the emitters read. Two rules, and the second is the one that makes a
+// waterfall a waterfall:
+//
+//   * A flow cell of level L has its surface L/8 of a block up, so it drops 8-L.
+//   * A cell with WATER DIRECTLY ABOVE IT is a column interior and is drawn full height, level
+//     or no level. This is not a tweak for looks. water.c gives every cell fed from above
+//     WATER_LEVEL_MAX (7), not 8 — "a waterfall does not weaken" — so without this rule every
+//     cell of a falling column would draw an eighth of a block short and the column would be a
+//     stack of separated slabs with daylight between them. It is also what lets the vertical
+//     self-cull stay unconditional: see sameMaterialCovers.
+//
+// The band's top plane is left at 0 because there is no cell above it to ask about, and nothing
+// in this chunk's geometry reads it — it is a skirt cell one block above the chunk's lid.
+static void dropBuild(const MeshScratch* s)
+{
+	s_any_drop = false;
+	if (!s->water_any) return;
+
+	memset(s_cell_drop, 0, sizeof s_cell_drop);
+
+	const int above = SCRATCH_DIM * SCRATCH_DIM;
+	for (int i = 0; i < SCRATCH_BLOCKS - above; i++) {
+		const uint8_t lvl = s->water[i];
+		if (!lvl) continue;
+
+		// A level for a cell that is not water any more. The band is a snapshot and the world
+		// it describes can have moved on — waterDropColumn clears a column's flow cells, and a
+		// placed block can sit where one was — so the block array is the authority on what is
+		// there and the band only says how tall it is.
+		if (s->blocks[i] != (BlockId)BLOCK_WATER) continue;
+		if (s->blocks[i + above] == (BlockId)BLOCK_WATER) continue;
+
+		s_cell_drop[i] = (uint8_t)(SCRATCH_WATER_STEPS - lvl);
+		s_any_drop = true;
 	}
 }
 
@@ -913,6 +1037,10 @@ void meshChunk(MeshOut* out, const MeshScratch* s)
 	// v1.6.0 task 11. No face has been claimed by a greedy run yet. One memset of 5,832
 	// bytes per chunk, against the ~24,000 face tests the passes below are about to do.
 	memset(s_face_done, 0, sizeof s_face_done);
+
+	// v1.8.0 task 22b. How tall each water cell is drawn. One branch and nothing else for a
+	// scratch with no flowing water in it, which is every chunk until a player digs into a sea.
+	dropBuild(s);
 
 	// Which cells emit at all, and which half of the frame each belongs to. One sweep for both.
 	emitCollect(s);

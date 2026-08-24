@@ -12,7 +12,9 @@ typedef struct {
 	int8_t  x, y, z;   // position in block units, chunk-local 0..16
 	int8_t  pad;       // packed light: sky * 16 + block. See below - its POSITION also matters.
 	uint8_t u, v;      // atlas pixel coordinates, texture space (v grows upwards)
-	uint8_t nrm;       // face index 0..5, resolved to a baked brightness in the shader
+	uint8_t nrm;       // face index 0..5 in bits 0..2, water height drop in bits 3..5.
+	                   // Resolved to a baked brightness AND a y offset by the shader's
+	                   // faceShade table; see MESH_NRM_FACE_BITS in world/mesher.h.
 	uint8_t ao;        // ambient occlusion 0..3, 3 being unoccluded
 } MeshVertex;
 

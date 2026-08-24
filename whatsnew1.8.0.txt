@@ -1,0 +1,18 @@
+# Release notes shown on the 3DS top screen before the update downloads.
+# Attach this to the v1.8.0 GitHub release alongside blocksmith1.8.0.cia.
+# Checked with: sh tools/make_whatsnew.sh 1.8.0
+#
+# v1.8.0 ONLY. This release is water, so [features] leads and [fixes] is short.
+# Swimming and the tick shipped in v1.7.1 and are deliberately NOT claimed here.
+# Player-facing prose only - it wraps at 61 characters on a 400px screen.
+# Items are capped at 95 characters each by source/app/whatsnew.h.
+# The developer-facing story lives in CHANGELOG.md.
+
+[features]
+Water flows. Dig into a lake and it pours into the hole instead of sitting there.
+Shallow water is drawn shallow. Eight depths, so you can see where a pool gets deeper.
+Water falls a block wide and pools where it lands. A waterfall does not thin out on the way.
+Take away the block a flow came from and the whole flow drains away.
+
+[fixes]
+Water that only changed depth now redraws. Before, the shape on screen could go stale.

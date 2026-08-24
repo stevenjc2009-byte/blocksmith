@@ -21,9 +21,29 @@
 #define SCRATCH_DIM     (CHUNK_DIM + 2)                                  // 18
 #define SCRATCH_BLOCKS  (SCRATCH_DIM * SCRATCH_DIM * SCRATCH_DIM)        // 5832
 
+// v1.8.0 task 22b. How the water band below encodes a cell:
+//
+//   0     a full cube — a water SOURCE, or a cell that holds no water at all.
+//   1..7  a flow level, exactly the 1..7 world/water.h's side map stores.
+//
+// The mesher turns level L into a top surface L/8 of a block high, so 0 reads as 8/8 and is
+// what every block that is not flowing water gets. That is why absence is 0 on both sides:
+// world/water.h's map already means "no entry == source == full", so a memset(0) band and an
+// unfilled band say the same true thing, and a build with no water simulation in the link
+// (every host suite but the water one) renders exactly what it rendered before this task.
+#define SCRATCH_WATER_STEPS  8
+
 typedef struct {
 	BlockId blocks[SCRATCH_BLOCKS];
 	uint8_t light[SCRATCH_BLOCKS];   // sky<<4 | block; see scratchFillLight
+	uint8_t water[SCRATCH_BLOCKS];   // 0 = full cube, 1..7 = flow level; see waterFillScratch
+
+	// Whether `water` holds anything at all. Cleared by scratchFill and set only by
+	// waterFillScratch, so a caller that never fills the band — the host suites, and the
+	// console before the simulation is wired in — costs one branch in the mesher and pays
+	// nothing else. It is NOT "there is water in this chunk": a lake of sources leaves it
+	// false, because every one of those cells is a full cube already.
+	bool    water_any;
 } MeshScratch;
 
 // sx/sy/sz are 0..17 — scratch space, where 0 is the border and 1..16 is the chunk.
@@ -43,6 +63,11 @@ void scratchFill(MeshScratch* s, const World* w, int cx, int cy, int cz);
 // borders at today's brightness until its own propagation lands instead of
 // painting black seams at the edge of the loaded ring.
 void scratchFillLight(MeshScratch* s, const World* w, int cx, int cy, int cz);
+
+// The water band is filled by waterFillScratch (world/water.h), which lives with the
+// simulation because the flow levels do. It is declared there and not here so that scratch.c
+// keeps its current link footprint: every host suite links this file, only one links
+// world/water.c, and a call from here would drag the simulation into all of them.
 
 // Reads in *chunk-local* coordinates, which run -1..16: the mesher works in the
 // chunk's own frame and stepping off the edge is normal, not an error.

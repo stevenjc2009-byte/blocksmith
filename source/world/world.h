@@ -98,6 +98,21 @@ BlockId worldGet(const World* w, int x, int y, int z);
 // reports success — there is nothing to store.
 bool worldSet(World* w, int x, int y, int z, BlockId id);
 
+// v1.8.0 task 22. Called after worldSet has changed a cell's id, with the id that was there
+// before. NOT called when the write stored the value the cell already held, and NOT called by
+// worldSetChunkAll — a generated or loaded chunk is not an edit, and firing 4096 times per
+// streamed chunk is the difference between a hook and a stall.
+//
+// One hook, installed once by main.c, so that a player break, a player place, a remote edit
+// arriving over the wire and the BS_EDIT_STRESS harness all reach the water simulation without
+// four call sites having to remember to. scene/interact.c is deliberately not touched: it
+// already calls worldSet, which is the single funnel every one of those paths goes through.
+typedef void (*WorldEditFn)(void* ud, int x, int y, int z, BlockId prev, BlockId now);
+
+// NULL to remove. There is exactly one slot: a second subscriber would need a list, and the
+// only caller is main.c.
+void worldSetEditHook(WorldEditFn fn, void* ud);
+
 // Step 9.2a/9.1b. Replaces a whole chunk's content in one shot, choosing whichever of
 // chunk.h's three storage forms fits `in` — this is what worldgen.c and (via
 // chunk_codec.c) a save load use instead of worldChunkCreate followed by CHUNK_BLOCKS

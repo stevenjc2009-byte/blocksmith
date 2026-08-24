@@ -67,6 +67,7 @@
 #include "world/registry.h"
 #include "world/relightq.h"
 #include "world/tick.h"
+#include "world/water.h"
 #include "world/world.h"
 #include "world/world_test.h"
 #include "world/worldgen.h"
@@ -94,6 +95,11 @@ static RelightQueue s_relightq;
 // render frame, so a mechanic runs at the same speed whether the console is holding 59.83 fps or
 // struggling at 30. See world/tick.h.
 static TickClock s_tickclock;
+
+// v1.8.0 task 22. The water simulation: sources, flow levels, spread and drainage. Its state is
+// the flow-level side map and the candidate queue — see world/water.h for why the level is not a
+// block id and why an untouched ocean costs nothing.
+static WaterSim s_water;
 
 // Measured ticks per second, for the debug menu. Deliberately timed against svcGetSystemTick
 // rather than against the same metricsFrameMs that feeds the clock: a readout derived from the
@@ -789,6 +795,17 @@ static void genUnloadColumn(int32_t cx, int32_t cz)
 	// would queue a remesh of a chunk that now reads as air and blank a neighbour.
 	chunkRenderReleaseColumn(cx, cz);
 	genSlotClear(&s_col_queued[0][0], GEN_MESH_SPAN, cx, cz);
+
+	// v1.8.0 task 22. Flowing water leaves with its column, and it MUST leave before the save
+	// encode two lines below rather than after: a flow cell written to the card comes back with
+	// no map entry, and world/water.h's absence-means-source rule would read it as a spring. One
+	// walk away and back would turn a puddle into a permanent fountain, and it would be in the
+	// save file, so it would never go away again. Sources are left exactly where they are.
+	//
+	// Runs for every unloading column, dirty or not — the map is keyed by world coordinate and
+	// an entry left behind for a column that no longer exists would still be found by a later
+	// waterLevelAt at the same place in a different world.
+	(void)waterDropColumn(&s_water, &s_world, cx, cz);
 
 	// Step 8.1. The last moment this column's blocks exist. Only columns the player edited
 	// are written — everything else the seed reproduces exactly, and saving it would turn
@@ -2687,6 +2704,52 @@ static void onRemoteEdit(void* userdata, int x, int y, int z)
 	chunkRenderTouch(&s_world, x, y, z);
 }
 
+// v1.8.0 task 22. world/water.h's change hook: the simulation has just turned a cell into water
+// or drained one back to air. Screen-side that is indistinguishable from a remote player having
+// done it, so it is deliberately the same two calls and not a second copy of the reasoning above
+// — relight the column (queued, falling back to inline on a full queue) and queue the remesh.
+//
+// Fired only for a cell whose BLOCK changed. A flow cell whose LEVEL changed inside water that
+// was already there does not reach here; onWaterLevel below is what carries that case.
+static void onWaterChange(void* ud, int x, int y, int z, BlockId id)
+{
+	(void)ud;
+	(void)id;
+	onRemoteEdit(NULL, x, y, z);
+}
+
+// v1.8.0 task 22b. world/water.h's LEVEL hook: the cell is still water and still water it was
+// before, but its flow level moved, so its surface now sits at a different height and the chunk
+// has to be re-meshed to show it. Before task 22b every level drew as the same full cube and
+// this hook did not need to exist.
+//
+// A remesh and NOTHING ELSE, which is the whole reason it is not onWaterChange. onRemoteEdit
+// relights the column first, and light is a function of which cells are opaque — a level change
+// moves no block, so every one of those cells is exactly as it was and the relight would
+// recompute an identical answer. Water settles over many ticks and touches a lot of cells on the
+// way down, so that would be the most expensive thing in the frame, spent on nothing.
+static void onWaterLevel(void* ud, int x, int y, int z, BlockId id)
+{
+	(void)ud;
+	(void)id;
+	chunkRenderTouch(&s_world, x, y, z);
+}
+
+// v1.8.0 task 22. world.h's edit hook, installed once. Every path that changes a single block —
+// scene/interact.c's break and place, net/networld.c's remote edits, the BS_EDIT_STRESS harness —
+// goes through worldSet, so hooking there is what lets water react to all of them without editing
+// any of them.
+//
+// Cheap on purpose: it only queues candidates. The recompute happens on the tick, under the
+// budget below, so no edit path can be made to do simulation work inline.
+static void onWorldEdit(void* ud, int x, int y, int z, BlockId prev, BlockId now)
+{
+	(void)ud;
+	(void)prev;
+	(void)now;
+	waterNotify(&s_water, x, y, z);
+}
+
 // v1.3.0. net/networld.h's inventory hook: the server has sent its authoritative copy of this
 // player's inventory (BS_APP_INV_STATE) and it replaces whatever s_inv currently holds.
 //
@@ -2994,6 +3057,23 @@ session_start:
 	// accumulator over would spend the loading screen's worth of banked real time as a burst of
 	// catch-up ticks on the first frame the player can see.
 	tickClockInit(&s_tickclock, TICK_MAX_CATCHUP_DEFAULT);
+
+	// v1.8.0 task 22, and the fourth version of the same reason: the flow map is keyed by world
+	// block coordinate, so an entry carried over from the previous session would claim that a cell
+	// of the NEW world is flowing water at a level nothing there ever set — and, because absence
+	// means source, the stale entry would also stop a real source at that coordinate from
+	// spreading. Cleared with the world, not at boot.
+	waterInit(&s_water);
+	worldSetEditHook(onWorldEdit, NULL);
+
+	// v1.8.0 task 22b, and both of these have to be re-done HERE and not once at boot: waterInit
+	// memsets the simulation, so the level hook installed for the previous world is gone with it.
+	// The renderer's pointer survives (s_water is a static and never moves), but it is set beside
+	// the hook so the two can never drift apart — a renderer pointing at a live simulation with no
+	// level hook would draw the first height correctly and then never update it again.
+	waterSetLevelHook(&s_water, onWaterLevel, NULL);
+	chunkRenderSetWater(&s_water);
+
 	s_tps            = 0.0f;
 	s_tps_mark_tick  = svcGetSystemTick();
 	s_tps_mark_count = 0;
@@ -3334,6 +3414,151 @@ session_start:
 
 	Interact it;
 	interactInit(&it);
+
+#ifdef BS_WATER_VIS_TEST
+	// VERIFICATION ONLY. Never defined by the Makefile, never in a release build — it exists
+	// so one claim can be looked at, and it is the only claim task 22b has that no host test
+	// can settle: that the eight flow levels are visibly DIFFERENT heights on a screen.
+	// world/water_test.c proves the levels are 8-d at manhattan distance d, and
+	// world/water_mesh_test.c proves every unequal pair emits exactly one side quad running
+	// from the lower surface to the higher one — but both of those are assertions about
+	// numbers in a vertex buffer, and "it renders as steps" is not a number.
+	//
+	// Built here rather than driven to, because driving to it failed. Six scripted Azahar
+	// sessions tried to dig a natural shoreline open at seed 1592 and all six failed on camera
+	// geometry — the aim ray ended up in the sky, in a pit wall, or six blocks inland — while
+	// never once contradicting the code. So the arrangement is put where the camera already
+	// points instead: the spawn faces yaw 135 degrees, camera.c:110 makes that forward vector
+	// (sin yaw, -cos yaw) = (+x, +z), so a pad six blocks out on both axes lands in the middle
+	// of frame one, tilted 35 degrees down, with no input needed at all.
+	//
+	// worldSet and nothing else. Every block goes through world.h's edit hook exactly as a
+	// player's own pick would, so waterNotify queues the source, the spread runs on the normal
+	// per-frame waterTick budget in the main loop, and the remesh arrives through onWaterLevel.
+	// Nothing here reaches past the path being verified, which is the entire point: a harness
+	// that called waterSettle directly would prove the simulation and not the game.
+	{
+		const int vy  = spawn_y - 1;                     // the surface being stood on
+		const int vcx = spawn_x + 6, vcz = spawn_z + 6;  // in front, per the yaw above
+		for (int dx = -8; dx <= 8; ++dx) {
+			for (int dz = -8; dz <= 8; ++dz) {
+				const int x = vcx + dx, z = vcz + dz;
+				// Stone, not the sand or grass around it, so the pad's own edge is
+				// unmistakable in the screenshot and a water quad cannot be confused
+				// with the terrain it sits on.
+				(void)worldSet(&s_world, x, vy, z, BLOCK_STONE);
+				for (int h = 1; h <= 12; ++h)
+					(void)worldSet(&s_world, x, vy + h, z, BLOCK_AIR);
+			}
+		}
+		// A plank pillar BS_WATER_VIS_TEST blocks tall, one step in front of the player. It is
+		// there to answer, from the screenshot alone, the two questions the mode-2 run could
+		// not otherwise settle: did this block run at all, and what value did the compiler
+		// actually see? Mode 2 came back with untouched natural terrain twice in a row, which
+		// is consistent both with "the block never ran" and with "it ran and something put the
+		// terrain back", and no amount of staring at the two pictures separates those.
+		// Parked at the pad's far corner rather than the near one it started at. One step in
+		// front of the player it filled the whole screen with plank texture and hid the very
+		// thing the run was taking a picture of; twenty blocks out it is a thumbnail that says
+		// the same thing.
+		for (int h = 1; h <= BS_WATER_VIS_TEST; ++h)
+			(void)worldSet(&s_world, vcx + 8, vy + h, vcz + 8, BLOCK_PLANKS);
+#if BS_WATER_VIS_TEST == 2
+		// Mode 2, the waterfall: the same sunken 7x7 basin with a 3x3 shaft six blocks deep
+		// through the middle of it and a single source in one corner. The water spreads across
+		// the basin floor, reaches the shaft, falls, and pools at the bottom. Two claims here
+		// that mode 1 cannot make — that a falling column draws at FULL height instead of as a
+		// stack of shrinking slabs, and that a fall turns into a spreading pool where it lands.
+		//
+		// DOWN a shaft rather than off a raised shelf, which is what this mode tried first.
+		// The spawn looks 35 degrees DOWNWARD and the script can only flatten that by about
+		// eight degrees per nudge, so a shelf six blocks up sat off the top of the screen in
+		// every frame of the run. A hole in the ground is the one shape this camera is already
+		// pointed into.
+		//
+		// The spreading water sits ON TOP of the pad, not in a sunken basin. The basin version
+		// came back looking empty: world/water_test.c's testSunkenBasin proves the same
+		// arrangement wets 31 of its 49 cells in six ticks on the host, so the water was there
+		// — but a one-block basin is in its own rim's shadow, and a flow cell of level 1 or 2 is
+		// a film a couple of pixels thick. On the open pad, which is the arrangement mode 1's
+		// bright blue rings already came out of, there is nothing to shade it.
+		for (int dx = -1; dx <= 1; ++dx) {
+			for (int dz = -1; dz <= 1; ++dz) {
+				for (int h = 0; h <= 6; ++h)
+					(void)worldSet(&s_world, vcx + dx, vy - h, vcz + dz, BLOCK_AIR);
+				(void)worldSet(&s_world, vcx + dx, vy - 7, vcz + dz, BLOCK_STONE);
+			}
+		}
+		// Three blocks diagonally out from the shaft mouth, on the pad, offset toward the
+		// camera so the fall is seen across the shaft rather than through its far wall.
+		// Three and not four: the nearest mouth cell is then four steps away by the manhattan
+		// rule the pour follows, so water arrives at the lip at level 4 — half a block deep,
+		// which reads on a 240-pixel screen. At four out it arrives at level 2, a film two
+		// pixels thick, and the picture would be arguing about nothing.
+		//
+		// NOT over the mouth itself: testSunkenBasin's second arm measured what that does — a
+		// source whose cell below is open can still go down, so by water.h's feeding rule it
+		// goes down and nothing else, pours straight into the shaft and spreads not one cell.
+		// Correct behaviour, and exactly the wrong picture for this test.
+		(void)worldSet(&s_world, vcx - 3, vy + 1, vcz - 3, BLOCK_WATER);
+#else
+		// Mode 1: a walled 7x7 basin, a 3x3 block of SOURCES in the middle of it, and the
+		// stepped rings that spread from them. Both halves of the claim in one frame.
+		//
+		// The rings alone cannot settle it, which is what the first two runs of this test
+		// found out. In a pour on flat ground the level is 8 minus the manhattan distance, so
+		// EVERY orthogonally adjacent pair differs by exactly one — and a mesher that
+		// correctly emits a 1/8 step between unequal levels draws the identical picture to a
+		// mesher that wrongly walls off every pair of water cells. Run 1 produced exactly that
+		// ambiguous grid of isolated tiles and proved nothing either way.
+		//
+		// The block of sources is the control that separates them. Sources are level 8 by
+		// definition (world/water.h: absence from the map means source), so those nine cells
+		// are one height with twelve internal faces between EQUAL levels, and a correct
+		// mesher must merge every one of them away into a single unbroken plateau. Stepped
+		// rings around a seamless middle is a picture only the correct mesher can draw; the
+		// always-a-wall bug still rules a grid across the middle.
+		//
+		// The basin is what keeps the whole thing inside one screenshot. Run 2 used a 5x5
+		// source patch with nothing to stop it, and it spread its full seven blocks in every
+		// direction — a pool wider than the frame at the spawn distance, with the plateau lost
+		// somewhere in the middle of it. Bounded to 7x7 the pour is 49 cells carrying levels 8
+		// down to 4: five distinct heights in a shape that fits.
+		//
+		// SUNK one block rather than walled by a rim on top of the pad, which is what run 3
+		// tried. A rim is a block tall and stands between the camera and the water, and at the
+		// spawn's 35-degree downward pitch it filled the frame with its own near corner and
+		// hid every cell behind it. Sinking the floor to vy-1 puts the lip flush with the pad,
+		// so the near edge occludes nothing and the water surface — vy plus one to eight
+		// eighths — sits between the pad top and one block below it.
+		for (int dx = -3; dx <= 3; ++dx) {
+			for (int dz = -3; dz <= 3; ++dz) {
+				(void)worldSet(&s_world, vcx + dx, vy - 1, vcz + dz, BLOCK_STONE);
+				(void)worldSet(&s_world, vcx + dx, vy, vcz + dz, BLOCK_AIR);
+			}
+		}
+		for (int dx = -1; dx <= 1; ++dx)
+			for (int dz = -1; dz <= 1; ++dz)
+				(void)worldSet(&s_world, vcx + dx, vy, vcz + dz, BLOCK_WATER);
+#endif
+		// worldSet does NOT remesh, and this harness has to say so itself. world.h's edit hook
+		// — onWorldEdit above — only notifies the water simulation; every in-game path that
+		// changes a block calls chunkRenderTouch on its own line afterwards, and nothing here
+		// had. Mode 2 is what found it: its blocks were all present, and the crosshair proved
+		// it by drawing a selection box around a plank pillar that was not on the screen, but
+		// no chunk had been asked to rebuild so the entire arrangement was invisible.
+		//
+		// Mode 1 was only ever correct by accident. Its water spreads inside the pad's own
+		// chunks, every flow-level change calls onWaterLevel, and onWaterLevel calls
+		// chunkRenderTouch — so the pad appeared as a side effect of the water moving. Mode 2
+		// puts its shelf six blocks up, in the chunk above, so the pad's chunks were never
+		// touched and nothing was drawn at all.
+		for (int dx = -8; dx <= 8; ++dx)
+			for (int dz = -8; dz <= 8; ++dz)
+				for (int h = -8; h <= 12; ++h)   // -8 reaches mode 2's shaft floor
+					chunkRenderTouch(&s_world, vcx + dx, vy + h, vcz + dz);
+	}
+#endif
 
 	// Step 8.2. Loaded after genStart, because that is what creates the world directory this
 	// file lives beside; saveWorldDir() returns NULL if the card is not writable, and
@@ -3804,13 +4029,19 @@ session_start:
 		// changed them before this frame relights and remeshes, or the change is a frame late
 		// and, worse, is lit by the previous frame's light.
 		//
-		// Nothing consumes the tick count yet; water is the first customer and adds the
-		// `for (int t = 0; t < ticks; t++)` body. Until then this is the clock running, being
-		// measured, and being visible in the debug menu — which is the only way the 20 TPS
-		// claim can be checked on hardware at all.
+		// v1.8.0 task 22 is that first customer. Water is stepped once per tick, never once
+		// per frame: a pour that spread faster on a console holding 60 fps than on one at 30
+		// would be a different game on the two machines, which is the whole reason the clock
+		// exists. Each step is capped at WATER_TICK_BUDGET cells, so the catch-up clamp handing
+		// four ticks to one frame costs at most four budgets and not an unbounded drain.
 		const int ticks_now = tickClockAdvance(&s_tickclock,
 		                                       (int64_t)(metricsFrameMs() * 1000.0f));
-		(void)ticks_now;
+		//
+		// Not separately timed into the CSV row below: MetricsWork lives in app/metrics.h,
+		// which this task does not own, and the cost is bounded by construction and measured
+		// directly in world/water_test.c against a real body of water.
+		for (int t = 0; t < ticks_now; t++)
+			(void)waterTick(&s_water, &s_world, WATER_TICK_BUDGET, onWaterChange, NULL);
 
 		// The measured rate, recomputed about once a second against the system tick counter.
 		{

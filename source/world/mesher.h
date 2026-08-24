@@ -76,6 +76,41 @@ typedef struct {
 // order. Both are always correct; this one is just cheaper. See chunkRenderDraw.
 extern const uint8_t kFaceOrder[BLOCK_FACES];
 
+// ── v1.8.0 task 22b: what MeshVertex.nrm carries now ─────────────────────────
+//
+//   bits 0..2   the face index, FACE_EAST..FACE_NORTH, exactly what the whole byte used to be
+//   bits 3..5   a HEIGHT DROP in eighths of a block, 0..7, subtracted from the vertex's y
+//
+// A drop is non-zero on exactly one thing: the top-plane corners of a flowing water cell. It is
+// zero on every other vertex the mesher has ever emitted, so every existing mesh comes out byte
+// for byte what it came out before — which is why the four pinned hashes in world/world_test.c
+// did not move.
+//
+// WHY THE HEIGHT IS NOT SIMPLY IN THE VERTEX'S y. MeshVertex.x/y/z are bytes in WHOLE BLOCK
+// UNITS and the GPU fetches them unscaled (scene/chunk_render.c's AttrInfo_AddLoader, and
+// `mov r0.xyz, inpos` in both world shaders), so the only heights a vertex can express are the
+// integers 0..16 — the same limit world/mesher.c's emitCross comment states for a plant's
+// quads. A 7/8-high cube is not one of them. The three ways out were: rescale every position to
+// eighths and divide the model matrix by eight, which moves the y byte of every vertex in the
+// game and re-pins those four hashes; give water its own draw call with its own scaled matrix,
+// which splits the transparent run three ways and adds renderer state nobody can test on this
+// machine; or carry the fraction in a byte the shader already reads. This is the third. The
+// shaders' faceShade table is grown from 8 entries to 64, indexed by the whole nrm byte, and
+// carries the drop as a second component beside the brightness it always carried — so the
+// decode is one `add` on a value the vertex stage had already fetched, and it is exactly 0.0
+// for every face index 0..5.
+//
+// Anything reading a vertex's face direction must mask. meshNrmDrop() is the height.
+#define MESH_NRM_FACE_BITS  3
+#define MESH_NRM_FACE_MASK  ((uint8_t)((1u << MESH_NRM_FACE_BITS) - 1))
+#define MESH_NRM_STATES     (1u << (MESH_NRM_FACE_BITS + 3))   // 64 faceShade rows
+
+static inline uint8_t meshNrmFace(uint8_t nrm) { return (uint8_t)(nrm & MESH_NRM_FACE_MASK); }
+static inline uint8_t meshNrmDrop(uint8_t nrm) { return (uint8_t)(nrm >> MESH_NRM_FACE_BITS); }
+
+// A face index has to fit under the drop, or the two would overlap in the byte.
+_Static_assert(BLOCK_FACES <= MESH_NRM_FACE_MASK + 1, "face index no longer fits nrm's low bits");
+
 // Meshes the chunk sitting in the middle of `s`. Positions come out chunk-local,
 // 0..16 in block units, so the caller places the chunk with a model matrix.
 //

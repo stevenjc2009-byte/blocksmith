@@ -11,6 +11,7 @@
 #include <citro3d.h>
 
 #include "scene/render_dist.h"
+#include "world/water.h"
 #include "world/world.h"
 
 // Per-slot capacity. A pathological 16³ checkerboard would need 12,288 faces, which
@@ -61,6 +62,17 @@ void chunkRenderSetDistance(int radius);
 
 // The numbers currently in force, for the report and for main.c's ring loops. Never NULL.
 const RenderDist* chunkRenderDistance(void);
+
+// v1.8.0 task 22b. Points the renderer at the water simulation so chunkRenderBuild can ask it
+// for the flow levels inside the chunk it is about to mesh, via waterFillScratch. NULL — which
+// is the state before main.c calls this — means every water block meshes as a full cube, which
+// is exactly v1.7.1's output and exactly what every host test binary that does not link water.c
+// keeps producing.
+//
+// A pointer rather than a #include-and-reach-in because the mesher must not gain a link
+// dependency on water.c: mesher.c is in six host binaries and water.c in one. The levels travel
+// as plain bytes in MeshScratch, so meshChunk never learns that a WaterSim exists.
+void chunkRenderSetWater(const WaterSim* sim);
 
 // Meshes one chunk out of the world into its slot, reusing the slot it already owns
 // if it has one. A chunk that meshes to nothing KEEPS its slot: releasing it made that

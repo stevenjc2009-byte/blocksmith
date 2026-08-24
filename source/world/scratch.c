@@ -26,6 +26,12 @@ static AxisSpan axisSpan(int d)
 
 void scratchFill(MeshScratch* s, const World* w, int cx, int cy, int cz)
 {
+	// v1.8.0 task 22b. The water band starts empty on every fill, and is NOT memset here:
+	// waterFillScratch clears it only when it has something to write, so a chunk with no flow
+	// cells near it costs one byte store instead of 5,832. A caller that never fills the band
+	// therefore meshes exactly what it meshed before this task — see SCRATCH_WATER_STEPS.
+	s->water_any = false;
+
 	for (int dy = -1; dy <= 1; dy++) {
 		const AxisSpan ay = axisSpan(dy);
 		const int ncy = cy + dy;

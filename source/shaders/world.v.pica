@@ -18,9 +18,23 @@
 
 .fvec projection[4], modelView[4]
 
-; Per-face brightness, indexed by the vertex's normal index. Six are used; the
-; array is 8 long because relative addressing wants a power of two to be safe.
-.fvec faceShade[8]
+; Per-vertex face table, indexed by the WHOLE nrm byte. Two components are read:
+;
+;   .x  the face's baked brightness, exactly what this array has always held.
+;   .y  a HEIGHT OFFSET added to the vertex's y, in world units. Zero for every row
+;       whose index is a bare face id 0..5, which is every vertex the mesher emitted
+;       before v1.8.0 task 22b.
+;
+; It is 64 rows and not 8 because nrm now packs a face index in bits 0..2 and a water
+; height drop in bits 3..5 — see MESH_NRM_FACE_BITS in source/world/mesher.h for why the
+; fraction could not live in the position bytes (they are whole block units and the GPU
+; fetches them unscaled, so 7/8 of a block is not a number a vertex can hold). Row
+; face + 8*d carries brightness(face) and -d/8, so a flowing water cell's lid and the tops
+; of its four walls come down by d eighths and nothing else in the world moves at all.
+;
+; scene/chunk_render.c fills all 64. Still a power of two, which is what relative
+; addressing wants.
+.fvec faceShade[64]
 
 ; The atlas is a one-tile-wide strip (v1.6.0 task 11), so U and V no longer divide by the
 ; same number: x MUST be 1/ATLAS_W_PX and y MUST be 1/ATLAS_H_PX, both from
@@ -59,8 +73,28 @@
 .alias inpack v1
 
 .proc main
+	; --- the vertex's face table row --------------------------------------
+	; Fetched FIRST, because the position below needs its .y. Relative addressing, and the
+	; only such construct in the project: `mova` loads the address register from the nrm
+	; byte and faceShade[a0.x] then fetches a uniform at an offset the CPU never sees.
+	;
+	; v1.2.4 replaced these two lines with a constant index — `mov r3, faceShade[0]` — to
+	; test them as the cause of the hardware freeze. That build still froze on the console,
+	; so this is CLEARED by measurement, not by argument. The real cause was the unaligned
+	; attribute fetch described in mesh_vertex.h; nothing was ever wrong with these two
+	; instructions. Moving them above the position block changes nothing about them.
+	mova a0.x, inpack.zzzz
+	mov r3, faceShade[a0.x]
+
 	; --- position ---------------------------------------------------------
 	mov r0.xyz, inpos
+
+	; v1.8.0 task 22b: the water height drop. r3.y is 0.0 for every face index 0..5, so
+	; this is an exact no-op for every vertex that is not the top of a flowing water cell
+	; — the pinned mesh hashes in source/world/world_test.c say the same thing on the CPU
+	; side. One instruction, and it reuses a fetch the shader was already doing.
+	add r0.y,   r3.yyyy, r0.yyyy
+
 	mov r0.w,   ones
 
 	dp4 r1.x, modelView[0], r0
@@ -82,17 +116,8 @@
 	mov outtc0, r2.xyxy
 
 	; --- baked lighting ---------------------------------------------------
-	; Relative addressing, and the only such construct in the project: `mova` loads the address
-	; register from the normal index carried on the vertex, and faceShade[a0.x] then fetches a
-	; uniform at an offset the CPU never sees.
-	;
-	; v1.2.4 replaced these two lines with a constant index — `mov r3, faceShade[0]` — to test
-	; them as the cause of the hardware freeze. That build still froze on the console, so this
-	; is CLEARED by measurement, not by argument, and is restored here unchanged. The real
-	; cause was the unaligned attribute fetch described in mesh_vertex.h; nothing was ever
-	; wrong with these two instructions.
-	mova a0.x, inpack.zzzz
-	mov r3, faceShade[a0.x]
+	; r3 was fetched at the top of main — see the note there for why, and for the v1.2.4
+	; measurement that cleared the relative addressing itself of the hardware freeze.
 
 	; ao factor = aoFloor + aoRange * (ao / 3)
 	mul r4.x, aoScale, inpack.wwww

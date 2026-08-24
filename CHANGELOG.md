@@ -4,6 +4,42 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.8.0] - 2026-08-24
+
+Water moves. 1.7.0 put water in the world and 1.7.1 taught the player to swim in it, but until
+now it was scenery: a still block that sat wherever the generator left it. From 1.8.0 it is
+simulated — it spreads, it falls, it finds its level, and it drains away when its source is
+taken.
+
+This is the second half of the simulation core. The 20 TPS clock that drives it, the lighting
+repair and the buoyancy that lets you swim all shipped in 1.7.1; water is what that clock was
+built to run.
+
+Worlds made in 1.7.x open in 1.8.0 unchanged, and no block id moved — see Compatibility.
+
+### Added
+
+- **Water physics.** Sources, flow levels 1..7, spread, and drainage when the source is removed.
+  A cell holding water is a source when the flow map has no entry for it and a flow cell when it
+  does, so an ocean occupies no map slots at all — absence-means-source is what makes the sea
+  free. Water falls a block wide, pools where it lands, and a falling column does not weaken.
+- **Water is drawn at its real depth.** Eight flow levels render as eight surface heights, with a
+  wall between any two unequal neighbours and no seam at all between equal ones. This cost no
+  texture-atlas slot: the height drop packs into three spare bits of the mesher's normal field.
+- **A remesh on a level change alone.** A cell whose water merely got shallower moves no block,
+  so nothing in the old edit path would have noticed it. Water now asks for its own chunk rebuild
+  when only the level changed — without a relight, deliberately, since no block moved and the
+  light would recompute an identical answer at the most expensive moment in the frame.
+
+### Compatibility
+
+- No save-format break, and no block id moved. `BLOCK_COUNT` is unchanged at 8, which matters
+  because the server uses it as its item ceiling and compares a CRC of the shared block registry
+  on connect — water levels deliberately live in a side map rather than as new block ids, since
+  seven new rows would have desynced every joined session permanently.
+- Water still cannot be carried or placed by the player: it sits outside the hotbar's id range by
+  design, and 1.8.0 does not change that.
+
 ## [1.7.1] - 2026-08-24
 
 A repair release for the four things steve reported playing 1.7.0, plus the optimisation pass

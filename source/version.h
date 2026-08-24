@@ -12,7 +12,7 @@
 // and offer a pointless update on every check.
 #pragma once
 
-#define BLOCKSMITH_VERSION "1.7.1"
+#define BLOCKSMITH_VERSION "1.8.0"
 
 // Whether the line above has been filled in. Everything that prints or compares the
 // version goes through this so there is one answer to "do we know".

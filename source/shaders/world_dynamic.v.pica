@@ -23,9 +23,13 @@
 
 .fvec projection[4], modelView[4]
 
-; Per-face brightness, indexed by the vertex's normal index. Six are used; the
-; array is 8 long because relative addressing wants a power of two to be safe.
-.fvec faceShade[8]
+; Per-vertex face table, indexed by the WHOLE nrm byte: .x is the face's baked
+; brightness, .y a height offset added to the vertex's y. 64 rows, filled by
+; scene/chunk_render.c, row face + 8*d holding brightness(face) and -d/8. Same layout
+; and same reasoning as world.v.pica — see the long note there and MESH_NRM_FACE_BITS in
+; source/world/mesher.h. It must move with it: a New 3DS binds THIS program instead, so a
+; drift here would leave flowing water full-height on exactly the hardware nobody tests on.
+.fvec faceShade[64]
 
 ; Day-night multiplier for the sky channel. Held per-channel-scaled so caves lit
 ; only by block light do not dim with the sun.
@@ -62,8 +66,19 @@
 .alias inpack v1
 
 .proc main
+	; --- the vertex's face table row --------------------------------------
+	; Fetched first because the position below needs its .y. Same two instructions and same
+	; relative-addressed fetch as world.v.pica, moved above the position block for the same
+	; reason. v1.2.4's measurement cleared them of the hardware freeze; see world.v.pica.
+	mova a0.x, inpack.zzzz
+	mov r3, faceShade[a0.x]
+
 	; --- position ---------------------------------------------------------
 	mov r0.xyz, inpos
+
+	; v1.8.0 task 22b: the water height drop, 0.0 for every face index 0..5.
+	add r0.y,   r3.yyyy, r0.yyyy
+
 	mov r0.w,   ones
 
 	dp4 r1.x, modelView[0], r0
@@ -83,10 +98,7 @@
 	mov outtc0, r2.xyxy
 
 	; --- baked lighting ---------------------------------------------------
-	; Same relative-addressed faceShade fetch as world.v.pica — cleared by
-	; measurement there, reused unchanged here.
-	mova a0.x, inpack.zzzz
-	mov r3, faceShade[a0.x]
+	; r3 was fetched at the top of main, exactly as in world.v.pica.
 
 	; ao factor = aoFloor + aoRange * (ao / 3)
 	mul r4.x, aoScale, inpack.wwww
