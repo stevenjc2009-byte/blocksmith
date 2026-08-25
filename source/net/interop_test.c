@@ -103,6 +103,56 @@ static void check(bool cond, const char *what)
     }
 }
 
+/* How many check() calls this suite makes against a healthy tree and a healthy daemon. A LITERAL
+ * on purpose, and hand-recomputed rather than pasted from a run.
+ *
+ * Every suite in this project used to end at "0 failed" and nothing else, which cannot tell a
+ * check that PASSED from a check that never RAN. That distinction is unusually sharp here: almost
+ * every test below is a conversation with a child process over a socket, so an early `return`
+ * after a timeout, a helper that gives up quietly, a loop over a packet count that comes back
+ * shorter than it should, or an rc-based bail in one of the four inventory tests all remove
+ * checks rather than fail them. The suite would then print PASS with a smaller number, and the
+ * number is the only place that shows.
+ *
+ * 56 is the count on 2026-08-25, the first time this binary was ever run in this environment
+ * (it is skipped on Windows/MSYS2 - see tools/run_host_tests.sh - and this repo's host is
+ * Windows, so it had never executed here at all until it was run from WSL).
+ *
+ * Legitimately adding or removing a check means editing this by hand. The suite going red until
+ * you do is deliberate friction, not an accident. */
+#define INTEROP_TEST_EXPECTED_CHECKS 56
+
+/* Deliberately NOT routed through check(): it must not perturb the number it is testing, so it
+ * bumps g_fails only and leaves g_checks alone. Reporting shape is check()'s, so a failure here
+ * reads the way every other failure in this file does.
+ *
+ * `ran` is latched from g_checks on entry, so the pin means "checks completed before this line"
+ * no matter how the counter is maintained. That is not pedantry: this project's suites are split
+ * between a CHECK macro that increments before it evaluates its condition and a check() function
+ * whose argument is evaluated at the call site before the increment, so the same pin expression
+ * is off by one in half of them. Latching first makes the reading identical everywhere. */
+static void check_count_pin(void)
+{
+    const int ran = g_checks;
+    if (ran == INTEROP_TEST_EXPECTED_CHECKS) return;
+
+    g_fails++;
+    if (ran < INTEROP_TEST_EXPECTED_CHECKS)
+        printf("  FAIL  CHECK COUNT: %d check(s) WENT MISSING - expected %d, ran %d.\n"
+               "        They did not fail. They never ran: a packet loop came back short, a\n"
+               "        timeout took an early return, a helper bailed, or a check was deleted.\n"
+               "        The checks that did run passing tells you nothing about the ones that\n"
+               "        did not. Find them. Do NOT re-pin INTEROP_TEST_EXPECTED_CHECKS to go\n"
+               "        green.\n",
+               INTEROP_TEST_EXPECTED_CHECKS - ran, INTEROP_TEST_EXPECTED_CHECKS, ran);
+    else
+        printf("  FAIL  CHECK COUNT: %d check(s) were ADDED - expected %d, ran %d.\n"
+               "        If you added them on purpose, set INTEROP_TEST_EXPECTED_CHECKS in\n"
+               "        source/net/interop_test.c to %d. If you did not, something is running\n"
+               "        checks more times than it should.\n",
+               ran - INTEROP_TEST_EXPECTED_CHECKS, INTEROP_TEST_EXPECTED_CHECKS, ran, ran);
+}
+
 /* ------------------------------------------------------------------------------- time helpers */
 
 static uint64_t now_ms(void)
@@ -929,6 +979,11 @@ int main(void)
     test_inv_pickup_roundtrip_reflected_in_snapshot();
 
     reap_daemon();
+
+    /* Last, so it sees every check the eight tests above managed to run. It is not reached on the
+     * wait_ready() path that returns 1 further up, and does not need to be: that path already
+     * fails loudly with its own message and a non-zero exit. */
+    check_count_pin();
 
     printf("%s: %d checks, %d failed\n", g_fails ? "FAIL" : "PASS", g_checks, g_fails);
     return g_fails ? 1 : 0;
