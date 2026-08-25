@@ -14,7 +14,9 @@ written for this project.
   <img src="docs/install-qr.png" width="220" alt="Install QR code for v1.8.2">
 </p>
 
-If the game ever stops responding it writes `sdmc:/blocksmith/postmortem.txt`.
+If the game ever crashes it writes `sdmc:/blocksmith/crash.txt`. If it stops
+drawing frames without crashing, that is the watchdog's job instead and it
+writes `sdmc:/blocksmith/hang.txt`, naming the phase the main thread was in.
 
 ## Install
 
@@ -35,8 +37,9 @@ install anything, `blocksmith.3dsx` runs from the Homebrew Launcher instead.
 ## What's in it
 
 * **An infinite world**, generated from seeded value noise — grass, dirt,
-  stone, sand, wood, leaves, planks, water and tall grass, with a biome pass,
-  trees, and 3D-noise caves.
+  stone, sand, wood, leaves, water and tall grass, with a biome pass, trees,
+  and 3D-noise caves. Planks are the one block the generator never places:
+  they only exist once you craft them from wood.
 * **Breaking a block takes time.** The break button is held, not tapped: every
   block has its own hardness in ticks at 20 TPS, and a crack spreads across the
   face while you work at it. Let go, look away, or have the block change under
@@ -56,9 +59,12 @@ install anything, `blocksmith.3dsx` runs from the Homebrew Launcher instead.
 * **Multiplayer.** Connect from the title screen and you are in the server's
   world — its seed, and every block edit anyone has made in it. Terrain is never
   transmitted: each console generates the same landscape from the same seed and
-  the server stores only the edits, so a join costs one small packet of history
-  rather than a world download. Other players show up and move around, your
-  edits reach them, and a session that ends tells you why.
+  the server stores only the edits. The client subscribes to each column as the
+  streaming ring loads it and the server answers with just that column's edits,
+  paged across as many packets as they need — so a join costs a trickle of small
+  edit packets bounded by your render distance, not a world download. Other
+  players show up and move around, your edits reach them, and a session that ends
+  tells you why.
 * **A touchscreen inventory**, hotbar and a small crafting table — four
   recipes: dirt → grass, stone → sand, leaves → dirt, wood → planks.
 * **Options that stick** — render distance, look sensitivity, inverted pitch,
@@ -88,15 +94,25 @@ the Home Menu out of the banner — **the game itself has no audio**.
 | X | Break block (**hold**) | yes |
 | Y | Place block | yes |
 | Circle pad | Look | no |
-| L / R | Move up / down | no |
+| L / R | Render distance down / up | no |
 | B | Back, close a menu | no |
 | SELECT | Pause menu | no |
-| START | Quit to title | no |
+| START | Exit the game | no |
 | Touch screen | Hotbar, inventory, crafting | no |
+
+**START closes the game — it does not go back to the title screen.** The row
+that returns to the title is **Quit to title** in the SELECT pause menu. Both
+save on the way out: the dirty-region flush, the inventory and the player pose
+all run on one shared teardown path, so nothing is lost either way.
+
+L and R change the render distance rather than moving you. Up and down movement
+exists only in a free-fly build (`-DBS_FLY=1`), which is not what ships.
 
 Seven actions are rebindable from Options → Controls — the four moves, jump,
 break and place — and they may only be bound to A, X, Y or a D-pad direction.
 ZL, ZR and the C-stick are unused.
+
+Every row of the table above was read back against the input code on 2026-08-25.
 
 ## Performance
 
@@ -110,10 +126,22 @@ snapshot restored before each arm, same starting chunk (v1.7.1):
 |---|---|---|---|---|
 | CPU per frame | 1.799 ms | 2.476 ms | 2.678 ms | 2.905 ms |
 
-Median triangles drawn 16,642. Over-budget mesh frames 11.3%. The chunk vertex
-pool is 9,199,616 bytes (8.77 MB), held in tiers of slab so a small chunk does
-not claim a large slab; if that much linear heap is not there the game says so
-at startup rather than misbehaving later.
+Median triangles drawn 16,642. Over-budget mesh frames 11.3%.
+
+**Read those figures as a recorded narrative, not a reproducible artifact.**
+They were measured in Azahar during v1.7.1 and written straight into
+CHANGELOG.md; no raw log, capture or CSV was ever committed, so nothing in this
+repository can reproduce or check them and no later release has re-measured.
+Three releases of rendering work have landed since — water's transparent pass,
+the 7/8 surface geometry and the crack overlay's extra draw pass — all of which
+cost main-thread time these numbers predate.
+
+The chunk vertex pool is 9,199,616 bytes (8.77 MB), held in three tiers of slab
+so a small chunk does not claim a large slab; if that much linear heap is not
+there the game says so at startup rather than misbehaving later. That figure is
+**derived by construction, not benchmarked** — 256 slots x 16,384 + 120 x 32,768
++ 16 x 65,536 = 9,175,040, plus a 24,576-byte shared index buffer, from the tier
+constants in `source/scene/chunk_render.c` (checked 2026-08-25).
 
 Whether an Old 3DS holds 60 fps at the largest render distance is **unknown** —
 nothing here has a GPU and the emulator does not model one.
@@ -178,10 +206,16 @@ Every release publishes **two** assets, not one:
 | `whatsnew<version>.txt` | the change notes the updater shows on the top screen |
 
 Both are fetched from the same predictable path —
-`https://github.com/<owner>/<repo>/releases/download/v<version>/<asset>` — off
-the `/releases/latest` **302 redirect**, never from `api.github.com`, which
-allows only 60 unauthenticated requests an hour per IP and made this updater
-fail at random once already.
+`https://github.com/<owner>/<repo>/releases/download/v<version>/<asset>` — built
+from the tag that the `/releases/latest` **302 redirect** names. The two asset
+downloads themselves never touch `api.github.com`, which allows only 60
+unauthenticated requests an hour per IP and made this updater fail at random
+once already.
+
+The version *check* prefers that same redirect for the same reason, but it has
+not escaped the rationing — when the redirect cannot be read it still falls back
+to `api.github.com` (`source/app/updater.c`). The common path avoids the quota;
+the fallback path is subject to it.
 
 ### The checklist
 

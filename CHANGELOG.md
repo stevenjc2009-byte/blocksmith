@@ -285,6 +285,16 @@ than claiming a fix that was never made.
   same starting chunk: main-thread `cpu_ms` median 2.230 to 1.799, p95 3.330 to 2.476, p99 3.634
   to 2.678, max 3.951 to 2.905, with median triangles drawn unchanged at 16,642 — the work was
   removed, not the geometry. Over-budget mesh frames 26.2% to 11.3% against 1.7.0.
+
+  **Provenance (added 2026-08-25).** Those figures are a recorded narrative, not a reproducible
+  artifact. They were taken in Azahar during the v1.7.1 session, on 2026-08-24, and written
+  straight into this entry — **no raw log, capture or CSV was committed anywhere in the tree**, so
+  nothing in this repository can reproduce or re-check them, and an audit on 2026-08-25 found no
+  artifact they could be traced to. Azahar does not emulate GPU cost, so they are CPU-side only
+  and say nothing about a real console; nothing in v1.7.1 or later has run on hardware. They have
+  also not been re-measured since, and v1.8.0, v1.8.1 and v1.8.2 each added main-thread rendering
+  work they predate — water's transparent pass, the 7/8 surface geometry and the crack overlay's
+  own draw pass. Left in place as history rather than deleted; do not quote them as current.
 - **A culling bug nobody had noticed**, found while proving the horizon rewrite equivalent. Over
   697,968 enumerated configurations the old and new predicates disagree six times, and in all six
   the *old* one is wrong: it culled a chunk that is genuinely inside the cone, because subtracting
