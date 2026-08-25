@@ -9217,6 +9217,61 @@ static void testGenVersionSidecar(void)
 	}
 
 	testRmTree(dir);
+
+	// ── A card that will not take the stamp, on a world that has never been saved. ────
+	//
+	// The mint branch's write is the one that has to land — genversion.c's comment above its
+	// return says why — so a refused write there has to be reported and not swallowed. Until
+	// this arm existed nothing in the suite could make genVersionWrite fail at all: every
+	// other call to it is CHECKed for success, so the discarded result had no test that could
+	// go red, and the bug shipped.
+	//
+	// Forcing a real refusal on a host that is not the console took finding. Two obvious
+	// routes are dead on this machine, both measured 2026-08-25 before this was written:
+	//
+	//   * A read-only world directory. chmod does not stick in this checkout — WSL mounts C:
+	//     as 9p/drvfs with no metadata, so a chmod 0555 directory came back drwxrwxrwx and
+	//     the write went straight through.
+	//   * A *directory* named genver.bin, so the write hits EISDIR. It does (errno 21), but
+	//     glibc's fopen(<a directory>, "rb") SUCCEEDS on Linux, so genVersionResolve's read
+	//     probe would find a "stamp" and answer GENVER_DAMAGED without ever reaching the
+	//     branch under test.
+	//
+	// What is left, and behaves the same on Windows and Linux, is a world_dir that lives
+	// under a path component that is a regular FILE: every open below it fails with ENOTDIR.
+	// Honest caveat: opendir() fails there too, so hasRegionFile() returns false because the
+	// listing failed rather than because it was empty. It is the same branch either way, and
+	// the checks below pin down which branch actually answered rather than assuming.
+	{
+		char blocked[128];
+		snprintf(blocked, sizeof blocked, "%s/gv-notadir", testWorldDir());
+		remove(blocked);
+		FILE* nf = fopen(blocked, "wb");
+		CHECK(nf != NULL);
+		if (nf) fclose(nf);
+
+		char inside[192];
+		snprintf(inside, sizeof inside, "%s/w", blocked);
+
+		// Preconditions, so a pass cannot be a pass for the wrong reason. The path is
+		// non-empty, so the NO_WORLD_DIR early return is not what answers; and no stamp is
+		// readable there, so the stamp-exists branch is not what answers either.
+		v = 0xDEADu;
+		CHECK(genVersionRead(inside, &v) == GENVER_OK);
+		CHECK(v == GEN_VERSION_LEGACY);
+		CHECK(genverSize(inside) == -1);
+
+		// The refusal itself. GENVER_STAMP_FAILED *together with* a derived
+		// GEN_VERSION_FOR_NEW_WORLDS can only come out of the mint branch: the legacy branch
+		// derives GEN_VERSION_LEGACY and the no-directory return leaves genVersionForSession(),
+		// which is also GEN_VERSION_LEGACY.
+		v = 0xDEADu;
+		CHECK(genVersionResolve(inside, &v) == GENVER_STAMP_FAILED);
+		CHECK(v == GEN_VERSION_FOR_NEW_WORLDS);
+		CHECK(genverSize(inside) == -1);   // and nothing was stamped anywhere
+
+		remove(blocked);
+	}
 }
 
 #endif  // !__3DS__

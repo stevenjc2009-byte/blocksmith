@@ -29,6 +29,12 @@
 //   * A stamp that is **present but unreadable** — bad magic, bad CRC, truncated — is also
 //     refused, for the same reason: a stamp was intended here, and the one thing we must not
 //     do is fall back to a *different* generator than the one that shaped this world.
+//   * A world with **no stamp, that cannot be given one** — the card refused the write — is
+//     refused as well, but **only when it is a brand new world**. That is the one case where
+//     the derived answer does not survive: the world is about to save its first region file,
+//     and from the next boot on the absent stamp beside that file derives LEGACY for a world
+//     that is not legacy. A world that already has a region file derives LEGACY either way,
+//     so its stamp is best effort and a refused write there changes nothing.
 //
 // The asymmetry between "absent" and "damaged" is the whole design. Absent is a fact about
 // history (versioning did not exist yet) and has exactly one correct answer. Damaged is a
@@ -100,6 +106,17 @@ typedef enum {
 	// Not an error and not a refusal: there is nothing on this console to be consistent with.
 	// *out is left at GEN_VERSION_LEGACY, which is what genVersionForSession() explains.
 	GENVER_NO_WORLD_DIR,
+
+	// A world that has no stamp and could not be given one: the card would not take the
+	// write. Only ever returned for a world that has never been saved, because that is the
+	// only case where the stamp has to land — see genVersionResolve for why the other one
+	// stays best effort. *out still holds the generator this session would have used.
+	//
+	// A separate code rather than reusing GENVER_DAMAGED because the sentence the player
+	// gets is a different sentence: a card that would not take the stamp is something they
+	// can do something about — free some space, take the write-lock off, reseat it — and an
+	// unreadable stamp is not. Folding the two together would cost them that.
+	GENVER_STAMP_FAILED,
 } GenVersionStatus;
 
 // Decides which generator `world_dir` gets, stamping it if it does not have one yet.
@@ -111,8 +128,11 @@ typedef enum {
 // existence — the title screen's New World button and main.c's saveWorldDir() — without
 // either of them having to know this file exists.
 //
-// The write is best-effort: a card that refuses it still gets the right answer this session,
-// and the next boot re-derives the same one from the same evidence. `*out` is always written.
+// The write is best-effort **for the legacy derivation only**: that answer was read off
+// evidence that is still on the card next boot, so a refused write costs nothing and the
+// status stays GENVER_OK. For a brand-new world it is not optional — its first save creates
+// the very region file that would make the next boot answer LEGACY — so a refused write
+// there returns GENVER_STAMP_FAILED. `*out` is always written, either way.
 GenVersionStatus genVersionResolve(const char* world_dir, uint32_t* out);
 
 // Reads the stamp without creating one. Exposed for the tests and for any caller that wants

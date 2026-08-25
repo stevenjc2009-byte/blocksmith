@@ -141,17 +141,35 @@ GenVersionStatus genVersionResolve(const char* world_dir, uint32_t* out)
 
 	// No stamp. Which generator this world *already* has is a question about its history, and
 	// the only evidence on the card is whether anything was ever saved for it.
-	const uint32_t chosen = hasRegionFile(world_dir) ? GEN_VERSION_LEGACY
-	                                                 : GEN_VERSION_FOR_NEW_WORLDS;
+	const bool played = hasRegionFile(world_dir);
+	const uint32_t chosen = played ? GEN_VERSION_LEGACY : GEN_VERSION_FOR_NEW_WORLDS;
 	*out = chosen;
 
-	// Best-effort. A refused write costs nothing today — the next boot sees the same absent
-	// stamp beside the same evidence and derives the same answer — but writing it now is what
-	// makes the answer survive the world's first save, after which the evidence would say
-	// LEGACY for a world that is not.
+	const bool stamp_ok = genVersionWrite(world_dir, chosen);
+
+	// **This is the line the whole prerequisite turns on**, and the two derivations want
+	// opposite things from it, which is why the result is not thrown away for both:
 	//
-	// **This is the line the whole prerequisite turns on.** Without it, the first column a new
-	// world saves creates a .bsr, and every boot after that would read this world as legacy.
-	(void)genVersionWrite(world_dir, chosen);
+	//   * Derived LEGACY — a region file is present. Best effort, and that is right. The
+	//     evidence that produced the answer is permanent: the next boot opens the same
+	//     directory, finds the same .bsr beside the same absent stamp, and derives LEGACY
+	//     again. A card that refuses the write costs this world nothing.
+	//
+	//   * Derived FOR_NEW_WORLDS — nothing has ever been saved here. The exact opposite,
+	//     because the evidence is about to change. This session generates the new terrain,
+	//     the player's first saved column creates a .bsr, and from the next boot on that
+	//     same derivation reads that .bsr and answers LEGACY — different terrain under a
+	//     base that is already built, silently, one boot later, with no error and nothing
+	//     to recover from. Carrying on here is what arms that, so it is refused instead,
+	//     and the only thing given up is a world that has never been played.
+	//
+	// Nothing in this file fsyncs — region.c:279 states that convention for the whole save
+	// path ("Nothing in this file fsyncs — everything flushes with fflush()") and this file
+	// keeps it. So `stamp_ok` means the C library and the card accepted the bytes, which is
+	// weaker than the stamp having survived a power cut in the moment after. That gap is
+	// left as it is on purpose: a torn stamp reads back as GENVER_DAMAGED and refuses,
+	// which is the safe direction, and changing the house convention for one 12-byte file
+	// is not this function's call to make. What is fixed here is only the silent case.
+	if (!stamp_ok && !played) return GENVER_STAMP_FAILED;
 	return GENVER_OK;
 }
