@@ -1623,17 +1623,27 @@ static void test_send_player_report_encodes(void)
  * was gone from HIS screen while still standing on everyone else's. This reproduces that
  * exactly, with no server and no second console.
  *
- * The shape of it: the server replays every diff it holds (BS_DIFF_MAX is 65536, so it is not
- * the one forgetting) the instant the handshake completes — which is on the title screen,
+ * The shape of it: the server replays every diff it holds — it is not the one forgetting —
+ * the instant the handshake completes, which is on the title screen,
  * before a world exists. With no world, every entry goes to the pending store, which REFUSES
  * rather than evicts once full. BLOCKDIFF_MAX_PENDING was 256, and the server sends
  * oldest-first, so the first 256 diffs survived and the newest were dropped. A house is the
  * newest thing in the world. Players who never left still have theirs in RAM, which is why
  * it stays visible to them — the asymmetry is the tell.
  *
- * The fix raised BLOCKDIFF_MAX_PENDING to match the server's 65536 exactly, so a join sync
- * can no longer overflow it. The count below stays at 300 — over the OLD cap, so this test
- * still goes red against the code that had the bug, which is the only reason to keep it.
+ * The fix raised BLOCKDIFF_MAX_PENDING from 256 to 65536, far past the 300 replayed below, so
+ * the case reproduced here cannot overflow it. That is NOT the same as "a join sync can no longer
+ * overflow it", which an earlier version of this comment claimed on the strength of the two
+ * caps matching at 65536. They do not match: the server's BS_DIFF_MAX is 131072u
+ * (deps/blocksmith-server/game/diffstore.h:39), raised there deliberately in server commit
+ * b95f980 on 2026-08-21, and a legacy full-dump sync that big still gets half of it refused —
+ * blockdiff_test.c's test_server_replay_overflow measures exactly that. The gap is the design
+ * and is not a defect to close: with per-column delivery the console holds edits for loaded
+ * columns only, so what it can hold is bounded by a 3DS's memory rather than by the server's,
+ * and the two ceilings are meant to come apart.
+ *
+ * The count below stays at 300 — over the OLD 256 cap, so this test still goes red against
+ * the code that had the bug, which is the only reason to keep it.
  * Measured against that code: "queued 256 of 300, refused 44", 3 checks failed. */
 
 #define REJOIN_EDITS 300

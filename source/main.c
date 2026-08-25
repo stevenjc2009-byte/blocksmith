@@ -4328,8 +4328,10 @@ session_start:
 		// screenshot. Each field splits the pipeline somewhere different (net/networld.h):
 		//   s sent edits   r payloads received   y WORLD_SYNC entries seen
 		//   a remote edits applied   q still queued for unloaded columns   p remote players
-		// Same 32-column console limit as `status` above: "net s99 r999 y999 a999 q99 p9"
-		// is 30.
+		// Typically short — "net s99 r999 y999 a999 q99 p9" is 30 — but do not size the buffer
+		// off that, and note this is NOT the 32-column console `status` above is bound by:
+		// netline's only consumer is drawBottomUi(), which draws it through scene/ui.c:270
+		// where 52 characters fit. See the buffer arithmetic below.
 		//
 		// The trailing "!" is v1.6.0 task 8's readout of net/networld.h's
 		// networldRegistrySynced(): in a session it means this client's block table never
@@ -4338,11 +4340,47 @@ session_start:
 		// server happens to have dug out, which is the same "silently identical to working"
 		// problem the rest of this line exists for. Printed only in a session — single player
 		// has no server table to agree with, so its absence there is not a warning.
-		char netline[33];
-		snprintf(netline, sizeof(netline), "net s%d r%d y%d a%d q%d p%d%s",
+		//
+		// The trailing "X" is the sibling report for a different silent loss, and one this
+		// line was until now blind to: net/networld.h's networldPendingRefusals(). The pending
+		// store turns a diff away once it is holding BLOCKDIFF_MAX_PENDING (65536) of them
+		// rather than evicting one to make room (net/blockdiff.c), and it has always counted
+		// those refusals — but nothing outside the test suites ever read the count, so a
+		// client that refused 65536 edits looked on screen exactly like one that refused
+		// none. That is the same "silently identical to working" failure the whole line
+		// exists to break, so it belongs here next to "!".
+		//
+		// Read it as "this session refused edits, so a loaded column may be showing a stale
+		// world until it is reloaded" — NOT as "the save is damaged". The loss is recoverable:
+		// the server's handle_chunk_sub() calls send_chunk_diffs() unconditionally, so every
+		// column the player loads gets its diffs delivered again.
+		//
+		// It is also not a sign that the two caps should meet. The server's BS_DIFF_MAX is
+		// 131072 on purpose (server commit b95f980, 2026-08-21): what capped it was never the
+		// server's memory but the console's, and with per-column delivery the 3DS holds edits
+		// for loaded columns only, so the two ceilings are meant to come apart. Nothing here
+		// should be read as asking the client to grow to match.
+		//
+		// 69 bytes, not the 33 this buffer used to be, computed from the declared ranges
+		// rather than from the typical values the estimate above quotes:
+		//   literals "net s" " r" " y" " a" " q" " p"                              15
+		//   s r y a — unclamped `int` lifetime counters, so 11 each ("-2147483648") 44
+		//   q — bounded by BLOCKDIFF_MAX_PENDING, 65536                             5
+		//   p — bounded by NETWORLD_MAX_REMOTE, 15                                  2
+		//   "!" and "X", which are independent and can both be present              2
+		//   NUL                                                                     1
+		// 33 was already short of that before this marker was added — y alone reaches 131072
+		// in the replay case blockdiff_test.c measures — and snprintf truncates without
+		// saying so, which is precisely the species of silent failure being reported here.
+		// Sized to the types so it cannot happen. This is the buffer bound only, not a screen
+		// bound: scene/ui.c:270 draws this at x=6 with FONT_ADVANCE 6 on the 320px bottom
+		// screen, so 52 characters are visible, comfortably past any plausible content.
+		char netline[69];
+		snprintf(netline, sizeof(netline), "net s%d r%d y%d a%d q%d p%d%s%s",
 		         networldSentEdits(), networldRecvMsgs(), networldSyncEntries(),
 		         networldAppliedEdits(), networldPendingCount(), networldRemoteCount(),
-		         (s_server_session && !networldRegistrySynced()) ? "!" : "");
+		         (s_server_session && !networldRegistrySynced()) ? "!" : "",
+		         (networldPendingRefusals() > 0) ? "X" : "");
 
 #if BS_CMDBUF_PROBE
 		// Throwaway instrument, not shipped. hang.txt proved the main thread finishes the
