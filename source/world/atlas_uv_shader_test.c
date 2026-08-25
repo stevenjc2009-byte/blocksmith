@@ -20,6 +20,28 @@
 // rendered every tile as the same ~14x14px corner of the sheet (the wood tile), so the whole
 // world drew flat brown with no grass green and no stone grey anywhere.
 //
+// THE WIRING HALF (new in v1.8.3), and the reason everything above it was not enough. Each
+// check described so far is about what uvScale DECLARES. None of them is about whether any
+// instruction READS it, and picasso does not care either way — a .constf nobody consumes is
+// uploaded and ignored, silently. So the exact defect this file was written to prevent was
+// still reachable, just through the other door.
+//
+// MEASURED, on this tree: `mul r2, uvScale, inpack` in source/shaders/world.v.pica changed to
+// `mul r2, consts, inpack` (consts is (0, 1, 0, 1/3), so every u is multiplied by zero and
+// every v by one), with the uvScale declaration left perfectly correct. Every UV on screen is
+// garbage. This suite printed "atlas uv shader self-test: PASS 4280 checks" — byte-identical
+// to a healthy tree, with not one check moved.
+//
+// What replaced token presence: ORDERED needles naming whole instructions, operand included.
+// The multiply must exist, must be the only write to r2, and the write that outputs r2 must
+// come after it. Both files, the BOUND one first. That arm now goes red 2/4293.
+//
+// And which file IS bound is asserted rather than narrated — see
+// checkBoundShaderIsTheDynamicOne(). The prose in this header saying "a New 3DS binds
+// world_dynamic.v.pica instead" went stale at v1.8.0 task 24, when scene/chunk_render.c
+// stopped binding world.v.pica for ANY model, and nothing noticed because nothing checked.
+// world.v.pica is compiled, checked here, and never on screen.
+//
 // Two things widened this in v1.6.0, both because the sheet became a one-tile-wide strip and
 // stopped being square:
 //
@@ -126,7 +148,29 @@ static char s_first[512];
 #define ATLAS_HEADER_PATH   "source/world/atlas_uv.h"
 #define ATLAS_PNG_PATH      "gfx/atlas.png"
 #define ATLAS_T3X_PATH      "build/atlas.t3x"
+#define RENDERER_PATH       "source/scene/chunk_render.c"
 #define NEEDLE ".constf uvScale("
+
+// THE WIRING NEEDLES (v1.8.3). Everything the NEEDLE above leads to is about what uvScale
+// DECLARES. None of it is about whether any instruction reads it, and the two are completely
+// independent: a `.constf` with nobody consuming it is not an error in picasso, it is a
+// register that gets uploaded and ignored.
+//
+// This is not hypothetical and it is not a new class of bug — it is verbatim the step 9.3c
+// defect this whole file was written to prevent, reached by the other door. MEASURED: with
+// source/shaders/world.v.pica's `mul r2, uvScale, inpack` changed to `mul r2, consts, inpack`
+// (consts is (0, 1, 0, 1/3), so every u is multiplied by zero and every v by one), the uvScale
+// declaration left correct and untouched, this suite printed "atlas uv shader self-test: PASS
+// 4280 checks" — byte-identical to a healthy tree, with not one check moved, while every UV on
+// screen was garbage.
+//
+// So the needles below name the whole instruction, operand included, and are checked in ORDER:
+// the multiply must exist and must be the only write to r2, and the output write that consumes
+// r2 must come after it. Token presence is what failed; an ordered pair of whole instructions
+// is what replaces it.
+#define UVSCALE_MUL_NEEDLE "mul r2, uvScale, inpack"
+#define UVSCALE_OUT_NEEDLE "mov outtc0, r2.xyxy"
+#define ANY_R2_MUL_NEEDLE  "mul r2,"
 
 // The number of slots tools/make_atlas.py's TILES list actually paints art into. Duplicated
 // from gfx/atlas.h's enum rather than included, because that header pulls in <3ds.h>; the
@@ -150,6 +194,65 @@ static char s_first[512];
 #define UV_TOLERANCE 1e-7
 
 static double absd(double v) { return v < 0.0 ? -v : v; }
+
+// ── Reading a source file as lines ───────────────────────────────────────────
+//
+// Lifted verbatim from world/water_alpha_test.c rather than reinvented, so the two suites
+// that parse these same two .pica files agree on what a "line" is: whitespace collapsed to
+// single spaces and the ends trimmed, because both shaders column-align their operands and a
+// needle matched against raw text would be asserting the indentation.
+//
+// loadLines() is one fgets() per line and joins NO continuations. That is a real limit and it
+// has bitten this project once already (water_alpha_test.c's BLEND_ON_TAIL); it does not bite
+// here, because a .pica instruction is always exactly one line.
+
+#define MAX_LINES 4096
+#define MAX_LINE  512
+
+static char s_lines[MAX_LINES][MAX_LINE];
+static int  s_nlines;
+
+static void squash(const char* in, char* out, size_t cap)
+{
+	size_t o = 0;
+	bool   sp = false;
+	for (const char* p = in; *p && o + 1 < cap; p++) {
+		if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') { sp = (o > 0); continue; }
+		if (sp) { out[o++] = ' '; sp = false; }
+		if (o + 1 < cap) out[o++] = *p;
+	}
+	out[o] = '\0';
+}
+
+// Returns the number of lines read, or -1 if the file could not be opened. The caller turns
+// -1 into a failure; it is never treated as "no lines, therefore nothing to complain about" —
+// the same rule the header of this file states for every other parse in it.
+static int loadLines(const char* path)
+{
+	FILE* f = fopen(path, "r");
+	if (!f) return -1;
+
+	s_nlines = 0;
+	char raw[4096];
+	while (s_nlines < MAX_LINES && fgets(raw, sizeof raw, f))
+		squash(raw, s_lines[s_nlines++], MAX_LINE);
+
+	fclose(f);
+	return s_nlines;
+}
+
+// How many loaded lines contain `needle`, and the line number (1-based) of the first.
+static int countLines(const char* needle, int* first_line)
+{
+	int n = 0;
+	if (first_line) *first_line = -1;
+	for (int i = 0; i < s_nlines; i++) {
+		if (!strstr(s_lines[i], needle)) continue;
+		if (first_line && *first_line < 0) *first_line = i + 1;
+		n++;
+	}
+	return n;
+}
 
 // Reads `path` looking for the ".constf uvScale(a, b, c, d)" line and extracts components a
 // and b - the U divisor and the V scale. Returns true and fills *outU/*outV only when every
@@ -270,6 +373,87 @@ static void checkShader(const char* path, double* outU, double* outV)
 
 	*outU = u;
 	*outV = v;
+}
+
+// Is uvScale actually CONSUMED, and does what it produces reach the texture coordinate output?
+//
+// checkShader() above proves the constant holds the right two numbers. This proves an
+// instruction reads it and that the result is written out. They are separate failures with the
+// same symptom — a world drawn with wrong UVs and no error anywhere — and until v1.8.3 only
+// the first was covered. See the UVSCALE_MUL_NEEDLE comment for the measurement.
+//
+// `bound` is printed, not branched on: both files are checked identically. It exists because
+// world.v.pica has been compiled-but-never-bound since v1.8.0 task 24 and world_dynamic.v.pica
+// is what both console models run, so a red run has to say which of the two names is the one
+// that is on screen. checkBoundShaderIsTheDynamicOne() below is what keeps that label honest.
+static void checkShaderUsesUvScale(const char* path, bool bound)
+{
+	const char* role = bound ? "BOUND on both console models" : "compiled, never bound";
+
+	const int n = loadLines(path);
+	CHECK(n >= 0, "cannot open %s to check that uvScale is used (%s)", path, role);
+	if (n < 0) return;
+
+	int mul_line = -1, out_line = -1;
+	const int any_muls = countLines(ANY_R2_MUL_NEEDLE, NULL);
+	const int scaled   = countLines(UVSCALE_MUL_NEEDLE, &mul_line);
+	const int outs     = countLines(UVSCALE_OUT_NEEDLE, &out_line);
+
+	// Exactly one write to r2, so the pair below is the whole story of how a texture
+	// coordinate is computed in this file and there is no second multiply to argue about.
+	CHECK(any_muls == 1,
+	      "%s (%s) has %d `%s` instructions, not 1 — the uvScale wiring check below only "
+	      "describes one of them", path, role, any_muls, ANY_R2_MUL_NEEDLE);
+
+	// The consumption itself. This is the check that goes red when uvScale is left declared,
+	// correct, and unread.
+	CHECK(scaled == 1,
+	      "%s (%s) does not multiply the packed attribute BY uvScale: expected exactly one "
+	      "`%s`, found %d. The declaration being right proves nothing on its own — a .constf "
+	      "nothing reads is uploaded and ignored, and every UV on screen comes out of whatever "
+	      "operand replaced it", path, role, UVSCALE_MUL_NEEDLE, scaled);
+
+	// ...and that the scaled result leaves the shader. A correct multiply into a register
+	// nothing outputs is the same picture as no multiply at all.
+	CHECK(outs == 1,
+	      "%s (%s) does not write the scaled coordinate to the texcoord output: expected "
+	      "exactly one `%s`, found %d", path, role, UVSCALE_OUT_NEEDLE, outs);
+
+	// ORDER, which is what makes the two needles a wiring claim rather than two presences.
+	// r2 must be written before it is read; the other way round outputs the previous vertex's
+	// leftovers, which draws a whole world one vertex out of step and errors nowhere.
+	CHECK(mul_line > 0 && out_line > 0 && mul_line < out_line,
+	      "%s (%s) scales into r2 at L%d but outputs r2 at L%d — the multiply must come FIRST",
+	      path, role, mul_line, out_line);
+}
+
+// WHICH of the two programs the renderer actually binds.
+//
+// This file has said "a New 3DS binds world_dynamic.v.pica instead" in prose since v1.6.0 and
+// that prose went stale at v1.8.0 task 24, when scene/chunk_render.c stopped binding
+// world.v.pica for ANY model. Nothing noticed, because nothing checked. The label is worth
+// having only if it cannot silently invert, so the fact is asserted here instead of narrated:
+// chunkRenderInit parses world_dynamic_shbin and parses world_shbin nowhere.
+//
+// If this pair ever goes red, the `bound` arguments in main() are what has to change — and the
+// same argument in world/water_alpha_test.c's checkOneShader calls with them.
+static void checkBoundShaderIsTheDynamicOne(void)
+{
+	const int n = loadLines(RENDERER_PATH);
+	CHECK(n >= 0, "cannot open %s to find out which shader program is bound", RENDERER_PATH);
+	if (n < 0) return;
+
+	const int dyn  = countLines("DVLB_ParseFile((u32*)world_dynamic_shbin", NULL);
+	const int baked = countLines("DVLB_ParseFile((u32*)world_shbin", NULL);
+
+	CHECK(dyn == 1,
+	      "%s parses world_dynamic_shbin %d times, not once — world_dynamic.v.pica is the file "
+	      "every check in this suite labels BOUND", RENDERER_PATH, dyn);
+	CHECK(baked == 0,
+	      "%s parses world_shbin %d times. Since v1.8.0 task 24 it parses it never, and every "
+	      "'compiled, never bound' label in this file and in world/water_alpha_test.c rests on "
+	      "that. If world.v.pica is being bound again, both files' labels are now backwards",
+	      RENDERER_PATH, baked);
 }
 
 // gfx/atlas.png's IHDR: 8-byte signature, then a 4-byte length and the 4-byte type "IHDR",
@@ -557,6 +741,13 @@ int main(void)
 	double wu = -1.0, wv = -1.0, du = -1.0, dv = -1.0;
 	checkShader(WORLD_SHADER_PATH, &wu, &wv);
 	checkShader(DYNAMIC_SHADER_PATH, &du, &dv);
+
+	// ── The shader WIRING (v1.8.3) ──────────────────────────────────────────────────────
+	// The constant being right and the constant being used are two different claims. The
+	// BOUND file goes first, so the head of a red run names the program that is on screen.
+	checkBoundShaderIsTheDynamicOne();
+	checkShaderUsesUvScale(DYNAMIC_SHADER_PATH, true);
+	checkShaderUsesUvScale(WORLD_SHADER_PATH, false);
 
 	// H2. The two shaders against each other, not only against the header. An Old 3DS binds
 	// one and a New 3DS the other, so they have to agree or the same world looks different on

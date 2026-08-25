@@ -33,6 +33,19 @@
 //                  bound — so an edit to only the one a human reads first is invisible on
 //                  hardware, and an edit to only the other is invisible to anyone reading the
 //                  file. The same drift world/atlas_uv_shader_test.c guards uvScale against.
+//                  The BOUND file is checked first, so a red run names it first.
+//
+//   THE ROW INDEX  (v1.8.3) and — this is the part that was missing — WHICH ROW that fetch
+//                  returns. `mov r3, faceShade[a0.x]` is relative addressing; a0.x comes from
+//                  `mova` and nowhere else, and the swizzle on mova's operand picks which byte
+//                  of the packed attribute is the row number. Every check above was satisfied
+//                  by both instructions merely being PRESENT and in order, so the operand was
+//                  free. MEASURED: `mova a0.x, inpack.zzzz` changed to `inpack.xxxx` in
+//                  world.v.pica — every vertex indexing the table by its atlas u column, so
+//                  wrong brightness and wrong alpha on every face in the world — and this
+//                  suite printed "PASS 34 checks, 0 failed", not one check moved. It now
+//                  asserts the whole instruction and that it precedes the fetch, and that
+//                  arm goes red 2/42 in each shader.
 //
 //   THE BLEND      scene/chunk_render.c must own the blend unit at both ends. Before v1.8.2
 //                  nothing in the world draw ever called C3D_AlphaBlend and exactly one place
@@ -43,6 +56,17 @@
 //                  transparent pass writes 0.70 that state decides whether water is
 //                  see-through or whether the ENTIRE WORLD is, and a frame-1 screenshot taken
 //                  before any UI has drawn would show neither.
+//
+//                  (v1.8.3) BOTH ENDS OF THAT CALL. C3D_AlphaBlend takes six arguments and
+//                  both call sites in the tree wrap after the fourth, so the needle that
+//                  described it stopped exactly where its first physical line stopped.
+//                  loadLines() is one fgets() per line and joins no continuations, so the
+//                  ALPHA src/dst factors were outside anything this file could see. MEASURED:
+//                  scene/chunk_render.c:2013 changed from `GPU_SRC_ALPHA,
+//                  GPU_ONE_MINUS_SRC_ALPHA);` to `GPU_ONE, GPU_ZERO);` and this suite printed
+//                  "PASS 34 checks, 0 failed"; gfx/sprite.c:187 the same. BLEND_ON_TAIL now
+//                  requires the factor pair on the immediately following line at both sites,
+//                  and each arm goes red 1/42.
 //
 // A parse that finds nothing must not read as "nothing wrong", so every failure path below —
 // file missing, line missing, malformed number — is itself a loud failure and never a skip.
@@ -135,6 +159,24 @@ static int countLines(const char* needle, int* first_line)
 		n++;
 	}
 	return n;
+}
+
+// Does the loaded line numbered `line1` (1-based) contain `needle`? The whole reason this
+// exists is that loadLines() is one fgets() per line and joins no continuations, so a needle
+// can only ever describe ONE physical line. A C call that wraps is therefore half-unchecked by
+// construction, and the unchecked half fails silently — see BLEND_ON_TAIL below.
+static bool lineHas(int line1, const char* needle)
+{
+	if (line1 < 1 || line1 > s_nlines) return false;
+	return strstr(s_lines[line1 - 1], needle) != NULL;
+}
+
+// The loaded line numbered `line1`, or a placeholder — for printing the line a check is
+// actually complaining about, so a red run does not have to be taken on trust.
+static const char* lineText(int line1)
+{
+	if (line1 < 1 || line1 > s_nlines) return "<past the end of the file>";
+	return s_lines[line1 - 1];
 }
 
 // ── The table ────────────────────────────────────────────────────────────────
@@ -247,8 +289,16 @@ static void testAlphaTestSurvives(void)
 
 #define ALPHA_READ_NEEDLE "mov outclr.w, r3.wwww"
 #define ALPHA_PIN_NEEDLE  "mov outclr.w, ones"
+#define MOVA_NEEDLE       "mova a0.x, inpack.zzzz"
+#define FETCH_NEEDLE      "mov r3, faceShade[a0.x]"
 
-static void checkOneShader(const char* path)
+// `bound` says whether this is the program the console actually runs. Both models have run
+// world_dynamic.v.pica since v1.8.0 task 24 (scene/chunk_render.c's chunkRenderInit parses
+// world_dynamic_shbin and nothing parses world_shbin), so world.v.pica is compiled, checked,
+// and never on screen. The flag is only ever printed: both files are checked identically, and
+// the point of saying which is which is that a red run should be readable without going and
+// looking up which of the two names is the live one.
+static void checkOneShader(const char* path, bool bound)
 {
 	const int n = loadLines(path);
 	CHECK(n >= 0, "%s opens and reads", path);
@@ -265,11 +315,40 @@ static void checkOneShader(const char* path)
 	// The row fetch the alpha rides on. If r3 stopped being faceShade[nrm] the .w above would
 	// be reading some other register's leftovers, which is a wrong picture and not an error.
 	int fetch = -1;
-	CHECK(countLines("mov r3, faceShade[a0.x]", &fetch) == 1,
-	      "%s still fetches the whole faceShade row into r3", path);
+	CHECK(countLines(FETCH_NEEDLE, &fetch) == 1,
+	      "%s still fetches the whole faceShade row into r3 [%s]", path,
+	      bound ? "BOUND" : "not bound");
 	CHECK(fetch > 0 && line > 0 && fetch < line,
 	      "%s fetches it BEFORE it reads .w out of it (fetch L%d, read L%d)",
 	      path, fetch, line);
+
+	// WHICH ROW. Everything above proves the fetch is present, in order, and read from — and
+	// none of it looks at the INDEX, which is the only part of the expression the CPU never
+	// sees. `faceShade[a0.x]` is relative addressing; a0.x comes from `mova` and from nothing
+	// else, and the swizzle on `mova`'s operand chooses which byte of the packed attribute
+	// becomes the row number. inpack is (u, v, nrm, ao), so .zzzz is the nrm byte and .xxxx is
+	// the vertex's atlas u column.
+	//
+	// MEASURED, not argued: with world.v.pica's `mova a0.x, inpack.zzzz` changed to
+	// `inpack.xxxx` — every vertex fetching the row numbered by its u coordinate, so wrong
+	// per-face brightness AND wrong per-face alpha across the whole world — this suite printed
+	// "PASS 34 checks, 0 failed", the same 34 as a healthy tree, with not one check moved.
+	// Both instructions were still present and still in the right order; only the operand
+	// changed, and no needle in this file described an operand.
+	const int movas = countLines("mova ", NULL);
+	int mova_line = -1;
+	const int nrm_movas = countLines(MOVA_NEEDLE, &mova_line);
+
+	CHECK(movas == 1, "%s has exactly one mova, so a0.x has exactly one source (found %d)",
+	      path, movas);
+	CHECK(nrm_movas == 1,
+	      "%s loads a0.x from the nrm byte with `%s` (found %d) — .xxxx or .yyyy there indexes "
+	      "the table by a texture coordinate instead, which draws a lit world with every face "
+	      "at another face's brightness and alpha", path, MOVA_NEEDLE, nrm_movas);
+	CHECK(mova_line > 0 && fetch > 0 && mova_line < fetch,
+	      "%s sets a0.x BEFORE `%s` reads it (mova L%d, fetch L%d) — after it, the fetch uses "
+	      "whatever the previous vertex left in the address register",
+	      path, FETCH_NEEDLE, mova_line, fetch);
 
 	// Task 13b's atlas layout must not have been disturbed on the way past.
 	CHECK(countLines(".constf uvScale(0.0625, 0.015625, 0.0, 0.0)", NULL) == 1,
@@ -280,8 +359,12 @@ static void testShadersReadAlpha(void)
 {
 	puts("water alpha: BOTH world shaders read the alpha, and neither still pins it to 1.0");
 
-	checkOneShader(WORLD_SHADER_PATH);
-	checkOneShader(DYNAMIC_SHADER_PATH);
+	// The BOUND one first. Until now this suite checked world.v.pica first, which is the file
+	// a human reads first and the file the console has not run since v1.8.0 — so the head of a
+	// red run described the dead copy. world/atlas_uv_shader_test.c asserts which of the two
+	// scene/chunk_render.c actually parses, so this ordering cannot quietly become wrong.
+	checkOneShader(DYNAMIC_SHADER_PATH, true);
+	checkOneShader(WORLD_SHADER_PATH, false);
 }
 
 // ── The blend state ──────────────────────────────────────────────────────────
@@ -290,6 +373,21 @@ static void testShadersReadAlpha(void)
                          "GPU_ONE, GPU_ZERO);"
 #define BLEND_ON_NEEDLE  "C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_SRC_ALPHA, " \
                          "GPU_ONE_MINUS_SRC_ALPHA,"
+
+// The SECOND physical line of that same call, and the reason it needs its own needle.
+//
+// C3D_AlphaBlend takes six arguments: the two equations, then the COLOUR src/dst factors, then
+// the ALPHA src/dst factors. Both call sites in the tree wrap after the fourth argument, so
+// BLEND_ON_NEEDLE above ends exactly where the first physical line ends and describes the
+// colour factors only. loadLines() is one fgets() per line and joins no continuations, so the
+// alpha factors were outside everything this file could see.
+//
+// MEASURED: with scene/chunk_render.c:2013 changed from `GPU_SRC_ALPHA,
+// GPU_ONE_MINUS_SRC_ALPHA);` to `GPU_ONE, GPU_ZERO);` — the destination alpha thrown away, so
+// the blend unit is configured differently from what the call is written to say — this suite
+// printed "PASS 34 checks, 0 failed". Nothing in the file had an opinion about line 2013.
+// Same blind spot, same needle, at gfx/sprite.c:187.
+#define BLEND_ON_TAIL    "GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA);"
 
 static void testRendererOwnsBlendState(void)
 {
@@ -307,6 +405,14 @@ static void testRendererOwnsBlendState(void)
 	CHECK(total == 3 && offs == 2 && ons == 1,
 	      "three C3D_AlphaBlend calls: two ONE/ZERO and one SRC_ALPHA (got %d, %d, %d)",
 	      total, offs, ons);
+
+	// ...and the half of that call the line above cannot reach. The check just above stays
+	// green whatever line on_first+1 says, so this one is what makes the SRC_ALPHA call a
+	// whole call rather than its first line.
+	CHECK(lineHas(on_first + 1, BLEND_ON_TAIL),
+	      "the blending call's ALPHA factors are on its continuation line L%d, which reads "
+	      "'%s' — expected it to contain '%s'",
+	      on_first + 1, lineText(on_first + 1), BLEND_ON_TAIL);
 
 	// Where the blending one sits. It must be inside the transparent pass — after the alpha
 	// test is armed against ALPHA_CUTOFF and before the pass turns it off again — or water is
@@ -352,9 +458,18 @@ static void testUiStillArmsItsOwnBlend(void)
 	CHECK(n >= 0, "source/gfx/sprite.c opens and reads");
 	if (n < 0) return;
 
-	CHECK(countLines(BLEND_ON_NEEDLE, NULL) == 1,
+	int ui_on = -1;
+	CHECK(countLines(BLEND_ON_NEEDLE, &ui_on) == 1,
 	      "control: gfx/sprite.c still sets SRC_ALPHA blending for its own batch, so the "
 	      "world's restore cannot leave the UI unblended");
+
+	// spriteBegin's call wraps after the fourth argument exactly as the renderer's does, so it
+	// has the same unchecked second line and gets the same needle. A HUD drawn with the alpha
+	// factors thrown away is every translucent panel and every font edge rendered wrong, with
+	// nothing anywhere reporting an error.
+	CHECK(lineHas(ui_on + 1, BLEND_ON_TAIL),
+	      "and its ALPHA factors on the continuation line L%d, which reads '%s' — expected it "
+	      "to contain '%s'", ui_on + 1, lineText(ui_on + 1), BLEND_ON_TAIL);
 }
 
 int main(void)
