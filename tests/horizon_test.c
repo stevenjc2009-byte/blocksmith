@@ -17,6 +17,12 @@
 // for twice (see tests/battery_test.c's note and run_host_tests.sh's meshq entry). Sabotage
 // source/scene/chunk_render.c and this binary goes red; there is no second copy to drift.
 //
+// 2026-08-25: that last sentence was audited by actually doing it, eleven ways. Eight arms went
+// red. Three did not, and each of the three has an entry below saying why and what was done
+// about it — one was a real hole in this file (the oracle was written in terms of HZN_HALF_W,
+// the constant it existed to watch) and is now fixed; two are production guards that provably
+// cannot change an answer on a 16-block chunk grid, so their headroom is measured instead.
+//
 // The reference below is the OTHER half of that trade and it IS a copy — a frozen verbatim
 // transcript of the pre-49h implementation, which by definition no longer exists in the tree.
 // A reference oracle is allowed to be a copy; the code under test is not.
@@ -124,7 +130,69 @@ static bool horizonHiddenRef(int cx, int cy, int cz)
 // oracle the claim becomes falsifiable in the direction that matters: the rewrite must match
 // the intended predicate everywhere, and any place the shipped float code did not is a bug in
 // the shipped float code, not a behaviour change introduced here.
+//
+// 2026-08-25 sabotage audit — WHY THE HALF-WIDTH BELOW IS A FROZEN LITERAL AND NOT HZN_HALF_W.
+// This oracle used to read chunk_render.c's own HZN_HALF_W, i.e. it was written in terms of the
+// constant it exists to watch. Measured: shrinking that define's 0.35f to 0.05f moved
+// 73,490 of 697,968 cases (ref-vs-new went 6 -> 73,490) and this file still printed
+// "horizon self-test: PASS  7 checks", because the oracle moved with the sabotage and
+// s_dis_new_exact stayed 0. Both remaining claims survived too: ref-vs-new and ref-vs-exact
+// stayed equal to each other because new and exact had moved together, and the direction check
+// held because a narrower cone only ever KEEPS chunks. Zero checks went red over a 10.5% change
+// in what the renderer culls. Same mechanism as the WATER_SPREAD_TICKS case in
+// code-vault blocksmith-lesson-sabotage-arm-must-actually-arm.md: a check parameterised by the
+// value under test cannot detect that value changing. So the oracle now carries the shipped
+// value as a naked literal — the same one horizonHiddenRef above already hardcodes — and the
+// production define is pinned separately in main().
 #define HZN_PI_D  3.14159265358979323846   /* -std=c11 does not give us M_PI */
+
+// The cone half-extent as the console shipped it: CHUNK_DIM/2 shrunk to 35%. Frozen here on
+// purpose. Retuning chunk_render.c's HZN_HALF_W must go red, both here and on main()'s pin.
+#define HZN_HALF_W_FROZEN  ((float)CHUNK_DIM * 0.5f * 0.35f)
+
+// ── Redundancy witnesses ───────────────────────────────────────────────────────────────
+//
+// Two guards inside horizonHidden() cannot change its answer at all on a 16-block chunk grid,
+// which the same audit established by sabotaging each of them and getting byte-identical
+// output across all 697,968 cases:
+//
+//   * `ndist >= dist - 1.0f`  (the one-block anti-flicker hysteresis) — changing it to
+//     `ndist >= dist` moved nothing. For the margin to decide anything a blocker would have to
+//     sit within 1 block of the candidate radially AND inside the bearing cone, which at these
+//     distances is 2.8 blocks transversally: a separation under 3 blocks between two DISTINCT
+//     column centres, which are 16 apart by construction.
+//   * `dist < (float)CHUNK_DIM * 0.5f`  (the near-camera bail) — changing it to `dist < 0.0f`,
+//     i.e. never firing, moved nothing. A cull needs ndist < dist - 1 < 7 with dist < 8, so the
+//     two centres would be under 15 apart. Again impossible for distinct columns.
+//   * (A third, `dot <= 0.0`, is redundant by algebra rather than by geometry: with dot <= 0
+//     the cone test's right-hand side is <= 0 and its left-hand side >= 0, so the cone rejects
+//     the blocker anyway. Nothing needs to witness that one.)
+//
+// So no behavioural check in this file can ever redden those two, and pretending otherwise
+// would be the "green over a broken feature" failure this project keeps paying for. What is
+// asserted instead is the HEADROOM that makes them unreachable, measured rather than argued.
+// The oracle is run three ways per case — normally, with the hysteresis dropped, and with the
+// near bail dropped — and two numbers come out of the dropped passes:
+//
+//   * s_margin_slack: the smallest `dist - ndist` over every blocker that got past the BEARING
+//     CONE, measured with the hysteresis disabled so the true distribution is visible. The
+//     hysteresis rejects a cone-passer exactly when that quantity is <= 1.0, so asserting it
+//     stays above 1.0 is a live, quantitative check with the measured margin printed next to
+//     it — not a boolean that only moves under an absurd edit.
+//   * s_near_slack: the smallest candidate `dist` at which the oracle ever culled anything,
+//     measured with the near bail disabled. This one is REPORTED, not asserted — see main().
+//     The near bail's actual check is s_dis_near, the count of cases the bail changes.
+//
+// A first attempt used plain disagreement counters here. The near one was live — widening the
+// bail to CHUNK_DIM * 4.0f moved 26,663 cases — but the margin one was NOT: widening the
+// hysteresis from 1.0f all the way to 12.0f still moved zero cases, because 12 blocks of radial
+// slop plus 2.8 of transverse is still under one 16-block column spacing. A check that needs a
+// sixteenfold edit before it can fire is barely a check, which is why the margin side is a
+// measured slack now. The near-bail counter is kept because it is already proven live.
+static int    s_orc_drop_margin;   // use `ndist >= dist` instead of `ndist >= dist - 1.0f`
+static int    s_orc_drop_near;     // skip the near-camera bail entirely
+static double s_margin_slack = 1e300;
+static double s_near_slack   = 1e300;
 
 static bool horizonHiddenExact(int cx, int cy, int cz)
 {
@@ -133,7 +201,7 @@ static bool horizonHiddenExact(int cx, int cy, int cz)
 	const float dx     = col_x - s_cam_x, dz = col_z - s_cam_z;
 	const float dist   = sqrtf(dx * dx + dz * dz);
 
-	if (dist < (float)CHUNK_DIM * 0.5f) return false;
+	if (!s_orc_drop_near && dist < (float)CHUNK_DIM * 0.5f) return false;
 
 	const double bearing = atan2((double)dz, (double)dx);
 	const float  top_y   = (float)((cy + 1) * CHUNK_DIM);
@@ -147,18 +215,28 @@ static bool horizonHiddenExact(int cx, int cy, int cz)
 		const float ndx = ncx - s_cam_x, ndz = ncz - s_cam_z;
 		const float ndist = sqrtf(ndx * ndx + ndz * ndz);
 
-		if (ndist >= dist - 1.0f) continue;
+		if (ndist >= (s_orc_drop_margin ? dist : dist - 1.0f)) continue;
 
 		double dbear = atan2((double)ndz, (double)ndx) - bearing;
 		while (dbear >  HZN_PI_D) dbear -= 2.0 * HZN_PI_D;
 		while (dbear < -HZN_PI_D) dbear += 2.0 * HZN_PI_D;
 
-		const double half_w = atan2((double)HZN_HALF_W, (double)ndist);
+		const double half_w = atan2((double)HZN_HALF_W_FROZEN, (double)ndist);
 		if (fabs(dbear) > half_w) continue;
+
+		// Past the cone. With the hysteresis disabled this is the population it would have
+		// been judging, so this is where its headroom is measured.
+		if (s_orc_drop_margin && (double)(dist - ndist) < s_margin_slack)
+			s_margin_slack = (double)(dist - ndist);
 
 		const double nelev = atan2((double)s_hzn_cols[c].top_y - (double)s_cam_y,
 		                           (double)ndist);
-		if (nelev >= elev) return true;
+		if (nelev >= elev) {
+			// With the near bail disabled, the closest candidate anything ever culls.
+			if (s_orc_drop_near && (double)dist < s_near_slack)
+				s_near_slack = (double)dist;
+			return true;
+		}
 	}
 	return false;
 }
@@ -171,6 +249,7 @@ static long s_dis_new_exact;    // the rewrite vs what the predicate means  -- m
 static long s_dis_ref_exact;    // shipped float angles vs what it means
 static long s_dis_ref_kept;     // of s_dis_ref_new, how many the rewrite KEEPS and ref culled
 static long s_true_ref;         // how many of the cases actually culled, in the reference
+static long s_dis_near;         // oracle with the near-camera bail dropped    -- must be 0
 static char s_dis_first[320];
 
 // The one assumption the rewrite makes that is not algebra: that ndist == 0.0f can only mean
@@ -207,6 +286,16 @@ static void compareAt(int cx, int cy, int cz)
 	if (ref) s_true_ref++;
 	if (now != exa) s_dis_new_exact++;
 	if (ref != exa) s_dis_ref_exact++;
+
+	// The two redundancy witnesses — see the comment above horizonHiddenExact. The
+	// drop-margin pass is run for its side effect on s_margin_slack, not for a verdict.
+	s_orc_drop_margin = 1;
+	(void)horizonHiddenExact(cx, cy, cz);
+	s_orc_drop_margin = 0;
+
+	s_orc_drop_near = 1;
+	if (horizonHiddenExact(cx, cy, cz) != exa) s_dis_near++;
+	s_orc_drop_near = 0;
 
 	if (ref != now) {
 		s_dis_ref_new++;
@@ -426,6 +515,31 @@ int main(void)
 	// rewrite is untested and this file is quietly lying about its coverage.
 	CHECK(s_zero_ndist > 0);
 
+	// A NAKED PIN on the production constant, written as a bare number on purpose. Every other
+	// claim in this file is a comparison between two implementations, and a comparison cannot
+	// see a constant that both sides read — which is exactly how a 0.35f -> 0.05f edit to
+	// chunk_render.c's HZN_HALF_W passed this suite 7/7 before today (see the note above
+	// horizonHiddenExact). 2.8f is CHUNK_DIM/2 * 0.35 at CHUNK_DIM 16, and it is the value the
+	// frozen reference and the frozen oracle are both written against, so if this goes red they
+	// are stale too and the ref-vs-new counts below mean nothing until it is resolved.
+	CHECK(HZN_HALF_W == 2.8f);
+
+	// The redundancy measurements. These do NOT cover horizonHidden's hysteresis and
+	// near-camera guards — nothing can, they cannot change an answer on a 16-block grid — they
+	// assert the headroom that makes them unreachable, so the day that stops being true this
+	// file says so instead of quietly staying green over two dead branches. Read the comment
+	// above horizonHiddenExact before touching any of these three.
+	CHECK(s_margin_slack < 1e299);      // it was measured at all, not left at its sentinel
+	CHECK(s_margin_slack > 1.0);        // ...and no cone-passer came within the 1.0f hysteresis
+	CHECK(s_dis_near == 0);             // the near bail never changed an answer
+
+	// s_near_slack is REPORTED and not asserted, on purpose. The obvious assertion —
+	// "nothing is ever culled closer than the bail radius CHUNK_DIM * 0.5" — turns out to be
+	// scale-invariant and therefore could never fail: the nearest cull is one column away,
+	// CHUNK_DIM, which is double the bail radius at every value of CHUNK_DIM. A check that
+	// cannot go red proves nothing, so the near bail's coverage is s_dis_near above, which
+	// IS live: widening the bail to CHUNK_DIM * 4.0f moved 26,663 cases.
+
 	// THE CLAIM. Not "the rewrite matches the old float code" — it does not, in a handful of
 	// cases out of hundreds of thousands, and the reason is in the report line below — but
 	// "the rewrite computes the predicate the old float code was TRYING to compute", judged
@@ -441,11 +555,25 @@ int main(void)
 	// safer of the two there.
 	CHECK(s_dis_ref_kept == s_dis_ref_new);
 
+	// ── The check count, pinned as a bare number, and it must stay LAST in main() ────────
+	//
+	// No suite in this project asserted its own check count until 2026-08-25, and that absence
+	// is what let a self-referential capacity check shrink a bound from 15 to 7, DELETE eight
+	// assertions, and still print "0 failed" (326 checks became 318). Any sabotage that shortens
+	// a loop bounded by a production constant removes checks instead of failing them, and the
+	// only thing that notices is a pinned total. 12 counts this line itself, because CHECK
+	// increments before it compares. If a new check is added, this number moves with it — that
+	// is the point, not a nuisance.
+	CHECK(s_checks == 12);
+
 	printf("horizon equivalence: %ld cases | ref-vs-new %ld | new-vs-exact %ld | "
 	       "ref-vs-exact %ld | of the ref-vs-new, %ld are the rewrite KEEPING a chunk the "
-	       "float code culled | %ld culled by the reference | %ld zero-distance blockers\n",
+	       "float code culled | %ld culled by the reference | %ld zero-distance blockers | "
+	       "half-width %.6g | hysteresis headroom %.6g blocks (guard bites at 1) | nearest cull "
+	       "%.6g blocks (bail radius %.6g) | near-guard witness %ld\n",
 	       s_cases, s_dis_ref_new, s_dis_new_exact, s_dis_ref_exact, s_dis_ref_kept,
-	       s_true_ref, s_zero_ndist);
+	       s_true_ref, s_zero_ndist, (double)HZN_HALF_W, s_margin_slack, s_near_slack,
+	       (double)((float)CHUNK_DIM * 0.5f), s_dis_near);
 	if (s_dis_first[0])
 		printf("horizon first ref-vs-new difference: %s\n", s_dis_first);
 

@@ -134,6 +134,17 @@ int main(void)
 	chunkRenderProfile(NULL, NULL, &builds_zero);
 	CHECK(builds_zero == 0);
 
+	// ── The check count, pinned as a bare number, and it must stay LAST in main() ────────
+	//
+	// No suite in this project asserted its own check count until 2026-08-25, and that absence
+	// is what let a self-referential capacity check elsewhere shrink a bound from 15 to 7,
+	// DELETE eight assertions, and still print "0 failed" (326 checks became 318). Any sabotage
+	// that shortens a loop bounded by a production constant removes checks instead of failing
+	// them, and the only thing that notices is a pinned total. 17 counts this line itself,
+	// because CHECK increments before it compares. If a check is added, this number moves with
+	// it — that is the point, not a nuisance.
+	CHECK(s_checks == 17);
+
 	if (s_fails == 0)
 		printf("profile reset self-test: PASS  %d checks\n", s_checks);
 	else
