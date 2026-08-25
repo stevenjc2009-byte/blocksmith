@@ -545,6 +545,109 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 "./$BH/session_test"
 
+# ---------------------------------------------------------------------------------------
+# build/atlas.t3x, the one input to this suite that git does not carry (v1.8.3).
+#
+# The atlas stanza below decodes build/atlas.t3x and asserts on its texels — that is the half
+# that checks the atlas's ART, and it is the half the v1.6.0 F7 defect lived in. But
+# build/atlas.t3x is a devkitPro build product, .gitignore:3 matches build/, and it is
+# therefore untracked. Two consequences, both measured on the tree as it stood before this
+# guard existed, on a frozen snapshot (a parallel session's in-flight files restored to HEAD
+# inside the snapshot only; the live tree was never touched):
+#
+#  1. A CLEAN CHECKOUT CANNOT PASS. With build/atlas.t3x removed:
+#     "atlas uv shader self-test: FAIL 1/4089  L1087 cannot open build/atlas.t3x - a build
+#     product (tex3ds, from gfx/atlas.t3s), not in git...". Note the TOTAL: 4089 against 4293
+#     with the file present. The 204 art checks do not fail, they cease to exist, so the count
+#     a reader compares against moves for a reason the failure line does not state.
+#
+#  2. WORSE: THE TEST VALIDATES WHATEVER t3x IS LYING AROUND. gfx/atlas.png patched — the sand
+#     tile's red channel raised by 32, which is four RGBA5551 quantisation steps, so the change
+#     survives the 5-bit channel (a one-step change does not; see the sand note in the atlas
+#     stanza) — and build/atlas.t3x deliberately NOT regenerated:
+#     "atlas uv shader self-test: PASS  4293 checks". Fully green, over an atlas that no longer
+#     exists. For scale, the correct t3x for that PNG is 2045 bytes against the 2033 on disk.
+#     This project has the lesson already: a diagnostic armed off disk inherits stale state.
+#
+# THE GUARD. tex3ds is deterministic — measured, two runs on the same input byte-identical, and
+# byte-identical again to the build/atlas.t3x that `make` had produced minutes earlier — so the
+# freshness question has an exact answer: rebuild the texture into this run's own scratch
+# directory and compare it with the artefact. That is a CONTENT test, not a presence test and
+# not an mtime test, and it needs no stamp file and no ritual anybody can forget.
+#
+# Rejected: having this script regenerate build/atlas.t3x in place. It is the Makefile's output
+# and a parallel console build may be writing it at that moment — the same shared-artefact
+# collision the BH="build-host/run-$$" comment at the top of this file exists for — and if the
+# two tex3ds invocations ever disagreed, the console would ship one texture while this suite
+# validated another. Rejected: a sha256 of gfx/atlas.png recorded in a stamp file beside the
+# artefact. Only the Makefile knows when the t3x is genuinely fresh, the Makefile is not this
+# script's to change, and a stamp this script writes itself can only ever bless whatever it
+# already found. Rejected: comparing mtimes. mtime is not content: a checkout, a copy or a
+# touch resets it, and `git archive` writes every file at the same instant.
+#
+# tex3ds is REQUIRED, not optional, and its absence is a loud failure rather than a skip. A
+# skip is how the situation above arose in the first place. Under WSL the binary found is
+# devkitPro's Windows tex3ds.exe through interop, and it is invoked from gfx/ with RELATIVE
+# paths on purpose: a Windows executable cannot resolve a WSL absolute path, and passing one
+# fails with "No such file or directory" while still exiting 0 on the tool's own terms.
+ATLAS_T3X="build/atlas.t3x"
+ATLAS_T3X_FRESH="$BH/atlas.expected.t3x"
+
+TEX3DS=""
+if command -v tex3ds >/dev/null 2>&1; then
+	TEX3DS="tex3ds"
+elif [ -n "$DEVKITPRO" ] && [ -x "$DEVKITPRO/tools/bin/tex3ds" ]; then
+	TEX3DS="$DEVKITPRO/tools/bin/tex3ds"
+elif [ -x /mnt/c/devkitPro/tools/bin/tex3ds.exe ]; then
+	TEX3DS="/mnt/c/devkitPro/tools/bin/tex3ds.exe"
+elif [ -x /c/devkitPro/tools/bin/tex3ds.exe ]; then
+	TEX3DS="/c/devkitPro/tools/bin/tex3ds.exe"
+fi
+
+if [ -z "$TEX3DS" ]; then
+	echo "atlas artefact guard: FAIL - tex3ds not found, so build/atlas.t3x cannot be checked" >&2
+	echo "  the atlas stanza below decodes that file and asserts on its TEXELS. Without tex3ds" >&2
+	echo "  this script cannot tell a fresh artefact from one left behind by an older build," >&2
+	echo "  and it will not guess: a green run over a stale atlas is the failure being guarded" >&2
+	echo "  against. Looked for: tex3ds on PATH, \$DEVKITPRO/tools/bin/tex3ds," >&2
+	echo "  /mnt/c/devkitPro/tools/bin/tex3ds.exe, /c/devkitPro/tools/bin/tex3ds.exe." >&2
+	echo "  Fix: install devkitPro, or set DEVKITPRO, then re-run." >&2
+	exit 1
+fi
+
+if ! ( cd gfx && "$TEX3DS" -i atlas.t3s -o "../$ATLAS_T3X_FRESH" ) >/dev/null 2>&1; then
+	echo "atlas artefact guard: FAIL - tex3ds ($TEX3DS) could not build gfx/atlas.t3s" >&2
+	echo "  this script rebuilds the texture into $ATLAS_T3X_FRESH purely to COMPARE it with" >&2
+	echo "  $ATLAS_T3X; it never writes into build/. Run it by hand to see the tool's own error:" >&2
+	echo "    cd gfx && $TEX3DS -i atlas.t3s -o /tmp/atlas.t3x" >&2
+	exit 1
+fi
+
+if [ ! -f "$ATLAS_T3X" ]; then
+	echo "atlas artefact guard: FAIL - $ATLAS_T3X is MISSING" >&2
+	echo "  it is a devkitPro build product (tex3ds, from gfx/atlas.t3s) and .gitignore:3" >&2
+	echo "  matches build/, so a fresh clone never has it. The atlas stanza below decodes it" >&2
+	echo "  and asserts on its texels; without it those ~204 art checks do not fail, they" >&2
+	echo "  silently cease to exist, and the suite's total drops from 4293 to 4089." >&2
+	echo "  Fix: run a console build from devkitPro's MSYS2 shell, from the repository root:" >&2
+	echo "    /c/devkitPro/msys2/usr/bin/bash.exe -lc 'cd \"\$PWD\" && make'" >&2
+	exit 1
+fi
+
+if ! cmp -s "$ATLAS_T3X" "$ATLAS_T3X_FRESH"; then
+	echo "atlas artefact guard: FAIL - $ATLAS_T3X is STALE" >&2
+	echo "  it is NOT what gfx/atlas.t3s and gfx/atlas.png produce today, so every texel check" >&2
+	echo "  in the atlas stanza below would be asserting against an atlas the game no longer" >&2
+	echo "  has. Rebuilt for comparison with: $TEX3DS" >&2
+	echo "  on disk : $(wc -c < "$ATLAS_T3X") bytes" >&2
+	echo "  expected: $(wc -c < "$ATLAS_T3X_FRESH") bytes" >&2
+	echo "  Fix: run a console build from devkitPro's MSYS2 shell, from the repository root:" >&2
+	echo "    /c/devkitPro/msys2/usr/bin/bash.exe -lc 'cd \"\$PWD\" && make'" >&2
+	exit 1
+fi
+
+echo "atlas artefact guard: build/atlas.t3x matches a fresh tex3ds build of gfx/atlas.t3s"
+
 # The whole atlas layout: both shaders' uvScale constants against source/world/atlas_uv.h,
 # atlasRect()'s geometry, and gfx/atlas.png's own IHDR dimensions. The original guard existed
 # because step 9.3c left world.v.pica at 1/256 after the atlas shrank from 256x256 to 64x64,
@@ -579,7 +682,10 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 # build/atlas.t3x — LZ11, then the PICA200's 8x8-tile Morton swizzle — and asserts on texel
 # values. NOTE: build/atlas.t3x is a build product and is gitignored, so this stanza needs a
 # console build to have run ("make" from devkitPro MSYS2). Its absence is a loud FAIL here, not
-# a skip: skipping would leave the atlas's art unchecked, which is where the defect lived.
+# a skip: skipping would leave the atlas's art unchecked, which is where the defect lived. Since
+# v1.8.3 that absence is caught EARLIER, by the artefact guard above this comment, which also
+# catches the case this stanza cannot see at all: a t3x that opens perfectly well and is simply
+# from a different build. The in-test failure stays as the backstop.
 #
 # The decoder was cross-checked against gfx/atlas.png with an independent Python decoder before
 # any golden was pinned: all 4096 texels matched with no vertical flip and all 4096 mismatched
