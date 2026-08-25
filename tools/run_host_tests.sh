@@ -1627,6 +1627,38 @@ rm -rf "$BHW"
 # requested change, not a regression, so testSourceUnchanged asserts the NEW height rather than
 # the v1.7.1 bytes. Only the terrain world is still pinned to v1.7.1. Do not "restore" the
 # sources pin -- re-flattening the surface is the thing this suite now exists to catch.
+# ── v1.8.2, testLevelChain: the pair test's blind spot ───────────────────────────────────────
+#
+# 69 checks -> 74, one new probe (testLevelChain), no other probe touched and no pin re-derived.
+#
+# testLevelBoundary is exhaustive over TWO cells and structurally blind to anything that needs
+# three: a greedy run's state carried from one step into the next, or an off-by-one that
+# compounds along a slope. The only 3+ fixture in the suite was testPinnedGeometry's staircase,
+# guarded by a face count and a hash -- which say "a byte moved" and never which boundary moved
+# it. That matters more than usual because the shelf cannot be PHOTOGRAPHED: water is unplaceable
+# in this build (BLOCK_WATER == BLOCK_COUNT, inventoryCanHold refuses it, there is no bucket), so
+# this suite is the only evidence the behaviour works at all.
+#
+# testLevelChain builds a real spreading shelf -- levels 7,6,5,4,3,2,1 side by side along +X at
+# y = 8, z = 8, drawn drops 1..7 -- and puts all six internal boundaries through the same three
+# assertions the pair test uses: exactly one wall quad on the plane, spanning the floor to the
+# TALLER neighbour, and no quad covering cells on both sides of it. That last one is the check
+# that reaches the gap. With seven DISTINCT heights no merge along X is legal, so a quad
+# straddling a boundary plane is a run that swallowed a step.
+#
+# The arm, against real production source: mergeCandidate's drop-equality test in
+# world/mesher.c:473 (`if (cellDrop(nb) != drop) return false;`) relaxed to "within 1 eighth", so
+# adjacent-by-one levels wrongly merge -> "FAILED - 4 of 74 checks", and inside the new probe
+# "FAIL   line 728: no quad spans a step: a run that swallowed one would flatten a visible
+# boundary", with "...first offending plane: x = 2". Note WHICH check went red: the count and
+# span checks stayed green, because a 1-wide chain's x-facing walls merge along Z where there is
+# nothing to merge with -- the swallowed step surfaces in the FLOORS and the z-facing walls
+# instead, and only the straddle check can see it. The rest of that arm's damage landed on
+# testNoGapAtTheColumn (line 452) and the staircase's face count and hash (lines 850, 853).
+#
+# Control green in BOTH arms: "control: plain terrain meshes to the 88 faces and the bytes it did
+# before v1.8.2" (faces=88 hash=0x9f47e02f). Terrain is all drop 0, so the relaxed test is a
+# no-op on it -- which is what makes the red arm a statement about water and not about the build.
 BHWM="build-host/run-$$-watermesh"
 mkdir -p "$BHWM"
 

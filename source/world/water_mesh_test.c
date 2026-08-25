@@ -35,6 +35,11 @@
 //                          side emits EXACTLY ONE quad on the plane between them, spanning
 //                          the floor to the TALLER of the two surfaces, so the step in the
 //                          surface is walled and no hole is left. Equal levels emit none.
+//   testLevelChain       - the same three assertions, but on a CHAIN of seven falling levels
+//                          rather than on a pair. Everything above it is two cells wide, so a
+//                          run's state carried from one step into the next has nowhere to show;
+//                          the only 3+ fixture in the file is the hashed staircase, and a hash
+//                          says "a byte moved" without saying which boundary moved it.
 //   testNoMergeAcrossLevels - a greedy run may not swallow a cell of a different height. One
 //                          quad cannot be two heights, and a merge that ignored the drop
 //                          would flatten a visible step with the face count still perfect.
@@ -651,6 +656,80 @@ static void testLevelBoundary(void)
 	      "level 6 beside level 3: one wall, topped at 6/8, hiding the 3/8 cell behind it");
 }
 
+// The chain, and the gap testLevelBoundary above structurally cannot reach. That test is
+// exhaustive over TWO cells and blind to everything that only appears in three or more: greedy
+// state carried from one step into the next, or an off-by-one that compounds along a slope. The
+// only fixture in this file with three or more heights in a row is testPinnedGeometry's
+// staircase, and that is guarded by a total face count and a hash — which say "some byte moved",
+// never which boundary moved it.
+//
+// So: a real spreading shelf, levels 7,6,5,4,3,2,1 side by side along +X at y = 8, z = 8, with
+// every one of its six internal boundaries put through the same three assertions the pair test
+// uses. Their drawn drops are 1..7, all distinct — which is what makes the straddle check sharp.
+// With no two neighbours at the same height, mergeCandidate must refuse every merge along X, so
+// NO quad in this fixture may cover more than one cell in X. A quad that spans a boundary plane
+// is a run that swallowed a step, and a two-cell fixture has no run to carry.
+static void testLevelChain(void)
+{
+	puts("water mesh: a chain of seven falling levels is walled at every step");
+
+	msReset();
+	for (int i = 0; i < 7; i++) msWater(1 + i, 8, 8, 7 - i);
+	runMesh();
+	collectQuads();
+
+	// The fixture's own precondition. Seven cells, seven different drawn heights: if any two
+	// neighbours came out equal, the boundary between them would legitimately draw nothing and
+	// the count check below would pass without having been asked anything.
+	int distinct_ok = 1;
+	for (int i = 0; i < 7; i++)
+		for (int j = i + 1; j < 7; j++)
+			if (wantDrop(7 - i) == wantDrop(7 - j)) distinct_ok = 0;
+	CHECK(distinct_ok, "control: the chain really is seven DIFFERENT heights, 1/8 through 7/8");
+
+	int bad_count = 0, bad_span = 0, straddling = 0;
+	int first_plane = -1;
+
+	for (int j = 0; j < 6; j++) {
+		const int plane = 2 + j;              // between cell x = 1+j and cell x = 2+j
+		const int da    = wantDrop(7 - j);    // the uphill cell
+		const int db    = wantDrop(6 - j);    // the downhill one
+		const int want  = da < db ? da : db;  // topped at the TALLER surface, i.e. the smaller drop
+
+		int walls = 0;
+		for (int i = 0; i < g_qn; i++) {
+			const Quad* q = &g_q[i];
+
+			// Covers cells on BOTH sides of this plane. Only a merged run can, and with seven
+			// distinct heights no merge along X is legal, so this is a flattened step.
+			if (q->x_lo < plane && q->x_hi > plane) {
+				straddling++;
+				if (first_plane < 0) first_plane = plane;
+				continue;
+			}
+
+			if (q->x_lo != plane || q->x_hi != plane) continue;
+			walls++;
+			if (q->y_lo != 8 || q->y_hi != 9 || q->drop_top != want) {
+				bad_span++;
+				if (first_plane < 0) first_plane = plane;
+			}
+		}
+
+		if (walls != 1) { bad_count++; if (first_plane < 0) first_plane = plane; }
+	}
+
+	if (first_plane >= 0) printf("  ...first offending plane: x = %d\n", first_plane);
+
+	CHECK(bad_count == 0,
+	      "each of the chain's six steps is walled by exactly one quad, never zero");
+	CHECK(bad_span == 0,
+	      "and each runs floor to the TALLER neighbour, the same span the pair test demands");
+	CHECK(straddling == 0,
+	      "no quad spans a step: a run that swallowed one would flatten a visible boundary");
+	CHECK(quadsConsistent(), "and no quad in the chain has corners that disagree");
+}
+
 static void testNoMergeAcrossLevels(void)
 {
 	puts("water mesh: a greedy run stops where the height changes");
@@ -996,6 +1075,7 @@ int main(void)
 	testLevelHeights();
 	testFallingIsFull();
 	testLevelBoundary();
+	testLevelChain();
 	testNoMergeAcrossLevels();
 	testPinnedGeometry();
 	testFillScratch();
