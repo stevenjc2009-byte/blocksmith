@@ -386,6 +386,92 @@ check-world-drift:
 	fi; \
 	echo "world mirror: $$n file(s) in $(WORLD_VENDOR) match $(WORLD_SRC) byte for byte"
 
+# ------------------------------------------------------- diff-store capacity guard
+#
+# net/blockdiff.h's BLOCKDIFF_MAX_PENDING (65536) and the server's BS_DIFF_MAX
+# (deps/blocksmith-server/game/diffstore.h, 131072) are deliberately NOT equal:
+# the server's b95f980 raised its own cap precisely so the two ceilings could
+# come apart, per-column CHUNK_SUB having removed the coupling that forced this
+# console's inbox to be as large as the server's whole store. So this guard does
+# NOT check that they match. Making them match is the wrong fix, and this target
+# must never be "fixed" by editing BLOCKDIFF_MAX_PENDING to whatever the server
+# happens to say today.
+#
+# What it checks is that the server value the client's REASONING was written
+# against is still the server value on disk. blockdiff.h records it as
+# BLOCKDIFF_SERVER_DIFF_MAX and spends a long comment on what the gap costs,
+# measured: "replayed 131072, accepted 65536, refused 65536". Every one of those
+# numbers is true only for a particular BS_DIFF_MAX. If the server moves again,
+# that comment silently becomes fiction again — which is exactly what happened
+# between b95f980 and now: the old comment asserted the server was 65536 and
+# that a join sync therefore "can never overflow this store at all", and nothing
+# noticed, for the same reason nothing ever notices prose.
+#
+# Shape taken from check-proto-drift and check-world-drift above rather than
+# inventing a third mechanism: phony target, reports and never mutates, wired
+# into `all` so it runs on every build instead of only on a fresh clone.
+#
+# It reads the header's TEXT rather than asserting in C, because a
+# _Static_assert cannot see both values. diffstore.h is a server GAME header,
+# not the shared wire contract in proto/bs_proto.h, and it is on no client
+# build's include path. Measured, not assumed:
+#   gcc -E -dM -I source -I deps/blocksmith-server   over a TU that includes
+#   net/blockdiff.h reports BS_DIFF_MAX in 0 lines, with or without the deps -I.
+# bs_proto.h does mention BS_DIFF_MAX, but only in prose explaining why
+# CHUNK_SUB exists; it defines nothing, so including it would not help either.
+DIFFSTORE_H	:=	$(PROTO)/game/diffstore.h
+BLOCKDIFF_H	:=	source/net/blockdiff.h
+
+.PHONY: check-diffcap-drift
+check-diffcap-drift:
+	@if [ ! -e $(DIFFSTORE_H) ]; then \
+		echo "Makefile: $(DIFFSTORE_H) is not there."; \
+		echo "  deps/blocksmith-server has not been fetched, so the server's diff-store"; \
+		echo "  capacity cannot be read and net/blockdiff.h's recorded copy of it cannot"; \
+		echo "  be checked. This guard FAILS rather than skips: a check that passes when"; \
+		echo "  it had nothing to check is not a check, which is the same stance"; \
+		echo "  check-world-drift above takes on the same missing clone."; \
+		echo "  fetch it with:  make deps"; \
+		exit 1; \
+	fi; \
+	srv=`sed -n 's/^[[:space:]]*#define[[:space:]][[:space:]]*BS_DIFF_MAX[[:space:]][[:space:]]*\([0-9][0-9]*\).*$$/\1/p' $(DIFFSTORE_H) | head -1`; \
+	cli=`sed -n 's/^[[:space:]]*#define[[:space:]][[:space:]]*BLOCKDIFF_SERVER_DIFF_MAX[[:space:]][[:space:]]*\([0-9][0-9]*\).*$$/\1/p' $(BLOCKDIFF_H) | head -1`; \
+	if [ -z "$$srv" ]; then \
+		echo "Makefile: cannot read BS_DIFF_MAX out of $(DIFFSTORE_H)."; \
+		echo "  no '#define BS_DIFF_MAX <number>' line matched, so that header's shape"; \
+		echo "  changed and this guard no longer knows what it is comparing. The build"; \
+		echo "  stops rather than compare nothing."; \
+		echo "  re-point the sed in check-diffcap-drift at wherever the value now lives."; \
+		exit 1; \
+	fi; \
+	if [ -z "$$cli" ]; then \
+		echo "Makefile: cannot read BLOCKDIFF_SERVER_DIFF_MAX out of $(BLOCKDIFF_H)."; \
+		echo "  that macro is this client's record of the server capacity its pending-diff"; \
+		echo "  store was reasoned against. Without it there is nothing to check against,"; \
+		echo "  so the build stops rather than pass having compared nothing."; \
+		exit 1; \
+	fi; \
+	if [ "$$srv" != "$$cli" ]; then \
+		echo "Makefile: the server's diff-store capacity has moved."; \
+		echo "  $(DIFFSTORE_H): BS_DIFF_MAX               = $$srv"; \
+		echo "  $(BLOCKDIFF_H): BLOCKDIFF_SERVER_DIFF_MAX = $$cli"; \
+		echo ""; \
+		echo "  DO NOT fix this by changing BLOCKDIFF_MAX_PENDING to match. The two caps"; \
+		echo "  are deliberately different - see blockdiff.h and the server's b95f980."; \
+		echo "  What has gone stale is the client's RECORD of the server number, and the"; \
+		echo "  measured overflow figures in blockdiff.h's comment that depend on it."; \
+		echo ""; \
+		echo "  to fix, in this order:"; \
+		echo "    1. re-read blockdiff.h's capacity comment and decide whether the gap is"; \
+		echo "       still the right call at the new server number;"; \
+		echo "    2. update BLOCKDIFF_SERVER_DIFF_MAX to $$srv;"; \
+		echo "    3. re-run the host suite so test_server_replay_overflow re-measures"; \
+		echo "       against it, and paste its new [measured] line into that comment:"; \
+		echo "         tools/run_host_tests.sh"; \
+		exit 1; \
+	fi; \
+	echo "diff-store caps: server BS_DIFF_MAX = $$srv, client records $$cli (client's own cap stays smaller, deliberately)"
+
 $(HYDRO)/hydrogen.h:
 	@mkdir -p deps
 	git clone -q $(HYDRO_REPO) $(HYDRO)
@@ -525,7 +611,7 @@ endif
 # hang it off as well (the host suites run from tools/run_host_tests.sh, not
 # from make), which is the one asymmetry with check-world-drift's `all: test:`
 # pair on the server side.
-all: check-proto-drift check-world-drift $(BUILD) $(GFXBUILD) $(DEPSDIR) $(ROMFS_T3XFILES) $(T3XHFILES)
+all: check-proto-drift check-world-drift check-diffcap-drift $(BUILD) $(GFXBUILD) $(DEPSDIR) $(ROMFS_T3XFILES) $(T3XHFILES)
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
 
 #---------------------------------------------------------------------------------

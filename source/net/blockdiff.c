@@ -6,7 +6,7 @@
 //
 // Every entry lives in exactly one singly-linked chain, threaded through BlockDiffEntry.next:
 // either the chain for the column-hash bucket its coordinate falls in, or the free list. That
-// is the whole reason BLOCKDIFF_MAX_PENDING can be 65536 (matching the server) instead of the
+// is the whole reason BLOCKDIFF_MAX_PENDING can be 65536 at all, instead of the
 // 256 it used to be. The previous implementation scanned all BLOCKDIFF_MAX_PENDING slots twice
 // per record() and once per drain(); at 65536 slots, absorbing a full join sync would have been
 // on the order of 4.3 billion integer comparisons — the console would simply have stopped.
@@ -90,8 +90,14 @@ bool blockdiffRecord(BlockDiffStore* s, int x, int y, int z, BlockId id)
 	// refusal rather than freeing something else to make room, and worldColumnCreate()
 	// returns NULL when the column table is full rather than evicting a live column.
 	//
-	// With the cap now matching the server's BS_DIFF_MAX this should be unreachable in
-	// practice: the server cannot hold, and so cannot replay, more diffs than fit here.
+	// This IS reachable, and measurably so — do not read the refusal path as dead code. The
+	// server's BS_DIFF_MAX is 131072, twice BLOCKDIFF_MAX_PENDING, and a legacy full-dump
+	// WORLD_SYNC replays all of it in one burst. blockdiff_test.c's
+	// test_server_replay_overflow measures the outcome: "replayed 131072, accepted 65536,
+	// refused 65536". An earlier version of this comment asserted the opposite ("the server
+	// cannot hold, and so cannot replay, more diffs than fit here") on the strength of a cap
+	// match that had already stopped being true. See blockdiff.h for the whole picture,
+	// including why the answer is not to grow this array.
 	if (s->count >= BLOCKDIFF_MAX_PENDING) {
 		s->refusals++;
 		return false;

@@ -267,6 +267,106 @@ static void test_capacity(void)
     blockdiffFree(&s);
 }
 
+/* ------------------------------------- the client/server capacity gap ---------------------- */
+/* What a legacy full-dump WORLD_SYNC of the SERVER's whole diff store actually does to this
+ * store, measured rather than reasoned about.
+ *
+ * Why this is not already covered by test_capacity() above: that test drives the store to
+ * BLOCKDIFF_MAX_PENDING and one past it, which proves the refusal POLICY (refuse, do not
+ * evict, count it). It says nothing about the number that matters operationally, which is how
+ * far past the cap a real server can push this store in one burst. The server's BS_DIFF_MAX is
+ * 131072 — twice BLOCKDIFF_MAX_PENDING — and send_world_sync() (bsgame.c) replays every diff it
+ * holds, oldest first, in back-to-back BS_APP_WORLD_SYNC batches, with no flow control and no
+ * way for this side to say stop.
+ *
+ * That burst is reachable in ordinary play, not only in some contrived race. The server falls
+ * back to it for any player who has not sent a CHUNK_SUB within BS_CHUNK_LEGACY_GRACE_MS (500
+ * ms) of joining (bsgame.c tick()), and this client's JOIN completes on the TITLE SCREEN
+ * (networld.h's PLAYER_STATE comment) while its first CHUNK_SUB cannot be sent until a column
+ * is live in the World (main.c genInstallOne()) — which is after the player has finished with
+ * the title screen and worldgen has produced a column. See this suite's report for why the 500
+ * ms figure itself is the one thing here that cannot be measured off hardware.
+ *
+ * The loss is recoverable — handle_chunk_sub() answers every subscription with that column's
+ * diffs unconditionally, so anything refused here comes back when the player walks to it — but
+ * "recoverable" is a claim about the SERVER's behaviour, not this store's. What this store owes
+ * the caller is an honest count of what it turned away, which is what the checks below pin. */
+static void test_server_replay_overflow(void)
+{
+    puts("a legacy full-dump WORLD_SYNC of the server's whole store overflows this one");
+
+    /* Structural facts first. These are the CONTROL for this file's red arms: they are
+     * properties of the entry layout, not of the capacity or refusal logic, so a sabotage of
+     * blockdiffRecord()'s cap handling must leave them green. Printed as real numbers because
+     * blockdiff.h's own cost comment asserts them. */
+    printf("    [measured] sizeof(BlockDiffEntry) = %zu bytes\n", sizeof(BlockDiffEntry));
+    printf("    [measured] entry[] at BLOCKDIFF_MAX_PENDING (%d) = %zu bytes (%.2f MB)\n",
+           BLOCKDIFF_MAX_PENDING,
+           sizeof(BlockDiffEntry) * (size_t)BLOCKDIFF_MAX_PENDING,
+           (double)(sizeof(BlockDiffEntry) * (size_t)BLOCKDIFF_MAX_PENDING) / (1024.0 * 1024.0));
+    printf("    [measured] entry[] at BLOCKDIFF_SERVER_DIFF_MAX (%u) would be %zu bytes (%.2f MB)\n",
+           (unsigned)BLOCKDIFF_SERVER_DIFF_MAX,
+           sizeof(BlockDiffEntry) * (size_t)BLOCKDIFF_SERVER_DIFF_MAX,
+           (double)(sizeof(BlockDiffEntry) * (size_t)BLOCKDIFF_SERVER_DIFF_MAX) / (1024.0 * 1024.0));
+    printf("    [measured] whole BlockDiffStore = %zu bytes (%.2f MB)\n",
+           sizeof(BlockDiffStore), (double)sizeof(BlockDiffStore) / (1024.0 * 1024.0));
+
+    check(sizeof(BlockDiffEntry) == 16,
+          "CONTROL: BlockDiffEntry is exactly 16 bytes, as blockdiff.h's cost figure assumes");
+    check(sizeof(BlockDiffEntry) * (size_t)BLOCKDIFF_MAX_PENDING == 1048576u,
+          "CONTROL: the entry array is exactly the 1 MB blockdiff.h claims");
+
+    check(BLOCKDIFF_SERVER_DIFF_MAX > (unsigned)BLOCKDIFF_MAX_PENDING,
+          "the server can hold strictly more diffs than this store can — the gap is real");
+
+    static BlockDiffStore s;
+    blockdiffInit(&s);
+
+    /* Replay BLOCKDIFF_SERVER_DIFF_MAX diffs oldest-first, exactly as send_world_sync() walks
+     * the server's store. One per column so nothing collapses via latest-write-wins, which is
+     * the worst case and also the realistic one for a world built out over many sessions. */
+    int accepted = 0;
+    for (unsigned i = 0; i < BLOCKDIFF_SERVER_DIFF_MAX; i++) {
+        if (blockdiffRecord(&s, (int)i * 16, 10, 0, BLOCK_STONE)) accepted++;
+    }
+
+    const unsigned expect_refused = BLOCKDIFF_SERVER_DIFF_MAX - (unsigned)BLOCKDIFF_MAX_PENDING;
+    printf("    [measured] replayed %u, accepted %d, refused %d\n",
+           (unsigned)BLOCKDIFF_SERVER_DIFF_MAX, accepted, blockdiffRefusals(&s));
+
+    check(accepted == BLOCKDIFF_MAX_PENDING,
+          "exactly BLOCKDIFF_MAX_PENDING of the server's replay were accepted");
+    check((unsigned)blockdiffRefusals(&s) == expect_refused,
+          "every diff past the cap was REFUSED and COUNTED — the store does not lose them quietly");
+    check(blockdiffCount(&s) == BLOCKDIFF_MAX_PENDING,
+          "CONTROL: the store holds exactly its capacity, nothing was evicted to make room");
+
+    /* Now name the blocks. The oldest edit in the replay must have survived; a late one must
+     * be provably gone. Reading back a specific coordinate is the point — a refusal count on
+     * its own does not tell a player WHICH of their blocks is missing. */
+    const int oldest_x = 0;
+    const int newest_x = (int)(BLOCKDIFF_SERVER_DIFF_MAX - 1u) * 16;
+
+    static struct applied_log oldest_log; oldest_log.n = 0;
+    const int oldest_drained = blockdiffDrain(&s, oldest_x >> 4, 0, logApply, &oldest_log);
+    check(oldest_drained == 1 && loggedContains(&oldest_log, oldest_x, 10, 0, BLOCK_STONE),
+          "CONTROL: the OLDEST edit of the replay survived and drains back as the block it was");
+
+    static struct applied_log newest_log; newest_log.n = 0;
+    const int newest_drained = blockdiffDrain(&s, newest_x >> 4, 0, logApply, &newest_log);
+    printf("    [measured] block at x=%d (column %d): drained %d, applied %d\n",
+           newest_x, newest_x >> 4, newest_drained, newest_log.n);
+
+    check(newest_drained == 0,
+          "the NEWEST edit of the replay is GONE — nothing pending for its column at all");
+    check(newest_log.n == 0,
+          "and the apply callback was never invoked for it, so no world would ever receive it");
+    check(!loggedContains(&newest_log, newest_x, 10, 0, BLOCK_STONE),
+          "read-back confirms it: the block the server replayed last is not in this store");
+
+    blockdiffFree(&s);
+}
+
 static void test_drain_empties_store(void)
 {
     puts("drain leaves the store empty");
@@ -313,7 +413,19 @@ int main(void)
     test_columns_stay_separate();
     test_y_bounds();
     test_capacity();
+    test_server_replay_overflow();
     test_drain_empties_store();
+
+    /* Latched BEFORE the pin's own check() runs, because check() increments g_checks: read
+     * after, the pin would be comparing against a total that includes itself and would have to
+     * be written one higher than the number of real checks, which is exactly the off-by-one
+     * that makes a pin useless to reason about. `ran` is the count of everything above.
+     *
+     * The pin exists because this project's signature failure is a green suite over a broken
+     * feature: a check silently DELETED still leaves "PASS", just with a smaller total, and
+     * nobody reads a total they were not given something to compare against. */
+    const int ran = g_checks;
+    check(ran == 80, "check-count pin: 80 checks ran (update deliberately, never to go green)");
 
     printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;
