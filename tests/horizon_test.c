@@ -26,6 +26,15 @@
 // The reference below is the OTHER half of that trade and it IS a copy — a frozen verbatim
 // transcript of the pre-49h implementation, which by definition no longer exists in the tree.
 // A reference oracle is allowed to be a copy; the code under test is not.
+//
+// 2026-08-25, THE ONE HOLE THE AUDIT LEFT OPEN AND THIS SECOND PASS CLOSES. Everything above
+// is about whether horizonHidden() COMPUTES the right answer. Nothing anywhere asserted that
+// the renderer still ASKS it. The extraction pulls the function out by its signature and this
+// file drives it directly, so deleting the renderer's one call — the chunk cull would simply
+// stop rejecting hidden chunks, silently drawing every column behind a hill again — left this
+// suite and tests/profile_reset_test.c both fully green: neither of them goes anywhere near
+// the caller. testTheRendererStillCallsIt() below is the fix; see its own header for how it
+// reads the caller and why it reads it the way it does.
 #ifndef __3DS__
 
 #include <math.h>
@@ -40,10 +49,16 @@ static int  s_checks;
 static int  s_fails;
 static char s_first[200];
 
+// Prints EVERY failure, not only the first. s_first still carries the first one for the
+// summary line, but a red arm has to be readable case by case: a run that reports one line
+// out of several cannot be used to tell a check that failed from a check that was quietly
+// neutralised, and telling those two apart is the whole job here. Same reporting rule as
+// world/water_alpha_test.c's CHECK.
 #define CHECK(cond) do {                                                          \
 		s_checks++;                                                                \
 		if (!(cond)) {                                                             \
 			s_fails++;                                                             \
+			printf("  FAIL L%d  %s\n", __LINE__, #cond);                           \
 			if (!s_first[0])                                                       \
 				snprintf(s_first, sizeof(s_first), "L%d %.170s", __LINE__, #cond); \
 		}                                                                          \
@@ -493,10 +508,260 @@ static void sweepFuzz(int rounds)
 	}
 }
 
+// ── Is the renderer still asking? ───────────────────────────────────────────────────────
+//
+// Everything above this line drives the extracted function directly, so all of it stays green
+// if scene/chunk_render.c's cull loop stops consulting the function at all. That is not a
+// hypothetical: the loop is four lines inside an #if, and deleting them costs nothing at build
+// time — the extraction anchors on the DEFINITION, so the function still compiles, still gets
+// tested here, and still has every one of its answers agree with the oracle. It just would not
+// be asked any of the questions. Chunks behind a hill would go back to being drawn, at the cost
+// this cull was written to avoid, and the two suites that mention the horizon (this one and
+// tests/profile_reset_test.c) would both report PASS.
+//
+// So the caller is asserted over its SOURCE TEXT. chunk_render.c includes <3ds.h> and
+// <citro3d.h> and cannot be compiled on the host, which is the same wall the extraction exists
+// to get around, and there is no other way to observe the call. The idiom is the one
+// world/water_alpha_test.c and world/atlas_uv_shader_test.c already use for the .pica files and
+// for the renderer's blend state: whitespace-squashed lines, needles that name a WHOLE
+// statement including its operands, an ordering assertion between the anchors, and a parse that
+// cannot fail quietly — a file that will not open, or a needle that finds nothing, is a loud
+// failure and never a skip. Anyone changing this should read c9df134 first.
+//
+// TWO THINGS A NAIVE strstr-OVER-SOURCE CHECK GETS WRONG, both of which have already cost this
+// project a green run today, and both of which are handled in loadSource() below:
+//
+//   PROSE.  strstr cannot tell code from a comment. A red arm elsewhere today went green for a
+//           reason nobody planned — the sabotaging agent's own comment restated the expression
+//           the needle was hunting for, so deleting the code left the needle satisfied by the
+//           note about deleting the code. loadSource() therefore CUTS // comments off every
+//           line before anything is searched, quote-aware so a literal is not mistaken for one.
+//           chunk_render.c contains no /* */ at all (measured: zero occurrences on 2026-08-25),
+//           so that is the whole of the comment syntax the file actually uses. Belt and braces,
+//           every needle below is also asserted to match EXACTLY ONCE, so a second copy of the
+//           text anywhere — prose or code — is itself a failure.
+//
+//   WRAPS.  a needle can only describe one physical line, so a call reformatted across two
+//           lines is half-unchecked by construction and the unchecked half fails silently. That
+//           is precisely how the renderer's blending call hid a GPU_ONE, GPU_ZERO for a
+//           release. loadSource() joins a statement whose parentheses are still open onto the
+//           following lines, so a needle naming a whole call keeps working whatever column the
+//           arguments end up in.
+//
+// It also drops blank and comment-only lines from the array while keeping each entry's real
+// physical line number for reporting, so "the next line" means the next line of CODE. The two
+// lines after the call are checked that way: the call is only load-bearing if the branch it
+// guards both counts the rejection and skips the chunk.
+//
+// The verbatim needles live here, in a file nothing in the tree greps or parses. Every comment
+// about them describes the line instead of restating it, for the PROSE reason above: a note in
+// the searched file that spells the needle out is indistinguishable from the code.
+
+#define RENDERER_PATH     "source/scene/chunk_render.c"
+
+#define HZN_DEF_NEEDLE    "static bool horizonHidden(int cx, int cy, int cz)"
+#define CULLFRAME_NEEDLE  "static void cullFrame(const C3D_Mtx* view)"
+#define DRAW_NEEDLE       "void chunkRenderDraw(const C3D_Mtx* view)"
+#define HZN_CALL_NEEDLE   "if (horizonHidden(s->cx, s->cy, s->cz)) {"
+#define HZN_COUNT_NEEDLE  "s_horizon_culled++;"
+#define HZN_SKIP_NEEDLE   "continue;"
+
+#define SRC_MAX_ENTRIES 6000
+#define SRC_MAX_ENTRY   1024
+#define SRC_MAX_JOIN    8      // physical lines one open-parens statement may swallow
+
+static char s_src[SRC_MAX_ENTRIES][SRC_MAX_ENTRY];
+static int  s_src_at[SRC_MAX_ENTRIES];   // 1-based physical line each entry starts on
+static int  s_src_n;
+
+// Truncates `s` at an unquoted //. Character and string literals are tracked so that a path or
+// a URL inside quotes survives; chunk_render.c has one such line (an include with a trailing
+// note) and it must keep its code half.
+static void stripComment(char* s)
+{
+	bool in_str = false, in_chr = false;
+	for (char* p = s; *p; p++) {
+		if (in_str) {
+			if (*p == '\\' && p[1]) p++;
+			else if (*p == '"') in_str = false;
+			continue;
+		}
+		if (in_chr) {
+			if (*p == '\\' && p[1]) p++;
+			else if (*p == '\'') in_chr = false;
+			continue;
+		}
+		if (*p == '"') { in_str = true; continue; }
+		if (*p == '\'') { in_chr = true; continue; }
+		if (*p == '/' && p[1] == '/') { *p = '\0'; return; }
+	}
+}
+
+// Every run of whitespace becomes one space and the ends are trimmed, so a needle is never
+// checking the file's indentation or its column alignment. Same helper, same reason, as
+// world/water_alpha_test.c's.
+static void squash(const char* in, char* out, size_t cap)
+{
+	size_t o = 0;
+	bool   sp = false;
+	for (const char* p = in; *p && o + 1 < cap; p++) {
+		if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') { sp = (o > 0); continue; }
+		if (sp) { out[o++] = ' '; sp = false; }
+		if (o + 1 < cap) out[o++] = *p;
+	}
+	out[o] = '\0';
+}
+
+// Running parenthesis balance of `s` starting from `depth`, ignoring anything inside a literal.
+static int parenDepth(const char* s, int depth)
+{
+	bool in_str = false, in_chr = false;
+	for (const char* p = s; *p; p++) {
+		if (in_str) {
+			if (*p == '\\' && p[1]) p++;
+			else if (*p == '"') in_str = false;
+			continue;
+		}
+		if (in_chr) {
+			if (*p == '\\' && p[1]) p++;
+			else if (*p == '\'') in_chr = false;
+			continue;
+		}
+		if (*p == '"') { in_str = true; continue; }
+		if (*p == '\'') { in_chr = true; continue; }
+		if (*p == '(') depth++;
+		else if (*p == ')' && depth > 0) depth--;
+	}
+	return depth;
+}
+
+// Returns the number of code entries read, or -1 if the file could not be opened. -1 is turned
+// into a failure by the caller; it is never read as "no lines, therefore nothing to complain
+// about". Preprocessor lines never join: an #if whose condition uses a macro call would
+// otherwise drag the code after it into one entry.
+static int loadSource(const char* path)
+{
+	FILE* f = fopen(path, "r");
+	if (!f) return -1;
+
+	s_src_n = 0;
+	char raw[4096], one[SRC_MAX_ENTRY];
+	int  phys = 0, joined = 0;
+	bool joining = false;
+
+	while (s_src_n < SRC_MAX_ENTRIES && fgets(raw, sizeof raw, f)) {
+		phys++;
+		stripComment(raw);
+		squash(raw, one, sizeof one);
+		if (one[0] == '\0') continue;
+
+		if (joining && joined < SRC_MAX_JOIN) {
+			// Appended by hand rather than with snprintf: the entry is a fixed buffer and
+			// truncating it silently is the one outcome this file must not have, so the copy
+			// stops at the wall and the entry simply ends there.
+			char*  dst  = s_src[s_src_n - 1];
+			size_t used = strlen(dst);
+			if (used + 1 < SRC_MAX_ENTRY) dst[used++] = ' ';
+			for (size_t k = 0; one[k] && used + 1 < SRC_MAX_ENTRY; k++) dst[used++] = one[k];
+			dst[used] = '\0';
+			joined++;
+		} else {
+			s_src_at[s_src_n] = phys;
+			snprintf(s_src[s_src_n], SRC_MAX_ENTRY, "%s", one);
+			s_src_n++;
+			joined = 0;
+		}
+
+		joining = (s_src[s_src_n - 1][0] != '#') &&
+		          parenDepth(s_src[s_src_n - 1], 0) > 0 && joined < SRC_MAX_JOIN;
+	}
+
+	fclose(f);
+	return s_src_n;
+}
+
+// How many code entries contain `needle`. `at` gets the physical line the first one starts on,
+// `idx` its index in the array, both left at -1 when there is no match.
+static int countCode(const char* needle, int* at, int* idx)
+{
+	int n = 0;
+	if (at)  *at  = -1;
+	if (idx) *idx = -1;
+	for (int i = 0; i < s_src_n; i++) {
+		if (!strstr(s_src[i], needle)) continue;
+		if (n == 0) {
+			if (at)  *at  = s_src_at[i];
+			if (idx) *idx = i;
+		}
+		n++;
+	}
+	return n;
+}
+
+// Does the code entry `idx` lines after the match contain `needle`? Blank and comment-only
+// lines are already gone, so this is "the next statement", not "the next physical line".
+static bool codeHas(int idx, const char* needle)
+{
+	if (idx < 0 || idx >= s_src_n) return false;
+	return strstr(s_src[idx], needle) != NULL;
+}
+
+static void testTheRendererStillCallsIt(void)
+{
+	const int n = loadSource(RENDERER_PATH);
+
+	int def_at = -1, cf_at = -1, draw_at = -1, call_at = -1;
+	int call_idx = -1;
+
+	const int defs  = countCode(HZN_DEF_NEEDLE,   &def_at,  NULL);
+	const int cfs   = countCode(CULLFRAME_NEEDLE, &cf_at,   NULL);
+	const int draws = countCode(DRAW_NEEDLE,      &draw_at, NULL);
+	const int calls = countCode(HZN_CALL_NEEDLE,  &call_at, &call_idx);
+
+	// Deliberately no early return anywhere in here. If the file cannot be opened, or the
+	// needles find nothing, every check below must still RUN and fail — a bail-out would delete
+	// checks instead, which is the exact failure the count pin at the end of main() exists to
+	// catch, and it would be this file causing it.
+	CHECK(n > 0);
+
+	// The three anchors. They are the control for this section: none of them has anything to do
+	// with whether the call is present, so they stay green while the call check goes red, and a
+	// run where they went red too is a broken parse rather than a missing call.
+	CHECK(defs == 1);
+	CHECK(cfs == 1);
+	CHECK(draws == 1);
+
+	// THE CLAIM. The cull loop still asks the predicate about the slot it is looking at, with
+	// the slot's own three coordinates. Matching exactly once matters as much as matching: a
+	// second copy of the text, in code or in a comment, means the needle is no longer pointing
+	// at one known statement.
+	CHECK(calls == 1);
+
+	// ...and it is a real call, in the right place. After the definition, so it resolves to the
+	// function this file has been testing; after cullFrame's own signature and before the next
+	// function's, so it is inside the per-frame cull loop and not in some unused helper.
+	CHECK(def_at > 0 && call_at > def_at);
+	CHECK(cf_at > 0 && draw_at > 0 && call_at > cf_at && call_at < draw_at);
+
+	// ...and its result is acted on. A call whose branch does nothing is a call that culls
+	// nothing: the next statement must count the rejection, and the one after must skip the
+	// chunk. Without the skip the counter still climbs and chunkRenderHorizonCulled() still
+	// reports work being done, while every chunk it claims to have rejected is drawn anyway.
+	CHECK(codeHas(call_idx + 1, HZN_COUNT_NEEDLE));
+	CHECK(codeHas(call_idx + 2, HZN_SKIP_NEEDLE));
+
+	printf("horizon call site: %s | %d code lines | definition L%d (x%d) | cullFrame L%d (x%d) "
+	       "| call L%d (x%d) | next function L%d (x%d)\n",
+	       RENDERER_PATH, n, def_at, defs, cf_at, cfs, call_at, calls, draw_at, draws);
+}
+
 // ── The checks ─────────────────────────────────────────────────────────────────────────
 
 int main(void)
 {
+	// First, because a renderer that no longer asks makes every number below decoration.
+	testTheRendererStillCallsIt();
+
 	sweepRing();
 	sweepTies();
 	sweepWrap();
@@ -561,10 +826,15 @@ int main(void)
 	// is what let a self-referential capacity check shrink a bound from 15 to 7, DELETE eight
 	// assertions, and still print "0 failed" (326 checks became 318). Any sabotage that shortens
 	// a loop bounded by a production constant removes checks instead of failing them, and the
-	// only thing that notices is a pinned total. 12 counts this line itself, because CHECK
+	// only thing that notices is a pinned total. 21 counts this line itself, because CHECK
 	// increments before it compares. If a new check is added, this number moves with it — that
 	// is the point, not a nuisance.
-	CHECK(s_checks == 12);
+	//
+	// 12 -> 21 on 2026-08-25: the nine checks in testTheRendererStillCallsIt(), the only part
+	// of this file that reads the CALLER rather than the predicate. Recomputed as 12 + 9, not
+	// pasted from what a run printed. Those nine deliberately have no early return, so a
+	// chunk_render.c that will not open fails nine checks instead of skipping them.
+	CHECK(s_checks == 21);
 
 	printf("horizon equivalence: %ld cases | ref-vs-new %ld | new-vs-exact %ld | "
 	       "ref-vs-exact %ld | of the ref-vs-new, %ld are the rewrite KEEPING a chunk the "
