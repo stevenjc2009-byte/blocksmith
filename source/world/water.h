@@ -216,7 +216,12 @@ typedef struct {
 	// Diagnostics, all lifetime totals. Exposed because a bounded queue that silently ate
 	// candidates is exactly the failure world/meshq.h exists to have stopped repeating.
 	uint32_t map_full;   // flow cells refused a map slot
-	uint32_t q_full;     // candidates refused a ring slot
+	// Candidates LOST to a full ring. v1.8.3: the loss is now an eviction of the oldest pending
+	// candidate rather than a refusal of the newest — see qPush in water.c for the measurement
+	// that changed it, and for why a refused NEWEST candidate was a permanent, unrecoverable
+	// loss rather than the self-correcting one this file used to claim. The number means the
+	// same thing either way: one candidate that will not be examined.
+	uint32_t q_full;
 	uint32_t examined;   // cells popped and recomputed
 	uint32_t changed;    // of those, cells whose level or block actually moved
 

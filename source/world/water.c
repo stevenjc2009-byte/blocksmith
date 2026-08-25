@@ -144,15 +144,63 @@ static void qsetEraseAt(WaterSim* s, uint32_t i)
 }
 
 // True when the cell is now queued — whether this call put it there or a previous one did.
-// False only when the ring is full, which is counted (waterQueueFull) and is not a permanent
-// loss: every level is recomputed from its neighbours, never accumulated, so a candidate that
-// was refused is corrected the next time anything beside it moves. That is the structural
-// difference from the mesh-queue drop world/meshq.h was written for, where the refused work
-// was the only thing that would ever have built that chunk.
+//
+// ── What happens when the ring is full, and why the OLDEST entry is the one that goes ──
+//
+// v1.8.3. This comment used to say that a refused candidate "is not a permanent loss: every level
+// is recomputed from its neighbours, never accumulated, so a candidate that was refused is
+// corrected the next time anything beside it moves." That was false, and it was false in the one
+// case that matters most — a source the player has just placed into a world where nothing else is
+// moving. Nothing beside it ever moves again, so the correction never comes, and the source sits
+// there as a lone full cube for ever while waterPending(), waterFlowCells() and the settle count
+// all report a simulation in perfect health.
+//
+// It is not recoverable after the fact either, and the reason is structural rather than an
+// oversight: a SOURCE has no map entry (see the absence-means-source rule at the top of water.h),
+// so once its notify is dropped the simulation holds no record anywhere that the cell exists.
+// There is no bounded set to re-offer, and the only thing that would find it again is a scan of
+// the world. That rules out the obvious repair — flag the overflow and rescan the dirty region on
+// a later tick — because the region is "wherever the water is", which is the whole world.
+//
+// So the fix is at the moment of the loss, not after it: when the ring is full, EVICT THE OLDEST
+// entry and admit the new one, rather than refusing the new one and keeping 1024 stale ones. The
+// count in waterQueueFull() means exactly what it always meant — one candidate lost — but the
+// candidate that is lost is now the one furthest from what just happened, instead of the one
+// closest to it. That is not self-healing and this comment does not claim it is; it is a choice
+// about WHICH loss to take, and it is made on the measurement below.
+//
+// MEASURED on 2026-08-25, on the real generator and the real edit hook, 200 arms sweeping five
+// seeds against 1..40 streamed columns: a source placed through worldSet after streaming failed to
+// spread in 16 of 200 arms (8.0%) under refuse-newest, every one of them a lone unspread cube, and
+// in 0 of 200 (0.0%) under evict-oldest. A genuine pour that overflows on its own merits reaches a
+// BYTE-IDENTICAL final world under both policies (25 basin sources dropped at once: 816 flow
+// cells, hash 57907c9cc2a4b240 either way), so the eviction is not buying that at the cost of the
+// ordinary case. And nothing that never overflows is touched at all, which is why every pinned
+// number in world/water_test.c — the four order-independence hashes included — is unmoved by this
+// change except the one that counts refusals during a fixture build.
+//
+// Why the ring gets full at all is NOT fixed here and is not water.c's to fix; see waterNotify().
+//
+// gen_remaining is decremented with the eviction because the head of the ring belongs to the
+// generation that is currently open (water.h's WATER_SPREAD_TICKS barrier). Leaving it alone would
+// leave the barrier counting an entry that is no longer there, and waterTick's own defensive
+// branch would then have to mop it up a pop later.
+static bool qPop(WaterSim* s, uint64_t* out);
+
 static bool qPush(WaterSim* s, uint64_t key)
 {
 	if (qsetFind(s, key) >= 0) return true;
-	if (s->qcount >= WATERQ_CAP) { s->q_full++; return false; }
+	if (s->qcount >= WATERQ_CAP) {
+		// Evict the oldest to make room for the newest — see the header comment above for the
+		// measurement this is made on. qPop cannot fail here (qcount is WATERQ_CAP, which is
+		// positive), but it is checked rather than assumed: a false return would mean the ring
+		// is simultaneously full and empty, and admitting an entry on top of that would write
+		// past qcount's own accounting.
+		uint64_t victim;
+		if (!qPop(s, &victim)) return false;
+		s->q_full++;
+		if (s->gen_remaining > 0) s->gen_remaining--;
+	}
 
 	const int slot = (s->qhead + s->qcount) & (WATERQ_CAP - 1);
 	s->ring[slot] = key;
@@ -372,6 +420,36 @@ void waterFillScratch(const WaterSim* s, MeshScratch* ms, int cx, int cy, int cz
 	ms->water_any = written > 0;
 }
 
+// ── Why the ring fills up, which is NOT a water.c problem ────────────────────────────
+//
+// v1.8.3, and recorded here rather than fixed here because the fix is in three files this task
+// does not own. world.c's edit hook is a FILE STATIC (world.c:217) and worldSet fires it for ANY
+// World* with no check of which world the write went to (world.c:278). main.c's onWorldEdit
+// (main.c:2827) calls straight through to waterNotify without a world argument, because the hook's
+// signature does not carry one.
+//
+// The consequence is that app/worker.c's generation thread feeds this queue. worker.c:266 runs
+// worldgenColumn against its own STAGING world, and worldgen's decoration pass places trees and
+// tall grass one block at a time through worldSet (worldgen.c:339 treePut, worldgen.c:458), so
+// every decorated cell of every streamed column arrives here — naming a coordinate in a world this
+// simulation does not simulate, from a thread that does not hold any lock over it.
+//
+// MEASURED on 2026-08-25, density generator, seed 12345, 144 columns: 8590 firings, worst single
+// column 221, and that one column alone offers up to 1547 candidates against a ring of 1024. The
+// ring is pinned at its cap for as long as terrain is streaming; the drain is 64 cells every
+// WATER_SPREAD_TICKS ticks and cannot begin to keep up. The legacy generator is the same shape
+// (8287 firings, worst column 193), and a BS_WORLD_GEN=0 build is far worse: handbuiltFill()
+// (main.c:3369, hook already live since main.c:3149) is 51364 firings in a single call.
+//
+// Two separate faults, both outside this file:
+//   * every one of those candidates is WRONG — the cell named did not change in the player's
+//     world, so the recompute it asks for is a guaranteed no-op that displaces real work; and
+//   * they arrive on the worker thread with no synchronisation against the main thread's
+//     waterTick, which is a data race on the ring, the dedup set and the counters.
+//
+// The fix belongs in world.h's hook signature (carry the World*) and in main.c's onWorldEdit
+// (ignore any world that is not s_world). Until that lands, qPush's eviction above is what keeps
+// a player's own edit from being the thing that gets thrown away.
 void waterNotify(WaterSim* s, int x, int y, int z)
 {
 	if (s->dropping) return;   // see WaterSim.dropping in water.h

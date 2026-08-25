@@ -162,6 +162,40 @@ static void buildFloor(void)
 	fillBox(-13, 13, 60, 63, -13, 13, BLOCK_STONE);
 }
 
+// v1.8.3. Called immediately after a fixture has been laid down with resetWorldWired()'s hook
+// live, and it does three things that a fixture built with the hook NULL never had to do.
+//
+// It MEASURES the build burst and pins it as bare literals, because with the hook live a fixture
+// is no longer free: every cell of it fires world.c's edit hook, so buildFloor's 2916 stone cells
+// offer candidates to a ring of 1024 with no tick in between to drain it. A build that quietly
+// starts saturating the ring is exactly how the outcome checks below stop meaning what they say —
+// see wiredEditHook's header for the version of that defect this file has already shipped once.
+//
+// It CHECKS that the build left no water behind, which is what makes "the pour" below the only
+// thing the numbers after it describe.
+//
+// And it DRAINS, so the source placement that follows starts from an empty ring, exactly as it
+// would on a console where 20 ticks a second run while the player is building. Without the drain
+// every probe below would be measuring a pour that started life competing with its own fixture.
+//
+// `want_lost` and `want_pending` are literals on purpose and are edited by hand when they move.
+// See main()'s check count for why this file states its numbers twice rather than computing them.
+static void wiredBuildDone(const char* what, uint32_t want_lost, int want_pending)
+{
+	const uint32_t lost    = waterQueueFull(&g_sim);
+	const int      pending = waterPending(&g_sim);
+
+	(void)waterSettle(&g_sim, &g_world, 20000, NULL, NULL);
+	const int flow = waterFlowCells(&g_sim);
+
+	printf("         %s build: %u lost, %d pending of %d, then drained to %d pending / %d flow\n",
+	       what, lost, pending, (int)WATERQ_CAP, waterPending(&g_sim), flow);
+
+	CHECK(lost == want_lost, "the fixture build loses exactly the candidates it is pinned to lose");
+	CHECK(pending == want_pending, "and leaves the ring at exactly the depth it is pinned to");
+	CHECK(flow == 0, "control: the fixture build left no water behind, only stone and air");
+}
+
 static int manhattan(int x, int z)
 {
 	return (x < 0 ? -x : x) + (z < 0 ? -z : z);
@@ -173,14 +207,21 @@ static void testFlatPour(void)
 {
 	puts("water: a source on flat ground spreads to exactly radius 7");
 
-	resetWorld();
+	// v1.8.3: the game's wiring, not a hand call. See wiredEditHook and wiredBuildDone.
+	resetWorldWired();
 	buildFloor();
+	wiredBuildDone("floor", 8156, 1024);
+	const uint32_t lost_base = waterQueueFull(&g_sim);
 
 	CHECK(worldSet(&g_world, 0, 64, 0, BLOCK_WATER), "the source block is placed");
 	CHECK(waterLevelAt(&g_sim, &g_world, 0, 64, 0) == WATER_LEVEL_SOURCE,
 	      "water with no map entry reads as a source");
 
-	waterNotify(&g_sim, 0, 64, 0);
+	// No hand call: the edit hook is what queued it, exactly as on the console. This goes red
+	// BEFORE any outcome check does if anyone ever unwires the hook again.
+	CHECK(waterPending(&g_sim) == 7,
+	      "the edit hook alone queued the source and its six neighbours");
+
 	const int ticks = waterSettle(&g_sim, &g_world, 2000, NULL, NULL);
 	printf("         settled in %d ticks, %u examined, %u changed\n",
 	       ticks, waterExamined(&g_sim), waterChanged(&g_sim));
@@ -210,19 +251,27 @@ static void testFlatPour(void)
 	CHECK(levels_ok, "every cell at distance d holds level 8 - d");
 	CHECK(edge_dry, "every cell at distance 8 is dry");
 	CHECK(no_second_layer, "nothing climbed to y = 65: water never flows upwards");
-	CHECK(waterMapFull(&g_sim) == 0 && waterQueueFull(&g_sim) == 0,
-	      "the pour fits in the map and the queue with nothing refused");
+	// A DELTA against the base taken after the fixture build, not against zero. q_full is
+	// cumulative for the life of the sim and this assertion has always been about the POUR;
+	// written as a delta it keeps meaning that while the build is judged separately by
+	// wiredBuildDone. Written against zero, with the hook live, it would be an assertion about
+	// the fixture — and with the hook NULL, which is how it used to be built, it was true by
+	// construction and could not go red at all.
+	CHECK(waterMapFull(&g_sim) == 0 && waterQueueFull(&g_sim) == lost_base,
+	      "the pour fits in the map and the queue with nothing lost");
 }
 
 static void testWaterfall(void)
 {
 	puts("water: a source in mid-air falls one block wide and pools where it lands");
 
-	resetWorld();
+	resetWorldWired();
 	buildFloor();
+	wiredBuildDone("floor", 8156, 1024);
 
 	(void)worldSet(&g_world, 0, 80, 0, BLOCK_WATER);
-	waterNotify(&g_sim, 0, 80, 0);
+	CHECK(waterPending(&g_sim) == 7,
+	      "the edit hook alone queued the source and its six neighbours");
 	const int ticks = waterSettle(&g_sim, &g_world, 5000, NULL, NULL);
 	printf("         settled in %d ticks, %d flow cells\n", ticks, waterFlowCells(&g_sim));
 
@@ -264,15 +313,17 @@ static void testDrainage(void)
 {
 	puts("water: removing the source drains every flow cell");
 
-	resetWorld();
+	resetWorldWired();
 	buildFloor();
+	wiredBuildDone("floor", 8156, 1024);
 	(void)worldSet(&g_world, 0, 64, 0, BLOCK_WATER);
-	waterNotify(&g_sim, 0, 64, 0);
 	CHECK(waterSettle(&g_sim, &g_world, 2000, NULL, NULL) >= 0, "the pour settles first");
 	CHECK(waterFlowCells(&g_sim) == 112, "112 flow cells are there to drain");
 
+	// The BREAK goes through worldSet too, which is what scene/interact.c:106 does. Nothing in
+	// this probe calls waterNotify by hand any more.
 	(void)worldSet(&g_world, 0, 64, 0, BLOCK_AIR);
-	waterNotify(&g_sim, 0, 64, 0);
+	CHECK(waterPending(&g_sim) == 7, "the edit hook alone queued the broken cell and its six neighbours");
 	const int ticks = waterSettle(&g_sim, &g_world, 2000, NULL, NULL);
 	printf("         drained in %d ticks\n", ticks);
 
@@ -544,12 +595,14 @@ static void testSettledIsFree(void)
 {
 	puts("water: a settled body costs nothing per tick");
 
-	resetWorld();
+	resetWorldWired();
 	buildFloor();
+	wiredBuildDone("floor", 8156, 1024);
 	(void)worldSet(&g_world, 0, 64, 0, BLOCK_WATER);
-	waterNotify(&g_sim, 0, 64, 0);
 	(void)waterSettle(&g_sim, &g_world, 2000, NULL, NULL);
 
+	// Snapshotted AFTER the pour, so what follows is a delta and the fixture drain above — which
+	// examines cells of its own now that the hook is live — cannot flatter or spoil it.
 	const uint32_t examined = waterExamined(&g_sim);
 	const uint32_t changed  = waterChanged(&g_sim);
 
@@ -645,17 +698,17 @@ static void testStaleEntry(void)
 {
 	puts("water: building into flowing water does not leak a map slot");
 
-	resetWorld();
+	resetWorldWired();
 	buildFloor();
+	wiredBuildDone("floor", 8156, 1024);
 	(void)worldSet(&g_world, 0, 64, 0, BLOCK_WATER);
-	waterNotify(&g_sim, 0, 64, 0);
 	(void)waterSettle(&g_sim, &g_world, 2000, NULL, NULL);
 	CHECK(waterFlowCells(&g_sim) == 112, "112 flow cells before the block goes in");
 	CHECK(waterLevelAt(&g_sim, &g_world, 7, 64, 0) == 1, "the far cell is a level-1 flow cell");
 
-	// A player places stone into the far end of the flow, exactly as scene/interact.c would.
+	// A player places stone into the far end of the flow, exactly as scene/interact.c does —
+	// and now literally so: the place goes through worldSet and the hook does the queueing.
 	(void)worldSet(&g_world, 7, 64, 0, BLOCK_STONE);
-	waterNotify(&g_sim, 7, 64, 0);
 	(void)waterSettle(&g_sim, &g_world, 2000, NULL, NULL);
 
 	CHECK(waterFlowCells(&g_sim) == 111, "the map drops that cell instead of keeping it");
@@ -666,10 +719,8 @@ static void testStaleEntry(void)
 	// check the map is exactly as big as the water that is actually there.
 	for (int i = 0; i < 300; i++) {
 		(void)worldSet(&g_world, 7, 64, 0, BLOCK_STONE);
-		waterNotify(&g_sim, 7, 64, 0);
 		(void)waterSettle(&g_sim, &g_world, 2000, NULL, NULL);
 		(void)worldSet(&g_world, 7, 64, 0, BLOCK_AIR);
-		waterNotify(&g_sim, 7, 64, 0);
 		(void)waterSettle(&g_sim, &g_world, 2000, NULL, NULL);
 	}
 	printf("         after 300 place/break cycles: %d flow cells, %u map refusals\n",
@@ -735,10 +786,10 @@ static void testDropColumn(void)
 {
 	puts("water: unloading a column takes its flow water and leaves its sources");
 
-	resetWorld();
+	resetWorldWired();
 	buildFloor();
+	wiredBuildDone("floor", 8156, 1024);
 	(void)worldSet(&g_world, 0, 64, 0, BLOCK_WATER);   // column (0, 0)
-	waterNotify(&g_sim, 0, 64, 0);
 	(void)waterSettle(&g_sim, &g_world, 2000, NULL, NULL);
 
 	const int before_flow  = waterFlowCells(&g_sim);
@@ -763,6 +814,11 @@ static void testDropColumn(void)
 	      "the only water left in column (0,0) is the source block");
 	CHECK(countBlocks(-13, 13, 60, 70, -13, 13, BLOCK_WATER) == before_water - cleared,
 	      "water outside the dropped column is untouched");
+	// v1.8.3: this check has teeth for the first time. waterDropColumn clears its cells through
+	// worldSet, so with the hook live every one of them fires world.c's edit hook and reaches
+	// waterNotify — and the only thing stopping seven candidates per cleared cell is
+	// WaterSim.dropping (water.h). Built with the hook NULL, as this probe used to be, nothing
+	// ever reached waterNotify and the flag was never exercised at all.
 	CHECK(waterPending(&g_sim) == 0,
 	      "dropping a column queues nothing: it is being removed, not changed");
 }
@@ -788,6 +844,25 @@ static void testSaveCompat(void)
 {
 	puts("water: a v1.7.1 world opens unchanged and no flow cell ever reaches the card");
 
+	// v1.8.3, and this is the ONE probe here whose fixture is deliberately built with the hook
+	// DOWN — which is an application of the fidelity rule, not an exception to it.
+	//
+	// Every other fixture in this file stands in for something a player does, and a player's
+	// blocks go in one at a time through worldSet, so the hook has to be live. This one stands in
+	// for a world ARRIVING FROM THE CARD, and that path fires the hook exactly zero times by
+	// design: a loaded or generated column is installed with worldSetChunkAll, which testEditHook
+	// pins at zero firings. Arming the hook over this fixture models a world no path in the game
+	// can produce.
+	//
+	// It also destroys the probe, measured rather than argued. With the hook armed over the build:
+	// the air cavity is carved AFTER the sea, so carving it notifies the sea wall, the ocean pours
+	// into the cavity during the fixture's own drain, and "a freshly opened world" arrives already
+	// holding 208 flow cells. The premise this whole probe rests on — that a v1.7.1 world opens
+	// with every water cell a source and nothing queued — cannot even be stated over that fixture.
+	//
+	// So: terrain with the hook down, exactly as the card delivers it; hook armed below for the
+	// DISTURBANCE, which is the part a player causes and the part that must run on the game's
+	// wiring.
 	resetWorld();
 
 	// A column shaped the way worldgen's density generator leaves one: stone up to the
@@ -802,6 +877,13 @@ static void testSaveCompat(void)
 	fillBox(-20, 20, 55, 71, -4, 20, BLOCK_STONE);
 	fillBox(0, 15, 64, 70, 0, 15, BLOCK_WATER);
 	fillBox(-16, -1, 64, 70, 0, 15, BLOCK_AIR);
+
+	// The card has delivered the world; from here on every change is one a player causes, so the
+	// hook goes on. Nothing above this line fired it, which is the whole point of the note at the
+	// top of this probe, and the two checks below say so rather than leaving it to the reader.
+	CHECK(waterPending(&g_sim) == 0,
+	      "loading a world queues nothing at all: worldSetChunkAll is not an edit");
+	worldSetEditHook(wiredEditHook, NULL);
 
 	// Opening it: the map is empty and every one of those 1792 water cells reads as a
 	// source, which is exactly what it is.
@@ -915,6 +997,89 @@ static void testQueueOverflow(void)
 	      "re-offering the cells converges on exactly the reference world");
 	CHECK(waterFlowCells(&g_sim) == 112, "112 flow cells again");
 	(void)after_loss;
+}
+
+// ── The overflow policy, and the claim that used to be made about it ──────────────────
+//
+// v1.8.3. water.c's qPush carried this comment until today: a candidate refused for want of a ring
+// slot "is not a permanent loss ... a candidate that was refused is corrected the next time
+// anything beside it moves". Nothing in this file tested it, and it is false. For a source placed
+// into a world that is then left alone, nothing beside it ever moves again, so the correction
+// never arrives — and because a SOURCE has no map entry (water.h's absence-means-source rule), the
+// simulation retains no record that the cell exists, so there is nothing to re-offer either. The
+// result is a lone full cube of water sitting on flat ground for ever while waterPending() reads
+// 0, waterFlowCells() reads 0 and waterSettle() reports a clean finish in single figures.
+//
+// That is the exact shape of the open v1.8.0 report — water not spreading, queue saturated — and
+// it is reachable in the shipping build: measured on 2026-08-25 against the real density generator
+// and the real edit hook, a source placed after terrain streaming failed to spread in 16 of 200
+// swept arms (8.0%). qPush now evicts the OLDEST pending candidate instead of refusing the newest,
+// which took that to 0 of 200.
+//
+// This probe is the arm that goes red if that is ever reverted. It is deliberately built the
+// game's way — resetWorldWired, no hand waterNotify — because the whole failure is about what
+// reaches the ring through world.c's edit hook, and a hand call bypasses the thing under test.
+static void testOverflowKeepsTheNewest(void)
+{
+	puts("water: a full ring loses its OLDEST candidate, never the edit that just happened");
+
+	resetWorldWired();
+	buildFloor();
+	wiredBuildDone("floor", 8156, 1024);
+
+	// Saturate the ring with candidates for cells a thousand blocks away that hold nothing, so
+	// that the source placed below arrives at a ring that is genuinely full. 300 distinct cells
+	// at 7 keys each is well past WATERQ_CAP, and none of them is anywhere near the floor.
+	for (int i = 0; i < 300; i++) waterNotify(&g_sim, 1000 + i * 3, 64, 0);
+	CHECK(waterPending(&g_sim) == (int)WATERQ_CAP, "the ring really is full before the edit");
+	const uint32_t lost_before = waterQueueFull(&g_sim);
+
+	// The player places a source, through worldSet, so the edit hook is what queues it.
+	CHECK(worldSet(&g_world, 0, 64, 0, BLOCK_WATER), "the source block is placed into a full ring");
+
+	// These two say that SEVEN candidates were lost and that the ring did not grow — and both are
+	// true under EITHER policy, which is worth stating here rather than leaving for someone to
+	// discover the hard way. Refuse-newest loses the seven new ones; evict-oldest loses seven old
+	// ones; either way the counter moves by seven and the depth stays pinned at the cap. Verified
+	// by sabotage on 2026-08-25: with qPush reverted to refuse-newest, both of these stayed GREEN.
+	// They are here because the loss must remain visible and bounded, not because they discriminate.
+	//
+	// The checks that DO discriminate are the outcome pair below, and that is not a weakness: the
+	// only honest way to ask which candidate was kept is to ask what the water did.
+	CHECK(waterQueueFull(&g_sim) - lost_before == 7,
+	      "seven candidates are lost, and the loss is counted rather than hidden");
+	CHECK(waterPending(&g_sim) == (int)WATERQ_CAP,
+	      "the ring is still exactly full: one admitted for one evicted, never more");
+
+	// And the outcome, which is the thing a player would actually see. The world is STATIC from
+	// here: nothing but the simulation itself ever touches it again, which is precisely the
+	// condition the old comment claimed would heal this and does not.
+	const int ticks = waterSettle(&g_sim, &g_world, 20000, NULL, NULL);
+	printf("         settled in %d ticks, %d flow cells, %d wet in the pour plane\n",
+	       ticks, waterFlowCells(&g_sim), countBlocks(-13, 13, 64, 64, -13, 13, BLOCK_WATER));
+
+	CHECK(ticks >= 0, "the pour reaches a stable state");
+	CHECK(waterFlowCells(&g_sim) == 112,
+	      "the source placed into a FULL ring still spreads to all 112 flow cells");
+	CHECK(countBlocks(-13, 13, 60, 70, -13, 13, BLOCK_WATER) == 113,
+	      "113 water blocks: the source did not sit alone");
+
+	// The control, and it is the one that says this probe can see the difference at all. Same
+	// world, same source cell, but the ring is left EMPTY — so nothing is evicted, nothing is
+	// lost, and the answer must be the identical 112. A probe whose full-ring arm passed while
+	// its empty-ring arm also passed for some unrelated reason would prove nothing about the
+	// ring; this pins that the two arms agree, which is the actual claim.
+	resetWorldWired();
+	buildFloor();
+	(void)waterSettle(&g_sim, &g_world, 20000, NULL, NULL);
+	const uint32_t control_lost = waterQueueFull(&g_sim);
+	CHECK(waterPending(&g_sim) == 0, "control: this arm starts from an EMPTY ring");
+	(void)worldSet(&g_world, 0, 64, 0, BLOCK_WATER);
+	(void)waterSettle(&g_sim, &g_world, 20000, NULL, NULL);
+	CHECK(waterQueueFull(&g_sim) == control_lost,
+	      "control: an empty ring loses nothing at all, so the eviction path really did fire above");
+	CHECK(waterFlowCells(&g_sim) == 112,
+	      "control: the same source into an empty ring reaches the same 112 flow cells");
 }
 
 static void testTickCost(void)
@@ -1174,13 +1339,29 @@ static void testSunkenBasin(void)
 
 	// The build burst, pinned as bare literals so it cannot drift silently. 6069 stone cells laid
 	// one worldSet at a time with the hook live and no tick between them: the ring saturates at
-	// WATERQ_CAP and 38771 further candidates are refused. That is a fixture artefact, not a
-	// simulation fault — nothing in the game installs terrain through per-block worldSet — and it
-	// is recorded rather than hidden because it is also the shape of the failure to look for: if
-	// a real edit ever lands while 1024 candidates are already pending, its own notify is refused
-	// and the water never moves. Measured that way before the drain was added: 0 flow cells,
-	// a lone unspread source cube, from a simulation that is working perfectly.
-	CHECK(corner.build_q_full == 38771, "the basin build refuses 38771 candidates with the hook live");
+	// WATERQ_CAP and 7425 further candidates are lost to it.
+	//
+	// v1.8.3 CORRECTS TWO CLAIMS THAT USED TO STAND HERE, both of them measured false on
+	// 2026-08-25.
+	//
+	// It said the number was 38771. It was, while qPush refused the newest candidate; qPush now
+	// evicts the oldest instead (see water.c), and the same 6069-cell build loses 7425.
+	//
+	// And it said this burst was "a fixture artefact ... nothing in the game installs terrain
+	// through per-block worldSet". That is wrong, and it is the important half. worldgen installs
+	// TERRAIN through worldSetChunkAll, which is where the claim came from, but its DECORATION
+	// pass places trees and tall grass one block at a time through worldSet (worldgen.c:339,
+	// worldgen.c:458) — and world.c's edit hook is a file static that fires for any World, so
+	// app/worker.c's generation thread drives this queue while it builds the staging world.
+	// Measured against the density generator at seed 12345: 8590 firings over 144 columns, worst
+	// single column 221, offering up to 1547 candidates to a ring of 1024. A source placed by the
+	// player after streaming failed to spread in 16 of 200 swept arms under the old policy.
+	//
+	// So the burst is not an artefact, the game reaches this state, and what used to follow from
+	// it — "its own notify is refused and the water never moves", a lone unspread source cube from
+	// a simulation reporting perfect health — was a live defect and not a hypothetical.
+	// testOverflowKeepsTheNewest is the arm that now holds it shut.
+	CHECK(corner.build_q_full == 7425, "the basin build loses 7425 candidates with the hook live");
 	CHECK(corner.build_pending == 1024, "and leaves the ring saturated at WATERQ_CAP");
 	CHECK((int)WATERQ_CAP == 1024, "control: WATERQ_CAP is still the 1024 those two numbers assume");
 
@@ -1435,6 +1616,7 @@ int main(void)
 	testDropColumn();
 	testSaveCompat();
 	testQueueOverflow();
+	testOverflowKeepsTheNewest();
 	testSunkenBasin();
 	testPadAndShaft();
 	testTickCost();
@@ -1444,14 +1626,20 @@ int main(void)
 	// v1.8.3. The suite counts itself, and no other suite in this project does — which is exactly
 	// how a 326 -> 318 deletion once passed as "0 failed" here. A red arm whose TOTAL dropped is
 	// deleting checks, not failing them, and nothing in the PASS line below can tell the two
-	// apart on its own. 161 is every check above this one; this check is the 162nd.
+	// apart on its own. 196 is every check above this one; this check is the 197th.
+	//
+	// v1.8.3: 161 -> 196. Twenty-one of the thirty-five are wiredBuildDone's three-check burst pin
+	// firing at each of its seven call sites; ten are testOverflowKeepsTheNewest, new below
+	// testQueueOverflow; the remaining four are the "the edit hook alone queued the source and its
+	// six neighbours" checks added to the four probes that place a source through worldSet, plus
+	// testSaveCompat's new "loading a world queues nothing at all".
 	//
 	// It is deliberately a naked literal and not a symbol: a count expressed in terms of anything
 	// the file computes would move with the file, which is the whole failure mode it exists to
 	// catch. When a check is legitimately added or removed, this number is edited by hand, on
 	// purpose, in the same commit — that edit IS the review.
 	const int counted = g_checks;
-	CHECK(counted == 161, "the suite ran all 161 of its checks: none was deleted or skipped");
+	CHECK(counted == 196, "the suite ran all 196 of its checks: none was deleted or skipped");
 
 	printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);
 	if (g_fails) printf("FAILED - %d of %d checks\n", g_fails, g_checks);
