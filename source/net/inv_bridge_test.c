@@ -541,6 +541,66 @@ int main(void)
     test_apply_state_clamps_the_selection();
     test_apply_state_sends_nothing();
 
+    /* ---- check-count guard -----------------------------------------------------------------
+     *
+     * This suite counts failures, and until 2026-08-25 that was ALL it counted. A suite that
+     * only counts failures cannot notice checks that never ran. Measured on net/networld_test.c
+     * the same day: shrinking one production constant took it from "PASS 326 checks, 0 failed"
+     * to "PASS 318 checks, 0 failed" — both green, exit 0, eight checks silently DELETED rather
+     * than failed.
+     *
+     * Said plainly, because it is a real difference between this file and its neighbours: this
+     * suite has no loop and no conditional that emits a check, so as it stands today no
+     * production sabotage can DELETE a check from it — every check() call is straight-line and
+     * unconditional, and the INV_SLOT_COUNT loops in it only fill slots. Measured, 2026-08-25:
+     * INV_HOTBAR_SLOTS 8 -> 4 does not even link, because net/inv_bridge.c:14 already carries a
+     * _Static_assert against the wire slot count. That is a fact about the file's shape TODAY,
+     * not a property anyone maintains, and it is exactly the sort of thing a later edit removes
+     * without noticing. The guard is therefore here for the two things that can still happen:
+     * a test_*() call quietly dropped from the list above, and a check added without the pin
+     * being updated.
+     *
+     * The number below is the count of checks that must already have run by the time control
+     * reaches this line. It is a naked literal on purpose — it is the one number in this file
+     * that is not derived from anything the tests themselves compute, which is precisely what
+     * lets it notice them vanishing. A count derived from INV_SLOT_COUNT would move with the
+     * very code it is supposed to be watching; that self-reference is the bug that let
+     * networld_test.c's 326 -> 318 hide.
+     *
+     * HOW TO UPDATE IT WHEN YOU ADD OR REMOVE CHECKS — read this before changing the number:
+     *   Work out the delta from what you actually changed (checks added minus checks removed)
+     *   and ADD THAT DELTA to the number below. Do NOT paste whatever the failing run printed.
+     *   Pasting the observed count is the single failure mode this guard exists to catch: if a
+     *   production change silently deleted checks, the printed count is the SYMPTOM, and copying
+     *   it in here re-arms the trap and throws away the only evidence you had. If your
+     *   recomputed delta and the observed count disagree, that disagreement is a bug report — go
+     *   and find out which checks stopped running, and why.
+     *
+     *   Note the number is the count BEFORE this guard itself, so the summary line prints one
+     *   more than it (62 here, 63 on the PASS line). That off-by-one is deliberate: it means
+     *   blind-pasting the number off the PASS line lands you a red, not a false green.
+     *
+     *   Latched into `ran` first, and compared through that, so the pin means "checks before
+     *   this line" no matter how the check machinery is spelled. It matters: the macro-based
+     *   suites in this fleet (world/region_growth_test.c, app/session_test.c) increment the
+     *   counter BEFORE evaluating the condition, and a guard written against the live counter
+     *   there silently wants a number one higher. Same latch everywhere, same meaning
+     *   everywhere, and it stays correct if this file's check() is ever turned into a macro. */
+    const int ran = g_checks;
+    if (ran != 62)
+        printf("\nCHECK-COUNT GUARD: %d checks ran, %d expected.\n"
+               "  %s\n"
+               "  This is NOT an ordinary assertion failure.\n"
+               "  Read the comment above this guard in net/inv_bridge_test.c before"
+               " touching the pinned number.\n",
+               ran, 62,
+               ran < 62
+                   ? "Checks went MISSING: checks that should have run never ran at all."
+                   : "Extra checks appeared: either you added checks and did not update the"
+                     " pin, or something is emitting checks it should not.");
+    check(ran == 62,
+          "check-count guard: every check in this suite actually ran (62 before this line)");
+
     printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;
 }

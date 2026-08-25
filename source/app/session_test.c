@@ -345,6 +345,60 @@ int main(void)
 	testTheResetIsHarmlessWhenThereIsNothingToReset();
 	testMainCRunsTheResetOnEverySessionLap();
 
+	// ---- check-count guard ---------------------------------------------------------------
+	//
+	// This suite counts failures, and until 2026-08-25 that was ALL it counted. A suite that
+	// only counts failures cannot notice checks that never ran. Measured on net/networld_test.c
+	// the same day: shrinking one production constant took it from "PASS 326 checks, 0 failed"
+	// to "PASS 318 checks, 0 failed" — both green, exit 0, eight checks silently DELETED rather
+	// than failed.
+	//
+	// This file's own deletion shape is the pair of guarded blocks in
+	// testMainCRunsTheResetOnEverySessionLap(): every source-text check about main.c sits behind
+	// `if (src == NULL) return;` or `if (label != NULL)`. Rename or remove the session_start
+	// label in source/main.c and four checks stop being emitted at all — the one check that goes
+	// red says the label is gone, and the four that would have said WHERE the reset sits vanish
+	// with it. That is the exact class of failure this file exists to catch, so it must not be
+	// able to shrink out from under itself.
+	//
+	// So: the number below is the count of checks that must already have run by the time control
+	// reaches this line. It is a naked literal on purpose — it is the one number in this file
+	// that is not derived from anything the tests themselves compute, which is precisely what
+	// lets it notice them vanishing. Deriving it from the text of main.c, or from any registry
+	// constant, would move it with the very thing it is supposed to be watching; that
+	// self-reference is the bug that let networld_test.c's 326 -> 318 hide.
+	//
+	// HOW TO UPDATE IT WHEN YOU ADD OR REMOVE CHECKS — read this before changing the number:
+	//   Work out the delta from what you actually changed (checks added minus checks removed)
+	//   and ADD THAT DELTA to the number below. Do NOT paste whatever the failing run printed.
+	//   Pasting the observed count is the single failure mode this guard exists to catch: if a
+	//   production change silently deleted checks, the printed count is the SYMPTOM, and copying
+	//   it in here re-arms the trap and throws away the only evidence you had. If your
+	//   recomputed delta and the observed count disagree, that disagreement is a bug report — go
+	//   and find out which checks stopped running, and why.
+	//
+	//   Note the number is the count BEFORE this guard itself, so the summary line prints one
+	//   more than it (36 here, 37 on the PASS line). That off-by-one is deliberate: it means
+	//   blind-pasting the number off the PASS line lands you a red, not a false green.
+	//   Latched into `ran` first, and compared through that, because this file's CHECK is a
+	//   MACRO that does s_checks++ BEFORE it evaluates its condition — testing s_checks directly
+	//   inside CHECK would be testing a counter the guard had already bumped, and would quietly
+	//   want 37. The latch keeps the pin meaning "checks before this line" in the same way it
+	//   does in the function-based suites, and so keeps the paste-trap above honest.
+	const int ran = s_checks;
+	if (ran != 36)
+		printf("  CHECK-COUNT GUARD: %d checks ran, %d expected.\n"
+		       "    %s\n"
+		       "    This is NOT an ordinary assertion failure.\n"
+		       "    Read the comment above this guard in app/session_test.c before"
+		       " touching the pinned number.\n",
+		       ran, 36,
+		       ran < 36
+		           ? "Checks went MISSING: checks that should have run never ran at all."
+		           : "Extra checks appeared: either you added checks and did not update the"
+		             " pin, or something is emitting checks it should not.");
+	CHECK(ran == 36);
+
 	if (s_fails == 0)
 		printf("session self-test: PASS  %d checks\n", s_checks);
 	else
