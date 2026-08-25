@@ -2566,3 +2566,114 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 "./$BHLL/light_luminance_test"
 
 rm -rf "$BHLL"
+
+# world/tick_test.c -- the 20 TPS simulation clock (v1.8.3). Own binary, own main(), appended
+# rather than merged into the world stanza for the reason every stanza in this file is appended:
+# an append is the one edit shape that cannot drop another session's work, and this file is
+# shared. The link is world/tick.c and nothing else -- tick.c includes only its own header and
+# has no dependencies at all, which is what lets both the console client and the Linux dedicated
+# server compile it from the same source.
+#
+# world/tick.c IS MIRRORED. deps/blocksmith-server/tools/sync-world-sources.sh vendors it as one
+# of eleven byte-identical copies into deps/blocksmith-server/game/world/, and the Makefile's
+# check-world-drift target fails the build for everyone the moment the two diverge. That is why
+# untested logic in this file is worse than untested client-only logic: a disagreement here does
+# not produce a visible bug, it desyncs players.
+#
+# WHY THIS EXISTS WHEN world_test.c ALREADY HAD A TICK BLOCK. It did, and it is a good one --
+# world_test.c:7176 testTickClock() owns the bank/remainder contract, the 20-ticks-per-second
+# rate, a ten-second drift check, the server's sleep-exactly-as-long loop, one catch-up clamp
+# event and its recovery, the backwards-clock rule, the max_catchup<=0 clamp, NULL safety on all
+# five clock entry points, and tickPeriodForDistSq's 575/576/577 boundary. None of that is
+# repeated here. What was MEASURED to be missing, and is what this file covers:
+#
+#   * tickDue() at the period production actually uses. testTickClock exercises periods 0, 1 and
+#     TICK_FAR_PERIOD (10). The dedicated server calls tickDue(t, BS_POS_BROADCAST_PERIOD, 0)
+#     once per tick at deps/blocksmith-server/game/bsgame.c:1306, and BS_POS_BROADCAST_PERIOD is
+#     TICK_HZ / 10 = 2. Period 2 is the ONLY period tickDue is called with anywhere in shipped
+#     code and it had no coverage at all. It gates the 10 Hz position broadcast to every client
+#     in the room.
+#   * The stagger as a PATTERN rather than as a count. testTickClock proves a decimated thing
+#     fires twenty times in two hundred ticks and that ten consecutive ids partition one period.
+#     Both survive a wrong PHASE. Ten hand-written literal bit strings pin which ticks are due.
+#   * Unbounded ids and large tick numbers -- tick.h promises `id` need not be "dense or
+#     bounded"; nothing tested an id above 12345 or a tick above 200.
+#   * The conservation law: count + dropped == the whole ticks the forward time fed in was worth,
+#     across a stream that clamps repeatedly. Time must be either simulated or explicitly counted
+#     as lost, never quietly evaporated.
+#   * Naked-literal pins for the seven constants. Every existing assertion about the clamp is
+#     written in terms of TICK_MAX_CATCHUP_DEFAULT itself, which is this project's recorded
+#     case-3 trap -- a check parameterised by the value under test cannot detect that value
+#     changing.
+#
+# THE MEASUREMENT THAT MOTIVATED THE FILE, and the reason it is quoted here rather than
+# summarised. tickDue's `== 0` was changed to `== 1` -- a pure PHASE SHIFT, which leaves every
+# firing count and every partition property in the existing suite exactly as it was. Built at
+# HEAD, linked against a private byte-identical copy of the sabotaged tick.c (the working tree's
+# world_test.c/worldgen*.c were mid-edit by a parallel session and did not compile):
+#
+#     healthy    world self-test: PASS  5184 checks
+#     sabotaged  world self-test: PASS  5184 checks
+#
+# `cmp` on the two captured outputs was SILENT -- byte-identical, zero FAIL lines, 5184 both
+# ways -- while `cmp` on the two linked ELFs showed they DIFFER, so the mutation reached the
+# build and not merely the file. The same shape as the shader case: a large green suite over a
+# broken shared behaviour. TICK_MAX_CATCHUP_DEFAULT 4 -> 12 (applied as a shadow header on a
+# -I ahead of -I source, so the real tick.h was never written to) also gave PASS 5184.
+#
+# ARMS. Every one against the REAL, MIRRORED source, restored immediately afterwards, with md5
+# back to baseline (tick.c 55360674be6c1df5ace9ef9ce4c2bd7d, tick.h
+# 8e81df022b1f5c2b570dba14034650ce) and `cmp` against deps/blocksmith-server/game/world/ SILENT
+# for both files after every arm. Which checks went red was read, not just how many, and the
+# count stayed 52 in all four -- nothing was deleted:
+#
+#   A  tickDue `== 0` -> `== 1` (the phase shift above)        FAIL 52 checks, 14 failed
+#      All ten pattern rows plus the four tick-10^12 phase checks. The period-10 PARTITION check
+#      stayed GREEN, which is what says the arm is a phase shift and not a wholesale break -- and
+#      is precisely why a partition-shaped check could not catch it.
+#   B  the `c->dropped += ...` line deleted from the clamp     FAIL 52 checks, 6 failed
+#      "twenty-two ticks were dropped across the stream", both conservation checks, both
+#      max_catchup drop counts, and "falsifiability: the stream clamped on more than 20 steps".
+#      Every count-of-ticks-RUN check stayed green: the clock still runs the right ticks, it just
+#      stops admitting what it threw away.
+#   C  `c->accum_us -= n * TICK_PERIOD_US;` -> `c->accum_us = 0;`   FAIL 52 checks, 8 failed
+#      first "FAIL the seven advances return 4, 4, 1, 0, 0, 1, 1", then the 74,999/25,001 split
+#      tick, then all four drift checks. tickDue stayed entirely green.
+#   D  TICK_MAX_CATCHUP_DEFAULT 4 -> 12 in the real tick.h     FAIL 52 checks, 1 failed
+#      "FAIL TICK_MAX_CATCHUP_DEFAULT is 4 -- the death-spiral clamp, pinned nowhere else in the
+#      tree". Exactly one check, which is the point: that constant had no naked-literal pin
+#      anywhere in the tree, and the 5184-check world suite does not move for it either.
+#
+# A stagger-DELETING arm (`(tick + id) % period` -> `tick % period`) was tried first and is NOT
+# usable: it makes `id` unused and -Wextra -Werror rejects the build. A sabotage that does not
+# compile is not an arm. The phase shift is the stronger mutation anyway.
+#
+# CONTROL, green in all four arms: "control: a freshly initialised clock is at tick 0, has
+# dropped nothing, and has banked nothing". Proved NOT vacuous by pointing its expected tick
+# count at 99 on an otherwise healthy tree, which gave "FAIL 52 checks, 1 failed" naming that
+# control. Reverted.
+#
+# The check-count pin was also made to fail on purpose before being trusted -- a checker that has
+# never been red is an untested function that runs at the worst possible moment. The pattern-table
+# loop bound was cut from 10 to 5, deleting five checks rather than failing them:
+# "FAIL 47 checks, 2 failed", "FAIL CHECK COUNT: 5 check(s) WENT MISSING - expected 52, ran 47."
+# The in-table falsifiability counter went red independently on the same run, so a deletion there
+# has two unrelated detectors.
+#
+# RE-RUN THROUGH THE STANZA ITSELF once it was wired in, to prove a red here reaches the script's
+# exit code rather than being swallowed. The stanza was sliced back out of THIS file (not
+# retyped -- a retyped copy proves nothing about the committed text), run under `set -e` as the
+# real script is, with arm D applied: "FAIL 52 checks, 1 failed", RUNNER_EXIT=1, and the echo
+# placed after the stanza never printed. Healthy, the same slice gives PASS 52 checks, 0 failed.
+BHTK="build-host/run-$$-tick"
+mkdir -p "$BHTK"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/tick.c \
+	source/world/tick_test.c \
+	-o "$BHTK/tick_test"
+
+"./$BHTK/tick_test"
+
+rm -rf "$BHTK"
