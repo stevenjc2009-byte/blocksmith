@@ -170,6 +170,88 @@ $(PROTO)/proto/bs_proto.h:
 	  || (echo "blocksmith-server checkout is not at the pinned commit"; exit 1)
 	@echo "bs_proto.h pinned at $(PROTO_COMMIT)"
 
+# ---------------------------------------------------------------- drift guard
+#
+# The rule above is a FILE target, so make runs it only when
+# deps/blocksmith-server/proto/bs_proto.h does not exist. Once the clone is on
+# disk it never runs again, and the "is the checkout at the pinned commit?"
+# test inside it never runs again either. That made the pin a first-fetch
+# formality rather than a guard: on any working dev tree — including this one,
+# where deps/blocksmith-server sits on branch sync/client-v1.8.2 at 1767061,
+# which is NOT PROTO_COMMIT — the build compiled against whatever bytes
+# happened to be in the working tree and said nothing. It only stayed correct
+# by luck: 1767061's proto/bs_proto.h happens to be byte-identical to
+# 05c14fd6's, so nothing was actually broken, but nothing was checking either.
+#
+# bs_proto.h is the wire contract between this client and the Linux server.
+# Drift here does not fail to compile; it produces a client and a server that
+# disagree about ids, flags or struct sizes and desync at runtime, which is the
+# hardest class of bug this project has to diagnose. So the check has to look
+# at CONTENT, and it has to run on every build.
+#
+# Shape copied deliberately from deps/blocksmith-server/game/Makefile's
+# check-world-drift (a phony `cmp`-on-bytes target wired into `all`) rather
+# than inventing a second, different mechanism for the same job. That comment
+# also argues, at length and from a real shipped bug, why a _Static_assert on a
+# protocol constant is not a substitute: the number was never what drifted.
+#
+# Truth source is the pinned commit's own blob, streamed out of the clone's
+# object store — NOT a sha256 recorded here beside PROTO_COMMIT. A recorded
+# digest is a second statement of the same fact and can drift from the pin it
+# describes: bump PROTO_COMMIT without bumping the digest and the guard goes
+# red on a correct tree, whose obvious "fix" is to paste in whatever the disk
+# says — training the reader to make the check green instead of to check.
+# Deriving the expected bytes from PROTO_COMMIT keeps one source of truth, and
+# because a commit SHA is content-addressed the bytes it names cannot change
+# under it; a force-push that replaces the commit makes the SHA unresolvable,
+# which this fires on, which is exactly the threat the pin comment claims.
+#
+# `cmp` on the streamed blob, not a `git hash-object` comparison, because the
+# server repo's .gitattributes says `* text=auto eol=lf`: hash-object applies
+# that clean filter, so a worktree file rewritten to CRLF would hash EQUAL to
+# the pin while differing on disk. cat-file | cmp has no filter on either side.
+# (The hash-object line in the failure message below is diagnostic only — if it
+# prints equal while cmp failed, the drift is line endings and nothing else.)
+#
+# This guard reports; it never mutates. It does not re-run `git checkout
+# $(PROTO_COMMIT)`, because deps/blocksmith-server is a separate repo a
+# developer may have deliberately parked on a sync branch, and a build that
+# silently moves your checkout is a worse bug than the one it is fixing.
+.PHONY: check-proto-drift
+check-proto-drift:
+	@if [ ! -e $(PROTO)/proto/bs_proto.h ]; then \
+		echo "Makefile: $(PROTO)/proto/bs_proto.h is not there."; \
+		echo "  the vendored protocol header has not been fetched yet."; \
+		echo "  fetch it with:  make deps"; \
+		exit 1; \
+	fi; \
+	pinned=$$(git -C $(PROTO) -c safe.directory='*' rev-parse -q --verify $(PROTO_COMMIT):proto/bs_proto.h 2>/dev/null); \
+	if [ -z "$$pinned" ]; then \
+		echo "Makefile: cannot read proto/bs_proto.h as of the pinned commit."; \
+		echo "  PROTO_COMMIT = $(PROTO_COMMIT)"; \
+		echo "  $(PROTO) has no such object. Either the clone is on an unrelated"; \
+		echo "  history, or that commit was force-pushed away upstream."; \
+		echo "  the build cannot prove which protocol it is compiling against, so it stops."; \
+		echo "  re-fetch it with:  git -C $(PROTO) fetch origin $(PROTO_COMMIT)"; \
+		exit 1; \
+	fi; \
+	if ! git -C $(PROTO) -c safe.directory='*' cat-file blob $$pinned | cmp -s - $(PROTO)/proto/bs_proto.h; then \
+		echo "Makefile: $(PROTO)/proto/bs_proto.h has drifted from the pinned commit."; \
+		echo "  pinned   PROTO_COMMIT = $(PROTO_COMMIT)"; \
+		echo "           blob         = $$pinned"; \
+		echo "  on disk  blob         = $$(git -C $(PROTO) -c safe.directory='*' hash-object proto/bs_proto.h 2>/dev/null)"; \
+		echo "           HEAD         = $$(git -C $(PROTO) -c safe.directory='*' rev-parse HEAD 2>/dev/null)"; \
+		echo "  bs_proto.h is the wire contract between this client and the Linux server."; \
+		echo "  building against a header the pin does not name yields a client that"; \
+		echo "  disagrees with the server about ids, flags or struct sizes, and that"; \
+		echo "  disagreement surfaces as a runtime desync, never as a compile error."; \
+		echo "  see what changed:  git -C $(PROTO) diff $(PROTO_COMMIT) -- proto/bs_proto.h"; \
+		echo "  restore the pin:   git -C $(PROTO) checkout $(PROTO_COMMIT) -- proto/bs_proto.h"; \
+		echo "  or, if the protocol really did move, bump PROTO_COMMIT above and say why"; \
+		echo "  in the comment beside it, as every previous bump does."; \
+		exit 1; \
+	fi
+
 $(HYDRO)/hydrogen.h:
 	@mkdir -p deps
 	git clone -q $(HYDRO_REPO) $(HYDRO)
@@ -299,7 +381,15 @@ endif
 .PHONY: all clean cia
 
 #---------------------------------------------------------------------------------
-all: $(BUILD) $(GFXBUILD) $(DEPSDIR) $(ROMFS_T3XFILES) $(T3XHFILES)
+# check-proto-drift is listed FIRST so the wire-contract check runs before any
+# compiling: a build that is going to be rejected for protocol drift should not
+# spend two minutes producing objects nobody may use. `cia: all` inherits it,
+# so release packaging is covered by the same one wiring. This is the only
+# always-runs entry point in this Makefile — there is no `test` target here to
+# hang it off as well (the host suites run from tools/run_host_tests.sh, not
+# from make), which is the one asymmetry with check-world-drift's `all: test:`
+# pair on the server side.
+all: check-proto-drift $(BUILD) $(GFXBUILD) $(DEPSDIR) $(ROMFS_T3XFILES) $(T3XHFILES)
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
 
 #---------------------------------------------------------------------------------
