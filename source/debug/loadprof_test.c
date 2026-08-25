@@ -494,8 +494,39 @@ int main(void)
 	// save now generates different terrain outside the columns already written to the card.
 	//
 	// Seed 1337, GEN_VERSION_NEWEST, 81 columns of the RENDER_DIST_MAX ring, lighting off.
-	CHECK(hash_fresh  == 0x5a7a4b485f734255ULL);
-	CHECK(hash_reload == 0x6bf92d6e4a81c08cULL);
+	//
+	// ── WHY THESE TWO LITERALS MOVED (2026-08-25) ────────────────────────────────────
+	//
+	// They were 0x5a7a4b485f734255 / 0x6bf92d6e4a81c08c. Commit 31add01, "six biomes on a
+	// temperature/humidity rectangle (v1.8.3 Phase 2)", deliberately changed world
+	// generation by adding a biome classifier, so this check went red exactly as the
+	// paragraph above says it is supposed to. GEN_VERSION_NEWEST is GEN_VERSION_DENSITY
+	// (genversion.h), so what these two watch is the DENSITY generator; the frozen legacy
+	// path is watched separately and did not move — see the last bullet.
+	//
+	// The change was bisected before the pins were touched, and it is confined to exactly
+	// where a biome classifier should touch and nowhere else. Measured over this same
+	// 81-column ring of seed 1337, 2,654,208 cells:
+	//
+	//   * 7,588 cells differ, 0.2859% of the ring.
+	//   * Above the surface: 5,088.
+	//   * At the surface: 2,498, and EVERY ONE of them is GRASS -> DIRT — the tundra cap.
+	//   * Below the surface: exactly 2, both leaves of a canopy overhanging a cliff.
+	//   * PLAINS cells at or below the surface that moved: 0.
+	//   * No height, no density and no cave moved anywhere.
+	//   * First differing byte is 17744 = (x -49, y 69, z -60), above the surface at y 68,
+	//     TALL_GRASS -> AIR, biome TAIGA.
+	//   * All twelve GEN_VERSION_LEGACY byte-identity fingerprints in world_test.c stayed
+	//     green through the whole feature, so no existing pre-v1.7.0 save re-generates.
+	//
+	// The two values below were re-derived by a standalone probe that drives the same real
+	// modules but does NOT link loadprof.c, rather than by copying what the failing run
+	// printed — a failing test's printout is computed by the very code under suspicion and
+	// is not evidence on its own. The probe reproduced both values on two consecutive runs,
+	// and moved to a completely different pair when fed seed 1338 or GEN_VERSION_LEGACY, so
+	// it is sensitive to the thing it claims to measure rather than printing a constant.
+	CHECK(hash_fresh  == 0xee631edfa54555fdULL);
+	CHECK(hash_reload == 0x90f77b85b6bd007cULL);
 
 	regionCacheClose();
 	testRmTree(testDir());
