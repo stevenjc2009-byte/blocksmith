@@ -190,9 +190,37 @@ Worlds made in 1.7.x open in 1.8.0 unchanged, and no block id moved — see Comp
 ### Compatibility
 
 - No save-format break, and no block id moved. `BLOCK_COUNT` is unchanged at 8, which matters
-  because the server uses it as its item ceiling and compares a CRC of the shared block registry
-  on connect — water levels deliberately live in a side map rather than as new block ids, since
-  seven new rows would have desynced every joined session permanently.
+  because the server uses it as its item ceiling and because the shared block registry's CRC is
+  part of the join handshake — water levels deliberately live in a side map rather than as new
+  block ids, since seven new rows would have desynced every joined session permanently.
+
+  **Correction (2026-08-25).** This entry originally said the server "compares a CRC of the
+  shared block registry on connect". It does not, and never has — verified by reading the code
+  on 2026-08-25. The server only *announces* its fingerprint, once: `send_registry_info()`
+  (`deps/blocksmith-server/game/bsgame.c:569-576`) sends `{rev, count, crc16}` from
+  `handle_join()` (`bsgame.c:915`). `BS_APP_REGISTRY_INFO` is server-to-client only
+  (`proto/bs_proto.h:291`) and the only registry message going the other way is
+  `BS_APP_REGISTRY_FETCH`, two bytes of type plus `first_index` (`bs_proto.h:292`). No CRC ever
+  travels client-to-server, so the server has nothing to compare and performs no comparison.
+  The whole gate is client-side, in `registryMatchesInfo()` at `source/net/networld.c:210-216`.
+
+  A mismatch also cannot repair itself. The client retries `REGISTRY_FETCH` four times at 250 ms,
+  but a `REGISTRY_DEFS` batch can only carry *dynamic* rows — `registryDefUnpack()`
+  (`source/world/registry.c:363`) rejects any id below `REG_ID_DYN_LO` at `:367`, so core rows
+  are compiled in and untransmittable by construction. After the 2000 ms deadline the client
+  enters the world degraded, permanently for that session. That degraded state is effectively
+  invisible to a player: the "Joined - syncing block table..." row vanishes on the deadline
+  exactly as it would on success, and the only lasting indicator is a `!` on the debug overlay,
+  which is off unless the player turned it on.
+
+  This is precisely why a **core** registry addition forces a matching server release, shipped
+  first or simultaneously and never client-first: nothing at runtime detects it for the player,
+  nothing at runtime repairs it, and the server accepts the join either way. `BS_PROTO_VERSION`
+  (`bs_proto.h:56`, enforced at `bsgate.c:867` and `bsnet_transport.c:570`) is a completely
+  independent gate and is not involved.
+
+  The same false claim is carried by blocksmith-server's published `v1.8.1` tag body and its
+  commit `c77db54`. Both are published history and are deliberately left unrewritten.
 - Water still cannot be carried or placed by the player: it sits outside the hotbar's id range by
   design, and 1.8.0 does not change that.
 

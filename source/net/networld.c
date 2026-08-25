@@ -145,6 +145,56 @@ static uint8_t  s_reg_info_rev;
 static uint8_t  s_reg_info_count;
 static uint16_t s_reg_info_crc;
 
+// WHICH SIDE COMPARES, and why the released record says otherwise. Verified by reading the
+// code on 2026-08-25. blocksmith-server's v1.8.1 annotated tag body and its commit c77db54
+// both state that "the server compares that CRC on join". That is false and has never been
+// true. Both artifacts are published and are deliberately left standing; this comment, at the
+// one place the comparison actually happens, is the correction.
+//
+// The server only ANNOUNCES, once, and never verifies. send_registry_info()
+// (deps/blocksmith-server/game/bsgame.c:569-576, called from handle_join() at bsgame.c:915)
+// packs {rev, count, crc16} into one BS_APP_REGISTRY_INFO and sends it. That message is S->C
+// only (proto/bs_proto.h:291). The only registry message that travels C->S is
+// BS_APP_REGISTRY_FETCH, and it is two bytes — type plus first_index (bs_proto.h:292;
+// sendRegistryFetch() at networld.c:983-989 is the whole encoder). No CRC, count or revision
+// ever reaches the server, so the server holds nothing to compare against and runs no such
+// comparison anywhere. The two send_kick() calls in the FETCH handler (bsgame.c:591-599) are a
+// length check and a range check on that request message; they are not a fingerprint verdict,
+// and no join is ever refused over the registry.
+//
+// The entire gate is registryMatchesInfo() below, client-side, in this process.
+//
+// A CORE-row mismatch cannot self-heal, and the retry cannot converge. On mismatch the client
+// sends up to NETWORLD_REG_FETCH_MAX_SENDS (4) FETCHes NETWORLD_REG_FETCH_RETRY_MS (250) apart,
+// but a DEFS batch can only ever carry DYNAMIC rows: registryDefUnpack() (world/registry.c:363)
+// returns false for any id < REG_ID_DYN_LO, at :367. Core rows are compiled into both binaries
+// and are untransmittable by construction. So when the two builds disagree about kCoreDefs —
+// which is exactly what happens when a core row is added or a byte inside one changes — the
+// whole retry budget is spent asking for rows that were never the problem,
+// NETWORLD_REG_SYNC_DEADLINE_MS (2000) expires, and the client enters the world DEGRADED with
+// s_reg_synced false for the rest of the session. Nothing on the wire can lift it.
+//
+// That degraded state is effectively invisible to a player. scene/title.c's "Joined - syncing
+// block table..." row is drawn only WHILE networldRegistryWaiting() is true, so on the deadline
+// it disappears exactly as it would have on success. The only lasting indicator is the "!"
+// main.c appends to the debug overlay's net line, and that overlay is not on unless the player
+// has toggled it on. In practice the failure is silent: every server-defined id resolves to air
+// through registryView()'s never-NULL contract, and a world full of holes reads as terrain.
+//
+// Which is precisely why a core registry addition FORCES a matching server release, shipped
+// FIRST or simultaneously and never client-first. Nothing at runtime detects it for the player,
+// nothing at runtime repairs it, and the server will happily accept the join either way. The
+// lockstep is a release-process obligation that people have to keep; the protocol does not
+// enforce it and cannot.
+//
+// BS_PROTO_VERSION is a COMPLETELY SEPARATE gate and must not be conflated with any of the
+// above. It is bumped only for incompatible wire changes (bs_proto.h:56) and it genuinely is
+// enforced, on both ends, by dropping the datagram before anything else looks at it:
+// gateway/bsgate.c:867 server-side and net/bsnet_transport.c:570 client-side. A registry CRC
+// move does not touch it — v1.8.1 moved the core CRC 0x72A8 -> 0x4066 with BS_PROTO_VERSION
+// unchanged at 1, which is exactly why that release needed a human-enforced lockstep instead
+// of getting a clean protocol-level drop.
+//
 // The single question s_reg_synced is an answer to: does the table, as it stands at this
 // instant, reproduce the fingerprint the server named?
 //

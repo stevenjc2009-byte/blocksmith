@@ -15,8 +15,10 @@
 // world/registry.c (md5 e33ec067652cfd4402bd790497078915 on both, checked 2026-08-24), and
 // deps/blocksmith-server is a git clone the Makefile pins at commit 05c14fd6 and re-checks
 // out on `make deps`. The server packs registryCount() and registryCrc16() from ITS copy
-// into BS_APP_REGISTRY_INFO (bsgame.c:519-520), and net/networld.c's registryMatchesInfo()
-// (networld.c:160-166) compares both against this client's own table. Adding seven core rows
+// into BS_APP_REGISTRY_INFO (bsgame.c:574-575), and net/networld.c's registryMatchesInfo()
+// (networld.c:210-216) compares both against this client's own table — that comparison is
+// CLIENT-SIDE and the server never performs one; see registryMatchesInfo()'s own header comment
+// in net/networld.c. Adding seven core rows
 // moves the count from 10 to 17 and changes the crc, so every joined session would answer
 // networldRegistrySynced() == false for ever, spend its whole FETCH retry budget, and fly the
 // "!" the debug overlay puts up for an unverified table (main.c:3948). Fixing that means
