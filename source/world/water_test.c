@@ -35,6 +35,11 @@
 //   testQueueOverflow   - a refused candidate is COUNTED, not silent, and the world converges
 //                         to the reference once the cells are offered again.
 //   testTickCost        - real microseconds per tick, settled and active arms interleaved.
+//   testSunkenBasin,
+//   testPadAndShaft     - the two fixture experiments. v1.8.3: both build their terrain and
+//                         place their source with world.h's edit hook LIVE (resetWorldWired),
+//                         because that is what the game does and the results have to transfer.
+//                         See wiredEditHook for what these two were measuring before that.
 //
 // The __3DS__ guard is load-bearing, not tidy: the console Makefile globs every .c under
 // source/world and this file's main() would collide with source/main.c's.
@@ -79,6 +84,39 @@ static void resetWorld(void)
 	worldInit(&g_world);
 	waterInit(&g_sim);
 	worldSetEditHook(NULL, NULL);
+}
+
+// v1.8.3. The GAME's wiring, in one function, and it is a copy of source/main.c's onWorldEdit
+// (main.c:2827, installed once at main.c:3149) down to the discarded arguments: every
+// single-block change on the console reaches the water simulation through world.h's edit hook —
+// world.c:278, `if (s_edit_fn && prev != id)` — and no edit path anywhere in the game calls
+// waterNotify by hand.
+//
+// Why this exists rather than a hand call: a fixture that builds with the hook NULL and then
+// calls waterNotify once is running a DIFFERENT EXPERIMENT from the game, and the difference is
+// not cosmetic. buildPad() is 3829 worldSet calls; with the hook dead not one of them queues
+// anything, so `waterQueueFull(&g_sim) == 0` afterwards was true by construction and could not
+// go red. Measured on 2026-08-25 by instrumenting qPush: with the hook dead the ring never gets
+// deeper than 210 of WATERQ_CAP's 1024 during the pad pour, and 50 and 29 during the two basin
+// pours. So halving the ring to 512 inside qPush — a real overrun, and that same build's own
+// testQueueOverflow reported 1595 candidates genuinely refused — still left this whole file at
+// "PASS 149 checks, 0 failed", pad arm included. That is the defect this hook fixes.
+static void wiredEditHook(void* ud, int x, int y, int z, BlockId prev, BlockId now)
+{
+	(void)ud; (void)prev; (void)now;
+	waterNotify(&g_sim, x, y, z);
+}
+
+// resetWorld() clears the hook and MUST keep clearing it. world.c's s_edit_fn (world.c:217) is a
+// file static that outlives every World — worldInit/worldExit never touch it — so a hook left
+// armed by the previous probe would fire during the next one's fixture build, against a counter
+// or a sim that probe never meant to disturb; and testEditHook's last check, "a NULL hook is
+// genuinely uninstalled", has nothing to assert if the reset does not put it back to NULL. So
+// the fix for the fidelity defect is to RE-ARM after the reset, never to stop clearing.
+static void resetWorldWired(void)
+{
+	resetWorld();
+	worldSetEditHook(wiredEditHook, NULL);
 }
 
 static void fillBox(int x0, int x1, int y0, int y1, int z0, int z1, BlockId id)
@@ -1018,6 +1056,9 @@ typedef struct {
 	int shaft_wet;    // water blocks in the 3x3 shaft between vy-6 and vy-1
 	int pool_cells;   // water blocks on the shaft floor at vy-6
 	int pool_max;     // the highest level on that floor
+	uint32_t build_q_full;   // candidates the fixture BUILD alone had refused, hook live
+	int      build_pending;  // still queued when the build finished, before any tick
+	int      build_flow;     // flow cells the build left behind — must be zero, it is all stone
 } BasinArm;
 
 // Runs one arm and prints everything an eye on the emulator would have been trying to read.
@@ -1028,8 +1069,29 @@ static BasinArm basinArm(const char* label, int sx, int sz)
 
 	printf("  -- %s source, one BLOCK_WATER at (%d, %d, %d) --\n", label, sx, BASIN_VY, sz);
 
-	resetWorld();
+	resetWorldWired();
 	buildBasin();
+
+	// The fixture goes in one block at a time through worldSet, so with the game's wiring the
+	// hook fires on every changed cell of it — buildBasin turns 6069 cells to stone before it
+	// carves anything — and not one tick runs in between. That is not a shape the game can
+	// produce: worldgen installs terrain through worldSetChunkAll, which fires the hook exactly
+	// zero times by design (testEditHook above pins that), and a player laying blocks by hand
+	// gets 20 drains a second. So the burst is a property of the FIXTURE, and it is measured
+	// here and asserted on by its caller rather than folded silently into the pour below.
+	r.build_q_full  = waterQueueFull(&g_sim);
+	r.build_pending = waterPending(&g_sim);
+
+	// Then let the simulation catch up, exactly as those 20 TPS would while the player builds.
+	// Every queued candidate is a stone or air cell with no water anywhere near it, so this
+	// changes nothing — build_flow below is the check that says so — and it leaves the pour as
+	// the only thing the numbers after it describe.
+	(void)waterSettle(&g_sim, &g_world, 20000, NULL, NULL);
+	r.build_flow = waterFlowCells(&g_sim);
+	const uint32_t q_full_base = waterQueueFull(&g_sim);
+
+	printf("         build: %u refused, %d pending, then drained to %d pending / %d flow cells\n",
+	       r.build_q_full, r.build_pending, waterPending(&g_sim), r.build_flow);
 
 	// Two controls. Neither reads the spread rule at all, so both stay green in the corner arm,
 	// in the centre arm, and in a sabotaged build — which is what makes the red ones below
@@ -1038,12 +1100,19 @@ static BasinArm basinArm(const char* label, int sx, int sz)
 	      "control: the pad rim outside the basin is stone");
 	CHECK(worldGet(&g_world, BASIN_VCX, BASIN_VY - 7, BASIN_VCZ) == (BlockId)BLOCK_STONE,
 	      "control: the shaft has a stone floor at vy-7");
+	CHECK(r.build_flow == 0, "control: the fixture build left no water behind, only stone and air");
 
 	CHECK(worldSet(&g_world, sx, BASIN_VY, sz, BLOCK_WATER), "the single source block is placed");
 	CHECK(waterLevelAt(&g_sim, &g_world, sx, BASIN_VY, sz) == WATER_LEVEL_SOURCE,
 	      "control: it reads as a source (level 8)");
 
-	waterNotify(&g_sim, sx, BASIN_VY, sz);
+	// No hand call. The place went through worldSet, so the edit hook queued the cell and its
+	// six neighbours the way it does on the console. This is the check that goes red the instant
+	// anyone unwires the hook again, and it goes red BEFORE any outcome check does — which is
+	// the whole point: an outcome check cannot see who queued the work, only that it happened.
+	CHECK(waterPending(&g_sim) == 7,
+	      "the edit hook alone queued the source and its six neighbours");
+
 	r.ticks      = waterSettle(&g_sim, &g_world, 20000, NULL, NULL);
 	r.flow_cells = waterFlowCells(&g_sim);
 
@@ -1088,7 +1157,11 @@ static BasinArm basinArm(const char* label, int sx, int sz)
 	CHECK(r.ticks >= 0, "the arm reaches a stable state inside 20000 ticks");
 	CHECK(waterPending(&g_sim) == 0, "nothing is left queued once it has settled");
 	CHECK(waterMapFull(&g_sim) == 0, "no flow cell was ever refused a map slot");
-	CHECK(waterQueueFull(&g_sim) == 0, "no candidate was ever refused a ring slot");
+	// Against the base taken after the build, not against zero: q_full is cumulative for the
+	// life of the sim, and this assertion has always been about the POUR. Written as a delta it
+	// keeps meaning exactly what it used to mean while the fixture build is judged separately.
+	CHECK(waterQueueFull(&g_sim) == q_full_base,
+	      "no candidate was refused a ring slot during the pour itself");
 	return r;
 }
 
@@ -1098,6 +1171,18 @@ static void testSunkenBasin(void)
 
 	// ARM 1 — the corner. Stone directly under it, so it cannot go down, so it feeds sideways.
 	const BasinArm corner = basinArm("corner", BASIN_VCX + 3, BASIN_VCZ + 3);
+
+	// The build burst, pinned as bare literals so it cannot drift silently. 6069 stone cells laid
+	// one worldSet at a time with the hook live and no tick between them: the ring saturates at
+	// WATERQ_CAP and 38771 further candidates are refused. That is a fixture artefact, not a
+	// simulation fault — nothing in the game installs terrain through per-block worldSet — and it
+	// is recorded rather than hidden because it is also the shape of the failure to look for: if
+	// a real edit ever lands while 1024 candidates are already pending, its own notify is refused
+	// and the water never moves. Measured that way before the drain was added: 0 flow cells,
+	// a lone unspread source cube, from a simulation that is working perfectly.
+	CHECK(corner.build_q_full == 38771, "the basin build refuses 38771 candidates with the hook live");
+	CHECK(corner.build_pending == 1024, "and leaves the ring saturated at WATERQ_CAP");
+	CHECK((int)WATERQ_CAP == 1024, "control: WATERQ_CAP is still the 1024 those two numbers assume");
 
 	CHECK(corner.basin_wet > 1,
 	      "the corner source does NOT sit alone: it wets more than its own cell");
@@ -1166,6 +1251,9 @@ typedef struct {
 	int pool_cells;   // water blocks on the shaft floor at vy-6
 	int pool_max;     // highest level on that floor
 	int spill_col;    // water blocks in the column one step OUTSIDE the pad rim, y = 0 .. vy
+	uint32_t build_q_full;   // candidates the fixture BUILD alone had refused, hook live
+	int      build_pending;  // still queued when the build finished, before any tick
+	int      build_flow;     // flow cells the build left behind — must be zero, it is all stone
 } PadArm;
 
 static PadArm padArm(const char* label, int sx, int sy, int sz)
@@ -1175,8 +1263,21 @@ static PadArm padArm(const char* label, int sx, int sy, int sz)
 
 	printf("  -- %s source, one BLOCK_WATER at (%d, %d, %d) --\n", label, sx, sy, sz);
 
-	resetWorld();
+	resetWorldWired();
 	buildPad();
+
+	// Same as basinArm: the fixture is 3829 worldSet calls with the game's hook live and no tick
+	// between any of them, which is a burst no in-game path produces. Measured, asserted on by
+	// testPadAndShaft, and then drained before the pour so the pour's own numbers stay the
+	// pour's own numbers.
+	r.build_q_full  = waterQueueFull(&g_sim);
+	r.build_pending = waterPending(&g_sim);
+	(void)waterSettle(&g_sim, &g_world, 20000, NULL, NULL);
+	r.build_flow = waterFlowCells(&g_sim);
+	const uint32_t q_full_base = waterQueueFull(&g_sim);
+
+	printf("         build: %u refused, %d pending, then drained to %d pending / %d flow cells\n",
+	       r.build_q_full, r.build_pending, waterPending(&g_sim), r.build_flow);
 
 	// Controls. None of them reads the spread rule, so all stay green here and in a sabotaged
 	// build — which is what makes the red checks below evidence rather than noise.
@@ -1186,12 +1287,16 @@ static PadArm padArm(const char* label, int sx, int sy, int sz)
 	      "control: the shaft mouth is open through the pad");
 	CHECK(worldGet(&g_world, sx, sy - 1, sz) == (BlockId)BLOCK_STONE,
 	      "control: the source has pad stone directly under it");
+	CHECK(r.build_flow == 0, "control: the fixture build left no water behind, only stone and air");
 
 	CHECK(worldSet(&g_world, sx, sy, sz, BLOCK_WATER), "the single source block is placed");
 	CHECK(waterLevelAt(&g_sim, &g_world, sx, sy, sz) == WATER_LEVEL_SOURCE,
 	      "control: it reads as a source (level 8)");
 
-	waterNotify(&g_sim, sx, sy, sz);
+	// No hand call — see basinArm. The hook is what queues the source, exactly as on the console.
+	CHECK(waterPending(&g_sim) == 7,
+	      "the edit hook alone queued the source and its six neighbours");
+
 	r.ticks      = waterSettle(&g_sim, &g_world, 20000, NULL, NULL);
 	r.flow_cells = waterFlowCells(&g_sim);
 
@@ -1256,7 +1361,9 @@ static PadArm padArm(const char* label, int sx, int sy, int sz)
 	CHECK(r.ticks >= 0, "the arm reaches a stable state inside 20000 ticks");
 	CHECK(waterPending(&g_sim) == 0, "nothing is left queued once it has settled");
 	CHECK(waterMapFull(&g_sim) == 0, "no flow cell was ever refused a map slot");
-	CHECK(waterQueueFull(&g_sim) == 0, "no candidate was ever refused a ring slot");
+	// A delta, for the same reason basinArm's is: cumulative counter, assertion about the pour.
+	CHECK(waterQueueFull(&g_sim) == q_full_base,
+	      "no candidate was refused a ring slot during the pour itself");
 	return r;
 }
 
@@ -1265,6 +1372,17 @@ static void testPadAndShaft(void)
 	puts("water: a source ON TOP of a flat pad with a shaft cut through it");
 
 	const PadArm pad = padArm("on-pad", PAD_VCX - 3, PAD_VY + 1, PAD_VCZ - 3);
+
+	// The build burst, bare literals, and the number that matters is 974. The pad fixture built
+	// with the game's wiring and no tick in between leaves 974 candidates pending against a ring
+	// of 1024 — FIFTY slots of headroom, 95.1% full, and nothing refused. Before the hook was
+	// wired this whole line was 0 pending and 0 refused, which is why the "no candidate was ever
+	// refused" check below used to be true by construction. Pin both halves: the refusal count
+	// AND the depth, because a change that only moves the depth is invisible in the count until
+	// the day it crosses 1024, and on that day the source's own notify is the one that is refused.
+	CHECK(pad.build_q_full == 0, "the pad build refuses nothing: 974 candidates fit in 1024 slots");
+	CHECK(pad.build_pending == 974, "and 974 is what it leaves pending, 50 short of WATERQ_CAP");
+	CHECK((int)WATERQ_CAP - pad.build_pending == 50, "50 slots of headroom, stated as a number");
 
 	// The headline, and it contradicts what the emulator showed: this source DOES spread. The
 	// cell under it is pad stone, so sideFeed hands out its level, and the manhattan ball runs
@@ -1322,6 +1440,18 @@ int main(void)
 	testTickCost();
 
 	worldExit(&g_world);
+
+	// v1.8.3. The suite counts itself, and no other suite in this project does — which is exactly
+	// how a 326 -> 318 deletion once passed as "0 failed" here. A red arm whose TOTAL dropped is
+	// deleting checks, not failing them, and nothing in the PASS line below can tell the two
+	// apart on its own. 161 is every check above this one; this check is the 162nd.
+	//
+	// It is deliberately a naked literal and not a symbol: a count expressed in terms of anything
+	// the file computes would move with the file, which is the whole failure mode it exists to
+	// catch. When a check is legitimately added or removed, this number is edited by hand, on
+	// purpose, in the same commit — that edit IS the review.
+	const int counted = g_checks;
+	CHECK(counted == 161, "the suite ran all 161 of its checks: none was deleted or skipped");
 
 	printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);
 	if (g_fails) printf("FAILED - %d of %d checks\n", g_fails, g_checks);
