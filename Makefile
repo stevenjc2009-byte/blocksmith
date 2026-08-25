@@ -252,6 +252,140 @@ check-proto-drift:
 		exit 1; \
 	fi
 
+# ------------------------------------------------------- vendored world guard
+#
+# deps/blocksmith-server/tools/sync-world-sources.sh mirrors eleven of this
+# client's source/world/ files into that repo's game/world/, one way, with
+# `cp -f`: this client is the source of truth and the server carries verbatim
+# copies because the DEPLOYED server is a standalone clone of that repo alone,
+# with no client tree beside it to include from. Those eleven files are the
+# block ids, the registry rows, the inventory rules and the tick model. A
+# client and a server that disagree about them do not fail to compile; they
+# desync at runtime, the same failure mode check-proto-drift above exists for.
+#
+# That mirror was guarded on ONE side only. The server's game/Makefile has its
+# own check-world-drift in `all:` and `test:`, but only under
+# ifeq ($(BS_HAVE_CLIENT_WORLD_HEADERS),1) — that is, only when somebody builds
+# the SERVER with a client tree sitting beside it. Nothing here checked it, so
+# editing source/world/inventory.c, building this client and shipping it
+# reported nothing at all, and the drift surfaced later, if ever, on whoever
+# next happened to build the server. v1.8.3 Phase 3 edits inventory.c,
+# registry.c and block.h — three of the eleven — so "later" is this week.
+#
+# Shape taken from check-proto-drift above and from the server's own
+# check-world-drift: a phony target, `cmp` on bytes, wired into `all`. A third
+# mechanism for the same job is deliberately not invented here.
+#
+# The file list is READ out of sync-world-sources.sh's FILES=( ... ) line, not
+# restated below. It is already written down twice — in that script and in the
+# server Makefile's VENDORED_WORLD_FILES — and a third hand-copy would be a
+# third place to forget when a twelfth file joins the mirror. If that line ever
+# stops matching, this stops the build rather than quietly checking an empty
+# list, and the success line prints the count it actually compared so a list
+# that silently shrank is visible in the build log instead of inferred from a
+# guard that said nothing.
+#
+# `cmp` on bytes, never `git hash-object`. The server repo's .gitattributes is
+# `* text=auto eol=lf` and this repo's pins `* -text`, so the two sides run
+# through DIFFERENT clean filters: a vendored copy rewritten to LF would hash
+# EQUAL to the client's CRLF original while differing on every line ending on
+# disk. (That repo carves out `game/world/** -text` last in its .gitattributes
+# precisely so the mirrored bytes survive a checkout; this guard is what would
+# notice if that carve-out were ever dropped.) A line-ending-only difference is
+# still reported AS drift: the mirror's contract is byte-identical, the server's
+# own cmp-on-bytes guard will fail on it too, and the fix is the same single
+# command — while a guard that normalised endings to be tolerant would be
+# reintroducing the very filter that hides the real thing. The message below
+# says when a difference is endings-only, so the reader is not sent hunting for
+# changed logic that is not there.
+#
+# A missing deps/blocksmith-server is a HARD failure here, not a skip. The
+# server's guard skips when no client tree sits beside it because a standalone
+# server IS a supported, shipped configuration over there. The mirror image is
+# not true on this side: this client cannot build without that clone at all —
+# proto/bs_proto.h comes out of it, and check-proto-drift above already stops
+# the build with the same `make deps` instruction when it is absent. So "deps/
+# is not there yet" is not a fresh clone this guard breaks; it is a fresh clone
+# that was already stopping one prerequisite earlier. Skipping would buy that
+# tree nothing and would leave behind a guard that passes when it checked
+# nothing, which this project has been bitten by before. Both branches say out
+# loud which one they took.
+#
+# It reports; it never mutates. It does not run sync-world-sources.sh for you:
+# deps/blocksmith-server is a separate repo a developer may have deliberately
+# parked on a sync branch, and a build that rewrites another checkout behind
+# your back is a worse bug than the one it is fixing.
+WORLD_SRC	:=	source/world
+WORLD_VENDOR	:=	$(PROTO)/game/world
+WORLD_MIRROR	:=	$(PROTO)/tools/sync-world-sources.sh
+
+.PHONY: check-world-drift
+check-world-drift:
+	@if [ ! -e $(WORLD_MIRROR) ]; then \
+		echo "Makefile: $(WORLD_MIRROR) is not there."; \
+		echo "  deps/blocksmith-server has not been fetched, so the vendored copies"; \
+		echo "  of $(WORLD_SRC)/ cannot be compared against their originals here."; \
+		echo "  this guard FAILS rather than skips: a check that passes when it had"; \
+		echo "  nothing to check is not a check. check-proto-drift stops on the same"; \
+		echo "  missing clone, so this is not new breakage for a fresh tree."; \
+		echo "  fetch it with:  make deps"; \
+		exit 1; \
+	fi; \
+	files=`sed -n 's/^FILES=(//p' $(WORLD_MIRROR) | sed 's/).*$$//'`; \
+	if [ -z "$$files" ]; then \
+		echo "Makefile: cannot read the mirrored-file list out of $(WORLD_MIRROR)."; \
+		echo "  this target reads that script's FILES=( ... ) line so the names live"; \
+		echo "  in one place instead of three. No such line matched, so the script's"; \
+		echo "  shape changed and this guard no longer knows what it is meant to"; \
+		echo "  compare. The build stops rather than compare nothing."; \
+		echo "  re-point the sed in check-world-drift at wherever the list now lives."; \
+		exit 1; \
+	fi; \
+	ok=1; n=0; \
+	for f in $$files; do \
+		n=`expr $$n + 1`; \
+		if [ ! -e $(WORLD_VENDOR)/$$f ]; then \
+			echo "Makefile: $(WORLD_VENDOR)/$$f is missing."; \
+			echo "  the mirror lists world/$$f but the vendored copy is not on disk:"; \
+			echo "  that copy is incomplete, not merely stale."; \
+			ok=0; continue; \
+		fi; \
+		if [ ! -e $(WORLD_SRC)/$$f ]; then \
+			echo "Makefile: $(WORLD_SRC)/$$f is missing, but the mirror lists it."; \
+			echo "  the client is the source of truth, so there is nothing to mirror"; \
+			echo "  from. Either restore it or drop it from $(WORLD_MIRROR)."; \
+			ok=0; continue; \
+		fi; \
+		cmp -s $(WORLD_SRC)/$$f $(WORLD_VENDOR)/$$f && continue; \
+		echo "Makefile: $(WORLD_VENDOR)/$$f has drifted from $(WORLD_SRC)/$$f."; \
+		if [ "`tr -d '\r' < $(WORLD_SRC)/$$f | cksum`" = "`tr -d '\r' < $(WORLD_VENDOR)/$$f | cksum`" ]; then \
+			echo "  the two differ ONLY in line endings — do not go hunting for changed"; \
+			echo "  logic. Still drift: the mirror's contract is byte-identical and the"; \
+			echo "  server's own cmp-on-bytes guard fails on it too."; \
+		else \
+			echo "  content differs. See it with:"; \
+			echo "    diff -u $(WORLD_VENDOR)/$$f $(WORLD_SRC)/$$f"; \
+		fi; \
+		ok=0; \
+	done; \
+	if [ $$n -eq 0 ]; then \
+		echo "Makefile: check-world-drift compared 0 files, which cannot be right."; \
+		exit 1; \
+	fi; \
+	if [ $$ok -eq 0 ]; then \
+		echo "Makefile: the vendored world sources in $(PROTO) are out of date."; \
+		echo "  this client is the source of truth for them and the copy is one-way."; \
+		echo "  they carry the block ids, the registry rows, the inventory rules and"; \
+		echo "  the tick model: a server built from a stale copy does not fail to"; \
+		echo "  compile, it disagrees with this client at runtime and desyncs."; \
+		echo "  re-sync them with:  $(WORLD_MIRROR)"; \
+		echo "  then review and commit the result in that repo yourself —"; \
+		echo "    git -C $(PROTO) diff -- game/world"; \
+		echo "  this guard reports; it never edits another checkout for you."; \
+		exit 1; \
+	fi; \
+	echo "world mirror: $$n file(s) in $(WORLD_VENDOR) match $(WORLD_SRC) byte for byte"
+
 $(HYDRO)/hydrogen.h:
 	@mkdir -p deps
 	git clone -q $(HYDRO_REPO) $(HYDRO)
@@ -381,15 +515,17 @@ endif
 .PHONY: all clean cia
 
 #---------------------------------------------------------------------------------
-# check-proto-drift is listed FIRST so the wire-contract check runs before any
-# compiling: a build that is going to be rejected for protocol drift should not
-# spend two minutes producing objects nobody may use. `cia: all` inherits it,
+# check-proto-drift and check-world-drift are listed FIRST so both contract
+# checks run before any compiling: a build that is going to be rejected for
+# protocol drift, or for a vendored copy of the world sources that no longer
+# matches source/world/, should not spend two minutes producing objects nobody
+# may use. `cia: all` inherits it,
 # so release packaging is covered by the same one wiring. This is the only
 # always-runs entry point in this Makefile — there is no `test` target here to
 # hang it off as well (the host suites run from tools/run_host_tests.sh, not
 # from make), which is the one asymmetry with check-world-drift's `all: test:`
 # pair on the server side.
-all: check-proto-drift $(BUILD) $(GFXBUILD) $(DEPSDIR) $(ROMFS_T3XFILES) $(T3XHFILES)
+all: check-proto-drift check-world-drift $(BUILD) $(GFXBUILD) $(DEPSDIR) $(ROMFS_T3XFILES) $(T3XHFILES)
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
 
 #---------------------------------------------------------------------------------
