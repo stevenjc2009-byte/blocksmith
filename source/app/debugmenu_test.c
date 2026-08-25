@@ -29,6 +29,66 @@ static char s_first[160];
 		}                                                                        \
 	} while (0)
 
+// ── The pool capacity, pinned to a hand-written literal ─────────────────
+//
+// DEBUG_MENU_MAX_ENTRIES is the size of app/debugmenu.c's static s_pool, i.e. the total number
+// of rows the debug menu can hold across every subsystem that registers one. It is the ceiling
+// on the feature, and debugMenuRegister() returns NULL the moment it is reached.
+//
+// Before 2026-08-25 testRegistryPoolFull() asserted that ceiling against ITSELF. It read
+//
+//     for (int i = 0; i < DEBUG_MENU_MAX_ENTRIES; i++)
+//             CHECK(debugMenuRegister() != NULL);
+//     ...
+//     CHECK(debugMenuCount() == DEBUG_MENU_MAX_ENTRIES);
+//
+// so the loop BOUND and the expectation were the same constant: shrinking it shrank the work and
+// the expectation together, and the checks that would have caught the shrink were never run at
+// all rather than failed. Measured, not theorised: app/debugmenu.h's DEBUG_MENU_MAX_ENTRIES cut
+// from 32 to 8 — a 75% cut in how many rows the menu can hold — built clean, and this suite went
+// from "debugmenu self-test: PASS  80 checks" to "debugmenu self-test: PASS  56 checks", exit 0
+// both times. Twenty-four checks vanished and nothing said so.
+//
+// So the bound and the expectations are a naked literal now. It must NEVER be computed from
+// DEBUG_MENU_MAX_ENTRIES or from anything else app/debugmenu.{c,h} can also move. Resizing the
+// pool for real means editing this one line by hand, and the suite going red until you do is the
+// entire point. Same layering as source/world/registry_test.c's REGISTRY_DYN_*_PIN (dc1fea3) and
+// source/net/networld_test.c's remote-player pin (0258188), so the fleet has one pattern.
+#define DEBUG_MENU_MAX_ENTRIES_PIN 32
+
+// Compile-time layer. This fires whenever the host suite builds, which is every
+// tools/run_host_tests.sh run; the 3DS build never compiles this file (see the __3DS__ guard at
+// the top). The runtime check in testRegistryPoolFull() is what remains if anyone deletes it.
+_Static_assert(DEBUG_MENU_MAX_ENTRIES == DEBUG_MENU_MAX_ENTRIES_PIN,
+               "app/debugmenu.h's DEBUG_MENU_MAX_ENTRIES is 32, the debug menu's row capacity; "
+               "if you resized the pool deliberately, update DEBUG_MENU_MAX_ENTRIES_PIN in "
+               "source/app/debugmenu_test.c by hand");
+
+// The remedy text the capacity pins print when they fail, so that someone who resized the pool
+// on purpose is told which line to edit instead of being handed a bare failed expression.
+static const char* const kPoolCapWhy =
+	"32 is the SIZE OF THE DEBUG-MENU ENTRY POOL (DEBUG_MENU_MAX_ENTRIES in\n"
+	"         source/app/debugmenu.h, the length of s_pool in source/app/debugmenu.c) — the\n"
+	"         total number of rows every subsystem can register between them. If you resized\n"
+	"         that pool ON PURPOSE, update DEBUG_MENU_MAX_ENTRIES_PIN in\n"
+	"         source/app/debugmenu_test.c to match. If you did NOT, the menu has silently lost\n"
+	"         capacity and rows registered late will simply never appear. This pin is\n"
+	"         deliberately NOT derived from DEBUG_MENU_MAX_ENTRIES: a pin computed from the\n"
+	"         constant it is pinning moves with it and guards nothing.";
+
+// CHECK for a pinned literal. Counts exactly like CHECK does — it must, or it would perturb the
+// very total that makes a shrunken loop visible — but a failure also prints the measured value,
+// the expected one, and what to do about it.
+static void checkPin(bool cond, long got, long want, const char* what, const char* why)
+{
+	s_checks++;
+	if (cond) return;
+
+	s_fails++;
+	printf("  FAIL   %s: expected %ld, got %ld.\n         %s\n", what, want, got, why);
+	if (!s_first[0]) snprintf(s_first, sizeof(s_first), "%.140s", what);
+}
+
 static void testMkdir(const char* path)
 {
 #if defined(_WIN32)
@@ -179,12 +239,27 @@ static void testRegistryUnavailable(void)
 static void testRegistryPoolFull(void)
 {
 	debugMenuReset();
-	for (int i = 0; i < DEBUG_MENU_MAX_ENTRIES; i++)
+
+	// The runtime half of the capacity pin, FIRST so that it is the failure the summary line
+	// names when the pool has been resized. The _Static_assert above is the primary defence;
+	// this one is what survives someone deleting it.
+	checkPin(DEBUG_MENU_MAX_ENTRIES == DEBUG_MENU_MAX_ENTRIES_PIN,
+	         (long)DEBUG_MENU_MAX_ENTRIES, (long)DEBUG_MENU_MAX_ENTRIES_PIN,
+	         "the debug-menu entry pool still holds 32 rows", kPoolCapWhy);
+
+	// The loop bound is the LITERAL, so this always attempts 32 registrations however big the
+	// pool actually is. That is the whole fix: with DEBUG_MENU_MAX_ENTRIES as the bound, a
+	// smaller pool ran fewer iterations and emitted fewer checks, and the ones that would have
+	// gone red were simply never reached. Now a shrunken pool FAILS these instead of skipping
+	// them, and the suite's total does not move.
+	for (int i = 0; i < DEBUG_MENU_MAX_ENTRIES_PIN; i++)
 		CHECK(debugMenuRegister() != NULL);
 
 	DebugEntry* overflow = debugMenuRegister();
 	CHECK(overflow == NULL);
-	CHECK(debugMenuCount() == DEBUG_MENU_MAX_ENTRIES);
+	checkPin(debugMenuCount() == DEBUG_MENU_MAX_ENTRIES_PIN,
+	         (long)debugMenuCount(), (long)DEBUG_MENU_MAX_ENTRIES_PIN,
+	         "a full pool reports exactly 32 entries", kPoolCapWhy);
 }
 
 // ── Options persistence tests ───────────────────────────────────────────
