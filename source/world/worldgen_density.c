@@ -70,33 +70,59 @@ static inline fx dCoord(int32_t block, int shift)
 // ── The biome table (task 16) ─────────────────────────────────────────────────────────
 //
 // Control points on the EXISTING biome field (world/worldgen.h's GEN_BIOME_*), placed against
-// its measured distribution — 0.075 .. 0.936, median near 0.68 — rather than spread over the
-// nominal [0, 1] range it never fills. See worldgen_density.h for the whole argument.
+// its distribution rather than spread over the nominal [0, 1] range it never fills.
 //
-// The four points, and why each is where it is:
+// **The distribution this used to quote — "0.075 .. 0.936, median near 0.68" — was wrong.**
+// MEASURED 2026-08-25 on a host build (x86-64 gcc -O2 under WSL, linking this tree's
+// world/noise.c and sampling worldgenBiome() directly; NOT measured on the ARM11), 13 seeds
+// over two independent 2048 x 2048-block windows at stride 8, 851,968 pooled columns each:
+// the field runs **0.005 .. 0.987 with median 0.503**, i.e. near-symmetric about 0.5 rather
+// than clustered high. See world/worldgen.h's GEN_SAND_BELOW for the full figures, the
+// per-seed spreads and why the original 1024x1024 window produced the wrong answer.
+//
+// **The table is UNCHANGED and was not re-derived.** The corrected statistic invalidates the
+// argument that was written up for these values, not the values themselves: they were tuned
+// by eye against the terrain they produce, and the amplitudes are pinned by the overhang and
+// world-ceiling arithmetic below, which is geometry and independent of the histogram. See
+// worldgen_density.h. Anyone re-tuning this table should re-derive it against the corrected
+// distribution instead of trusting the percentile labels this comment used to carry.
+//
+// The four points, and why each is where it is. **The percentile labels below are the
+// corrected ones**, from the wide-window measurement above; two of the four were badly wrong:
 //
 // `amp` is the NOMINAL peak-to-trough range, i.e. what the field would span if the fBm
 // reached 0 and 1. It does not: measured over 13 x 13 columns on three seeds the realised
 // surface spread is 30 to 33 blocks against nominal amplitudes of 14 to 64, so about half.
 // The nominal figures below are quoted as nominal, and the measured ones beside them.
 //
-//   0x1333 (0.075, the measured MINIMUM). Lowland. base 52, amp 14 -> nominal 45..59,
+//   0x1333 (0.075). Labelled "the measured MINIMUM"; it is not, the measured minimum is
+//     0.005. It is the 0.05th percentile — effectively the floor, which is what the entry
+//     needs to be, so the value stands and only the label was wrong. Lowland. base 52,
+//     amp 14 -> nominal 45..59,
 //     entirely below GEN_SEA_LEVEL 64. This is the seabed and the shore, and it is the
 //     flattest entry on purpose: the one place the player stands at the waterline is the one
 //     place a cliff would be most annoying.
 //
-//   0x7800 (0.469, the measured TENTH PERCENTILE). **Reused, not a new number**: it is
+//   0x7800 (0.469). Labelled "the measured TENTH PERCENTILE"; it is **the 43rd**, and it
+//     selects 42.6 % of columns pooled (37.9 .. 46.8 % per seed), not a tenth. The real tenth
+//     percentile is 0.292 (0x4AA9). **Reused, not a new number**: it is
 //     already GEN_SAND_BELOW, the sand threshold worldgenIsSandy() applies. Putting the
 //     lowland-to-plains control point on exactly that value is what keeps the shape and the
 //     material agreeing — the terrain stops being beach-flat at the same place it stops being
 //     sand. base 64, amp 28 -> nominal 50..78, straddling sea level, which is what a coastal
 //     plain is.
 //
-//   0xAE14 (0.68, the measured MEDIAN). Plains and low hills, and therefore what most of the
-//     world is. base 76, amp 48 -> nominal 52..100. Clear of the water, walkable, with enough
-//     relief to be worth walking over.
+//   0xAE14 (0.68). Labelled "the measured MEDIAN"; it is **the 85th percentile** — the
+//     measured median is 0.503, which lands between this point and 0x7800. So this is not
+//     "what most of the world is": about 85 % of columns fall below it, and the terrain most
+//     of the world actually gets is the interpolation between 0x7800 and here rather than
+//     this pair. Plains and low hills. base 76, amp 48 -> nominal 52..100. Clear of the
+//     water, walkable, with enough relief to be worth walking over.
 //
-//   0xEF9D (0.936, the measured MAXIMUM). Mountains. base 88, amp 64 -> nominal 56..120,
+//   0xEF9D (0.936). Labelled "the measured MAXIMUM"; it is the 99.95th percentile, the
+//     measured maximum being 0.987. The gap matters only in that a handful of columns per
+//     world sit above this point and are clamped to it, which is the intended behaviour for
+//     the top entry. Mountains. base 88, amp 64 -> nominal 56..120,
 //     realised maximum 94 over the sampled area. Two things bound the top:
 //       * the tree pass adds a trunk of up to GEN_TREE_MAX_H 7 plus two canopy layers, so a
 //         surface at 116 would put leaves at 125 against a 128-block ceiling. treeInCell()'s

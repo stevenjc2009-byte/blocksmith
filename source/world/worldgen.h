@@ -88,20 +88,70 @@
 // Below this the surface is sand rather than grass, and no trees grow. A hard threshold
 // on a smooth field, so the boundary follows a contour of the noise — biomes have edges.
 //
-// **Chosen from a measured histogram, not by eye.** Value-noise fBm does not fill [0, 1]
-// evenly: over a 1024x1024 sample it ran 0.075..0.936 with a median around 0.68, so the
-// obvious-looking "a fifth of the range" (0x3000) selected 0.7 % of the world on one seed
-// and 0 % of a 400-block neighbourhood on another — a biome nobody would ever see. 0x7800
-// is the tenth percentile and gives roughly a tenth of the world.
-#define GEN_SAND_BELOW    0x00007800    // 0.469 of the biome range, ~10 % of columns
+// **The threshold is unchanged at 0x7800. The description of what it selects was wrong and
+// is corrected below.** This comment used to claim the field "ran 0.075..0.936 with a median
+// around 0.68" and that 0x7800 "is the tenth percentile and gives roughly a tenth of the
+// world". None of that is true. It is out by roughly thirty percentage points, and anyone
+// placing a new threshold against this field on the strength of it would be badly wrong.
+//
+// **MEASURED — 2026-08-25.** Provenance, stated plainly because the figures it replaces read
+// like measurements too: a HOST build only — x86-64 gcc -O2 under WSL, linking this tree's
+// world/noise.c and including world/rng.h, sampling worldgenBiome()'s exact expression
+// (noiseFbm2 of rngMix(seed ^ SALT_BIOME) at biomeCoord, GEN_BIOME_OCTAVES). **Not measured
+// on the ARM11.** Every step of the field is integer, so the console should agree bit for
+// bit — that is the whole reason world/noise.h is fixed point — but it was not re-checked on
+// hardware for this pass, and "should" is not "did".
+//
+// 13 seeds: 12345, 0xBEEF, 7919, 1337, 1616, 4242, 7, 99999, 20260818, 90210, 0, 1, 2. Two
+// independent windows, each 65,536 columns per seed and 851,968 pooled:
+//
+//   * 2048 x 2048 blocks at stride 8, centred on the origin — 16 biome features across:
+//     min 0.005, max 0.987, **median 0.503**, tenth percentile 0.292.
+//     **0x7800 selects 42.6 % of columns** pooled, and 37.9 .. 46.8 % per seed.
+//   * the same window moved to (100000, 100000), to check it is not a near-origin artifact:
+//     median 0.497, 0x7800 selects 43.7 % pooled, 37.9 .. 50.8 % per seed.
+//
+// So the field is very nearly symmetric about 0.5 — it is NOT "clustered high" — and 0x7800
+// (0.469) sits just below its median, not at its tenth percentile. Sand is about two fifths
+// of the world. **If a tenth is ever actually wanted, the value is 0.292 (0x4AA9)**, which
+// measured 10.00 % on the wide window and 10.5 % on the far one. Do not reuse 0x7800 for it.
+//
+// **Where the old figures came from, so the trap is not re-entered.** They came from a single
+// 1024x1024 window. That is only eight biome features across, so it measures one seed's local
+// terrain rather than the field's distribution. The same probe over a 290 x 290 window
+// reproduces the failure exactly: pooled median 0.533 and 37.5 % sand, but a per-seed spread
+// of 0.41 % to 64.2 % — at that scale some seeds sit almost entirely inside a single biome.
+// Quote the per-seed spread alongside any pooled figure taken from this field, or the next
+// reader gets a number with no error bar on it.
+//
+// The rejection of 0x3000 still stands, but for a smaller margin than claimed: pooled it
+// selects 2.0 % of columns on the wide window and 2.6 % on the dense one, not the 0.7 % the
+// old text quoted from one seed. Still too rare to be a biome anyone meets; still rejected.
+//
+// **The suite did not catch this and still would not.** world/world_test.c's
+// testWorldgenBiome only asserts the sand fraction lies strictly between 2 % and 98 %, and
+// both 10 % and 42 % satisfy that — the band is far too loose to discriminate between the
+// claim and the truth. Sharper evidence was already sitting in the same file: the seed
+// comment on testWorldgenTrees records seed 1616 splitting its region 47.7 % sand to 52.3 %
+// grass, which agrees with 42 % and flatly contradicts 10 %. (world_test.c is deliberately
+// not touched by this correction; tightening that band is a separate change.)
+#define GEN_SAND_BELOW    0x00007800    // 0.469 of the biome range; MEASURED ~42 % of columns
 
 // How flat the flattest terrain is, as a fraction of GEN_SURFACE_RANGE. Not zero: a biome
 // with no relief at all is a billiard table, and the point of the variation pass is that
 // somewhere is calmer than somewhere else, not that somewhere is dead.
 //
-// An eighth rather than a quarter for the same reason as the threshold above: with the
-// biome clustered high, a quarter-to-full amplitude range came out as roughly
-// three-quarters-to-full everywhere and the contrast was invisible.
+// An eighth rather than a quarter. **The constant is unchanged; its stated reason was wrong.**
+// This used to read "for the same reason as the threshold above: with the biome clustered
+// high, a quarter-to-full amplitude range came out as roughly three-quarters-to-full
+// everywhere". The biome field is NOT clustered high — see GEN_SAND_BELOW above, median 0.503
+// measured 2026-08-25 — so that explanation does not hold.
+//
+// What survives is the observation, not the explanation: a quarter-to-full range was tried
+// and the contrast between calm and broken ground was not visible. That was judged by eye
+// against the terrain and has NOT been re-measured here, so treat it as a recorded
+// observation rather than a number. An eighth is what shipped and what the tests are written
+// against; changing it is a terrain change, not a comment fix.
 #define GEN_FLAT_FRACTION 8
 
 // Step 5.4's caves. Two independent 3D fBms; a block is hollowed out where BOTH of them
@@ -114,9 +164,20 @@
 // is why there are two salts rather than one field with a wider band.
 //
 // **The centre is the measured median, not 0.5.** Over a 1,032,192-sample box the cave-scale
-// fBm ran 0.029..0.958 with mean 0.483 and p50 0.469 — much more symmetric than the 2D
-// heightmap fBm (0.075..0.936, median 0.68), which is exactly why it had to be measured
-// again rather than reused.
+// fBm ran 0.029..0.958 with mean 0.483 and p50 0.469. Those three figures are the original
+// 3D measurement and have NOT been re-checked here — only the 2D comparison below was.
+//
+// The comparison that used to follow them was wrong and is removed: this said the cave field
+// was "much more symmetric than the 2D heightmap fBm (0.075..0.936, median 0.68)". It is not
+// much more symmetric, because the 2D fields are not skewed either. Measured 2026-08-25 on
+// the same host build described under GEN_SAND_BELOW, 13 seeds over 851,968 columns, the
+// heightmap fBm (GEN_FEATURE_SHIFT 6, GEN_OCTAVES 4, unsalted) runs 0.019..0.967 with
+// **median 0.4996**, and the biome fBm runs 0.005..0.987 with median 0.503. All three fields
+// sit close to 0.5.
+//
+// Measuring the cave field separately was still the right call — a 3D fBm at a different
+// octave count is a different distribution and reusing a 2D number would have been an
+// assumption — but the justification was the contrast, and the contrast was not real.
 //
 // **The half-width is the connectivity knee.** Carved fraction and the share of carved
 // volume sitting in systems bigger than 100 blocks, 6-connected flood fill over a 96x64x96

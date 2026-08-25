@@ -160,13 +160,41 @@
 // a continuous field instead gives smooth boundaries for free, with no extra noise
 // evaluations and no neighbourhood buffer — which on this CPU is the difference that matters.
 //
-// **The control points are placed against the field's MEASURED distribution, not spread
-// evenly over [0,1].** world/worldgen.h records that this fBm runs 0.075..0.936 with a median
-// near 0.68 — it is strongly clustered high — so evenly spaced control points would spend
-// four fifths of the table on values the world almost never takes, and every world would be
-// one biome. 0x7800 is the field's measured tenth percentile and is already the sand
-// threshold, so it is reused as the lowland control point rather than a second number that
-// would drift away from it.
+// **The control points are placed against the field's distribution rather than spread evenly
+// over [0,1] — but the distribution this paragraph used to quote was wrong.** It said the
+// fBm "runs 0.075..0.936 with a median near 0.68 — it is strongly clustered high" and that
+// "0x7800 is the field's measured tenth percentile".
+//
+// **MEASURED 2026-08-25, and none of that holds.** Host build only — x86-64 gcc -O2 under
+// WSL, linking this tree's world/noise.c, sampling worldgenBiome()'s exact expression; NOT
+// measured on the ARM11. 13 seeds, two independent 2048 x 2048-block windows at stride 8,
+// 65,536 columns per seed and 851,968 pooled each. The field runs 0.005..0.987 with
+// **median 0.503** (0.497 on the far-field window) — very nearly symmetric about 0.5, not
+// clustered high. 0x7800 is not the tenth percentile; it is roughly the 43rd, and it selects
+// **42.6 % of columns** pooled, 37.9 .. 46.8 % per seed. The real tenth percentile is 0.292
+// (0x4AA9). world/worldgen.h's GEN_SAND_BELOW comment carries the full figures and the
+// per-seed spreads; read them there rather than restating them, which is how this comment
+// and that one drifted apart in the first place.
+//
+// **The table below is UNCHANGED and is not re-derived by this correction.** That needs
+// saying, because the false statistic was written up as the table's justification and the
+// obvious reading of a corrected statistic is that the table must now be wrong too. It does
+// not follow. The control-point values were arrived at by eye against the terrain they
+// produce — the amplitudes in particular are pinned by the overhang and world-ceiling
+// arithmetic recorded beside them in worldgen_density.c, which is geometry and does not
+// depend on the field's histogram at all. What is now known to be false is the *argument*
+// offered for them, not the values.
+//
+// So: the justification does not hold, and anyone re-tuning this table should re-derive it
+// from the corrected distribution rather than trusting the reasoning above it. Two of the
+// four points are also mislabelled in worldgen_density.c — 0x7800 is called the tenth
+// percentile and 0xAE14 the median, and they are actually the 43rd and 85th. The labels are
+// corrected there; the numbers they label are not.
+//
+// Reusing 0x7800 for the lowland control point is still right for the reason it always was,
+// which never depended on the histogram: it is already GEN_SAND_BELOW, so putting the
+// control point on exactly that value keeps the terrain's shape and its surface material
+// changing at the same place instead of at two numbers that drift apart.
 #define GEN_D_BIOME_POINTS 4
 
 typedef struct {
