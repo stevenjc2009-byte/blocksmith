@@ -22,6 +22,62 @@
 #include "world/block.h"
 #include "world/registry.h"
 
+// ---------------------------------------------------------------------------
+// The dynamic block-id range, pinned to hand-written literals.
+//
+// This is the most important range in the block system: REG_ID_DYN_LO..REG_ID_DYN_HI is
+// how many block types a server may add at join time, so it is the ceiling on what the
+// game can represent beyond the ten compiled-in core rows.
+//
+// Before 2026-08-25 this file asserted that range against ITSELF. The two checks in
+// testRegistryRoundTrip() read
+//
+//     check(placed == REG_ID_DYN_HI - REG_ID_DYN_LO + 1 - 5, ...);
+//     check(registryCount() == 1 + 9 + (REG_ID_DYN_HI - REG_ID_DYN_LO + 1), ...);
+//
+// and world/registry.c allocates from those same two constants, so both sides of every
+// comparison moved together and neither could ever disagree. Measured, not theorised:
+// cutting REG_ID_DYN_HI from 0xFD to 0x90 in source/world/registry.h — the dyn range from
+// 126 rows to 17, i.e. a silent 87% cut in what the game can represent — built clean and
+// this suite printed "PASS 53 checks, 0 failed", exit 0. The check-count pin below could
+// not help: the count does not move, because the fill loop emits one check regardless of
+// how many rows it managed to place.
+//
+// So the expectations are naked literals now. They must NEVER be computed from
+// REG_ID_DYN_LO, REG_ID_DYN_HI, REGISTRY_MAX or anything else world/registry.{c,h} can
+// also move. Widening or narrowing the range for real means editing these four lines by
+// hand, and the suite going red until you do is the entire point.
+#define REGISTRY_DYN_LO_PIN     0x80  // first dynamic block id
+#define REGISTRY_DYN_HI_PIN     0xFD  // last one; 0xFE/0xFF stay reserved
+#define REGISTRY_DYN_ROWS_PIN   126   // 0xFD - 0x80 + 1, WRITTEN OUT, never computed
+#define REGISTRY_FULL_COUNT_PIN 136   // 10 core rows (air + nine) + 126 dyn rows
+
+// Compile-time layer. These fire when the host suite builds, which is every
+// tools/run_host_tests.sh run; the 3DS build never compiles this file (see the __3DS__
+// guard at the top). The runtime layer below survives anyone deleting these.
+_Static_assert(REG_ID_DYN_LO == REGISTRY_DYN_LO_PIN,
+               "registry.h's REG_ID_DYN_LO is 0x80, the first dynamic block id");
+_Static_assert(REG_ID_DYN_HI == REGISTRY_DYN_HI_PIN,
+               "registry.h's REG_ID_DYN_HI is 0xFD, the last dynamic block id");
+_Static_assert(REG_ID_DYN_HI - REG_ID_DYN_LO + 1 == REGISTRY_DYN_ROWS_PIN,
+               "the dynamic block-id range holds 126 rows; if you moved it deliberately, "
+               "update REGISTRY_DYN_ROWS_PIN and REGISTRY_FULL_COUNT_PIN in "
+               "source/world/registry_test.c by hand");
+
+// The remedy text every dyn-range pin prints when it fails. One string, so a reader who
+// trips two of them at once is told the same thing the same way twice.
+static const char *const kDynRangeWhy =
+	"126 is the SIZE OF THE DYNAMIC BLOCK-ID RANGE (REG_ID_DYN_LO 0x80 ..\n"
+	"         REG_ID_DYN_HI 0xFD in source/world/registry.h) — how many block types a\n"
+	"         server can add on top of the ten core rows. If you widened or narrowed\n"
+	"         that range ON PURPOSE, update REGISTRY_DYN_LO_PIN / REGISTRY_DYN_HI_PIN /\n"
+	"         REGISTRY_DYN_ROWS_PIN / REGISTRY_FULL_COUNT_PIN in\n"
+	"         source/world/registry_test.c to match, and expect the pinned core crc and\n"
+	"         every connected server to need the same change. If you did NOT, the range\n"
+	"         has moved behind your back and the game silently represents fewer blocks.\n"
+	"         These pins are deliberately NOT derived from REG_ID_DYN_HI/LO: a pin\n"
+	"         computed from the constant it is pinning moves with it and guards nothing.";
+
 static int g_checks = 0;
 static int g_fails  = 0;
 
@@ -34,6 +90,24 @@ static void check(bool cond, const char *what)
 	} else {
 		printf("  ok     %s\n", what);
 	}
+}
+
+// check() for a pinned literal. Counts exactly like check() does — it must, or it would
+// perturb the check-count pin below — but a failure also prints the measured value, the
+// expected one, and WHY the expected one is what it is and what to do about it.
+//
+// A bare "FAIL   the dyn range accepts exactly its remaining capacity" tells whoever
+// widened the range nothing at all: not which number is wrong, not which line to edit,
+// not that the literal is hand-written on purpose. The `why` block does.
+static void checkPin(bool cond, long got, long want, const char *what, const char *why)
+{
+	g_checks++;
+	if (cond) {
+		printf("  ok     %s\n", what);
+		return;
+	}
+	g_fails++;
+	printf("  FAIL   %s: expected %ld, got %ld.\n         %s\n", what, want, got, why);
 }
 
 // How many check() calls this suite makes on a healthy tree. A LITERAL on purpose.
@@ -50,7 +124,10 @@ static void check(bool cond, const char *what)
 //
 // Legitimately adding or removing a check means editing this by hand. The suite going red
 // until you do is deliberate friction, not an accident.
-#define REGISTRY_TEST_EXPECTED_CHECKS 53
+//
+// 53 -> 54 on 2026-08-25: one check added, "the dynamic block-id range is still
+// 0x80..0xFD, 126 rows", the runtime half of the dyn-range pin.
+#define REGISTRY_TEST_EXPECTED_CHECKS 54
 
 // Deliberately NOT routed through check(): this must not perturb the number it is testing,
 // so it bumps g_fails only. Reporting shape is check()'s, so a failure here reads the same
@@ -104,6 +181,14 @@ static void testRegistryRoundTrip(void)
 	check(registryCount() == 10, "a fresh table defines exactly air + the nine core blocks");
 	check(registryFind("grass") == BLOCK_GRASS, "core rows are findable by name");
 
+	// The runtime half of the dyn-range pin. The two _Static_asserts at the top of this
+	// file are the primary, compile-time defence; this one is what remains if somebody
+	// ever deletes them, and it names the range in the run output on a healthy tree so
+	// the number is visible rather than implied.
+	checkPin(REG_ID_DYN_LO == REGISTRY_DYN_LO_PIN && REG_ID_DYN_HI == REGISTRY_DYN_HI_PIN,
+	         (long)(REG_ID_DYN_HI - REG_ID_DYN_LO + 1), (long)REGISTRY_DYN_ROWS_PIN,
+	         "the dynamic block-id range is still 0x80..0xFD, 126 rows", kDynRangeWhy);
+
 	// Five dynamic registrations land on consecutive ids from REG_ID_DYN_LO up.
 	BlockId ids[5];
 	for (int i = 0; i < 5; i++) {
@@ -112,10 +197,18 @@ static void testRegistryRoundTrip(void)
 		BlockDef d = makeDef(name);
 		ids[i] = registryRegister(&d);
 	}
+	// Against the literal 0x80, not REG_ID_DYN_LO: registryRegister() allocates FROM
+	// REG_ID_DYN_LO, so comparing to it asks the code whether it agrees with itself.
 	bool consecutive = true;
+	long first_bad = -1, first_want = -1;
 	for (int i = 0; i < 5; i++)
-		if (ids[i] != (BlockId)(REG_ID_DYN_LO + i)) consecutive = false;
-	check(consecutive, "registrations take the lowest free dyn ids in order");
+		if (ids[i] != (BlockId)(REGISTRY_DYN_LO_PIN + i)) {
+			if (consecutive) { first_bad = ids[i]; first_want = REGISTRY_DYN_LO_PIN + i; }
+			consecutive = false;
+		}
+	checkPin(consecutive, first_bad, first_want,
+	         "registrations take the lowest free dyn ids in order, starting at 0x80",
+	         kDynRangeWhy);
 
 	for (int i = 0; i < 5; i++) {
 		char name[REGISTRY_NAME_MAX];
@@ -140,7 +233,8 @@ static void testRegistryRoundTrip(void)
 	check(strcmp(blockInfo((BlockId)0xFE)->name, "air") == 0,
 	      "the reserved 0xFE answers air too");
 
-	// Fill the whole dyn range: exactly 126 more registrations fit, then 0.
+	// Fill the whole dyn range: exactly 121 more registrations fit (126 rows minus the
+	// five placed above), then 0.
 	int placed = 0;
 	for (;;) {
 		char name[REGISTRY_NAME_MAX];
@@ -150,10 +244,13 @@ static void testRegistryRoundTrip(void)
 		if (id == 0) break;
 		placed++;
 	}
-	check(placed == REG_ID_DYN_HI - REG_ID_DYN_LO + 1 - 5,
-	      "the dyn range accepts exactly its remaining capacity, then refuses");
-	check(registryCount() == 1 + 9 + (REG_ID_DYN_HI - REG_ID_DYN_LO + 1),
-	      "count reflects every defined row once the range is full");
+	checkPin(placed == REGISTRY_DYN_ROWS_PIN - 5, placed, REGISTRY_DYN_ROWS_PIN - 5,
+	         "the dyn range accepts exactly its remaining 121 rows, then refuses",
+	         kDynRangeWhy);
+	checkPin(registryCount() == REGISTRY_FULL_COUNT_PIN,
+	         (long)registryCount(), (long)REGISTRY_FULL_COUNT_PIN,
+	         "count reflects every defined row once the range is full: 10 core + 126 dyn",
+	         kDynRangeWhy);
 }
 
 static void testRegistryCoreIdsStable(void)
@@ -277,8 +374,11 @@ static void testRegistrySidecar(void)
 	BlockDef b = makeDef("side_b");
 	b.flags |= REG_FLAG_LUMINOUS;
 	BlockId id_b = registryRegister(&b);
-	check(id_a == REG_ID_DYN_LO && id_b == REG_ID_DYN_LO + 1,
-	      "two defs registered before saving");
+	// Literals again, for the reason spelled out at the top of this file: registryRegister()
+	// hands out ids counting up from REG_ID_DYN_LO, so REG_ID_DYN_LO cannot be the yardstick.
+	checkPin(id_a == REGISTRY_DYN_LO_PIN && id_b == REGISTRY_DYN_LO_PIN + 1,
+	         (long)id_a, (long)REGISTRY_DYN_LO_PIN,
+	         "two defs registered before saving, landing on 0x80 and 0x81", kDynRangeWhy);
 
 	uint16_t before_crc = registryCrc16();
 	check(registrySidecarSave(path), "sidecarSave writes the file");
