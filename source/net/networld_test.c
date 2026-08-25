@@ -41,6 +41,37 @@
 
 #include "proto/bs_proto.h"
 
+/* game/players.h is the server-side home of BS_GAME_MAX_PLAYERS, the room cap that
+ * networld.h:355 claims NETWORLD_MAX_REMOTE mirrors "minus the local player". It is pulled in
+ * HERE, in the test, rather than in net/networld.c alongside the two mirror asserts already at
+ * networld.c:33-36, because BS_GAME_MAX_PLAYERS is not reachable from that translation unit:
+ * networld.c includes only proto/bs_proto.h, and bs_proto.h does not define it. Measured with
+ * `gcc -E -dM` over networld.c's TU on 2026-08-25 — 0 hits for BS_GAME_MAX_PLAYERS, 2 for
+ * BS_INV_SLOT_COUNT, which is exactly why those two asserts can live in networld.c and this one
+ * cannot without dragging a server header into production client code.
+ *
+ * The gap that leaves, stated plainly rather than buried: this guard fires when the HOST test
+ * build compiles (every tools/run_host_tests.sh run), not in the 3DS console build. Console
+ * builds never compile this file (see the __3DS__ guard in this file's header comment). */
+#include "game/players.h"
+
+/* The mirror guard networld.h:355 always implied and never had, in the idiom of the two at
+ * net/networld.c:33-36. Its absence was measurable: shrinking NETWORLD_MAX_REMOTE from 15 to 7
+ * built clean and this suite printed "PASS 318 checks, 0 failed" against a baseline of 326 —
+ * green, with eight checks silently deleted rather than failed, because the fill loop below was
+ * bounded by the very constant its expectation was compared against. A client whose table is
+ * smaller than the server's room cap silently drops players in a full room. */
+_Static_assert(NETWORLD_MAX_REMOTE == BS_GAME_MAX_PLAYERS - 1,
+               "networld.h's NETWORLD_MAX_REMOTE must be game/players.h's BS_GAME_MAX_PLAYERS "
+               "minus the local player");
+
+/* And the naked-literal pin, because the assert above is satisfied by both constants moving
+ * TOGETHER — a room-cap change would otherwise take the client's table with it unnoticed. This
+ * is the line that must be changed consciously, and only after deciding that 16-player rooms
+ * really have become something else. Never edit it to silence a build. */
+_Static_assert(NETWORLD_MAX_REMOTE == 15,
+               "NETWORLD_MAX_REMOTE is 15 (16 players minus the local one)");
+
 static int g_checks = 0;
 static int g_fails  = 0;
 
@@ -847,22 +878,39 @@ static void test_16th_remote_dropped_existing_survive(void)
 {
     puts("a 16th remote sid is dropped, not evicted, and the existing 15 survive");
 
+    /* Every bound and every expectation below is the naked literal 15, never
+     * NETWORLD_MAX_REMOTE. That is deliberate, and it is the whole shape of this function:
+     * before 2026-08-25 the fill loop was bounded by NETWORLD_MAX_REMOTE *and* the resulting
+     * count was asserted against NETWORLD_MAX_REMOTE, so both sides moved together and neither
+     * could ever disagree. A check parameterised by the value under test cannot detect that
+     * value changing.
+     *
+     * Bounding the loops by the literal too — not just the comparisons — is the part that
+     * matters most: it keeps the NUMBER of checks this function emits (19) independent of the
+     * constant, so drift arrives as named FAILURES rather than as a shorter, still-green run.
+     * The two _Static_asserts at the top of this file are the primary, compile-time defence;
+     * these are the runtime one that survives if somebody ever deletes those. */
     networldInit();
 
+    check(NETWORLD_MAX_REMOTE == 15, "NETWORLD_MAX_REMOTE is still 15");
+
     uint8_t msg[BS_POS_UPDATE_S_BYTES];
-    for (uint32_t sid = 1; sid <= NETWORLD_MAX_REMOTE; sid++) {
+    for (uint32_t sid = 1; sid <= 15; sid++) {
         buildPosUpdateS(msg, sid, 0, 0, 0, 0, 0);
         networldApplyPayload(msg, sizeof msg);
     }
-    check(networldRemoteCount() == NETWORLD_MAX_REMOTE, "table filled to capacity");
+    check(networldRemoteCount() == 15, "table filled to capacity, all 15 slots taken");
 
     buildPosUpdateS(msg, 999, 1, 1, 1, 1, 1);
     networldApplyPayload(msg, sizeof msg);
-    check(networldRemoteCount() == NETWORLD_MAX_REMOTE, "the 16th sid was dropped, not evicted");
+    check(networldRemoteCount() == 15, "the 16th sid was dropped, not evicted");
 
     bool found_extra = false;
-    for (int i = 0; i < networldRemoteCount(); i++) {
+    for (int i = 0; i < 15; i++) {
+        /* networldRemoteGet() leaves *out untouched on an out-of-range index (see
+         * networld.h), so r must be initialised before the read of r.sid below. */
         NetworldRemote r;
+        memset(&r, 0, sizeof r);
         check(networldRemoteGet(i, &r), "each of the original slots is still readable");
         if (r.sid == 999) found_extra = true;
     }
@@ -2687,6 +2735,36 @@ int main(void)
     test_registry_terminator_alone_is_not_a_synced_table();
     test_registry_sync_is_proved_by_the_fingerprint();
     test_mesher_tables_after_register();
+
+    /* ---- check-count guard -----------------------------------------------------------------
+     * This suite counts failures, and until 2026-08-25 that was ALL it counted. A suite that
+     * only counts failures cannot notice checks that never ran. Any sabotage which shortens a
+     * loop bounded by a production constant therefore DELETES checks instead of failing them,
+     * and the run stays green: NETWORLD_MAX_REMOTE 15 -> 7 took this file from
+     * "PASS 326 checks, 0 failed" to "PASS 318 checks, 0 failed", both green, eight checks gone.
+     *
+     * So: the number below is the count of checks that must already have run by the time
+     * control reaches this line. It is a naked literal on purpose — it is the one number in
+     * this file that is not derived from anything the tests themselves compute, which is
+     * precisely what lets it notice them vanishing.
+     *
+     * HOW TO UPDATE IT WHEN YOU ADD OR REMOVE CHECKS — read this before changing the number:
+     *   Work out the delta from what you actually changed (checks added minus checks removed)
+     *   and ADD THAT DELTA to the number below. Do NOT paste whatever the failing run printed.
+     *   Pasting the observed count is the single failure mode this guard exists to catch: if a
+     *   constant shrank and silently deleted eight checks, the printed count is the SYMPTOM,
+     *   and copying it in here re-arms the trap and throws away the only evidence you had.
+     *   If your recomputed delta and the observed count disagree, that disagreement is a bug
+     *   report — go and find out which checks stopped running, and why.
+     *
+     *   Note the number is the count BEFORE this guard itself, so the summary line prints one
+     *   more than it (327 here, 328 on the PASS line). That off-by-one is deliberate: it means
+     *   blind-pasting the number off the PASS line lands you a red, not a false green.
+     *
+     * This guard is deliberately scoped to THIS suite. The same hole exists in every other
+     * host suite under source/ and is a separate, fleet-wide job. */
+    check(g_checks == 327,
+          "check-count guard: every check in this suite actually ran (327 before this line)");
 
     printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;

@@ -352,7 +352,15 @@ int networldAppliedEdits(void);
 
 // ---- remote players and pose sync ---------------------------------------------------------
 //
-// Mirrors BS_GAME_MAX_PLAYERS (16) minus the local player.
+// Mirrors BS_GAME_MAX_PLAYERS (16, deps/blocksmith-server/game/players.h) minus the local
+// player. That claim went unguarded until 2026-08-25, while the other two mirror claims in this
+// header were not; it is guarded now, by the pair of _Static_asserts at the top of
+// net/networld_test.c. They sit there rather than beside the mirror asserts at
+// net/networld.c:33-36 — the natural home — because BS_GAME_MAX_PLAYERS is not
+// reachable from that translation unit: networld.c includes only proto/bs_proto.h, which does
+// not define it, and pulling a server header into production client code for one integer is
+// the very thing this restated constant exists to avoid. The gap that leaves, said plainly:
+// drift is caught when the HOST suite compiles, not by the 3DS build.
 #define NETWORLD_MAX_REMOTE 15
 
 // How often the local pose goes out. Matches the server's own 10 Hz tick, so resending an
