@@ -258,25 +258,66 @@ bool regionDecodeColumn(World* w, int32_t cx, int32_t cz, const uint8_t* in, uin
 
 // ── Public read and write ─────────────────────────────────────────────────────────────
 
-// Closes regionCompact's one unsafe window. Compaction writes a complete .tmp, removes the
-// .bsr, then renames — so the only state a power cut can leave that is not already correct
-// is "no .bsr, complete .tmp". Promoting the .tmp before any open turns that into a normal
-// file again. A .tmp sitting next to a .bsr is the other interrupted case, and there the
-// .bsr is the good one, so the .tmp is dropped.
+static bool fileExists(const char* path)
+{
+	PROBE_BUMP(g_region_fopens);
+	FILE* f = fopen(path, "rb");
+	if (!f) return false;
+	fclose(f);
+	return true;
+}
+
+// Resolves whatever a power cut left behind, before any open. It runs on every open, so it
+// has to be cheap when there is nothing to do — and there is nothing to do in every session
+// that did not crash mid-compaction, which is why it probes the two sidecar names rather
+// than listing the directory.
+//
+// ── v1.8.2: the .bak, and why the sequence has three names instead of two ─────────────
+//
+// Compaction used to write a complete .tmp, remove the .bsr, then rename. That leaves a
+// window in which the path has NO file on it and the only copy of 256 columns is a .tmp
+// written seconds ago. Nothing in this file fsyncs — everything flushes with fflush() and
+// hands the bytes to libctru's sdmc devoptab — so whether those sectors are on the card when
+// the battery is pulled is unknown, and untestable from a host suite running on ext4.
+// region.h's header comment named that window as the one reason regionCompact was left
+// unwired, and named the remedy with it: "a sequence that never leaves the path with no file
+// on it".
+//
+// So compaction now renames the OLD file aside to .bak first, and removes it only once the
+// new file is in place. Recovery therefore never has to trust the freshly written .tmp:
+// whenever a .bak exists it is the complete, long-since-durable previous region and it wins.
+// A cut in the window costs one compaction, not 256 columns.
+//
+// Resolution table. `bak` is checked FIRST because its presence is what says a compaction was
+// in flight; the .tmp rules below it are v1.7.1's, unchanged, which is what keeps
+// world_test.c's three power-cut stages meaning what they meant.
+//
+//   bak + bsr    the rename onto .bsr landed, the cut came before the cleanup -> drop bak
+//   bak, no bsr  the cut came between the two renames                         -> restore bak
+//   tmp + bsr    a rewrite that never got as far as the first rename          -> drop tmp
+//   tmp, no bsr  a v1.7.1-era cut, or a .bsr lost some other way              -> promote tmp
+//
+// The last row is kept for region files left behind by a build that shipped the two-name
+// sequence. Dropping it would turn a crash that this build can still recover from into a
+// world regenerated from the seed.
 static void regionRecover(const char* world_dir, int32_t rx, int32_t rz)
 {
-	char src[256], tmp[256];
+	char src[256], tmp[256], bak[256];
 	regionPath(src, sizeof(src), world_dir, rx, rz, "bsr");
 	regionPath(tmp, sizeof(tmp), world_dir, rx, rz, "tmp");
+	regionPath(bak, sizeof(bak), world_dir, rx, rz, "bak");
 
-	PROBE_BUMP(g_region_fopens);
-	FILE* t = fopen(tmp, "rb");
-	if (!t) return;
-	fclose(t);
+	if (fileExists(bak)) {
+		// Either way the .tmp is worthless: it has either been promoted already or it is
+		// about to be superseded by the .bak going back.
+		remove(tmp);
+		if (fileExists(src)) remove(bak);
+		else                 rename(bak, src);
+		return;
+	}
 
-	PROBE_BUMP(g_region_fopens);
-	FILE* s = fopen(src, "rb");
-	if (s) { fclose(s); remove(tmp); return; }
+	if (!fileExists(tmp)) return;
+	if (fileExists(src))  { remove(tmp); return; }
 
 	rename(tmp, src);
 }
@@ -527,9 +568,16 @@ bool regionCompact(const char* world_dir, int32_t rx, int32_t rz)
 	// names. See the note in openRegion.
 	regionCacheClose();
 
-	char src[256], tmp[256];
+	char src[256], tmp[256], bak[256];
 	regionPath(src, sizeof(src), world_dir, rx, rz, "bsr");
 	regionPath(tmp, sizeof(tmp), world_dir, rx, rz, "tmp");
+	regionPath(bak, sizeof(bak), world_dir, rx, rz, "bak");
+
+	// This is the one entry point into region.c that does not go through openRegion, so it
+	// does its own recovery: a .bak or .tmp left by an interrupted compaction has to be
+	// resolved before this one reads the file, or the repack would be built from whichever
+	// of the two the last cut happened to leave in place.
+	regionRecover(world_dir, rx, rz);
 
 	FILE* in = fopen(src, "rb");
 	if (!in) return false;
@@ -604,11 +652,97 @@ bool regionCompact(const char* world_dir, int32_t rx, int32_t rz)
 
 	if (!ok) { remove(tmp); return false; }
 
-	// The original is not touched until the replacement is closed and complete. A power cut
-	// between these two lines leaves no .bsr and a complete .tmp, which is why the loader
-	// falls back to the .tmp — see regionRecover.
+	// ── The swap. Three names, and every failure leaves the old region intact ─────────
+	//
+	// v1.8.2. This was remove(src) then rename(tmp, src), which is the sequence that kept
+	// this function unwired: between those two lines the path has no file on it and the only
+	// copy of 256 columns is a .tmp whose sectors may not be on the card. See regionRecover.
+	//
+	// It also fails better. The devoptab's rename() is unverified on hardware; if it does not
+	// work at all, the first rename below fails and NOTHING has been touched — the old .bsr
+	// is still there and still correct. The old sequence had already removed it by then.
 	regionCacheClose();
-	if (remove(src) != 0)     return false;
-	if (rename(tmp, src) != 0) return false;
+
+	if (rename(src, bak) != 0) { remove(tmp); return false; }
+
+	if (rename(tmp, src) != 0) {
+		// Put the world back. If this second rename fails too, the .bak is still on the card
+		// and regionRecover restores it on the next open, so the failure is recoverable
+		// rather than silent.
+		rename(bak, src);
+		remove(tmp);
+		return false;
+	}
+
+	remove(bak);
 	return true;
+}
+
+// ── The wiring, and why it is here rather than in the caller ──────────────────────────
+//
+// v1.8.2. regionCompact had no caller in any shipped build, so a region file grew by a full
+// payload every time a column was saved and nothing ever gave the space back. Measured on the
+// host by source/world/region_growth_test.c, driving this file through 960 column saves over
+// a 24-column working set inside one region: **482,885 bytes on disk against 19,452 bytes
+// live — 95.9 % of the arena dead** — and still climbing linearly at the end of the run. With
+// this function called after each save the same workload finished at **43,883 bytes**, an 11x
+// difference, having compacted 36 times.
+//
+// **The exact workload, and where in it that number is taken**, because this paragraph has
+// already been wrong once for want of saying so. It is arm 2 of region_growth_test.c: 24 columns
+// at DISTINCT directory slots inside region (0,0), each re-saved 40 times = 960 saves, payload
+// lengths produced by the real chunkEncode over generated terrain with churn = 8 + pass*6 +
+// column scattered single-block edits on top, and regionMaintain() called after every one of the
+// 960 saves. The figure is a stat() of r.0.0.bsr taken AFTER the last save and after the
+// regionMaintain that follows it — final, not peak; in this arm peak and final are the same
+// 43,883 bytes, because the file oscillates around twice-live instead of climbing. Bit-identical
+// on three consecutive runs.
+//
+// **This said 21,763 bytes, 22x, 56 compactions until 2026-08-25. That was never a valid
+// measurement — do not resurrect it from git history thinking it was an earlier good one.**
+// Those are the numbers the first-draft fixture printed, before spreadColumns() asserted its 24
+// slots were distinct: it placed columns at cx=(i*7)&15, cz=(i*5)&15, whose period in i is 16, so
+// columns 16..23 sat on the directory slots of 0..7 and only 16 columns were ever really live.
+// Less live data makes the half-dead gate below fire sooner, which is why that run compacted 56
+// times and settled smaller. Its own control_readback was RED in that run — 8 of 24 columns
+// wrong, in BOTH arms — so it was a broken fixture, not a superseded result. Reproduced
+// deliberately on 2026-08-25 from a build-dir COPY of region_growth_test.c with the old placement
+// restored and this file untouched: 482,885 / 21,763 / 56 compactions, control_readback 8 of 24
+// wrong, exit 1. The uncompacted arm is unaffected by the fixture bug — the same 960 payloads get
+// appended either way — which is why 482,885 and 19,452 were right the whole time and only the
+// compacted figure moved.
+//
+// **Where it is called from, and why the save path rather than world close.** app/worker.c's
+// workerWriteSave, immediately after regionWriteColumn, on the worker thread. World close was
+// the obvious alternative and is rejected on two counts: the number of regions to rewrite at
+// quit is unbounded, so the stall is unbounded, and it puts the one moment the file is being
+// replaced at the one moment a player is most likely to close the lid or pull the battery.
+// The save path has neither problem — the worker is a background thread measured at ~94 %
+// idle, so the rewrite does not touch the frame at all, and it happens while the player is
+// still playing rather than while they are trying to leave.
+//
+// **What it costs, amortised.** The gate inside regionCompact only fires when at least half
+// the arena is dead, so the arena has to grow by its own live size before another rewrite is
+// worth doing, and each rewrite moves live bytes. That is the doubling-array argument: the
+// extra bytes written over a session are bounded by about twice the bytes saved, however long
+// the session runs. In the measured run that is 36 rewrites across 960 saves — one save in 27
+// pays for a rewrite, and twenty-six out of twenty-seven pay two file-existence probes. (That
+// ratio is 960/36 and moved with the figure above; it read "one save in 17" while the count was
+// the fixture-inflated 56.)
+//
+// **What is NOT measured**, and it is the honest half: every number above is a host number on
+// ext4 through WSL. A rewrite of a fully built 256-column region moves on the order of 200 KB
+// each way, and how long that takes on a FAT32 SD card behind libctru's devoptab at 268 MHz
+// has not been measured. If it is slow enough, three column saves landing inside one rewrite
+// would fill worker.c's two-slot save ring and make the main thread wait — which is a stall
+// the debug overlay's save-wait counters (workerSaveWaits) would show, and which nothing here
+// can rule out from the host.
+void regionMaintain(const char* world_dir, int32_t rx, int32_t rz)
+{
+	// Deliberately just the gated compaction, with no policy of its own. The threshold lives
+	// inside regionCompact where the numbers it tests are, and a second threshold here would
+	// be a way for the two to disagree. This function exists so that the wiring itself sits
+	// in region.c and can be reached by a host test — a call in worker.c alone would be a
+	// line no suite links.
+	(void)regionCompact(world_dir, rx, rz);
 }

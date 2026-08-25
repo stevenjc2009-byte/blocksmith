@@ -1882,6 +1882,90 @@ static void buildRegistryInfoFor(uint8_t *out /* BS_APP_REGISTRY_INFO_BYTES */,
     registryInitCore();
 }
 
+/* The ten core rows as world/block.h's own constants spell them, written out here so the
+ * core-only fingerprint below can be DERIVED rather than recorded. This is deliberately not
+ * read out of world/registry.c's kCoreDefs (it is static there anyway): a reference built from
+ * the table under test would move whenever that table moved, and a pasted hash literal — which
+ * is what this replaced — would pin whatever the table happened to hash to on the day it was
+ * recorded, wrong answer included. Two independent spellings of the same ten rows can disagree;
+ * a number copied out of a run cannot.
+ *
+ * The fields the rows never vary are not listed: luminance is 0 on every core row, fluid_class
+ * is REG_FLUID_NONE on every core row (water included — REG_FLAG_LIQUID is what makes it a
+ * liquid, and Phase B is what will make fluid_class mean anything), and variant_of is the row's
+ * own id, because a core row is its own variant base. registryInitCore() sets the last two
+ * itself rather than taking them from the definition; coreOnlyCrc16() below says so in bytes. */
+typedef struct {
+    uint8_t     id;
+    const char *name;
+    uint8_t     tex[BLOCK_FACES];
+    uint8_t     flags;
+    uint8_t     hardness;
+} CoreRowSpec;
+
+static const CoreRowSpec kCoreRowSpecs[] = {
+    { 0, "air",   { 0, 0, 0, 0, 0, 0 }, REG_FLAG_TRANSPARENT, 0 },
+    { 1, "grass", { BTEX_GRASS_SIDE, BTEX_GRASS_SIDE, BTEX_GRASS_TOP,
+                    BTEX_DIRT,       BTEX_GRASS_SIDE, BTEX_GRASS_SIDE }, REG_FLAG_SOLID, 12 },
+    { 2, "dirt",  { BTEX_DIRT, BTEX_DIRT, BTEX_DIRT,
+                    BTEX_DIRT, BTEX_DIRT, BTEX_DIRT }, REG_FLAG_SOLID, 12 },
+    { 3, "stone", { BTEX_STONE, BTEX_STONE, BTEX_STONE,
+                    BTEX_STONE, BTEX_STONE, BTEX_STONE }, REG_FLAG_SOLID, 45 },
+    { 4, "sand",  { BTEX_SAND, BTEX_SAND, BTEX_SAND,
+                    BTEX_SAND, BTEX_SAND, BTEX_SAND }, REG_FLAG_SOLID, 10 },
+    { 5, "wood",  { BTEX_WOOD_SIDE, BTEX_WOOD_SIDE, BTEX_WOOD_TOP,
+                    BTEX_WOOD_TOP,  BTEX_WOOD_SIDE, BTEX_WOOD_SIDE }, REG_FLAG_SOLID, 40 },
+    { 6, "leaves", { BTEX_LEAVES, BTEX_LEAVES, BTEX_LEAVES,
+                     BTEX_LEAVES, BTEX_LEAVES, BTEX_LEAVES },
+      REG_FLAG_SOLID | REG_FLAG_TRANSPARENT, 4 },
+    { 7, "planks", { BTEX_PLANKS, BTEX_PLANKS, BTEX_PLANKS,
+                     BTEX_PLANKS, BTEX_PLANKS, BTEX_PLANKS }, REG_FLAG_SOLID, 40 },
+    { 8, "water",  { BTEX_WATER, BTEX_WATER, BTEX_WATER,
+                     BTEX_WATER, BTEX_WATER, BTEX_WATER },
+      REG_FLAG_TRANSPARENT | REG_FLAG_LIQUID, 0 },
+    { 9, "tall_grass", { BTEX_TALL_GRASS, BTEX_TALL_GRASS, BTEX_TALL_GRASS,
+                         BTEX_TALL_GRASS, BTEX_TALL_GRASS, BTEX_TALL_GRASS },
+      REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS), 1 },
+};
+
+/* CRC-16/CCITT-FALSE, spelled out here rather than reached for in world/registry.c, so that the
+ * comparison below is between two whole derivations and not between one derivation and itself.
+ * The algorithm and the 28-byte record layout are both written down in world/registry.h's
+ * contract for registryCrc16()/registryDefPack(); this is that contract, implemented a second
+ * time from the header rather than from the .c file it is checking. */
+static uint16_t coreCrcFeed(uint16_t crc, const uint8_t *bytes, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        crc ^= (uint16_t)((uint16_t)bytes[i] << 8);
+        for (int b = 0; b < 8; b++)
+            crc = (crc & 0x8000u) ? (uint16_t)((crc << 1) ^ 0x1021u) : (uint16_t)(crc << 1);
+    }
+    return crc;
+}
+
+/* What registryCrc16() must answer on a table holding the core rows and nothing else. */
+static uint16_t coreOnlyCrc16(void)
+{
+    uint16_t crc = 0xFFFF;
+    for (unsigned i = 0; i < sizeof kCoreRowSpecs / sizeof kCoreRowSpecs[0]; i++) {
+        const CoreRowSpec *row = &kCoreRowSpecs[i];
+        uint8_t rec[REGISTRY_WIRE_RECORD_BYTES];
+
+        memset(rec, 0, sizeof rec);                 /* name tail is NUL padding */
+        rec[0] = row->id;
+        memcpy(&rec[1], row->name, strlen(row->name));
+        memcpy(&rec[17], row->tex, BLOCK_FACES);
+        rec[23] = row->flags;
+        rec[24] = 0;                                /* luminance: 0 on every core row */
+        rec[25] = row->hardness;
+        rec[26] = row->id;                          /* variant_of: a base is its own root */
+        rec[27] = REG_FLUID_NONE;
+
+        crc = coreCrcFeed(crc, rec, sizeof rec);
+    }
+    return crc;
+}
+
 /* registryJoinWithMismatch()'s honest sibling: a real join against a server whose table is the
  * core rows plus `defs`. It still mismatches — this client is core-only until the DEFS land, so
  * the same single FETCH goes out — but this fingerprint is one a correct delivery can actually
@@ -2139,8 +2223,8 @@ static void test_registry_table_resets_between_sessions(void)
     check(registryCount() == 10, "after leaving, only the ten core rows remain");
     check(registryFind("srv1_a") == 0 && registryFind("srv1_b") == 0,
           "the first server's names are gone, not merely hidden");
-    check(registryCrc16() == 0x4066u,
-          "and the table hashes as the pinned core-only golden again");
+    check(registryCrc16() == coreOnlyCrc16(),
+          "and the table hashes as the independently derived core-only fingerprint again");
     check(!networldRegistrySynced() && !networldRegistryWaiting(),
           "with the sync state cleared alongside it");
 

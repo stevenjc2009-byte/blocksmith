@@ -59,6 +59,60 @@
 #define PLAYER_SWIM_UP_SPEED     3.0f
 #define PLAYER_WATER_SPEED_MUL   0.5f
 
+// v1.8.2 — the surface. The four constants above describe a body INSIDE a water column
+// and describe it well; what they had no answer for was the waterline itself, where
+// SWIM_UP_SPEED's hard clamp, the -8/-28 gravity step and a submersion test with no middle
+// state formed a three-line bang-bang relay. Measured before this change: holding the swim
+// button at the top of a lake made the body cross vy=0 fifty-nine times in the last 399 of
+// 600 frames -- a 4.4 Hz judder through 0.223 blocks. Nothing was wrong with any one of the
+// three lines; the loop was in how they met.
+//
+//   SURFACE_RISE    the held-jump target for vy once the head is out of the water, as
+//                   opposed to SWIM_UP_SPEED which still governs the climb through the
+//                   column. 0.0 means the button holds you AT the surface rather than
+//                   throwing you off it, which is the whole ask.
+//   SWIM_RESPONSE   1/s. How fast vy is pulled TOWARDS its target instead of being
+//                   assigned it. The old code set vy every frame from whatever it was,
+//                   including straight through zero from a negative value, which is the
+//                   velocity reversal that made the bob feel like a judder rather than a
+//                   float. ~100 ms to close the gap.
+//   WATER_VDRAG     1/s. Vertical drag on an UNDRIVEN upward coast, which water had none
+//                   of: gravity and the terminal clamp alone let a body that stopped being
+//                   pushed keep every bit of its velocity and arc ballistically.
+//   WET_HYSTERESIS  blocks. The band the eye must clear ABOVE the waterline before a
+//                   submerged body stops counting as submerged. See bodyWetUpdate.
+//
+// The first cut of this (v1.8.2 attempt 1) got the target right and the FORCE BALANCE
+// wrong, and the difference is the whole of attempt 2. Pulling vy towards 0 does not hold
+// a body still, because a velocity target cannot cancel a constant acceleration: gravity
+// re-establishes about -0.5 blocks/s of droop every frame, the body sinks out of
+// BODY_SURFACE, the state flips to BODY_SUBMERGED, the +3 target throws it back, and the
+// relay simply moved from vy=0 to the state boundary. Measured: travel fell from 0.223333
+// blocks to 0.022027, which reads like a win, but the eye crossed the waterline 140 times
+// in 399 frames where the old code crossed it 0 -- a 10.5 Hz strobe of the water plane
+// through the camera, which is worse than the bob it replaced.
+//
+// So the rule here is a force rule, not a velocity rule: WHILE THE BUTTON IS ACTIVELY
+// PULLING, gravity is not applied at all (bodyStep, via Body::swim_drive). vy = target is
+// then a genuine fixed point rather than a point the body falls away from -- nothing
+// restores the error, so there is no limit cycle to damp. The two consequences are both
+// wanted:
+//   * at the surface the body stops dead and stays stopped, and
+//   * a driven climb settles at exactly SWIM_UP_SPEED again, undoing attempt 1's
+//     unasked-for 2.866667 -> 1.215686 blocks/s regression.
+// Drag is likewise confined to the undriven coast, which is what it was for; attempt 1
+// applied it to the driven climb and to the sink as well, dragging the free-sink terminal
+// off PLAYER_WATER_TERMINAL to -1.328954. Both are back.
+//
+// Both rates are applied through dampAlpha() in physics.c rather than as `k * dt`, so that
+// no tick length can overshoot the target -- the body runs on the RENDER frame
+// (scene/player.c passes metricsFrameMs()), not on the 20 TPS tick, so dt here is whatever
+// the frame took. See dampAlpha for what that does and does not buy.
+#define PLAYER_SURFACE_RISE      0.0f
+#define PLAYER_SWIM_RESPONSE    10.0f
+#define PLAYER_WATER_VDRAG       6.0f
+#define PLAYER_WET_HYSTERESIS    0.25f
+
 // There is deliberately no step-height constant. Auto-step is a flat one-block rise
 // gated by a headroom probe, because every block in this game is a full 1.0 cube and
 // there is nothing shorter to measure a sub-block threshold against. See tryStepUp in
@@ -70,10 +124,48 @@
 #define BLOCKED_Y  (1 << 1)
 #define BLOCKED_Z  (1 << 2)
 
+// How wet the body is. The two cells this is read from are the same two the old boolean
+// bodySubmerged() already probed — feet and eye — so this is a wider ANSWER, not a more
+// expensive question.
+//
+// Both are checked, not just the feet, because a body falling through a waterfall can have
+// its head in water with air under its feet, and one that has just jumped out of a lake has
+// the opposite. Either counts as "in water" — this answers the swim question, not a
+// drowning question, and there is no drowning.
+//
+// BODY_SURFACE exists because the old boolean had to answer the same thing for a diver
+// twenty blocks down and for a swimmer with his head in the air, and those two want
+// opposite vertical inputs: the diver wants to be lifted, the swimmer wants to be held
+// still. One bit could not say that, so the relay between the two answers was the bob.
+//
+// Declared above Body rather than next to bodyWetState() because Body now CARRIES one:
+// the boundary between BODY_SURFACE and BODY_SUBMERGED is hysteretic, and hysteresis is
+// by definition a function of where you came from. See bodyWetUpdate().
+typedef enum {
+	BODY_DRY       = 0,   // neither cell is liquid
+	BODY_SURFACE   = 1,   // feet in liquid, eyes in air — floating at the waterline
+	BODY_SUBMERGED = 2    // eye cell is liquid — under, whatever the feet are in
+} BodyWet;
+
 typedef struct {
 	float x, y, z;      // centre of the box in x/z, FEET in y
 	float vx, vy, vz;
 	bool  on_ground;
+
+	// v1.8.2 attempt 2. Two frames' worth of memory, both owned by physics.c and both
+	// meaningless to read from outside it.
+	//
+	// `wet` is last frame's answer, and it is what makes the wet test hysteretic instead
+	// of a bare threshold that anything sitting on it can chatter across.
+	//
+	// `swim_drive` is set by bodyJump when the water branch actually pulled this frame,
+	// and consumed (and cleared) by bodyStep. It is state rather than a bodyStep argument
+	// because bodyStep has three call sites — the player, main.c's walk-stress probe and
+	// the tests — and only one of them knows anything about a jump button; the comment on
+	// bodyStep below is about exactly that mistake. A body nobody calls bodyJump for is
+	// simply never driven, which is the right answer for a walk probe.
+	BodyWet wet;
+	bool    swim_drive;
 } Body;
 
 void bodyInit(Body* b, float x, float y, float z);
@@ -104,13 +196,38 @@ int bodyStep(Body* b, const World* w, float dt_s);
 // True if the body would overlap a solid block at the given position.
 bool bodyBlocked(const World* w, float x, float y, float z);
 
-// True if the body is in water: either the feet cell or the eye cell holds a liquid.
+// The INSTANTANEOUS wet state: what the two cells say right now, with no memory and no
+// band. This is the honest reading of the world, and it is what bodySubmerged() and the
+// tests' "is this body in water" assertions want. It is NOT what the vertical input is
+// driven from — see bodyWetUpdate.
+BodyWet bodyWetState(const World* w, const Body* b);
+
+// The DRIVEN wet state: the same reading, with PLAYER_WET_HYSTERESIS applied to the
+// submerged boundary, stored into b->wet and returned. Call it once per frame, before
+// bodyJump; bodyStep calls it too, and the two agree because the update is idempotent at a
+// fixed position.
 //
-// Both are checked, not just the feet, because a body falling through a waterfall can have
-// its head in water with air under its feet, and one that has just jumped out of a lake has
-// the opposite. Either counts as "in water" — this answers the swim question, not a
-// drowning question, and there is no drowning.
-bool bodySubmerged(const World* w, const Body* b);
+// The band is one-sided and sits ABOVE the waterline: the eye entering the water submerges
+// you immediately, but leaving takes the eye a further PLAYER_WET_HYSTERESIS clear of the
+// surface. That asymmetry is deliberate and is what places the resting float. Centring the
+// band on the waterline instead would make a body with its eyes 0.1 blocks UNDER the water
+// read as BODY_SURFACE, whose target is 0 — it would hover there, head under, doing
+// nothing, which is the exact opposite of what the state is for. Biased this way the
+// answer to "am I under?" is always yes when in doubt, so the only thing the band can do is
+// hold you up.
+//
+// Two frames of hysteresis are two frames of lag on a boundary the player can also cross by
+// walking off a ledge; that is accepted. The state is only ever read for the vertical
+// input, and the wrong answer for one frame there is a fifth of a swim stroke.
+BodyWet bodyWetUpdate(const World* w, Body* b);
+
+// True if the body is in water at all. Kept as the exact predicate it always was so that
+// bodyWalkSpeed(), the tests and player.c's horizontal branch do not have to care about the
+// distinction that only the vertical input needs.
+static inline bool bodySubmerged(const World* w, const Body* b)
+{
+	return bodyWetState(w, b) != BODY_DRY;
+}
 
 // Horizontal speed for one tick, given the answer bodySubmerged() just gave. A function
 // rather than a macro at the call site so the rule is linkable and testable: player.c
@@ -120,7 +237,14 @@ float bodyWalkSpeed(bool submerged);
 
 // The vertical half of the movement input for one tick. On land this is the ground-gated
 // single-impulse jump, unchanged from before task 25 (a HELD button must not fly). In
-// water it is a sustained rise while the button is held, with no ground test at all.
+// water it is a sustained pull of vy TOWARDS a target while the button is held, with no
+// ground test at all — the target being SWIM_UP_SPEED under the surface and SURFACE_RISE at
+// it. A pull rather than an assignment, and a target that depends on the state, are two of
+// the three halves of the v1.8.2 surface fix; the third is that a pull also sets
+// Body::swim_drive, which tells bodyStep to leave gravity off for that frame. See the
+// constants above for why a target alone was not enough.
 //
-// `jump_pressed` is the this-frame edge (hidKeysDown), `jump_held` the level (hidKeysHeld).
-void bodyJump(Body* b, bool submerged, bool jump_held, bool jump_pressed);
+// `wet` is the answer bodyWetUpdate() just gave, `jump_pressed` the this-frame edge
+// (hidKeysDown), `jump_held` the level (hidKeysHeld), and `dt_s` the same frame time
+// bodyStep is about to be handed — the water branch is rate-based, so it needs it.
+void bodyJump(Body* b, BodyWet wet, bool jump_held, bool jump_pressed, float dt_s);

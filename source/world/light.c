@@ -24,9 +24,16 @@ typedef struct {
 static bool    s_enabled;
 static int     s_attached;
 static int     s_queue_dropped;   // BFS refusals this call; must stay zero (see the CAP note)
-// One entry per id in the WHOLE registry id space, core and dynamic alike — not
-// BLOCK_COUNT entries. All zeros today: no block emits yet.
+// The effective luminance both engines read, one entry per id in the WHOLE registry
+// id space, core and dynamic alike — not BLOCK_COUNT entries.
+//
+// This is a CACHE of BlockDef.luminance, rebuilt by syncLuminance() below. Nothing
+// else writes it: the registry is the single source of truth for what a block emits.
 static uint8_t s_luminance[REGISTRY_MAX];
+
+// Test overrides, laid over the registry by syncLuminance(). Zero means "no override"
+// — see lightSetLuminanceForTest, which is the only writer.
+static uint8_t s_lum_test[REGISTRY_MAX];
 
 // The six in-column neighbour offsets, shared by both engines.
 static const int8_t kDirs[6][3] = {
@@ -194,11 +201,37 @@ static void heightMapFill(HeightMap* hm, const Chunk* const chunks[COLUMN_CHUNKS
 // takes 720.1 us — 0.011% of the call it gates. Scaled by instruction count to a 268 MHz
 // ARM11 (248 extra iterations, ~4 instructions each, ~1 IPC) that is roughly 3.7 us per
 // edit, against a relight that is milliseconds there; NOT measured on hardware.
-static bool anyLuminance(void)
+//
+// v1.8.2: the same walk now also FILLS the table from the registry, which is the whole
+// of the fix. BlockDef.luminance has existed since v1.6.0 and crosses the wire in both
+// directions (registry.c's registryDefPack/registryDefUnpack, bytes[24]), but no reader
+// ever put it into s_luminance — so a server that registered a glowing block at join
+// sent its luminance, the client unpacked it into the def, and the lighting engine never
+// looked. The block rendered pitch dark with no error and no log line.
+//
+// Pulling here rather than pushing from registry.c is deliberate, for two reasons.
+// First it is ONE choke point instead of three: registryInitCore, registryRegister and
+// registryRemoteApply all end up in the same table, and reading that table covers every
+// one of them (plus registrySidecarLoad, which goes through RemoteApply) with no way to
+// wire two of the three and miss the third. Second, registry.c and registry.h are
+// mirrored verbatim into the dedicated server (deps/blocksmith-server/tools/
+// sync-world-sources.sh), and light.c is not — a push would have dragged the lighting
+// engine into the server build and forced a paired release for a client-only fix.
+//
+// Cost: the loop was already 256 entries and already ran exactly once per column
+// propagate/relight. It now does a registryGet() per entry instead of an array read.
+// registryGet on an undefined id answers the air row, whose luminance is 0, so no
+// is-defined test is needed.
+static bool syncLuminance(void)
 {
-	for (int i = 0; i < REGISTRY_MAX; i++)
-		if (s_luminance[i]) return true;
-	return false;
+	bool any = false;
+	for (int i = 0; i < REGISTRY_MAX; i++) {
+		uint8_t lum = s_lum_test[i];
+		if (lum == 0) lum = registryGet((BlockId)i)->luminance;
+		s_luminance[i] = lum;
+		if (lum) any = true;
+	}
+	return any;
 }
 
 // ── engine 1: breadth-first flood fill ───────────────────────────────────────
@@ -320,9 +353,10 @@ bool lightPropagateColumn(World* w, int cx, int cz, LightQueue* q)
 	}
 	spread(lc->sky, chunks, q);
 
-	// Block seeds: luminous cells. No registry block emits today, so the scan is
-	// skipped entirely until a test (or a future torch) puts a value in the table.
-	if (anyLuminance()) {
+	// Block seeds: luminous cells. syncLuminance() refreshes the table from the
+	// registry and answers whether anything in it emits at all; no core row declares
+	// a luminance today, so on a single-player world the scan is skipped entirely.
+	if (syncLuminance()) {
 		for (int cy = 0; cy < COLUMN_CHUNKS; cy++) {
 			if (!chunks[cy]) continue;
 			for (int i = 0; i < CHUNK_BLOCKS; i++) {
@@ -384,7 +418,7 @@ bool lightRelightColumnSweeps(World* w, int cx, int cz)
 	HeightMap hm;
 	heightMapFill(&hm, chunks);
 
-	const bool lum_any = anyLuminance();
+	const bool lum_any = syncLuminance();
 
 	bool changed = true;
 	while (changed) {
@@ -459,9 +493,15 @@ bool lightRelightColumnSweeps(World* w, int cx, int cz)
 	return true;
 }
 
+// Sets a test override that syncLuminance() lays over whatever the registry says.
+// Level 0 REMOVES the override rather than forcing the block dark, which is what the
+// suite's two "restore production truth" calls have always meant — and with the
+// registry now feeding the table, forcing a zero over a declared luminance would be a
+// way to make the test disagree with the game. No core row declares a luminance, so
+// those calls still land on 0 either way.
 void lightSetLuminanceForTest(BlockId id, uint8_t level)
 {
-	s_luminance[id] = level;
+	s_lum_test[id] = level;
 }
 
 void lightSetSkyForTest(Column* col, int lx, int y, int lz, uint8_t level)

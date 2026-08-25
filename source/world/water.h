@@ -142,6 +142,37 @@
 // layer up.
 #define WATER_TICK_BUDGET 64
 
+// ── How FAST it spreads, which is not the same question as how much it costs ──────────
+//
+// v1.8.2. The budget above is a CPU cap and it used to be the rate as well, because nothing
+// separated one propagation hop from the next: a tick drained 64 entries off a FIFO ring, and
+// the entries a popped cell pushed were popped again a few slots later inside that same tick.
+// A seven-block pour is about 225 examinations, so it finished in four ticks — 200 ms, with the
+// first three blocks of it inside the first 50 ms. That does not read as water flowing, it
+// reads as a puddle appearing.
+//
+// So waterTick now drains at most ONE GENERATION — the entries that were already waiting when
+// the tick opened, which is exactly one hop — and holds the next generation for this many ticks.
+// Five is Beta 1.7.3's Overworld rate, one block per 0.25 s, the same reference the seven-block
+// reach above is taken from.
+//
+// Measured rather than derived, by world/water_test.c's testSpreadRate: a source dropped on flat
+// ground wets distance 1 on tick 1 and distance 7 on tick 31, and the whole pour settles on tick
+// 36 — against ticks 1 and 7, settled on 9, before the barrier. At the WATER_TICK_BUDGET of 64
+// it is three ticks slower still (distance 7 on tick 34, settled on 41), because the frontier
+// from distance 5 outwards is wider than 64 candidates and those generations each need a second
+// tick to drain. So a seven-block spread goes from 200 ms to 1.70 s on the console.
+//
+// The two numbers cannot move each other now. Raising WATER_TICK_BUDGET buys a wide flood more
+// throughput and does not make it spread faster; raising this makes it spread slower and does
+// not make a saturated tick cheaper. And the barrier can only leave budget UNSPENT, so the
+// worst-case tick is the same 64 examinations it always was.
+//
+// Nothing about the destination changes. The barrier inserts idle ticks into the pop sequence
+// and never reorders it, so every cell still comes off the ring in the order it always did —
+// which is why world/water_test.c's four-budget order-independence hashes are unmoved.
+#define WATER_SPREAD_TICKS 5
+
 // Called once for every cell whose BLOCK actually changed — not for a cell whose flow level
 // changed inside an unchanged block of water. main.c passes the same relight-then-remesh pair
 // its remote-edit hook uses.
@@ -165,6 +196,14 @@ typedef struct {
 	uint64_t qset[WATERQ_SET_SLOTS];
 	int      qhead, qcount;
 
+	// The generation barrier (WATER_SPREAD_TICKS above). `gen_remaining` is how much of the
+	// OPEN generation is still unpopped — a generation can outlive its tick when it is bigger
+	// than the budget, which is the case the two counters have to be separate for.
+	// `gen_cooldown` is how many ticks are left before the next one may open. Both are zeroed
+	// by waterInit's memset, so a build that never ticks behaves exactly as it did before.
+	int      gen_remaining;
+	int      gen_cooldown;
+
 	// Set only while waterDropColumn is running, and the reason is that main.c installs
 	// waterNotify on world.c's edit hook: without it, clearing a flooded column would push
 	// seven candidates per cleared cell for a column that is about to stop existing, and
@@ -178,6 +217,15 @@ typedef struct {
 	uint32_t q_full;     // candidates refused a ring slot
 	uint32_t examined;   // cells popped and recomputed
 	uint32_t changed;    // of those, cells whose level or block actually moved
+
+	// Ticks that ended with budget left over AND work still queued, i.e. ticks the barrier
+	// deliberately held back. It is here for the same reason q_full is: a rate limiter that
+	// throttles silently is indistinguishable from a simulation that has stopped, and the one
+	// question worth asking when water looks stuck is whether it is waiting or wedged.
+	// It is EXPECTED to be large during a spread — four of every five ticks of a pour are a
+	// stall by this definition — so what it diagnoses is a value that stops rising while
+	// waterPending() stays above zero.
+	uint32_t gen_stalls;
 
 	// v1.8.0 task 22b. Fired for a cell whose LEVEL moved inside water that was already there
 	// — the case the on_change hook above deliberately stays quiet for. NULL until
@@ -201,8 +249,10 @@ void waterSetLevelHook(WaterSim* s, WaterChangeFn fn, void* ud);
 // player break, a placed block and a remote edit all reach it without three call sites.
 void waterNotify(WaterSim* s, int x, int y, int z);
 
-// One 20 TPS tick. Examines at most `budget` queued cells and returns how many actually
-// changed. `on_change` may be NULL.
+// One 20 TPS tick. Examines at most `budget` queued cells — and at most the one generation
+// that was already waiting, see WATER_SPREAD_TICKS — and returns how many actually changed.
+// `on_change` may be NULL. A tick held back by the barrier returns 0 without examining
+// anything and is counted in gen_stalls.
 int waterTick(WaterSim* s, World* w, int budget, WaterChangeFn on_change, void* ud);
 
 // Ticks until the queue is empty or `max_ticks` have run. Returns the number of ticks used,
@@ -236,6 +286,7 @@ uint32_t waterMapFull(const WaterSim* s);
 uint32_t waterQueueFull(const WaterSim* s);
 uint32_t waterExamined(const WaterSim* s);
 uint32_t waterChanged(const WaterSim* s);
+uint32_t waterGenStalls(const WaterSim* s);
 
 // Removes every flow cell in column (cx, cz) from the world and from the map, returning how
 // many cells it cleared. Sources are untouched.

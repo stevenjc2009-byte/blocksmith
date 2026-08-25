@@ -111,6 +111,39 @@ static inline uint8_t meshNrmDrop(uint8_t nrm) { return (uint8_t)(nrm >> MESH_NR
 // A face index has to fit under the drop, or the two would overlap in the byte.
 _Static_assert(BLOCK_FACES <= MESH_NRM_FACE_MASK + 1, "face index no longer fits nrm's low bits");
 
+// ── v1.8.2: the vertex alpha, and why it rides in the same table ─────────────
+//
+// How opaque a faceShade row draws. 0.70 for water, 1.0 for everything else.
+//
+// The row index IS the whole nrm byte, so rows 0..7 are the 8 face ids at drop 0 and rows
+// 8..63 are every non-zero drop. Since the surface floor landed (WATER_SURFACE_DROP in
+// world/scratch.h) a non-zero drop is carried by water and by nothing else in the world, so
+// those 56 rows are water-only and the alpha binds with no extra vertex bits, no extra
+// instruction and no extra uniform register: the shaders' `mov outclr.w, ones` becomes
+// `mov outclr.w, r3.wwww` and r3 was already fetched.
+//
+// That is the whole reason the recessed surface and the see-through surface had to land in one
+// change. Without the floor, a SOURCE sits at drop 0 in rows 0..7 alongside stone and is
+// indistinguishable from it; separating them would need a water flag in the nrm byte, which
+// doubles the table to 128 rows against a PICA200 vertex stage that has 96 float uniform
+// registers in total and already spends 77 of them.
+//
+// 0.70 is chosen so the alpha TEST does not have to move. scene/chunk_render.c tests
+// GPU_GREATER against 127 and the TEV modulates alpha (C3D_Both), so a water fragment is
+// 255 * 0.70 = 178 and passes, while a leaf's cutout texel is 255 * 0 = 0 and still fails.
+// Anything in (128, 255) would work; below 0.50 the cutoff would have to move with it.
+//
+// It lives here rather than in scene/chunk_render.c because that file includes <3ds.h> and no
+// host test can link it. This header is the one place both the renderer and the host suite can
+// read the same number, which is what stops world/water_alpha_test.c from being a test that
+// only checks its own copy of the rule.
+#define WATER_ALPHA  0.70f
+
+static inline float meshNrmAlpha(uint8_t nrm)
+{
+	return meshNrmDrop(nrm) >= WATER_SURFACE_DROP ? WATER_ALPHA : 1.0f;
+}
+
 // Meshes the chunk sitting in the middle of `s`. Positions come out chunk-local,
 // 0..16 in block units, so the caller places the chunk with a model matrix.
 //

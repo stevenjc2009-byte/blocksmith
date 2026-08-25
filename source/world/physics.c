@@ -51,6 +51,14 @@ void bodyInit(Body* b, float x, float y, float z)
 	b->vy = 0.0f;
 	b->vz = 0.0f;
 	b->on_ground = false;
+
+	// BODY_DRY rather than "whatever the world says here", because bodyInit does not take
+	// a world and the hysteresis only ever biases TOWARDS submerged: a body initialised
+	// inside water reads BODY_SUBMERGED on its very first bodyWetUpdate anyway, since the
+	// band does not resist entering. Starting dry therefore costs nothing and needs no
+	// world pointer.
+	b->wet = BODY_DRY;
+	b->swim_drive = false;
 }
 
 // blockIsSolid, and that is the whole of v1.6.0 task 13's collision story: nothing here
@@ -258,13 +266,69 @@ int bodyMove(Body* b, const World* w, float dx, float dy, float dz)
 // and a body whose centre line is in a water cell is in the water. Probing the corners
 // would make a body standing with 0.05 of its width over a shoreline cell count as
 // swimming, which is the wrong answer and a more expensive way to get it.
-bool bodySubmerged(const World* w, const Body* b)
+// `eye_bias` shifts the height the EYE is probed at, and is the whole of the hysteresis:
+// 0 for the honest instantaneous reading, -PLAYER_WET_HYSTERESIS for a body that was
+// already submerged, which is what makes it keep counting as submerged until the eye is a
+// clear band above the water. The feet probe is never biased — the feet are what say
+// "in water at all", and a band there would let a body walk a quarter of a block into a
+// pond before the water noticed, or a quarter of a block out of it before the water let go.
+static BodyWet wetAt(const World* w, const Body* b, float eye_bias)
 {
 	const int bx = floorToInt(b->x);
 	const int bz = floorToInt(b->z);
 
-	if (blockInfo(worldGet(w, bx, floorToInt(b->y), bz))->liquid) return true;
-	return blockInfo(worldGet(w, bx, floorToInt(b->y + PLAYER_EYE), bz))->liquid;
+	// Eyes first, because eyes-under is the strongest answer and it does not matter what
+	// the feet are in once it is true: a body head-first under a waterfall lip is
+	// submerged even with air below it, which is the case the two-cell probe was written
+	// for in the first place.
+	if (blockInfo(worldGet(w, bx, floorToInt(b->y + PLAYER_EYE + eye_bias), bz))->liquid)
+		return BODY_SUBMERGED;
+	if (blockInfo(worldGet(w, bx, floorToInt(b->y), bz))->liquid)
+		return BODY_SURFACE;
+	return BODY_DRY;
+}
+
+BodyWet bodyWetState(const World* w, const Body* b)
+{
+	return wetAt(w, b, 0.0f);
+}
+
+// Idempotent at a fixed position, which is why player.c and bodyStep may both call it in
+// the same frame: if the answer is BODY_SUBMERGED then the eye was liquid at (eye - band),
+// so it is certainly liquid at (eye - band) again next call; if it is not, the eye was air
+// at (eye), and the second call — now unbiased in the other direction — probes the same
+// cell. Neither can flip the other. That property is what lets the state be read where it
+// is needed rather than threaded through three signatures.
+BodyWet bodyWetUpdate(const World* w, Body* b)
+{
+	const float bias = (b->wet == BODY_SUBMERGED) ? -PLAYER_WET_HYSTERESIS : 0.0f;
+	b->wet = wetAt(w, b, bias);
+	return b->wet;
+}
+
+// Fraction of the remaining gap to close in dt seconds, for a first-order approach at
+// `rate` per second. This is the backward-Euler step for dv/dt = -k*v, written as
+// k*dt/(1 + k*dt) — one divide — rather than as the bare k*dt the naive version uses.
+//
+// The reason is BOUNDEDNESS, and it is worth being precise about because the other reason
+// people reach for this form turns out not to apply here. k*dt passes 1.0 once dt exceeds
+// 1/k and keeps going, so a long enough tick does not merely overshoot the target, it
+// flings the body past it and then backwards. This form is in [0, 1) for every
+// non-negative dt there is, so the worst a long tick can do is arrive. Measured: with the
+// naive form in place, world_test.c's tick sweep goes red at dt = 0.25, 1.0 and 10.0
+// ("worst.vy <= PLAYER_SWIM_UP_SPEED", three times) and stays green with this one.
+//
+// What this does NOT buy, measured rather than assumed: the resting float. Swapping the
+// naive form back in leaves every check in testSurfaceSwim green — the crossings, the
+// travel, the head clearance and the 20/30/60 fps spread alike — and reddens only the tick
+// sweep and the three measured single-step values. The resting height is pinned by the
+// state boundary, not by the decay rate, so frame-rate consistency of the float was never
+// the thing at risk here. The tick sweep is the only witness this form has; if that sweep
+// is ever deleted as redundant, this becomes an undefended one-liner.
+static float dampAlpha(float rate, float dt_s)
+{
+	const float kdt = rate * dt_s;
+	return kdt / (1.0f + kdt);
 }
 
 float bodyWalkSpeed(bool submerged)
@@ -272,13 +336,39 @@ float bodyWalkSpeed(bool submerged)
 	return submerged ? PLAYER_WALK_SPEED * PLAYER_WATER_SPEED_MUL : PLAYER_WALK_SPEED;
 }
 
-void bodyJump(Body* b, bool submerged, bool jump_held, bool jump_pressed)
+void bodyJump(Body* b, BodyWet wet, bool jump_held, bool jump_pressed, float dt_s)
 {
-	if (submerged) {
-		// Raised TO the swim speed, never set to it: a body that entered the water
-		// already rising faster -- kicked off the bottom, or swum up out of a current --
-		// must not be slowed down by holding the button that is supposed to lift it.
-		if (jump_held && b->vy < PLAYER_SWIM_UP_SPEED) b->vy = PLAYER_SWIM_UP_SPEED;
+	if (wet != BODY_DRY) {
+		if (!jump_held) return;
+
+		// Under the surface the button still means "climb"; at the surface it means
+		// "stay here". Before v1.8.2 it meant "climb" in both, so the swimmer was thrown
+		// clear of the water, went dry, caught the full -28 gravity and fell back in --
+		// and the frame he landed the SAME line snapped vy from negative to +3 with no
+		// ramp at all. That reversal is the 4.4 Hz judder, and this is the line it came
+		// from.
+		const float target = (wet == BODY_SUBMERGED) ? PLAYER_SWIM_UP_SPEED
+		                                            : PLAYER_SURFACE_RISE;
+
+		// Raised TOWARDS the target, never set to it, and never lowered to it: a body
+		// that entered the water already rising faster -- kicked off the bottom, or swum
+		// up out of a current -- must not be slowed down by holding the button that is
+		// supposed to lift it. Held from below, that same test is why a swimmer breaking
+		// the surface with +3 on him is left to coast rather than being braked to zero:
+		// he loses it to gravity and drag over the next fifth of a second instead, which
+		// is what makes the arrival read as a float rather than as a stop.
+		//
+		// `<=`, not `<`, and the equal case matters more than it looks. It makes the pull
+		// a no-op (the gap is zero) while still setting swim_drive, so a body sitting
+		// exactly ON its target keeps gravity switched off and stays there EXACTLY --
+		// vy = target is a fixed point of the whole system, not merely of this line. With
+		// `<` the body at vy = 0 gets one ungoverned tick of gravity, and while that only
+		// costs it 0.0155 blocks before the pull catches it again, "only drifts a bit" is
+		// what attempt 1 said too.
+		if (b->vy <= target) {
+			b->vy += (target - b->vy) * dampAlpha(PLAYER_SWIM_RESPONSE, dt_s);
+			b->swim_drive = true;
+		}
 		return;
 	}
 
@@ -295,11 +385,44 @@ int bodyStep(Body* b, const World* w, float dt_s)
 	// physics.h. The terminal is the half that makes hitting the surface at speed feel
 	// like water rather than like a slower kind of air -- a body arriving at -60 is
 	// snapped to the water terminal on this very tick, before it moves.
-	const bool  submerged = bodySubmerged(w, b);
-	const float gravity   = submerged ? PLAYER_WATER_GRAVITY  : PLAYER_GRAVITY;
-	const float terminal  = submerged ? PLAYER_WATER_TERMINAL : PLAYER_TERMINAL;
+	const BodyWet wet      = bodyWetUpdate(w, b);
+	const bool    in_water = (wet != BODY_DRY);
+	const float   terminal = in_water ? PLAYER_WATER_TERMINAL : PLAYER_TERMINAL;
 
-	b->vy += gravity * dt_s;
+	// Consumed, not merely read: the flag describes THIS frame's input and must not
+	// survive into a frame bodyJump was not called for, or a player who releases the
+	// button hangs in the water until something calls bodyJump again to clear it.
+	const bool driven = b->swim_drive;
+	b->swim_drive = false;
+
+	// The v1.8.2 attempt-2 line, and the only one that mattered. A swimmer actively
+	// pulling towards a target is not in free fall, so gravity is not applied at all while
+	// he is: without this, vy is a balance between the pull and a constant -8, the balance
+	// sits BELOW the target by g/k, and at the surface (target 0) that residual droop is
+	// what sank the body back through the state boundary sixty times a second. With it,
+	// vy = target is a genuine fixed point -- there is no error left for anything to
+	// restore. It is also what puts the driven climb back at SWIM_UP_SPEED exactly instead
+	// of at SWIM_UP_SPEED - WATER_GRAVITY/SWIM_RESPONSE.
+	//
+	// Only while DRIVEN. Let go and the body is in free fall again on the next frame,
+	// which is what makes releasing the button sink you.
+	if (!(in_water && driven))
+		b->vy += (in_water ? PLAYER_WATER_GRAVITY : PLAYER_GRAVITY) * dt_s;
+
+	// Water had no vertical drag at all, only the terminal clamp -- so a body that stopped
+	// being driven kept every bit of the velocity it had and coasted ballistically until
+	// the clamp caught it, which is what let a swimmer leaving the water arc into the air
+	// before falling back. Drag is what makes the same departure decay instead of arc.
+	//
+	// Confined to an undriven UPWARD coast, which is the only motion it was ever meant to
+	// describe, and attempt 1's failure to confine it is where two unasked-for regressions
+	// came from: on the driven climb it fought the pull down to 1.215686 blocks/s, and on
+	// the way down it balanced water gravity at -1.328954 and quietly retired
+	// PLAYER_WATER_TERMINAL, which is the constant that is supposed to own the sink rate.
+	// A sink already has a terminal; it does not need a second one derived from a drag.
+	if (in_water && !driven && b->vy > 0.0f)
+		b->vy -= b->vy * dampAlpha(PLAYER_WATER_VDRAG, dt_s);
+
 	if (b->vy < terminal) b->vy = terminal;
 
 	return bodyMove(b, w, b->vx * dt_s, b->vy * dt_s, b->vz * dt_s);

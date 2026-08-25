@@ -16,9 +16,16 @@
 //
 // The channels are Minecraft-shaped: sky light is seeded straight down through
 // air at 15 and spreads outward with -1 falloff; block light is seeded from
-// luminous blocks. No luminous block exists in the registry yet, so the block
-// channel is always zero in production — the machinery is real and tested, and a
-// torch later is one row in the luminance table. Light stops at opaque cells
+// luminous blocks.
+//
+// v1.8.2: what a block emits is BlockDef.luminance, read out of the registry — the
+// engine's luminance table is a cache of it, refreshed once per column propagate or
+// relight. Before that it was a private table nothing ever filled, so a luminance that
+// had crossed the wire in a DEFS record (registry.c packs and unpacks byte 24) was
+// silently dropped and the block rendered pitch dark. No CORE row declares a luminance,
+// so a single-player world's block channel is still always zero and the block-light pass
+// is still skipped outright; what changed is that a server-registered glowing block now
+// actually glows. Light stops at opaque cells
 // (solid and not transparent, the same predicate the mesher's occlusion table
 // uses), so air and leaves pass it and stone does not.
 //
@@ -156,8 +163,12 @@ bool  lightRelightColumnSweeps(World* w, int cx, int cz);
 int    lightColumnsAttached(void);
 size_t lightBytesUsed(void);   // budget bytes currently held by attached columns
 
-// Test hooks. The luminance table is all zeros in production — no block emits —
-// and these exist so the suite can prove the block channel end-to-end without
-// inventing a gameplay feature.
+// Test hooks. No block in the CORE registry declares a luminance — nothing emits in a
+// single-player world — and these exist so the suite can prove the block channel
+// end-to-end without inventing a gameplay feature.
+//
+// lightSetLuminanceForTest sets an OVERRIDE laid over whatever the registry declares.
+// Level 0 clears the override (the block falls back to its registry luminance, which for
+// every core row is 0); it does not force a declared emitter dark.
 void  lightSetLuminanceForTest(BlockId id, uint8_t level);
 void  lightSetSkyForTest(Column* col, int lx, int y, int lz, uint8_t level);

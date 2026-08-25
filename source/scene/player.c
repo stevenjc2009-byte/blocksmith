@@ -49,7 +49,15 @@ void playerUpdate(Player* p, const World* w, float dt_ms)
 	// and cannot be linked into the host suite, so a decision left here is a decision
 	// nothing checks. world_test.c's testPlayerWiresSwimming reads this file as text for
 	// exactly that reason.
-	const bool submerged = bodySubmerged(w, &p->body);
+	// v1.8.2 widened this from a bool to a three-state answer, because the vertical input
+	// needs to tell "head under" from "head out" and the horizontal one still does not
+	// care. The old boolean predicate is now a wrapper over this same call, so the walk
+	// speed below reads exactly as it did.
+	// bodyWetUpdate, not bodyWetState: the submerged boundary is hysteretic and the band
+	// is carried on the body, so the driven answer is the one the vertical input must see.
+	// bodyStep calls it again below and gets the same answer at the same position.
+	const BodyWet wet = bodyWetUpdate(w, &p->body);
+	const bool submerged = (wet != BODY_DRY);
 
 	// Step 8.4. The four directions come from the player's bindings rather than from KEY_DUP
 	// and friends directly. app/input_map.c answers with exactly those defaults until an
@@ -74,11 +82,13 @@ void playerUpdate(Player* p, const World* w, float dt_ms)
 	p->body.vx = ix;
 	p->body.vz = iz;
 
-	// Grounded single impulse on land, sustained rise in water. Both rules are in
-	// world/physics.c's bodyJump; this passes it the level and the edge and lets it
-	// decide, so the whole truth table is covered by the host suite.
+	// Grounded single impulse on land, sustained rise in water, hold-in-place at the
+	// surface. All three rules are in world/physics.c's bodyJump; this passes it the
+	// state, the level, the edge and the frame time and lets it decide, so the whole
+	// truth table is covered by the host suite. `dt` is the same clamped value bodyStep
+	// gets below — the water branch is a rate, so both halves must agree on the tick.
 	const u32 jump_bit = inputKey(ACTION_JUMP);
-	bodyJump(&p->body, submerged, (held & jump_bit) != 0, (hidKeysDown() & jump_bit) != 0);
+	bodyJump(&p->body, wet, (held & jump_bit) != 0, (hidKeysDown() & jump_bit) != 0, dt);
 
 	bodyStep(&p->body, w, dt);
 

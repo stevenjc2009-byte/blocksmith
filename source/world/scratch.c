@@ -32,6 +32,19 @@ void scratchFill(MeshScratch* s, const World* w, int cx, int cy, int cz)
 	// therefore meshes exactly what it meshed before this task — see SCRATCH_WATER_STEPS.
 	s->water_any = false;
 
+	// v1.8.2. Whether this neighbourhood holds ANY water, sources included — the gate that
+	// lets world/mesher.c's dropBuild shorten an ocean surface without scanning 5,832 cells
+	// on every waterless chunk in the world. See has_water in world/scratch.h for why
+	// water_any cannot answer it.
+	//
+	// Answered here because this is the one function that writes every cell of `blocks`, and
+	// it is answered per RUN rather than per cell: x is the contiguous axis, so a run is a
+	// flat byte range and memchr is one call for up to sixteen cells. The `!s->has_water`
+	// guard makes the whole sweep stop the moment the first water cell is seen, so the common
+	// waterless chunk pays 972 memchr calls over 5,832 bytes and a water chunk usually pays
+	// far fewer.
+	s->has_water = false;
+
 	for (int dy = -1; dy <= 1; dy++) {
 		const AxisSpan ay = axisSpan(dy);
 		const int ncy = cy + dy;
@@ -67,6 +80,12 @@ void scratchFill(MeshScratch* s, const World* w, int cx, int cy, int cz)
 							                           az.local_begin + j),
 							             ax.count, dst);
 						}
+
+						// See has_water above. After the write, never before it, and over
+						// exactly the bytes that were just written.
+						if (!s->has_water &&
+						    memchr(dst, (BlockId)BLOCK_WATER, (size_t)ax.count))
+							s->has_water = true;
 					}
 				}
 			}

@@ -174,8 +174,32 @@ static bool workerLoadColumn(int32_t cx, int32_t cz)
 static void workerWriteSave(int slot)
 {
 	const SaveSlot* s = &s_save[slot];
-	if (regionWriteColumn(s_world_dir, s->cx, s->cz, s->bytes, s->len)) s_saved++;
-	else                                                                s_save_failed++;
+	if (regionWriteColumn(s_world_dir, s->cx, s->cz, s->bytes, s->len)) {
+		s_saved++;
+
+		// v1.8.2. The region file's payload arena is append-only, so this save just orphaned
+		// the previous copy of this column and nothing used to give that space back:
+		// regionCompact() existed and had no caller in any shipped build, and a region file
+		// measured at 482,885 bytes on disk holding 19,452 bytes of live columns after 960
+		// saves — 95.9 % dead and still climbing. regionMaintain declines unless at least half
+		// the arena is dead, so this is two file probes and a directory read on twenty-six saves
+		// out of twenty-seven and a whole-file rewrite on the other one. That ratio is 960/36 —
+		// the measured run compacted 36 times across its 960 saves — and it is written with its
+		// derivation so it cannot drift away from the compaction count again: it read "sixteen
+		// out of seventeen" (960/56) while that count was the fixture-inflated 56. See region.h.
+		//
+		// Here rather than at world close on purpose. The worker is the background thread —
+		// measured ~94 % idle — so a rewrite costs the frame nothing, and it happens while the
+		// player is still playing rather than while they are trying to quit, which is the one
+		// moment a lid close or a battery pull is most likely. See region.h.
+		//
+		// Not verified on hardware: if an SD rewrite of a big region is slow enough, three
+		// column saves landing inside one would fill the two-slot ring above and make the main
+		// thread wait in workerSubmitSave. workerSaveWaits() is where that would show.
+		regionMaintain(s_world_dir, regionOf(s->cx), regionOf(s->cz));
+	} else {
+		s_save_failed++;
+	}
 
 	LightLock_Lock(&s_lock);
 	s_save_tail = (s_save_tail + 1) % SAVE_SLOTS;

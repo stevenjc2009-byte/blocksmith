@@ -131,7 +131,14 @@
 
 	mul r5, r3.xxxx, r4.xxxx
 	mov outclr.xyz, r5.xxx
-	mov outclr.w,   ones
+
+	; v1.8.2: the vertex alpha, straight out of the same table row. .w used to be written 1.0
+	; and never read; scene/chunk_render.c now fills it with 0.70 for every row whose drop is
+	; non-zero — which since WATER_SURFACE_DROP is water and nothing else — and 1.0 for the
+	; rest. Zero extra instructions: r3 was fetched at the top of main. Must match
+	; world_dynamic.v.pica exactly; world/atlas_uv_shader_test.c and world/water_alpha_test.c
+	; both parse this line out of BOTH files.
+	mov outclr.w,   r3.wwww
 
 	end
 .end

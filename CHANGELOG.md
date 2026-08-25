@@ -4,6 +4,110 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.8.2] - 2026-08-25
+
+Water was asked for again — four things in one go — and this is the release that answers all
+four. 1.8.0 made water move, but it moved *instantly*, filled its block edge to edge, was as
+opaque as stone, and juddered under you when you swam up to the top of it. The first three
+were wrong for the same reason: water that behaves like a solid reads like a solid. The
+fourth was a feedback loop at the waterline. From 1.8.2 water spreads at a pace you can
+watch, sits a little below the rim of its block, can be seen through, and holds you still
+when you surface in it.
+
+Worlds made in 1.8.1 open unchanged and no block id moved — see Compatibility.
+
+### Changed
+
+- **Water now spreads gradually instead of arriving all at once.** A flat pour that used to
+  finish in 9 ticks takes 41; a 7-block spread reaches its far edge at tick 34 rather than
+  tick 7. **The settled result is identical** — the same 112 flow cells in the same final
+  layout — so nothing about where water ends up has moved, only how long it takes to get
+  there. That distinction is the whole point of the change: a pour you cannot watch is a pour
+  that looks like a texture swap, and the equivalence of the end state is what makes it safe
+  to slow down.
+- **The water surface sits 7/8 of a block high rather than filling the block.** There is now a
+  visible lip where water meets land instead of the two meeting flush, which is what made a
+  shoreline read as a wall of blue blocks. Only the full and near-full levels move; the
+  shallower flow levels are unchanged, because they were already drawn below the rim and
+  lowering them again would have opened a gap under the surface.
+- **Water is see-through.** Alpha 0.70, drawn in a transparent pass rather than as an opaque
+  block, so a lake bottom, a submerged wall and anything you have built underwater are all
+  visible from above.
+- **The upward swim speed is now exactly 3.0 blocks/second, about 4.6% faster than 1.8.0's
+  2.867.** Written down rather than left to be noticed, because it is a real change to how the
+  game feels — but it is not a tuning decision. 3.0 was always the intended constant; the old
+  figure was gravity leaking into the clamped value every frame, so the fix is that the
+  intended constant is now the actual one and the speed change is its consequence. In the same
+  vein, dropping into water from a height now leaves you floating higher than it used to
+  rather than bouncing you back out of it.
+- **The texture atlas holds 64 block textures instead of 15**, which is room for many more
+  kinds of block than the game has ever had — twelve slots are in use today, one is
+  permanently reserved as the missing-texture marker, and 51 are free. The old ceiling was
+  never the sheet: `MeshVertex.v` held an atlas pixel row, and a `uint8_t` capped the sheet at
+  256 px, which is 16 slots with the top one's upper edge falling off the end. That byte now
+  counts slot edges rather than pixels, the `TILE_PX` factor moved into the shaders'
+  `uvScale.y`, and the sheet grew to 16x1024 — the vertex is still 8 bytes. **1024 is where
+  this stops**: it is the PICA200's maximum texture dimension, measured from citro3d 1.7.1's
+  `checkTexSize` rather than picked, so 64 slots is the most this one-tile-wide design can
+  ever have and not a step towards a larger sheet later.
+
+### Fixed
+
+- **Swimming up to the surface settles instead of bobbing.** Hold the swim button at the top
+  of a lake and you rise, stop, and float there with your head clearly out of the water —
+  0.485 blocks of it — rather than the camera juddering up and down through the waterline.
+  Vertical drift while floating is 0.000018 blocks, against 0.223333 before. Nothing about
+  swimming speed underwater or the rate you sink is different to the eye. The old behaviour
+  was not one broken rule but three correct ones meeting badly: a hard clamp on the upward
+  swim speed, a step change in gravity at the surface, and a submersion test with no middle
+  state, which together formed a relay. The first attempt at fixing it pulled the vertical
+  speed towards zero and looked better on the obvious measurement — travel down to 0.022027
+  blocks — while crossing the waterline **140 times in 399 frames** where the shipped fix
+  crosses it **zero** times, which is a strobing water plane rather than a bob and is worse.
+  What ships instead suspends gravity while the button is actively pulling, so the resting
+  point is a real fixed point with nothing re-establishing the error. Zero crossings holds at
+  60, 30 and 20 fps.
+- **Standing exactly on the seam between two chunks could blink a hole in the world.** Walk
+  across the boundary and a chunk that should have been in front of you was culled for a
+  moment — the terrain simply was not drawn, then came back. It is easiest to catch
+  underground, where a cave wall vanishes and you are looking into nothing. Only the frames
+  spent precisely on the seam were affected; nothing was wrong with the world itself or with
+  what was saved.
+- **The CIA has a banner chime again.** The Home Menu icon played nothing at all; it now plays
+  its own sound like every other title.
+
+### Compatibility
+
+- No save-format break, and no block id moved. `BLOCK_COUNT` is unchanged at 8, so a 1.8.2
+  client and a 1.8.1 server still agree on the block registry — none of the water changes
+  above is a block, a level or a wire field, only how the existing ones are stepped, drawn
+  and swum in.
+- **The water and tall-grass block ids are now pinned to literals** rather than derived from
+  their position in the registry. Both sit deliberately outside `BLOCK_COUNT`, and the old
+  form meant that adding one core block would have shifted them silently — a save-format break
+  with no compile error and no failing test in front of it.
+
+### Corrected
+
+- Several source comments describing water's old instant spread and its full-height surface
+  now say what the code actually does. They were accurate when they were written and stopped
+  being accurate in this release, which is exactly the kind of comment that gets believed
+  later.
+
+### Testing
+
+- The host suite is now about 5,100 world checks, and gained 90 checks covering the chunk-cull
+  boundary case above so the seam cannot regress unnoticed. The server suite is 236 checks.
+
+### Known limitations
+
+- **Tapping the swim button repeatedly at the surface still bobs you**, because letting go of
+  it restores gravity; holding it is what settles you. That is the intended behaviour rather
+  than a remnant of the bug above — the button holding you still is exactly what the button
+  is doing.
+- Every swimming figure quoted above is measured on the host test suite. None of it, and
+  nothing else in this release, has run on a real console.
+
 ## [1.8.1] - 2026-08-24
 
 Breaking a block takes time. Until now every block came out on the frame the button went down,

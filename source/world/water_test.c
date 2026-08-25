@@ -15,6 +15,13 @@
 //   testDrainage        - remove the source and every flow cell goes, in bounded time.
 //   testOrderIndependent- the same pour settled at four different per-tick budgets, and two
 //                         sources disturbed in both orders, all hash byte-identically.
+//   testSpreadRate      - v1.8.2. WHEN, not where: the pour walks out one block every
+//                         WATER_SPREAD_TICKS ticks instead of arriving all at once, and the
+//                         ticks it spends waiting are counted in gen_stalls rather than being
+//                         a silent throttle.
+//   testSpreadRateIsTicksNotBudget
+//                       - the two things WATER_TICK_BUDGET used to conflate are apart: the
+//                         budget can add ticks to a spread and can never remove any.
 //   testSettledIsFree   - a settled body examines zero cells per tick, for ever. This is the
 //                         property the whole design exists for on a 268 MHz ARM11.
 //   testChangeHook      - on_change fires once per BLOCK change and never for a level-only
@@ -298,6 +305,201 @@ static void testOrderIndependent(void)
 	       (unsigned long long)ha, (unsigned long long)hb);
 	CHECK(ha == hb, "two overlapping pours settle identically whichever is disturbed first");
 	CHECK(ha != hhuge, "control: two sources do not settle to the same world as one");
+}
+
+// ── The spread RATE ──────────────────────────────────────────────────────────────────
+//
+// v1.8.2. Everything above this line is about WHERE the water ends up; these two probes are the
+// only ones about WHEN, and they exist because the answer used to be "all of it, more or less at
+// once". water.c drained 64 candidates a tick with nothing separating one propagation hop from
+// the next, so the 225 examinations of a seven-block pour fitted in four ticks — 200 ms, with
+// the first three blocks inside the first 50 ms.
+//
+// The claim under test is the one WATER_SPREAD_TICKS makes: the ring at manhattan distance d
+// goes wet on tick (d-1) * WATER_SPREAD_TICKS and not before, so the pour walks outwards one
+// block every five ticks and takes 35 ticks to reach its full reach of seven.
+//
+// Measured in TICKS and not in milliseconds on purpose. waterTick is only ever called from
+// main.c's `ticks_now` loop off world/tick.h's 20 TPS clock, so a tick count is a wall-clock
+// duration on the console and a host measurement of seconds here would be a measurement of this
+// machine.
+
+// Every cell of the manhattan ring at distance d, in the pour plane, holds water.
+static bool ringWet(int d)
+{
+	for (int z = -d; z <= d; z++) {
+		const int x = d - (z < 0 ? -z : z);
+		if (waterLevelAt(&g_sim, &g_world, x, 64, z) == 0) return false;
+		if (x != 0 && waterLevelAt(&g_sim, &g_world, -x, 64, z) == 0) return false;
+	}
+	return true;
+}
+
+typedef struct {
+	int      ticks;          // ticks run before the ring emptied, or `cap`
+	int      first_wet[9];   // ticks run when the ring at distance d first went fully wet; 0 = never
+	uint32_t stalls;         // waterGenStalls over the run
+	uint32_t examined;
+} SpreadRun;
+
+// One flat pour, ticked by hand at `budget` so the tick count is the measurement rather than
+// something waterSettle decided.
+static SpreadRun spreadRun(int budget, int cap)
+{
+	SpreadRun r;
+	memset(&r, 0, sizeof r);
+
+	resetWorld();
+	buildFloor();
+	(void)worldSet(&g_world, 0, 64, 0, BLOCK_WATER);
+	waterNotify(&g_sim, 0, 64, 0);
+
+	for (int t = 0; t < cap; t++) {
+		if (waterPending(&g_sim) == 0) break;
+		(void)waterTick(&g_sim, &g_world, budget, NULL, NULL);
+		r.ticks = t + 1;
+		for (int d = 1; d <= 8; d++)
+			if (r.first_wet[d] == 0 && ringWet(d)) r.first_wet[d] = t + 1;
+	}
+
+	r.stalls   = waterGenStalls(&g_sim);
+	r.examined = waterExamined(&g_sim);
+	return r;
+}
+
+static void printSpreadRun(const char* label, const SpreadRun* r)
+{
+	printf("         %-14s settled %4d ticks, %5u examined, %5u stalls, first wet at d ="
+	       " 1:%d 2:%d 3:%d 4:%d 5:%d 6:%d 7:%d 8:%d\n",
+	       label, r->ticks, r->examined, r->stalls,
+	       r->first_wet[1], r->first_wet[2], r->first_wet[3], r->first_wet[4],
+	       r->first_wet[5], r->first_wet[6], r->first_wet[7], r->first_wet[8]);
+}
+
+static void testSpreadRate(void)
+{
+	puts("water: a pour walks outwards one block per WATER_SPREAD_TICKS ticks");
+
+	// The law, measured at a budget wide enough that no generation is ever cut in half by it.
+	// This arm is the barrier on its own, with the CPU cap taken out of the picture.
+	const SpreadRun wide = spreadRun(512, 4000);
+	printSpreadRun("budget 512", &wide);
+
+	// Controls first. Neither reads the barrier at all, so both stay green in every sabotage
+	// arm below — which is what makes the red ones evidence and not noise.
+	CHECK(waterFlowCells(&g_sim) == 112,
+	      "control: the settled pour is still 112 flow cells, whatever the rate was");
+	CHECK(worldGet(&g_world, 3, 63, 3) == (BlockId)BLOCK_STONE,
+	      "control: the floor under the pour is stone");
+
+	// The constant itself, pinned as a literal, and every claim below it stated BOTH ways.
+	// Found by sabotage, which is the only way it would have been found: with the checks
+	// written only as `first_wet[d] == (d-1) * WATER_SPREAD_TICKS + 1`, setting
+	// WATER_SPREAD_TICKS to 1 moved the code and the assertion together and the whole probe
+	// stayed green over a fluid that had gone back to spreading a block a tick. The symbolic
+	// form still earns its place — it is what goes red if the barrier logic breaks while the
+	// constant is untouched — but on its own it cannot see the constant move.
+	CHECK(WATER_SPREAD_TICKS == 5,
+	      "the shipped rate is one block per 5 ticks: 250 ms, Beta 1.7.3's Overworld water");
+
+	bool rate_ok = true;
+	for (int d = 1; d <= 7; d++)
+		if (wide.first_wet[d] != (d - 1) * WATER_SPREAD_TICKS + 1) rate_ok = false;
+	CHECK(rate_ok, "distance d goes wet on tick (d-1) * WATER_SPREAD_TICKS and not one tick sooner");
+
+	// Spelled out rather than left to the loop, because these are the numbers water.h quotes
+	// and the ones a wrong WATER_SPREAD_TICKS moves first and furthest.
+	CHECK(wide.first_wet[1] == 1, "distance 1 is wet after the very first tick");
+	CHECK(wide.first_wet[2] == 1 + WATER_SPREAD_TICKS,
+	      "distance 2 is still dry five ticks in and goes wet on the sixth");
+	CHECK(wide.first_wet[7] == 1 + 6 * WATER_SPREAD_TICKS,
+	      "distance 7 takes 31 ticks: a full spread is 1.55 s at 20 TPS, not 200 ms");
+	CHECK(wide.first_wet[8] == 0,
+	      "distance 8 is never wet: the reach is still seven blocks, the barrier did not widen it");
+
+	// The same law again as bare numbers, so that a change to WATER_SPREAD_TICKS has to come
+	// through here and be re-pinned deliberately instead of dragging the assertions with it.
+	CHECK(wide.first_wet[2] == 6 && wide.first_wet[7] == 31 && wide.ticks == 36,
+	      "in numbers: distance 2 on tick 6, distance 7 on tick 31, settled on tick 36");
+
+	// And the arm that is what the console actually runs. It is NOT the clean law above, and
+	// the difference is worth pinning rather than rounding off: the generations of a full-reach
+	// pour grow with the frontier, and from distance 5 outwards they are wider than
+	// WATER_TICK_BUDGET, so each of those three takes two ticks to drain instead of one. The
+	// pour reaches distance 7 on tick 34, not 31.
+	//
+	// That is the CPU cap doing its job, not the barrier failing. It can only ever make the
+	// spread slower — see testSpreadRateIsTicksNotBudget — and 34 ticks is 1.70 s against the
+	// 1.55 s of the law and the 0.20 s this all replaced. These numbers are MEASURED off a run
+	// and re-pinned by measurement if the budget or the rule ever moves; do not compute them.
+	const SpreadRun real = spreadRun(WATER_TICK_BUDGET, 4000);
+	printSpreadRun("budget 64", &real);
+
+	CHECK(real.first_wet[1] == 1 && real.first_wet[2] == 6 && real.first_wet[3] == 11 &&
+	      real.first_wet[4] == 16 && real.first_wet[5] == 22 && real.first_wet[6] == 28 &&
+	      real.first_wet[7] == 34,
+	      "at the shipping budget of 64 the pour goes wet at ticks 1, 6, 11, 16, 22, 28, 34");
+	CHECK(real.ticks == 41, "and the whole thing settles in 41 ticks rather than the old 9");
+
+	// The barrier really is what is holding it, and it says so rather than throttling silently.
+	CHECK(real.stalls > 0, "the held ticks are counted in gen_stalls rather than being invisible");
+	CHECK(real.stalls * 2 >= (uint32_t)real.ticks,
+	      "and most of the run is held ticks: waiting is what the pour now spends its time doing");
+	printf("         %u of %d ticks were held by the barrier\n", real.stalls, real.ticks);
+
+	// And it stops holding once there is nothing to hold. A counter that kept climbing over a
+	// settled lake would mean the cooldown was ticking for ever, which is the shape of bug
+	// testSettledIsFree exists for.
+	const uint32_t settled_stalls = waterGenStalls(&g_sim);
+	for (int t = 0; t < 1000; t++) (void)waterTick(&g_sim, &g_world, WATER_TICK_BUDGET, NULL, NULL);
+	CHECK(waterGenStalls(&g_sim) == settled_stalls,
+	      "1000 ticks over the settled pour add not one stall: the barrier is idle, not spinning");
+}
+
+static void testSpreadRateIsTicksNotBudget(void)
+{
+	puts("water: the spread rate is ticks, and the budget is only a CPU cap");
+
+	const SpreadRun r64  = spreadRun(WATER_TICK_BUDGET, 4000);
+	const SpreadRun r512 = spreadRun(512, 4000);
+	const SpreadRun r8   = spreadRun(8, 4000);
+	printSpreadRun("budget 64", &r64);
+	printSpreadRun("budget 512", &r512);
+	printSpreadRun("budget 8", &r8);
+
+	CHECK(r64.examined == r512.examined && r512.examined == r8.examined,
+	      "control: all three budgets examine exactly the same cells in the same order");
+
+	// The whole failing of the old code was that the budget WAS the rate: at 512 the pour
+	// finished inside one tick and at 8 it crawled, and 64 was simply the number that made
+	// "instant" come out as 200 ms. Now the generation decides when the next hop happens and the
+	// budget can only ever add ticks to it, never remove them. So the claim is a floor, not an
+	// equality — and the floor is the law testSpreadRate pins at budget 512.
+	CHECK(r512.first_wet[2] == 1 + WATER_SPREAD_TICKS &&
+	      r64.first_wet[2]  == 1 + WATER_SPREAD_TICKS &&
+	      r8.first_wet[2]   >= 1 + WATER_SPREAD_TICKS,
+	      "no budget gets water to distance 2 before tick 1 + WATER_SPREAD_TICKS");
+	CHECK(r64.first_wet[7] >= r512.first_wet[7] && r8.first_wet[7] >= r64.first_wet[7],
+	      "a budget too narrow to hold a generation is slower, never faster");
+	CHECK(r512.first_wet[7] == 1 + 6 * WATER_SPREAD_TICKS && r512.first_wet[7] == 31,
+	      "and 512 is wide enough to hold every generation, so it sits exactly on the law");
+
+	// Sixty-four is NOT wide enough, and the gap is small and real: three ticks over a whole
+	// pour. Measured, not derived — the frontier at distance 5 and beyond is wider than 64
+	// candidates, so those generations each cost a second tick.
+	printf("         distance 7 reached on tick %d at budget 512, %d at 64, %d at 8\n",
+	       r512.first_wet[7], r64.first_wet[7], r8.first_wet[7]);
+	CHECK(r64.first_wet[7] - r512.first_wet[7] == 3,
+	      "the 64-cell cap costs the full pour exactly three ticks against the law");
+	// The sensitivity control for the three comparisons above: they are only evidence if a
+	// budget can move a tick count at all. Written as a bare inequality on the SETTLE time and
+	// not as a ratio on first_wet, because a ratio is a claim about the rate as well as about
+	// the budget, and this one has to stay green whatever WATER_SPREAD_TICKS is set to.
+	CHECK(r8.ticks > r64.ticks && r64.ticks > r512.ticks,
+	      "control: a narrower budget really does cost ticks, so the comparison can see a budget");
+
+	CHECK(r8.first_wet[8] == 0 && r64.first_wet[8] == 0 && r512.first_wet[8] == 0,
+	      "control: no budget lets the pour past distance 7");
 }
 
 static void testSettledIsFree(void)
@@ -1106,6 +1308,8 @@ int main(void)
 	testWaterfall();
 	testDrainage();
 	testOrderIndependent();
+	testSpreadRate();
+	testSpreadRateIsTicksNotBudget();
 	testSettledIsFree();
 	testChangeHook();
 	testStaleEntry();

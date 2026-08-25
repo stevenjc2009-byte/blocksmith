@@ -303,6 +303,39 @@ static inline int chunkOfBlock(float block)
 
 // The N.V < 0 test. `face` is stepped through only when the camera is on its inner side, so
 // the walk can never move back toward the camera. Distances are in world blocks.
+//
+// The comparison is ASYMMETRIC on purpose: the low face is `>=` and the high face is strictly
+// `<`. That is not a taste choice, it is chunkOfBlock's interval convention written down. A
+// chunk owns the HALF-OPEN span [lo, hi) — floorf(x) >> 4 puts x == hi in the chunk east of
+// this one — and this test has to use the same span or it contradicts the function that
+// decided which chunk the camera is in.
+//
+// v1.8.2. Both comparisons used to be inclusive (`cam_x <= hi_x`, `cam_x >= lo_x`), and that
+// was wrong in a way that reached all the way up into scene/chunk_render.c's frame cache:
+//
+//   * At an exact boundary, cam_x == 16.0 say, BOTH x faces of chunk 0 led away. FACE_WEST of
+//     chunk 1 led away as well, so the walk could step west out of the camera's chunk into
+//     chunk 0 and then step straight back EAST into chunk 1 — toward the camera, which this
+//     test exists to forbid. The walk then reached strictly MORE chunks from x == 16.0 than
+//     from anywhere else in the same chunk. Measured on the hand-derived fixture in
+//     world/cavewalk_test.c: 5 chunks from x = 24.0, 6 from x = 16.0.
+//   * That extra reach was an UNDER-cull — a false positive, never a missed chunk. No straight
+//     sight line from a camera at x == 16.0 into anything east of x == 16.0 can pass through a
+//     chunk west of x == 16.0 first, because such a ray never has x < 16.0 at all. So the step
+//     the strict `<` removes is one no real line of sight can take, and removing it cannot lose
+//     a visible chunk. Nothing here has become more aggressive; a false reach has stopped.
+//   * The damage was done by the CACHE above it, not by the extra reach. chunk_render.c's
+//     caveWalk keys its frame cache on the camera's CHUNK, so walking from mid-chunk and then
+//     stepping onto the boundary is a cache hit — and the cached, smaller answer then culls a
+//     chunk that a fresh walk this frame would have kept. That is an OVER-cull, a hole in the
+//     world, which the header of this file forbids by name.
+//
+// With the half-open span, every case below reduces to a comparison of CHUNK indices and not
+// of positions: `cam_x < hi_x` is exactly `chunkOfBlock(cam_x) <= cx`, and `cam_x >= lo_x` is
+// exactly `chunkOfBlock(cam_x) >= cx`, because the camera's own x is confined to
+// [cam_cx * 16, cam_cx * 16 + 16). The float form is kept because it is the same instruction
+// count and it reads as the geometry it is; the point is that its ANSWER now depends on the
+// camera's chunk and nothing finer, which is precisely the property caveWalk's cache assumes.
 static bool faceLeadsAway(int face, int cx, int cy, int cz, float cam_x, float cam_y, float cam_z)
 {
 	const float lo_x = (float)(cx * CHUNK_DIM), hi_x = lo_x + (float)CHUNK_DIM;
@@ -310,11 +343,11 @@ static bool faceLeadsAway(int face, int cx, int cy, int cz, float cam_x, float c
 	const float lo_z = (float)(cz * CHUNK_DIM), hi_z = lo_z + (float)CHUNK_DIM;
 
 	switch (face) {
-	case FACE_EAST:   return cam_x <= hi_x;
+	case FACE_EAST:   return cam_x < hi_x;
 	case FACE_WEST:   return cam_x >= lo_x;
-	case FACE_TOP:    return cam_y <= hi_y;
+	case FACE_TOP:    return cam_y < hi_y;
 	case FACE_BOTTOM: return cam_y >= lo_y;
-	case FACE_SOUTH:  return cam_z <= hi_z;
+	case FACE_SOUTH:  return cam_z < hi_z;
 	case FACE_NORTH:  return cam_z >= lo_z;
 	default:          return false;
 	}

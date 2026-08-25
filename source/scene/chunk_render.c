@@ -726,6 +726,24 @@ static void pipelineBind(void)
 	// the moment another tile grows a hole.
 	C3D_AlphaTest(false, GPU_ALWAYS, 0);
 
+	// v1.8.2. The blend unit, and this call is NOT cosmetic tidying.
+	//
+	// Until now the world draw never configured blending at all, and exactly one place in the
+	// whole tree ever does: gfx/sprite.c's spriteBegin arms SRC_ALPHA / ONE_MINUS_SRC_ALPHA for
+	// the UI and nothing ever turns it off. citro3d keeps blend state in the persistent
+	// C3D_Context, so from the frame after the first UI batch the world has been drawing with
+	// the blend unit live — harmless only because every vertex alpha in the game was 255.
+	//
+	// The moment the transparent pass below starts writing 0.70 that stops being harmless in
+	// the other direction: whatever state the last UI batch happened to leave would decide
+	// whether water is see-through, and a frame-1 screenshot would not show it. So the opaque
+	// pass says ONE / ZERO explicitly — source colour, destination discarded, i.e. no blending
+	// — and the transparent pass turns real blending on for itself and puts this back. Every
+	// 3D pass drawn after the world (scene/highlight.c, scene/crackoverlay.c,
+	// scene/playermodel.c) writes alpha 255, so ONE / ZERO is what they were already getting
+	// in effect and none of them changes.
+	C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ZERO, GPU_ONE, GPU_ZERO);
+
 	// Fog, re-established per frame for the same reason everything else here is: this is
 	// global GPU state, not per-program state, and the moment a second pass touches it there
 	// is no owner. The gas mode argument is only read when the fog mode is GPU_GAS, and the
@@ -747,12 +765,21 @@ static void pipelineBind(void)
 	// (BLOCK_FACES is 6) but are filled anyway: an unwritten uniform holds whatever the last
 	// program left in that register, and a stray index would then move geometry by an
 	// arbitrary amount instead of by a wrong-but-bounded one.
+	//
+	// v1.8.2 adds the fourth component. .w used to be a constant 1.0 that neither shader read;
+	// both now do (`mov outclr.w, r3.wwww`), and it carries WATER_ALPHA for every row whose
+	// drop is non-zero. Since the surface floor landed, a non-zero drop belongs to water and to
+	// nothing else in the world (world/mesher.h), so this one number is the whole of the
+	// see-through surface — no extra vertex byte, no extra instruction, no extra register.
+	// meshNrmAlpha is called rather than restated so world/water_alpha_test.c can prove the
+	// rule against the real function instead of against a copy of it.
 	for (unsigned i = 0; i < MESH_NRM_STATES; i++) {
 		const unsigned face = meshNrmFace((uint8_t)i);
 		const unsigned drop = meshNrmDrop((uint8_t)i);
 		const float    s    = (face < BLOCK_FACES) ? kFaceShade[face] : 1.0f;
 		const float    dy   = -(float)drop / (float)SCRATCH_WATER_STEPS;
-		C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uloc_faceshade + (int)i, s, dy, s, 1.0f);
+		const float    a    = meshNrmAlpha((uint8_t)i);
+		C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uloc_faceshade + (int)i, s, dy, s, a);
 	}
 
 	// The dynamic shader's day-night multiplier. No cycle exists yet (v1.5.0 scope
@@ -1967,6 +1994,23 @@ void chunkRenderDraw(const C3D_Mtx* view)
 	s_alpha_tris = 0;
 	s_alpha_draws = 0;
 	C3D_AlphaTest(true, GPU_GREATER, ALPHA_CUTOFF);
+
+	// v1.8.2. Real blending, for this pass and this pass only — see the ONE / ZERO call in
+	// pipelineBind for why the state is owned explicitly at both ends rather than inherited.
+	//
+	// The alpha test stays exactly where it was: WATER_ALPHA (world/mesher.h) is 0.70, the TEV
+	// modulates alpha (C3D_Both, above), so water's fragment alpha is 255 * 0.70 = 178 and
+	// clears the 127 cutoff, while a leaf's cutout texel is 255 * 0 = 0 and is still discarded.
+	// That is the whole reason 0.70 was chosen over a lower number.
+	//
+	// Depth writes stay ON. Turning them off for water alone means splitting the transparent
+	// run three ways (leaves / water / the rest), a third offset in MeshOut and a third draw
+	// call per chunk. With writes on and GPU_GREATER, the depth test resolves overlap for us:
+	// the nearer surface takes the pixel whatever order the two were emitted in, so there is no
+	// double-blend and no order-dependent flicker. The cost is that you never see water THROUGH
+	// water — a deep sea is exactly as blue as a puddle — which is a fidelity limit, not a bug.
+	C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA,
+	               GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA);
 #if BS_DRAW_PROBE
 	// arms 3 and 5 have no transparent pass. Only the loop is cut, not the alpha-test pair
 	// around it: those two calls are render state rather than draws, and leaving them in
@@ -1990,6 +2034,13 @@ void chunkRenderDraw(const C3D_Mtx* view)
 	// Left off for whatever draws next. This is global GPU state, not per-program state,
 	// and the highlight pass in scene/highlight.c never sets it.
 	C3D_AlphaTest(false, GPU_ALWAYS, 0);
+
+	// And the blend unit back to "no blending", for the same reason and in the same breath.
+	// scene/highlight.c, scene/crackoverlay.c and scene/playermodel.c all draw after this and
+	// none of them configures blending; every one of them writes alpha 255, so this is what
+	// they were already getting in effect. gfx/sprite.c's spriteBegin arms its own blending for
+	// the UI, so the HUD is unaffected either way.
+	C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ZERO, GPU_ONE, GPU_ZERO);
 
 #if BS_DRAW_PROBE
 	watchdogDrawStage(WD_DRAW_DONE, -1, -1);

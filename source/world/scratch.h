@@ -33,6 +33,23 @@
 // (every host suite but the water one) renders exactly what it rendered before this task.
 #define SCRATCH_WATER_STEPS  8
 
+// v1.8.2. How far the top of an EXPOSED water surface is pulled below the cell boundary, in
+// the same eighths SCRATCH_WATER_STEPS counts. Every water cell with something other than
+// water above it is drawn at least this short, source or not, so the sea reads as a surface
+// sitting inside its cell rather than as a wall of blue cubes flush with the grass beside it.
+//
+// 1, i.e. 7/8 = 87.5%. That is Minecraft's own number and it is the nearest value the eighths
+// ladder can express to the "about ninety percent" this was asked for. The denominator is NOT
+// free to change: world/water.c static-asserts SCRATCH_WATER_STEPS == WATER_LEVEL_SOURCE, so
+// re-basing it to tenths would change what a flow LEVEL means to the simulation. Faking an
+// exact 90% by writing row 8's offset as -0.10f in scene/chunk_render.c was rejected for a
+// different reason: it makes the ladder uneven (90%, 75%, 62.5% — a 15% first step and 12.5%
+// after it), so a waterfall's steps would no longer be equal.
+//
+// A cell with water directly ABOVE it is untouched by this and stays full height — see
+// dropBuild in world/mesher.c, which is what keeps a falling column one solid shaft.
+#define WATER_SURFACE_DROP   1
+
 typedef struct {
 	BlockId blocks[SCRATCH_BLOCKS];
 	uint8_t light[SCRATCH_BLOCKS];   // sky<<4 | block; see scratchFillLight
@@ -44,6 +61,16 @@ typedef struct {
 	// nothing else. It is NOT "there is water in this chunk": a lake of sources leaves it
 	// false, because every one of those cells is a full cube already.
 	bool    water_any;
+
+	// Whether any cell of `blocks` is BLOCK_WATER at all — sources included. Set by
+	// scratchFill, which is the one place every cell of the scratch is written.
+	//
+	// water_any above cannot answer this and never could: it means "the band holds a FLOW
+	// level", and an ocean of sources holds none, so before v1.8.2 a pure sea never entered
+	// dropBuild's loop and could not be shortened. The alternative — deleting dropBuild's
+	// early return — would pay a 5,508-cell scan on every chunk in the world, and about 95%
+	// of them hold no water whatever.
+	bool    has_water;
 } MeshScratch;
 
 // sx/sy/sz are 0..17 — scratch space, where 0 is the border and 1..16 is the chunk.

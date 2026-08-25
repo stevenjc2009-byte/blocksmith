@@ -994,26 +994,49 @@ static void meshPass(MeshOut* out, const MeshScratch* s, const EmitCell* cells,
 //
 // The band's top plane is left at 0 because there is no cell above it to ask about, and nothing
 // in this chunk's geometry reads it — it is a skirt cell one block above the chunk's lid.
+//
+// ── v1.8.2: the surface floor ────────────────────────────────────────────────
+//
+// A third rule now sits over the two above: EVERY water cell with a non-water cell above it is
+// drawn at least WATER_SURFACE_DROP (world/scratch.h) short, whatever its level says. A source
+// has no entry in the simulation's side map at all — that is what makes an ocean free, see
+// world/water.h — so its band byte is 0 and its natural drop is 0, and until this task a sea
+// was a wall of full cubes flush with the grass beside it. It is now 7/8, which is what
+// Minecraft draws and what makes water read as a surface.
+//
+// The rule is a FLOOR, not an override: a level-3 trickle keeps its drop of 5. Only the cells
+// that would have come out taller than 7/8 move, which is levels 8 (source) and 7.
+//
+// The gate below is the reason this costs nothing on the rest of the map. water_any means "the
+// band holds a flow level", and a lake of sources holds none, so it alone would send a pure
+// ocean straight back out of this function with the change invisible. has_water means "some
+// cell in the scratch is BLOCK_WATER", which world/scratch.c answers while it is already
+// copying the blocks. Deleting the gate instead would pay the 5,508-cell scan below on every
+// chunk in the world, ~95% of which contain no water at all.
 static void dropBuild(const MeshScratch* s)
 {
 	s_any_drop = false;
-	if (!s->water_any) return;
+	if (!s->water_any && !s->has_water) return;
 
 	memset(s_cell_drop, 0, sizeof s_cell_drop);
 
 	const int above = SCRATCH_DIM * SCRATCH_DIM;
 	for (int i = 0; i < SCRATCH_BLOCKS - above; i++) {
-		const uint8_t lvl = s->water[i];
-		if (!lvl) continue;
-
-		// A level for a cell that is not water any more. The band is a snapshot and the world
-		// it describes can have moved on — waterDropColumn clears a column's flow cells, and a
-		// placed block can sit where one was — so the block array is the authority on what is
-		// there and the band only says how tall it is.
+		// The block array is the authority on what is there and the band only says how tall it
+		// is. The band is a snapshot and the world it describes can have moved on —
+		// waterDropColumn clears a column's flow cells, and a placed block can sit where one
+		// was — so a level for a cell that is not water any more is ignored.
+		//
+		// Asked BEFORE the band is read, which is the v1.8.2 inversion: a source's band byte is
+		// 0 and is indistinguishable from "not water", so the block test is now the thing that
+		// decides whether this cell is a water surface at all.
 		if (s->blocks[i] != (BlockId)BLOCK_WATER) continue;
 		if (s->blocks[i + above] == (BlockId)BLOCK_WATER) continue;
 
-		s_cell_drop[i] = (uint8_t)(SCRATCH_WATER_STEPS - lvl);
+		const uint8_t lvl = s->water[i];
+		const uint8_t nat = lvl ? (uint8_t)(SCRATCH_WATER_STEPS - lvl) : 0u;
+
+		s_cell_drop[i] = nat > WATER_SURFACE_DROP ? nat : (uint8_t)WATER_SURFACE_DROP;
 		s_any_drop = true;
 	}
 }

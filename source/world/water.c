@@ -385,12 +385,44 @@ void waterNotify(WaterSim* s, int x, int y, int z)
 	qPush(s, waterKey(x, y, z - 1));
 }
 
+// v1.8.2. The generation barrier, and the whole of it is the two blocks around the loop.
+//
+// The ring is FIFO and every push goes to the tail (qPush, above), so the entries waiting at the
+// instant a tick opens are exactly one propagation hop and everything they push is the next one.
+// Nothing used to separate the two: the loop just ran `budget` times, so a hop pushed by the cell
+// popped three slots ago was popped again in the same tick and a pour cascaded as deep as 64
+// examinations reached. Snapshotting qcount into gen_remaining is what draws the line, and
+// gen_cooldown is what keeps the next line WATER_SPREAD_TICKS away from this one.
+//
+// What it deliberately does NOT do is change the order cells come off the ring. A held tick pops
+// nothing at all, so the pop sequence is the same sequence it was before with idle ticks spliced
+// into it — which is why the settled world, the flow-cell count and the four order-independence
+// hashes in world/water_test.c are all unmoved, and why only the timing checks needed re-pinning.
 int waterTick(WaterSim* s, World* w, int budget, WaterChangeFn on_change, void* ud)
 {
+	if (s->gen_remaining <= 0) {
+		if (s->gen_cooldown > 0) {
+			s->gen_cooldown--;
+			// Only a stall when there was something to hold back. A cooldown running out over
+			// an empty ring is the simulation going idle, and counting that would bury the
+			// signal under the four idle ticks that follow every settled pour.
+			if (s->qcount > 0) s->gen_stalls++;
+			return 0;
+		}
+		s->gen_remaining = s->qcount;   // open the next generation: the ring as it stands
+		if (s->gen_remaining <= 0) return 0;
+	}
+
 	int changed = 0;
-	for (int n = 0; n < budget; n++) {
+	int n = 0;
+	for (; n < budget && s->gen_remaining > 0; n++) {
 		uint64_t key;
-		if (!qPop(s, &key)) break;
+		// Defensive, and it has to set the counter rather than just break: qcount can only
+		// grow while a generation is open, so an empty ring here is impossible — but if it ever
+		// happened, a gen_remaining left above zero would make every later tick skip the
+		// cooldown block and the barrier would be gone for the rest of the session.
+		if (!qPop(s, &key)) { s->gen_remaining = 0; break; }
+		s->gen_remaining--;
 
 		int x, y, z;
 		waterUnkey(key, &x, &y, &z);
@@ -418,6 +450,16 @@ int waterTick(WaterSim* s, World* w, int budget, WaterChangeFn on_change, void* 
 				s->level_fn(s->level_ud, x, y, z, (BlockId)BLOCK_WATER);
 		}
 	}
+
+	// The generation is spent, so the next one is due WATER_SPREAD_TICKS after THIS tick — and
+	// this tick is the first of the five, which is why it is minus one. Measured, not reasoned:
+	// without the minus one the period is six ticks, and the pour reaches distance 7 on tick 37
+	// instead of 31. water_test.c's testSpreadRate pins both numbers as bare literals so the
+	// off-by-one cannot come back quietly.
+	if (s->gen_remaining <= 0) {
+		s->gen_cooldown = WATER_SPREAD_TICKS - 1;
+		if (n < budget && s->qcount > 0) s->gen_stalls++;
+	}
 	return changed;
 }
 
@@ -437,6 +479,7 @@ uint32_t waterMapFull(const WaterSim* s)   { return s->map_full; }
 uint32_t waterQueueFull(const WaterSim* s) { return s->q_full; }
 uint32_t waterExamined(const WaterSim* s)  { return s->examined; }
 uint32_t waterChanged(const WaterSim* s)   { return s->changed; }
+uint32_t waterGenStalls(const WaterSim* s) { return s->gen_stalls; }
 
 int waterDropColumn(WaterSim* s, World* w, int cx, int cz)
 {

@@ -1,0 +1,23 @@
+# Release notes shown on the 3DS top screen before the update downloads.
+# Attach this to the v1.8.2 GitHub release alongside blocksmith1.8.2.cia.
+# Checked with: sh tools/make_whatsnew.sh 1.8.2
+#
+# v1.8.2 ONLY. This release is the water rework - how it spreads, how tall it sits,
+# seeing through it, and swimming to the surface. Nothing else is claimed here.
+# The bigger texture atlas is deliberately NOT here: no new block uses it yet, so
+# there is nothing a player can see or do differently for it.
+# Player-facing prose only - it wraps at 61 characters on a 400px screen.
+# Items are capped at 95 characters each by source/app/whatsnew.h.
+# The developer-facing story lives in CHANGELOG.md.
+
+[features]
+Water spreads a bit at a time now. Pour it out and you can watch it find its way.
+It ends up in the same place as before, it just takes longer to get there.
+Water sits a little below the top of its block, so there is a lip where it meets land.
+You can see through water. Look down into a lake and the bottom is there.
+Swimming up to the surface settles now instead of bobbing. Hold the button to float.
+
+[fixes]
+Standing right on the line between two areas could blink a hole in the world.
+That was easiest to catch underground, where a cave wall would vanish for a moment.
+The icon on the Home Menu plays its sound now instead of sitting there silent.

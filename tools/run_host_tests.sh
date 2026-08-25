@@ -203,10 +203,16 @@
 # `got` and the memcmp passed on the old answer — one red line where there should have been
 # two. The memset above it is what makes the second check able to go red, and it does.
 #
-# regionCompact is still not wired to anything, on the evidence rather than despite it. See
-# the header comment in source/world/region.h: the remove-before-rename window depends on the
-# .tmp being durable on the card, nothing in region.c fsyncs, and neither that nor rename() on
-# libctru's sdmc devoptab can be tested from this suite. Every number above is a host number.
+# CORRECTED IN v1.8.2, and corrected in place rather than deleted so the reversal stays
+# readable. What stood here through v1.7.1 and v1.8.1 was "regionCompact is still not wired to
+# anything, on the evidence rather than despite it": the remove-before-rename window depended
+# on the .tmp being durable on the card, nothing in region.c fsyncs, and neither that nor
+# rename() on libctru's sdmc devoptab could be tested from this suite. v1.8.2 closed that
+# window instead of accepting it — the swap now renames the old .bsr aside to .bak first and
+# removes it last — and wired the call in through regionMaintain(), called from app/worker.c's
+# workerWriteSave. So regionCompact HAS a caller now, and source/world/region.h's header says
+# the same. What that cost and what still cannot be measured from a host is in the
+# region_growth_test stanza at the bottom of this file. Every number above is a host number.
 #
 # Usage, from the project root:  sh tools/run_host_tests.sh
 set -e
@@ -1455,6 +1461,16 @@ rm -rf "$BHN"
 #    REGRESSION GUARD (new min < ref min * 1.15), not a speedup. It is not a speedup claim
 #    dressed down; the host genuinely cannot see this one.
 #
+#    v1.8.2 made that one guard OPT-IN, and only that one -- the 105,573 equivalence checks in
+#    the same binary are untouched and still hard. It measures wall clock, so it is the only
+#    check in this whole file whose answer depends on what ELSE the machine is doing, and it
+#    failed once during a full-suite run with several parallel builds in flight, then passed
+#    3/3 standalone. It still RUNS and still PRINTS its ratio against the ceiling on every run
+#    -- read the "guard" line in the noise A/B output -- but it only fails the suite when
+#    BS_NOISE_BENCH_STRICT=1 is in the environment. Widening 1.15 was rejected: see the comment
+#    at the check itself in source/world/noise_ab_test.c for why that trades a flake for a
+#    blind spot. Set the variable when benchmarking; leave it unset in this script.
+#
 #    Bit-identity is proved two ways: 105,574 checks comparing old against new across the
 #    normalise input range and 20,000 random noise samples, and the load harness's whole-
 #    world hash over every loaded chunk's decompressed cells, unchanged across the change at
@@ -1600,9 +1616,17 @@ rm -rf "$BHW"
 # exactly one quad on the plane between them spanning the floor to the TALLER surface -- the
 # level-boundary hole is the failure this task was most likely to ship -- that a greedy run stops
 # where the height changes while cells at one level still merge, that waterFillScratch agrees
-# with waterLevelAt over the whole 18-cube window, and that a world of SOURCES and a world of
-# ordinary terrain still mesh byte-identically to v1.7.1 with the band switched on. That last one
-# is the control, and it is the check that must stay green while any of the others is sabotaged.
+# with waterLevelAt over the whole 18-cube window, and -- the control -- that a world of
+# ordinary terrain still meshes byte-identically to v1.7.1 with the band switched on, pinned at
+# faces=88 hash=0x9f47e02f. That terrain pin is the check that must stay green while any of the
+# others is sabotaged.
+#
+# CORRECTED IN v1.8.2. This paragraph used to claim the SOURCES world was pinned byte-identical
+# to v1.7.1 as well, and it is not, deliberately: ask 2 dropped the water surface to 7/8 of a
+# block so a source with sky above it no longer sits flush with the block beside it. That was a
+# requested change, not a regression, so testSourceUnchanged asserts the NEW height rather than
+# the v1.7.1 bytes. Only the terrain world is still pinned to v1.7.1. Do not "restore" the
+# sources pin -- re-flattening the surface is the thing this suite now exists to catch.
 BHWM="build-host/run-$$-watermesh"
 mkdir -p "$BHWM"
 
@@ -1690,3 +1714,595 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 "./$BHMN/mining_test"
 
 rm -rf "$BHMN"
+
+# cavewalk_test: the cave cull's per-frame ORCHESTRATOR -- source/scene/chunk_render.c's
+# caveWalk(). The algorithm underneath it (world/visgraph.c) has had coverage in world_test.c
+# since Phase 7; caveWalk itself had none, and it is the half that decides which chunks the
+# algorithm is told about, how big a box to run it over, whether to re-run it, and whether the
+# renderer may trust the answer at all. Three of those fail toward OVER-culling, which
+# world/visgraph.h calls out in bold as a hole in the world rather than a missed optimisation.
+#
+# Extracted, not hand-copied, exactly like horizon_test above and for the same reason:
+# chunk_render.c includes <3ds.h> and <citro3d.h> and cannot be compiled on the host, and a
+# hand-copied function is the "a test that links nothing tests nothing" failure this project
+# has already paid for twice. The awk below lifts three statics out by their signature lines --
+# cullInvalidate, chunkOfFloat, caveWalk -- in file order, which is also the order they have to
+# be defined in. The trailing #define is the anchor's own receipt: it is printed only when the
+# caveWalk range both STARTED and CLOSED, and source/world/cavewalk_test.c has an #error on it.
+# Break an anchor and the build stops at compile time naming the lost anchor; there is no
+# fallback copy in the test to quietly pass against.
+#
+# Proof that it really is the extracted function and not a copy, measured: with the caveWalk
+# anchor changed to match a name that does not exist, the compile fails with
+#   error: #error "cavewalk_extract.inc did not carry caveWalk() out of source/scene/chunk_render.c"
+# and, with that #error stubbed out to expose the underlying dependency,
+#   error: implicit declaration of function 'caveWalk'
+# Nothing named caveWalk exists in the test file itself.
+#
+# world/visgraph.c is NOT extracted -- it is host-clean and is linked for real, so the walk the
+# checks observe is the walk the console runs. block/registry/chunk/budget are along only
+# because visChunkConnectivity (which this suite never calls) references them; -lm for floorf.
+#
+# What each family guards is written at the top of source/world/cavewalk_test.c. Green arm,
+# before and after every arm below: "PASS 90 checks, 0 failed", exit 0.
+#
+# READ THE TOTALS WITH THEIR DATE. Arms A-E below were measured when this suite was 81 checks
+# and their "of 81" denominators are left as they were measured rather than rescaled, because
+# a denominator nobody re-ran is a fabricated number. v1.8.2 took the suite to 90: the cache-
+# key family was rewritten (see arm F, and testCacheKeyIsSound in the test file). The failure
+# COUNTS in arms A-E are still the counts those sabotages produced; only the total moved.
+#
+# Sabotaged and measured. Arms A-E mutate the EXTRACT -- byte-for-byte the text awk lifted out
+# of chunk_render.c seconds earlier, so it is that function's code that goes wrong -- because a
+# parallel session owned chunk_render.c while this was written and editing it would have
+# clobbered their work. Arms F-G mutate the REAL source/world/visgraph.c on disk, restored
+# afterwards and confirmed byte-identical by md5 (back to f065bc84cc09efcb6aaabdd224260ff6);
+# chunk_render.c was never written to at all (d89f6c0a007494e60ed3ac34b4dbb942 throughout).
+#
+#  * A. chunkOfFloat's floorf replaced by a truncating cast -> "FAILED - 6 of 81 checks":
+#    the four negative-coordinate cases (L251-L255), the 2,049-position sweep against
+#    visgraph's chunkOfBlock (L273), and "and the key is chunk -1, not chunk 0" (L522) -- the
+#    cache failing to notice the player stepping west out of the origin chunk. Every positive
+#    coordinate stays GREEN, which is what says these discriminate the sign and not the maths.
+#  * B. the "used" test deleted from the box loop -> "FAILED - 7 of 81 checks":
+#    L329/L330 (a released slot's stale coordinate blows the box past VIS_BOX_MAX_XZ and the
+#    whole cull switches itself off), the three empty-pool refusal checks (L356-L358, an
+#    unused slot now counts as content), and L703. The cull's correct answers on a clean pool
+#    all stay GREEN -- the bug is invisible until the pool has been released from.
+#  * C. the empty-pool early return made to set s_cave_ran first -> "FAILED - 1 of 81 checks",
+#    L356 alone. One check, one line, nothing else disturbed: the narrowest arm here, and the
+#    one that proves the refusal family is not just riding on the others.
+#  * D. visWalkSet's drawable argument forced from the index_count test to a literal true ->
+#    "FAILED - 1 of 81 checks", L422 "the empty chunk is reached but not drawable, so it is
+#    not 'visible'". The mask half of the same insert stays GREEN, which separates "fed in at
+#    all" from "fed in with the right drawable flag".
+#  * E. the trailing cache validation deleted -> "FAILED - 13 of 81 checks", first L385, then
+#    every cache-hit and re-run count (L490-L509 and on). The walk still computes the right
+#    answer everywhere -- only its rate is wrong -- so the whole cull-correctness half of the
+#    suite stays GREEN and it is the counting checks that go red.
+#  * F. visgraph.c's faceLeadsAway FACE_EAST case made strict, its <= turned into < ->
+#    "FAILED - 4 of 90 checks", L643, L644, L687 and L705, i.e. the cache-key family and
+#    nothing else in the file. That family is the one covering the property caveWalk's frame
+#    cache bets on: the cache is keyed on the camera's CHUNK, so the walk's answer must not
+#    depend on where inside that chunk the camera stands. Read the note on
+#    testCacheKeyIsSound (source/world/cavewalk_test.c:537) before touching a red here,
+#    because this arm is what proves the family is about that comparison. The name matters:
+#    through v1.8.1 this family was testCacheKeyIsUnsound, written to PIN a property that was
+#    false; v1.8.2 made it true and renamed the family. Nothing called testCacheKeyIsUnsound
+#    exists any more, so an older note pointing at it points at nothing.
+#  * G. visWalkBegin's mask prefill changed from 0xFF to 0x00, so an unmeshed coordinate reads
+#    as a WALL -> "FAILED - 1 of 81 checks", L468. This arm is why testHolesAreSeeThrough
+#    exists: on the first pass it came back "PASS 77 checks, 0 failed", because every other
+#    fixture in the file fills its box completely and the unmeshed sky -- the case
+#    visgraph.h's header warns about by name -- was never in one.
+#
+# The controls that stayed green in EVERY arm, red ones included: "control: CHUNK_DIM is still
+# 16", "control: the pool sentinels are intact after the widest legal box", "control:
+# cullInvalidate drops the frustum cache too", "control: it blocks sight either way, so the
+# mask reached the walk both times", "control: a hole the sealed chunk hides is still culled",
+# "control: the sentinels survived the determinism runs", "control: the sentinels are intact
+# after the far-negative box", "control: a coordinate outside the box answers visible",
+# "control: visPairIndex numbers all 15 face pairs uniquely and symmetrically" and "control:
+# the 'assume the worst' sentinel is still all-bits-set".
+BCW="build-host/run-$$-cavewalk"
+mkdir -p "$BCW"
+
+awk '
+/^static void cullInvalidate\(void\)$/ { inf=1 }
+/^static int chunkOfFloat\(float v\)$/ { inf=1 }
+/^static void caveWalk\(void\)$/       { inf=1; saw=1 }
+inf { print; if ($0 == "}") { if (saw) done=1; inf=0 } }
+END { if (saw && done) print "#define BS_CAVEWALK_EXTRACT_OK 1" }
+' source/scene/chunk_render.c > "$BCW/cavewalk_extract.inc"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source -I "$BCW" \
+	source/world/visgraph.c \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/budget.c \
+	source/world/cavewalk_test.c \
+	-lm \
+	-o "$BCW/cavewalk_test"
+
+"./$BCW/cavewalk_test"
+
+rm -rf "$BCW"
+
+# The CIA banner chime (roadmap task 44).
+#
+# tools/make_banner_audio.py synthesises the track the 3DS Home Menu plays out of the CIA
+# banner, replacing the 0.1 s of printf'd silence tools/make_cia.sh used to hand bannertool.
+# It is checked here rather than by ear because most of its failure modes are silent ones: a
+# wrong sample rate still plays (at the wrong speed), a non-zero last sample still plays
+# (with a click every time the Home Menu wraps), a drifting generator still produces a file
+# (a different one every build, so a release stops being reproducible), and a chime whose
+# tone has been lost still produces a perfectly well-formed WAV -- of four clicks.
+#
+# That last one is why the pitch arm exists. Without it this suite passed a file with every
+# harmonic set to zero: the noise transients alone normalise to -3 dBFS and satisfy every
+# header and endpoint check. A Goertzel at each note's own frequency, against a control
+# 3 semitones below it, is what makes "there is a tune in here" a claim that can go red.
+#
+# What CANNOT be checked here, stated so the gap is not found later: whether it sounds
+# right, and whether the Home Menu plays it at all. Azahar has no 3DS Home Menu, so a banner
+# track never plays there. That one is hardware, and it is steve's.
+#
+# The determinism arm compares two fresh runs rather than a hardcoded hash, on purpose: the
+# tune is an open decision (t44 blueprint 6.3) and a baked-in md5 would go red for a
+# deliberate edit instead of for a bug. For the record, the current figure hashes to
+# 37c42dfc9bd9b14050151dff4a3ed80f identically under Windows CPython 3.13.14 and WSL CPython
+# 3.14.4 -- two different libm implementations, the same 70604 bytes.
+#
+# Sabotaged in the real generator and measured, each arm restored afterwards and the restore
+# confirmed by md5 (make_banner_audio.py back to 48074164e6f9faa9dd8472fea946924a every
+# time). Green arm before and after the whole run: "PASS 12 checks, 0 failed", exit 0.
+#
+#  * RATE 22050 -> 16000 -> "FAIL 12 checks, 1 failed", "sample rate is 22050 Hz (got
+#    16000)". Note what stays GREEN, because it is a real limit of this suite: the duration
+#    check does NOT go red, since frames scale with the rate and 1.6 s stays 1.6 s. It can
+#    only ever catch a change to DURATION_S.
+#  * END_FADE_S 0.030 -> 0.0 -> "FAIL 12 checks, 1 failed", "last sample is 0 (no click at
+#    the loop point), got 20". Small, because the final note has decayed a long way by
+#    1.6 s -- but 20 is still a step to zero, and an uncompressed banner track has nothing
+#    to hide it behind.
+#  * the LCG swapped for an unseeded random.randrange -> "FAIL 12 checks, 1 failed",
+#    "two runs are byte-identical (got 70604 and 70604 bytes)". Same length, different
+#    contents: every header, endpoint and pitch check stays GREEN.
+#  * PEAK_DBFS -3.0 -> -6.0 -> "FAIL 12 checks, 1 failed", "peak normalised to -3 dBFS (got
+#    -6.00 dBFS, 16422 of 32767)".
+#  * HARMONICS reduced to ((1, 0.0),), i.e. the tone deleted and only the noise strikes left
+#    -> "FAIL 12 checks, 4 failed", one per note, first "note at +0 semitones rings at
+#    220.00 Hz, not at a control 3 semitones below it (ratio 0.70, want > 4)". Every header
+#    and endpoint check stays GREEN -- this is the arm the suite used to pass.
+#  * DEGREES (0, 7, 12, 4) -> (0, 5, 12, 4), one note moved a whole tone -> "FAIL 12 checks,
+#    1 failed", the +7 note only. The other three notes stay GREEN, which is what says the
+#    pitch arm discriminates one note rather than collapsing the fixture.
+PY_CHIME="$(command -v python3 || command -v python || true)"
+if [ -z "$PY_CHIME" ]; then
+	echo "banner chime: SKIPPED - no python3/python on PATH. This is a GAP, not a pass:"
+	echo "  tools/make_banner_audio.py was not run, so the .wav make_cia.sh feeds bannertool is unchecked."
+else
+	BHCH="build-host/run-$$-chime"
+	mkdir -p "$BHCH"
+
+	"$PY_CHIME" tools/make_banner_audio.py "$BHCH/a.wav" > /dev/null
+	"$PY_CHIME" tools/make_banner_audio.py "$BHCH/b.wav" > /dev/null
+
+	"$PY_CHIME" - "$BHCH/a.wav" "$BHCH/b.wav" <<'CHIME_PY'
+import math
+import struct
+import sys
+import wave
+
+a, b = sys.argv[1], sys.argv[2]
+checks = 0
+failed = 0
+
+
+def check(ok, what):
+    global checks, failed
+    checks += 1
+    if not ok:
+        failed += 1
+        print("banner chime: FAILED - %s" % what)
+
+
+with open(a, "rb") as fa, open(b, "rb") as fb:
+    ba, bb = fa.read(), fb.read()
+check(ba == bb, "two runs are byte-identical (got %d and %d bytes)" % (len(ba), len(bb)))
+
+with wave.open(a, "rb") as w:
+    rate, ch, width, frames = w.getframerate(), w.getnchannels(), w.getsampwidth(), w.getnframes()
+    data = w.readframes(frames)
+
+check(rate == 22050, "sample rate is 22050 Hz (got %d)" % rate)
+check(ch == 1, "mono (got %d channels)" % ch)
+check(width == 2, "16-bit (got %d-bit)" % (width * 8))
+check(abs(frames / rate - 1.6) < 1e-6, "1.6000 s long (got %.4f s)" % (frames / rate))
+
+samples = struct.unpack("<%dh" % frames, data)
+check(samples[0] == 0, "first sample is 0 (no click on start), got %d" % samples[0])
+check(samples[-1] == 0, "last sample is 0 (no click at the loop point), got %d" % samples[-1])
+
+peak = max(abs(s) for s in samples)
+db = -999.0 if peak == 0 else 20.0 * math.log10(peak / 32767.0)
+check(abs(db + 3.0) < 0.05, "peak normalised to -3 dBFS (got %.2f dBFS, %d of 32767)" % (db, peak))
+
+
+def goertzel(sig, f):
+    """Magnitude of one frequency bin. Standard library only, like the generator."""
+    k = 2.0 * math.cos(2.0 * math.pi * f / rate)
+    q1 = q2 = 0.0
+    for x in sig:
+        q0 = k * q1 - q2 + x
+        q2, q1 = q1, q0
+    return math.sqrt(abs(q1 * q1 + q2 * q2 - k * q1 * q2)) / len(sig)
+
+
+# Each note, measured in its own 100 ms window starting 8 ms after its onset (past the
+# attack, before the next onset at +160 ms). The control is 3 semitones below the note: not
+# a partial of anything else playing, so it reads the noise floor rather than the tune.
+# Measured margins on the current figure: 11.95, 17.42, 70.32, 13.92 against a threshold of 4.
+ROOT_HZ = 220.0
+for degree, onset in zip((0, 7, 12, 4), (0.00, 0.16, 0.32, 0.48)):
+    f = ROOT_HZ * 2.0 ** (degree / 12.0)
+    lo = int((onset + 0.008) * rate)
+    win = samples[lo:lo + int(0.10 * rate)]
+    here = goertzel(win, f)
+    ctrl = goertzel(win, f * 2.0 ** (-3.0 / 12.0))
+    ratio = here / ctrl if ctrl > 0 else float("inf")
+    check(ratio > 4.0, "note at +%d semitones rings at %.2f Hz, not at a control 3 semitones "
+                       "below it (ratio %.2f, want > 4)" % (degree, f, ratio))
+
+if failed:
+    print("banner chime: FAIL %d checks, %d failed" % (checks, failed))
+    sys.exit(1)
+print("banner chime: PASS %d checks, 0 failed" % checks)
+CHIME_PY
+
+	rm -rf "$BHCH"
+fi
+
+# world/water_alpha_test.c -- SEE-THROUGH water (v1.8.2, blueprint ask 4). Own binary, own
+# main(), appended rather than merged into the water-mesh stanza above it for the reason every
+# stanza in this file is appended: an append is the one edit shape that cannot drop another
+# session's work, and this file is shared.
+#
+# Separate from water_mesh_test.c on purpose, and the split is the same one that suite already
+# makes against water_test.c: water_test owns where the water GOES, water_mesh_test owns the
+# SHAPE the mesher gives it, and this one owns what colour comes out the other end. The link
+# sets differ -- this binary links nothing but block.c, registry.c and a header -- and a failure
+# in one must not be able to hide behind another's totals.
+#
+# What it settles, none of which is geometry and none of which can fail loudly on its own:
+#
+#   * meshNrmAlpha (world/mesher.h) gives 1.0 to the eight faceShade rows at drop 0 and
+#     WATER_ALPHA to the 56 rows above them. The REAL function is linked, not a copy of it --
+#     WATER_ALPHA lives in that header precisely because scene/chunk_render.c includes <3ds.h>
+#     and no host test can link it -- and the renderer is then checked BY TEXT to call
+#     meshNrmAlpha rather than to carry its own copy of the ternary. Without that second half
+#     this suite would be proving things about dead code, the exact defect recorded against
+#     app/battery.c and app/sleep.c further up this file.
+#   * 0.70 clears the alpha TEST, with ALPHA_CUTOFF parsed out of scene/chunk_render.c rather
+#     than restated. This is the check that matters most in practice: an alpha under the cutoff
+#     does not make water faint, it makes water VANISH and the seabed show through a hole. A
+#     leaf's cutout texel (tex.a 0) is asserted to still be discarded, as the control.
+#   * BOTH source/shaders/world.v.pica and world_dynamic.v.pica read the alpha out of the same
+#     table row (`mov outclr.w, r3.wwww`) and neither still nails it to 1.0. world_dynamic is
+#     the program actually bound on both console models since the v1.8.0 shader split, and
+#     world.v.pica is compiled and never bound, so an edit to only one of them is invisible both
+#     on the hardware and to the next person reading the file. Same drift world/
+#     atlas_uv_shader_test.c guards uvScale against, and each file's uvScale literal is
+#     re-checked here as a control.
+#   * scene/chunk_render.c owns the blend unit at BOTH ends -- ONE/ZERO armed in pipelineBind
+#     for the opaque pass, SRC_ALPHA/ONE_MINUS_SRC_ALPHA armed inside the transparent pass and
+#     put back to ONE/ZERO after it. Before v1.8.2 the world draw never called C3D_AlphaBlend at
+#     all and gfx/sprite.c's spriteBegin was the only caller in the tree, so the world had been
+#     drawing with whatever the last HUD batch left standing in citro3d's persistent context --
+#     harmless only while every vertex alpha in the game was 255. The ordering (armed after the
+#     alpha test, restored before scene/highlight.c and scene/crackoverlay.c draw) is asserted
+#     by line number, not just by presence.
+#
+# Sabotaged in the REAL production sources, each restored afterwards and every restore verified
+# byte-identical by md5. Every FAIL line of every red run was read, not just the first:
+#
+#   * WATER_ALPHA 0.70f -> 0.40f in source/world/mesher.h:140 -> "FAILED - 1 of 34 checks",
+#     "FAIL L237  water is 102 > 127, so the surface DRAWS (under it, water vanishes entirely)".
+#     Everything else stays GREEN, including all 64 table rows -- which is the point: the table
+#     is perfectly self-consistent at 0.40 and the water is invisible anyway. That one check is
+#     the only thing standing between a plausible-looking constant and a sea you fall into.
+#   * `mov outclr.w, r3.wwww` reverted to `mov outclr.w, ones` in world_dynamic.v.pica ONLY ->
+#     "FAILED - 3 of 34 checks", first "FAIL L261  source/shaders/world_dynamic.v.pica writes
+#     the vertex alpha from the table exactly once (found 0)". world.v.pica's three checks stay
+#     green, which is the whole reason this test reads both files.
+#   * the transparent pass's C3D_AlphaBlend deleted from scene/chunk_render.c -> "FAILED - 2 of
+#     34 checks", "FAIL L307  three C3D_AlphaBlend calls: two ONE/ZERO and one SRC_ALPHA (got 2,
+#     2, 0)". The table half stays green: nothing about the uniform changed, the GPU simply
+#     never blends it.
+#
+# Controls green in EVERY arm, red ones included: "control: a leaf's cutout texel is 0 and is
+# still discarded", both files' "control: ... uvScale literal is untouched", and "control:
+# gfx/sprite.c still sets SRC_ALPHA blending for its own batch".
+#
+# ── The other half of v1.8.2, which lands in the water_mesh_test.c stanza above ──────────────
+#
+# Ask 2 (the recessed surface) had to ship in the same change as ask 4 and its checks went into
+# world/water_mesh_test.c rather than here, so its numbers are recorded here to keep them with
+# their sibling: 44 checks -> 69, three new probes (testOceanSurfaceIsShort,
+# testOceanSurfaceStillMerges, testNoGapAtTheColumn, plus testScratchFillFlagsWater on the real
+# scratchFill). Two arms, both against real production source:
+#
+#   * dropBuild's surface floor reverted to `s_cell_drop[i] = nat;` in world/mesher.c:1039 ->
+#     "FAILED - 10 of 63 checks", first "FAIL   line 267: a source with sky above it is drawn
+#     7/8 tall, not flush with the block beside it".
+#   * the has_water half of dropBuild's gate deleted (`if (!s->water_any) return;`) ->
+#     "FAILED - 6 of 63 checks". The staircase probes stay green at faces=47 hash=0xac0babdd
+#     because a staircase has flow levels; only the SOURCE fixtures go red, which is exactly the
+#     case the flag exists for.
+#   * the memchr in world/scratch.c:86 neutered -> "FAILED - 2 of 69 checks", "FAIL line 894:
+#     scratchFill raises the flag on a window full of sources".
+#
+# NOTE for whoever reads the water_mesh_test.c stanza above: its closing sentence used to claim
+# "a world of SOURCES and a world of ordinary terrain still mesh byte-identically to v1.7.1",
+# which went half stale in v1.8.2. That stanza HAS now been corrected in place -- the TERRAIN
+# half is still the control and is still pinned (faces=88 hash=0x9f47e02f), the SOURCES half
+# deliberately moved because a source with sky above it is now 7/8 tall, and testSourceUnchanged
+# asserts the new height instead. Recorded here as well because this is where its arms live.
+BHWA="build-host/run-$$-wateralpha"
+mkdir -p "$BHWA"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/water_alpha_test.c \
+	-o "$BHWA/water_alpha_test"
+
+"./$BHWA/water_alpha_test"
+
+rm -rf "$BHWA"
+
+# world/region_growth_test.c -- region files grew without bound, and now do not (v1.8.2). Own
+# binary, own main(), appended rather than merged into any stanza above it for the reason every
+# stanza in this file is appended: an append is the one edit shape that cannot drop another
+# session's work, and this file is shared.
+#
+# It links the REAL source/world/region.c and drives 960 column saves through it, stat()ing the
+# file on disk as it goes, because the bug this covers is a number on a card and not a property
+# of a diff. tests/net_stub.c is in the link only because world.c's worldSet calls
+# networldOnColumnLoad. This is the suite that made the case for wiring regionCompact() up; the
+# header paragraph near the top of this file that said it was "still not wired to anything" has
+# been corrected to match, and so has source/world/region.h.
+#
+# HOW BAD IT WAS. regionCompact() had no caller -- confirmed by grep over the whole tree, not by
+# reading. 24 distinct columns inside region (0,0), each re-saved 40 times with payloads that
+# lengthen the way a column being built in lengthens (real chunkEncode, real regionEncodeColumn,
+# scattered single-block edits on top of generated terrain), 960 saves in all, stat()ing
+# r.0.0.bsr as it goes:
+#
+#   saves    file bytes   live bytes   dead
+#   24       10773        4597         0.0 %
+#   264      78259        8338         88.4 %
+#   624      247633       13910        94.2 %
+#   960      482885       19452        95.9 %
+#
+# Still climbing linearly at the end of the run; an append-only arena has no plateau. With
+# regionMaintain() wired into app/worker.c's workerWriteSave the same workload finished at 43883
+# bytes -- 11x smaller, oscillating around twice-live instead of climbing -- having compacted 36
+# times across 960 saves. 43883 is a stat() of r.0.0.bsr taken AFTER the 960th save and after the
+# regionMaintain that follows it -- final, not peak; in this arm peak and final are both 43883.
+# Bit-identical on three consecutive runs (2026-08-25), so the single figure is safe to quote.
+#
+# 2026-08-25 RECONCILIATION. source/world/region.h and source/world/region.c said 21763 bytes,
+# 22x, 56 compactions for what they called this same workload. That figure is NOT this workload:
+# it is the first-draft fixture, cx=(i*7)&15 / cz=(i*5)&15, whose 16-period aliased columns 16..23
+# onto the slots of 0..7, leaving only 16 columns live -- so regionCompact's half-dead gate fired
+# sooner and the file settled smaller. Reproduced on purpose from a build-dir COPY of
+# region_growth_test.c with the old placement restored, region.c untouched: 482885 / 21763 / 56
+# compactions, control_readback 8 of 24 columns wrong in BOTH arms, exit 1. It was never a sound
+# run. The no-compaction arm is identical either way (the same 960 payloads get appended), which
+# is why 482885 and 19452 were right the whole time and only the compacted figure moved. region.h
+# has been corrected to 43883 / 11x / 36 and now states its workload and its measurement point.
+# source/world/region.c's header block carried the same stale figures and has been corrected to
+# match, comment-only -- see HASH CHANGED below for why its md5 moved and the proof that the
+# generated code did not. source/app/worker.c carried the same error in derived form -- its
+# "sixteen saves out of seventeen" is 960/56 -- and is now twenty-six out of twenty-seven (960/36),
+# also comment-only, also recorded under HASH CHANGED. Its 482885 / 19452 / 95.9 % figures were
+# never wrong and are untouched. A FOURTH copy of the same derived ratio turned up in the final
+# sweep at source/world/region.h:200, on regionMaintain's own declaration -- "sixteen saves out of
+# seventeen" again -- and is corrected the same way. It was found by grepping for the DERIVED
+# wording (sixteen/seventeen) rather than for the headline figures, which is the only reason it
+# surfaced: a wrong number does not have to contain any of the digits you are searching for.
+# After that pass the tree holds exactly ONE set of figures for
+# this workload: 482885 uncompacted, 43883 compacted, 11x, 36 compactions, 19452 live. Every
+# remaining occurrence of 21763 / 22x / 56 in source/ or tools/ sits inside a paragraph whose
+# subject is that those numbers were a broken fixture and must not be reused.
+#
+# The fix also changed regionCompact's swap from remove(.bsr)+rename(.tmp,.bsr) to
+# rename(.bsr,.bak)+rename(.tmp,.bsr)+remove(.bak), which is what made wiring it up safe: the old
+# sequence left an instant with no file at the path and 256 columns living only in a .tmp that
+# nothing here fsyncs. regionRecover() now resolves .bak first. REGION_VERSION is untouched and
+# the .bsr bytes are unchanged.
+#
+# HASH CHANGED 2026-08-25, and here is the reason, because a hash that moves with no recorded
+# cause is indistinguishable from tampering to the next reader. source/world/region.c went from
+#   old  09386ae6ae3bd457a3f177a85e7193c5   (the value the sabotage arms below were restored to)
+#   new  603d3d786315746ef3dffdf7716bc5b1   (current)
+# for a COMMENT-ONLY correction: its header block carried the same wrong 21763/22x/56 figures the
+# reconciliation above describes, and they are now 43883/11x/36 with the workload and measurement
+# point spelled out. No code, no whitespace reflow. PROVED comment-only rather than asserted --
+# region.c compiled before and after with `gcc -std=c11 -Wall -Wextra -Werror -O1 -I source`, both
+# to assembly (-S) and to an object (-c), and both outputs are byte-identical across the edit:
+#   region.s  d3b484f407a5302965142aae3d440898  (before == after)
+#   region.o  6f9449f9ab5bd6649945f8c78c5bcfff  (before == after)
+#
+# source/app/worker.c changed on the same date, for the same reason, and went from
+#   old  f4518839240fa8465ad13f4244979882
+#   new  1b9c24d455536dd6d3d9779ee7e749ad   (current)
+# Its workerWriteSave comment said the rewrite costs "two file probes and a directory read on
+# sixteen saves out of seventeen", which is 960/56 off the bad fixture; it now reads twenty-six
+# out of twenty-seven and carries its own derivation (960/36) so it cannot drift from the
+# compaction count again. The 482885 / 19452 / 95.9 % figures in that same comment were never
+# wrong and are untouched. Comment text only, no code, no whitespace reflow.
+# worker.c includes <3ds.h>, so host gcc cannot compile it and the proof above could not be run
+# with it. It was compiled instead with devkitARM -- the compiler the console build itself uses --
+# at the ARCH and INCLUDE flags out of the project Makefile (lines 28 and 45), compile only:
+#   arm-none-eabi-gcc -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft -mword-relocations
+#     -Wall -Wextra -O3 -D__3DS__ -I source -I deps/libhydrogen -I deps/blocksmith-server
+#     -I $DEVKITPRO/libctru/include -I $DEVKITPRO/portlibs/3ds/include
+# Both outputs byte-identical across the edit, -g excluded for the same reason as region.c:
+#   worker.s  0d6f0ea42af6905eb8ef5664ac6f16d2  (before == after)
+#   worker.o  eacf8ef2a12931b4e2ae0b3de4894acc  (before == after)
+# Note this is a compile of ONE translation unit for the hash comparison and nothing more -- it
+# is not a console build, and the standing rule that console builds run only from devkitPro MSYS2
+# is unaffected.
+# -g was deliberately NOT used for that comparison: the corrected comment is longer than the one
+# it replaced, so every line number below it shifts, and DWARF would record that difference for a
+# reason that has nothing to do with generated code. The assembly and the non-debug object carry
+# no line table and no timestamp, so they isolate exactly the thing being claimed.
+#
+# Sabotaged in the REAL source/world/region.c and measured, each arm restored afterwards and the
+# restore confirmed by md5 (region.c back to 09386ae6ae3bd457a3f177a85e7193c5 -- the pre-2026-08-25
+# value, see HASH CHANGED above). Green control on
+# both sides of every arm: "region growth: PASS  2494 checks", exit 0. The named control that
+# must stay GREEN in every arm is control_readback -- every column reads back byte for byte --
+# because it is a correctness claim and not a size one.
+#
+#  * regionMaintain neutered so compaction never runs. Written as
+#    `if (world_dir == NULL || rx == INT32_MIN || rz == INT32_MIN)` around the regionCompact
+#    call, which reads all three parameters -- an `if (0)` is rejected outright by
+#    -Werror=unused-parameter, and a sabotage that does not compile proves nothing (the same
+#    note the meshq and task-48 arms at the top of this file record).
+#      -> "FAILED - 1 of 2494 checks", "FAIL L404 bounded < ceiling", summary line read:
+#      no-compaction 482885 bytes, compaction-wired 482885 bytes. control_readback GREEN in both
+#      arms (0 of 24 wrong), bak_state1 and bak_state2 GREEN. Exactly the one claim, nothing else.
+#
+#    RE-RUN when this stanza was wired into the suite, and the same arm re-measured through the
+#    RUNNER rather than by hand, to prove a red here reaches the script's exit code and is not
+#    swallowed by set -e running on past it: "region growth: FAILED - 1 of 2494 checks",
+#    "FAIL L410 bounded < ceiling", "bound: compacted file must be under 64532 bytes", summary
+#    "no-compaction 482885 bytes, compaction-wired 482885 bytes, live at end 19452",
+#    "peak file bytes: 482885   final: 482885   compactions: 0", and RUNNER_EXIT=1. The three
+#    named controls stayed green in that run -- control_readback 0 of 24 columns wrong,
+#    bak_state1 0 of 24, bak_state2 0 of 24. The failing line is L410 and not the L404 recorded
+#    above it: region_growth_test.c moved between the two measurements, and the line number is
+#    quoted from the run that produced it rather than carried forward.
+#
+#    The sabotage was applied WITHOUT writing to source/world/region.c, which a parallel session
+#    owned at the time: this stanza was temporarily pointed at a sed'd copy of region.c in its
+#    own build directory, wrapping the regionCompact call in
+#    `if (world_dir == NULL || rx == INT32_MIN || rz == INT32_MIN)`. region.c was never opened
+#    for writing and was still 09386ae6ae3bd457a3f177a85e7193c5 at the end of that arm. It is
+#    603d3d786315746ef3dffdf7716bc5b1 today, changed only by the comment-only correction recorded
+#    under HASH CHANGED above, whose generated code is byte-identical -- so this arm's result
+#    stands unchanged against the current file.
+#  * regionRecover's .bak restore turned into a drop (`rename(bak, src)` -> `remove(bak)`), i.e.
+#    a cut between the two renames loses the region.
+#      -> "FAILED - 2 of 2494 checks", bak_state1 (bak, no bsr, torn tmp): 24 of 24 columns
+#      wrong, "FAIL L332 readAll() == 0" and "FAIL L333 fileBytes(bsr) == good".
+#      control_readback GREEN, bak_state2 GREEN, the size bound GREEN. So the size claim and the
+#      crash-safety claim are separable, which is the point of having both.
+#
+# A fixture bug caught on the way and worth recording: the first draft placed the 24 columns at
+# cx=(i*7)&15, cz=(i*5)&15, whose period in i is 16, so columns 16..23 sat on the same directory
+# slots as 0..7. control_readback reported "8 of 24 columns wrong" in BOTH arms -- a fixture
+# defect that looked exactly like a region.c defect. The distinctness of the 24 slots is now
+# asserted in spreadColumns() rather than assumed.
+#
+# NOT MEASURED, and it is the honest half. Every number above is a host number on ext4 through
+# WSL. A rewrite of a fully built 256-column region moves on the order of 200 KB each way and
+# nobody has timed that on a FAT32 SD card behind libctru's devoptab at 268 MHz. If it is slow
+# enough, three column saves landing inside one rewrite would fill worker.c's two-slot save ring
+# and make the MAIN thread wait in workerSubmitSave; workerSaveWaits() in the debug overlay is
+# where that would show. rename() on that devoptab is also still unverified -- but it now fails
+# SAFE: if it does not work at all, the first rename fails, nothing has been touched, and the old
+# .bsr is still there. The old sequence had already removed it by then.
+BHRG="build-host/run-$$-regiongrowth"
+mkdir -p "$BHRG"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/chunk_codec.c \
+	source/world/crc32.c \
+	source/world/region.c \
+	source/world/world.c \
+	source/world/budget.c \
+	tests/net_stub.c \
+	source/world/region_growth_test.c \
+	-lm \
+	-o "$BHRG/region_growth_test"
+
+"./$BHRG/region_growth_test"
+
+rm -rf "$BHRG"
+
+# tests/light_luminance_test.c -- BlockDef.luminance reaching world/light.c (v1.8.2). Own binary,
+# own main(), appended for the same reason every stanza here is appended.
+#
+# The field has existed since v1.6.0 and has always crossed the wire (registry.c packs it at byte
+# 24 of a DEFS record and unpacks it straight back), but nothing on the receiving side ever fed
+# it to the lighting engine -- light.c read a private table whose only writer was
+# lightSetLuminanceForTest. A server that registered a glowing block at join therefore sent its
+# luminance, the client stored it in the def, and the block rendered pitch dark with no error and
+# no log line. Same class of bug as the anyLuminance() loop bound recorded at the top of this
+# file, one layer further out: there the table was too narrow, here nothing ever wrote it.
+#
+# Same link list as scratch_light_test above -- world.c #includes light.c (see its line 16), so
+# light.c must NOT be listed separately or it is defined twice.
+#
+# Five arms, 107 checks. Arms 1 and 2 register an emitter into the DYNAMIC id space through
+# registryRegister and registryRemoteApply -- the two calls the join path ends in -- and measure
+# the falloff; nothing adds a luminous row to the shipped core table, so the pinned core crc16
+# (0x4066, registry_test) cannot move. Arm 0 asserts no core row declares a luminance and an
+# ordinary block still lights nothing; arm 3 asserts a defined but unplaced emitter lights
+# nothing.
+#
+# Arm 4 is coverage the shipped suite never had: world_test.c's testLightBlockChannel and
+# testLightBlockChannelFromDynamicId both place an emitter, assert the lit values and tear the
+# world down -- neither ever BREAKS the block and re-reads, and un-lighting is the classic
+# failure mode of a light engine. It drives the engine through lightSetLuminanceForTest rather
+# than the registry, which also makes it the named control for the sabotage run: with the
+# registry read deleted from light.c's syncLuminance(), arms 1 and 2 go red with 20 verbatim
+# "FAIL L159: [register|defs] block light at distance N = 0, want M" lines and arms 0, 3 and 4
+# stay green (87 of 107).
+#
+# RE-RUN through the RUNNER when this stanza was wired in, to prove a red here reaches the
+# script's exit code rather than being swallowed: the same sabotage gave exactly those 20 FAIL
+# lines, "light luminance self-test: FAILED - 87 of 107 checks", and RUNNER_EXIT=1. Arm 3 (a
+# defined but unplaced emitter) and arm 4 (the test-hook control: placed 7 6 5 4 3 2, broken
+# 0 0 0 0 0 0, replaced 7 6 5 4 3 2) both stayed green, which is what says the arms discriminate
+# the registry read rather than the whole engine collapsing.
+#
+# READ THAT SUMMARY LINE CAREFULLY. tests/light_luminance_test.c:349 prints s_checks - s_fail,
+# so "FAILED - 87 of 107 checks" means 87 PASSED and 20 failed. It is not 87 failures. Count the
+# FAIL lines, not the number in the summary -- the other suites in this file print the failure
+# count there and the two conventions are one glance apart.
+#
+# The sabotage was applied WITHOUT writing to source/world/light.c, which a parallel session
+# owned at the time. world.c pulls the engine in with `#include "world/light.c"` (see world.c
+# line 16), so a sed'd copy was written to this stanza's own build directory under world/ and
+# reached with a -I placed ahead of -I source. light.c was never opened for writing and is still
+# 6602977812703fa64c986d47e814b7dd.
+BHLL="build-host/run-$$-luminance"
+mkdir -p "$BHLL"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/world.c \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/budget.c \
+	source/world/scratch.c \
+	tests/net_stub.c \
+	tests/light_luminance_test.c \
+	-o "$BHLL/light_luminance_test"
+
+"./$BHLL/light_luminance_test"
+
+rm -rf "$BHLL"

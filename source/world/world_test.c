@@ -3974,6 +3974,23 @@ static void testBuoyancy(void)
 		// that says the probe is not simply answering true.
 		Body onfloor; bodyInit(&onfloor, 12.5f, 4.0f, 12.5f);
 		CHECK(bodySubmerged(&s_world, &onfloor) == false);
+
+		// v1.8.2 — the same four bodies through bodyWetState, which is now what the
+		// boolean is a wrapper over. The wrapper collapses SURFACE and SUBMERGED into
+		// one answer; these checks are the only place the difference between them is
+		// visible, and the vertical input is the only thing that reads it.
+		CHECK(bodyWetState(&s_world, &wet)     == BODY_SUBMERGED);
+		CHECK(bodyWetState(&s_world, &dry)     == BODY_DRY);
+		CHECK(bodyWetState(&s_world, &wading)  == BODY_SURFACE);   // feet in, eyes out
+		CHECK(bodyWetState(&s_world, &onfloor) == BODY_DRY);
+
+		// Head under with air below the feet is SUBMERGED, not SURFACE: the state is
+		// named for where the EYES are. A rule written off the feet alone would call
+		// this dry and a rule written off "both cells" would have nothing to say.
+		CHECK(worldSet(&s_world, 12, 4, 12, BLOCK_WATER));
+		Body underlip; bodyInit(&underlip, 12.5f, 3.2f, 12.5f);
+		CHECK(bodyWetState(&s_world, &underlip) == BODY_SUBMERGED);
+		CHECK(worldSet(&s_world, 12, 4, 12, BLOCK_AIR));
 	}
 
 	// --- One tick of gravity, from rest, in each medium. Water must pull less.
@@ -3990,14 +4007,30 @@ static void testBuoyancy(void)
 		CHECK(wet.vy < 0.0f);            // and the wet arm sinks, it does not float up
 
 		// The exact numbers, so a change to either constant has to be deliberate.
-		// -28 * 1/60 = -0.4667 ; -8 * 1/60 = -0.1333.
+		// -28 * 1/60 = -0.4667 dry, -8 * 1/60 = -0.1333 wet.
+		//
+		// This band moved twice inside v1.8.2 and is now back where it started, which is
+		// worth recording rather than quietly restoring. Attempt 1 applied
+		// PLAYER_WATER_VDRAG to every wet tick, which took 1/11 of the first tick's
+		// gravity straight back off and read -0.121212 here; the band was widened to
+		// match. Attempt 2 confines the drag to an UNDRIVEN UPWARD coast, so a body
+		// sinking from rest is not dragged at all and the tick is a pure -8/60 again.
+		// Measured -0.133333.
 		CHECK(dry.vy > -0.47f && dry.vy < -0.46f);
 		CHECK(wet.vy > -0.14f && wet.vy < -0.13f);
 	}
 
 	// --- Terminal speed. Sixty ticks of free fall in each medium; the dry arm is heading
-	// for PLAYER_TERMINAL, the wet arm must be pinned at PLAYER_WATER_TERMINAL. Started
-	// high enough in each column that neither reaches the floor inside the run.
+	// for PLAYER_TERMINAL, the wet arm must be sitting exactly on PLAYER_WATER_TERMINAL.
+	// Started high enough in each column that neither reaches the floor inside the run.
+	//
+	// The equality is load-bearing and is the second half of the drag re-scoping above.
+	// Attempt 1's whole-tick drag gave a free sink a SECOND terminal of its own, -8/6 =
+	// -1.3333, reached before the -1.5 clamp could ever fire — which quietly retired the
+	// constant that is supposed to own the sink rate and made sinking 11% slower than
+	// v1.8.1 for no reason anybody asked for. Measured -1.328954 then, -1.500000 now.
+	// If this ever reads "just short of" the clamp again, a drag has leaked back onto the
+	// downward half.
 	{
 		Body wet;  bodyInit(&wet, 4.5f, 9.0f, 4.5f);
 		Body dry;  bodyInit(&dry, 12.5f, 40.0f, 12.5f);
@@ -4005,7 +4038,7 @@ static void testBuoyancy(void)
 			bodyStep(&wet, &s_world, dt);
 			bodyStep(&dry, &s_world, dt);
 		}
-		CHECK(wet.vy == PLAYER_WATER_TERMINAL);
+		CHECK(wet.vy == PLAYER_WATER_TERMINAL);         // the clamp owns the sink rate
 		CHECK(dry.vy < PLAYER_WATER_TERMINAL * 4.0f);   // control: nothing clamped the dry arm
 		CHECK(wet.y > 4.0f);                            // still in the pool, not resting on the floor
 	}
@@ -4045,45 +4078,214 @@ static void testSwimming(void)
 		// Land, grounded, edge press: the ordinary jump, unchanged by this task.
 		Body b; bodyInit(&b, 12.5f, 4.0f, 12.5f);
 		b.on_ground = true;
-		bodyJump(&b, false, true, true);
+		bodyJump(&b, BODY_DRY, true, true, dt);
 		CHECK(b.vy == PLAYER_JUMP_SPEED);
 
 		// Land, grounded, button merely HELD with no fresh press: nothing. This is the
 		// half that stops a held button flying, and it must survive the new branch.
 		bodyInit(&b, 12.5f, 4.0f, 12.5f);
 		b.on_ground = true;
-		bodyJump(&b, false, true, false);
+		bodyJump(&b, BODY_DRY, true, false, dt);
 		CHECK(b.vy == 0.0f);
 
 		// Land, airborne, edge press: nothing. No double jump.
 		bodyInit(&b, 12.5f, 8.0f, 12.5f);
 		b.on_ground = false;
-		bodyJump(&b, false, true, true);
+		bodyJump(&b, BODY_DRY, true, true, dt);
 		CHECK(b.vy == 0.0f);
 
 		// Water, airborne, button held: rises. NOT gated on on_ground — a swimmer has
 		// nothing under it, and a land-jump gate copied onto this branch is the whole
 		// reason the check above and this one are stated separately.
+		//
+		// v1.8.2 re-pin, and the single most important line in this test: it used to
+		// read `b.vy == PLAYER_SWIM_UP_SPEED` after ONE call. That assignment, fired
+		// every frame from whatever vy happened to be, is the bang-bang relay that made
+		// the surface judder. It is now an approach: 3.0 * (10*dt / (1 + 10*dt)) with
+		// dt = 1/60 is 0.428571, measured. The old exact-equality assertion is what
+		// would have to go back for the bug to return, so it is the sabotage arm.
 		bodyInit(&b, 4.5f, 8.0f, 4.5f);
 		b.on_ground = false;
-		bodyJump(&b, true, true, false);
-		CHECK(b.vy == PLAYER_SWIM_UP_SPEED);
+		bodyJump(&b, BODY_SUBMERGED, true, false, dt);
+		CHECK(b.vy > 0.0f);                                 // it does lift
+		CHECK(b.vy < PLAYER_SWIM_UP_SPEED * 0.5f);          // but nowhere near all at once
+		CHECK(b.vy > 0.4280f && b.vy < 0.4292f);            // the measured step
+
+		// ...and it converges. bodyJump alone, no gravity and no drag, so this is the
+		// approach on its own: 23 calls to get within 3% of the target. That is ~0.38 s
+		// at 60 fps, which is the "reached in about a third of a second" the design
+		// traded the instant clamp for.
+		{
+			Body a; bodyInit(&a, 4.5f, 8.0f, 4.5f);
+			int n = 0;
+			bool monotonic = true;
+			float prev = a.vy;
+			while (n < 200 && a.vy < 2.9f) {
+				bodyJump(&a, BODY_SUBMERGED, true, false, dt);
+				if (a.vy <= prev) monotonic = false;
+				prev = a.vy;
+				n++;
+			}
+			CHECK(monotonic);                               // never overshoots, never dips
+			CHECK(n == 23);
+			CHECK(a.vy < PLAYER_SWIM_UP_SPEED);             // approaches from below, never past
+		}
 
 		// Water, button released: no rise, and the sink is left alone.
 		bodyInit(&b, 4.5f, 8.0f, 4.5f);
 		b.vy = -1.0f;
-		bodyJump(&b, true, false, false);
+		bodyJump(&b, BODY_SUBMERGED, false, false, dt);
 		CHECK(b.vy == -1.0f);
 
 		// Water, already rising faster than the swim speed (kicked off the bottom):
 		// holding the button must not SLOW it down to the cap.
 		bodyInit(&b, 4.5f, 8.0f, 4.5f);
 		b.vy = PLAYER_SWIM_UP_SPEED + 4.0f;
-		bodyJump(&b, true, true, true);
+		bodyJump(&b, BODY_SUBMERGED, true, true, dt);
 		CHECK(b.vy == PLAYER_SWIM_UP_SPEED + 4.0f);
+
+		// v1.8.2 — the surface row, which had no equivalent before because there was no
+		// surface state. Same button, same water, head out: the target is
+		// PLAYER_SURFACE_RISE (0.0) instead of PLAYER_SWIM_UP_SPEED, so a body already
+		// at rest is left exactly at rest rather than being thrown upward. THIS is the
+		// line the bug was: at the surface the old code still asserted +3.0.
+		//
+		// swim_drive is the attempt-2 half and it is asserted here rather than only
+		// through behaviour, because it is the flag that tells bodyStep to leave gravity
+		// off. A body sitting exactly ON its target must still be DRIVEN — that is the
+		// difference between `<=` and `<` in bodyJump, and without it vy = 0 is not a
+		// fixed point at all, it is a point the body falls away from at -8 m/s^2.
+		bodyInit(&b, 4.5f, 8.0f, 4.5f);
+		bodyJump(&b, BODY_SURFACE, true, false, dt);
+		CHECK(b.vy == 0.0f);
+		CHECK(b.swim_drive == true);
+
+		// ...and released, it is not driven, so gravity is back on the next bodyStep.
+		bodyInit(&b, 4.5f, 8.0f, 4.5f);
+		bodyJump(&b, BODY_SURFACE, false, false, dt);
+		CHECK(b.swim_drive == false);
+
+		// Nor on land, at any input: a grounded jump is an impulse, not a drive, and if
+		// this ever set the flag the player would hang in mid-air on the way up.
+		bodyInit(&b, 12.5f, 4.0f, 12.5f);
+		b.on_ground = true;
+		bodyJump(&b, BODY_DRY, true, true, dt);
+		CHECK(b.vy == PLAYER_JUMP_SPEED);
+		CHECK(b.swim_drive == false);
+
+		// And a body sinking at the surface is pulled back UP towards 0, not slammed to
+		// it: one frame closes 1/7 of the gap, not the whole gap.
+		bodyInit(&b, 4.5f, 8.0f, 4.5f);
+		b.vy = -1.0f;
+		bodyJump(&b, BODY_SURFACE, true, false, dt);
+		CHECK(b.vy > -1.0f);                                // rising
+		CHECK(b.vy < 0.0f);                                 // but still sinking this frame
+		CHECK(b.vy > -0.8580f && b.vy < -0.8567f);          // -1 * (1 - 10dt/(1+10dt))
+
+		// Surface, rising fast: the `vy <= target` guard means the surface target never
+		// BRAKES a body. A swimmer arriving from below with +3 on him keeps it and loses
+		// it to gravity and drag, which is what makes the arrival read as a float rather
+		// than as hitting a ceiling. He is also NOT driven while he does — that coast is
+		// the only stretch where PLAYER_WATER_VDRAG is allowed to act, and it is what
+		// places the resting float about half a block above the waterline.
+		bodyInit(&b, 4.5f, 8.0f, 4.5f);
+		b.vy = PLAYER_SWIM_UP_SPEED;
+		bodyJump(&b, BODY_SURFACE, true, false, dt);
+		CHECK(b.vy == PLAYER_SWIM_UP_SPEED);
+		CHECK(b.swim_drive == false);
+	}
+
+	// --- The hysteresis band, on its own, with no motion involved. PLAYER_WET_HYSTERESIS
+	// is one-sided and sits ABOVE the waterline (top face of the y=12 water block, 13.0),
+	// so:
+	//   entering  is instant — eye under the line at all means BODY_SUBMERGED, because a
+	//             body reading BODY_SURFACE with its eyes underwater would hover there
+	//             with a target of 0 and never come up, which is the opposite of the point;
+	//   leaving   takes a further PLAYER_WET_HYSTERESIS of clearance, which is what stops
+	//             a body resting on the boundary from chattering across it, and what puts
+	//             the resting float visibly clear of the surface instead of level with it.
+	{
+		// Eye at 13.10 — a tenth of a block clear of the water. A body that was already
+		// submerged stays submerged, because 13.10 - 0.25 is still inside the water.
+		Body b; bodyInit(&b, 4.5f, 13.10f - PLAYER_EYE, 4.5f);
+		b.wet = BODY_SUBMERGED;
+		CHECK(bodyWetUpdate(&s_world, &b) == BODY_SUBMERGED);
+		CHECK(bodyWetState(&s_world, &b) == BODY_SURFACE);   // the unbiased reading differs
+		CHECK(bodyWetUpdate(&s_world, &b) == BODY_SUBMERGED); // idempotent at a fixed y
+
+		// The same position approached from the other side stays at the surface: no band
+		// resists going up, so nothing drags a floating body back under.
+		bodyInit(&b, 4.5f, 13.10f - PLAYER_EYE, 4.5f);
+		b.wet = BODY_SURFACE;
+		CHECK(bodyWetUpdate(&s_world, &b) == BODY_SURFACE);
+
+		// Clear of the band: submerged no longer holds, whatever it came from.
+		bodyInit(&b, 4.5f, 13.40f - PLAYER_EYE, 4.5f);
+		b.wet = BODY_SUBMERGED;
+		CHECK(bodyWetUpdate(&s_world, &b) == BODY_SURFACE);
+
+		// Under the line: submerged immediately, with no band to climb through first.
+		bodyInit(&b, 4.5f, 12.99f - PLAYER_EYE, 4.5f);
+		b.wet = BODY_SURFACE;
+		CHECK(bodyWetUpdate(&s_world, &b) == BODY_SUBMERGED);
+		bodyInit(&b, 4.5f, 12.99f - PLAYER_EYE, 4.5f);
+		b.wet = BODY_DRY;
+		CHECK(bodyWetUpdate(&s_world, &b) == BODY_SUBMERGED);
+
+		// Control: the band is on the EYE only. Dry land is dry from any history, or a
+		// band on the feet probe would let a body stand a quarter-block into a pond
+		// without the water noticing.
+		Body d; bodyInit(&d, 12.5f, 8.0f, 12.5f);
+		d.wet = BODY_SUBMERGED;
+		CHECK(bodyWetUpdate(&s_world, &d) == BODY_DRY);
+	}
+
+	// --- The approach must never overshoot its target, at any tick length. The body runs
+	// on the RENDER frame (scene/player.c hands bodyStep metricsFrameMs(), clamped to its
+	// MAX_TICK of 0.05), so dt is 16.7 ms on a good frame and up to 50 ms on a bad one —
+	// but bodyStep is a public entry point and main.c's walk-stress probe steps it too,
+	// so "the caller will clamp it" is not something this function gets to assume.
+	//
+	// Deliberately taken well past MAX_TICK: at dt = 1.0 a bare `rate * dt` of 10 would
+	// put the body at ten times its own target, and at dt = 10 it would fling it
+	// backwards. dampAlpha is bounded in [0, 1) for every non-negative dt, so the worst
+	// a long tick can do is arrive.
+	//
+	// This sweep is the ONLY witness in the suite for dampAlpha's rational form, measured:
+	// with `return kdt;` put back in physics.c it goes red three times over, at 0.25, 1.0
+	// and 10.0, and nothing else in the surface tests notices. The 0.05 row is green in
+	// both arms — 10 * 0.05 is 0.5, which the naive form survives — so it is stated
+	// separately below as the control rather than being counted as evidence.
+	{
+		const float ticks[] = { 0.05f, 0.25f, 1.0f, 10.0f };
+		for (int i = 0; i < 4; i++) {
+			Body worst; bodyInit(&worst, 4.5f, 6.0f, 4.5f);
+			bodyJump(&worst, BODY_SUBMERGED, true, false, ticks[i]);
+			CHECK_QUIET(worst.vy > 0.0f);
+			CHECK_QUIET(worst.vy <= PLAYER_SWIM_UP_SPEED);
+		}
+		Body sane; bodyInit(&sane, 4.5f, 6.0f, 4.5f);
+		bodyJump(&sane, BODY_SUBMERGED, true, false, 0.05f);
+		CHECK(sane.vy > 0.0f && sane.vy < PLAYER_SWIM_UP_SPEED);   // control, spelled loudly
 	}
 
 	// --- Swimming up, mid-water, nothing under the feet. Sixty frames of held jump.
+	//
+	// This bound has now moved twice inside v1.8.2 and BOTH numbers are stated, because
+	// the middle one was a regression nobody asked for and the only way to stop it coming
+	// back is to leave it written down:
+	//
+	//     v1.8.1        2.866667 blocks/s steady, 2.866668 blocks over the second
+	//     attempt 1     1.215686 blocks/s steady, 1.144175 over the second   <-- 58% SLOWER
+	//     attempt 2     2.999712 blocks/s steady, 2.700029 over the second
+	//
+	// Attempt 1 lost it two ways at once: PLAYER_WATER_VDRAG damped the driven climb as
+	// well as the coast, and the approach drooped by WATER_GRAVITY/SWIM_RESPONSE below its
+	// own target. Attempt 2 removes both from a DRIVEN frame, so the steady climb is now
+	// PLAYER_SWIM_UP_SPEED itself rather than something derived from three constants.
+	// The steady rate is 4.6% above v1.8.1's, since v1.8.1 paid one tick of gravity per
+	// frame on top of its hard clamp; the first second is 6% short of it, because the
+	// approach has to ramp where the clamp did not.
 	{
 		Body b; bodyInit(&b, 4.5f, 6.0f, 4.5f);
 		const float y0 = b.y;
@@ -4091,14 +4293,16 @@ static void testSwimming(void)
 		bool  monotonic = true;
 		for (int i = 0; i < 60; i++) {
 			CHECK_QUIET(b.on_ground == false);   // never touched anything to rise off
-			bodyJump(&b, bodySubmerged(&s_world, &b), true, i == 0);
+			bodyJump(&b, bodyWetUpdate(&s_world, &b), true, i == 0, dt);
 			bodyStep(&b, &s_world, dt);
 			if (b.y <= prev) monotonic = false;
 			prev = b.y;
 		}
 		CHECK(monotonic);
-		CHECK(b.y > y0 + 2.0f);    // a real rise, not a twitch
-		CHECK(b.y < y0 + 4.0f);    // and bounded — roughly SWIM_UP_SPEED for one second
+		CHECK(b.y > y0 + 2.6f);            // a real rise, at roughly the v1.8.1 rate
+		CHECK(b.y < y0 + 2.75f);           // measured 2.700029 over the second
+		CHECK(b.vy > 2.99f && b.vy < 3.001f);  // a STEADY climb at the swim speed, 2.999712
+		CHECK(b.vy <= PLAYER_SWIM_UP_SPEED);   // and it never passes it
 	}
 
 	// --- The control arm that proves the rise above is the water branch and not the
@@ -4107,23 +4311,24 @@ static void testSwimming(void)
 		Body b; bodyInit(&b, 12.5f, 20.0f, 12.5f);
 		const float y0 = b.y;
 		for (int i = 0; i < 60; i++) {
-			bodyJump(&b, bodySubmerged(&s_world, &b), true, i == 0);
+			bodyJump(&b, bodyWetUpdate(&s_world, &b), true, i == 0, dt);
 			bodyStep(&b, &s_world, dt);
 		}
 		CHECK(b.y < y0);
+		CHECK(b.y < y0 - 14.2f && b.y > y0 - 14.3f);   // -14.233344, untouched by v1.8.2
 	}
 
 	// --- Sinking. Released button in water: the body drifts down, and slowly. Sixty
-	// frames at PLAYER_WATER_TERMINAL is at most 1.5 blocks, against 60-odd dry.
+	// frames at the drag terminal is about 1.1 blocks, against 14-odd dry.
 	{
 		Body wet; bodyInit(&wet, 4.5f, 11.0f, 4.5f);
 		const float y0 = wet.y;
 		for (int i = 0; i < 60; i++) {
-			bodyJump(&wet, bodySubmerged(&s_world, &wet), false, false);
+			bodyJump(&wet, bodyWetUpdate(&s_world, &wet), false, false, dt);
 			bodyStep(&wet, &s_world, dt);
 		}
 		CHECK(wet.y < y0);                 // it does sink
-		CHECK(wet.y > y0 - 1.6f);          // but no faster than the water terminal allows
+		CHECK(wet.y > y0 - 1.6f);          // but no faster than water allows — unmoved bound
 	}
 
 	// --- Horizontal speed. bodyWalkSpeed's own answer, and then the displacement it
@@ -4153,6 +4358,239 @@ static void testSwimming(void)
 	worldExit(&s_world);
 }
 
+// v1.8.2 — the waterline, which is the one region of the water column no test above ever
+// entered. testSwimming starts at y=6 in water spanning 4..12 and asserts a rise that never
+// reaches y=13; testBuoyancy never crosses either. The bug lived exactly in the gap.
+//
+// Reported as: "when you swim upwards, once you get to the top, you stop having up and down
+// really fast. I don't want that one to be slower, more Minecraft like." Read literally,
+// that is two requirements — it must STOP, and the swim itself must not get slower — and
+// the run below measures both. All figures are 600 frames of held jump from the bottom of
+// the lake at dt = 1/60, sampled from frame 200 once the climb is over:
+//
+//                        y travel     vy envelope          eye crossings of the waterline
+//   v1.8.1               0.223333     +2.866667/-3.200001  0 of 399  (thrown clear, bobbing
+//                                                                    in the AIR above it)
+//   v1.8.2 attempt 1     0.022027     +0.487818/-0.379595  140 of 399
+//   v1.8.2 attempt 2     0.000018     -0.000000/-0.000210  0 of 399
+//
+// The middle row is why this test is written the way it is. Attempt 1 moved the body ten
+// times less and was still wrong: pulling vy towards 0 does not hold a body still, because
+// a velocity target cannot cancel a constant acceleration. Gravity re-established about
+// -0.5 blocks/s of droop every frame, the body sank out of BODY_SURFACE, the +3 target
+// threw it back, and the equilibrium simply relocated to the state boundary — which is the
+// EYE LINE. So the camera crossed the water plane ten times a second where the old code
+// never crossed it at all. A travel check alone called that a fix. It was not one.
+//
+// Hence the checks here are on three quantities, not one: the travel, the velocity
+// envelope, and the number of times the eye passes through the surface plane. The last is
+// the one that would have caught attempt 1, and it is the one closest to what the player
+// actually sees, since there is no underwater tint — the only cue that the head went under
+// is the water quad flicking past the near plane.
+//
+// Attempt 2 makes vy = target a genuine fixed point by not applying gravity at all on a
+// frame where the swim input is pulling (Body::swim_drive). Nothing restores the error, so
+// there is no limit cycle left to damp, and the measured travel is 18 micro-blocks over the
+// last 400 frames rather than 2.2 cm.
+static void testSurfaceSwim(void)
+{
+	// Frame-indexed traces. Static rather than automatic: 600 floats twice is 4.8 KB and
+	// this file is also built for a 32 KB console stack.
+	static float vy[600];
+	static float py[600];
+
+	const float dt = 1.0f / 60.0f;
+
+	// The same lake testSwimming uses: stone at y=3, water y=4..12 over x<8, so the water
+	// SURFACE is the plane y=13.0 and the top water cell is y=12.
+	worldInit(&s_world);
+	for (int x = 0; x < 16; x++)
+		for (int z = 0; z < 16; z++)
+			CHECK(worldSet(&s_world, x, 3, z, BLOCK_STONE));
+	for (int y = 4; y <= 12; y++)
+		for (int x = 0; x < 8; x++)
+			for (int z = 0; z < 16; z++)
+				CHECK_QUIET(worldSet(&s_world, x, y, z, BLOCK_WATER));
+
+	// Started on the LAKE BED with the swim button held, which is the run the report
+	// describes — "when you swim upwards, once you get to the top". Attempt 1's version of
+	// this test dropped the body in from above instead, which turned out to exercise a
+	// different path entirely (the entry brake, not the arrival), and is kept below as a
+	// second arm rather than as the main one. 600 frames is ten seconds; the climb from
+	// y=4.5 to the surface takes about 150 of them.
+	Body b; bodyInit(&b, 4.5f, 4.5f, 4.5f);
+	for (int i = 0; i < 600; i++) {
+		bodyJump(&b, bodyWetUpdate(&s_world, &b), true, i == 0, dt);
+		bodyStep(&b, &s_world, dt);
+		vy[i] = b.vy;
+		py[i] = b.y;
+	}
+
+	// --- The headline check: does the eye ever pass back through the water plane once the
+	// body has arrived? This is the one attempt 1 failed, 140 times, and the one a travel
+	// threshold on its own is blind to.
+	//
+	// The surface plane is y = 13.0 — the top face of the y=12 water cell — so the eye is
+	// under water exactly when its cell is liquid, which is the same question physics.c
+	// asks. Counted as CROSSINGS rather than as a fraction of frames so that a body which
+	// settles just under the line (bad, but quiet) cannot be confused with one that settles
+	// just over it.
+	{
+		int under = 0, crossings = 0;
+		bool prev = blockInfo(worldGet(&s_world, 4, (int)(py[200] + PLAYER_EYE), 4))->liquid;
+		for (int i = 200; i < 600; i++) {
+			const bool now = blockInfo(worldGet(&s_world, 4, (int)(py[i] + PLAYER_EYE), 4))->liquid;
+			if (now) under++;
+			if (now != prev) crossings++;
+			prev = now;
+		}
+		CHECK(crossings == 0);
+		CHECK(under == 0);        // and it settled ABOVE the line, not below it
+	}
+
+	// --- How far it travels once settled, and the velocity envelope beside it so that a
+	// quiet position cannot be bought with a violent velocity.
+	//
+	// 0.05 blocks is 5 cm. v1.8.1 measured 0.223333 here and attempt 1 measured 0.022027;
+	// attempt 2 measures 0.000018, which is three orders of magnitude inside the bound.
+	// The tight second bound is what makes this a FIXED POINT check rather than a
+	// small-oscillation check: 0.001 blocks is a millimetre, and neither earlier version
+	// comes within a factor of twenty of it.
+	{
+		float ymax = py[200], ymin = py[200], vmax = vy[200], vmin = vy[200];
+		for (int i = 200; i < 600; i++) {
+			if (py[i] > ymax) ymax = py[i];
+			if (py[i] < ymin) ymin = py[i];
+			if (vy[i] > vmax) vmax = vy[i];
+			if (vy[i] < vmin) vmin = vy[i];
+		}
+
+		CHECK(ymax - ymin < 0.05f);      // the bound attempt 1 also passed
+		CHECK(ymax - ymin < 0.001f);     // the bound only a fixed point passes
+
+		// v1.8.1: +2.866667 / -3.200001. Attempt 1: +0.487818 / -0.379595.
+		// Attempt 2: -0.000000 / -0.000210 — the body is not moving at all.
+		CHECK(vmax < 1.0f);
+		CHECK(vmin > -1.0f);
+		CHECK(vmax < 0.001f && vmin > -0.001f);
+
+		// Control, green in every arm including the sabotaged ones: the run stayed inside
+		// the lake and never fell through to the stone floor or flew off the top. This is
+		// the check that says the ones above are measuring a floating body and not a
+		// fixture that collapsed.
+		CHECK(ymin > 4.0f && ymax < 14.0f);
+	}
+
+	// --- It reaches that point rather than creeping towards it. Frame 300 against frame
+	// 599 is five seconds apart; v1.8.1 drifted 0.010000 over that stretch and attempt 1
+	// drifted 0.000859. Attempt 2 does not move at all, so the bound is a hundredth of
+	// attempt 1's rather than six times it.
+	{
+		const float creep = py[599] > py[300] ? py[599] - py[300] : py[300] - py[599];
+		CHECK(creep < 0.005f);
+		CHECK(creep < 0.00005f);
+	}
+
+	// --- Where it settles, and this is the check PLAYER_WET_HYSTERESIS is load-bearing
+	// for. The feet must be in water and the EYES must be clearly out of it — Minecraft
+	// floats you with your head above the surface, not level with it.
+	//
+	// The clearance comes from two places and the band is the reliable half: a body leaves
+	// BODY_SUBMERGED only once its eye is PLAYER_WET_HYSTERESIS (0.25) above the plane, and
+	// then coasts a further ~0.24 on the velocity it arrived with before the surface target
+	// takes it. Measured eye height 13.485423, so 0.485 clear. With the band collapsed to
+	// zero the coast is all that is left and the eye settles at 13.235, which is why the
+	// bound below is 0.40 and not 0.10: it is placed to go red on exactly that change.
+	//
+	// v1.8.1 for contrast settled with its feet cell in AIR at y 13.124444 — thrown clear
+	// of the lake altogether, bobbing above it. That is the "up and down" of the report.
+	{
+		const int feet = (int)py[599];
+		CHECK(blockInfo(worldGet(&s_world, 4, feet, 4))->liquid == true);
+
+		const float eye = py[599] + PLAYER_EYE;
+		CHECK(eye > 13.0f);              // head out of the water at all
+		CHECK(eye > 13.40f);             // and CLEARLY out, measured 13.485423
+		CHECK(eye < 13.60f);             // without being launched clear of the lake
+	}
+
+	// --- The same hold at other frame rates. The body runs on the RENDER frame, so this is
+	// not hypothetical: a console dropping to 30 or 20 fps must float at the same height,
+	// or the water would feel different depending on how much of the world was on screen.
+	// Measured settled y: 11.865423 at 60 fps, 11.893859 at 30, 11.870266 at 20 — a spread
+	// of 0.028 blocks across a three-fold change in tick length.
+	//
+	// Stated plainly because the tempting claim is wrong: this is NOT a witness for
+	// physics.c's dampAlpha, which was measured to move these heights by less than half a
+	// centimetre. The witness for dampAlpha itself is testSwimming's long-tick sweep.
+	{
+		const float rates[2] = { 1.0f / 30.0f, 1.0f / 20.0f };
+		for (int r = 0; r < 2; r++) {
+			Body h; bodyInit(&h, 4.5f, 4.5f, 4.5f);
+			bool under = false;
+			for (int i = 0; i < 600; i++) {
+				bodyJump(&h, bodyWetUpdate(&s_world, &h), true, i == 0, rates[r]);
+				bodyStep(&h, &s_world, rates[r]);
+				if (i >= 200 && blockInfo(worldGet(&s_world, 4, (int)(h.y + PLAYER_EYE), 4))->liquid)
+					under = true;
+			}
+			CHECK_QUIET(under == false);                 // the headline check, at this rate
+			const float gap = h.y > py[599] ? h.y - py[599] : py[599] - h.y;
+			CHECK_QUIET(gap < 0.05f);
+			CHECK_QUIET(blockInfo(worldGet(&s_world, 4, (int)h.y, 4))->liquid == true);
+			CHECK_QUIET(h.y + PLAYER_EYE > 13.40f);
+		}
+		// Spelled loudly once, so a silent sweep cannot be the only evidence.
+		Body h30; bodyInit(&h30, 4.5f, 4.5f, 4.5f);
+		for (int i = 0; i < 600; i++) {
+			bodyJump(&h30, bodyWetUpdate(&s_world, &h30), true, i == 0, 1.0f / 30.0f);
+			bodyStep(&h30, &s_world, 1.0f / 30.0f);
+		}
+		CHECK(h30.y > 11.84f && h30.y < 11.94f);         // measured 11.893859
+	}
+
+	// --- Arriving from ABOVE instead of from below: the same button, held through a fall
+	// into the lake. Attempt 1's test used this as its only case, so it is kept, but it is
+	// a different path — the swim pull brakes the entry rather than ending a climb, and the
+	// body stops much higher (settled y 12.767226, eye 1.387 clear of the plane) because a
+	// driven frame has no gravity to carry it under. Recorded because it is a visible
+	// behaviour change from v1.8.1, where the hard +3 clamp bounced the body straight back
+	// out of the water on its first wet frame.
+	{
+		Body a; bodyInit(&a, 4.5f, 14.0f, 4.5f);
+		int crossings = 0;
+		bool prev = false;
+		for (int i = 0; i < 600; i++) {
+			bodyJump(&a, bodyWetUpdate(&s_world, &a), true, i == 0, dt);
+			bodyStep(&a, &s_world, dt);
+			if (i >= 200) {
+				const bool now = blockInfo(worldGet(&s_world, 4, (int)(a.y + PLAYER_EYE), 4))->liquid;
+				if (i > 200 && now != prev) crossings++;
+				prev = now;
+			}
+		}
+		CHECK(crossings == 0);
+		CHECK(a.vy > -0.001f && a.vy < 0.001f);                          // stopped dead
+		CHECK(blockInfo(worldGet(&s_world, 4, (int)a.y, 4))->liquid == true);   // feet wet
+		CHECK(a.y > 12.7f && a.y < 12.85f);                              // measured 12.767226
+	}
+
+	// --- Control arm, green in every sabotage: the identical held-button loop in the dry
+	// column beside the lake must fall and land. If this ever goes red the fixture broke,
+	// not the surface rule.
+	{
+		Body d; bodyInit(&d, 12.5f, 14.0f, 12.5f);
+		for (int i = 0; i < 600; i++) {
+			bodyJump(&d, bodyWetUpdate(&s_world, &d), true, i == 0, dt);
+			bodyStep(&d, &s_world, dt);
+		}
+		CHECK(d.on_ground == true);
+		CHECK(d.y > 3.9f && d.y < 4.1f);   // resting on the stone at y=3
+	}
+
+	worldExit(&s_world);
+}
+
 #ifndef __3DS__
 // The half of task 25 that lives in source/scene/player.c, which includes <3ds.h> through
 // app/input_map.h and so cannot be linked into this binary at all.
@@ -4177,14 +4615,36 @@ static void testPlayerWiresSwimming(void)
 	src[n] = '\0';
 	CHECK(n > 0 && n < sizeof(src) - 1);   // read whole, not truncated
 
-	// It must ask the question...
-	const char* ask = strstr(src, "bodySubmerged(");
+	// It must ask the question... and since v1.8.2 it must ask the WIDE one, through the
+	// HYSTERETIC entry point. Asking only the boolean wrapper would compile and would swim,
+	// and the surface would judder exactly as it did before, because bodyJump cannot tell
+	// BODY_SURFACE from BODY_SUBMERGED unless this file hands it the difference. Asking
+	// bodyWetState instead of bodyWetUpdate would also compile and would also mostly work,
+	// and would quietly cost the float its head clearance — the band lives on the body and
+	// only bodyWetUpdate advances it.
+	const char* ask = strstr(src, "bodyWetUpdate(");
 	CHECK(ask != NULL);
+	CHECK(strstr(src, "bodyWetState(") == NULL);
 
 	// ...and hand the answer to both consumers. A build that computes submersion and
 	// then ignores it is the exact defect this file cannot otherwise see.
 	CHECK(strstr(src, "bodyWalkSpeed(") != NULL);
 	CHECK(strstr(src, "bodyJump(") != NULL);
+
+	// v1.8.2 — and it must hand bodyJump the STATE and the frame time, not a bool and
+	// nothing. `bodyJump(&p->body, wet, ...)` with `dt` last is the only shape that gives
+	// the water branch a target it can pick and a rate it can apply; passing `submerged`
+	// there would compile (BodyWet is an enum, a bool converts) and would silently pin
+	// every swimmer to BODY_SURFACE's zero target, so a swimmer could never climb.
+	const char* jump = strstr(src, "bodyJump(&p->body, wet,");
+	CHECK(jump != NULL);
+	if (jump) {
+		const char* end = strchr(jump, ';');
+		CHECK(end != NULL);
+		// The last argument on that one call has to be the tick. Searched inside the call
+		// only, so bodyStep's own `, dt)` cannot stand in for it.
+		if (end) CHECK(strstr(jump, ", dt)") != NULL && strstr(jump, ", dt)") < end);
+	}
 
 	// The old inline jump must be GONE, not merely shadowed by a new branch below it:
 	// two writers to vy on the same frame is a race decided by line order.
@@ -8924,6 +9384,7 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testStepUpRefusals();
 	testBuoyancy();
 	testSwimming();
+	testSurfaceSwim();
 #ifndef __3DS__
 	testPlayerWiresSwimming();
 #endif

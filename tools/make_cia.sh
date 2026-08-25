@@ -51,7 +51,7 @@ BANNER_PNG="$ROOT/gfx/banner.png"
 BUILD="$ROOT/cia/build"
 CIA_SMDH="$BUILD/$TARGET-cia.smdh"
 BANNER_BNR="$BUILD/$TARGET.bnr"
-SILENCE_WAV="$BUILD/silence.wav"
+CHIME_WAV="$BUILD/chime.wav"
 OUT_CIA="$ROOT/$TARGET.cia"
 
 # --- 1. Find the tools. Full paths, same reasoning as the sibling Makefile:
@@ -118,24 +118,34 @@ echo "make_cia.sh: building SMDH from $ICON_PNG ..."
 [ -f "$CIA_SMDH" ] || die "bannertool makesmdh reported success but $CIA_SMDH does not exist."
 
 # --- 5. Build the banner. bannertool's makebanner refuses to run without an
-# audio track (-a/-ca) even for a silent title, so a short silent PCM WAV is
-# generated here rather than shipped as a checked-in asset - it is
-# throwaway build input, not art. Verified bannertool's banner-image size
-# requirement directly: a 100x100 test image was rejected with
-# "[ERROR] Image must be exactly 256 x 128 in size."; a 256x128 image (what
-# make_banner.py produces) is accepted. ---
-echo "make_cia.sh: writing a silent placeholder track ..."
-# Minimal 16-bit PCM mono WAV, 16000 Hz, 0.1s (1600 samples / 3200 bytes of
-# silence). Built by hand with printf so this script has no dependency
-# beyond bash + coreutils.
-printf 'RIFF\xA4\x0C\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x80\x3E\x00\x00\x00\x7D\x00\x00\x02\x00\x10\x00data\x80\x0C\x00\x00' > "$SILENCE_WAV" \
-    || die "could not write $SILENCE_WAV"
-head -c 3200 /dev/zero >> "$SILENCE_WAV" || die "could not append silence to $SILENCE_WAV"
+# audio track (-a/-ca), and up to task 44 this script satisfied that with 0.1s
+# of printf'd silence. It now generates the real Home Menu chime instead, with
+# tools/make_banner_audio.py - synthesised from scratch with the Python
+# standard library, deterministic, nothing sampled. The WAV is still build
+# output rather than a checked-in asset: the script is the source, the .wav is
+# what it prints, exactly like gfx/*.png and their generators.
+#
+# Regenerated on every run rather than only-if-missing (the pattern used for
+# the PNGs at step 3), because the generator is cheap and a stale chime left
+# over from an edited script would ship silently.
+#
+# The track is played by the 3DS Home Menu out of the banner, not by the game:
+# it needs no audio code in Blocksmith and does not depend on roadmap task 43.
+#
+# Verified bannertool's banner-image size requirement directly: a 100x100 test
+# image was rejected with "[ERROR] Image must be exactly 256 x 128 in size.";
+# a 256x128 image (what make_banner.py produces) is accepted. ---
+echo "make_cia.sh: generating the banner chime with tools/make_banner_audio.py ..."
+PY_AUDIO="$(command -v python3 || command -v python)" \
+    || die "no python3/python on PATH to generate the banner chime. Install Python (the generator needs only the standard library - no Pillow, no numpy), then re-run this script."
+"$PY_AUDIO" "$ROOT/tools/make_banner_audio.py" "$CHIME_WAV" \
+    || die "tools/make_banner_audio.py failed - see its output above."
+[ -f "$CHIME_WAV" ] || die "tools/make_banner_audio.py ran but $CHIME_WAV still doesn't exist."
 
 echo "make_cia.sh: building banner from $BANNER_PNG ..."
 "$BANNERTOOL" makebanner \
     -i "$BANNER_PNG" \
-    -a "$SILENCE_WAV" \
+    -a "$CHIME_WAV" \
     -o "$BANNER_BNR" \
     || die "bannertool makebanner failed - see its output above."
 [ -f "$BANNER_BNR" ] || die "bannertool makebanner reported success but $BANNER_BNR does not exist."
