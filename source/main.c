@@ -4304,15 +4304,46 @@ session_start:
 		// otherwise leave open: whether the ray found anything (`aim` block and face),
 		// whether an edit reached the world (`b`roke / `p`laced / `r`efused), and whether
 		// the queue is keeping up (`dq` current/peak) — read that against `worst` and
-		// `over` above. The console is 32 columns wide and truncates without complaining,
-		// so this has to stay inside it: "aim -12 8 -10 f2 b9 p9 r9 dq8/8" is 31.
+		// `over` above. Typically short — "aim -12 8 -10 f2 b9 p9 r9 dq8/8" is 31 — but the
+		// buffer is NOT sized off that, for the same reason netline below is not.
 		//
 		// Built here, before the frame opens, rather than after it closes where it used to
 		// live: step 8.3's bottom-screen UI draws this same string *inside* the frame, and
 		// a value cannot be drawn before it exists. Both consumers now read one buffer, so
 		// the console overlay and the touch screen can never disagree about what the player
 		// is aiming at.
-		char status[33];
+		//
+		// 93 bytes, not the 33 this used to be. What sized it at 33 was a claim that "the
+		// console is 32 columns wide and truncates without complaining, so this has to stay
+		// inside it", and that reasoning was wrong twice over. The 32-column clip is real but
+		// it belongs to debug/metrics.c:393's `printf("%-32s\n", status)` — a MINIMUM field
+		// width, which pads and never shortens — and that whole overlay is compiled only when
+		// BS_BOTTOM_UI is 0 (gfx/screen.c:21-35 is the only consoleInit in the program), so
+		// the CIA the player runs has no console for it to be clipped by. Its real consumer is
+		// drawBottomUi() -> scene/ui.c:268, `fontDrawf(6, y, 1, ...)` with FONT_ADVANCE 6
+		// (gfx/font.h:39) on the 320px bottom screen, where 52 characters are visible. A
+		// display clip loses characters off the right edge of one frame; a short buffer makes
+		// snprintf truncate silently, which is the failure mode that matters, and 33 was
+		// already short of the declared ranges long before anyone counted:
+		//   literals "aim " " " " " " f" " b" " p" " r" " dq" "/"                     18
+		//   x, z — world block coords, "signed and unbounded" (world/world.h:9-10)
+		//          and reached through floorToInt of a float camera, so 11 each        22
+		//   y — 11, not 3. worldGet clamps reads (world/world.c:192-193) but not this
+		//       field: above the ceiling reads air so no hit lands there, and below 0
+		//       reads WORLD_FLOOR_BLOCK, which is targetable, so the DDA stops at -1
+		//       whenever the camera starts inside the world. A BS_FLY build (main.c:231)
+		//       replaces playerUpdate with cameraUpdate and keeps interactAim, so the
+		//       camera flies below the floor and worldRaycast's inside-a-solid early
+		//       return hands back floorToInt(oy) unbounded. Bounded by physics, not by
+		//       the type, and one of the in-tree builds removes the physics             11
+		//   face — FACE_* 0..5 or RAY_FACE_NONE (-1), world/raycast.h:13                 2
+		//   b p r — Interact.broke/placed/refused, unclamped `int` lifetime counters
+		//           (scene/interact.h:51-53), so 11 each ("-2147483648")                33
+		//   dq pair — dirtyqCount/dirtyqPeak, both bounded by DIRTYQ_MAX 392 and never
+		//             negative (world/dirtyq.c:33-53), so 3 each                         6
+		//   NUL                                                                          1
+		// The "aim none" branch is shorter (58) and does not set the size.
+		char status[93];
 		if (it.target.hit)
 			snprintf(status, sizeof(status), "aim %d %d %d f%d b%d p%d r%d dq%d/%d",
 			         it.target.x, it.target.y, it.target.z, it.target.face,
@@ -4329,9 +4360,11 @@ session_start:
 		//   s sent edits   r payloads received   y WORLD_SYNC entries seen
 		//   a remote edits applied   q still queued for unloaded columns   p remote players
 		// Typically short — "net s99 r999 y999 a999 q99 p9" is 30 — but do not size the buffer
-		// off that, and note this is NOT the 32-column console `status` above is bound by:
-		// netline's only consumer is drawBottomUi(), which draws it through scene/ui.c:270
-		// where 52 characters fit. See the buffer arithmetic below.
+		// off that. netline's only consumer is drawBottomUi(), which draws it through
+		// scene/ui.c:270 where 52 characters fit. That used to add "and note this is NOT the
+		// 32-column console `status` above is bound by" — `status` is not bound by it either,
+		// and was silently truncating because of that belief. See the note there.
+		// See the buffer arithmetic below.
 		//
 		// The trailing "!" is v1.6.0 task 8's readout of net/networld.h's
 		// networldRegistrySynced(): in a session it means this client's block table never
