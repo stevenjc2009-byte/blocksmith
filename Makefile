@@ -156,7 +156,35 @@ PROTO_REPO	:=	https://github.com/stevenjc2009-byte/blocksmith-server.git
 # silently dropping every edit placing one, so against an older server a dynamic block
 # still cannot be placed — a server-side ceiling, not a protocol difference, which is
 # why no capability gate can paper over it.
-PROTO_COMMIT	:=	05c14fd6c34bafac280288dfd62ceb3e97acaa6b
+#
+# Bumped again to 632d1998, head of the server branch docs/registry-crc-correction.
+# NOT a wire change. bs_proto.h's only edit since 05c14fd6 is that one commit, and it
+# renames literals without moving a byte: the same probe compiled against the old and
+# the new header reports BS_APP_REGISTRY_DEFS_MAX_N 36, a full batch packing 1012
+# bytes and declaring 1012, identically both times. A clone pinned at either commit
+# emits the same packets, and an already-deployed v1.6.0+ server needs no update.
+#
+# It moves because bs_proto.h had to be edited at all, and this pin verifies the
+# header by SHA -- leaving it at 05c14fd6 red-lines check-proto-drift on every build
+# in this repo, which is why the bump is part of the same change and not a follow-up.
+#
+# What was edited: BS_APP_REGISTRY_DEFS_MAX_N and BS_APP_REGISTRY_DEFS_BYTES() each
+# spelled the registry wire record size as a bare `28u`. That number belongs to
+# world/registry.h (REGISTRY_WIRE_RECORD_BYTES = id byte + sizeof(BlockDef)), and the
+# server's bsgame.c packs a REGISTRY_DEFS batch with the registry constant while
+# declaring the packet's length with the literal. One extra BlockDef field takes the
+# record 28 -> 29 and the literal does not follow: measured, 36 records then pack 1048
+# bytes behind a declared length of 1012 -- 36 bytes short on every batch -- with
+# MAX_N still 36 when 35 fit, 1048 overrunning BS_MAX_PAYLOAD (1024), and gcc exiting
+# 0 with no warning. It is now BS_REGISTRY_WIRE_RECORD_BYTES, static-asserted against
+# REGISTRY_WIRE_RECORD_BYTES in the server's game/validate.c, the one translation
+# unit that sees both headers.
+#
+# Caveat worth stating: this pin now names a working BRANCH head rather than a
+# released server, which is the opposite of what the 05c14fd6 bump above was for.
+# The fix is server-side-only and no released server carries it yet. This should move
+# again to whichever release absorbs docs/registry-crc-correction.
+PROTO_COMMIT	:=	632d19989b49ac1d38f2a466a7a0c91551d0881c
 PROTO		:=	deps/blocksmith-server
 
 .PHONY: deps
