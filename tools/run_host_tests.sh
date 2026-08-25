@@ -3,8 +3,14 @@
 #
 # Everything under source/world is plain C with no 3DS dependency, so it can be
 # tested here in a second instead of through a devkitARM build and an emulator.
-# The file list is explicit rather than a glob because block_tiles_check.c includes
-# <3ds.h> — it is the console-only bridge that checks the two duplicated enums.
+# The file list is explicit rather than a glob because these binaries each need a
+# different subset of it, and because a glob would sweep in the _test.c files, every one
+# of which carries its own main().
+#
+# world/block_tiles_check.c — the bridge that checks the two duplicated tile enums — is
+# what that sentence used to be about: it included gfx/atlas.h, that header includes
+# <3ds.h>, so the file was console-only and this script skipped it. It has its own stanza
+# below now and is compiled on every run. See there for what the skip was costing.
 #
 # source/scene/render_dist.c is in the list under the same rule: step 7.7 put the
 # render distance arithmetic in a file with no <3ds.h> precisely so the fog and
@@ -269,6 +275,108 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	-o "$BH/world_test"
 
 "./$BH/world_test"
+
+# world/block_tiles_check.c — the BTEX_*/TILE_* mirror (v1.8.3).
+#
+# COMPILED, NOT RUN, and the only stanza in this file that is. The whole translation unit is
+# _Static_assert; there is nothing to execute, and wrapping it in a main() that printed
+# "PASS 12 checks" would be a check that cannot fail — this project has eleven recorded cases
+# of exactly that. gcc exiting non-zero IS the red arm, and `set -e` above turns it into a
+# failed suite.
+#
+# WHY IT IS HERE AT ALL. world/block.h hand-mirrors gfx/atlas.h's TILE_* enum as BTEX_*, and
+# this file's _Static_asserts were the only thing holding the two together. It included
+# gfx/atlas.h, which includes <3ds.h>, so it was never linked into any host binary and this
+# script's own header comment said so. A mismatch therefore compiled silently here and was
+# caught only by a devkitPro console build, if somebody happened to run one.
+#
+# Measured on the unfixed tree, on a frozen snapshot (a parallel session's in-flight
+# genversion work had world_test at "FAILED - 4 of 5179", which `set -e` turns into an
+# aborted suite, so the files that session was editing were restored to HEAD inside the
+# snapshot only). Green control: "world self-test: PASS  5143 checks", SUITE_EXIT=0. That
+# control reads 5184 in the red arms further down rather than 5143: HEAD moved between the two
+# measurements, on that other session's work. It is green in every run either way, which is all
+# it is being asked.
+#
+#  * gfx/atlas.h's TILE_TALL_GRASS given the value 12 while world/block.h's BTEX_TALL_GRASS
+#    stayed 11 — a real mirror mismatch, the exact thing the asserts exist for -> SUITE_EXIT=0,
+#    "atlas uv shader self-test: PASS  4280 checks", and grep -c FAIL over the whole run: 0.
+#    The suite could not see it, because nothing it compiles had ever heard of TILE_*.
+#
+# The mismatch was introduced on the TILE side deliberately, and the reason is worth keeping:
+# the same drift introduced on the BTEX side is caught INCIDENTALLY, by something that is not
+# about the atlas at all. world/block.h's BTEX_TALL_GRASS set to 12 was measured first and gave
+# "FAIL 53 checks, 1 failed", the one being registry_test's "core-only crc matches the pinned
+# golden 0x4066" — because a core block's tex[] bytes go into that crc16. That covers only the
+# tiles a CORE block's faces actually use (never TILE_SENTINEL, and nothing a server-registered
+# dyn row picks), it says nothing about the atlas in its message, and it disappears the moment
+# the golden is re-pinned. It is not a guard on the mirror; the TILE-side arm is what shows the
+# hole with nothing else standing in front of it.
+#
+# THE FIX, and what was rejected. The tile list moved to gfx/atlas_tiles.h, which has no 3DS
+# dependency; gfx/atlas.h includes it, so the console build sees the same enum it always did,
+# and this file includes atlas_tiles.h instead of atlas.h. Rejected: deleting world/block.h's
+# BTEX_* mirror now that TILE_* is includable from the host — that would make source/world
+# depend on source/gfx, which block.h's opening comment exists to prevent, and it would touch
+# every file that names a BTEX_*. Rejected: generating the asserts from tools/make_atlas.py's
+# TILES list — it adds a codegen step to a build that has none.
+#
+# world/block.h itself is NOT touched by this change, and that is a decision rather than an
+# oversight: it is vendored into deps/blocksmith-server/game/world/block.h, and the Makefile's
+# check-world-drift target fails the console build outright when the two differ. Measured — an
+# earlier version of this work added a BTEX_USED_COUNT sentinel there and `make` stopped with
+# "Makefile: deps/blocksmith-server/game/world/block.h has drifted from source/world/block.h",
+# MAKE_EXIT=2, before compiling anything. Closing that last case needs a sync and a review in a
+# repository this change does not own, so it is left open and named in block_tiles_check.c.
+#
+# THE SECOND DEFECT, which is the miss-prone one. One assert per tile means omitting a line
+# leaves that tile unguarded, silently, on host and console alike — and v1.8.3 Phase 3 appends
+# about six tiles at once. The pairs are an X-macro list now, expanded twice: once into the
+# twelve asserts, once into a count that is asserted equal to gfx/atlas_tiles.h's
+# TILE_USED_COUNT. A tile appended without its assert is a build error.
+#
+# Both halves sabotaged in the REAL production headers and measured, each restored afterwards
+# and the restore confirmed byte-identical by md5 AND cmp (block.h back to
+# 2e22f1758b2dc87483dde29b00c8e650, atlas_tiles.h to 39e9e5cf292aaf15c5676f52a0662ccf). Control
+# in both arms: the world_test stanza immediately above, which runs FIRST and printed
+# "world self-test: PASS  5184 checks" in the healthy build and in each arm — so the red below
+# is the mirror, not the tree failing to build in general.
+#
+# The two arms fail through DIFFERENT asserts, one each, which is what says the two guards
+# discriminate instead of both firing on any edit at all:
+#
+#  * world/block.h's BTEX_TALL_GRASS given the value 12 (the value-mirror arm)
+#    -> ONE error: "static assertion failed: "atlas tile order changed - BTEX_TALL_GRASS and
+#    TILE_TALL_GRASS disagree; update world/block.h to match gfx/atlas_tiles.h"", with gcc's
+#    expansion notes naming the exact X(BTEX_TALL_GRASS, TILE_TALL_GRASS) line. The other
+#    eleven pair asserts and the pair-COUNT assert stay green: the list did not change length.
+#  * gfx/atlas_tiles.h given a thirteenth tile, appended, with no X() line here (the
+#    missing-assert arm) -> ONE error: "a tile was added (or removed) without its assert, so
+#    that tile is unguarded. Add the missing X(BTEX_..., TILE_...) line." ALL TWELVE per-pair
+#    asserts stay green — they all still hold — which is exactly the failure the hand-written
+#    form could not see, and the reason the count assert is not redundant with them.
+#
+# NOT recorded as an arm, and worth the line. The missing-assert arm was first written as an
+# INSERTION (TILE_GRAVEL between TILE_WATER and TILE_TALL_GRASS) and that also renumbers
+# TILE_TALL_GRASS, so it takes the pair assert down with the count assert and proves nothing
+# about which guard caught what. Appending is both the realistic edit and the one that
+# isolates the count assert.
+#
+# tools/make_atlas.py needs no change for either arm: the count is derived from the C enum,
+# not from that script's TILES list.
+#
+# NOT recorded as an arm, and the reason is the mirror image of the meshq note at the top of
+# this file. Both count asserts were first written without the (int) casts, and gcc rejected
+# the HEALTHY tree with "error: comparison between 'enum <anonymous>' and 'enum <anonymous>'
+# [-Werror=enum-compare]", SUITE_EXIT=1. A sabotage that does not compile proves nothing; a
+# guard that does not compile guards nothing, and it would have been read as a red arm working.
+# The casts are why the per-pair asserts have always had them.
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	-c source/world/block_tiles_check.c \
+	-o "$BH/block_tiles_check.o"
+
+echo "block tiles mirror: BTEX_*/TILE_* static asserts compiled"
 
 # The master block registry itself (v1.6.0 Phase A). Sixteenth binary, own main(),
 # same reason as every one above it: registration, name lookup, the full-range

@@ -28,40 +28,17 @@
 // this code rather than a copy of it.
 #include "world/atlas_uv.h"
 
-// Tile slots. The order is the contract with tools/make_atlas.py — append only,
-// never reorder, or every mesh built before the change points at the wrong art.
-enum {
-	TILE_GRASS_TOP = 0,
-	TILE_GRASS_SIDE,
-	TILE_DIRT,
-	TILE_STONE,
-	TILE_SAND,
-	TILE_SENTINEL,   // magenta checker — a bleed alarm, never used on real blocks
-	TILE_WOOD_SIDE,  // step 5.3's trees, appended after the sentinel rather than
-	TILE_WOOD_TOP,   // beside sand, because inserting would re-texture everything
-	TILE_LEAVES,     // after the insertion point
-	TILE_PLANKS,     // the first crafted block; the tile that forced the sheet to 128
-	TILE_WATER,      // roadmap task 17 — opaque art; tools/make_atlas.py's tile_water says why
-	TILE_TALL_GRASS, // roadmap task 19 — the first tile drawn for a BLOCK_SHAPE_CROSS block
-	// Twelve of ATLAS_TILE_COUNT (64) addressable slots used, 0..11.
-	//
-	// It was twelve of FIFTEEN until v1.8.2's task 13b. The old ceiling was not the sheet
-	// height: MeshVertex.v held an atlas pixel row, so a uint8_t capped the sheet at 256 px
-	// = 16 slots and the top slot's top edge (v = 256) did not fit, leaving 15. Task 13b
-	// changed that byte's UNITS to a slot-edge index, moved the TILE_PX factor into the
-	// shaders' uvScale.y, and the sheet grew to 1024 px — the PICA200's maximum texture
-	// dimension — for 64 slots, all addressable. The vertex is still 8 bytes. See the long
-	// note in world/atlas_uv.h.
-	//
-	// The 52 spares (12..62, and the reserved 63) are NOT blank. Since v1.6.0 F7
-	// tools/make_atlas.py paints every slot this list does not name with the magenta/black
-	// missing-texture marker, and ATLAS_TILE_MISSING (slot 63, world/atlas_uv.h) is reserved
-	// as one permanently — it is where atlasRect() clamps an out-of-range tile id. Before
-	// that, tex 10..14 drew the sheet's near-black background fill and an out-of-range tex
-	// drew grass, so a server shipping a wrong tex byte looked like a rendering bug here.
-	// Appending a real tile below simply overwrites the next spare's marker; slot 63 is the
-	// one that cannot be taken, and tools/make_atlas.py refuses rather than letting it be.
-};
+// Tile slots. The list itself lives in gfx/atlas_tiles.h, which has no 3DS dependency, so
+// world/block_tiles_check.c can compile the TILE_* names on the HOST and check world/block.h's
+// BTEX_* mirror of them on every tools/run_host_tests.sh run. It was in this file until
+// v1.8.3, and that put the names behind the <3ds.h> above: a BTEX/TILE mismatch then compiled
+// silently on the host, the whole 22-binary host suite stayed green, and only a devkitPro
+// console build could catch it. Measured before the split — TILE_TALL_GRASS given the value 12
+// while BTEX_TALL_GRASS stayed 11: "SUITE_EXIT=0", zero FAIL lines in the entire run.
+//
+// Appending a tile has two steps, and gfx/atlas_tiles.h states both. The second one cannot be
+// forgotten silently any more; see the assert-count note in world/block_tiles_check.c.
+#include "gfx/atlas_tiles.h"
 
 // Uploads the atlas to the GPU and binds it to texture unit 0. Returns false if
 // the embedded t3x could not be parsed.
