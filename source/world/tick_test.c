@@ -81,7 +81,7 @@ static void check(bool cond, const char *what)
 //
 // Legitimately adding or removing a check means editing this by hand. The suite going red
 // until you do is deliberate friction, not an accident.
-#define TICK_TEST_EXPECTED_CHECKS 52
+#define TICK_TEST_EXPECTED_CHECKS 58
 
 // Deliberately NOT routed through check(): this must not perturb the number it is testing,
 // so it bumps g_fails only. Reporting shape is check()'s, so a failure here reads the same
@@ -466,6 +466,74 @@ static void testTickPeriodForDistSqSweep(void)
 	      "one squared unit further out drops to period 10");
 }
 
+// ------------------------------------------- tickPeriodForDistSq BELOW ZERO ------------------
+//
+// The sweep above only ever feeds d*d for d in 0..40, and world_test.c's block only ever feeds
+// 0, 575, 576, 577 and 1<<20. Every one of those is non-negative, so nothing in the tree asked
+// the question that was actually answered wrongly: what comes back when dist_sq arrives NEGATIVE.
+//
+// Until this fix the answer was 1 -- FULL RATE -- because `dist_sq <= TICK_NEAR_DIST_SQ` is
+// satisfied by a negative int32 exactly as happily as by a small positive one. That is the rule
+// inverted: a squared distance can only go negative by a caller overflowing dx*dx + dz*dz, which
+// means the thing is impossibly far away, and it was being handed the most expensive tick rate in
+// the system. tick.c is MIRRORED into the dedicated server, so it was the wrong answer in both
+// programs at once.
+//
+// MEASURED before the fix, these exact inputs, via a probe linked against the real tick.c:
+//   tickPeriodForDistSq(-1) = 1, (-576) = 1, (INT32_MIN) = 1, (46341^2 wrapped) = 1,
+//   and 271182 of 271182 sampled negative values returned 1.
+//
+// Expectations are naked literals -- 10, not TICK_FAR_PERIOD, and 1, not the constant. A check
+// spelled in terms of the value under test cannot see that value move; this file's own header
+// calls that the project's recorded case-3 trap.
+static void testTickPeriodForDistSqBelowZero(void)
+{
+	check(tickPeriodForDistSq(-1) == 10,
+	      "dist_sq -1 is FAR, not near -- the smallest negative value, which returned period 1 "
+	      "before the guard existed");
+	check(tickPeriodForDistSq(-576) == 10,
+	      "dist_sq -576 is FAR -- the near boundary's own value, negated, is not near");
+	check(tickPeriodForDistSq(INT32_MIN) == 10,
+	      "dist_sq INT32_MIN is FAR -- the most negative int32 there is");
+
+	// Both halves in one check, so a guard placed one unit to either side of zero goes red:
+	// 0 must still be near, -1 must be far. This is what pins WHERE the low edge sits.
+	check(tickPeriodForDistSq(0) == 1 && tickPeriodForDistSq(-1) == 10,
+	      "the low guard sits at exactly zero: 0 is near, -1 is far");
+
+	// A real overflow rather than a hand-picked negative: 46341 blocks on one axis, and 40000
+	// on each of two axes, both wrap an int32 squared distance negative. Computed through
+	// unsigned so the wrap is defined behaviour and not UB. negatives_seen is the
+	// falsifiability term -- if either expression stopped actually wrapping, this check would
+	// otherwise pass for the wrong reason.
+	int wrong = 0, negatives_seen = 0;
+	{
+		const int32_t one_axis = (int32_t)((uint32_t)46341u * (uint32_t)46341u);
+		const int32_t two_axis = (int32_t)((uint32_t)40000u * (uint32_t)40000u
+		                                 + (uint32_t)40000u * (uint32_t)40000u);
+		if (one_axis < 0) negatives_seen++;
+		if (two_axis < 0) negatives_seen++;
+		if (tickPeriodForDistSq(one_axis) != 10) wrong++;
+		if (tickPeriodForDistSq(two_axis) != 10) wrong++;
+	}
+	check(wrong == 0 && negatives_seen == 2,
+	      "a genuinely overflowed squared distance -- 46341 on one axis, 40000 on two -- wraps "
+	      "negative and reads as FAR, not as full rate");
+
+	// The entire negative half of the domain, sampled on a prime stride. One hand-picked
+	// negative is satisfied by a guard that happens to catch only that value; this is not.
+	// 271182 is a naked literal for the sample count so that a stride or bound that quietly
+	// shrank the sweep goes red instead of passing over fewer values.
+	int full_rate = 0, sampled = 0;
+	for (int64_t v = INT32_MIN; v < 0; v += 7919) {
+		sampled++;
+		if (tickPeriodForDistSq((int32_t)v) == 1) full_rate++;
+	}
+	check(full_rate == 0 && sampled == 271182,
+	      "sweeping 271,182 values across the whole negative half of the int32 domain, not one "
+	      "of them reports full rate");
+}
+
 int main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
@@ -481,6 +549,7 @@ int main(void)
 	testTickClockDriftOverAThousandFrames();
 	testTickClockInvariantsOverAMixedStream();
 	testTickPeriodForDistSqSweep();
+	testTickPeriodForDistSqBelowZero();
 
 	checkCountPin();
 
