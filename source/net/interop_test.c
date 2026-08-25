@@ -75,15 +75,25 @@
 /* ---------------------------------------------------------------- gate<->game IPC framing ---
  * Not part of bs_proto.h — it is the LOCAL convention between bsgate and bsgame on one box, not
  * anything a 3DS ever sees on the wire (see bs_proto.h's own header comment on that boundary).
- * Duplicated here exactly as server/game/bsgame_test.c already duplicates it, for the identical
- * reason: this is the one other place in the tree that has to stand in for bsgate without
- * including gateway-private code. Canonical values: deps/blocksmith-server/game/bsgame.c. */
-enum bs_game_msg {
-    BS_GAME_JOIN  = 1,   /* gate -> game: sid(4) + pubkey(32) + label(32) */
-    BS_GAME_DATA  = 2,   /* both ways:    sid(4) + payload                */
-    BS_GAME_LEAVE = 3,   /* gate -> game: sid(4)                          */
-    BS_GAME_KICK  = 4    /* game -> gate: sid(4)                          */
-};
+ *
+ * enum bs_game_msg was hand-copied into this file until now: one of SIX copies of the same four
+ * values, in two repos, with nothing whatsoever holding them equal. A value drifting between them
+ * would not have been a compile error anywhere — it would have been the gate sending one kind byte
+ * for what the game read as another, at runtime, with no diagnostic. deps/blocksmith-server's
+ * 65d40f8 collapsed the four server-side copies into proto/bs_gamelink.h and named this file as
+ * one of the two it could not reach from inside that repo. This is that edit; six copies become
+ * two.
+ *
+ * Reached by exactly the path bs_proto.h above is reached by — `-I deps/blocksmith-server`, in
+ * tools/run_host_tests.sh's interop_test stanza — so no build change is needed for it. Note that
+ * nothing in bs_gamelink.h is covered by this repo's PROTO_COMMIT pin: check-proto-drift compares
+ * proto/bs_proto.h and nothing else, by design, because bs_gamelink.h never travels on the wire
+ * and no 3DS build ever includes it (this whole file is inside #ifndef __3DS__). See that
+ * header's own comment for why it is a separate file from bs_proto.h.
+ *
+ * BS_GAME_ENVELOPE_BYTES stays local. bsgame.c owns that constant and bs_gamelink.h deliberately
+ * does not define it — it only points at it. */
+#include "proto/bs_gamelink.h"
 
 #define BS_GAME_ENVELOPE_BYTES 5u
 
