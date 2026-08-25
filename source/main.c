@@ -977,7 +977,7 @@ static uint32_t s_seed_used = BS_WORLD_SEED;
 
 // v1.4.0: control-remap screen state and the debug-menu flag. Reset per session, like the
 // seed above. The minimap's fog-of-war buffer and save path used to live here too; the
-// whole feature was removed in v1.6.0 (see below, at the old init site).
+// whole feature was removed in v1.5.1 (see below, at the old init site).
 static RemapState s_remap;
 static bool       s_remap_open;
 static bool       s_debug_open;
@@ -1077,7 +1077,7 @@ static void bsDebugRegister(void)
 	}
 
 	// A "Minimap" toggle used to sit here, between Render distance and Weather. It went
-	// with the feature in v1.6.0, so every entry below it moved up one index — the debug
+	// with the feature in v1.5.1, so every entry below it moved up one index — the debug
 	// menu builds its rows from this registration order, so this list IS the row order.
 	e = debugMenuRegister();
 	if (e) {
@@ -3422,7 +3422,7 @@ session_start:
 	(void)playerModelInit();
 
 	// The v1.4.0 minimap claimed its 64x64 texture and loaded this world's fog-of-war here.
-	// Removed entirely in v1.6.0, not repaired: scene/minimap.c:251 called worldGet(NULL, wx,
+	// Removed entirely in v1.5.1, not repaired: scene/minimap.c:251 called worldGet(NULL, wx,
 	// 0, wz) and world/world.c:44 dereferences w->slots[i] with no NULL guard, so the first
 	// pixel it ever drew was a data abort on a real console. The spec's touch-screen map is
 	// a fresh build, not a fix of this one. Fog files already written to
@@ -4508,7 +4508,7 @@ session_start:
 			batteryDraw(284.0f, 4.0f);
 			spriteEnd();
 
-			// The v1.4.0 live minimap drew here, bottom-right. Removed in v1.6.0 — see the
+			// The v1.4.0 live minimap drew here, bottom-right. Removed in v1.5.1 — see the
 			// init site above for why it was cut rather than fixed.
 
 			// After the UI and on the same target, so it lands on top of it. See
@@ -4721,7 +4721,7 @@ session_start:
 	}
 
 	// The v1.4.0 explored-fog map was saved here on the way out. Gone with the feature in
-	// v1.6.0; existing sdmc:/blocksmith/fog/*.bin files are left orphaned by design.
+	// v1.5.1; existing sdmc:/blocksmith/fog/*.bin files are left orphaned by design.
 
 	// The play loop can be left with the menu still up. Choosing Quit closes it on the way
 	// out, but a lost server session (the netStatus() break above) does not, and neither

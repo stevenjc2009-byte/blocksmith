@@ -11,7 +11,15 @@
 typedef struct {
 	int8_t  x, y, z;   // position in block units, chunk-local 0..16
 	int8_t  pad;       // packed light: sky * 16 + block. See below - its POSITION also matters.
-	uint8_t u, v;      // atlas pixel coordinates, texture space (v grows upwards)
+	uint8_t u, v;      // atlas coordinates in texture space (both grow upwards/rightwards),
+	                   // and THE TWO ARE IN DIFFERENT UNITS since v1.8.2's task 13b:
+	                   //   u  atlas PIXELS across — 0..240, widened past one tile by a merge
+	                   //   v  SLOT-EDGE INDEX up  — 0..ATLAS_TILE_SLOTS, NOT pixels
+	                   // The shader carries the missing TILE_PX in uvScale.y. Until v1.8.2 v
+	                   // held a pixel row too, and a u8 of pixel rows is what capped the sheet
+	                   // at 16 slots. See world/atlas_uv.h:139-165 for the full layout; the
+	                   // field kept the bare name `v` while atlas_uv.h's renamed to vslot0/
+	                   // vslot1, so this comment is the only thing that says so here.
 	uint8_t nrm;       // face index 0..5 in bits 0..2, water height drop in bits 3..5.
 	                   // Resolved to a baked brightness AND a y offset by the shader's
 	                   // faceShade table; see MESH_NRM_FACE_BITS in world/mesher.h.

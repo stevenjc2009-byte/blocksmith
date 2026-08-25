@@ -94,6 +94,40 @@ Worlds made in 1.8.1 open unchanged and no block id moved — see Compatibility.
   being accurate in this release, which is exactly the kind of comment that gets believed
   later.
 
+- **Region compaction was wired up in this release and the entry above never said so
+  (recorded 2026-08-25).** This is the omission, not a change of behaviour: the code shipped in
+  1.8.2 and only the record is being repaired. `regionCompact()` had no caller in any shipped
+  build through 1.8.1, so a heavily edited world's region file grew on the card until the player
+  deleted the world. It now has one. `regionMaintain()` (`source/world/region.c:740-748`) is a
+  gated call to `regionCompact()`, and `workerWriteSave` calls it on the worker thread straight
+  after `regionWriteColumn` (`source/app/worker.c:199`) — not at world close, where the number of
+  regions to rewrite is unbounded and the file swap would land at the moment a player is most
+  likely to close the lid. The wiring lives in `region.c` rather than as a bare `regionCompact`
+  call in `worker.c` specifically so a host test can reach it; the threshold stays inside
+  `regionCompact` so there is no second one to disagree with it.
+
+  **Measured**, by `source/world/region_growth_test.c` driving the real `region.c` through 960
+  column saves over a 24-column working set inside one region: unwired, the file reached
+  **482,885 bytes on disk holding 19,452 bytes of live columns** — 95.9% dead and still climbing
+  linearly, because an append-only arena has no plateau and the ceiling is the card. With
+  `regionMaintain()` after each save the same workload finished at **43,883 bytes, 11x smaller,
+  having compacted 36 times**. Bit-identical on three consecutive runs. Full workload description
+  and the reason an earlier draft of these numbers (21,763 / 22x / 56) was invalidated are in
+  `source/world/region.h:45-73` — do not resurrect that earlier set.
+
+  The `remove()`-then-`rename()` window that was the stated reason for leaving it unwired is
+  closed rather than accepted: the old file is renamed aside to `.bak` first and removed last, so
+  recovery never depends on freshly written bytes being on the card (`region.h:85-93`). The `.bsr`
+  format is byte-for-byte unchanged and `REGION_VERSION` is untouched, so a world written by this
+  build loads on 1.7.1 and the other way round.
+
+  **Not verified.** Every figure here is a host number on ext4 through WSL (`region.h:95-100`).
+  A rewrite of a fully built 256-column region moves on the order of 200 KB each way and nobody
+  has timed that on a FAT32 SD card behind libctru's devoptab at 268 MHz, so whether the rewrite
+  can stall the main thread through worker.c's two-slot save ring is unknown. Nothing in this
+  release has run on a real console. The retraction of 1.7.1's "still not wired to anything, and
+  that is deliberate" is recorded under that release as well.
+
 ### Testing
 
 - The host suite is now about 5,100 world checks, and gained 90 checks covering the chunk-cull
@@ -299,6 +333,25 @@ than claiming a fix that was never made.
   697,968 enumerated configurations the old and new predicates disagree six times, and in all six
   the *old* one is wrong: it culled a chunk that is genuinely inside the cone, because subtracting
   two ~2.76 radian `atan2f` results loses the 1.5e-6 that decides it. Six holes in 139,514 culls.
+
+  **Provenance (added 2026-08-25).** Unlike the frame-time figures above, these three numbers
+  are **reproducible on demand** — they are printed by a suite that lives in this repository.
+  `tests/horizon_test.c` enumerates the configuration space and its final `printf` reports the
+  case count, the ref-vs-new disagreement count and the reference's cull count. Built and run
+  on the host on 2026-08-25 from the recipe in `tools/run_host_tests.sh:1480-1491` (gcc -O1,
+  the `horizonHidden` body extracted out of `source/scene/chunk_render.c` by awk so the test
+  links the shipped predicate rather than a copy of it), the verbatim line is:
+
+  > `horizon equivalence: 697968 cases | ref-vs-new 6 | new-vs-exact 0 | ref-vs-exact 6 | of the ref-vs-new, 6 are the rewrite KEEPING a chunk the float code culled | 139514 culled by the reference | ...`
+
+  So 697,968, the six, and 139,514 are all live output, and the six are confirmed to be the
+  rewrite keeping a chunk rather than dropping one. One caveat on how tightly they are held:
+  the counts are **printed, not pinned**. The only assertion over the case count is the control
+  `CHECK(s_cases > 500000)`, so a change to `CHUNK_DIM` or to the sweep bounds would move these
+  figures without turning the suite red — re-read the printed line rather than assuming it.
+  These are host numbers about a predicate, not a performance claim, so nothing here depends on
+  hardware; the *benefit* of the fix on a console remains unmeasured, as does everything since
+  v1.7.1.
 - **A save-corruption path in region compaction.** `regionCompact()` read only the live directory
   copy, so a column whose newest payload had been torn by a power cut was dropped from the repack
   *and* its recoverable older copy deleted. It now falls back to the older entry exactly as the
@@ -345,11 +398,52 @@ than claiming a fix that was never made.
   reverted with the numbers left at the call site. What did land is one integer division removed
   from the fBm inner loop, taking `__aeabi_ldivmod` from 2 calls to 0 in the shipped ARM object —
   8.1 million library calls per load, though what that is worth in cycles is unmeasured.
+
+  **Provenance (added 2026-08-25).** The parenthesised codegen figures — "508 to 535
+  instructions, 94 to 101 multiplies, host -10.5%" — are an **untraceable one-off**. An audit on
+  2026-08-25 found no instruction-counting tool anywhere in `tools/`, no objdump wrapper, no
+  committed disassembly and no saved counts, so nothing in this repository produces or checks
+  them and no one can re-derive them without rebuilding the reverted branch by hand. They were
+  taken during the v1.7.1 session on 2026-08-24 and written straight into this entry. Treat them
+  as a **recorded observation, not a measurement you can stand on**: the direction they claim
+  (hand-factoring was slower) is what justified the revert, and that decision is not being
+  reopened here, but the specific numbers should not be quoted as if a benchmark backs them.
+  Deliberately left in place rather than deleted, and deliberately not re-benchmarked. The
+  `__aeabi_ldivmod` "2 calls to 0" claim in the same bullet is a different kind of statement —
+  it is a property of the shipped ARM object and could be re-checked by disassembling it — but
+  no such check is committed either, and the sentence already says the cycle cost is unmeasured.
 - **Region compaction is still not wired to anything**, and that is deliberate rather than
   forgotten. It is proven correct and crash-safe on the host (9,289 to 7,134 bytes, arena 3,113 to
   958, 69% reclaimed), but its `remove()` then `rename()` window depends on `.tmp` durability on
   an SD card and on `rename()` behaving on libctru's sdmc devoptab. Nothing in the region writer
   fsyncs, and neither property can be tested anywhere except on the console.
+
+  **Correction (2026-08-25).** The headline of this bullet is **no longer true, and the retraction
+  belongs here as well as under 1.8.2 below.** Region compaction *is* wired now. `regionMaintain()`
+  (`source/world/region.c:740-748`) calls `regionCompact()`, and `workerWriteSave` calls
+  `regionMaintain` on the worker thread straight after `regionWriteColumn`
+  (`source/app/worker.c:199`). That landed in 1.8.2 and was never recorded in the 1.8.0, 1.8.1 or
+  1.8.2 entries, so this paragraph stood as the newest word on the subject for three releases
+  while the opposite was shipping. It is now recorded under 1.8.2. The `remove()`-then-`rename()`
+  window described above is not merely accepted either: the sequence renames the old file aside
+  to `.bak` first and removes it last, so recovery no longer depends on freshly written bytes
+  being on the card (`source/world/region.h:85-93`). The durability caveat that remains is the
+  honest half — every figure below and in 1.8.2 is a host number taken on ext4 through WSL
+  (`region.h:95-100`), and nothing since v1.7.1 has run on a real console.
+
+  **Provenance (added 2026-08-25).** The figures in the sentence above — "9,289 to 7,134 bytes,
+  arena 3,113 to 958, 69% reclaimed" — are an **unreproducible one-off host figure**. They match
+  neither set of numbers the tree carries today. `source/world/region_growth_test.c` measures
+  482,885 bytes on disk holding 19,452 live, compacting to 43,883 bytes, 11x smaller, 36
+  compactions (`source/world/region.h:45-51`); and the *earlier, invalidated* fixture result that
+  the same header explicitly warns against resurrecting was 21,763 bytes, 22x, 56 compactions
+  (`region.h:63-73`). This entry's 9,289 / 7,134 / 3,113 / 958 / 69% is a **third, untethered
+  set** on some smaller workload that was never described here, never committed as a fixture and
+  cannot now be identified. No raw log, CSV or test artifact exists for it anywhere in the tree.
+  Left in place as history — do **not** quote it as the cost or benefit of compaction, and do not
+  reconcile it against `region_growth_test.c`, because they are not measuring the same thing.
+  Deliberately not re-benchmarked: the current numbers already have a committed fixture behind
+  them and re-running this one would invent a fourth set rather than recover the original.
 - **Whether the main thread stalls waiting for a save slot is now observable, not answered.**
   `workerSubmitSave()` sleeps the main thread in 1 ms steps waiting for one of two slots, on a
   worker pinned to the same core. The geometry that justified two slots is wrong — one
@@ -436,6 +530,16 @@ release where a server-defined block actually becomes a thing you can see, stand
 with, and consequently the release where every place that quietly assumed there are exactly
 eight block types had to be found and fixed. Several of those were live defects rather than
 hypotheticals; each is listed below by what it did, not by what it was.
+
+**Note (added 2026-08-25): the minimap was not removed in this release.** It was removed in
+**1.5.1**, in commit `f5aa0f8`, and it is recorded under 1.5.1 → Removed below — the earliest tag
+containing that commit is `v1.5.1`, so there is no ambiguity about which release shipped the cut.
+Five comments in `source/main.c` attributed the removal to 1.6.0 and were corrected on 2026-08-25;
+this note exists so that anyone who read one of them before the correction, or who finds the
+attribution surviving somewhere else, lands on the right version rather than searching this entry
+for a removal it never contained. Nothing about the feature or the reasons it was cut has changed:
+`scene/minimap.c` data-aborted a real console on the first pixel it drew, and the touch-screen map
+in the spec is a fresh build rather than a repair of that one.
 
 ### Added
 
@@ -541,6 +645,18 @@ hypotheticals; each is listed below by what it did, not by what it was.
   stores its V coordinate in a byte. Not a constraint on anything today — the registry protocol
   has no texture upload, so a server-defined block can only reference a tile the client already
   ships.
+
+  **Correction (2026-08-25).** This limitation was **lifted in 1.8.2** and this entry was never
+  annotated, so it read as current for three releases. The sheet now holds **64 slots: twelve
+  painted, one permanently reserved as the missing-texture marker, and 51 free** — see the 1.8.2
+  entry above. The diagnosis here was right and is worth keeping: the ceiling was never the sheet,
+  it was `MeshVertex.v` holding an atlas pixel row, which a `uint8_t` caps at 256 px, i.e. 16
+  slots with the top one's upper edge falling off the end. That byte now counts **slot edges**
+  rather than pixels and the `TILE_PX` factor moved into the shaders' `uvScale.y`, so the sheet
+  grew to 16x1024 with the vertex still 8 bytes. 1024 is the PICA200's maximum texture dimension,
+  so 64 is the most this one-tile-wide design can ever have. The second sentence still holds
+  unchanged: the registry protocol has no texture upload, so a server-defined block can still only
+  reference a tile the client already ships.
 - **Whether an Old 3DS holds 60 fps at radius 3 is unknown.** It submits roughly 1.9× the
   triangles of radius 2 before culling. This machine has no GPU and the emulator does not model
   one, so nothing measured here makes radius 3 safe — it makes it available. That is why the

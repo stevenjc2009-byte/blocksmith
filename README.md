@@ -55,7 +55,10 @@ install anything, `blocksmith.3dsx` runs from the Homebrew Launcher instead.
 * **Worlds that persist.** A region save format with CRC32 checksums and
   torn-write recovery, so a power cut during a write costs you that one region
   and nothing else.
-* **Multiple worlds**, created and picked from a title screen.
+* **Multiple worlds**, created and picked from a title screen. They keep their
+  own saved edits, but not their own terrain: single-player worlds currently
+  share one fixed seed, so a newly created world starts out as the same
+  landscape as every other one. Per-world seeds are planned.
 * **Multiplayer.** Connect from the title screen and you are in the server's
   world — its seed, and every block edit anyone has made in it. Terrain is never
   transmitted: each console generates the same landscape from the same seed and
