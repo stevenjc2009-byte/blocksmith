@@ -36,6 +36,48 @@ static void check(bool cond, const char *what)
 	}
 }
 
+// How many check() calls this suite makes on a healthy tree. A LITERAL on purpose.
+//
+// Every suite in this project used to end at "0 failed" and nothing else, which means a
+// check that never RUNS is indistinguishable from a check that passes. Measured, not
+// theorised: a sabotage that shortened a production-constant-bounded loop in the net suite
+// took its count from 326 to 318 and the suite reported "0 failed". Eight checks were
+// deleted and it called that a pass.
+//
+// The number below must never be computed from a production constant, a loop bound, or
+// anything else the code under test can also move — a pin that shrinks alongside the thing
+// it is pinning is exactly the bug it exists to catch.
+//
+// Legitimately adding or removing a check means editing this by hand. The suite going red
+// until you do is deliberate friction, not an accident.
+#define REGISTRY_TEST_EXPECTED_CHECKS 53
+
+// Deliberately NOT routed through check(): this must not perturb the number it is testing,
+// so it bumps g_fails only. Reporting shape is check()'s, so a failure here reads the same
+// way every other failure in this file does.
+static void checkCountPin(void)
+{
+	if (g_checks == REGISTRY_TEST_EXPECTED_CHECKS)
+		return;
+
+	g_fails++;
+	if (g_checks < REGISTRY_TEST_EXPECTED_CHECKS)
+		printf("  FAIL   CHECK COUNT: %d check(s) WENT MISSING - expected %d, ran %d.\n"
+		       "         They did not fail. They never ran: a loop bound shrank, an early\n"
+		       "         return or a continue fired, or a check was deleted. The checks that\n"
+		       "         did run passing tells you nothing about the ones that did not.\n"
+		       "         Find them. Do NOT re-pin REGISTRY_TEST_EXPECTED_CHECKS to go green.\n",
+		       REGISTRY_TEST_EXPECTED_CHECKS - g_checks,
+		       REGISTRY_TEST_EXPECTED_CHECKS, g_checks);
+	else
+		printf("  FAIL   CHECK COUNT: %d check(s) were ADDED - expected %d, ran %d.\n"
+		       "         If you added them on purpose, set REGISTRY_TEST_EXPECTED_CHECKS in\n"
+		       "         source/world/registry_test.c to %d. If you did not, something is\n"
+		       "         running checks more times than it should.\n",
+		       g_checks - REGISTRY_TEST_EXPECTED_CHECKS,
+		       REGISTRY_TEST_EXPECTED_CHECKS, g_checks, g_checks);
+}
+
 // A dyn def with a distinct name and stone faces everywhere, solid. Returns the
 // packed def rather than registering it, so tests control when/whether that happens.
 static BlockDef makeDef(const char *name)
@@ -264,6 +306,8 @@ int main(void)
 	testRegistryCoreIdsStable();
 	testRegistryCrcStability();
 	testRegistrySidecar();
+
+	checkCountPin();
 
 	printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL",
 	       g_checks, g_fails);

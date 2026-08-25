@@ -35,6 +35,62 @@ static char s_first[160];
 		}                                                                        \
 	} while (0)
 
+// How many CHECK()s this suite makes on a healthy tree. A LITERAL on purpose.
+//
+// This suite is the one in source/world where the hazard is real rather than theoretical:
+// its check count is driven by production constants. testAddToEmpty loops to
+// INV_SLOT_COUNT, testEveryRecipeCrafts and its insufficient-inputs twin loop to
+// RECIPE_COUNT, and the latter carries an `if (r->input_count == 0) continue;`. Shrink any
+// of those in the real headers and checks stop RUNNING rather than start FAILING — and a
+// suite that only reports failures calls that a pass. Measured elsewhere in this project:
+// a shortened production-constant-bounded loop took the net suite from 326 checks to 318
+// and it printed "0 failed".
+//
+// So this number is never derived from INV_SLOT_COUNT, RECIPE_COUNT or anything else the
+// code under test can move. A pin computed from the constant it is pinning shrinks with the
+// sabotage and guards nothing.
+//
+// Legitimately adding or removing a CHECK means editing this by hand. The suite going red
+// until you do is deliberate friction, not an accident.
+#define INVENTORY_TEST_EXPECTED_CHECKS 180
+
+// Deliberately NOT routed through CHECK(): this must not perturb the number it is testing,
+// so it bumps s_fails only. It fills s_first (with both numbers, so the one-line summary is
+// self-explanatory) and prints the detail above that summary.
+static void checkCountPin(void)
+{
+	if (s_checks == INVENTORY_TEST_EXPECTED_CHECKS)
+		return;
+
+	s_fails++;
+	if (s_checks < INVENTORY_TEST_EXPECTED_CHECKS) {
+		printf("CHECK COUNT: %d check(s) WENT MISSING - expected %d, ran %d.\n"
+		       "  They did not fail. They never ran: a loop bound shrank, an early return or\n"
+		       "  a continue fired, or a CHECK was deleted. The checks that did run passing\n"
+		       "  tells you nothing about the ones that did not. Find them. Do NOT re-pin\n"
+		       "  INVENTORY_TEST_EXPECTED_CHECKS to go green.\n",
+		       INVENTORY_TEST_EXPECTED_CHECKS - s_checks,
+		       INVENTORY_TEST_EXPECTED_CHECKS, s_checks);
+		if (!s_first[0])
+			snprintf(s_first, sizeof(s_first),
+			         "CHECK COUNT: %d checks MISSING (expected %d, ran %d) - see above",
+			         INVENTORY_TEST_EXPECTED_CHECKS - s_checks,
+			         INVENTORY_TEST_EXPECTED_CHECKS, s_checks);
+	} else {
+		printf("CHECK COUNT: %d check(s) were ADDED - expected %d, ran %d.\n"
+		       "  If you added them on purpose, set INVENTORY_TEST_EXPECTED_CHECKS in\n"
+		       "  source/world/inventory_test.c to %d. If you did not, something is running\n"
+		       "  checks more times than it should.\n",
+		       s_checks - INVENTORY_TEST_EXPECTED_CHECKS,
+		       INVENTORY_TEST_EXPECTED_CHECKS, s_checks, s_checks);
+		if (!s_first[0])
+			snprintf(s_first, sizeof(s_first),
+			         "CHECK COUNT: %d checks ADDED (expected %d, ran %d) - re-pin to %d",
+			         s_checks - INVENTORY_TEST_EXPECTED_CHECKS,
+			         INVENTORY_TEST_EXPECTED_CHECKS, s_checks, s_checks);
+	}
+}
+
 // MinGW's <sys/stat.h> declares the one-argument MSVC mkdir; POSIX takes a mode. Copied
 // from app/options_test.c's testMkdir, which copied it from world/world_test.c — same
 // "this only runs on the host, and the host might be either" problem, solved the same way
@@ -542,6 +598,8 @@ int main(void)
 	testCrashRecovery();
 
 	testCleanup();
+
+	checkCountPin();
 
 	if (s_fails == 0)
 		printf("inventory self-test: PASS  %d checks\n", s_checks);
