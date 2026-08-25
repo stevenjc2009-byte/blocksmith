@@ -6,9 +6,10 @@ copied from another game. The palette is deliberately its own: cooler greens and
 a redder soil than the obvious reference, so the look reads as Blocksmith's.
 
 Layout (v1.6.0 task 11 prerequisite): a ONE-TILE-WIDE STRIP. 16 px wide by
-256 px tall, 16 tile slots of 16x16 stacked vertically, no padding anywhere.
-Was a 128x128 sheet holding a 6x6 grid of 20x20 cells (16px of art inside a 2px
-edge-extended border) up to v1.5.1.
+1024 px tall, 64 tile slots of 16x16 stacked vertically, no padding anywhere.
+It was 16x256 — 16 slots — from v1.6.0 until v1.8.2's task 13b raised it, and
+before that, up to v1.5.1, a 128x128 sheet holding a 6x6 grid of 20x20 cells
+(16px of art inside a 2px edge-extended border).
 
 Why the strip. Greedy meshing merges N co-planar faces into one quad, and that
 quad needs the tile to REPEAT N times across it. On a packed grid it cannot:
@@ -30,13 +31,35 @@ its header (measured, byte 5 of the file). source/gfx/atlas.c also asks for
 GPU_NEAREST on both the min and the mag filter, which is not a mipmapped filter
 mode, so no level beyond the base is ever sampled.
 
-Why 16 slots but only 15 addressable. MeshVertex.u/v are uint8_t (the format is
-locked — see source/world/mesh_vertex.h), so a tile's TOP edge v1 must fit in
-255. The topmost slot in texture space would need v1 = 256, which does not fit,
-so slot 15 is left unaddressable. TILES holds 12, so there are 3 spare
-addressable slots — 12 and 13, plus the reserved MARKER_SLOT 14, which is not
-really spare at all. The next step up is a 16x512 sheet: 32 slots, 31
-addressable, 16 KB of VRAM instead of 8 KB.
+Why all 64 slots are addressable. Until v1.8.1 this said "16 slots but only 15
+addressable", and the reason was the vertex format rather than the sheet:
+MeshVertex.u/v are uint8_t (the format is locked — see
+source/world/mesh_vertex.h) and v held a raw atlas PIXEL offset, so a tile's TOP
+edge v1 had to fit in 255. Sixteen slots' worth of pixels is exactly where that
+byte ran out — the topmost slot needed v1 = 256 — so the top slot was left
+unaddressable and the sheet was capped at 15 usable slots however tall it grew.
+That constraint no longer applies. v1.8.2's task 13b changed the field's UNITS
+rather than its width: vslot0/vslot1 now hold a SLOT-EDGE INDEX — the tile
+number, and tile + 1 for the top edge — and the TILE_PX factor that used to be
+baked into the byte moved into uvScale.y in both vertex shaders. The largest
+edge index this sheet can produce is 64, which fits a uint8_t with room to
+spare, so nothing overflows and every slot is addressable. The vertex is still
+8 bytes, the stride is unchanged and the attribute configuration was not
+touched.
+
+Why 64 is the end of the line. The limiter is now the HARDWARE, and unlike the
+byte it cannot be worked around. citro3d's checkTexSize rejects any texture
+dimension outside 8..1024 inclusive and any dimension that is not a power of
+two, testing the two dimensions independently — which is what makes a 64:1
+strip legal in the first place, and also what makes 1024 px the tallest this
+sheet will ever be. At 16 px a slot that is 64 slots, permanently. TILES holds
+12 of them (0..11) and MARKER_SLOT 63 is reserved forever, so there are exactly
+51 free slots for the rest of the project's life. Past that the sheet cannot
+simply be made taller: the next tile has to come from reclaiming a slot, from a
+second sheet the way gfx/crackatlas.png is one, or from widening the sheet in U
+— and widening U means re-deriving the greedy mesher's GPU_REPEAT trick, not
+editing a constant. place() refuses with that same explanation rather than
+leaving it as a comment somebody can walk past.
 
 Why every unused slot is painted (v1.6.0 F7). It used to be left at the sheet's
 background fill, and that was a defect: the slots above the painted ones are REAL,
@@ -132,9 +155,10 @@ TILES = [
     # TILE_* enum and world/block.h's BTEX_* mirror of it), and inserting would
     # silently re-texture every tile after the insertion point.
     #
-    # These claim slots 10 and 11 of the four that were free (10..13). 12 and 13
-    # stay as the missing-texture marker, which is what an unclaimed slot is
-    # supposed to look like, and MARKER_SLOT (14) cannot be claimed at all.
+    # These claim slots 10 and 11. Since task 13b lifted the sheet to 64 slots that
+    # leaves 12..62 — fifty-one of them — still carrying the missing-texture marker,
+    # which is what an unclaimed slot is supposed to look like, and MARKER_SLOT (63)
+    # cannot be claimed at all.
     "water",
     "tall_grass",
 ]
@@ -512,7 +536,7 @@ def tile_missing(_rng):
     screen a 2px checker blurs to flat pink while four half-tile quadrants stay
     four blocks, so they are told apart on sight.
 
-    Takes no randomness, and that is load-bearing: the ten painted tiles are
+    Takes no randomness, and that is load-bearing: the twelve painted tiles are
     drawn from one seeded stream in TILES order, so a marker that pulled from it
     would shift every tile after it and silently change the art.
     """
@@ -606,9 +630,11 @@ def main() -> None:
     # Every slot starts as the missing-texture marker, and art is blitted over the ones TILES
     # names. Painting the marker FIRST rather than filling only the leftovers afterwards means
     # there is no way to add a slot and forget it, and it is done before the TILES loop so the
-    # marker cannot touch the seeded stream the art is drawn from. Note this covers slot 15 as
-    # well, which place() will not accept: it is unaddressable today, but leaving one slot of
-    # background fill on the sheet keeps the trap armed for whoever next grows ATLAS_H_PX.
+    # marker cannot touch the seeded stream the art is drawn from. Note this covers MARKER_SLOT
+    # (63) as well, which place() will not accept. That slot is perfectly addressable — since
+    # task 13b every slot is — it is simply reserved, and it is the one slot atlasRect() aims
+    # out-of-range tile ids at deliberately, so it is the last one on the sheet that may be
+    # left as background fill.
     marker = tile_missing(None).convert("RGBA")
     for index in range(SLOTS):
         atlas.paste(marker, (0, slot_png_y(index)))

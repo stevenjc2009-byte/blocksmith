@@ -1,7 +1,10 @@
 // The block texture atlas.
 //
-// One 16x256 RGBA5551 strip: sixteen 16x16 tile slots stacked vertically with no
-// padding between them, fifteen of them addressable. It is one tile wide so that
+// One 16x1024 RGBA5551 strip: sixty-four 16x16 tile slots stacked vertically with
+// no padding between them, and since v1.8.2's task 13b every one of them is
+// addressable. It was 16x256 with sixteen slots, fifteen addressable, from v1.6.0
+// to v1.8.1. 1024 px is the PICA200's maximum texture dimension, so 64 is a
+// permanent ceiling rather than the current size. It is one tile wide so that
 // GPU_REPEAT in U has a period of exactly one tile, which is what lets greedy
 // meshing merge co-planar faces into a single quad and still have the tile repeat
 // across it. world/atlas_uv.h holds the full reasoning and the arithmetic.
