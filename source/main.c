@@ -57,6 +57,7 @@
 #include "scene/title.h"
 #include "scene/ui.h"
 #include "world/budget.h"
+#include "world/genrefuse.h"
 #include "world/handbuilt.h"
 #include "world/inventory.h"
 #include "world/jobq.h"
@@ -537,6 +538,23 @@ static bool s_server_session = false;
 // "was the thing that just ended a server world?" rather than "is the thing about to start
 // one?". Its only job is to decide which screen the menu opens on — see runTitleScreen.
 static bool s_left_server = false;
+
+// v1.8.3. Why the world the player just picked would not open, or NULL when nothing refused it.
+// Set by genStart() below and carried, exactly like s_left_server above, across the one lap back
+// to the menu that has to say it — cleared the moment runTitleScreen has put it on screen.
+//
+// A `const char*` rather than a buffer because every value it can hold is a string literal out
+// of world/genrefuse.h with static storage duration, so there is nothing here that can dangle
+// and nothing to copy. It lives beside s_left_server because it is the same kind of thing: a
+// one-shot fact about the session that just ended, whose only reader is the menu.
+static const char* s_world_refused_why = NULL;
+
+// How long that line stays on the menu, in frames — ~6 s at the project's measured 59.83 fps.
+// The same budget scene/title.c gives its own error lines (its WORLD_ERROR_STATUS_TTL, and for
+// the same reason stated there: a message the player has to read *and act on* needs longer than
+// one they can glance at). Spelled out again here rather than shared because scene/title.h does
+// not export that constant; if either moves, move both.
+#define WORLD_REFUSED_STATUS_TTL 360
 
 static const char* saveWorldDir(void)
 {
@@ -1107,6 +1125,11 @@ static void bsDebugRegister(void)
 // the loop starts.
 static bool genStart(int32_t cx, int32_t cz)
 {
+	// v1.8.3. Cleared on the way IN, before anything can set it, rather than by whoever reads it.
+	// A refusal is a fact about THIS attempt at THIS world; one left standing from the previous
+	// attempt would be put on the menu after a world that opened perfectly well.
+	s_world_refused_why = NULL;
+
 	// Which world this is, decided here and nowhere else. In a session the server owns the
 	// seed and sends it as BS_APP_WORLD_INFO right after JOIN (net/networld.h): the terrain is
 	// never transmitted, so generating from anything other than the server's seed would put
@@ -1150,9 +1173,20 @@ static bool genStart(int32_t cx, int32_t cz)
 	// generating a stamped world at the wrong version writes the wrong landscape under the
 	// player's buildings, and there is no way to tell that apart afterwards from the world
 	// corruption it looks exactly like.
-	if (gv == GENVER_TOO_NEW || gv == GENVER_DAMAGED) {
-		printf("world refused: generator %lu %s\n", (unsigned long)gen_version,
-		       gv == GENVER_TOO_NEW ? "is newer than this build" : "stamp is unreadable");
+	//
+	// v1.8.3. This line used to be an `if` naming TOO_NEW and DAMAGED by hand, and that shape is
+	// what let GENVER_STAMP_FAILED ship doing nothing: 82d4a1e added the status with a red/green
+	// test behind it and no expression anywhere in this file mentioned it, so a world whose stamp
+	// the card refused fell past the test and loaded. world/genrefuse.h is the same question
+	// asked as a switch over the whole enum, so the next status added cannot repeat it — it stops
+	// the build instead. See that file for why it is not in genversion.c.
+	//
+	// The message is stashed rather than only printed. printf goes to a console nobody is looking
+	// at on a retail 3DS; the player gets s_world_refused_why on the menu, below.
+	const char* const refusal = genVersionRefusalText(gv);
+	if (refusal) {
+		printf("world refused: generator %lu (%s)\n", (unsigned long)gen_version, refusal);
+		s_world_refused_why = refusal;
 		loadprofSince(LOAD_STAGE_SETUP, t_setup);
 		return false;
 	}
@@ -1162,6 +1196,7 @@ static bool genStart(int32_t cx, int32_t cz)
 		// is the same predicate asked twice, on purpose, at the one other place a WorldGen can
 		// come into existence.
 		printf("world refused: generator %lu unknown\n", (unsigned long)gen_version);
+		s_world_refused_why = "world could not be started";
 		loadprofSince(LOAD_STAGE_SETUP, t_setup);
 		return false;
 	}
@@ -1219,6 +1254,12 @@ static bool genStart(int32_t cx, int32_t cz)
 	workerSetWorldDir(world_dir);
 
 	if (!workerStart(&s_gen)) {
+		// The third and last way out of this function, and it gets a reason for the same reason
+		// the two above do: `false` from here means the same thing to the caller — there is no
+		// world to walk into — so the player must be told something rather than watching a bar
+		// that can never fill. Nothing more specific than this is honest; app/worker.h's failure
+		// is "the thread would not start", which is not a fault the player can act on.
+		s_world_refused_why = "world could not be started";
 		loadprofSince(LOAD_STAGE_SETUP, t_setup);
 		return false;
 	}
@@ -2492,6 +2533,23 @@ static bool runTitleScreen(Options* opts, bool returning_from_server)
 	titleInit(&ts);
 	if (returning_from_server) ts.screen = TITLE_SCR_MULTIPLAYER;
 
+	// v1.8.3. The sentence the player gets when the world they picked would not open — see
+	// s_world_refused_why and world/genrefuse.h. Written straight into the state titleInit just
+	// zeroed, the same way the screen above it is: scene/title.c owns the status line's layout
+	// and its countdown, and this is the one caller that has something to put on it before the
+	// first frame is drawn. It lands on the MAIN screen, which is where the menu opens from here,
+	// and scene/title.c's drawMain draws it there.
+	//
+	// Consumed, not just read: cleared so the next trip back to the menu — after a world that
+	// opened fine, or after a server session — does not repeat a refusal the player has already
+	// been told about. The message itself is a string literal with static storage duration, so
+	// the copy below is about the TTL, not about lifetime.
+	if (s_world_refused_why) {
+		snprintf(ts.status, sizeof(ts.status), "%s", s_world_refused_why);
+		ts.status_ttl = WORLD_REFUSED_STATUS_TTL;
+		s_world_refused_why = NULL;
+	}
+
 	while (aptMainLoop()) {
 		hidScanInput();
 
@@ -3203,6 +3261,29 @@ session_start:
 	                                have_saved_pose ? genColumnOf(saved_pose.z) : 0);
 	BOOT_END("genStart");
 
+	// v1.8.3. genStart() returning false has always meant "there is no world to walk into", and
+	// until now nothing acted on it. worker_ok gated the sleep hooks below and fed WORLD_INTACT()
+	// on the world report, and that was all: control carried straight on into runLoadingScreen(),
+	// which then waited for columns from a worker that was never started until scene/loading.c's
+	// LOADING_STALL_FRAMES (900 frames, ~15 s at the measured 59.83 fps) turned it into "no
+	// progress" and offered a way out. So a refused world cost the player a quarter-minute stare
+	// at a bar stuck on 0% and then dropped them out of the game entirely, with the only
+	// explanation printf'd to a console a retail 3DS has no way to show.
+	//
+	// Named separately from worker_ok rather than testing worker_ok twice, because the two are
+	// different questions that happen to share an answer today: worker_ok is "is there a thread
+	// writing this world", which is what the sleep hooks and the world report want, and this is
+	// "should the player be put back on the menu", which is what the three lines below want. They
+	// are pinned together here, in one place, instead of at each use.
+	const bool world_refused = !worker_ok;
+	if (world_refused && !s_world_refused_why) {
+		// genStart sets a reason on every one of its three false returns, so this is belt and
+		// braces for a fourth added later without one. A refusal with no sentence is still far
+		// better than the stall it replaces — but it must never be a refusal with a NULL that
+		// the menu code below would have to guard.
+		s_world_refused_why = "world could not be started";
+	}
+
 	// v1.6.0. From here until workerStop() below there is a world in memory and a worker
 	// able to write it, which is exactly the window in which closing the lid should flush.
 	// Registered on worker_ok and nowhere else: with no worker, sleepFlushOneColumn() would
@@ -3234,11 +3315,23 @@ session_start:
 	// us. That is not an early return — the world, the worker and the card all exist by now, so
 	// it drops through into the normal main loop, which breaks immediately and takes the usual
 	// save-and-shutdown path out.
-	if (!runLoadingScreen(ui_ok,
+	//
+	// v1.8.3. Not entered at all for a refused world, and that is the half of the fix the player
+	// actually feels. There is no worker, so genColumnsInstalled() can only ever answer 0 and
+	// every frame spent in here is a frame spent waiting for something that is not coming; the
+	// screen's own stall detector would eventually say so, ~15 s later, in a sentence about
+	// columns rather than about the world's version. quit_requested instead takes the same route
+	// a player who gave up on a stalled load already takes — one pass of the game loop below,
+	// which breaks immediately — with the difference that quit_to_title is set from
+	// world_refused, so the loop's teardown ends on the menu instead of on app_shutdown.
+	if (!world_refused &&
+	    !runLoadingScreen(ui_ok,
 	                       s_server_session   ? "JOINING WORLD"
 	                       : world_played_before ? "LOADING WORLD" : "CREATING WORLD",
 	                       s_server_session ? netServerAddress() : s_world_name))
 		quit_requested = true;
+
+	if (world_refused) quit_requested = true;
 
 	// v1.7.1 task 48b. The load is over: the ring is full, its geometry is built and the next
 	// frame is one the player can move in. Stopped and written here rather than at the top of
@@ -3275,6 +3368,18 @@ session_start:
 	s_genr = (GenResult){0};
 	const bool handbuilt_ok = handbuiltFill(&s_world);
 	s_genr.mesh_refused = meshHandbuilt();
+
+	// v1.8.3. The other arm of the world_refused declared beside genStart above, for the same
+	// reason menu_quit has one: everything that reads it — quit_to_title's initialiser and the
+	// two saves on the way out — is below this #endif and is compiled in both configurations, so
+	// a name that existed in only one of them would break the build nobody runs by hand.
+	//
+	// Always false here, and that is not a stub. Refusing is a decision about a world's stored
+	// generator version, and a BS_WORLD_GEN=0 build has no stored world at all: handbuiltFill()
+	// builds the same fixed test scene into memory every launch, there is no world directory,
+	// no stamp, and nothing on a card that this build could be inconsistent with. handbuilt_ok
+	// covers the one way that can fail and already feeds WORLD_INTACT() below.
+	const bool world_refused = false;
 #endif
 
 	// Runs once, before the first frame, so the numbers on screen are a completed
@@ -3675,7 +3780,16 @@ session_start:
 	// exits that existed before this menu were HOME and a lost server session, and both of
 	// those genuinely end the session. Quit does not — it means "put me back on the title
 	// screen", which is where choosing another world and quitting the app both live.
-	bool quit_to_title = false;
+	//
+	// v1.8.3. Initialised from world_refused rather than from `false`, and that is the whole
+	// reason the refusal takes this route instead of a `goto` from up beside genStart. "Put me
+	// back on the title screen" is exactly what a world that would not open needs, the code that
+	// does it correctly already exists, and every line of teardown between the loop and that goto
+	// runs on the way — pauseMenuClose, the sleep hooks (whose own comment at the clear already
+	// anticipates "a hook that was never set because genStart() failed"), workerStop,
+	// watchdogStop, networldSetWorld(NULL), chunkRenderReleaseAll, worldExit. A jump that skipped
+	// them is what main.c's comment beside sleepSetFlushHook(NULL) calls a crash on lid-close.
+	bool quit_to_title = world_refused;
 
 #if BS_BOTTOM_UI
 	// Last frame's touch_down, kept across iterations so the screens layered over the pause
@@ -4570,7 +4684,13 @@ session_start:
 	// A failed save is counted by nobody and retried by nobody, same as a failed region
 	// write — inventory.h says as much — because stalling the quit to retry is worse than
 	// losing the last session's pickups.
-	if (inv_dir) inventorySave(&s_inv, inv_dir);
+	//
+	// v1.8.3. And not for a world that was refused. The whole of world/genversion.h is one rule —
+	// a world this build cannot account for is left exactly as it was found — and a refusal that
+	// wrote an inventory file into it on the way out would break that rule in the one direction
+	// it cannot afford: the world was never entered, so anything written here describes a session
+	// that did not happen. Same test on the pose immediately below.
+	if (inv_dir && !world_refused) inventorySave(&s_inv, inv_dir);
 
 	// v1.7.1 task 46b, and deliberately on this exact line rather than anywhere else on the
 	// main thread. app/worker.h:92-97 allows exactly one thread inside the SD's FS service
@@ -4588,7 +4708,13 @@ session_start:
 	// here: "Quit to title" from the pause menu, a HOME exit, a power-off, and a lost server
 	// session. The lid-close case is the one that does not, and sleepFlushOneColumn() above
 	// is where that one is answered.
-	if (inv_dir) {
+	//
+	// v1.8.3: `&& !world_refused`, for the reason on the inventory save above, and here it is not
+	// only a principle. A refused world still reaches this line with a `player` that was built at
+	// the generator's spawn point, so without the test a world made by a newer build would have
+	// had its saved pose overwritten with (8.5, y, 8.5) by the very code that refused to open it
+	// — the player's position lost by the safety check, on a world it could not otherwise touch.
+	if (inv_dir && !world_refused) {
 		const PlayerPose pose = { player.body.x, player.body.y, player.body.z,
 		                          player.cam.yaw, player.cam.pitch };
 		(void)playerPoseSave(&pose, inv_dir);

@@ -28,6 +28,7 @@
 #include "world/worldgen.h"
 #include "world/worldgen_density.h"
 #include "world/genversion.h"
+#include "world/genrefuse.h"
 
 // Big enough to matter on a 32 KB console stack, and only ever one of each.
 static World       s_world;
@@ -9068,6 +9069,28 @@ static long genverSize(const char* dir)
 	return n;
 }
 
+// v1.8.3. Slurps a source file so a test can assert on its TEXT. Needed for exactly one thing —
+// checking that source/main.c really routes the refusal — and copied in shape from the same
+// helper in source/app/session_test.c, which exists for the same reason: main.c cannot be linked
+// into a host binary (it owns main(), pulls in <3ds.h>, and every module below it is stubbed
+// here), so the only way to test that a decision is wired into the boot path is to read it.
+// Caller frees.
+static char* genverReadWholeFile(const char* path)
+{
+	FILE* f = fopen(path, "rb");
+	if (!f) return NULL;
+	if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+	const long n = ftell(f);
+	if (n <= 0) { fclose(f); return NULL; }
+	rewind(f);
+	char* buf = (char*)malloc((size_t)n + 1);
+	if (!buf) { fclose(f); return NULL; }
+	const size_t got = fread(buf, 1, (size_t)n, f);
+	fclose(f);
+	buf[got] = '\0';
+	return buf;
+}
+
 static void testGenVersionSidecar(void)
 {
 	char dir[256];
@@ -9271,6 +9294,175 @@ static void testGenVersionSidecar(void)
 		CHECK(genverSize(inside) == -1);   // and nothing was stamped anywhere
 
 		remove(blocked);
+	}
+
+	// ══ v1.8.3: the REFUSAL, which is what every status above is for ═══════════════════
+	//
+	// Everything before this point tests what genVersionResolve() decides. None of it tests
+	// whether anything ACTS on the decision, and that gap is not hypothetical: 82d4a1e added
+	// GENVER_STAMP_FAILED with the red/green arm above proving it is returned, and main.c gated
+	// the refusal on `if (gv == GENVER_TOO_NEW || gv == GENVER_DAMAGED)` — an expression that
+	// names two statuses by hand. The new one fell straight through it and the world loaded
+	// anyway. A returned value with nothing reading it is not a fix, and this suite could not
+	// see the difference.
+	//
+	// So the decision is now a total function over the enum in world/genrefuse.h, and these are
+	// its tests. Read that file's comment for why a switch with no default is the mechanism: it
+	// turns "a new status nobody routed" from a silent wrong answer into a -Wswitch/-Werror
+	// build failure, which is a stronger guarantee than any check below.
+	{
+		// ── 1. The predicate, over every enumerator that exists. ─────────────────────
+		//
+		// Written out one enumerator at a time rather than looped, so a red run names WHICH
+		// status stopped being routed. The two non-refusals are the CONTROL: they must stay
+		// green whatever happens to the three refusals, which is what makes a red run here
+		// isolate the routing rather than the file failing to compile or link.
+		CHECK(genVersionRefusalText(GENVER_OK) == NULL);
+		CHECK(!genVersionRefuses(GENVER_OK));
+		CHECK(genVersionRefusalText(GENVER_NO_WORLD_DIR) == NULL);
+		CHECK(!genVersionRefuses(GENVER_NO_WORLD_DIR));
+
+		CHECK(genVersionRefuses(GENVER_TOO_NEW));
+		CHECK(genVersionRefuses(GENVER_DAMAGED));
+		CHECK(genVersionRefuses(GENVER_STAMP_FAILED));
+
+		// ── 2. What the player is actually shown. ────────────────────────────────────
+		//
+		// Three requirements, and each one is a real failure mode rather than a tidiness
+		// check. Non-empty: an empty string is a refusal with no explanation, which is the
+		// state this whole task exists to end. Distinct: genversion.h's comment on
+		// GENVER_STAMP_FAILED says the separate status exists precisely because the sentence
+		// is a different sentence — a card that would not take the write is something the
+		// player can fix, an unreadable stamp is not — so three statuses sharing one string
+		// would give that reasoning away. Short: the line lands in TitleState.status, a
+		// char[48] (scene/title.h), drawn at scale 1 into a 320 px screen, which at
+		// gfx/font.h's FONT_ADVANCE of 6 is 53 characters — the buffer is the tighter of the
+		// two, so 47 is the real budget.
+		const char* const msg[3] = { genVersionRefusalText(GENVER_TOO_NEW),
+		                             genVersionRefusalText(GENVER_DAMAGED),
+		                             genVersionRefusalText(GENVER_STAMP_FAILED) };
+		for (int i = 0; i < 3; i++) {
+			CHECK(msg[i] != NULL);
+			if (!msg[i]) continue;
+			CHECK(msg[i][0] != '\0');
+			CHECK(strlen(msg[i]) <= 47);
+		}
+		if (msg[0] && msg[1] && msg[2]) {
+			CHECK(strcmp(msg[0], msg[1]) != 0);
+			CHECK(strcmp(msg[0], msg[2]) != 0);
+			CHECK(strcmp(msg[1], msg[2]) != 0);
+		}
+	}
+
+	// ── 3. End to end, through the REAL genVersionResolve on the REAL filesystem. ───────
+	//
+	// The checks above take a status as an argument, so on their own they prove only that a
+	// constant maps to a string. These build the four world directories a console can actually
+	// present, resolve each one exactly as main.c's genStart() does, and feed the answer to the
+	// same predicate main.c gates on — so the pair under test is (what the card says) ->
+	// (whether the player gets in), with nothing hand-fed in the middle.
+	{
+		// A brand-new world that resolves cleanly. The CONTROL arm of this block: it must stay
+		// green in every sabotage of the refusal, because a world that is fine must never stop
+		// opening — that failure would be worse than the one being fixed.
+		genverTestDir(dir, sizeof dir, "gv-route-ok");
+		v = 0;
+		const GenVersionStatus st_ok = genVersionResolve(dir, &v);
+		CHECK(st_ok == GENVER_OK);
+		CHECK(!genVersionRefuses(st_ok));
+		CHECK(genVersionRefusalText(st_ok) == NULL);
+		testRmTree(dir);
+
+		// Stamped by a build that does not exist yet.
+		genverTestDir(dir, sizeof dir, "gv-route-toonew");
+		CHECK(genVersionWrite(dir, GEN_VERSION_NEWEST + 1u));
+		const GenVersionStatus st_new = genVersionResolve(dir, &v);
+		CHECK(st_new == GENVER_TOO_NEW);
+		CHECK(genVersionRefuses(st_new));
+		testRmTree(dir);
+
+		// Stamped, and the stamp cannot be read.
+		genverTestDir(dir, sizeof dir, "gv-route-damaged");
+		CHECK(genVersionWrite(dir, GEN_VERSION_DENSITY));
+		{
+			const uint8_t bad_magic[1] = {'X'};
+			genverPoke(dir, 0, bad_magic, 1);
+		}
+		const GenVersionStatus st_bad = genVersionResolve(dir, &v);
+		CHECK(st_bad == GENVER_DAMAGED);
+		CHECK(genVersionRefuses(st_bad));
+		testRmTree(dir);
+
+		// The one 82d4a1e added and nothing routed: a mint world the card will not stamp. Same
+		// ENOTDIR-under-a-regular-file trick the arm above uses, and for the reasons documented
+		// there — chmod does not stick on this checkout's mount and a directory named genver.bin
+		// is opened successfully by glibc.
+		{
+			char blocked2[128];
+			snprintf(blocked2, sizeof blocked2, "%s/gv-route-notadir", testWorldDir());
+			remove(blocked2);
+			FILE* nf = fopen(blocked2, "wb");
+			CHECK(nf != NULL);
+			if (nf) fclose(nf);
+
+			char inside2[192];
+			snprintf(inside2, sizeof inside2, "%s/w", blocked2);
+
+			v = 0xDEADu;
+			const GenVersionStatus st_sf = genVersionResolve(inside2, &v);
+			CHECK(st_sf == GENVER_STAMP_FAILED);
+			CHECK(v == GEN_VERSION_FOR_NEW_WORLDS);
+			CHECK(genVersionRefuses(st_sf));
+			CHECK(genVersionRefusalText(st_sf) != NULL);
+
+			remove(blocked2);
+		}
+	}
+
+	// ── 4. And that source/main.c actually routes it. ───────────────────────────────────
+	//
+	// The block above proves the predicate answers correctly. It cannot prove main.c asks it, and
+	// "the predicate is right, nothing calls it" is precisely the shape of the bug being fixed —
+	// one layer up. main.c cannot be linked here (see genverReadWholeFile), so its text is read,
+	// exactly as source/app/session_test.c reads it to prove sessionBegin() is on the lap.
+	//
+	// Each fact is asserted separately so a red run says which one broke, and the negative one is
+	// as load-bearing as the positives: while the old hand-written two-status `if` is still in
+	// the file, a third status can still be forgotten, whatever else is also true.
+	//
+	// Honest about what this is: a text match, so renaming `world_refused` breaks it without
+	// breaking the game. That is the accepted cost of the alternative being no coverage at all.
+	// Run from the repository root, the same working directory this file's atlas checks use.
+	{
+		char* src = genverReadWholeFile("source/main.c");
+		CHECK(src != NULL);
+		if (src) {
+			// The refusal is decided by the total function, not by a list of statuses.
+			CHECK(strstr(src, "#include \"world/genrefuse.h\"") != NULL);
+			CHECK(strstr(src, "genVersionRefusalText(gv)") != NULL);
+			// This one matched on the first run — against the COMMENT in main.c that quoted
+			// the old line verbatim while explaining why it went. strstr cannot tell code from
+			// prose, so main.c's comment now describes the old expression instead of spelling
+			// it, and the verbatim text is kept in world/genrefuse.h's file comment where
+			// nothing greps for it. Worth recording rather than quietly working around: it is
+			// the proof this check reads the real file and can go red.
+			CHECK(strstr(src, "gv == GENVER_TOO_NEW || gv == GENVER_DAMAGED") == NULL);
+
+			// genStart's false answer becomes a refusal the rest of the boot path can see...
+			CHECK(strstr(src, "const bool world_refused = !worker_ok;") != NULL);
+
+			// ...the loading screen is skipped, so there is no 900-frame stall...
+			CHECK(strstr(src, "if (!world_refused &&") != NULL);
+
+			// ...and the way out is the pause menu's existing return to the title screen, which
+			// runs the whole teardown, rather than a jump past it or a quit.
+			CHECK(strstr(src, "bool quit_to_title = world_refused;") != NULL);
+
+			// A refused world is left exactly as it was found: neither save writes into it.
+			CHECK(strstr(src, "if (inv_dir && !world_refused)") != NULL);
+
+			free(src);
+		}
 	}
 }
 

@@ -467,6 +467,27 @@ static TitleResult drawMain(TitleState* ts, const TitleInput* in, bool tap)
 	const int tw = fontTextWidth("BLOCKSMITH", 2);
 	fontDraw((SCR_W - (float)tw) * 0.5f, 6, 2, COL_ACCENT, "BLOCKSMITH");
 
+	// v1.8.3. The same status line world select has had since v1.6.0 (drawWorldSelect above),
+	// drawn here too because this screen is now where the player lands after a world refuses to
+	// open: main.c's genStart() returns false for a generator this build cannot honour, and the
+	// menu is what tells them why — see world/genrefuse.h for the three sentences. Without this
+	// the refusal reached TitleState.status and was never painted, which is the same defect as
+	// not having a message at all.
+	//
+	// Centred, and between the wordmark and the first button rather than beside either. The
+	// wordmark is scale 2, so it occupies y 6..19 (FONT_GLYPH_H 7, doubled); MAIN_TOP_Y is 44;
+	// a scale-1 line at 28 sits 7 px tall in the middle of that gap and moves nothing. It is
+	// never wider than the screen: TitleState.status is char[48], and at gfx/font.h's
+	// FONT_ADVANCE of 6 the 320 px bottom screen holds 53 characters.
+	//
+	// No layout is reserved for it. The line only exists while status_ttl is counting down
+	// (titleUpdateDraw decrements it), and the four buttons below start below where it ends, so
+	// a frame with a message and a frame without one place every touch target identically.
+	if (ts->status_ttl > 0) {
+		const int sw = fontTextWidth(ts->status, 1);
+		fontDraw((SCR_W - (float)sw) * 0.5f, 28, 1, COL_WARN, ts->status);
+	}
+
 	float y = MAIN_TOP_Y;
 	const TRect play_r  = {10, y, SCR_W - 20, MAIN_BTN_H}; y += MAIN_BTN_H + MAIN_GAP;
 	const TRect mp_r    = {10, y, SCR_W - 20, MAIN_BTN_H}; y += MAIN_BTN_H + MAIN_GAP;
