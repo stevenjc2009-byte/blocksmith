@@ -377,18 +377,41 @@ static void buildSlope(void)
 // growing on the floor of a sealed cave is the classic way this pass goes wrong. Beta reaches
 // the same result by running its surface pass before it carves caves; doing it by exposure
 // costs nothing here and needs no ordering rule.
-static inline BlockId surfaceBlock(int depth, int top_y, int slope_x2, bool sandy)
+static inline BlockId surfaceBlock(int depth, int top_y, int slope_x2, BiomeId biome)
 {
 	// A cliff face is bare rock all the way to the top. Checked first because it overrides
 	// both the beach and the grass rules: sand on a vertical wall is worse than grass on one.
+	//
+	// **Unchanged by v1.8.3 Phase 2, and deliberately so.** A cliff is a cliff in every
+	// biome; making the override biome-dependent would put dirt on a tundra rock face for no
+	// reason a player standing under it could read.
 	if (slope_x2 >= GEN_D_CLIFF_SLOPE_X2)
 		return BLOCK_STONE;
 
 	// Beach. Everything at or just above the waterline is sand, and so is the whole sandy
 	// biome — one rule for both, since a shoreline and a desert want the same material and
 	// worldgenIsSandy() is already the game's answer to the second half of it.
-	if (sandy || top_y <= GEN_SEA_LEVEL + GEN_D_BEACH_ABOVE)
+	//
+	// **The beach band is unchanged too.** What changed underneath it is which biome counts
+	// as sandy: worldgenIsSandy() now answers BIOME_DESERT for a density world instead of
+	// the raw threshold, which is what shrinks sand-capped ground from about half the world
+	// to a place you travel to. The waterline half of this test is untouched, so a cold
+	// shoreline is still a beach and not a tundra — which is the right way round, since a
+	// band of dirt at the waterline reads as erosion rather than as weather.
+	if (biome == BIOME_DESERT || top_y <= GEN_SEA_LEVEL + GEN_D_BEACH_ABOVE)
 		return (depth <= GEN_DIRT_DEPTH) ? BLOCK_SAND : BLOCK_STONE;
+
+	// v1.8.3 Phase 2. Tundra caps with bare DIRT — no grass, all the way down through the
+	// dirt band.
+	//
+	// **This is an explicit PHASE 3 PLACEHOLDER, not the intended material.** Snow is what
+	// belongs here and snow needs a new core block id and an atlas tile, which is a server
+	// release and therefore a different phase (see the v1.8.3 world-variety decision page).
+	// Bare dirt is a stretch and it is the weakest design call on this rung; it is here so
+	// that the cold half of the climate rectangle exists at all rather than being deferred,
+	// and Phase 3 replaces THIS ONE BRANCH and nothing else.
+	if (biome == BIOME_TUNDRA)
+		return (depth <= GEN_DIRT_DEPTH) ? BLOCK_DIRT : BLOCK_STONE;
 
 	if (depth == 0)               return BLOCK_GRASS;
 	if (depth <= GEN_DIRT_DEPTH)  return BLOCK_DIRT;
@@ -477,12 +500,22 @@ bool wgdColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 	s_top_valid = true;
 	buildSlope();
 
-	// The sandy-biome answer per (x, z), from the SAME worldgenIsSandy() the legacy generator
-	// and the tree pass ask — one rule, one place, so the material and the biome cannot drift.
-	bool sandy[CHUNK_DIM][CHUNK_DIM];
+	// v1.8.3 Phase 2. The biome per (x, z), resolved once for the column and consumed by the
+	// surface pass below.
+	//
+	// **This replaces a per-cell worldgenIsSandy() call and does not weaken it.** On a
+	// density world worldgenIsSandy() IS `worldgenBiomeAt() == BIOME_DESERT` — that is the
+	// version branch it takes, not a parallel rule — so resolving the biome here and letting
+	// surfaceBlock() compare against BIOME_DESERT gives the identical answer for half the
+	// noise: asking both would evaluate the temperature and humidity fields twice for every
+	// one of the 256 cells. The identity is not left as an argument in a comment; the suite
+	// asserts worldgenIsSandy() and the classifier agree at every position of a wide sweep,
+	// which is the check that goes red if the two ever drift apart.
+	uint8_t biome[CHUNK_DIM][CHUNK_DIM];
 	for (int z = 0; z < CHUNK_DIM; z++)
 		for (int x = 0; x < CHUNK_DIM; x++)
-			sandy[z][x] = worldgenIsSandy(g, cx * CHUNK_DIM + x, cz * CHUNK_DIM + z);
+			biome[z][x] = (uint8_t)worldgenBiomeAt(g, cx * CHUNK_DIM + x,
+			                                       cz * CHUNK_DIM + z);
 
 	if (!worldColumnCreate(w, cx, cz))
 		return false;
@@ -611,7 +644,8 @@ bool wgdColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 
 					s_flat[chunkIndex(x, ly, z)] =
 						exposed[z][x]
-							? surfaceBlock(depth, s_top[z][x], s_slope[z][x], sandy[z][x])
+							? surfaceBlock(depth, s_top[z][x], s_slope[z][x],
+							               (BiomeId)biome[z][x])
 							: BLOCK_STONE;
 					any = true;
 				}

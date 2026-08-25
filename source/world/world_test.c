@@ -7466,6 +7466,256 @@ static void testWorldgenLegacyByteIdentity(void)
 	}
 }
 
+// ── v1.8.3 Phase 2: the legacy sand rule, swept where the answer can actually move ────
+//
+// **This is the gate for the version dispatch inside worldgenIsSandy(), and
+// testWorldgenLegacyByteIdentity() above is NOT.** That distinction was measured, not
+// assumed, and it is the reason this function exists.
+//
+// The twelve fingerprints above pin seeds 1337 / 4242 / 90210 crossed with the columns
+// (0,0) (1,0) (-1,-1) (7,-3). Under the exact sabotage they are supposed to catch — deleting
+// the version gate so a legacy world resolves sand through the biome classifier — **eleven of
+// the twelve cannot go red**: measured, only 4242 at (7,-3) moves, and it moves by a single
+// cell. The four columns were chosen for tidiness (the origin, its neighbour, a negative pair
+// to exercise sign handling, one arbitrary offset) and nobody checked what terrain they land
+// on. Seed 1337 at the origin is 98.7 % one biome and 90210 is 100 % another. **A rule that
+// decides between two materials cannot be caught changing in a region that only ever produces
+// one of them.** The sabotage arms, the hash is computed correctly, the comparison is exact,
+// and the answer is the same either way because the input never asked the question.
+//
+// The fingerprints are KEPT — they still catch wholesale corruption for almost nothing — but
+// they are no longer the gate. This is.
+//
+// **Assertion 2 is the whole point and is the easy one to leave out.** Without it, assertion
+// 1 is satisfied by any region where the two rules agree anyway, which is precisely the state
+// the twelve pinned columns are in. So the sweep also counts how often the OLD rule and the
+// NEW rule give different answers, and requires that count to be large. That makes the test
+// arm from BOTH sides: delete the gate and assertion 1 goes red; hard-wire both versions to
+// the old rule and assertion 2 goes red. One red direction proves one of the two things is
+// load-bearing and says nothing at all about the other.
+//
+// Measured on this tree, 21,609 positions per seed:
+//
+//     seed 1337   legacy mismatch 0   disagree 3248 (15.03 %)
+//     seed 4242   legacy mismatch 0   disagree 3687 (17.06 %)
+//     seed 90210  legacy mismatch 0   disagree 5349 (24.75 %)
+//
+// so the `> 1000` bound has between three and five times the margin it needs, and it will
+// itself go red if someone later narrows the sweep into a uniform region.
+static void testWorldgenLegacySandyWideSweep(void)
+{
+	static const uint32_t seeds[3] = {1337u, 4242u, 90210u};
+
+	long swept = 0;
+	for (int s = 0; s < 3; s++) {
+		WorldGen legacy, density;
+		CHECK(worldgenInit(&legacy,  seeds[s], GEN_VERSION_LEGACY));
+		CHECK(worldgenInit(&density, seeds[s], GEN_VERSION_DENSITY));
+
+		long mismatch = 0, disagree = 0, old_sandy = 0, new_sandy = 0, n = 0;
+		for (int32_t z = -512; z <= 512; z += 7) {
+			for (int32_t x = -512; x <= 512; x += 7) {
+				// The rule the legacy generator has always applied, spelled out in full
+				// rather than by calling the function under test. A check written in terms
+				// of the thing it is testing moves with it and keeps agreeing.
+				const bool old_rule = worldgenBiome(&legacy, x, z) < GEN_SAND_BELOW;
+
+				if (worldgenIsSandy(&legacy, x, z) != old_rule) mismatch++;
+				const bool new_rule = worldgenIsSandy(&density, x, z);
+				if (new_rule != old_rule) disagree++;
+				if (old_rule) old_sandy++;
+				if (new_rule) new_sandy++;
+				n++;
+			}
+		}
+		swept += n;
+
+		// 1. A legacy world's sand is exactly where it always was. Zero exceptions.
+		CHECK(mismatch == 0);
+
+		// 2. ...and the two rules were CAPABLE of disagreeing here, so the zero above is a
+		// fact about the gate rather than a fact about the coordinates.
+		CHECK(disagree > 1000);
+
+		// Non-vacuity for each rule on its own: a region that came out entirely sand, or
+		// entirely not, under either rule would satisfy assertion 1 for free.
+		CHECK(old_sandy > 0 && old_sandy < n);
+		CHECK(new_sandy > 0 && new_sandy < n);
+
+		// The new rule can only ever REMOVE sand, never add it: desert is hot AND dry, and
+		// hot alone is character for character the old test. new_sandy above old_sandy would
+		// mean GEN_TEMP_HOT had stopped being derived from GEN_SAND_BELOW.
+		CHECK(new_sandy < old_sandy);
+	}
+
+	// **The control.** It stays green under both sabotage arms above — neither one changes
+	// how many positions the loops visit — and it is not vacuous: narrowing the sweep, which
+	// is the change that would quietly turn assertion 2 back into decoration, makes it red.
+	// 147 values of x and of z per seed, over three seeds.
+	CHECK(swept == 147L * 147L * 3L);
+}
+
+// ── v1.8.3 Phase 2: the climate fields, the classifier and the per-biome table ─────────
+static void testWorldgenBiomes(void)
+{
+	WorldGen g;
+	CHECK(worldgenInit(&g, 1337u, GEN_VERSION_DENSITY));
+
+	// **GEN_TEMP_HOT is an arithmetic identity, not a tuning constant**, and this is the
+	// check that says so. `temp > FX_ONE - GEN_SAND_BELOW` must be the same predicate as
+	// `biome < GEN_SAND_BELOW` at every position, or the density table's second control
+	// point and the surface material have started deciding at two different coordinates.
+	CHECK(GEN_TEMP_HOT == FX_ONE - GEN_SAND_BELOW);
+	{
+		long hot = 0, cold = 0, wet = 0, dry = 0, n = 0, bad_identity = 0, out_of_range = 0;
+		for (int32_t z = -400; z <= 400; z += 11) {
+			for (int32_t x = -400; x <= 400; x += 11) {
+				const fx b = worldgenBiome(&g, x, z);
+				const fx h = worldgenHumidity(&g, x, z);
+				const fx t = FX_ONE - b;
+
+				if (h < 0 || h > FX_ONE) out_of_range++;
+				if ((t > GEN_TEMP_HOT) != (b < GEN_SAND_BELOW)) bad_identity++;
+
+				if (t > GEN_TEMP_HOT)   hot++;
+				if (t < GEN_TEMP_COLD)  cold++;
+				if (h >= GEN_HUMID_WET) wet++; else dry++;
+				n++;
+			}
+		}
+		CHECK(out_of_range == 0);
+		CHECK(bad_identity == 0);
+		// Every band is reachable in the sampled region, or the identity above was checked
+		// where only one answer occurs — the exact defect this whole section exists over.
+		CHECK(hot > 0 && hot < n);
+		CHECK(cold > 0 && cold < n);
+		CHECK(wet > 0 && dry > 0);
+	}
+
+	// The humidity field is a SECOND field, not the temperature field wearing a hat. Two
+	// fBms drawn from the same seed are visibly the same shape, and if the salt were dropped
+	// the climate square would collapse onto its diagonal — only three biomes could occur.
+	{
+		long same = 0, n = 0;
+		for (int32_t z = -400; z <= 400; z += 11)
+			for (int32_t x = -400; x <= 400; x += 11) {
+				if (worldgenHumidity(&g, x, z) == worldgenBiome(&g, x, z)) same++;
+				n++;
+			}
+		CHECK(same * 100 < n);   // under 1 % coincidental equality
+	}
+
+	// The classifier is exactly the 3 x 2 rectangle, re-derived here from the two fields
+	// rather than trusted.
+	{
+		long wrong = 0;
+		for (int32_t z = -400; z <= 400; z += 11)
+			for (int32_t x = -400; x <= 400; x += 11) {
+				const fx t = FX_ONE - worldgenBiome(&g, x, z);
+				const bool w = worldgenHumidity(&g, x, z) >= GEN_HUMID_WET;
+				BiomeId want;
+				if (t > GEN_TEMP_HOT)       want = w ? BIOME_JUNGLE : BIOME_DESERT;
+				else if (t < GEN_TEMP_COLD) want = w ? BIOME_TAIGA  : BIOME_TUNDRA;
+				else                        want = w ? BIOME_FOREST : BIOME_PLAINS;
+				if (worldgenBiomeAt(&g, x, z) != want) wrong++;
+			}
+		CHECK(wrong == 0);
+	}
+
+	// Sand on a density world is the desert cap and nothing else. worldgen_density.c's
+	// wgdColumn resolves the biome once per cell and compares against BIOME_DESERT rather
+	// than asking worldgenIsSandy() a second time; this is what makes that an identity
+	// instead of a second copy of the rule that can drift away from the first.
+	{
+		long drift = 0, sandy = 0, n = 0;
+		for (int32_t z = -400; z <= 400; z += 11)
+			for (int32_t x = -400; x <= 400; x += 11) {
+				const bool s = worldgenIsSandy(&g, x, z);
+				if (s != (worldgenBiomeAt(&g, x, z) == BIOME_DESERT)) drift++;
+				if (s) sandy++;
+				n++;
+			}
+		CHECK(drift == 0);
+		CHECK(sandy > 0 && sandy < n);   // and both answers occur where it was checked
+	}
+
+	// ── The per-biome table ───────────────────────────────────────────────────────────
+	//
+	// The silhouette bounds are a CORRECTNESS constraint, not a style one: worldgenDecorate
+	// derives its tree-cell scan from GEN_TREE_RADIUS, so a canopy wider than that would be
+	// clipped at a column border depending on which column was generated first — an
+	// order-dependence bug. The trunk bounds are what keeps treeInCell's world-ceiling check
+	// honest.
+	{
+		int max_grass = 0;
+		for (int b = 0; b < BIOME_COUNT; b++) {
+			const BiomeParams* p = worldgenBiomeParams((BiomeId)b);
+			CHECK_QUIET(p != NULL);
+			CHECK_QUIET(p->canopy_radius >= 1 && p->canopy_radius <= GEN_TREE_RADIUS);
+			CHECK_QUIET(p->trunk_min >= GEN_TREE_MIN_H);
+			CHECK_QUIET(p->trunk_max <= GEN_TREE_MAX_H);
+			CHECK_QUIET(p->trunk_min <= p->trunk_max);
+			if (p->grass_chance > max_grass) max_grass = p->grass_chance;
+		}
+		// worldgenScatter rejects on GEN_GRASS_CHANCE_MAX before it resolves the biome. If
+		// that stopped being an upper bound over the table, the biome with the highest
+		// chance would be silently clamped to it and nothing else would notice.
+		CHECK(max_grass == GEN_GRASS_CHANCE_MAX);
+
+		// An id outside the table resolves to the baseline rather than reading off the end.
+		CHECK(worldgenBiomeParams(BIOME_COUNT) == worldgenBiomeParams(BIOME_PLAINS));
+		CHECK(worldgenBiomeParams((BiomeId)255) == worldgenBiomeParams(BIOME_PLAINS));
+
+		// The numbers themselves, as naked literals. A check written in terms of the
+		// constants it is testing moves with them and keeps agreeing — this project has a
+		// recorded case of exactly that costing three of five reddened checks.
+		CHECK(worldgenBiomeParams(BIOME_TUNDRA)->grass_chance == 0);
+		CHECK(worldgenBiomeParams(BIOME_TAIGA)->grass_chance  == 12);
+		CHECK(worldgenBiomeParams(BIOME_PLAINS)->grass_chance == 40);
+		CHECK(worldgenBiomeParams(BIOME_FOREST)->grass_chance == 24);
+		CHECK(worldgenBiomeParams(BIOME_DESERT)->grass_chance == 0);
+		CHECK(worldgenBiomeParams(BIOME_JUNGLE)->grass_chance == 56);
+		CHECK(worldgenBiomeParams(BIOME_TUNDRA)->tree_chance == 0);
+		CHECK(worldgenBiomeParams(BIOME_TAIGA)->tree_chance  == 64);
+		CHECK(worldgenBiomeParams(BIOME_PLAINS)->tree_chance == 24);
+		CHECK(worldgenBiomeParams(BIOME_FOREST)->tree_chance == 128);
+		CHECK(worldgenBiomeParams(BIOME_DESERT)->tree_chance == 0);
+		CHECK(worldgenBiomeParams(BIOME_JUNGLE)->tree_chance == 160);
+		// The three silhouettes: jungle tall and broad, taiga tall and narrow, the other
+		// four unchanged. Each of the two differs from the default in one field only.
+		CHECK(worldgenBiomeParams(BIOME_JUNGLE)->trunk_min == 6);
+		CHECK(worldgenBiomeParams(BIOME_JUNGLE)->canopy_radius == 2);
+		CHECK(worldgenBiomeParams(BIOME_TAIGA)->trunk_min == 6);
+		CHECK(worldgenBiomeParams(BIOME_TAIGA)->canopy_radius == 1);
+		CHECK(worldgenBiomeParams(BIOME_PLAINS)->trunk_min == GEN_TREE_MIN_H);
+		CHECK(worldgenBiomeParams(BIOME_PLAINS)->canopy_radius == GEN_TREE_RADIUS);
+	}
+
+	// ── Reachability ──────────────────────────────────────────────────────────────────
+	//
+	// All six biomes have to occur in a world, or one of them is a branch nobody ever walks
+	// into and every surface check below is testing five things. Measured here over these
+	// three seeds at 1024 x 1024 blocks: worst single share 5.37 % (tundra on 90210). Over
+	// the design page's full thirteen seeds the worst is 1.82 % (taiga on 1616), which is
+	// where the 1 % bound comes from — set below the worst seed KNOWN rather than below the
+	// three that are actually run here.
+	{
+		static const uint32_t seeds[3] = {1337u, 4242u, 90210u};
+		for (int s = 0; s < 3; s++) {
+			WorldGen gs;
+			CHECK(worldgenInit(&gs, seeds[s], GEN_VERSION_DENSITY));
+			long n[BIOME_COUNT] = {0}, tot = 0;
+			for (int32_t z = -512; z < 512; z += 8)
+				for (int32_t x = -512; x < 512; x += 8) {
+					n[worldgenBiomeAt(&gs, x, z)]++;
+					tot++;
+				}
+			for (int b = 0; b < BIOME_COUNT; b++)
+				CHECK_QUIET(n[b] * 100 > tot);   // every biome over 1 % of the world
+		}
+	}
+}
+
 // The version contract that needs no filesystem: which values exist, which this build will
 // run, and what worldgenInit does with one it does not know.
 static void testGenVersionContract(void)
@@ -7841,16 +8091,206 @@ static int genTestTerrainTop(const World* w, int32_t x, int32_t z)
 	return -1;
 }
 
+// ── v1.8.3 Phase 2: what a biome actually looks like on the ground ────────────────────
+//
+// **The area is the whole test, and it was chosen by measurement.** A biome rule can only be
+// caught misbehaving somewhere the biome occurs, and the two areas testWorldgenWaterAndGrass
+// already surveys cannot do this job: seed 1337 at (-12,12) contains no tundra at all, and
+// seed 90210 at (8,-8) is FOREST 4790 / JUNGLE 1610 and nothing else. Checking a six-way rule
+// there would pass with four of the six branches never executed — the same defect Case 7 of
+// blocksmith-lesson-sabotage-arm-must-actually-arm.md records, one file over.
+//
+// So a sweep of 8 seeds x 81 column origins was run and scored on the WORST-represented
+// biome, and this is the winner: seed 90210, columns (10,-20), radius 3 (7 x 7 = 49 columns,
+// 112 x 112 blocks). Usable surface cells — above the beach band, not cliff stone — per
+// biome, measured on this tree:
+//
+//     TUNDRA 1190   TAIGA 1951   PLAINS 282   FOREST 3762   DESERT 331   JUNGLE 1147
+//
+// Plains is the thin one at 282, which is why nothing below asks plains for a tree: at 24
+// tree draws in 256 over roughly four 8 x 8 cells, the expected number of plains trees here
+// is under one, and it measured zero. An assertion that plains grows trees would be an
+// assertion about this seed's luck, not about the generator.
+static void testWorldgenBiomeSurface(void)
+{
+	WorldGen g;
+	CHECK(worldgenInit(&g, 90210u, GEN_VERSION_DENSITY));
+	worldInit(&s_world);
+	const int32_t ox = 10, oz = -20, r = 3;
+	for (int32_t cz = oz - r; cz <= oz + r; cz++)
+		for (int32_t cx = ox - r; cx <= ox + r; cx++)
+			CHECK_QUIET(worldgenColumn(&g, &s_world, cx, cz));
+
+	long usable[BIOME_COUNT] = {0}, wrong_cap[BIOME_COUNT] = {0};
+	long eligible[BIOME_COUNT] = {0}, plants[BIOME_COUNT] = {0};
+	long trunks[BIOME_COUNT] = {0}, leaves[BIOME_COUNT] = {0};
+	int tmin[BIOME_COUNT], tmax[BIOME_COUNT];
+	for (int b = 0; b < BIOME_COUNT; b++) { tmin[b] = 999; tmax[b] = -1; }
+
+	for (int32_t z = (oz - r) * CHUNK_DIM; z < (oz + r + 1) * CHUNK_DIM; z++) {
+		for (int32_t x = (ox - r) * CHUNK_DIM; x < (ox + r + 1) * CHUNK_DIM; x++) {
+			const BiomeId b = worldgenBiomeAt(&g, x, z);
+			for (int y = 0; y < WORLD_HEIGHT; y++)
+				if (worldGet(&s_world, x, y, z) == BLOCK_LEAVES) leaves[b]++;
+
+			const int top = genTestTerrainTop(&s_world, x, z);
+			if (top < 0 || top + 1 >= WORLD_HEIGHT)
+				continue;
+			// The two overrides that outrank the biome and are NOT being tested here: the
+			// beach band, which is sand whatever the climate says, and the cliff rule, which
+			// is bare stone on any slope steep enough. Both predate Phase 2 and both still
+			// win — that is the point of excluding them rather than special-casing them.
+			if (top + 1 <= GEN_SEA_LEVEL + GEN_D_BEACH_ABOVE)
+				continue;
+			const BlockId cap = worldGet(&s_world, x, top, z);
+			if (cap == BLOCK_STONE)
+				continue;
+
+			usable[b]++;
+			// Desert caps in sand; tundra caps in bare dirt (the Phase 3 placeholder, see
+			// surfaceBlock in worldgen_density.c); the other four cap in grass.
+			const BlockId want = (b == BIOME_DESERT) ? BLOCK_SAND
+			                   : (b == BIOME_TUNDRA) ? BLOCK_DIRT
+			                                         : BLOCK_GRASS;
+			if (cap != want)
+				wrong_cap[b]++;
+
+			const BlockId over = worldGet(&s_world, x, top + 1, z);
+			if (cap == BLOCK_GRASS && (over == BLOCK_AIR || over == BLOCK_TALL_GRASS)) {
+				eligible[b]++;
+				if (over == BLOCK_TALL_GRASS)
+					plants[b]++;
+			}
+			if (over == BLOCK_WOOD) {
+				trunks[b]++;
+				int n = 0;
+				for (int y = top + 1;
+				     y < WORLD_HEIGHT && worldGet(&s_world, x, y, z) == BLOCK_WOOD; y++)
+					n++;
+				if (n < tmin[b]) tmin[b] = n;
+				if (n > tmax[b]) tmax[b] = n;
+			}
+		}
+	}
+	worldExit(&s_world);
+
+	// ── Caps ──────────────────────────────────────────────────────────────────────────
+	// Every biome is present with real ground, and every cell of it caps in the material
+	// its biome says. The first half is what stops the second half being vacuous.
+	for (int b = 0; b < BIOME_COUNT; b++) {
+		CHECK_QUIET(usable[b] > 100);
+		CHECK_QUIET(wrong_cap[b] == 0);
+	}
+	// Named individually as well, because a loop of CHECK_QUIET reports a count and these
+	// six are the headline claim of the whole phase.
+	CHECK(usable[BIOME_TUNDRA] > 100 && wrong_cap[BIOME_TUNDRA] == 0);
+	CHECK(usable[BIOME_TAIGA]  > 100 && wrong_cap[BIOME_TAIGA]  == 0);
+	CHECK(usable[BIOME_PLAINS] > 100 && wrong_cap[BIOME_PLAINS] == 0);
+	CHECK(usable[BIOME_FOREST] > 100 && wrong_cap[BIOME_FOREST] == 0);
+	CHECK(usable[BIOME_DESERT] > 100 && wrong_cap[BIOME_DESERT] == 0);
+	CHECK(usable[BIOME_JUNGLE] > 100 && wrong_cap[BIOME_JUNGLE] == 0);
+
+	// ── Tall grass ────────────────────────────────────────────────────────────────────
+	// The rate, against the table, with a 0.6x .. 1.5x band. Measured here, per 256 eligible
+	// cells: taiga 13.04 (nominal 12), plains 41.76 (40), forest 23.88 (24), jungle 58.09
+	// (56) — every one inside 9 % of nominal, so the band is loose enough to survive a
+	// different area and tight enough that swapping any two rows of the table reddens it.
+	{
+		static const int nominal[BIOME_COUNT] = {0, 12, 40, 24, 0, 56};
+		for (int b = 0; b < BIOME_COUNT; b++) {
+			if (nominal[b] == 0)
+				continue;
+			CHECK_QUIET(eligible[b] > 200);
+			CHECK_QUIET(plants[b] * 2560L >= eligible[b] * (long)nominal[b] * 6L);
+			CHECK_QUIET(plants[b] * 2560L <= eligible[b] * (long)nominal[b] * 15L);
+		}
+		const bool grassy = eligible[BIOME_TAIGA] > 200 && eligible[BIOME_PLAINS] > 200 &&
+		                    eligible[BIOME_FOREST] > 200 && eligible[BIOME_JUNGLE] > 200;
+		CHECK(grassy);
+		// Plains grows MORE tall grass than forest — 40 against 24 — which is the one row of
+		// the table that reads like a typo and is not. Asserted so that "fixing" it has to be
+		// a deliberate act. Cross-multiplied into locals: there is no integer divide on the
+		// ARM11, and the CHECK macro stringifies its condition into a 96-byte buffer.
+		const long plains_rate = plants[BIOME_PLAINS] * eligible[BIOME_FOREST];
+		const long forest_rate = plants[BIOME_FOREST] * eligible[BIOME_PLAINS];
+		CHECK(plains_rate > forest_rate);
+	}
+	// Nothing grows in tundra or desert. Note what this does NOT prove on its own: neither
+	// biome has a grass cap for a plant to stand on, so worldgenScatter's own surface test
+	// would reject every cell even if the chance table said 56. The load-bearing assertion
+	// for those two is the CAP above; this is the consequence, recorded because a future
+	// change to the tundra placeholder (Phase 3) will make it load-bearing.
+	CHECK(plants[BIOME_TUNDRA] == 0);
+	CHECK(plants[BIOME_DESERT] == 0);
+
+	// ── Trees ─────────────────────────────────────────────────────────────────────────
+	// Zero where the table says zero. This one is NOT a consequence of anything else: the
+	// tree pass has no surface-material rule of its own, so a tundra tree is exactly what a
+	// broken chance lookup would produce.
+	CHECK(trunks[BIOME_TUNDRA] == 0);
+	CHECK(trunks[BIOME_DESERT] == 0);
+	CHECK(trunks[BIOME_TAIGA] > 0);
+	CHECK(trunks[BIOME_FOREST] > 0);
+	CHECK(trunks[BIOME_JUNGLE] > 0);
+
+	// Forest is denser than taiga per unit of ground — 128 against 64 in the table, measured
+	// 31 trunks over 3762 cells against 7 over 1951. Cross-multiplied rather than divided:
+	// there is no integer divide on the ARM11 and the ratios are small.
+	CHECK(trunks[BIOME_TAIGA] * usable[BIOME_FOREST] <
+	      trunks[BIOME_FOREST] * usable[BIOME_TAIGA]);
+
+	// ── Silhouette ────────────────────────────────────────────────────────────────────
+	// Taiga and jungle trunks start at 6; everything else may still be as short as 4, and
+	// forest measured a 4 here, which is what keeps the first pair from being satisfied by
+	// some global change to GEN_TREE_MIN_H.
+	CHECK(tmin[BIOME_TAIGA] >= 6 && tmax[BIOME_TAIGA] <= GEN_TREE_MAX_H);
+	CHECK(tmin[BIOME_JUNGLE] >= 6 && tmax[BIOME_JUNGLE] <= GEN_TREE_MAX_H);
+	CHECK(tmin[BIOME_FOREST] < 6);
+
+	// The narrow taiga canopy, the only Phase 2 shape change with no constant to read back:
+	// a radius-1 canopy is two 3 x 3 layers where a radius-2 one is two 5 x 5 layers less
+	// corners, so leaves per trunk has to be markedly lower. Measured 35.43 for taiga against
+	// 43.61 for forest and 60.60 for jungle. Leaves are attributed to the biome under them
+	// rather than to the tree that grew them, so a canopy crossing a border is counted on the
+	// wrong side — which can only ever blunt this check, never manufacture it.
+	CHECK(leaves[BIOME_TAIGA] * trunks[BIOME_FOREST] <
+	      leaves[BIOME_FOREST] * trunks[BIOME_TAIGA]);
+}
+
 static void testWorldgenWaterAndGrass(void)
 {
 	// ── The terrain fingerprint. ──────────────────────────────────────────────────────
+	//
+	// **These twelve are the DENSITY generator's fingerprints, and v1.8.3 Phase 2 moved seven
+	// of them on purpose.** They are not the legacy-identity pins — those are
+	// testWorldgenLegacyByteIdentity()'s, they use genTestHashColumn() rather than
+	// genTestHashColumnTerrain(), and they did NOT move: a legacy world is byte-for-byte what
+	// it was, which is the hard constraint of the whole generator-version scheme.
+	//
+	// A density world is a different matter: biomes ARE a change to it, and the design says
+	// so. What moved was measured cell by cell over an 81-column ring of seed 1337, this
+	// build against the pre-change sources — 7,588 differing cells of 2,654,208 (0.2859 %):
+	//
+	//     above the surface  5088   tall grass and tree shape (the decorate/scatter pass)
+	//     at the surface     2498   every one of them GRASS -> DIRT, the tundra cap
+	//     below the surface     2   leaves of a canopy overhanging a cliff; the ground
+	//                               under them is STONE in both arms and did not move
+	//
+	// So no cell of ground moved: no height, no density, no cave. Nothing a player has built
+	// on can be left floating or buried by this. And of the cells that did move, ZERO were at
+	// or below the surface of a MILD/DRY column — plains keeps the old cap and the old tree
+	// chance and only gains tall grass, which stands above the ground by definition.
+	//
+	// source/debug/loadprof_test.c pins a whole-world content hash of the same generator
+	// (GEN_VERSION_NEWEST == GEN_VERSION_DENSITY, genversion.h:75) and moves for the same
+	// reason; its own comment says it is supposed to.
 	static const struct { uint32_t seed; int32_t cx, cz; uint32_t hash; } pinned[] = {
-		{1337u,   0,  0, 0x593053f8u}, {1337u,   1,  0, 0xa93c46e7u},
-		{1337u,  -1, -1, 0xc048a199u}, {1337u,   7, -3, 0x479464fdu},
-		{4242u,   0,  0, 0x91359a7fu}, {4242u,   1,  0, 0x22a375f8u},
-		{4242u,  -1, -1, 0xff57462du}, {4242u,   7, -3, 0x7fb8f23fu},
+		{1337u,   0,  0, 0x4514ba79u}, {1337u,   1,  0, 0x849f4a0bu},
+		{1337u,  -1, -1, 0x690f990du}, {1337u,   7, -3, 0x479464fdu},
+		{4242u,   0,  0, 0x40c702cbu}, {4242u,   1,  0, 0xa038a451u},
+		{4242u,  -1, -1, 0xe4b4d7c1u}, {4242u,   7, -3, 0x7fb8f23fu},
 		{90210u,  0,  0, 0x8bb38a6eu}, {90210u,  1,  0, 0xea29565au},
-		{90210u, -1, -1, 0xdd9c1f34u}, {90210u,  7, -3, 0xe64a8988u},
+		{90210u, -1, -1, 0xdd9c1f34u}, {90210u,  7, -3, 0x8794b8b1u},
 	};
 	for (size_t i = 0; i < sizeof(pinned) / sizeof(pinned[0]); i++) {
 		WorldGen g;
@@ -9619,11 +10059,14 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testWorldgenCaves();
 	testWorldgenMemoryProjection();
 	testWorldgenLegacyByteIdentity();
+	testWorldgenLegacySandyWideSweep();
+	testWorldgenBiomes();
 	testGenVersionContract();
 	testDensityBiomeTable();
 	testDensityField();
 	testDensityDistribution();
 	testWorldgenWaterAndGrass();
+	testWorldgenBiomeSurface();
 	testRaycast();
 	testBodyBlocked();
 	testCeilingCollision();
@@ -9672,6 +10115,52 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	CHECK(budgetUsed() == 0);
 
 	testBudget();
+
+	// ── Check-count guard ─────────────────────────────────────────────────────────────
+	//
+	// This suite reports s_checks as well as s_fails, so a shrinking total is at least
+	// VISIBLE here — unlike the six suites 0258188 and 1a56469 had to fix, which printed
+	// failures alone. Visible is not the same as caught: the number is printed into a
+	// harness log nobody diffs, and a change that stops a check from running rather than
+	// failing it still leaves an exit code of 0. This makes it red.
+	//
+	// **Recompute the number, never paste it off the PASS line.** Work out how many checks
+	// your change adds or removes and add that delta to the pin. If the printed count and
+	// your recomputed one disagree, that disagreement is the bug report — some other check
+	// stopped running, and pasting the observed number is what destroys that evidence.
+	//
+	// The pin is the count BEFORE this guard, so the PASS line prints one higher. Blind
+	// pasting therefore lands a red rather than a false green.
+	//
+	// 5262 was arrived at that way and then confirmed against the run, which is the order
+	// that matters: the tree was at 5184 before v1.8.3 Phase 2, and the three tests this
+	// phase adds contribute 22 + 35 + 21 = 78 CHECKs. CHECK_QUIET is invisible here — it
+	// counts only failures, deliberately — so the 21,609-position sweep in
+	// testWorldgenLegacySandyWideSweep costs seven, not sixty-four thousand. 5184 + 78 =
+	// 5262, and 5262 is what the run printed.
+	//
+	// **Host only, and this is a real gap.** Nine tests above are inside `#ifndef __3DS__`
+	// and the console total is a different number, which cannot be measured right now: the
+	// devkitPro build is red tree-wide for an unrelated reason (source/world/block.h has
+	// drifted from its vendored server copy). A console-side pin needs its own measured
+	// literal and is not guessable from this one.
+#ifndef __3DS__
+	{
+		const int ran = s_checks;
+		if (ran != 5262)
+			printf("\nCHECK-COUNT GUARD: %d checks ran, %d expected.\n"
+			       "  %s\n"
+			       "  This is NOT an ordinary assertion failure.\n"
+			       "  Read the comment above this guard in world/world_test.c before"
+			       " touching the pinned number.\n",
+			       ran, 5262,
+			       ran < 5262
+			           ? "Checks went MISSING: checks that should have run never ran at all."
+			           : "Extra checks appeared: either you added checks and did not update"
+			             " the pin, or something is emitting checks it should not.");
+		CHECK(ran == 5262);
+	}
+#endif
 
 	if (summary && cap) {
 		if (s_fails == 0)

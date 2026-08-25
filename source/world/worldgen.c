@@ -61,6 +61,13 @@ static inline fx caveCoordY(int32_t block)
 #define SALT_CAVE   0x43415645U   // 'CAVE'
 #define SALT_CAVE2  0x43415632U   // 'CAV2'
 
+// v1.8.3 Phase 2. The humidity field's salt, following the house convention: four ASCII
+// characters packed big-endian, applied as rngMix(g->seed ^ SALT_X). Checked against all
+// nine existing salts — BIOM TREE PLNT CAVE CAV2 DLOW DHIG DSEL and the BLKS seed mix — and
+// it collides with none of them. rngMix is a bijection (lowbias32), so distinct salts always
+// give distinct mixed seeds; the check is only that the salt constants themselves differ.
+#define SALT_HUMID  0x48554D44U   // 'HUMD'
+
 bool worldgenInit(WorldGen* g, uint32_t seed, uint32_t version)
 {
 	// Refused rather than coerced. A WorldGen carrying a version this build cannot generate
@@ -93,8 +100,65 @@ fx worldgenBiome(const WorldGen* g, int32_t x, int32_t z)
 	                 GEN_BIOME_OCTAVES);
 }
 
+fx worldgenHumidity(const WorldGen* g, int32_t x, int32_t z)
+{
+	return noiseFbm2(rngMix(g->seed ^ SALT_HUMID), biomeCoord(x), biomeCoord(z),
+	                 GEN_BIOME_OCTAVES);
+}
+
+// v1.8.3 Phase 2. The per-biome table, in BiomeId order. Built from the macros in
+// world/worldgen.h rather than from bare numbers here, so the derived bound
+// GEN_GRASS_CHANCE_MAX cannot drift away from the column it bounds.
+//
+// The trunk range and the canopy radius are the whole of the silhouette. Jungle is tall and
+// broad, taiga tall and narrow, and the other four keep the shape the game already had —
+// three distinguishable canopies rather than two and a variant.
+static const BiomeParams s_biome_params[BIOME_COUNT] = {
+	// grass, tree, trunk_min, trunk_max, radius
+	{GEN_GRASS_TUNDRA, GEN_TREE_TUNDRA, GEN_TREE_MIN_H, GEN_TREE_MAX_H, GEN_TREE_RADIUS},
+	{GEN_GRASS_TAIGA,  GEN_TREE_TAIGA,  6,              GEN_TREE_MAX_H, 1},
+	{GEN_GRASS_PLAINS, GEN_TREE_PLAINS, GEN_TREE_MIN_H, GEN_TREE_MAX_H, GEN_TREE_RADIUS},
+	{GEN_GRASS_FOREST, GEN_TREE_FOREST, GEN_TREE_MIN_H, GEN_TREE_MAX_H, GEN_TREE_RADIUS},
+	{GEN_GRASS_DESERT, GEN_TREE_DESERT, GEN_TREE_MIN_H, GEN_TREE_MAX_H, GEN_TREE_RADIUS},
+	{GEN_GRASS_JUNGLE, GEN_TREE_JUNGLE, 6,              GEN_TREE_MAX_H, GEN_TREE_RADIUS},
+};
+
+const BiomeParams* worldgenBiomeParams(BiomeId b)
+{
+	// Never NULL, and never an out-of-range read. An id from outside the table is a caller
+	// bug, and resolving it to the baseline biome is the one answer that cannot produce a
+	// world with a hole in it while the bug is being found.
+	if ((unsigned)b >= (unsigned)BIOME_COUNT)
+		b = BIOME_PLAINS;
+	return &s_biome_params[b];
+}
+
+BiomeId worldgenBiomeAt(const WorldGen* g, int32_t x, int32_t z)
+{
+	// Temperature is the existing field inverted — see GEN_TEMP_HOT in world/worldgen.h for
+	// why that direction and why the hot threshold is derived from GEN_SAND_BELOW rather
+	// than written as a number of its own.
+	const fx temp  = FX_ONE - worldgenBiome(g, x, z);
+	const bool wet = worldgenHumidity(g, x, z) >= GEN_HUMID_WET;
+
+	if (temp > GEN_TEMP_HOT)
+		return wet ? BIOME_JUNGLE : BIOME_DESERT;
+	if (temp < GEN_TEMP_COLD)
+		return wet ? BIOME_TAIGA : BIOME_TUNDRA;
+	return wet ? BIOME_FOREST : BIOME_PLAINS;
+}
+
 bool worldgenIsSandy(const WorldGen* g, int32_t x, int32_t z)
 {
+	// v1.8.3 Phase 2. **The version gate, and the reason world/worldgen.h documents it at
+	// length.** A density world's sand is the desert cap and nothing else; a legacy world
+	// keeps the expression it has always had, evaluated on the same field with the same
+	// constant, so its beaches and deserts cannot move. The two rules disagree at about a
+	// fifth of all columns — every column that is hot AND wet is sand under the old rule and
+	// jungle under the new one — so this branch is load-bearing rather than tidy.
+	if (g->version == GEN_VERSION_DENSITY)
+		return worldgenBiomeAt(g, x, z) == BIOME_DESERT;
+
 	return worldgenBiome(g, x, z) < GEN_SAND_BELOW;
 }
 
@@ -178,22 +242,49 @@ typedef struct {
 	int32_t x, z;    // world block coordinates of the trunk
 	int     ground;  // y of the first air above the ground, i.e. the trunk's base
 	int     trunk;   // trunk blocks
+	int     radius;  // canopy half-width of the two wide layers — the silhouette
 } Tree;
 
 static Tree treeInCell(const WorldGen* g, int32_t tcx, int32_t tcz)
 {
 	Tree t = {0};
+	t.radius = GEN_TREE_RADIUS;
 
 	const uint32_t h = rngHash2(rngMix(g->seed ^ SALT_TREE), tcx, tcz);
-	if ((h & 0xFFu) >= (uint32_t)GEN_TREE_CHANCE)
-		return t;
 
 	// Offset inside the cell, kept away from the very edge so that two trees in adjacent
 	// cells cannot stand shoulder to shoulder: with GEN_TREE_CELL 8 and the offset in
 	// 1..6, the closest two trunks can be is three blocks, which is one more than a
 	// canopy's reach on each side.
+	//
+	// **Computed BEFORE the spawn draw as of v1.8.3, and that reordering is deliberate and
+	// legacy-safe.** The offsets are a pure function of `h` with no side effects, so moving
+	// them above the draw cannot change what the draw decides; what it buys is a trunk
+	// coordinate to resolve the biome at, which is what the per-biome tree density needs.
+	// A cell whose draw fails still returns t.exists == false and every caller ignores the
+	// rest of the struct. The twelve legacy fingerprints are the check on this.
 	t.x = tcx * GEN_TREE_CELL + 1 + (int32_t)((h >> 8) % (GEN_TREE_CELL - 2));
 	t.z = tcz * GEN_TREE_CELL + 1 + (int32_t)((h >> 13) % (GEN_TREE_CELL - 2));
+
+	// v1.8.3 Phase 2. Tree density and silhouette per biome on a density world; the single
+	// global constants on a legacy one, which is what keeps every existing world's forest
+	// exactly where it was.
+	int trunk_min = GEN_TREE_MIN_H, trunk_max = GEN_TREE_MAX_H;
+	uint32_t chance = (uint32_t)GEN_TREE_CHANCE;
+	if (g->version == GEN_VERSION_DENSITY) {
+		const BiomeParams* bp = worldgenBiomeParams(worldgenBiomeAt(g, t.x, t.z));
+		chance    = bp->tree_chance;
+		trunk_min = bp->trunk_min;
+		trunk_max = bp->trunk_max;
+		t.radius  = bp->canopy_radius;
+	}
+
+	// The draw uses the same low 8 bits it always has, compared against the biome's chance
+	// instead of one global number. Tundra and desert are 0, so the comparison is false for
+	// every possible draw and nothing grows there — no separate "does this biome have trees"
+	// branch to keep in step with the table.
+	if ((h & 0xFFu) >= chance)
+		return t;
 
 	// Sand grows nothing. Asked at the trunk only: a canopy overhanging a dune edge is
 	// what a tree on a shoreline actually looks like.
@@ -214,8 +305,8 @@ static Tree treeInCell(const WorldGen* g, int32_t tcx, int32_t tcz)
 	if (g->version == GEN_VERSION_DENSITY && t.ground <= GEN_SEA_LEVEL)
 		return t;
 
-	t.trunk  = GEN_TREE_MIN_H +
-	           (int)((h >> 18) % (uint32_t)(GEN_TREE_MAX_H - GEN_TREE_MIN_H + 1));
+	t.trunk  = trunk_min +
+	           (int)((h >> 18) % (uint32_t)(trunk_max - trunk_min + 1));
 
 	// Nothing may be written above the world ceiling. This cannot fire at the current
 	// surface band — 68 + 7 + 1 is 76 against a 128-block world — but the band is a tuning
@@ -275,9 +366,17 @@ bool worldgenDecorate(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 			// Canopy. Two wide layers around the top of the trunk and two narrow ones
 			// above it, with the corners of the wide layers left out so the silhouette is
 			// round-ish rather than a cube on a stick.
+			//
+			// v1.8.3 Phase 2. The wide layers' half-width is the biome's (t.radius) rather
+			// than GEN_TREE_RADIUS, which is what makes a taiga spruce narrow. It is never
+			// LARGER than GEN_TREE_RADIUS, and that bound is load-bearing: the cell scan
+			// above is written in terms of GEN_TREE_RADIUS, so a wider canopy would be
+			// clipped at a column border depending on which column was generated first.
+			// The corner clip still keys on GEN_TREE_RADIUS, so a radius-1 canopy keeps all
+			// nine of its cells — there are no corners to round off a 3 x 3.
 			const int top = t.ground + t.trunk;   // first y above the trunk
 			for (int dy = -2; dy <= 1; dy++) {
-				const int r = (dy <= -1) ? GEN_TREE_RADIUS : 1;
+				const int r = (dy <= -1) ? t.radius : 1;
 				for (int dz = -r; dz <= r; dz++) {
 					for (int dx = -r; dx <= r; dx++) {
 						if (r == GEN_TREE_RADIUS && dx * dx + dz * dz > r * r)
@@ -329,10 +428,20 @@ bool worldgenScatter(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 
 			const int32_t x = cx * CHUNK_DIM + lx, z = cz * CHUNK_DIM + lz;
 
-			// The draw first: it rejects ~90 % of cells for one hash, which is cheaper than
-			// the two world lookups below it and makes them the exception rather than the
-			// rule.
-			if ((rngHash2(salt, x, z) & 0xFFu) >= (uint32_t)GEN_GRASS_CHANCE)
+			// The draw first: it rejects most cells for one hash, which is cheaper than the
+			// two world lookups below it and than the noise the biome costs, and makes both
+			// the exception rather than the rule.
+			//
+			// v1.8.3 Phase 2. The draw is compared twice: once against the largest chance
+			// any biome has, which needs no noise at all, and then against this cell's own
+			// biome. GEN_GRASS_CHANCE_MAX is an upper bound over the whole table, so the
+			// first test can only reject cells the second would have rejected anyway — the
+			// answer is identical to resolving the biome for all 256 cells, at a fraction of
+			// the cost. The suite asserts the bound really does bound the table.
+			const uint32_t draw = rngHash2(salt, x, z) & 0xFFu;
+			if (draw >= (uint32_t)GEN_GRASS_CHANCE_MAX)
+				continue;
+			if (draw >= (uint32_t)worldgenBiomeParams(worldgenBiomeAt(g, x, z))->grass_chance)
 				continue;
 
 			// Grass only — not sand, not the bare stone of a cliff face, not a dirt scar.

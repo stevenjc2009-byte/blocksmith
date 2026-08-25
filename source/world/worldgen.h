@@ -220,7 +220,15 @@
 // states for terrain and the same one treeInCell() follows — so two neighbouring columns
 // generated in either order, in different sessions, agree without talking to each other, and
 // the same seed regenerates the identical field of plants.
-#define GEN_GRASS_CHANCE  24            // out of 256 eligible surface cells
+//
+// **SUPERSEDED by v1.8.3 Phase 2 and NO LONGER READ BY ANY CODE PATH.** The GEN_GRASS_*
+// per-biome chances below replaced it, and the scatter has only ever run for a density world,
+// so there is no legacy caller left to keep it alive either. Changing this number now changes
+// nothing at all. It is kept rather than deleted because the paragraph above it is the
+// measurement the per-biome numbers are calibrated against — 24/256 is what "a meadow with
+// gaps you can see the ground through" was measured to look like, and forest still sits
+// exactly there.
+#define GEN_GRASS_CHANCE  24            // out of 256; superseded, see GEN_GRASS_* below
 
 // Trees. One per 8x8 cell at most, so two trunks can never be closer than a couple of
 // blocks and the decoration pass has a bounded neighbourhood to scan.
@@ -229,6 +237,124 @@
 #define GEN_TREE_MIN_H    4             // trunk blocks, before the canopy
 #define GEN_TREE_MAX_H    7
 #define GEN_TREE_RADIUS   2             // canopy half-width, in blocks
+
+// ── Biomes (v1.8.3 Phase 2) ───────────────────────────────────────────────────────────
+//
+// **Reached only by a GEN_VERSION_DENSITY world.** Every rule below is behind the version
+// dispatch in worldgen.c, for world/genversion.h's reason: a GEN_VERSION_LEGACY world must
+// keep generating the terrain it always did, byte for byte, and none of this may touch it.
+//
+// **Biome is a LABEL painted onto terrain that already exists — it never drives height.**
+// wgdBiomeParams() keeps deriving base height and amplitude from the raw biome field exactly
+// as it did before. Thresholding a continuous field and then feeding the resulting discrete
+// id into the height function is what produces the classic biome-border cliff; not letting
+// the id near the height function makes that seam structurally impossible rather than
+// something to blend away afterwards. Cost of the fix: zero, by construction.
+//
+// The set is a 3 x 2 rectangle — three temperature bands crossed with two humidity bands:
+//
+//            DRY (humid < GEN_HUMID_WET)   WET (humid >= GEN_HUMID_WET)
+//   COLD     BIOME_TUNDRA                  BIOME_TAIGA
+//   MILD     BIOME_PLAINS                  BIOME_FOREST
+//   HOT      BIOME_DESERT                  BIOME_JUNGLE
+//
+// **Why the hot-wet cell cannot be merged back into desert.** Making the hot band
+// humidity-independent is the obvious way back to four biomes, and measured it puts
+// sand-capped ground at 26-65 % of the world — worse than the 26.8-56.2 % it is today.
+// Shrinking the desert from "half the world" to a place you travel to is the single largest
+// visible win of this rung, and merging the cell throws it away. Kept separate, desert
+// measures 14.7-32.0 %.
+//
+// **JUNGLE, not swamp, and the name is not cosmetic.** Swamp was rejected on this project
+// for a measured reason recorded at tools/make_atlas.py:414-415 — a teal sea beside a green
+// field on a 5-bit-per-channel sheet is two shades of the same thing. And Phase 2 adds NO
+// new block ids: a hot, wet region built from grass, dirt, sand, wood and leaves, given the
+// densest trees and the thickest undergrowth in the world, is a jungle. Naming an enum
+// member for an intention rather than for what it renders is how this same file acquired
+// three comments that were false for a year.
+typedef enum {
+	BIOME_TUNDRA = 0,   // cold, dry — bare dirt cap; see the placeholder note in surfaceBlock
+	BIOME_TAIGA,        // cold, wet — sparse tall narrow trees
+	BIOME_PLAINS,       // mild, dry — the baseline the others are read against
+	BIOME_FOREST,       // mild, wet — dense trees, moderate undergrowth
+	BIOME_DESERT,       // hot, dry  — sand cap, nothing grows
+	BIOME_JUNGLE,       // hot, wet  — the densest trees and undergrowth in the world
+	BIOME_COUNT,
+} BiomeId;
+
+// **Temperature is the existing biome field INVERTED**: temp = FX_ONE - worldgenBiome().
+// One subtract, no new noise, and it cannot move a block. The direction matters: the biome
+// field's high end is the tall broken ground of the density table's upper control points, so
+// reading it as "hot" would put deserts on mountain tops and tundra on beaches. Its low end
+// is the flat lowland the first two control points describe, and that is where the sand
+// already is.
+//
+// **GEN_TEMP_HOT is DERIVED, not tuned.** `temp > FX_ONE - GEN_SAND_BELOW` is
+// `biome < GEN_SAND_BELOW`, character for character the test worldgenIsSandy() has always
+// applied. Reusing the constant rather than writing a fresh literal is what keeps the density
+// table's second control point and the surface material agreeing: the terrain stops being
+// lowland-flat at exactly the coordinate the desert stops. Writing a new number here would
+// let the two drift apart silently on the next retune.
+#define GEN_TEMP_HOT   (FX_ONE - GEN_SAND_BELOW)   // 0x8800; equals biome < GEN_SAND_BELOW
+
+// ~18th percentile of the temperature field. **The weakest of the three thresholds**, and it
+// says so on purpose: 0x3800 / 0x4000 / 0x4800 / 0x5000 were swept over 13 seeds and 0x5000
+// is the best of those four — at 0x3800 taiga fell to 0.66 % on seed 1616, which is a biome
+// nobody ever walks into — but nothing above 0x5000 was tried. Measured at this value:
+// tundra 3.6-12.1 %, taiga 1.8-14.5 %.
+#define GEN_TEMP_COLD  0x00005000
+
+// The middle of the humidity field's range, and the only threshold here that genuinely is
+// one. The field measured symmetric — pooled median 0.4939, every seed's own median inside
+// 0.4712..0.5271 — so 0x8000 splits every world tried no worse than 47/53. No percentile of
+// the temperature field manages that, which is why that one had to be measured instead.
+#define GEN_HUMID_WET  0x00008000
+
+// Per-biome parameters, as macros so that the derived bounds below are compile-time constants
+// and cannot drift from the table that feeds them.
+//
+// Tall grass is asked per BLOCK of eligible ground, out of 256 — the same idiom and the same
+// scale as the single global GEN_GRASS_CHANCE 24 it replaces, which was measured to read as
+// "a meadow with gaps you can see the ground through". Jungle at 56 is a little over twice
+// that; tundra and desert are zero because nothing grows on snow-country dirt or on sand.
+#define GEN_GRASS_TUNDRA   0
+#define GEN_GRASS_TAIGA   12
+#define GEN_GRASS_PLAINS  40
+#define GEN_GRASS_FOREST  24
+#define GEN_GRASS_DESERT   0
+#define GEN_GRASS_JUNGLE  56
+
+// The largest of the six. worldgenScatter draws its hash FIRST and rejects against this
+// before it resolves the biome, so the common case still costs one hash and no noise — the
+// ordering the old single-constant code was written for. Asserted against the table in the
+// suite, because a new biome with a higher chance would otherwise be silently clamped here.
+#define GEN_GRASS_CHANCE_MAX GEN_GRASS_JUNGLE
+
+// Trees, out of 256 per 8 x 8 cell, replacing the single global GEN_TREE_CHANCE 96.
+#define GEN_TREE_TUNDRA    0
+#define GEN_TREE_TAIGA    64
+#define GEN_TREE_PLAINS   24
+#define GEN_TREE_FOREST  128
+#define GEN_TREE_DESERT    0
+#define GEN_TREE_JUNGLE  160
+
+// Silhouette, from trunk length and canopy radius ONLY — no new block ids, no new tiles.
+// Three shapes: jungle tall and broad, taiga tall and narrow, everything else the existing
+// shape. Canopy shape reads at distances where colour does not, which is what matters on a
+// 400x240 screen.
+//
+// **Every trunk length stays inside GEN_TREE_MIN_H..GEN_TREE_MAX_H and every radius inside
+// GEN_TREE_RADIUS, and that is a correctness bound rather than a style one.**
+// worldgenDecorate's scan bounds are written in terms of GEN_TREE_RADIUS, so a canopy wider
+// than it would be clipped at a column border depending on which column was generated first
+// — an order-dependence bug, not a cosmetic one. Asserted in the suite.
+typedef struct {
+	uint8_t grass_chance;    // out of 256 eligible surface cells
+	uint8_t tree_chance;     // out of 256 tree cells
+	uint8_t trunk_min;       // trunk blocks, before the canopy
+	uint8_t trunk_max;
+	uint8_t canopy_radius;   // half-width of the two wide canopy layers, in blocks
+} BiomeParams;
 
 typedef struct {
 	uint32_t seed;
@@ -265,9 +391,47 @@ int worldgenHeight(const WorldGen* g, int32_t x, int32_t z);
 // should not have to guess.
 fx worldgenBiome(const WorldGen* g, int32_t x, int32_t z);
 
+// v1.8.3 Phase 2. The humidity field at (x, z), in [0, FX_ONE]. The second axis of the
+// climate square, sampled at the same GEN_BIOME_SHIFT and the same octave count as the biome
+// field so that the two vary at the same scale — a humidity field with finer features would
+// stipple jungle into desert one column at a time instead of drawing regions.
+//
+// Its own salt, for the reason worldgen.c's salt block gives: two fBms drawn from the same
+// seed are visibly the same shape, and a humidity field sharing the temperature field's seed
+// would put every wet region in the same place as every cold one and collapse the 3 x 2
+// rectangle to a diagonal.
+//
+// Exposed for the same reason worldgenBiome() is: the tests check the classifier against the
+// two fields rather than re-deriving the thresholds.
+fx worldgenHumidity(const WorldGen* g, int32_t x, int32_t z);
+
+// v1.8.3 Phase 2. Which biome (x, z) is in, from the (temperature, humidity) pair.
+//
+// **Answers for any world, including a legacy one** — it is a pure function of the two noise
+// fields and does not consult g->version. What is gated on the version is who ASKS: nothing
+// on the legacy path calls this. Keeping it ungated is what lets the suite measure both
+// answers side by side for the same seed and assert they differ, which is the check that
+// notices the version gate being deleted.
+BiomeId worldgenBiomeAt(const WorldGen* g, int32_t x, int32_t z);
+
+// The tall-grass chance, tree chance and tree silhouette for one biome. Never NULL: an id
+// outside the table resolves to BIOME_PLAINS, the baseline, rather than walking off the end.
+const BiomeParams* worldgenBiomeParams(BiomeId b);
+
 // True where the top of the ground is sand rather than grass and dirt. One rule, one
 // place: the column fill and the tree pass both ask this rather than each comparing
 // against GEN_SAND_BELOW and drifting apart.
+//
+// **v1.8.3 Phase 2 splits the answer by generator version, and this is the single most
+// safety-critical line of the rung.** A GEN_VERSION_DENSITY world resolves sand through the
+// biome classifier — sand is the DESERT cap and nothing else — while a GEN_VERSION_LEGACY
+// world keeps the original `worldgenBiome() < GEN_SAND_BELOW` test unchanged. The two rules
+// disagree at roughly a fifth of all columns, so deleting the gate would move the beaches and
+// deserts of every world on every SD card. testWorldgenLegacySandyWideSweep() exists for
+// exactly that sabotage, and it asserts BOTH that the legacy answer still matches the old
+// expression everywhere AND that the two rules were capable of disagreeing in the swept
+// region — the second half being what stops the first from passing by landing somewhere the
+// question is never asked.
 bool worldgenIsSandy(const WorldGen* g, int32_t x, int32_t z);
 
 // The raw cave field at a block: true where the two 3D fBms agree that this is hollow.
