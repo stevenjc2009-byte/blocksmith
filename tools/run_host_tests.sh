@@ -1911,9 +1911,23 @@ rm -rf "$BCW"
 #  * DEGREES (0, 7, 12, 4) -> (0, 5, 12, 4), one note moved a whole tone -> "FAIL 12 checks,
 #    1 failed", the +7 note only. The other three notes stay GREEN, which is what says the
 #    pitch arm discriminates one note rather than collapsing the fixture.
-PY_CHIME="$(command -v python3 || command -v python || true)"
+#
+# $BS_PYTHON overrides the PATH search, the same knob and the same rule as
+# tools/make_cia.sh: set-but-not-executable is fatal rather than a fall back to
+# PATH, because testing a different interpreter than the one that was named
+# would make this arm green about something nobody asked about. Unset, the PATH
+# search below is unchanged, and a missing interpreter is still a SKIP.
+if [ -n "${BS_PYTHON:-}" ]; then
+	if [ ! -x "$BS_PYTHON" ]; then
+		echo "banner chime: FAILED - \$BS_PYTHON is set to '$BS_PYTHON', which is not an executable file. Point it at a real Python interpreter, or unset it to search \$PATH instead."
+		exit 1
+	fi
+	PY_CHIME="$BS_PYTHON"
+else
+	PY_CHIME="$(command -v python3 || command -v python || true)"
+fi
 if [ -z "$PY_CHIME" ]; then
-	echo "banner chime: SKIPPED - no python3/python on PATH. This is a GAP, not a pass:"
+	echo "banner chime: SKIPPED - no python3/python on PATH and \$BS_PYTHON is not set. This is a GAP, not a pass:"
 	echo "  tools/make_banner_audio.py was not run, so the .wav make_cia.sh feeds bannertool is unchecked."
 else
 	BHCH="build-host/run-$$-chime"

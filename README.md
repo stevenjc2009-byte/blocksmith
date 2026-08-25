@@ -144,10 +144,11 @@ make
 ```
 
 To package it as an installable `.cia` afterwards (needs `makerom` and
-`bannertool` on PATH):
+`bannertool` on PATH, plus a Python 3 for the generated banner assets — the
+MSYS2 shell has none, so name one with `BS_PYTHON` instead of editing PATH):
 
 ```
-tools/make_cia.sh
+BS_PYTHON=/c/Path/To/python.exe tools/make_cia.sh
 ```
 
 > **Note — run `make deps` once first.** Two things are fetched rather than
