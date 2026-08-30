@@ -2765,12 +2765,16 @@ rm -rf "$BHTK"
 #      "FAIL line 245: control: resolving a NULL world directory is WSEED_NO_WORLD_DIR", and the
 #      green control count dropped from 8 to 7. Reverted.
 #
-# THE STANZA IS ALSO THE ENFORCEMENT POINT FOR world/genrefuse.h's -Wswitch CLAIM, which is worth
-# saying out loud because that file's own comment asserts "the host suite and the console build
-# both run -Werror" and the console half of that is NOT true — the client Makefile carries -Wall
-# only. So this gcc line is the only place in the tree where a WorldSeedStatus added without a
-# decision actually stops anything. Measured, arm G, by appending WSEED_SOMETHING_NEW to
-# world/worldseed.h's enum:
+# THIS STANZA IS AN ENFORCEMENT POINT FOR world/genrefuse.h's -Wswitch CLAIM, and it is worth
+# recording that the claim was checked rather than believed. That file asserts "the host suite and
+# the console build both run -Werror"; when this stanza was first written the console half of it
+# was false — the client Makefile carried -Wall -Wextra and no -Werror — so this gcc line was the
+# ONLY place in the tree where a WorldSeedStatus added without a decision stopped anything. It was
+# made true again by 0cd86ca ("build(makefile): add -Werror to the console build"), which landed on
+# this branch mid-session; Makefile:58 now reads `-g -Wall -Wextra -Werror -O3 ...` and the console
+# build was re-run against it warning-free (MAKE_RC=0, 0 errors, 0 warnings). Both halves of
+# genrefuse.h's sentence hold as of this commit. Measured, arm G, by appending WSEED_SOMETHING_NEW
+# to world/worldseed.h's enum:
 #
 #     source/world/genrefuse.h:106:9: error: enumeration value 'WSEED_SOMETHING_NEW' not handled
 #     in switch [-Werror=switch]
