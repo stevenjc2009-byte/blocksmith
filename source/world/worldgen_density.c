@@ -401,21 +401,61 @@ static inline BlockId surfaceBlock(int depth, int top_y, int slope_x2, BiomeId b
 	if (biome == BIOME_DESERT || top_y <= GEN_SEA_LEVEL + GEN_D_BEACH_ABOVE)
 		return (depth <= GEN_DIRT_DEPTH) ? BLOCK_SAND : BLOCK_STONE;
 
-	// v1.8.3 Phase 2. Tundra caps with bare DIRT — no grass, all the way down through the
-	// dirt band.
+	// Tundra caps with SNOW over the dirt band.
 	//
-	// **This is an explicit PHASE 3 PLACEHOLDER, not the intended material.** Snow is what
-	// belongs here and snow needs a new core block id and an atlas tile, which is a server
-	// release and therefore a different phase (see the v1.8.3 world-variety decision page).
-	// Bare dirt is a stretch and it is the weakest design call on this rung; it is here so
-	// that the cold half of the climate rectangle exists at all rather than being deferred,
-	// and Phase 3 replaces THIS ONE BRANCH and nothing else.
-	if (biome == BIOME_TUNDRA)
-		return (depth <= GEN_DIRT_DEPTH) ? BLOCK_DIRT : BLOCK_STONE;
+	// **v1.8.3 Phase 3 redeems Phase 2's placeholder, and this is the branch it was left
+	// for.** Phase 2 capped tundra with bare DIRT and said so in as many words: snow was the
+	// intended material and it needed a new core block id and an atlas tile, which is a
+	// server release and therefore a different phase. BLOCK_SNOW is that id (world/
+	// registry.c row [10]) and this is the one branch that was promised to change.
+	//
+	// Only the TOP block, not the whole cap. Snow is weather sitting on ground, so the dirt
+	// band underneath stays exactly what it was and a tundra cliff or a dug hole shows dirt
+	// under a white lid — which is what snow-covered ground looks like from the side. Making
+	// the whole cap snow would give the tundra four blocks of solid snowfall and would read
+	// as a different rock rather than as weather.
+	//
+	// TAIGA is deliberately NOT included. It is the other cold cell of the climate square,
+	// but capping it too would put snow under every spruce in the world and there is no
+	// design call on record for that; the Phase 2 note names tundra and nothing else. Cold
+	// WATER does freeze in both — see the sea fill in wgdColumn below — because that rule is
+	// about the waterline and not about the ground.
+	if (biome == BIOME_TUNDRA) {
+		if (depth == 0)               return BLOCK_SNOW;
+		if (depth <= GEN_DIRT_DEPTH)  return BLOCK_DIRT;
+		return BLOCK_STONE;
+	}
 
 	if (depth == 0)               return BLOCK_GRASS;
 	if (depth <= GEN_DIRT_DEPTH)  return BLOCK_DIRT;
 	return BLOCK_STONE;
+}
+
+// v1.8.3 Phase 3. Which block one cell of the sea fill gets: ICE on the surface of a cold
+// sea, water everywhere else.
+//
+// **One cell thick, and only the cell the water surface would have occupied.** The sea fill
+// below walks a column downwards from GEN_SEA_LEVEL - 1 and stops at the first solid, so
+// `y == GEN_SEA_LEVEL - 1` is the topmost water block of an ocean or lake and nothing else
+// can match it: a column whose ground is higher never enters the fill at all, and every cell
+// under that one is strictly below it. A thicker sheet would need a depth counter the fill
+// does not carry, and a frozen lake reads from the surface.
+//
+// **Cold is TUNDRA or TAIGA — the whole cold row of the climate square, not just the half
+// the ground rule takes.** surfaceBlock() above caps tundra with snow and leaves taiga's
+// ground alone, and that asymmetry is on purpose: snow on the ground is weather, and there
+// is no design call on record for snowing on every spruce. Freezing is not the same
+// question. A lake at the cold end of the temperature field freezes whether or not the trees
+// beside it are standing in snow, and a taiga shore with open water on it while the tundra
+// shore fifty blocks away is frozen would read as a bug rather than as a boundary.
+//
+// It is written INSTEAD OF water, never on top of it, so it costs no extra cell and cannot
+// push the sea surface up a block.
+static inline BlockId seaBlockAt(int y, BiomeId biome)
+{
+	if (y == GEN_SEA_LEVEL - 1 && (biome == BIOME_TUNDRA || biome == BIOME_TAIGA))
+		return BLOCK_ICE;
+	return BLOCK_WATER;
 }
 
 // ── Height ────────────────────────────────────────────────────────────────────────────
@@ -591,7 +631,8 @@ bool wgdColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 						if (run[z][x] >= 0) exposed[z][x] = false;
 						run[z][x] = -1;
 						if (under_line && sea[z][x]) {
-							s_flat[chunkIndex(x, ly, z)] = BLOCK_WATER;
+							s_flat[chunkIndex(x, ly, z)] =
+								seaBlockAt(y, (BiomeId)biome[z][x]);
 							any = true;
 						}
 						continue;
@@ -625,9 +666,12 @@ bool wgdColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 						// stopped on it. The case that DOES reach here is a cave breaking
 						// into the underside of an overhang that stands open to the sea, and
 						// water belonging in it is the same answer as for any other air cell
-						// the walk can still see.
+						// the walk can still see. Same for ice: seaBlockAt() keys on the
+						// waterline y, and a carved cell AT y == GEN_SEA_LEVEL - 1 that the
+						// walk can still see is the sea surface however it came to be air.
 						if (under_line && sea[z][x]) {
-							s_flat[chunkIndex(x, ly, z)] = BLOCK_WATER;
+							s_flat[chunkIndex(x, ly, z)] =
+								seaBlockAt(y, (BiomeId)biome[z][x]);
 							any = true;
 						}
 						continue;

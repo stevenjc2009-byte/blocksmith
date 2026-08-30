@@ -6,7 +6,7 @@
 //
 // What each probe guards:
 //   testRegistryRoundTrip    - register/find/duplicate/full-range/unknown-id contract
-//   testRegistryCoreIdsStable- ids 1..9 byte-identical after InitCore; every saved
+//   testRegistryCoreIdsStable- ids 1..14 byte-identical after InitCore; every saved
 //                              world and replay depends on these never moving
 //   testRegistryCrcStability - same defs -> same crc16, different defs -> different
 //                              crc16, plus a pinned golden for the core-only table
@@ -27,7 +27,8 @@
 //
 // This is the most important range in the block system: REG_ID_DYN_LO..REG_ID_DYN_HI is
 // how many block types a server may add at join time, so it is the ceiling on what the
-// game can represent beyond the ten compiled-in core rows.
+// game can represent beyond the fifteen compiled-in core rows (ten until v1.8.3 Phase 3
+// appended snow, ice, cactus, dead_bush and fern at ids 10..14).
 //
 // Before 2026-08-25 this file asserted that range against ITSELF. The two checks in
 // testRegistryRoundTrip() read
@@ -50,7 +51,7 @@
 #define REGISTRY_DYN_LO_PIN     0x80  // first dynamic block id
 #define REGISTRY_DYN_HI_PIN     0xFD  // last one; 0xFE/0xFF stay reserved
 #define REGISTRY_DYN_ROWS_PIN   126   // 0xFD - 0x80 + 1, WRITTEN OUT, never computed
-#define REGISTRY_FULL_COUNT_PIN 136   // 10 core rows (air + nine) + 126 dyn rows
+#define REGISTRY_FULL_COUNT_PIN 141   // 15 core rows (air + fourteen) + 126 dyn rows
 
 // Compile-time layer. These fire when the host suite builds, which is every
 // tools/run_host_tests.sh run; the 3DS build never compiles this file (see the __3DS__
@@ -127,7 +128,20 @@ static void checkPin(bool cond, long got, long want, const char *what, const cha
 //
 // 53 -> 54 on 2026-08-25: one check added, "the dynamic block-id range is still
 // 0x80..0xFD, 126 rows", the runtime half of the dyn-range pin.
-#define REGISTRY_TEST_EXPECTED_CHECKS 54
+//
+// 54 -> 89 on 2026-08-30 by v1.8.3 Phase 3, counted off the source first and only then
+// compared with the run:
+//
+//    +5   testRegistryCoreIdsStable's name loop runs to 15 instead of 10, and its body is
+//         one check() per id — snow, ice, cactus, dead_bush, fern.
+//   +30   the kPhase3 table in the same function: five rows x six checks (solid,
+//         transparent, not-liquid, shape, tile-on-every-face, past the item ceiling).
+//
+// 54 + 35 = 89, and the guard printed "expected 54, ran 89" — the same 89, arrived at from
+// the other direction. Nothing else in this suite changed count: the crc golden moved VALUE
+// (0x4066 -> 0x189B, see testRegistryCrcStability) but it is still exactly one check, and
+// REGISTRY_FULL_COUNT_PIN moved value too without adding a call.
+#define REGISTRY_TEST_EXPECTED_CHECKS 89
 
 // Deliberately NOT routed through check(): this must not perturb the number it is testing,
 // so it bumps g_fails only. Reporting shape is check()'s, so a failure here reads the same
@@ -174,11 +188,12 @@ static void testRegistryRoundTrip(void)
 	puts("registry: register / find / duplicate / full range / unknown id");
 
 	registryInitCore();
-	// Nine core rows since roadmap tasks 17 and 19: grass..planks are the seven that
-	// also carry ITEM ids, plus water (0x08) and tall grass (0x09), which are core
-	// blocks and deliberately NOT items — world/block.h records why BLOCK_COUNT
-	// stayed at 8 while the registry's row count moved to 10.
-	check(registryCount() == 10, "a fresh table defines exactly air + the nine core blocks");
+	// Fourteen core rows since v1.8.3 Phase 3: grass..planks are the seven that also carry
+	// ITEM ids, plus water (0x08) and tall grass (0x09) from roadmap tasks 17 and 19, plus
+	// snow (0x0A), ice (0x0B), cactus (0x0C), dead bush (0x0D) and fern (0x0E). Every one
+	// of the last seven is a core block and deliberately NOT an item — world/block.h
+	// records why BLOCK_COUNT stayed at 8 while the registry's row count moved to 15.
+	check(registryCount() == 15, "a fresh table defines exactly air + the fourteen core blocks");
 	check(registryFind("grass") == BLOCK_GRASS, "core rows are findable by name");
 
 	// The runtime half of the dyn-range pin. The two _Static_asserts at the top of this
@@ -249,24 +264,29 @@ static void testRegistryRoundTrip(void)
 	         kDynRangeWhy);
 	checkPin(registryCount() == REGISTRY_FULL_COUNT_PIN,
 	         (long)registryCount(), (long)REGISTRY_FULL_COUNT_PIN,
-	         "count reflects every defined row once the range is full: 10 core + 126 dyn",
+	         "count reflects every defined row once the range is full: 15 core + 126 dyn",
 	         kDynRangeWhy);
 }
 
 static void testRegistryCoreIdsStable(void)
 {
-	puts("registry: core ids 1..9 are identical after InitCore");
+	puts("registry: core ids 1..14 are identical after InitCore");
 
 	registryInitCore();
 
-	// These ten checks ARE the save-format guarantee: a region file written by
+	// These fifteen checks ARE the save-format guarantee: a region file written by
 	// any earlier build decodes by raw id, so if grass ever stops being 1 every
 	// old world silently re-textures. Names first, then the texture rows.
+	//
+	// The last five are v1.8.3 Phase 3's, and they join this list the moment they exist
+	// rather than once a server has shipped them: the guarantee is about what a saved byte
+	// MEANS, and it starts applying the first time a world is generated with one in it.
 	static const char *const want_names[] = {
 		"air", "grass", "dirt", "stone", "sand", "wood", "leaves", "planks",
 		"water", "tall_grass",
+		"snow", "ice", "cactus", "dead_bush", "fern",
 	};
-	for (BlockId id = 0; id < 10; id++) {
+	for (BlockId id = 0; id < 15; id++) {
 		char what[64];
 		snprintf(what, sizeof what, "id %u is still \"%s\"", (unsigned)id, want_names[id]);
 		check(strcmp(registryGet(id)->name, want_names[id]) == 0, what);
@@ -313,6 +333,70 @@ static void testRegistryCoreIdsStable(void)
 	      "tall grass is the first BLOCK_SHAPE_CROSS block in the game");
 	check(tg->tex[FACE_TOP] == BTEX_TALL_GRASS && tg->tex[FACE_EAST] == BTEX_TALL_GRASS,
 	      "tall grass wears its own tile; emitCross reads the east rect");
+
+	// v1.8.3 Phase 3's five, ids 0x0A..0x0E. Pinned for the same reason as every row above,
+	// and per-FLAG rather than only by name: the crc golden already notices any byte moving,
+	// but it says nothing about WHICH byte, and these five rows' behaviour is entirely in
+	// their flags. A row that quietly lost REG_FLAG_SOLID would keep its name, keep its crc
+	// contribution shape, and become a block the player falls through.
+	//
+	// The tile assertions are the half this project has been bitten by before: a wrong
+	// texture constant still renders A texture, so it looks like bad art and never raises
+	// anything (world/atlas_uv.h says so). Each of the five is pinned to its own BTEX_*, and
+	// world/block_tiles_check.c is what ties those to gfx/atlas_tiles.h.
+	static const struct {
+		BlockId     id;
+		const char *name;
+		bool        solid;
+		bool        transparent;
+		uint8_t     shape;
+		uint8_t     tex;
+	} kPhase3[] = {
+		{ (BlockId)BLOCK_SNOW,      "snow",      true,  false, BLOCK_SHAPE_FULL_CUBE, BTEX_SNOW      },
+		{ (BlockId)BLOCK_ICE,       "ice",       true,  false, BLOCK_SHAPE_FULL_CUBE, BTEX_ICE       },
+		{ (BlockId)BLOCK_CACTUS,    "cactus",    true,  false, BLOCK_SHAPE_FULL_CUBE, BTEX_CACTUS    },
+		{ (BlockId)BLOCK_DEAD_BUSH, "dead_bush", false, true,  BLOCK_SHAPE_CROSS,     BTEX_DEAD_BUSH },
+		{ (BlockId)BLOCK_FERN,      "fern",      false, true,  BLOCK_SHAPE_CROSS,     BTEX_FERN      },
+	};
+	for (size_t i = 0; i < sizeof kPhase3 / sizeof kPhase3[0]; i++) {
+		const BlockDef *d = registryGet(kPhase3[i].id);
+		char what[96];
+
+		snprintf(what, sizeof what, "%s is solid=%d", kPhase3[i].name, kPhase3[i].solid);
+		check(((d->flags & REG_FLAG_SOLID) != 0) == kPhase3[i].solid, what);
+
+		snprintf(what, sizeof what, "%s is transparent=%d", kPhase3[i].name,
+		         kPhase3[i].transparent);
+		check(((d->flags & REG_FLAG_TRANSPARENT) != 0) == kPhase3[i].transparent, what);
+
+		// Not one of the five is a liquid, and that is load-bearing rather than incidental:
+		// blockIsTargetable() is `drawn && !liquid`, so a liquid flag here would make the
+		// block un-aimable and un-buildable-against — which for ice, the surface you stand
+		// on, would read as the crosshair falling through a frozen lake.
+		snprintf(what, sizeof what, "%s is not a liquid, so the crosshair CAN stop on it",
+		         kPhase3[i].name);
+		check(!(d->flags & REG_FLAG_LIQUID), what);
+
+		snprintf(what, sizeof what, "%s has shape %u", kPhase3[i].name,
+		         (unsigned)kPhase3[i].shape);
+		check(regShapeOf(d->flags) == kPhase3[i].shape, what);
+
+		snprintf(what, sizeof what, "%s wears tile %u on every face", kPhase3[i].name,
+		         (unsigned)kPhase3[i].tex);
+		bool all_faces = true;
+		for (int f = 0; f < BLOCK_FACES; f++)
+			if (d->tex[f] != kPhase3[i].tex) all_faces = false;
+		check(all_faces, what);
+
+		// The item ceiling, asserted from the row rather than assumed from the id. All five
+		// sit past BLOCK_COUNT, so scene/interact.c's guard refuses the break for the three
+		// cubes and allows it (yielding nothing) for the two CROSS plants. This check is what
+		// goes red if somebody widens BLOCK_COUNT rather than the predicate — the move
+		// world/block.h spends forty lines forbidding.
+		snprintf(what, sizeof what, "%s is past the item ceiling and cannot reach the bag",
+		         kPhase3[i].name);
+		check(kPhase3[i].id >= BLOCK_COUNT, what);
+	}
 }
 
 static void testRegistryCrcStability(void)
@@ -348,8 +432,32 @@ static void testRegistryCrcStability(void)
 	// into the bounded REGISTRY_FETCH retry, and finishes with s_reg_synced false. v1.8.1
 	// therefore ships the server in lockstep — deps/blocksmith-server/game/world/registry.c is
 	// a byte-identical vendored copy and tools/sync-world-sources.sh is what keeps it so.
-	check(base == 0x4066u,
-	      "core-only crc matches the pinned golden 0x4066");
+	//
+	// Moved 0x4066 -> 0x189B on 2026-08-30 by v1.8.3 Phase 3, which appends FIVE core rows —
+	// snow (0x0A), ice (0x0B), cactus (0x0C), dead bush (0x0D) and fern (0x0E). This is the
+	// same shape of move as tasks 17/19 above and NOT the same shape as task 50's: task 50
+	// changed byte values inside existing records and left registryCount() at 10, whereas
+	// this adds five whole 28-byte records, so the count moves 10 -> 15 as well and BOTH
+	// halves of registryMatchesInfo() disagree with an older server rather than just the crc.
+	//
+	// **How this was told apart from breakage, rather than re-pinned to whatever ran.** The
+	// value came from a probe linking this tree's real world/registry.c and world/block.c
+	// (scratchpad p3_crc_probe.c) which prints the row table alongside the crc: it shows
+	// rows 0..9 unchanged in every field — name, solid, transparent, liquid, shape, hardness
+	// and tex[0] — and five new rows at 10..14 carrying tex 12..16. An appended record can
+	// only extend the hash, and the count check above pins the extension to exactly five. If
+	// rows 0..9 had moved, that table is where it would have shown, and the pin would have
+	// been a bug to find rather than a number to update.
+	//
+	// The cost is the identical one recorded above and is why the SERVER SHIPS FIRST: a
+	// client carrying these rows against a server that does not fails registryMatchesInfo()
+	// and finishes with s_reg_synced false, which is degraded but visible. The reverse — a
+	// client WITHOUT them against a server that has them — is the one that must never ship,
+	// because deps/blocksmith-server/game/bsgame.c accepts the join anyway and every id 10..14
+	// in the world resolves through registryGet()'s never-NULL contract to the AIR row: an
+	// invisible hole indistinguishable from a cave.
+	check(base == 0x189Bu,
+	      "core-only crc matches the pinned golden 0x189B");
 
 	// Content sensitivity: one extra def must move the crc, and re-init must
 	// put it back - proving the crc covers table content, not process state.

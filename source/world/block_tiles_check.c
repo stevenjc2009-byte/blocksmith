@@ -52,7 +52,12 @@
 	X(BTEX_LEAVES,     TILE_LEAVES)     \
 	X(BTEX_PLANKS,     TILE_PLANKS)     \
 	X(BTEX_WATER,      TILE_WATER)      \
-	X(BTEX_TALL_GRASS, TILE_TALL_GRASS)
+	X(BTEX_TALL_GRASS, TILE_TALL_GRASS) \
+	X(BTEX_SNOW,       TILE_SNOW)       \
+	X(BTEX_ICE,        TILE_ICE)        \
+	X(BTEX_CACTUS,     TILE_CACTUS)     \
+	X(BTEX_DEAD_BUSH,  TILE_DEAD_BUSH)  \
+	X(BTEX_FERN,       TILE_FERN)
 
 // One _Static_assert per pair, exactly as before. The names are stringified into the message
 // because every one of these expands from the same source line, so the message is the only

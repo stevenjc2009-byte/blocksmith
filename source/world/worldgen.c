@@ -68,6 +68,18 @@ static inline fx caveCoordY(int32_t block)
 // give distinct mixed seeds; the check is only that the salt constants themselves differ.
 #define SALT_HUMID  0x48554D44U   // 'HUMD'
 
+// v1.8.3 Phase 3. The per-biome flora pass's salt — cactus, dead bush and fern. Same house
+// convention as every salt above: four ASCII characters packed big-endian, applied as
+// rngMix(g->seed ^ SALT_X). Checked against all ten existing salts — BIOM TREE PLNT CAVE
+// CAV2 HUMD DLOW DHIG DSEL and the BLKS seed mix — and it collides with none of them.
+//
+// It is a NEW salt rather than a second draw off SALT_GRASS, and that is the point: the
+// tall-grass pass and this one both ask a question of every eligible surface cell, and
+// sharing a hash would tie the answers together — every cell that drew low for grass would
+// draw low for fern, so ferns would appear only where tall grass already stood and the two
+// scatters would be one field wearing two textures.
+#define SALT_FLORA  0x464C4F52U   // 'FLOR'
+
 bool worldgenInit(WorldGen* g, uint32_t seed, uint32_t version)
 {
 	// Refused rather than coerced. A WorldGen carrying a version this build cannot generate
@@ -392,6 +404,14 @@ bool worldgenDecorate(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 	return ok;
 }
 
+// v1.8.3 Phase 3's flora pass, defined below worldgenScatter because it is the second half
+// of that pass and reads far better after it. Forward-declared rather than moved above it so
+// the tall-grass rule — the one this file has shipped since v1.7.0 — stays the first thing a
+// reader meets. `tops` is worldgenScatter's own wgdColumnTops() pointer, handed down rather
+// than re-fetched: it is per-column state that the caller has already validated.
+static bool worldgenFlora(const WorldGen* g, World* w, int32_t cx, int32_t cz,
+                          const int16_t* tops);
+
 // v1.7.0 task 19. Tall grass on the exposed surface.
 //
 // Gated on the generator by its only caller, exactly as the tree pass's waterline rule is: a
@@ -456,6 +476,132 @@ bool worldgenScatter(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 				continue;
 
 			ok &= worldSet(w, x, y, z, BLOCK_TALL_GRASS);
+		}
+	}
+
+	return worldgenFlora(g, w, cx, cz, tops) && ok;
+}
+
+// v1.8.3 Phase 3. Are the `n` cells from (x, y, z) upwards inside the world AND all air?
+//
+// Asked before ANY of them is written, so a cactus that would not fit is not placed at all
+// rather than placed half-height. The ceiling test is part of the same question because the
+// only reason a cell can be missing is that it is above the world, and answering the two
+// separately is how a loop ends up writing the first block and then discovering the second.
+static bool cellsClear(World* w, int32_t x, int y, int32_t z, int n)
+{
+	if (y + n > WORLD_HEIGHT)
+		return false;
+	for (int i = 0; i < n; i++)
+		if (worldGet(w, x, y + i, z) != BLOCK_AIR)
+			return false;
+	return true;
+}
+
+// v1.8.3 Phase 3. The per-biome flora pass: cactus and dead bush on desert sand, fern on
+// taiga and jungle grass.
+//
+// **Why it is a second loop and not a second draw inside worldgenScatter's.** That loop's
+// very first test is `draw >= GEN_GRASS_CHANCE_MAX`, and GEN_GRASS_TUNDRA and
+// GEN_GRASS_DESERT are both 0 — so the cells this pass exists for are exactly the ones that
+// loop throws away before it ever resolves a biome. Folding this in would mean widening that
+// bound to cover both tables, which would make the cheap rejection stop rejecting and cost
+// the noise for a biome lookup on cells that want neither plant. Two loops, two bounds, each
+// tight.
+//
+// It runs AFTER the tall-grass loop and keeps that pass's one safety rule unchanged: air,
+// and nothing else, is written into. A trunk, a leaf, a block of water or a tall grass
+// already standing in the cell is not air, so the flora is silently not placed. Order
+// between the two passes is therefore fixed and deliberate — tall grass wins a contested
+// cell — but neither depends on which COLUMN was generated first, because every input is a
+// hash of the world (x, z) plus this column's own blocks.
+static bool worldgenFlora(const WorldGen* g, World* w, int32_t cx, int32_t cz,
+                          const int16_t* tops)
+{
+	const uint32_t salt = rngMix(g->seed ^ SALT_FLORA);
+
+	bool ok = true;
+	for (int lz = 0; lz < CHUNK_DIM; lz++) {
+		for (int lx = 0; lx < CHUNK_DIM; lx++) {
+			const int y = tops[lz * CHUNK_DIM + lx];
+
+			// The same two gates the tall-grass loop applies, and for the same reasons:
+			// nothing grows in the sea, and nothing is written through the ceiling.
+			if (y <= GEN_SEA_LEVEL)
+				continue;
+			if (y >= WORLD_HEIGHT)
+				continue;
+
+			const int32_t x = cx * CHUNK_DIM + lx, z = cz * CHUNK_DIM + lz;
+
+			// One hash, used twice: the low byte is the draw, and bit 8 is the cactus's
+			// height. Two independent draws off one hash rather than two hashes, which is
+			// what treeInCell() does with its own (offset, chance, trunk, radius) bundle.
+			const uint32_t h    = rngHash2(salt, x, z);
+			const uint32_t draw = h & 0xFFu;
+
+			// The cheap reject, exactly the shape the tall-grass loop uses.
+			// GEN_FLORA_CHANCE_MAX is an upper bound over every branch below, so this can
+			// only reject cells those branches would have rejected anyway — the answer is
+			// identical to resolving the biome for all 256 cells, at a fraction of the
+			// cost. The bound holds BY CONSTRUCTION rather than by assertion: worldgen.h
+			// defines it as a MAX over the same constants these branches test against.
+			// A branch added below with a NEW chance must be folded into that MAX, or
+			// this reject silently clamps it; worldgen.h says so at the definition.
+			if (draw >= (uint32_t)GEN_FLORA_CHANCE_MAX)
+				continue;
+
+			const BiomeId b = worldgenBiomeAt(g, x, z);
+			switch (b) {
+			case BIOME_DESERT:
+				// Sand only. The desert cap is sand by surfaceBlock(), but a cliff face
+				// inside a desert is bare stone and a dune's edge at the waterline is
+				// beach — asking the block rather than the biome is what keeps a cactus
+				// off a rock face.
+				if (worldGet(w, x, y - 1, z) != BLOCK_SAND)
+					continue;
+
+				if (draw < (uint32_t)GEN_CACTUS_CHANCE) {
+					// One or two blocks. Both must be clear before either is written.
+					const int th = GEN_CACTUS_MIN_H +
+					               (int)((h >> 8) %
+					                     (uint32_t)(GEN_CACTUS_MAX_H - GEN_CACTUS_MIN_H + 1));
+					if (!cellsClear(w, x, y, z, th))
+						continue;
+					for (int i = 0; i < th; i++)
+						ok &= worldSet(w, x, y + i, z, BLOCK_CACTUS);
+				} else if (draw < (uint32_t)(GEN_CACTUS_CHANCE + GEN_DEAD_BUSH_CHANCE)) {
+					if (!cellsClear(w, x, y, z, 1))
+						continue;
+					ok &= worldSet(w, x, y, z, BLOCK_DEAD_BUSH);
+				}
+				break;
+
+			case BIOME_TAIGA:
+			case BIOME_JUNGLE: {
+				const uint32_t chance = (b == BIOME_TAIGA) ? (uint32_t)GEN_FERN_TAIGA
+				                                           : (uint32_t)GEN_FERN_JUNGLE;
+				if (draw >= chance)
+					continue;
+				// Grass only — not the bare stone of a cliff face, not a dirt scar, and
+				// not the snow or sand of a neighbouring cap that reached in.
+				if (worldGet(w, x, y - 1, z) != BLOCK_GRASS)
+					continue;
+				if (!cellsClear(w, x, y, z, 1))
+					continue;
+				ok &= worldSet(w, x, y, z, BLOCK_FERN);
+				break;
+			}
+
+			// Tundra, plains and forest grow none of these three. Written out rather than
+			// left to a default so that adding a biome is a compile warning here under
+			// -Wswitch rather than a silent nothing.
+			case BIOME_TUNDRA:
+			case BIOME_PLAINS:
+			case BIOME_FOREST:
+			case BIOME_COUNT:
+				break;
+			}
 		}
 	}
 

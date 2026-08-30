@@ -338,6 +338,80 @@ typedef enum {
 #define GEN_TREE_DESERT    0
 #define GEN_TREE_JUNGLE  160
 
+// ── Flora (v1.8.3 Phase 3) ────────────────────────────────────────────────────────────
+//
+// Cactus and dead bush on desert sand; fern on taiga and jungle grass. All four chances are
+// out of 256 per eligible SURFACE CELL — the same idiom and the same scale as the GEN_GRASS_*
+// table above, and NOT the per-8x8-cell scale the GEN_TREE_* chances use. Getting those two
+// scales confused is what the GEN_GRASS_CHANCE note warns about: the same number means one
+// plant per block and one tree per sixty-four.
+//
+// They are their own constants rather than five more fields in BiomeParams, because they are
+// not one quantity per biome. Desert has TWO plants drawn from one shared band and the other
+// five biomes have at most one, so a field per plant would carry four zeros for every biome
+// that grows none of them, and the derived bound below would be a max over a mostly-zero
+// table rather than over the three expressions that actually bound the branches.
+//
+// **The two desert chances share ONE draw and must be read as a band, not as two independent
+// rolls.** world/worldgen.c tests `draw < GEN_CACTUS_CHANCE` first and then
+// `draw < GEN_CACTUS_CHANCE + GEN_DEAD_BUSH_CHANCE`, so the second constant is the WIDTH of
+// the band above the first: 3 and 8 give 3/256 cactus and 8/256 dead bush, never 11/256 of
+// either. Raising GEN_CACTUS_CHANCE alone therefore takes cells away from the dead bush.
+//
+// Scale, against the one density on this rung that was ever measured. Tall grass at 24/256
+// was measured to read as "a meadow with gaps you can see the ground through" (GEN_GRASS_CHANCE
+// above). These four are placed against that ruler by eye and are **NOT independently
+// measured** — said plainly, because the numbers around them are:
+//
+//   cactus       3/256   about 3 per 16x16 chunk of desert. Sparse deliberately: a cactus is
+//                        a full solid cube here (world/registry.c row [12] says why there is
+//                        no narrow shape yet), so a dense field of them is a maze to walk.
+//   dead bush    8/256   about 8 per chunk, a third of tall grass, which is what makes a
+//                        desert read as picked over rather than planted.
+//   fern taiga  20/256   just above taiga's own tall grass at 12, so the cold forest floor
+//                        reads fern-first.
+//   fern jungle 32/256   under jungle's tall grass at 56, and drawn on a separate salt so the
+//                        two are independent fields rather than one wearing two textures. The
+//                        pair is the thickest undergrowth in the world, which is what
+//                        BIOME_JUNGLE's own comment says that biome is for.
+#define GEN_CACTUS_CHANCE     3
+#define GEN_DEAD_BUSH_CHANCE  8
+#define GEN_FERN_TAIGA       20
+#define GEN_FERN_JUNGLE      32
+
+// Cactus height in blocks, inclusive. Two at most. Not a safety bound — the pass checks every
+// cell of the column before it writes any of them, so a taller cactus would simply be refused
+// more often under a canopy or against a dune — but a three-block stack of a FULL_CUBE reads
+// as a pillar rather than as a plant at this tile size.
+#define GEN_CACTUS_MIN_H      1
+#define GEN_CACTUS_MAX_H      2
+
+// The largest draw any branch of the flora pass can use. worldgenFlora draws its hash FIRST
+// and rejects against this before it resolves a biome, so the common case costs one hash and
+// no noise — the same ordering, and the same reason, as GEN_GRASS_CHANCE_MAX above.
+//
+// A MAX over three expressions rather than a single name, because the desert's two plants
+// share a band: the widest branch is whichever of (cactus + dead bush), fern-in-taiga and
+// fern-in-jungle is largest. Written as nested conditionals so it stays a compile-time
+// constant. It bounds all three branches BY CONSTRUCTION -- it is a MAX over the very
+// expressions those branches test against -- so there is no way for it to stop bounding them
+// and no assertion is written for it. Saying that plainly rather than claiming a check: an
+// assert of the form `MAX >= GEN_FERN_JUNGLE` reads like proof and can never go red, which
+// is worse than nothing.
+//
+// What is NOT checked anywhere, and is the real way this rots: a NEW branch added to
+// worldgenFlora()'s switch whose chance is not folded into the MAX above. The draw is
+// rejected against this bound BEFORE the biome is resolved, so the new chance would be
+// silently clamped -- fewer plants, no error, and every placement assertion still green,
+// because they all check WHERE a plant stands and never HOW MANY there are. Add a branch,
+// add its chance here.
+#define GEN_FLORA_DESERT_TOTAL (GEN_CACTUS_CHANCE + GEN_DEAD_BUSH_CHANCE)
+#define GEN_FLORA_FERN_MAX \
+	(GEN_FERN_TAIGA > GEN_FERN_JUNGLE ? GEN_FERN_TAIGA : GEN_FERN_JUNGLE)
+#define GEN_FLORA_CHANCE_MAX                       \
+	(GEN_FLORA_DESERT_TOTAL > GEN_FLORA_FERN_MAX ? \
+	 GEN_FLORA_DESERT_TOTAL : GEN_FLORA_FERN_MAX)
+
 // Silhouette, from trunk length and canopy radius ONLY — no new block ids, no new tiles.
 // Three shapes: jungle tall and broad, taiga tall and narrow, everything else the existing
 // shape. Canopy shape reads at distances where colour does not, which is what matters on a
@@ -460,6 +534,14 @@ bool worldgenColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz);
 // a plant would have gone simply is not air and the plant is not placed. That is a structural
 // impossibility rather than a probability, and it is the right way round: a plant skipped
 // under a canopy costs nothing, while a leaf skipped over a plant would be a hole in a tree.
+//
+// **v1.8.3 Phase 3 adds a SECOND pass inside this one**, run after the tall grass and under
+// the same rule: cactus and dead bush on desert sand, fern on taiga and jungle grass. It is a
+// separate loop with a separate salt, not a second draw on the tall-grass hash — see
+// GEN_FLORA_CHANCE_MAX above for why the bound could not be shared, and world/worldgen.c for
+// why the salt could not be. The ordering between the two is fixed and one-way: tall grass
+// goes down first, so a contested cell is tall grass and the fern is the one silently not
+// placed. Neither pass depends on which COLUMN was generated first.
 //
 // Returns false only if the world refused an allocation, or if the density generator's
 // per-column surface heights are not the ones for (cx, cz) — see wgdColumnTops().
