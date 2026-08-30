@@ -93,7 +93,7 @@
 // object the GPU is handed (LZ11, then the PICA200's 8x8-tile Morton swizzle), and asserts on
 // texel values: that every slot the TILES list does not fill is the magenta/black missing-
 // texture marker, that no slot anywhere is still a solid block of background fill, and that
-// each of the twelve painted slots still fingerprints to what it did before F7 touched the
+// each painted slot still fingerprints to what it did before F7 touched the
 // generator. This is as close to looking at the sheet as a host test can get. Since task 13b
 // that sweep covers 64 slots rather than 16.
 //
@@ -172,11 +172,24 @@ static char s_first[512];
 #define UVSCALE_OUT_NEEDLE "mov outtc0, r2.xyxy"
 #define ANY_R2_MUL_NEEDLE  "mul r2,"
 
-// The number of slots tools/make_atlas.py's TILES list actually paints art into. Duplicated
-// from gfx/atlas.h's enum rather than included, because that header pulls in <3ds.h>; the
-// coverage loop further down is what stops the two drifting, since every block's face tile
-// has to land below this and the marker check owns everything at or above it.
-#define ATLAS_PAINTED_SLOTS 12
+// The number of slots tools/make_atlas.py's TILES list actually paints art into.
+//
+// This used to be described as a copy of gfx/atlas.h's TILE_* enum count. From v1.8.3 phase 3
+// it is NOT that any more, and the difference is deliberate: the sheet carries 17 painted
+// slots while the enum still names 12. The five extra - snow, ice, cactus, dead bush and fern
+// in slots 12..16 - are ART THAT LANDED AHEAD OF THE BLOCK IDS that will use them, which is
+// the safe order to land the two halves in. An atlas slot no tex byte addresses is never
+// sampled and costs nothing; the reverse order is the failure this whole file exists for - a
+// registered block whose tile is still an unpainted slot draws the magenta missing-texture
+// marker on a real block face.
+//
+// So this number belongs to the GENERATOR, and the two checks it feeds still say exactly what
+// they said before: everything below it is real art with a pinned fingerprint, and everything
+// at or above it must be the missing-texture marker texel for texel. Neither claim ever needed
+// the enum. What the enum's count governs is TILE_USED_COUNT in gfx/atlas_tiles.h, which
+// world/block_tiles_check.c asserts against the BTEX_* mirror - a separate guard over a
+// separate pair of lists, untouched by this and still reading 12 on both sides.
+#define ATLAS_PAINTED_SLOTS 17
 
 // Slots 10 and 11 within that: water and tall grass (roadmap tasks 17 and 19). Named here
 // because the two texel-content checks further down are about what these two tiles ARE, not
@@ -1105,9 +1118,18 @@ int main(void)
 			      "%s's subtexture is %ux%u, not the whole %dx%d sheet",
 			      ATLAS_T3X_PATH, t.sub_w, t.sub_h, ATLAS_W_PX, ATLAS_H_PX);
 
-			// H11. The twelve painted slots, pinned. Slots 0..9's fingerprints were taken from
+			// H11. The painted slots, pinned. Slots 0..9's fingerprints were taken from
 			// the t3x built BEFORE F7 touched tools/make_atlas.py; slots 10 and 11 were added by
-			// tasks 17/19 and computed independently from gfx/atlas.png. The generator draws
+			// tasks 17/19 and computed independently from gfx/atlas.png, and 12..16 by v1.8.3
+			// phase 3 the same way. "Independently" is load-bearing and is not a figure of
+			// speech: the pins below were produced by a separate decoder walking the PNG's own
+			// RGBA8 pixels through the RGBA5551 packing, NOT by running this suite and copying
+			// what it printed. The two routes to a texel share nothing - this one goes through
+			// LZ11 and the Morton swizzle and the other does not - so agreeing is evidence,
+			// where a pin lifted out of the suite's own failure message would only ever have
+			// been a record of what the code did. Slots 0..11's pins were left untouched by that
+			// exercise and still hold, which is what says the seeded stream did not move.
+			// The generator draws
 			// every tile from ONE seeded stream in TILES order precisely so that appending to
 			// TILES cannot disturb art already painted.
 			//
@@ -1136,6 +1158,11 @@ int main(void)
 				0x3E149457CC8AF270ull,   //  9 planks
 				0x55BDFF89F02B7891ull,   // 10 water
 				0x8CD474E09FA7C22Cull,   // 11 tall_grass
+				0x655A7DA542F30C5Eull,   // 12 snow
+				0x8A6AD29F1C304552ull,   // 13 ice
+				0x27AD124F58810F53ull,   // 14 cactus
+				0x2DF2ECEF5259A5A2ull,   // 15 dead_bush
+				0x003F0B7EA35C1195ull,   // 16 fern
 			};
 			for (int slot = 0; slot < ATLAS_PAINTED_SLOTS; slot++) {
 				const uint64_t got = slotFingerprint(SLOT_PNG_TOP(slot));
@@ -1206,7 +1233,7 @@ int main(void)
 			// duplicate only by accident - it compares each slot against its own pin, never
 			// against its neighbours - so a painter wired to the wrong function would pin
 			// cleanly and ship two identical tiles. Bounded by ATLAS_PAINTED_SLOTS, not by the
-			// slot count: the 52 unpainted slots are all the marker and ARE deliberately
+			// slot count: the 47 unpainted slots are all the marker and ARE deliberately
 			// identical to each other, which the marker sweep below owns instead.
 			for (int a = 0; a < ATLAS_PAINTED_SLOTS; a++) {
 				for (int b = a + 1; b < ATLAS_PAINTED_SLOTS; b++) {
@@ -1219,7 +1246,7 @@ int main(void)
 			// H9. Every slot the TILES list does not fill must be the marker, texel for texel.
 			// This is the check the F7 defect exists in: before it, the spare slots were a flat
 			// near-black fill and every geometry test in this file was green over them. Since
-			// task 13b that is slots 12..63 - 52 of them rather than 4 - and the bound is
+			// v1.8.3 phase 3 claimed 12..16 that is slots 17..63 - 47 of them - and the bound is
 			// ATLAS_TILE_SLOTS so it follows the sheet rather than a number written here.
 			for (int slot = ATLAS_PAINTED_SLOTS; slot < ATLAS_TILE_SLOTS; slot++) {
 				const int png_top = SLOT_PNG_TOP(slot);
@@ -1246,7 +1273,7 @@ int main(void)
 			}
 
 			// H10. And no slot ANYWHERE on the sheet is a solid block of background fill. The
-			// check above already covers slots 12..63 by value; this one covers the twelve
+			// check above already covers slots 17..63 by value; this one covers the seventeen
 			// painted ones too, and it is the one that would catch a future slot painted by a
 			// painter that silently returned nothing.
 			for (int slot = 0; slot < ATLAS_TILE_SLOTS; slot++) {

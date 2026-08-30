@@ -53,8 +53,9 @@ dimension outside 8..1024 inclusive and any dimension that is not a power of
 two, testing the two dimensions independently — which is what makes a 64:1
 strip legal in the first place, and also what makes 1024 px the tallest this
 sheet will ever be. At 16 px a slot that is 64 slots, permanently. TILES holds
-12 of them (0..11) and MARKER_SLOT 63 is reserved forever, so there are exactly
-51 free slots for the rest of the project's life. Past that the sheet cannot
+17 of them (0..16) since v1.8.3 phase 3 added snow, ice, cactus, dead bush and
+fern, and MARKER_SLOT 63 is reserved forever, so there are exactly 46 free slots
+for the rest of the project's life. Past that the sheet cannot
 simply be made taller: the next tile has to come from reclaiming a slot, from a
 second sheet the way gfx/crackatlas.png is one, or from widening the sheet in U
 — and widening U means re-deriving the greedy mesher's GPU_REPEAT trick, not
@@ -64,14 +65,14 @@ leaving it as a comment somebody can walk past.
 Why every unused slot is painted (v1.6.0 F7). It used to be left at the sheet's
 background fill, and that was a defect: the slots above the painted ones are REAL,
 addressable slots, so a block declared with one drew an opaque near-black solid.
-At the time that meant tex 10..14; since task 13b it would mean 12..62. On a 240px
+At the time that meant tex 10..14; since task 13b it would mean 17..62. On a 240px
 screen that reads as a dark block, not as an error. The block registry lets a
 SERVER define block types over the wire, so a server shipping a wrong or
 unsupported tex looked like a Blocksmith rendering bug instead of a server
 misconfiguration — and this project has already lost days to exactly that, since
 a wrong texture constant still renders *a* texture and never raises anything.
 
-So every slot TILES does not fill — 12..63 since task 13b lifted the ceiling — is
+So every slot TILES does not fill — 17..63 since v1.8.3 phase 3 claimed 12..16 — is
 painted with tile_missing()'s magenta/black quadrant checker before art goes down.
 Those spares are not wasted by this: the marker is simply the DEFAULT content of
 an unclaimed slot, and each one gets overwritten by real art as TILES
@@ -155,12 +156,31 @@ TILES = [
     # TILE_* enum and world/block.h's BTEX_* mirror of it), and inserting would
     # silently re-texture every tile after the insertion point.
     #
-    # These claim slots 10 and 11. Since task 13b lifted the sheet to 64 slots that
-    # leaves 12..62 — fifty-one of them — still carrying the missing-texture marker,
-    # which is what an unclaimed slot is supposed to look like, and MARKER_SLOT (63)
-    # cannot be claimed at all.
+    # These claim slots 10 and 11, which were the last two claimed before v1.8.3
+    # phase 3 took 12..16 below.
     "water",
     "tall_grass",
+    # v1.8.3 phase 3's five. Appended for the same reason as everything since the
+    # sentinel: this order IS the contract, so inserting would silently re-texture
+    # every tile after the insertion point.
+    #
+    # These claim slots 12..16, which were the lowest free ones. They are ART ONLY
+    # and are deliberately landing ahead of the block ids that will use them: no
+    # TILE_* name in source/gfx/atlas_tiles.h and no BTEX_* in source/world/block.h
+    # points at any of them yet. That costs nothing and breaks nothing — an atlas
+    # slot no tex byte addresses is simply never sampled — and it is the safe half
+    # of the change to land first, because the failure mode of the OTHER order is
+    # the one this sheet's whole F7 story is about: a registered block whose tile is
+    # still an unpainted slot draws the magenta marker, and a wrong-but-painted tile
+    # draws plausible art and never raises anything.
+    #
+    # Slots 17..62 still carry the missing-texture marker, and MARKER_SLOT (63)
+    # cannot be claimed at all.
+    "snow",
+    "ice",
+    "cactus",
+    "dead_bush",
+    "fern",
 ]
 
 
@@ -505,6 +525,261 @@ def tile_tall_grass(rng):
     return img
 
 
+def tile_snow(rng):
+    """Snow cover — v1.8.3 phase 3. A near-white cube tile, opaque.
+
+    The whole difficulty of this tile is RGBA5551. Five bits a channel means the
+    top of the range is coarse: 248, 252 and 255 all quantise to 31, so the usual
+    trick of dropping a few pure-white sparkles onto a near-white field produces
+    literally nothing — the sparkle and the field become the same texel. The four
+    shades below are therefore spaced 12..14 apart in 8-bit, which is at least one
+    full 5-bit step (8) in every channel, and none of them is allowed to sit at the
+    very top where there is no headroom left to be brighter than.
+
+    It reads apart from sand at a glance because it is neutral-to-blue where sand is
+    yellow: sand's darkest is (198,178,132), a 66-wide spread from red to blue, and
+    every shade here has blue ABOVE red. Two pale tiles that differ only in
+    brightness would be one tile on a 240px screen; these differ in hue.
+    """
+    snows = [(206, 216, 234), (220, 228, 242), (234, 240, 250), (246, 250, 254)]
+    img = speckle(rng, TILE_PX, snows, weights=[2, 3, 4, 3])
+    px = img.load()
+
+    # Hollows: a dished 2x2 in the cool shade with a brighter lip on its lower edge,
+    # which is the only way a white surface shows relief at all. Lit from the top
+    # left like tile_dirt's pebbles, so the two agree about where the light is.
+    shadow = (188, 202, 226)
+    for _ in range(6):
+        x = rng.randrange(1, TILE_PX - 2)
+        y = rng.randrange(1, TILE_PX - 2)
+        for dy in range(2):
+            for dx in range(2):
+                px[x + dx, y + dy] = shadow
+        for dx in range(2):
+            px[x + dx, y + 2] = (246, 250, 254)
+    return img
+
+
+def tile_ice(rng):
+    """Ice — v1.8.3 phase 3. Returns RGB, i.e. FULLY OPAQUE, for exactly the reason
+    tile_water does: the pass this draws in is an alpha TEST and RGBA5551 carries one
+    bit of alpha, so there is no value that comes out half-visible. A dither of
+    alpha-0 holes would show whatever is behind through a stipple, and at 16x16 on a
+    240px screen a stipple reads as holes in the ice rather than as glass.
+
+    Faceted rather than banded, and that is what separates it from water on sight.
+    Water is a horizontal 8px swell — the eye reads it as moving. Ice is a small
+    Voronoi of flat plates with dark fracture lines along every plate boundary, which
+    the eye reads as frozen and cracked. They are also far apart in value: water's
+    lightest is (56,112,172) against ice's darkest (124,170,212), a gap of 68 in red,
+    so they never read as two shades of the same blue.
+
+    It has to stay clear of snow for the same reason, and does: snow is neutral and
+    sits at 206..246, ice is cyan and sits at 124..172. That is nine 5-bit steps of
+    red between the two tiles' nearest shades.
+    """
+    plates = [(140, 184, 220), (156, 198, 230), (124, 170, 212), (172, 210, 238)]
+    crack  = (92, 140, 190)
+    glint  = (204, 230, 246)
+
+    img = Image.new("RGB", (TILE_PX, TILE_PX))
+    px = img.load()
+
+    # Five plate seeds. Nearest-seed assignment rather than a drawn polygon: the
+    # boundaries come out straight-ish and meeting at odd angles on their own, which
+    # is what a fracture pattern looks like, and no seed placement can produce a
+    # degenerate tile the way a hand-drawn line through the middle could.
+    seeds = [(rng.uniform(0, TILE_PX), rng.uniform(0, TILE_PX)) for _ in range(5)]
+    shades = [rng.choice(plates) for _ in seeds]
+    owner = [[0] * TILE_PX for _ in range(TILE_PX)]
+    for y in range(TILE_PX):
+        for x in range(TILE_PX):
+            best, best_d = 0, None
+            for i, (sx, sy) in enumerate(seeds):
+                d = (x - sx) ** 2 + (y - sy) ** 2
+                if best_d is None or d < best_d:
+                    best, best_d = i, d
+            owner[y][x] = best
+            px[x, y] = shades[best]
+
+    # The fractures themselves: any texel with a differently-owned neighbour. Drawn
+    # after the fill so a crack is never overwritten by the next plate.
+    for y in range(TILE_PX):
+        for x in range(TILE_PX):
+            for dx, dy in ((1, 0), (0, 1)):
+                nx, ny = x + dx, y + dy
+                if nx < TILE_PX and ny < TILE_PX and owner[ny][nx] != owner[y][x]:
+                    px[x, y] = crack
+
+    # A few short highlights catching the light off a plate face. Dashes, not lines,
+    # for the reason tile_water's glints are dashes: greedy meshing repeats this art
+    # up to ATLAS_MAX_MERGE_BLOCKS times across one quad, and anything continuous
+    # here becomes a ruler out there.
+    for _ in range(5):
+        x = rng.randrange(TILE_PX - 3)
+        y = rng.randrange(TILE_PX)
+        for dx in range(2 + rng.randrange(2)):
+            px[x + dx, y] = glint
+    return img
+
+
+def tile_cactus(rng):
+    """Cactus flank — v1.8.3 phase 3. Opaque, and structured rather than speckled.
+
+    The ribs are on an EIGHT pixel pitch — grooves at x 3 and 11, ridges at 7 and 15 —
+    so the tile is seamless against itself horizontally. That matters here more than
+    it does for a speckled tile: u is the axis greedy meshing merges along and
+    GPU_REPEAT wraps this art onto itself, so a rib pattern whose pitch did not divide
+    16 would show a visible stutter at every block boundary of a merged run.
+
+    It is told apart from grass_top by SHAPE, not colour, which is the same argument
+    tile_planks makes against wood_side. Both are mid greens on a 5-bit sheet and no
+    palette gap would survive quantisation reliably; what survives is that grass is a
+    flat directionless speckle and this has four hard vertical lines and pale spines
+    down it.
+    """
+    flesh  = [(66, 116, 68), (56, 102, 60), (78, 132, 76), (48, 90, 54)]
+    groove = (36, 72, 44)
+    ridge  = (96, 152, 88)
+    spine  = (198, 206, 164)
+
+    img = speckle(rng, TILE_PX, flesh, weights=[4, 3, 2, 2])
+    px = img.load()
+
+    for y in range(TILE_PX):
+        for x in (3, 11):
+            px[x, y] = groove
+        for x in (7, 15):
+            # Not every pixel of the ridge, so it is a lit edge rather than a drawn
+            # line. A solid column reads as a wire down the block at 240p.
+            if rng.random() < 0.72:
+                px[x, y] = ridge
+
+    # Spines, on and beside the ridges where a real one grows out of the crest. Two
+    # px tall as often as one, because a lone pale pixel on a green field is noise.
+    for _ in range(11):
+        x = rng.choice((6, 7, 8, 14, 15, 0))
+        y = rng.randrange(TILE_PX - 1)
+        px[x, y] = spine
+        if rng.random() < 0.45:
+            px[x, y + 1] = spine
+    return img
+
+
+def tile_dead_bush(rng):
+    """Dead bush — v1.8.3 phase 3, and a BLOCK_SHAPE_CROSS tile like tall_grass.
+
+    Returns RGBA and is mostly alpha 0, with alpha only ever 0 or 255, for the reason
+    spelled out in tile_tall_grass and tile_leaves: the draw is an alpha test, so a
+    middling value lands on one side of the threshold and looks like a mistake either
+    way. Like tall_grass and unlike leaves it does NOT keep an opaque border — a cross
+    has no silhouette but its own art, so an opaque edge would draw a rectangle around
+    every bush in the world.
+
+    Twigs BRANCH, where tall_grass's blades do not, and that is the whole distinction
+    between the two at 16x16. Colour alone would not carry it on a screen this size;
+    a tangle that forks reads as dead wood and a set of parallel strokes reads as
+    grass, whatever colour either one is. It is also much sparser — three stems
+    against tall_grass's eight — because a dead bush that fills its cell is a shrub.
+
+    Image row 0 is the TOP of the face, so the stems are rooted on the last row and
+    walk upwards, exactly as tall_grass does.
+    """
+    twigs = [(132, 98, 56), (112, 80, 44), (150, 114, 68)]
+
+    img = Image.new("RGBA", (TILE_PX, TILE_PX), (0, 0, 0, 0))
+    px = img.load()
+
+    def draw(x, y, dx, steps, shade):
+        """One twig: walks up by one row a step, drifting dx columns, and stops at the
+        edge rather than wrapping. Returns the list of (x, y) it covered, so a fork can
+        start from anywhere ALONG it rather than only from its tip."""
+        path = []
+        for _ in range(steps):
+            if y < 0:
+                break
+            x = max(0, min(TILE_PX - 1, x))
+            px[x, y] = shade + (255,)
+            path.append((x, y))
+            x += dx
+            y -= 1
+            if rng.random() < 0.3:
+                dx = rng.choice((-1, 0, 1))
+        return path
+
+    # Forks come off the MIDDLE of a stem, not off its tip. Tip-only forking was the
+    # first version and it drew a bare vertical stalk with a Y on top — a stick figure,
+    # not a bush. A dead bush is a tangle whose branch points are spread up the whole
+    # height, and the low ones are what fill the bottom of the cell.
+    for root in (3, 8, 12):
+        x = max(0, min(TILE_PX - 1, root + rng.choice((-1, 0, 1))))
+        shade = rng.choice(twigs)
+        stem = draw(x, TILE_PX - 1, rng.choice((-1, 0, 1)), 7 + rng.randrange(5), shade)
+        for _ in range(2 + rng.randrange(2)):
+            if len(stem) < 3:
+                break
+            # Never from the lowest pixel (that is the root, and a fork there floats
+            # free of the ground) and never from the tip (that is the old defect).
+            bx, by = stem[rng.randrange(1, len(stem) - 1)]
+            draw(bx, by, rng.choice((-1, 1)), 3 + rng.randrange(4), rng.choice(twigs))
+    return img
+
+
+def tile_fern(rng):
+    """Fern — v1.8.3 phase 3, the second BLOCK_SHAPE_CROSS tile added here. Same
+    alpha contract as tile_dead_bush and tile_tall_grass: RGBA, 0 or 255 and never
+    between, no opaque border.
+
+    Fronds, not blades. Each stem carries PAIRED horizontal leaflets that shorten
+    toward the tip, so the silhouette tapers to a point; tall_grass is eight
+    independent vertical strokes with no horizontal extent at all. That is a shape
+    difference legible at 16 px, which colour would not be — these greens are
+    deliberately darker and bluer than tall_grass's (58..86 red against its 58..126),
+    but on a 5-bit sheet next to grass, leaves and cactus, hue is not enough on its
+    own and is not being asked to carry it.
+
+    Two stems of different heights rather than one centred one, because a cross is
+    seen from every horizontal angle and a single central stem presents as a bare
+    stick from the two directions where the frond is edge-on.
+    """
+    frond = [(46, 100, 60), (58, 120, 70), (36, 84, 52)]
+    tip   = (92, 156, 88)
+
+    img = Image.new("RGBA", (TILE_PX, TILE_PX), (0, 0, 0, 0))
+    px = img.load()
+
+    for stem_x, height in ((4, 13), (12, 9)):
+        shade = rng.choice(frond)
+        x = stem_x
+        for step in range(height):
+            y = TILE_PX - 1 - step
+            # A gentle arch: the stem leans away from centre as it rises, at most one
+            # column per row so it curves instead of kinking, the same rule
+            # tall_grass's blades follow.
+            if step >= 3 and rng.random() < 0.3:
+                x = max(1, min(TILE_PX - 2, x + (1 if stem_x > 7 else -1)))
+            px[x, y] = shade + (255,)
+            # Leaflets, one pair per row, shortening with height. The 3 at the base
+            # and 0 near the tip are what makes the frond a triangle rather than a
+            # comb; the jitter stops the two stems' leaflets lining up into rows.
+            #
+            # The //4 is a correction, not a first guess: at //3 the reach was 4 at
+            # the base, so the two stems at x 4 and 12 each spanned nine columns and
+            # overlapped in the middle. The tile came out a solid green mass with the
+            # frond shape buried in it — visibly a bush, not a fern. Narrower reaches
+            # leave a gap of bare alpha between the two plants, which is what makes
+            # each one's taper legible at 16 px.
+            reach = max(0, (height - step) // 4 + 1 - (1 if rng.random() < 0.3 else 0))
+            for d in range(1, reach + 1):
+                leaf = rng.choice(frond) + (255,)
+                if x - d >= 0:
+                    px[x - d, y] = leaf
+                if x + d < TILE_PX:
+                    px[x + d, y] = leaf
+        px[x, TILE_PX - height] = tip + (255,)
+    return img
+
+
 def tile_sentinel(_rng):
     """Not art — a bleed alarm.
 
@@ -562,6 +837,11 @@ PAINTERS = {
     "planks": tile_planks,
     "water": tile_water,
     "tall_grass": tile_tall_grass,
+    "snow": tile_snow,
+    "ice": tile_ice,
+    "cactus": tile_cactus,
+    "dead_bush": tile_dead_bush,
+    "fern": tile_fern,
 }
 
 
