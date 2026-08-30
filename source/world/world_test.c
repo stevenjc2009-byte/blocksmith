@@ -7406,7 +7406,35 @@ static uint32_t genTestHashColumn(const World* w, int32_t cx, int32_t cz)
 // disjunction so CHECK_QUIET's stringified condition fits its 96-byte report buffer.
 static bool genTestIsGround(BlockId b)
 {
-	return b == BLOCK_STONE || b == BLOCK_DIRT || b == BLOCK_GRASS || b == BLOCK_SAND;
+	// BLOCK_SNOW joined this list in v1.8.3 Phase 3 and it is a widening of it, so it is
+	// worth saying why it is not a hole. Snow is a SURFACE CAP, not a decoration:
+	// worldgen_density.c's surfaceBlock() returns it from the `depth == 0` arm of the
+	// tundra branch, in exactly the slot grass occupies in a plains column and sand in a
+	// desert one. Under it is dirt and then stone, like everywhere else. A checker that
+	// still refused it would be asserting that tundra has no ground.
+	return b == BLOCK_STONE || b == BLOCK_DIRT || b == BLOCK_GRASS || b == BLOCK_SAND ||
+	       b == BLOCK_SNOW;
+}
+
+// Is this block something that STANDS ON the ground rather than being it?
+//
+// One list, used by genTestTerrainTop() and by testDensityDistribution's own downward walk,
+// which had drifted into keeping the same list twice. v1.8.3 Phase 3 is what made that
+// expensive: it adds four more ids to step over, and a list updated in one place and not the
+// other does not fail loudly — it silently reads the wrong cell, and every surface claim
+// built on it quietly becomes a claim about a fern.
+//
+// SNOW IS DELIBERATELY NOT HERE, for the reason genTestIsGround() gives above. ICE is, and
+// that is the other half of the same decision: ice caps the SEA, so the ground under a frozen
+// lake is the seabed, not the pane floating on top of it. Cactus is here for the reason wood
+// is — a trunk standing on sand is not the sand.
+static bool genTestNotGround(BlockId b)
+{
+	return b == BLOCK_AIR       || b == BLOCK_WATER   || b == BLOCK_TALL_GRASS ||
+	       b == BLOCK_WOOD      || b == BLOCK_LEAVES  ||
+	       /* v1.8.3 Phase 3 */
+	       b == BLOCK_ICE       || b == BLOCK_CACTUS  ||
+	       b == BLOCK_DEAD_BUSH || b == BLOCK_FERN;
 }
 
 // **The single most important check in the v1.7.0 terrain rework.**
@@ -7898,7 +7926,7 @@ static void testDensityDistribution(void)
 		// noise contributed nothing at all.
 		static int bk_lo[GEN_D_TEST_BUCKETS], bk_hi[GEN_D_TEST_BUCKETS];
 		for (int i = 0; i < GEN_D_TEST_BUCKETS; i++) { bk_lo[i] = WORLD_HEIGHT; bk_hi[i] = -1; }
-		long grass = 0, dirt = 0, sand = 0, stone_top = 0;
+		long grass = 0, dirt = 0, sand = 0, stone_top = 0, snow_top = 0;
 		static int seen[WORLD_HEIGHT + 1];
 		memset(seen, 0, sizeof seen);
 
@@ -7915,8 +7943,14 @@ static void testDensityDistribution(void)
 							// the GROUND, and neither an ocean nor a tuft of grass is it.
 							// Without them the "top" of a seabed column is the waterline and
 							// every surface-material check below reads the wrong cell.
-							if (b == BLOCK_LEAVES || b == BLOCK_WOOD ||
-							    b == BLOCK_WATER  || b == BLOCK_TALL_GRASS) continue;
+							//
+							// v1.8.3 Phase 3 moved the list into genTestNotGround() rather
+							// than adding four more ids to a second copy of it; ice, cactus,
+							// dead bush and fern step over here for exactly these reasons.
+							// BLOCK_AIR is in that predicate too, so the `!= BLOCK_AIR` arm
+							// below now only ever sees ground and the `else` only ever sees
+							// air — which is what it always meant.
+							if (b != BLOCK_AIR && genTestNotGround(b)) continue;
 							if (b != BLOCK_AIR) {
 								if (top < 0) top = y;
 								solid_total++;
@@ -7943,6 +7977,12 @@ static void testDensityDistribution(void)
 							case BLOCK_DIRT:  dirt++;      surface_mat++; break;
 							case BLOCK_SAND:  sand++;      surface_mat++; break;
 							case BLOCK_STONE: stone_top++; surface_mat++; break;
+							// v1.8.3 Phase 3's tundra cap. Counted separately rather than
+							// folded into dirt: the check below is that EVERY surface cell
+							// is one the surface pass could have chosen, and a fifth choice
+							// that is invisible in the tally cannot be told from a bug that
+							// puts an unexpected block on top.
+							case BLOCK_SNOW:  snow_top++;  surface_mat++; break;
 							default: break;
 						}
 					}
@@ -7996,7 +8036,7 @@ static void testDensityDistribution(void)
 		// Every surface block is one of the four the surface pass can choose. Anything else
 		// on top means the pass ran on a block it should not have.
 		CHECK(surface_mat == 5 * 5 * CHUNK_DIM * CHUNK_DIM);
-		CHECK(grass + dirt + sand + stone_top == surface_mat);
+		CHECK(grass + dirt + sand + stone_top + snow_top == surface_mat);
 
 		worldExit(&s_world);
 	}
@@ -8081,13 +8121,9 @@ static uint32_t genTestHashColumnTerrain(const World* w, int32_t cx, int32_t cz)
 // ask the question for all 6,400 cells of a 5 x 5-column area, twice.
 static int genTestTerrainTop(const World* w, int32_t x, int32_t z)
 {
-	for (int y = WORLD_HEIGHT - 1; y >= 0; y--) {
-		const BlockId b = worldGet(w, x, y, z);
-		if (b == BLOCK_AIR || b == BLOCK_WATER || b == BLOCK_TALL_GRASS ||
-		    b == BLOCK_WOOD || b == BLOCK_LEAVES)
-			continue;
-		return y;
-	}
+	for (int y = WORLD_HEIGHT - 1; y >= 0; y--)
+		if (!genTestNotGround(worldGet(w, x, y, z)))
+			return y;
 	return -1;
 }
 
@@ -8147,10 +8183,14 @@ static void testWorldgenBiomeSurface(void)
 				continue;
 
 			usable[b]++;
-			// Desert caps in sand; tundra caps in bare dirt (the Phase 3 placeholder, see
-			// surfaceBlock in worldgen_density.c); the other four cap in grass.
+			// Desert caps in sand; tundra caps in SNOW as of v1.8.3 Phase 3, which is what
+			// the bare-dirt placeholder here was reserved for — see surfaceBlock() in
+			// worldgen_density.c, where the tundra branch's `depth == 0` arm now returns
+			// BLOCK_SNOW. The other four cap in grass, taiga included: no design call was
+			// ever recorded for a snow-capped taiga, so Phase 3 did not invent one. Cold
+			// WATER still freezes in taiga, which is a separate rule about the sea.
 			const BlockId want = (b == BIOME_DESERT) ? BLOCK_SAND
-			                   : (b == BIOME_TUNDRA) ? BLOCK_DIRT
+			                   : (b == BIOME_TUNDRA) ? BLOCK_SNOW
 			                                         : BLOCK_GRASS;
 			if (cap != want)
 				wrong_cap[b]++;
@@ -8257,6 +8297,210 @@ static void testWorldgenBiomeSurface(void)
 	      leaves[BIOME_FOREST] * trunks[BIOME_TAIGA]);
 }
 
+// ── v1.8.3 Phase 3: where the five new blocks actually land ───────────────────────────
+//
+// The registry rows are proved in world/registry_test.c; this is the other half — that
+// worldgen puts each of them where the design says and nowhere else. Every claim below is a
+// "== 0" over the whole area paired with a "> 0" that stops it being satisfied by an empty
+// world, because a placement rule that never fires satisfies every negative ever written
+// about it.
+//
+// **The area was chosen by measurement, and the table is the reason it is r5 and not r3.**
+// Seed 90210 around (10, -20) is already this file's six-biome area (see
+// testWorldgenBiomeSurface above for why that seed and that origin). Surveyed on this tree by
+// a probe linking the real worldgen.c, cells of each block over the whole area:
+//
+//     r3 (7x7 columns)    snow 1190  ice  44  cactus 10  dead_bush 35  fern 255
+//     r5 (11x11 columns)  snow 4596  ice 280  cactus 16  dead_bush 54  fern 540
+//
+// Cactus is the thin one either way — GEN_CACTUS_CHANCE is 3 in 256 of the desert cells that
+// also have sand directly under them — and ten cells of it is close enough to zero that a
+// modest retune of that constant would make the "> 0" below a claim about luck. r5 costs 121
+// generated columns against 49 and buys 16. The counts are deterministic for a fixed seed, so
+// none of this varies run to run; what it buys is headroom against the constants moving.
+//
+// Biomes in the r5 area, from the same probe:
+//     TUNDRA 4596  TAIGA 2297  PLAINS 1458  FOREST 6546  DESERT 6989  JUNGLE 9090
+static void testWorldgenPhase3Flora(void)
+{
+	const uint32_t seed = 90210u;
+	const int32_t  ox = 10, oz = -20;
+	const int      r  = 5;
+
+	WorldGen g;
+	CHECK(worldgenInit(&g, seed, GEN_VERSION_DENSITY));
+	worldInit(&s_world);
+	for (int32_t cz = oz - r; cz <= oz + r; cz++)
+		for (int32_t cx = ox - r; cx <= ox + r; cx++)
+			CHECK_QUIET(worldgenColumn(&g, &s_world, cx, cz));
+
+	long snow = 0, snow_wrong_biome = 0, snow_not_cap = 0;
+	long ice  = 0, ice_wrong_biome  = 0, ice_off_line = 0;
+	long cactus_cells = 0, cactus_bases = 0, cactus_wrong_biome = 0;
+	long cactus_not_on_sand = 0, cactus_bad_height = 0;
+	long bush = 0, bush_wrong_biome = 0, bush_not_on_sand = 0, bush_off_ground = 0;
+	long fern = 0, fern_wrong_biome = 0, fern_not_on_grass = 0, fern_off_ground = 0;
+	long flora_at_or_below_sea = 0, flora_stacked = 0;
+	long fern_taiga = 0, fern_jungle = 0, grass_cap_taiga = 0, grass_cap_jungle = 0;
+
+	for (int32_t z = (oz - r) * CHUNK_DIM; z < (oz + r + 1) * CHUNK_DIM; z++) {
+		for (int32_t x = (ox - r) * CHUNK_DIM; x < (ox + r + 1) * CHUNK_DIM; x++) {
+			const BiomeId b   = worldgenBiomeAt(&g, x, z);
+			const int     top = genTestTerrainTop(&s_world, x, z);
+			int plants_here = 0;
+
+			for (int y = 0; y < WORLD_HEIGHT; y++) {
+				const BlockId here  = worldGet(&s_world, x, y, z);
+				const BlockId under = (y > 0) ? worldGet(&s_world, x, y - 1, z) : BLOCK_AIR;
+
+				switch (here) {
+					case BLOCK_SNOW:
+						// Snow is a CAP, so it is the topmost ground cell and never buried.
+						// Snow under dirt would mean surfaceBlock() answered it for a depth
+						// other than 0.
+						snow++;
+						if (b != BIOME_TUNDRA) snow_wrong_biome++;
+						if (y != top)          snow_not_cap++;
+						break;
+
+					case BLOCK_ICE:
+						ice++;
+						if (b != BIOME_TUNDRA && b != BIOME_TAIGA) ice_wrong_biome++;
+						if (y != GEN_SEA_LEVEL - 1)                ice_off_line++;
+						break;
+
+					case BLOCK_CACTUS:
+						cactus_cells++;
+						if (b != BIOME_DESERT)  cactus_wrong_biome++;
+						if (y <= GEN_SEA_LEVEL) flora_at_or_below_sea++;
+						if (under != BLOCK_CACTUS) {
+							// The base of a stack. Its own rules, and the height of the
+							// stack above it, are read here rather than once per cell.
+							cactus_bases++;
+							if (under != BLOCK_SAND) cactus_not_on_sand++;
+							if (y != top + 1)        cactus_not_on_sand++;
+							int n = 0;
+							for (int yy = y;
+							     yy < WORLD_HEIGHT &&
+							     worldGet(&s_world, x, yy, z) == BLOCK_CACTUS; yy++)
+								n++;
+							if (n < GEN_CACTUS_MIN_H || n > GEN_CACTUS_MAX_H)
+								cactus_bad_height++;
+						}
+						break;
+
+					case BLOCK_DEAD_BUSH:
+						bush++;
+						plants_here++;
+						if (b != BIOME_DESERT)   bush_wrong_biome++;
+						if (under != BLOCK_SAND) bush_not_on_sand++;
+						if (y != top + 1)        bush_off_ground++;
+						if (y <= GEN_SEA_LEVEL)  flora_at_or_below_sea++;
+						break;
+
+					case BLOCK_FERN:
+						fern++;
+						plants_here++;
+						if (b != BIOME_TAIGA && b != BIOME_JUNGLE) fern_wrong_biome++;
+						if (under != BLOCK_GRASS) fern_not_on_grass++;
+						if (y != top + 1)         fern_off_ground++;
+						if (y <= GEN_SEA_LEVEL)   flora_at_or_below_sea++;
+						if (b == BIOME_TAIGA)  fern_taiga++;
+						if (b == BIOME_JUNGLE) fern_jungle++;
+						break;
+
+					default: break;
+				}
+			}
+			if (plants_here > 1) flora_stacked++;
+
+			// Ground a fern could have stood on, per biome. This is the denominator the rate
+			// comparison at the bottom needs; without it that comparison is between two raw
+			// counts and says more about how much taiga the area holds than about the table.
+			if (top >= 0 && top + 1 > GEN_SEA_LEVEL && top + 1 < WORLD_HEIGHT &&
+			    worldGet(&s_world, x, top, z) == BLOCK_GRASS) {
+				if (b == BIOME_TAIGA)  grass_cap_taiga++;
+				if (b == BIOME_JUNGLE) grass_cap_jungle++;
+			}
+		}
+	}
+	worldExit(&s_world);
+
+	// ── The five are where they belong, and nowhere else. ─────────────────────────────
+	CHECK(snow_wrong_biome   == 0);
+	CHECK(snow_not_cap       == 0);
+	CHECK(ice_wrong_biome    == 0);
+	CHECK(ice_off_line       == 0);
+	CHECK(cactus_wrong_biome == 0);
+	CHECK(cactus_not_on_sand == 0);
+	CHECK(cactus_bad_height  == 0);
+	CHECK(bush_wrong_biome   == 0);
+	CHECK(bush_not_on_sand   == 0);
+	CHECK(bush_off_ground    == 0);
+	CHECK(fern_wrong_biome   == 0);
+	CHECK(fern_not_on_grass  == 0);
+	CHECK(fern_off_ground    == 0);
+	CHECK(flora_at_or_below_sea == 0);
+	CHECK(flora_stacked         == 0);
+
+	// ── And every one of them exists, so none of the above is vacuous. ────────────────
+	// The bounds are "> 0" rather than the measured numbers so that retuning a chance constant
+	// need not move this test — but a placement branch that stopped running altogether cannot
+	// pass, and that is the failure this whole function is about.
+	CHECK(snow > 0);
+	CHECK(ice  > 0);
+	CHECK(cactus_cells > 0);
+	CHECK(cactus_bases > 0);
+	CHECK(bush > 0);
+	CHECK(fern > 0);
+	// Cacti are stacks, not single blocks: cells must outnumber bases, or nothing in the area
+	// reached GEN_CACTUS_MAX_H and the height check above is testing one constant.
+	CHECK(cactus_cells > cactus_bases);
+
+	// ── The table is the right way round. ─────────────────────────────────────────────
+	// GEN_FERN_JUNGLE is 32 in 256 against GEN_FERN_TAIGA's 20, so jungle must come out denser
+	// per cell of eligible ground. Cross-multiplied rather than divided: this is integer C and
+	// a ratio would round both sides to 0. Swapping the two rows of the table reddens it, and
+	// so does a flora pass that ignores the biome and uses one chance for both.
+	CHECK(grass_cap_taiga > 0 && grass_cap_jungle > 0);
+	CHECK(fern_jungle * grass_cap_taiga > fern_taiga * grass_cap_jungle);
+
+	// ── None of the five may reach a LEGACY world. ────────────────────────────────────
+	// worldgenScatter() — where worldgenFlora() is called from — is reached only from
+	// worldgenColumn's GEN_VERSION_DENSITY arm, and surfaceBlock()/seaBlockAt() live in
+	// worldgen_density.c, which the legacy path never enters. That is the argument; this is
+	// the measurement. Same shape as testWorldgenWaterAndGrass's legacy sweep for water and
+	// tall grass, and it exists for the same reason: a saved legacy world must stay
+	// byte-identical to what the pre-v1.7.0 generator produced, and five new block ids
+	// appearing in one would change every world on every SD card.
+	{
+		static const uint32_t legacy_seeds[2] = {1337u, 90210u};
+		for (int li = 0; li < 2; li++) {
+			WorldGen lg;
+			CHECK(worldgenInit(&lg, legacy_seeds[li], GEN_VERSION_LEGACY));
+			worldInit(&s_world);
+			for (int32_t cz = -1; cz <= 1; cz++)
+				for (int32_t cx = -1; cx <= 1; cx++)
+					CHECK_QUIET(worldgenColumn(&lg, &s_world, cx, cz));
+
+			long intruders = 0, cells = 0;
+			for (int32_t z = -CHUNK_DIM; z < 2 * CHUNK_DIM; z++)
+				for (int32_t x = -CHUNK_DIM; x < 2 * CHUNK_DIM; x++)
+					for (int y = 0; y < WORLD_HEIGHT; y++) {
+						const BlockId lb = worldGet(&s_world, x, y, z);
+						cells++;
+						if (lb == BLOCK_SNOW || lb == BLOCK_ICE || lb == BLOCK_CACTUS ||
+						    lb == BLOCK_DEAD_BUSH || lb == BLOCK_FERN)
+							intruders++;
+					}
+			CHECK(intruders == 0);
+			// The sweep ran over a real world rather than over nothing.
+			CHECK(cells == 3L * CHUNK_DIM * 3L * CHUNK_DIM * WORLD_HEIGHT);
+			worldExit(&s_world);
+		}
+	}
+}
+
 static void testWorldgenWaterAndGrass(void)
 {
 	// ── The terrain fingerprint. ──────────────────────────────────────────────────────
@@ -8284,13 +8528,42 @@ static void testWorldgenWaterAndGrass(void)
 	// source/debug/loadprof_test.c pins a whole-world content hash of the same generator
 	// (GEN_VERSION_NEWEST == GEN_VERSION_DENSITY, genversion.h:75) and moves for the same
 	// reason; its own comment says it is supposed to.
+	// ── v1.8.3 Phase 3 moved FOUR of the twelve, and only four. ───────────────────────
+	//
+	// Told apart from breakage by measurement, not by the fact that the suite went green
+	// again. An A/B probe built the SAME dump program twice — once against faeaa63 and once
+	// against this tree — and diffed all 32,768 cells of each column. Every differing cell in
+	// all twelve columns took one of exactly three transitions:
+	//
+	//     seed 1337  ( 0,  0)  26 cells  air -> fern                    0x4514ba79 -> 0x5d83eac5
+	//     seed 1337  ( 1,  0)  18 cells  air -> fern                    0x849f4a0b -> 0xec6b57df
+	//     seed 1337  (-1, -1)  21 cells  air -> fern (20), water -> ice (1)
+	//                                                                   0x690f990d -> 0x12fc3ace
+	//     seed 90210 ( 7, -3)  31 cells  dirt -> snow                   0x8794b8b1 -> 0x30e49729
+	//     the other eight columns        IDENTICAL, 32,768 of 32,768 cells
+	//
+	// That shape is the whole argument. air -> fern is the scatter pass putting a plant in
+	// empty space above the ground. dirt -> snow and water -> ice are surface-cap swaps at a
+	// cell that was already occupied. NO cell of ground moved: no height, no density, no cave,
+	// nothing under a surface. Nothing a player has built on can be left floating or buried.
+	//
+	// And it is the DENSITY generator's output that moved, which is the one that is allowed
+	// to. worldgenScatter() — and so the new worldgenFlora() inside it — is only reached from
+	// worldgenColumn's GEN_VERSION_DENSITY arm, and surfaceBlock()/seaBlockAt() live in
+	// worldgen_density.c, which the legacy path never enters. testWorldgenLegacyByteIdentity's
+	// twelve GEN_VERSION_LEGACY hashes did NOT move, this run or any run of this work, and
+	// they are the check that would have caught it if they had.
+	//
+	// Eight of twelve unchanged is itself evidence rather than luck: the four that moved are
+	// exactly the four the cell diff found cells in, and 4242 has no cold, no desert and no
+	// taiga/jungle undergrowth in any of its four sampled columns.
 	static const struct { uint32_t seed; int32_t cx, cz; uint32_t hash; } pinned[] = {
-		{1337u,   0,  0, 0x4514ba79u}, {1337u,   1,  0, 0x849f4a0bu},
-		{1337u,  -1, -1, 0x690f990du}, {1337u,   7, -3, 0x479464fdu},
+		{1337u,   0,  0, 0x5d83eac5u}, {1337u,   1,  0, 0xec6b57dfu},
+		{1337u,  -1, -1, 0x12fc3aceu}, {1337u,   7, -3, 0x479464fdu},
 		{4242u,   0,  0, 0x40c702cbu}, {4242u,   1,  0, 0xa038a451u},
 		{4242u,  -1, -1, 0xe4b4d7c1u}, {4242u,   7, -3, 0x7fb8f23fu},
 		{90210u,  0,  0, 0x8bb38a6eu}, {90210u,  1,  0, 0xea29565au},
-		{90210u, -1, -1, 0xdd9c1f34u}, {90210u,  7, -3, 0x8794b8b1u},
+		{90210u, -1, -1, 0xdd9c1f34u}, {90210u,  7, -3, 0x30e49729u},
 	};
 	for (size_t i = 0; i < sizeof(pinned) / sizeof(pinned[0]); i++) {
 		WorldGen g;
@@ -8360,7 +8633,7 @@ static void testWorldgenWaterAndGrass(void)
 	static const struct { uint32_t seed; int32_t cx, cz; } areas[2] = {
 		{1337u, -12, 12}, {90210u, 8, -8},
 	};
-	long total_water = 0, total_plants = 0;
+	long total_water = 0, total_plants = 0, total_ice = 0;
 
 	for (int si = 0; si < 2; si++) {
 		const int32_t ox = areas[si].cx, oz = areas[si].cz;
@@ -8373,6 +8646,10 @@ static void testWorldgenWaterAndGrass(void)
 
 		long water = 0, plants = 0, eligible = 0, sealed_air = 0, trunk_bases = 0;
 		long water_above_line = 0, unfilled_ocean = 0, detached_water = 0;
+		// v1.8.3 Phase 3's sea ice. `ice` is the non-vacuity counter for the three that
+		// follow it; without it "no ice off the waterline" is satisfied by a world with no
+		// ice in it, which is exactly the shape of failure this file keeps recording.
+		long ice = 0, ice_off_line = 0, ice_wrong_biome = 0, ice_no_water_under = 0;
 		long plant_below_line = 0, plant_off_ground = 0, plant_not_on_grass = 0;
 		long plant_stacked = 0;
 
@@ -8390,6 +8667,15 @@ static void testWorldgenWaterAndGrass(void)
 				bool hit_solid   = false;
 				for (int y = GEN_SEA_LEVEL - 1; y >= 0; y--) {
 					const BlockId b = worldGet(&s_world, x, y, z);
+					// v1.8.3 Phase 3: the topmost cell of a cold body is ICE, not water, so
+					// it is the SURFACE of the body and not a break in it. Treating it as a
+					// break was the first symptom this change produced — every water cell in
+					// a frozen column counted as detached, four checks red — and "widen the
+					// sweep" is the right answer only because ice is placed by
+					// seaBlockAt() in the same walk that places the water, at exactly the
+					// one y this arm accepts. Anything else is still a break.
+					if (b == BLOCK_ICE && y == GEN_SEA_LEVEL - 1 && still_water)
+						continue;
 					if (b == BLOCK_WATER) {
 						water++;
 						if (!still_water) detached_water++;
@@ -8406,12 +8692,41 @@ static void testWorldgenWaterAndGrass(void)
 				for (int y = GEN_SEA_LEVEL; y < WORLD_HEIGHT; y++)
 					if (worldGet(&s_world, x, y, z) == BLOCK_WATER) water_above_line++;
 
+				// ── Sea ice (v1.8.3 Phase 3). ─────────────────────────────────────────
+				// Every ice cell in the column, wherever it is, so "only at the waterline"
+				// is a claim this loop can actually falsify rather than one the loop bound
+				// makes true. The biome and the cell underneath are checked at the same
+				// time: seaBlockAt() answers BLOCK_ICE only for TUNDRA and TAIGA and only
+				// for the top cell of a filled column, so ice anywhere else, ice in a warm
+				// biome, or ice with nothing but air under it are three different bugs.
+				{
+					const BiomeId ib = worldgenBiomeAt(&g, x, z);
+					for (int y = 0; y < WORLD_HEIGHT; y++) {
+						if (worldGet(&s_world, x, y, z) != BLOCK_ICE) continue;
+						ice++;
+						if (y != GEN_SEA_LEVEL - 1)                    ice_off_line++;
+						if (ib != BIOME_TUNDRA && ib != BIOME_TAIGA)   ice_wrong_biome++;
+						if (y > 0 && worldGet(&s_world, x, y - 1, z) == BLOCK_AIR)
+							ice_no_water_under++;
+					}
+				}
+
 				// An ocean column — one whose ground never reaches the line — must be full
 				// to the brim. This is the half that catches a fill stopping a block short,
 				// which the sweep above would happily call consistent.
-				if (top >= 0 && top < GEN_SEA_LEVEL - 1 &&
-				    worldGet(&s_world, x, GEN_SEA_LEVEL - 1, z) != BLOCK_WATER)
-					unfilled_ocean++;
+				//
+				// ICE COUNTS AS FULL, and leaving it out would have been worse than a red
+				// check: genTestTerrainTop() now steps over ice, so a frozen ocean column
+				// reports its seabed as `top` and DOES enter this branch — where before
+				// Phase 3 it reported the ice itself, `top < GEN_SEA_LEVEL - 1` was false,
+				// and the column was skipped entirely. The check went vacuous for exactly
+				// the columns Phase 3 added, silently, and this arm is what puts it back.
+				{
+					const BlockId brim = worldGet(&s_world, x, GEN_SEA_LEVEL - 1, z);
+					if (top >= 0 && top < GEN_SEA_LEVEL - 1 &&
+					    brim != BLOCK_WATER && brim != BLOCK_ICE)
+						unfilled_ocean++;
+				}
 
 				// ── Plants. ───────────────────────────────────────────────────────────
 				int seen_plant = 0;
@@ -8438,6 +8753,9 @@ static void testWorldgenWaterAndGrass(void)
 		CHECK(water_above_line == 0);
 		CHECK(unfilled_ocean == 0);
 		CHECK(detached_water == 0);
+		CHECK(ice_off_line == 0);
+		CHECK(ice_wrong_biome == 0);
+		CHECK(ice_no_water_under == 0);
 		CHECK(plant_below_line == 0);
 		CHECK(plant_off_ground == 0);
 		CHECK(plant_not_on_grass == 0);
@@ -8459,6 +8777,7 @@ static void testWorldgenWaterAndGrass(void)
 
 		total_water  += water;
 		total_plants += plants;
+		total_ice    += ice;
 		worldExit(&s_world);
 	}
 
@@ -8466,6 +8785,12 @@ static void testWorldgenWaterAndGrass(void)
 	// seed: how much water a given seed has is a property of its biome field, not of the fill.
 	CHECK(total_water > 0);
 	CHECK(total_plants > 0);
+	// And the three ice checks above have to have had something to look at. Summed for the
+	// same reason and a stronger one: whether a given area is cold enough to freeze is a
+	// property of its biome field, and area 1337/(-12,12) is documented above as containing
+	// no tundra at all. Asserting per-seed would be asserting where the climate noise put
+	// taiga, which is not what this test is about.
+	CHECK(total_ice > 0);
 
 	// ── Regenerating the same seed gives the identical world, water and plants included. ──
 	// Forwards and backwards over the same 3 x 3 columns, hashing every block: both passes
@@ -10171,6 +10496,7 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testDensityDistribution();
 	testWorldgenWaterAndGrass();
 	testWorldgenBiomeSurface();
+	testWorldgenPhase3Flora();
 	testRaycast();
 	testBodyBlocked();
 	testCeilingCollision();
@@ -10248,6 +10574,21 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	// 15 cap/dir-length pairs with 4 CHECKs each, so 5262 + 60 = 5322. Recomputed from the
 	// table's length, then confirmed against the run -- that order, not the other one.
 	//
+	// v1.8.3 Phase 3 (snow, ice, cactus, dead bush, fern): 5322 + 38 = 5360, and the 38 was
+	// counted off the source before the suite was run, in the order this comment demands.
+	//
+	//    +7  testWorldgenWaterAndGrass gains ice_off_line, ice_wrong_biome and
+	//        ice_no_water_under inside the loop over its TWO areas (3 x 2 = 6), plus one
+	//        CHECK(total_ice > 0) after it.
+	//   +31  testWorldgenPhase3Flora, new: 1 worldgenInit + 15 "== 0" placement invariants
+	//        + 6 non-vacuity counters + 1 cactus stacking + 2 for the fern rate ordering
+	//        + 6 for the legacy sweep (worldgenInit, intruders, cells) over 2 seeds.
+	//
+	// Predicted 5360 and the run printed 5360, which is the half that matters: an intermediate
+	// run of the same work predicted 5269 and printed 5269 as well, so the two agreements are
+	// independent. The CHECK_QUIET in the new test's 121-column generation loop and in its
+	// legacy 3 x 3 loops contributes nothing while it passes, per the rule stated above.
+	//
 	// **Host only, and this is a real gap.** Nine tests above are inside `#ifndef __3DS__`
 	// and the console total is a different number, which cannot be measured right now: the
 	// devkitPro build is red tree-wide for an unrelated reason (source/world/block.h has
@@ -10256,18 +10597,18 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 #ifndef __3DS__
 	{
 		const int ran = s_checks;
-		if (ran != 5322)
+		if (ran != 5360)
 			printf("\nCHECK-COUNT GUARD: %d checks ran, %d expected.\n"
 			       "  %s\n"
 			       "  This is NOT an ordinary assertion failure.\n"
 			       "  Read the comment above this guard in world/world_test.c before"
 			       " touching the pinned number.\n",
-			       ran, 5322,
-			       ran < 5322
+			       ran, 5360,
+			       ran < 5360
 			           ? "Checks went MISSING: checks that should have run never ran at all."
 			           : "Extra checks appeared: either you added checks and did not update"
 			             " the pin, or something is emitting checks it should not.");
-		CHECK(ran == 5322);
+		CHECK(ran == 5360);
 	}
 #endif
 
