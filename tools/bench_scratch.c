@@ -13,10 +13,39 @@
 // source/ is globbed into the console build by the Makefile, and a second main() would
 // break that link.
 //
-// Build and run:
-//   gcc -std=c11 -O2 -I source tools/bench_scratch.c source/world/{block,chunk,world,
-//       scratch,noise,worldgen,handbuilt}.c -lm -o build-host/bench_scratch
+// Build and run (verified from WSL, repository root, 2026-08-30):
+//   gcc -std=c11 -O2 -I source tools/bench_scratch.c tests/net_stub.c \
+//       source/world/{block,chunk,world,scratch,noise,worldgen,worldgen_density,handbuilt,
+//       registry,budget}.c -lm -o build-host/bench_scratch
 //   ./build-host/bench_scratch
+//
+// The list above is wider than the original comment's, in three ways, each found by running
+// the old command and reading the real error rather than guessing at one:
+//   - tests/net_stub.c is in the link because world.c's worldSet() calls
+//     networldOnColumnLoad() (net/networld.c), which needs a real socket/TLS stack this
+//     bench has no business linking. Same stub, same reason, as tools/run_host_tests.sh and
+//     source/world/Makefile.playerpose-test use it for.
+//   - source/world/registry.c and source/world/budget.c are in the link because block.c and
+//     world.c call into both (registryIsDefined/registryView/registryGet,
+//     budgetClaim/budgetRelease) — they were never optional, the old command just never
+//     tried to link and find out.
+//   - source/world/worldgen_density.c is in the link because worldgen.c's column/height/
+//     scatter paths (wgdColumn, wgdHeight, wgdColumnTops) live there, not in worldgen.c
+//     itself.
+// Without tests/net_stub.c, linking the old command fails with "undefined reference to
+// `networldOnColumnLoad'"; with only that added, it fails again with a page of undefined
+// references into registry.c/budget.c/worldgen_density.c. The old command also predates
+// strict -std=c11 making clock_gettime()/CLOCK_MONOTONIC invisible without the
+// _POSIX_C_SOURCE guard below — see that guard's own comment.
+//
+// Must be defined before ANY header is pulled in, same reason and same fix as
+// source/net/bsnet_sock.c's file comment: glibc's feature-test macros latch on the first
+// system header, not the first one that happens to need them, so clock_gettime()/
+// CLOCK_MONOTONIC below are invisible under strict -std=c11 without this.
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 199309L
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
