@@ -56,17 +56,59 @@ static const int8_t kDirs[6][3] = {
 // case is today's speed rather than no light.
 static LightQueue* s_edit_queue;
 
+// v1.8.3. Whether that allocation was refused, and how many relights the refusal has cost.
+//
+// The malloc above used to be fire-and-forget: `if (!s_edit_queue) s_edit_queue = malloc(...)`
+// with the result never read. A refusal left s_enabled true and s_edit_queue NULL, so
+// lightRelightColumn fell through to lightRelightColumnSweeps for the rest of the session — 26x
+// slower, per the measurement above — with no counter, no flag and nowhere for it to show up.
+//
+// The FALLBACK is not the defect and is not being removed: sweeps at today's speed beat no light
+// at all. The defect is that it was silent. The sentence defending it ("the worst case is today's
+// speed") was written when a relight ran once per edit; v1.8.0 added main.c's per-frame drain,
+// which runs many per frame, and the justification was never revisited against that.
+//
+// A counter and a predicate rather than a log line, because that is what this layer already does.
+// source/world compiles with no <3ds.h> and contains no logging facility of any kind — that is
+// deliberate, it is what makes the whole directory host-testable — and every other degraded state
+// here is reported the same way: a static counter behind an accessor, read by main.c and the host
+// suite. relightqOverflows() and relightqCoalesced() (world/relightq.h), dirtyqPeak()
+// (world/dirtyq.h), lightColumnsAttached() and lightBytesUsed() just below are all this shape.
+//
+// Refusing to claim the engine at all — leaving s_enabled false on a refused malloc — was the
+// other candidate and it is worse: it turns a slow relight into no light LEVEL anywhere, which is
+// a much larger regression than the one being reported.
+static bool s_edit_queue_refused;
+static int  s_sweep_fallbacks;
+
+// Test hook, in the same spirit as lightSetLuminanceForTest below: makes the next
+// lightEngineInit(true) behave exactly as a refused malloc does, so the degraded path can be
+// entered on purpose instead of only by running out of memory. Nothing in production sets it.
+static bool s_fail_edit_queue_for_test;
+
 void lightEngineInit(bool enable)
 {
 	s_enabled = enable;
 
 	if (enable) {
-		if (!s_edit_queue) s_edit_queue = (LightQueue*)malloc(sizeof(LightQueue));
+		if (!s_edit_queue && !s_fail_edit_queue_for_test)
+			s_edit_queue = (LightQueue*)malloc(sizeof(LightQueue));
+
+		// The result, READ. This assignment is the whole of defect A's fix: everything else
+		// here exists to carry it somewhere a person or a test can see it.
+		s_edit_queue_refused = (s_edit_queue == NULL);
 	} else {
 		free(s_edit_queue);
-		s_edit_queue = NULL;
+		s_edit_queue        = NULL;
+		s_edit_queue_refused = false;
 	}
 }
+
+bool lightFastEngineReady(void) { return s_enabled && !s_edit_queue_refused; }
+int  lightSweepFallbacks(void)  { return s_sweep_fallbacks; }
+
+void lightFailEditQueueForTest(bool fail)   { s_fail_edit_queue_for_test = fail; }
+void lightResetSweepFallbacksForTest(void)  { s_sweep_fallbacks = 0; }
 
 bool lightEnabled(void)           { return s_enabled; }
 
@@ -394,7 +436,14 @@ bool lightPropagateColumn(World* w, int cx, int cz, LightQueue* q)
 bool lightRelightColumn(World* w, int cx, int cz)
 {
 	if (!s_enabled) return false;
-	if (!s_edit_queue) return lightRelightColumnSweeps(w, cx, cz);
+
+	// v1.8.3: counted on the way past. Without this the fallback is indistinguishable from the
+	// fast path at every level above it — same signature, same return value, same light, 26x the
+	// cost. See s_sweep_fallbacks above for why a counter and not a log line.
+	if (!s_edit_queue) {
+		s_sweep_fallbacks++;
+		return lightRelightColumnSweeps(w, cx, cz);
+	}
 
 	lightQueueInit(s_edit_queue);
 	return lightPropagateColumn(w, cx, cz, s_edit_queue);

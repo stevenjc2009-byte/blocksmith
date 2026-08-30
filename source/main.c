@@ -67,6 +67,7 @@
 #include "world/playerpose.h"
 #include "world/region.h"
 #include "world/registry.h"
+#include "world/relight_drain.h"
 #include "world/relightq.h"
 #include "world/tick.h"
 #include "world/water.h"
@@ -91,6 +92,12 @@ static World s_world;
 // onRemoteEdit, drained once per frame ahead of the mesh drain — see world/relightq.h for
 // why the relight cannot stay inline in the hook.
 static RelightQueue s_relightq;
+
+// v1.8.3. The clock world/relight_drain.c's budget runs against. A wrapper rather than
+// svcGetSystemTick itself because RelightClockFn is declared in terms of uint64_t and the drain
+// has to stay <3ds.h>-free to be host-testable — the host suite passes a counter of its own here,
+// which is the only way the TIME half of that budget can be tested at all.
+static uint64_t relightNowTicks(void) { return (uint64_t)svcGetSystemTick(); }
 
 // v1.8.0 task 21. The simulation clock. Everything the spec defines per-tick — fluid spread,
 // redstone, crop growth, smelting, hunger, mob AI — is phased against this and not against the
@@ -181,6 +188,52 @@ static int worldReportBuild(void)
 // is the knob, at the cost of a slower drain rather than a dropped frame.
 #define DRAIN_BUDGET_MS   4.0f
 #define DRAIN_MAX_CHUNKS  3
+
+// The same two knobs for the relight drain that runs just before the mesh drain (v1.8.3). It had
+// none until now — see the drain itself in the main loop, and world/relight_drain.h for what the
+// old comment there got wrong.
+//
+// MEASURED, on the host, for this change. The tree quoted three inconsistent figures for one
+// lightRelightColumn — 0.141 ms (light.h:13, world.h:54), 0.156 ms (light.c:47, light.h:152) and
+// 720.1 us (relightq.h:4) — so the cost was timed directly rather than picked from among them.
+// 240 samples, gcc -O1, six column profiles chosen to bracket the shape the drain actually meets
+// (open plain, half-full, nearly-full, rolling hills, blocky mesa, noisy, the last three with
+// air pockets under solid roof, which is where a flood fill iterates most):
+//
+//     flood fill, all profiles, n=240:  min 0.013  med 0.156  p95 0.227  max 0.287 ms
+//
+// The median lands on 0.156 ms EXACTLY, which is light.c:47's figure — that is the true one.
+// 720.1 us in relightq.h:4 is not a flood-fill number at all: the same run measures the SWEEPS
+// engine at med 0.950 / max 1.650 ms, and 720.1 us sits in that range, so relightq.h is quoting
+// a pre-v1.8.0 sweeps-era cost. It is left alone here because correcting it is not this fix.
+//
+// The count cap binds the worst case, for the reason DRAIN_MAX_CHUNKS above binds the mesh one:
+// a clock can only stop the loop after a column has already overrun it. Four columns at the
+// measured max of 0.287 ms is 1.148 ms, and that is the number to write down. Plus the mesh
+// drain's own written-down 6.2 ms worst case, 0.62 ms of steady-state CPU and a 0.37 ms submit,
+// it is 8.34 ms of 16.71 — inside, with 8.4 ms to spare.
+//
+// What it replaces, at the same measured figures: RELIGHTQ_CAP = 64 columns unbudgeted is 9.98 ms
+// at the median and 18.4 ms at the max — a dropped frame ON THE HOST, before any ARM11 penalty.
+//
+// The time budget is a quarter of the mesh drain's, because a relight is a PREREQUISITE of a
+// mesh and not a competitor to it: the drain exists so a chunk is not meshed with stale light,
+// and it should never be the reason the mesh it is preparing for does not get built. On the host
+// the COUNT is what binds — 4 columns at p95 is 0.908 ms, inside the 1.0 ms clock — so the clock
+// is the backstop for the console, where every column is dearer. That asymmetry is the point: at
+// any per-column cost above 1.0 ms the clock stops the drain after ONE column, so the console
+// worst case degrades to one column plus a clock read rather than to four.
+//
+// NOT MEASURED ON A CONSOLE. Everything above is host gcc -O1 on x86; a 268 MHz ARM11 with no L2
+// is dearer by a factor nobody here has measured, and nothing since v1.2.5 has run on hardware.
+// The time budget is what makes that gap safe rather than fatal, but the four-column figure is a
+// host figure and should not be quoted as a console one.
+//
+// Cost of the deferral: a 64-entry backlog now takes 16 frames to clear at 4/frame, so 0.27 s at
+// 59.83 Hz instead of one 18.4 ms frame. If that turns out to be visible, this is the knob, at
+// the cost of a slower drain rather than a dropped frame.
+#define RELIGHT_BUDGET_MS    1.0f
+#define RELIGHT_MAX_COLUMNS  4
 
 // Phase 4 cannot be verified by pressing buttons: no keyboard key reaches the emulated
 // console (every button in the emulator's config is bound to an SDL pad), which is the
@@ -1193,6 +1246,40 @@ static bool genStart(int32_t cx, int32_t cz)
 		s_world_refused_why = refusal;
 		loadprofSince(LOAD_STAGE_SETUP, t_setup);
 		return false;
+	}
+
+	// v1.8.3 Phase 4. A joined session has no world directory, so genVersionResolve() above
+	// returned GENVER_NO_WORLD_DIR and left gen_version at genVersionForSession() — which is
+	// the right answer only for a server that has not said otherwise. Now it can say: the
+	// server declares its world's generator as BS_APP_WORLD_GEN (proto/bs_proto.h) and
+	// networldServerGenVersion() holds what it said.
+	//
+	// Deliberately a second resolve with its own refusal rather than a branch folded into the
+	// one above, exactly as the seed block below is: the two questions are asked of two
+	// different things — one of a directory on this card, one of a server on the network — and
+	// merging them would produce one status whose sentence could not be right for both.
+	//
+	// The decision is entirely this client's. The server announces and never verifies (see
+	// bsgame.c's send_registry_info for the same posture stated at length), and there is no
+	// acknowledgement to send: refusing means not joining that world, and nothing about that is
+	// the server's business.
+	if (s_server_session) {
+		uint32_t wire_gen = 0u;
+		const bool have_wire = networldServerGenVersion(&wire_gen);
+		const GenVersionStatus sgv =
+			genVersionForSessionResolve(have_wire, wire_gen, &gen_version);
+
+		// Same switch, same file, same reason as the refusal above — genrefuse.h answers over
+		// the whole enum with no default, so GENVER_SESSION_MISMATCH could not be added
+		// without a decision being made about it here.
+		const char* const sess_refusal = genVersionRefusalText(sgv);
+		if (sess_refusal) {
+			printf("session refused: server generator %lu (%s)\n",
+			       (unsigned long)wire_gen, sess_refusal);
+			s_world_refused_why = sess_refusal;
+			loadprofSince(LOAD_STAGE_SETUP, t_setup);
+			return false;
+		}
 	}
 
 	// v1.8.3 Phase 1. WHICH world this is, as opposed to which generator shapes it. The whole
@@ -4329,20 +4416,54 @@ session_start:
 		// chunks, and a chunk meshed before its column is relit bakes the old light into
 		// its vertices and keeps it until something else touches it.
 		//
-		// Drained to empty rather than budgeted, because the set is bounded by the loaded
-		// column count (RENDER_DIST_MAX_COLUMNS = 49) however many edits arrived, and a
-		// partial drain would be exactly the stale-light case above. The old code ran one
-		// full relight per EDIT, with no bound at all.
-		// v1.7.1 task 49: timed. This drain is deliberately unbudgeted (see above), which is
-		// correct and also means it is the one piece of per-frame work that has no ceiling at
-		// all. It is multiplayer-only, so it should read 0.000 in single player — and if it
-		// does not, that is itself the finding.
+		// v1.8.3: BUDGETED, and the two sentences that used to stand here are gone because
+		// both were false. They said this drain was "bounded by the loaded column count
+		// (RENDER_DIST_MAX_COLUMNS = 49)" and that it "is multiplayer-only, so it should read
+		// 0.000 in single player". Neither survives reading the code:
+		//
+		//   * The bound is RELIGHTQ_CAP = 64 (world/relightq.h), which is what caps how many
+		//     entries relightqPop can return. And 49 was not the loaded column count either —
+		//     that is the RENDER distance ring; the columns actually loaded are the generation
+		//     area, GEN_AREA_SPAN * GEN_AREA_SPAN = 81.
+		//   * Single player feeds it every time water moves. onWorldEdit -> waterNotify, then
+		//     world/water.c's change hook -> onWaterChange -> onRemoteEdit -> relightqPush.
+		//     Digging into a lake fills this queue with no server involved, so "it should read
+		//     0.000 in single player" was pointing anyone who read the metrics CSV away from
+		//     the thing they were looking at.
+		//
+		// 64 columns at the MEASURED host cost of one lightRelightColumn (med 0.156 ms, max
+		// 0.287 ms over 240 samples) is 9.98 to 18.4 ms in one frame against a budget of 16.71
+		// — a dropped frame on the host, before any ARM11 penalty. See RELIGHT_BUDGET_MS at the
+		// top of this file for the measurement and where the two limits come from; the drain
+		// itself is world/relight_drain.c, split out of here so the budget can be host-tested —
+		// main.c links into no host binary, so a loop written in this function cannot be.
+		//
+		// WHAT THE DEFERRAL COSTS, stated because it is a real regression against the old
+		// behaviour and not only a saving. Nothing is dropped — a column this frame does not
+		// reach stays in the set and is relit on a later frame — but the ordering guarantee in
+		// the paragraph above is now only guaranteed for the columns that DID drain. A chunk
+		// belonging to a deferred column can be meshed by the drain below before its column is
+		// relit, and it then holds the old light until something touches it again. That window
+		// opens only when more than RELIGHT_MAX_COLUMNS columns are pending in one frame (a
+		// rejoin, or a large water collapse). Repairing it needs a remesh policy — re-touching
+		// a deferred column dirties all COLUMN_CHUNKS = 8 of its chunks, eight times the mesh
+		// work of the edit that caused it — and that is a decision, not a detail, so it is
+		// left alone here and reported rather than invented.
+		//
+		// SEAM, deliberately left open (v1.8.3). A water-aware notify suppression is queued
+		// behind Phase 4: it wants a drain-in-progress flag raised around the drain in
+		// net/networld.c and read by onWorldEdit, so that the edits a relight itself provokes
+		// do not re-enter the queue it is draining. Nothing here needs changing for it —
+		// relightDrain is ONE call with the whole drain inside it, which is exactly the shape
+		// such a flag needs to bracket. Do not widen it.
+		//
+		// BLANKET notify suppression is NOT the fix and must not be substituted for it. It was
+		// tried and measured, and it regressed the control arm from 117 blocks / 608 flow back
+		// to 1 block / 0 flow — i.e. it switched the water simulation off. Only the water-aware
+		// version is wanted.
 		const u64 t_relight = svcGetSystemTick();
-		if (lightEnabled()) {
-			int rx, rz;
-			while (relightqPop(&s_relightq, &rx, &rz))
-				lightRelightColumn(&s_world, rx, rz);
-		}
+		relightDrain(&s_world, &s_relightq, RELIGHT_MAX_COLUMNS,
+		             (u64)(RELIGHT_BUDGET_MS * CPU_TICKS_PER_MSEC), relightNowTicks);
 		const float relight_ms =
 			(float)((double)(svcGetSystemTick() - t_relight) / CPU_TICKS_PER_MSEC);
 

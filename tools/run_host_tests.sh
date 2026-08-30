@@ -2806,3 +2806,104 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 "./$BHWS/worldseed_test"
 
 rm -rf "$BHWS"
+
+# world/relight_drain_test.c -- the per-frame relight budget (world/relight_drain.c) and the
+# lighting engine's now-reported edit-queue refusal (world/light.c), both v1.8.3. Own binary, own
+# main(), appended rather than merged into the world stanza for the reason every stanza in this
+# file is appended: an append is the one edit shape that cannot drop another session's work.
+#
+# THE TWO DEFECTS.
+#
+#  1. main.c drained world/relightq.h to EMPTY every frame -- `while (relightqPop(...))
+#     lightRelightColumn(...)` -- with no budget at all, under a comment asserting the drain was
+#     multiplayer-only and bounded by 49. Both were false: RELIGHTQ_CAP is 64, and single player
+#     feeds the queue on every water movement (onWorldEdit -> waterNotify -> water.c's change
+#     hook -> onWaterChange -> onRemoteEdit -> relightqPush). Digging into a lake drains an
+#     arbitrary number of columns inside one frame with no server involved.
+#  2. lightEngineInit ignored its 65,544-byte malloc's result. A refusal left the engine ENABLED
+#     and queueless, so every relight for the rest of the session silently took the 26x slower
+#     sweep path with no flag, no counter and no log line anywhere.
+#
+# MEASURED for the budget, rather than quoted from a comment: the tree carried three inconsistent
+# host figures for one lightRelightColumn (0.141 ms, 0.156 ms, 720.1 us). Timed directly -- 240
+# samples, gcc -O1, six column profiles bracketing open plain through nearly-full, the last three
+# with air pockets under solid roof where a flood fill iterates most:
+#
+#     flood fill, n=240:  min 0.013  med 0.156  p95 0.227  max 0.287 ms
+#     sweeps,     n=36:   min 0.342  med 0.950  p95 1.517  max 1.650 ms
+#
+# The median lands on light.c:47's 0.156 ms EXACTLY, so that is the true figure. relightq.h:4's
+# 720.1 us sits in the SWEEPS range above, not the flood-fill one -- it is a pre-v1.8.0 sweeps-era
+# number. It is left alone; correcting it was not this fix. 64 columns unbudgeted is therefore
+# 9.98 ms (median) to 18.4 ms (max) in one frame against 16.71 -- a dropped frame on the HOST,
+# before any ARM11 penalty. RELIGHT_MAX_COLUMNS = 4 is 1.148 ms at the measured max;
+# RELIGHT_BUDGET_MS = 1.0 is the backstop that binds instead on a console, where any per-column
+# cost above 1.0 ms stops the drain after ONE column rather than four.
+#
+# THE CONTROL is testControlEngineAndFixture(), asserted first, 5 checks. It drives the same world
+# builder, the same engine and the same observation (columnIsLit) every other check depends on,
+# straight through lightRelightColumn with no drain involved. NON-VACUITY PROVEN rather than
+# assumed: with `return lightPropagateColumn(w, cx, cz, s_edit_queue);` in light.c's
+# lightRelightColumn replaced by `return true;`, it goes red --
+# "FAIL   control: column 0 now reads sky 15 in open air", "FAIL 68 checks, 10 failed". It stays
+# green in all three arms below, which is what makes those arms readable at all.
+#
+# ARM 1 -- the budget. Sabotaged in world/relight_drain.c by restoring pre-fix BEHAVIOUR: both
+# `if (done >= max_columns) break;` and `if (now() - t0 >= budget_ticks) break;` replaced by
+# `(void)max_columns; (void)budget_ticks; (void)t0;`, so the loop drains to empty and still
+# compiles under -Werror (a sabotage that will not compile proves nothing). Result:
+# "FAIL 68 checks, 30 failed" -- the whole count cap (6), the always-one-column contract (7), the
+# whole time budget (7), the per-iteration recheck (5), the frame COUNT in the nothing-dropped
+# test (1), and 4 of the 5 degraded-state drain checks. TOTAL STAYED 68: no check was deleted.
+# Green throughout: all 5 control checks, all 8 refusal checks, and -- correctly -- `total ==
+# COLUMNS`, `relightqCount(&q) == 0` and all three "column N survived the budgeted drain" checks,
+# because an unbudgeted drain still drops nothing, it just does it all in one frame. That is the
+# arm discriminating the BUDGET rather than the module collapsing.
+# Restored, cmp SILENT, md5 back to 9e2e614c0d1c578b5f6e9a42cdb6826c.
+#
+# ARM 2a -- the malloc result unread. Sabotaged in world/light.c by `s_edit_queue_refused = false;`
+# in place of `s_edit_queue_refused = (s_edit_queue == NULL);` -- exactly the pre-fix line, which
+# never read the result. Result: "FAIL 68 checks, 2 failed", both of them the checks asserting the
+# refusal is VISIBLE: "and it says so: the fast engine is not ready" and "degraded before the
+# drain". Everything else green, the fallback counter included -- that is the other half.
+#
+# ARM 2b -- the silence. Sabotaged in world/light.c by deleting `s_sweep_fallbacks++;` from
+# lightRelightColumn's fallback branch. Result: "FAIL 68 checks, 3 failed", all three the counter
+# assertions: "and is counted, once", "the counter is per relight, not per session", and "and
+# every one of the 3 relights is counted as a sweep fallback". The refusal-FLAG checks stayed
+# green, which is what says 2a and 2b exercise different halves of defect 2 rather than the same
+# half twice. Restored, cmp SILENT, md5 back to 87e3b53a97e33c76e0bdb84c038fd05c.
+#
+# THE CHECK-COUNT PIN (RELIGHT_DRAIN_TEST_EXPECTED_CHECKS = 68) exists because a red arm whose
+# TOTAL dropped is deleting checks, not failing them. All four arms above printed 68.
+#
+# NOT VERIFIED BY THIS STANZA, stated rather than left implied:
+#   * RELIGHT_BUDGET_MS and RELIGHT_MAX_COLUMNS themselves live in source/main.c, which links into
+#     no host binary, so the two literals this project SHIPS cannot be pinned here -- only the
+#     behaviour they are fed into. The console build compiling is what stands behind that wiring,
+#     and the rest is a playtest.
+#   * Every timing above is host gcc -O1 on x86. Nothing was measured on a 268 MHz ARM11, and
+#     nothing since v1.2.5 has run on hardware.
+#
+# world/light.c must NOT be listed below -- world.c #includes it (world.c line 16), the same
+# arrangement the luminance and scratch stanzas above depend on. Listing it is a double definition.
+BHRD="build-host/run-$$-relightdrain"
+mkdir -p "$BHRD"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/world.c \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/budget.c \
+	source/world/scratch.c \
+	source/world/relightq.c \
+	source/world/relight_drain.c \
+	tests/net_stub.c \
+	source/world/relight_drain_test.c \
+	-o "$BHRD/relight_drain_test"
+
+"./$BHRD/relight_drain_test"
+
+rm -rf "$BHRD"

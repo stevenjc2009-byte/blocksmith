@@ -163,6 +163,21 @@ bool  lightRelightColumnSweeps(World* w, int cx, int cz);
 int    lightColumnsAttached(void);
 size_t lightBytesUsed(void);   // budget bytes currently held by attached columns
 
+// v1.8.3. Whether lightEngineInit(true) actually got the edit queue it asked for, and how many
+// relights have run the 26x slower sweeps because it did not.
+//
+// lightEngineInit ignored its malloc's result until v1.8.3: a refusal left the engine ENABLED and
+// queueless, every lightRelightColumn for the rest of the session silently took the sweep path,
+// and nothing recorded it. The fallback stays — sweeps beat darkness — but it now announces
+// itself, the same way world/relightq.h's overflows counter and world/dirtyq.h's peak do. See
+// light.c's s_edit_queue_refused for why this shape and not a log line.
+//
+// lightFastEngineReady() is false from the moment the refusal happens, before any relight has run;
+// lightSweepFallbacks() is what says the refusal has actually cost frame time. Both are cheap
+// enough to read every frame.
+bool lightFastEngineReady(void);
+int  lightSweepFallbacks(void);
+
 // Test hooks. No block in the CORE registry declares a luminance — nothing emits in a
 // single-player world — and these exist so the suite can prove the block channel
 // end-to-end without inventing a gameplay feature.
@@ -172,3 +187,9 @@ size_t lightBytesUsed(void);   // budget bytes currently held by attached column
 // every core row is 0); it does not force a declared emitter dark.
 void  lightSetLuminanceForTest(BlockId id, uint8_t level);
 void  lightSetSkyForTest(Column* col, int lx, int y, int lz, uint8_t level);
+
+// Forces the NEXT lightEngineInit(true) to behave exactly as a refused 65,544-byte malloc does.
+// Call lightEngineInit(false) first: an edit queue already held is not thrown away by this, so
+// without the release the next init still has one and the hook appears to do nothing.
+void  lightFailEditQueueForTest(bool fail);
+void  lightResetSweepFallbacksForTest(void);
