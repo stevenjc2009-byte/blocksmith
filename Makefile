@@ -500,6 +500,109 @@ check-diffcap-drift:
 	fi; \
 	echo "diff-store caps: server BS_DIFF_MAX = $$srv, client records $$cli (client's own cap stays smaller, deliberately)"
 
+# ------------------------------------------------------ chunk dimension guard
+#
+# CHUNK_DIM (source/world/chunk.h) and BS_CHUNK_DIM in the server's
+# proto/bs_proto.h are the same number written twice, and until this target
+# nothing anywhere compared them. bs_proto.h says so in prose -- "The client's CHUNK_DIM
+# (source/world/chunk.h:50), restated here" -- and prose does not fail a build.
+# That is exactly the shape of the hand-copied capacity constant that shipped
+# v1.6.0 unbootable: a correct comment naming its source, wrong within one
+# release, with no compiler anywhere in a position to notice.
+#
+# This one is worse than a capacity. BS_CHUNK_DIM is what bs_col_of() shifts by,
+# so every CHUNK_SUB, CHUNK_UNSUB and CHUNK_DIFFS column coordinate on the wire
+# is derived from it. A divergence would not run out of room; it would file
+# every edit under a column nobody subscribed to, on an unordered transport that
+# reports nothing, in a build that compiles clean on BOTH sides.
+#
+# A _Static_assert cannot do this job here. Measured, not assumed: no translation
+# unit under source/ includes both headers -- of the .c files that include
+# bs_proto.h, none also includes world/chunk.h -- and `grep -rn BS_CHUNK_DIM
+# source/` matches 0 lines, so no client TU has the server's value in scope at
+# all. chunk.h is also not one of the eleven files sync-world-sources.sh mirrors
+# into the server tree, so game/validate.c -- where every other cross-repo static
+# assert lives -- cannot see it from the other direction either. Vendoring a
+# twelfth file to make it visible was rejected: it enlarges a sync surface that
+# is maintained by hand, to buy one integer, and chunk.h includes world/block.h
+# so it would not arrive alone.
+#
+# The shape is check-diffcap-drift's, immediately above, not a fourth mechanism:
+# a phony target that reads the TEXT of both headers at build time, reports and
+# never mutates, wired into `all` so it runs on every build rather than only on
+# a fresh clone. Neither value is transcribed into this Makefile -- a copy here
+# would be a third place to forget, which is the bug this is about. Both file
+# names and both values are printed on failure, so a future failure explains
+# itself without archaeology.
+#
+# BS_CHUNK_DIM_SHIFT is deliberately NOT checked here. game/validate.c already
+# asserts (1u << BS_CHUNK_DIM_SHIFT) == BS_CHUNK_DIM in C, in a translation unit
+# that sees both; text-matching it a second time would be a weaker copy of a
+# guard that is already the build.
+CHUNK_H		:=	source/world/chunk.h
+PROTO_H		:=	$(PROTO)/proto/bs_proto.h
+
+.PHONY: check-chunkdim-drift
+check-chunkdim-drift:
+	@if [ ! -e $(PROTO_H) ]; then \
+		echo "Makefile: $(PROTO_H) is not there."; \
+		echo "  deps/blocksmith-server has not been fetched, so BS_CHUNK_DIM cannot be"; \
+		echo "  read and $(CHUNK_H)'s CHUNK_DIM cannot be checked against it. This guard"; \
+		echo "  FAILS rather than skips: a check that passes when it had nothing to"; \
+		echo "  check is not a check, the same stance check-world-drift and"; \
+		echo "  check-diffcap-drift above take on the same missing clone."; \
+		echo "  fetch it with:  make deps"; \
+		exit 1; \
+	fi; \
+	if [ ! -e $(CHUNK_H) ]; then \
+		echo "Makefile: $(CHUNK_H) is not there."; \
+		echo "  that header is where this client defines CHUNK_DIM, the value the wire"; \
+		echo "  contract's BS_CHUNK_DIM is a copy of. With it gone there is nothing to"; \
+		echo "  compare, so the build stops rather than pass having compared nothing."; \
+		exit 1; \
+	fi; \
+	cli=`sed -n 's/^[[:space:]]*#define[[:space:]][[:space:]]*CHUNK_DIM[[:space:]][[:space:]]*\([0-9][0-9]*\).*$$/\1/p' $(CHUNK_H) | head -1`; \
+	srv=`sed -n 's/^[[:space:]]*#define[[:space:]][[:space:]]*BS_CHUNK_DIM[[:space:]][[:space:]]*\([0-9][0-9]*\).*$$/\1/p' $(PROTO_H) | head -1`; \
+	if [ -z "$$cli" ]; then \
+		echo "Makefile: cannot read CHUNK_DIM out of $(CHUNK_H)."; \
+		echo "  no '#define CHUNK_DIM <number>' line matched, so that header's shape"; \
+		echo "  changed and this guard no longer knows what it is comparing. The build"; \
+		echo "  stops rather than compare nothing."; \
+		echo "  re-point the sed in check-chunkdim-drift at wherever the value now lives."; \
+		exit 1; \
+	fi; \
+	if [ -z "$$srv" ]; then \
+		echo "Makefile: cannot read BS_CHUNK_DIM out of $(PROTO_H)."; \
+		echo "  no '#define BS_CHUNK_DIM <number>' line matched. That macro is the wire"; \
+		echo "  contract's copy of this client's CHUNK_DIM and is what bs_col_of()"; \
+		echo "  shifts every column coordinate by. Without it there is nothing to check"; \
+		echo "  against, so the build stops rather than pass having compared nothing."; \
+		echo "  re-point the sed in check-chunkdim-drift at wherever the value now lives."; \
+		exit 1; \
+	fi; \
+	if [ "$$cli" != "$$srv" ]; then \
+		echo "Makefile: the client and the wire contract disagree about the chunk size."; \
+		echo "  $(CHUNK_H): CHUNK_DIM    = $$cli"; \
+		echo "  $(PROTO_H): BS_CHUNK_DIM = $$srv"; \
+		echo ""; \
+		echo "  These are one number written twice. BS_CHUNK_DIM is what bs_col_of()"; \
+		echo "  shifts by, so with them apart every CHUNK_SUB/CHUNK_UNSUB/CHUNK_DIFFS"; \
+		echo "  column coordinate on the wire names a different column at each end:"; \
+		echo "  edits are filed under a column nobody subscribed to and simply never"; \
+		echo "  arrive. Nothing else in either build reports this - both sides compile"; \
+		echo "  clean, and the symptom is a silent desync at runtime."; \
+		echo ""; \
+		echo "  Decide which value the game should have, then set BOTH. Note that"; \
+		echo "  CHUNK_DIM is not free to move on the client side either: chunk.h's own"; \
+		echo "  header comment records that the cave-culling flood fill is defined on"; \
+		echo "  cubic chunks, and BS_CHUNK_DIM_SHIFT in $(PROTO_H) is log2 of this"; \
+		echo "  value and must move with it (game/validate.c asserts that pair)."; \
+		echo "  Changing bs_proto.h also means bumping PROTO_COMMIT above to a pushed"; \
+		echo "  server commit, or check-proto-drift stops the next build instead."; \
+		exit 1; \
+	fi; \
+	echo "chunk dim: client CHUNK_DIM = $$cli, server BS_CHUNK_DIM = $$srv (equal, as the wire requires)"
+
 $(HYDRO)/hydrogen.h:
 	@mkdir -p deps
 	git clone -q $(HYDRO_REPO) $(HYDRO)
@@ -639,7 +742,7 @@ endif
 # hang it off as well (the host suites run from tools/run_host_tests.sh, not
 # from make), which is the one asymmetry with check-world-drift's `all: test:`
 # pair on the server side.
-all: check-proto-drift check-world-drift check-diffcap-drift $(BUILD) $(GFXBUILD) $(DEPSDIR) $(ROMFS_T3XFILES) $(T3XHFILES)
+all: check-proto-drift check-world-drift check-diffcap-drift check-chunkdim-drift $(BUILD) $(GFXBUILD) $(DEPSDIR) $(ROMFS_T3XFILES) $(T3XHFILES)
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
 
 #---------------------------------------------------------------------------------
