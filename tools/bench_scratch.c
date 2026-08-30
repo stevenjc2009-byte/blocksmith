@@ -30,10 +30,13 @@ static World       s_world;
 static WorldGen    s_gen;
 static MeshScratch s_scratch;
 
-// The widest ring the game ever meshes: render_dist.h caps RENDER_DIST_MAX at 2, a 5x5
-// column area. Benching the shipped worst case rather than one chunk keeps the form mix
-// (UNIFORM deep rock, PALETTE4 surface, RAW where cave noise perforates) representative
-// instead of whatever a hand-built chunk happens to be.
+// render_dist.h caps RENDER_DIST_MAX at 3, a 7x7 = 49 column area — that is the widest
+// ring the game ever meshes today. RADIUS below is still 2 (a 5x5 = 25 column area, the
+// cap before v1.6.0 task 12 raised it), so this bench no longer covers the shipped worst
+// case; whether to raise it to 3 to match is a scope decision for whoever owns this file,
+// not taken here. Benching a wide ring rather than one chunk keeps the form mix (UNIFORM
+// deep rock, PALETTE4 surface, RAW where cave noise perforates) representative instead of
+// whatever a hand-built chunk happens to be.
 #define RADIUS 2
 
 static double nowSeconds(void)
