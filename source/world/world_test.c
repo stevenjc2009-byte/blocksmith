@@ -9480,9 +9480,32 @@ static void genverTestDir(char* out, size_t cap, const char* leaf)
 	testMkdir(out);
 }
 
-static void genverStampPath(char* out, size_t cap, const char* dir)
+// Answers false, and leaves `out` empty, when the path does not fit. gcc 16 rejects the bare
+// snprintf this used to be — "'%s' directive output may be truncated writing 10 bytes into a
+// region of size between 0 and 255", an error under -Werror — and it is right to: `dir` is
+// unbounded going into a 256-byte `out`, so "genver.bin" has between 0 and 255 bytes to land in.
+// gcc 15 says nothing, which is why it sat here; the hazard was identical on both.
+//
+// Truncation is refused rather than performed, because a truncated path is not a broken path.
+// It is a perfectly openable name for a DIFFERENT file, so every caller below would go on to
+// poke, size or read that file and report its answer as the stamp's — a suite going green on
+// the wrong file, which is the one failure mode a test helper must not have. Widening `out`
+// only moves that hazard further out; there is no width at which "it fits" is a property of
+// this code rather than of today's callers.
+//
+// An empty `out` is the refusal because it is the one name no fopen can mistake for a
+// neighbour: all four call sites already CHECK the open or the size that follows, so a refusal
+// lands as a red check instead of a wrong answer. Same discipline as 1a806b3's saturating
+// builders — count what actually fits, never what snprintf wished for — applied to the one
+// case where the right amount to saturate at is none.
+static bool genverStampPath(char* out, size_t cap, const char* dir)
 {
-	snprintf(out, cap, "%s/%s", dir, GEN_VERSION_FILE);
+	const int n = snprintf(out, cap, "%s/%s", dir, GEN_VERSION_FILE);
+	if (n < 0 || (size_t)n >= cap) {
+		if (cap) out[0] = '\0';   // cap 0 has nowhere to put even the NUL: touch nothing.
+		return false;
+	}
+	return true;
 }
 
 // Writes `n` bytes over the start of the stamp file, leaving its length alone.
@@ -9529,6 +9552,87 @@ static char* genverReadWholeFile(const char* path)
 	fclose(f);
 	buf[got] = '\0';
 	return buf;
+}
+
+// ── genverStampPath's refusal ─────────────────────────────────────────────────────────────
+//
+// The helper builds "<dir>/genver.bin" into a fixed 256-byte buffer out of a `dir` it does not
+// bound, and until this existed nothing asserted what happens when that does not fit — nor
+// could it: every `dir` the sidecar test passes is a short build-host path, so the truncating
+// branch was UNEXECUTED by the suite rather than merely unchecked. That is the same gap
+// 1a806b3 found in loadprofFormat, and it is why gcc 16 was the first thing to notice.
+//
+// `out` is a window inside a larger '#'-filled array so a write past `cap` is caught as data
+// rather than as a crash that may or may not happen, and so the cap-0 case can be shown to
+// write nothing at all rather than merely to return false.
+static void testGenverStampPath(void)
+{
+	// "<dir>/genver.bin" needs dirlen + 11 characters plus a NUL, so at cap 256 the longest
+	// dir that fits is 244. The pairs straddle that boundary and two smaller ones, because an
+	// off-by-one here reads as a working path right up until it silently addresses a
+	// neighbouring file.
+	static const struct { size_t cap; size_t dirlen; } kCases[] = {
+		{ 256,    1 }, { 256,   10 }, { 256,  100 }, { 256,  243 },
+		{ 256,  244 },   // exactly fits: 244 + 11 = 255, + NUL = 256
+		{ 256,  245 },   // one byte over
+		{ 256,  246 }, { 256,  300 }, { 256, 1000 },
+		{  16,    4 },   // exactly fits: "dddd/genver.bin" is 15, + NUL = 16
+		{  16,   10 },
+		{  13,    1 },   // exactly fits: "d/genver.bin" is 12, + NUL = 13
+		{  12,    1 },   // one byte short of that
+		{   1,    1 },   // room for the NUL and nothing else
+		{   0,    1 },   // no room even for the NUL
+	};
+
+	static const size_t kPad = 64;
+	for (size_t k = 0; k < sizeof kCases / sizeof kCases[0]; k++) {
+		const size_t cap    = kCases[k].cap;
+		const size_t dirlen = kCases[k].dirlen;
+
+		char dir[1024];
+		memset(dir, 'd', dirlen);
+		dir[dirlen] = '\0';
+
+		// Deliberately large enough that even the longest dir here would fit, so the content
+		// checks below can never themselves read out of bounds whatever the function does.
+		// The last byte is a NUL rather than padding for the same reason: with the fix
+		// sabotaged the success branch runs on a buffer the helper truncated, and an
+		// unterminated array would send strlen off the end — turning the red arm into a crash
+		// instead of into the FAIL line that is the whole point of running it.
+		char raw[2048];
+		memset(raw, '#', sizeof raw);
+		raw[sizeof raw - 1] = '\0';
+		char* out = raw + kPad;
+
+		const bool ok = genverStampPath(out, cap, dir);
+
+		const size_t want = dirlen + 1 + (sizeof GEN_VERSION_FILE - 1);
+		CHECK(ok == (want + 1 <= cap));
+
+		// On success the path is the whole path, not a prefix of it that happens to open. On
+		// refusal `out` is empty — except at cap 0, where there is nowhere to put even the NUL
+		// and the padding check below is the thing that proves nothing was written.
+		//
+		// Folded into a named bool rather than written inline, because CHECK stringifies its
+		// condition into a 96-byte s_first and gcc 16 rejects the file outright when that
+		// overflows: measured at "163 bytes into a region of size 90" for the inline form.
+		const bool path_as_documented =
+		    ok ? (strlen(out) == want && out[dirlen] == '/' &&
+		          memcmp(out, dir, dirlen) == 0 &&
+		          strcmp(out + dirlen + 1, GEN_VERSION_FILE) == 0)
+		       : (cap == 0 || out[0] == '\0');
+		CHECK(path_as_documented);
+
+		bool pad_before_intact = true;
+		for (size_t i = 0; i < kPad; i++)
+			if (raw[i] != '#') pad_before_intact = false;
+		CHECK(pad_before_intact);
+
+		bool pad_after_intact = true;
+		for (size_t i = kPad + cap; i + 1 < sizeof raw; i++)   // last byte is the NUL above
+			if (raw[i] != '#') pad_after_intact = false;
+		CHECK(pad_after_intact);
+	}
 }
 
 static void testGenVersionSidecar(void)
@@ -10099,6 +10203,7 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testChunkCodecPaletteUnify();
 	testChunkPlanAllMatchesLoadAll();
 #ifndef __3DS__
+	testGenverStampPath();
 	testRegionRoundTrip();
 	testRegionPowerCut();
 	testRegionTornDirectory();
@@ -10139,6 +10244,10 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	// testWorldgenLegacySandyWideSweep costs seven, not sixty-four thousand. 5184 + 78 =
 	// 5262, and 5262 is what the run printed.
 	//
+	// v1.8.3, genverStampPath truncation fix: testGenverStampPath drives that helper over
+	// 15 cap/dir-length pairs with 4 CHECKs each, so 5262 + 60 = 5322. Recomputed from the
+	// table's length, then confirmed against the run -- that order, not the other one.
+	//
 	// **Host only, and this is a real gap.** Nine tests above are inside `#ifndef __3DS__`
 	// and the console total is a different number, which cannot be measured right now: the
 	// devkitPro build is red tree-wide for an unrelated reason (source/world/block.h has
@@ -10147,18 +10256,18 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 #ifndef __3DS__
 	{
 		const int ran = s_checks;
-		if (ran != 5262)
+		if (ran != 5322)
 			printf("\nCHECK-COUNT GUARD: %d checks ran, %d expected.\n"
 			       "  %s\n"
 			       "  This is NOT an ordinary assertion failure.\n"
 			       "  Read the comment above this guard in world/world_test.c before"
 			       " touching the pinned number.\n",
-			       ran, 5262,
-			       ran < 5262
+			       ran, 5322,
+			       ran < 5322
 			           ? "Checks went MISSING: checks that should have run never ran at all."
 			           : "Extra checks appeared: either you added checks and did not update"
 			             " the pin, or something is emitting checks it should not.");
-		CHECK(ran == 5262);
+		CHECK(ran == 5322);
 	}
 #endif
 
