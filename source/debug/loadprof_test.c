@@ -582,8 +582,42 @@ int main(void)
 	// is not evidence on its own. The probe reproduced both values on two consecutive runs,
 	// and moved to a completely different pair when fed seed 1338 or GEN_VERSION_LEGACY, so
 	// it is sensitive to the thing it claims to measure rather than printing a constant.
-	CHECK(hash_fresh  == 0xee631edfa54555fdULL);
-	CHECK(hash_reload == 0x90f77b85b6bd007cULL);
+	//
+	// ── WHY THEY MOVED AGAIN (2026-08-30) ────────────────────────────────────────────
+	//
+	// They were 0xee631edfa54555fd / 0x90f77b85b6bd007c. Commit 6d4847e, "add snow, ice,
+	// cactus, dead bush and fern core block ids (v1.8.3 Phase 3)", deliberately changed
+	// world generation again — a snow cap on tundra ground, ice on the top cell of a cold
+	// sea, and a flora pass on its own salt — so this check went red exactly as the
+	// paragraph above says it is supposed to.
+	//
+	// Re-derived the same way as last time and for the same reason: a standalone probe that
+	// links the real world modules but NOT loadprof.c, re-implementing the ring walk and the
+	// FNV-1a mix from this file. Its validity is not asserted, it is demonstrated — built
+	// against the PARENT commit 263e887 that probe printed 0xee631edfa54555fd /
+	// 0x90f77b85b6bd007c, i.e. it reproduces the literals it is replacing. Built against
+	// 6d4847e it printed the two below, twice, and a different pair for seed 1338.
+	//
+	// Measured over the same 81-column ring of seed 1337, 2,654,208 cells:
+	//
+	//   * 4,316 cells differ, 0.1626% of the ring.
+	//   * DIRT -> SNOW    2,498 — the tundra cap. The same 2,498 cells the biome classifier
+	//                     turned GRASS -> DIRT in Phase 2, now wearing the block that
+	//                     placeholder was standing in for. One for one.
+	//   * AIR  -> FERN    1,060, y 67..98, on taiga and jungle grass.
+	//   * WATER -> ICE      758, EVERY ONE of them at y=63, which is GEN_SEA_LEVEL - 1.
+	//   * Nothing else moved at all. The only ids appearing on the new side are 10 SNOW,
+	//     11 ICE and 14 FERN; the only ids leaving are AIR, DIRT and WATER. No height, no
+	//     density, no cave and no tree moved.
+	//   * First differing byte is 17422 = column (-4,-4), local (14, y 68, 0), AIR -> FERN.
+	//   * NOT exercised by this ring: cactus (12) and dead bush (13) never appear, because
+	//     seed 1337's 81 columns contain no desert. They are covered by world_test.c's flora
+	//     census on seed 90210, not here, and this pin would not catch a regression in them.
+	//   * GEN_VERSION_LEGACY did not move: the same probe run with genv 1 printed
+	//     0x5261168a27a7fa18 / 0xb5dca6b8b125ef35 against BOTH commits, so no existing
+	//     pre-v1.7.0 save re-generates.
+	CHECK(hash_fresh  == 0xb51487523ffaaf9bULL);
+	CHECK(hash_reload == 0x4a9b3a1d2fffd77aULL);
 
 	regionCacheClose();
 	testRmTree(testDir());
