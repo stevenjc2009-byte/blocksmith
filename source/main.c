@@ -1645,7 +1645,17 @@ static void bootEnd(const char* what)
 	if (s_boot_len + 1 >= sizeof(s_boot_log)) return;
 	const int n = snprintf(s_boot_log + s_boot_len, sizeof(s_boot_log) - s_boot_len,
 	                       "%-22s %9.1f ms\n", what, ms);
-	if (n > 0) s_boot_len += (size_t)n;
+	// n < 0 is an encoding error and adds nothing. Otherwise snprintf reports how many
+	// characters it *would* have written, which can exceed the space it actually had — clamp
+	// to what it really placed before the NUL it always terminates with, or bootTimingWrite's
+	// fwrite(s_boot_log, 1, s_boot_len, f) reads past the end of the array and puts whatever
+	// follows it in .bss into boot_timing.txt. Measured at 5 BOOT_END call sites this cannot
+	// fire; measured at 22 it does, at 792 against a 768-byte buffer. Adding boot stages is an
+	// ordinary thing to do and nothing would have warned. Same shape as app/crash.c's
+	// dumpAppend, which is the other saturating string builder in this program.
+	if (n <= 0) return;
+	const size_t room = sizeof(s_boot_log) - s_boot_len - 1;
+	s_boot_len += ((size_t)n < room) ? (size_t)n : room;
 }
 
 static void bootTimingWrite(void)

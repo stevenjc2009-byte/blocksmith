@@ -151,30 +151,47 @@ int loadprofFormat(char* buf, size_t cap)
 	uint64_t sum = 0;
 	for (int i = 0; i < LOAD_STAGE_COUNT; i++) sum += s_p.ticks[i];
 
+	// `len` is bytes actually placed, never snprintf's return. snprintf reports the length it
+	// WOULD have written, so accumulating it directly overshoots the moment anything truncates
+	// — measured at 683 against a 640-byte buffer — and this function's return value is
+	// documented in loadprof.h as "the length written", which is exactly the number a caller
+	// would hand to fwrite. A negative return is worse still: `buf + n` would index backwards.
+	// Same saturating shape as app/crash.c's dumpAppend and app/watchdog.c's gxAppend.
+	size_t len = 0;
+
 	int n = snprintf(buf, cap, "load %s (%s) %.1f ms over %lu frames\n",
 	                 s_p.world[0] ? s_p.world : "?",
 	                 s_p.reloaded ? "reloaded" : "fresh",
 	                 wall_ms, (unsigned long)s_p.frames);
+	if (n > 0) len = ((size_t)n < cap) ? (size_t)n : cap - 1;
 
-	for (int i = 0; i < LOAD_STAGE_COUNT && n < (int)cap; i++) {
+	for (int i = 0; i < LOAD_STAGE_COUNT && len + 400 < cap; i++) {
 		const double ms  = ticksToMs(s_p.ticks[i]);
 		const double pct = wall_ms > 0.0 ? ms * 100.0 / wall_ms : 0.0;
 		const double per = s_p.calls[i] ? ms * 1000.0 / (double)s_p.calls[i] : 0.0;
-		n += snprintf(buf + n, cap - (size_t)n, "  %-9s %9.3f ms %5.1f%% n=%-6lu %8.1f us/call\n",
-		              kStageName[i], ms, pct, (unsigned long)s_p.calls[i], per);
+		const int m = snprintf(buf + len, cap - len,
+		                       "  %-9s %9.3f ms %5.1f%% n=%-6lu %8.1f us/call\n",
+		                       kStageName[i], ms, pct, (unsigned long)s_p.calls[i], per);
+		if (m <= 0) break;
+		const size_t room = cap - len - 1;
+		len += ((size_t)m < room) ? (size_t)m : room;
 	}
 
-	if (n < (int)cap) {
+	if (len + 1 < cap) {
 		// Wall minus the stages. On a vsynced loading screen this is the VBlank wait the
 		// present stage's own C3D_FrameBegin is blocked in, plus whatever the frame loop does
 		// outside every bracket; it is printed rather than hidden because a load that is
 		// frame-bound rather than work-bound is exactly the answer it gives.
 		const double other = wall_ms - ticksToMs(sum);
-		n += snprintf(buf + n, cap - (size_t)n, "  %-9s %9.3f ms %5.1f%%\n", "other", other,
-		              wall_ms > 0.0 ? other * 100.0 / wall_ms : 0.0);
+		const int m = snprintf(buf + len, cap - len, "  %-9s %9.3f ms %5.1f%%\n", "other", other,
+		                       wall_ms > 0.0 ? other * 100.0 / wall_ms : 0.0);
+		if (m > 0) {
+			const size_t room = cap - len - 1;
+			len += ((size_t)m < room) ? (size_t)m : room;
+		}
 	}
 
-	return n;
+	return (int)len;
 }
 
 void loadprofWrite(const char* path)

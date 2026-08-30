@@ -393,6 +393,62 @@ static void testProfilerContract(void)
 	CHECK(loadprofGet()->calls[LOAD_STAGE_DECODE] == 0);
 }
 
+// ── loadprofFormat's return value, and the buffer it was handed ────────────────────────
+//
+// loadprof.h documents the return as "the length written", which is the number a caller hands
+// to fwrite. snprintf does not return that: it returns the length it WOULD have written, and
+// accumulating that directly walks the write cursor past the end of the buffer the moment
+// anything truncates — after which `cap - len` underflows a size_t into a huge value and the
+// next snprintf is told it has essentially unlimited room.
+//
+// Nothing asserted any of this before. loadprofFormat was called once in this file, inside
+// report(), into a char[1024] generous enough never to truncate, with its return discarded —
+// so the whole truncation path was unexecuted by the suite rather than merely unchecked.
+//
+// The buffer is a window inside a larger '#'-filled array so an overrun is caught as data, not
+// as a crash that may or may not happen: writing one byte past `cap` is silent on this host and
+// would otherwise show up only as a corrupted neighbour much later.
+static void testFormatTruncation(void)
+{
+	loadprofReset();
+	loadprofBegin("truncation", 1);
+	for (int i = 0; i < LOAD_STAGE_COUNT; i++) loadprofSince((LoadStage)i, 0);
+
+	// Caps straddling the three points the old accumulation could run away: too small for even
+	// the header line, big enough for the header but not a stage line, and big enough that the
+	// stage loop runs and the "other" tail then has to fit in what is left.
+	static const size_t kCaps[] = { 4, 8, 16, 32, 64, 96, 128, 200, 320, 512, 640, 800, 1024 };
+
+	static const size_t kPad = 64;
+	for (size_t k = 0; k < sizeof kCaps / sizeof kCaps[0]; k++) {
+		const size_t cap = kCaps[k];
+		char raw[1200];
+		memset(raw, '#', sizeof raw);
+		char* buf = raw + kPad;
+
+		const int n = loadprofFormat(buf, cap);
+
+		// The contract, stated three ways because each one fails differently: a negative
+		// return would index backwards, a return at or past cap would overrun an fwrite, and
+		// a return that disagrees with strlen is the "would have written" number leaking out.
+		CHECK(n >= 0);
+		CHECK((size_t)n < cap);
+		CHECK((size_t)n == strlen(buf));
+
+		bool pad_before_intact = true;
+		for (size_t i = 0; i < kPad; i++)
+			if (raw[i] != '#') pad_before_intact = false;
+		CHECK(pad_before_intact);
+
+		bool pad_after_intact = true;
+		for (size_t i = kPad + cap; i < sizeof raw; i++)
+			if (raw[i] != '#') pad_after_intact = false;
+		CHECK(pad_after_intact);
+	}
+
+	loadprofReset();
+}
+
 int main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
@@ -408,6 +464,7 @@ int main(void)
 	if (!s_verts || !s_idx) return 1;
 
 	testProfilerContract();
+	testFormatTruncation();
 
 	testMkdir("build-host");
 	testMkdir(testDir());
