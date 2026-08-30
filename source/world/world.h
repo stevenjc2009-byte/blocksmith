@@ -107,7 +107,24 @@ bool worldSet(World* w, int x, int y, int z, BlockId id);
 // arriving over the wire and the BS_EDIT_STRESS harness all reach the water simulation without
 // four call sites having to remember to. scene/interact.c is deliberately not touched: it
 // already calls worldSet, which is the single funnel every one of those paths goes through.
-typedef void (*WorldEditFn)(void* ud, int x, int y, int z, BlockId prev, BlockId now);
+//
+// v1.8.3. `w` is the world the write went to, and it is not decoration — READ IT.
+//
+// s_edit_fn is one file static (world.c:217) and worldSet fires it for ANY World*, from
+// WHATEVER THREAD called worldSet. There is more than one World in this program: main.c owns
+// the live s_world, and app/worker.c owns a second one, s_staging (worker.c:52), which it
+// generates into on the WORKER THREAD (worker.c:266) and whose decoration pass writes single
+// blocks through worldSet (worldgen.c:339 treePut, worldgen.c:458 tall grass). Both arrive
+// here, at the same one hook, and before this parameter existed the callback had no way to
+// tell them apart.
+//
+// So a consumer that keeps mutable state for ONE world must compare `w` against that world
+// and return on any other — see main.c's onWorldEdit, which is the only consumer in the tree
+// and does exactly that. A consumer that does not compare is not merely doing extra work: it
+// is being mutated from the worker thread with no synchronisation against the main thread.
+// const, because identity is the only legitimate use of this pointer; a consumer that wants
+// to write through it is writing to a world it does not own, from a thread it did not choose.
+typedef void (*WorldEditFn)(void* ud, const World* w, int x, int y, int z, BlockId prev, BlockId now);
 
 // NULL to remove. There is exactly one slot: a second subscriber would need a list, and the
 // only caller is main.c.

@@ -28,6 +28,11 @@
 //                         change inside water that was already there.
 //   testEditHook        - world.c's worldSetEditHook fires on a real change, not on a no-op
 //                         write, and not from worldSetChunkAll.
+//   testEditHookReportsWorld
+//                       - v1.8.3. WHICH world it fired for. One hook, two Worlds, and the
+//                         callback must name the right one so a consumer can drop the other.
+//                         Nothing checked this before, which is how app/worker.c's staging
+//                         world spent a release feeding the live water simulation.
 //   testDropColumn      - unloading a column takes its flow water and leaves its sources.
 //   testSaveCompat      - a v1.7.1-shaped ocean column encodes to the same bytes before and
 //                         after the simulation has run, and a flooded column encodes back to
@@ -87,7 +92,7 @@ static void resetWorld(void)
 }
 
 // v1.8.3. The GAME's wiring, in one function, and it is a copy of source/main.c's onWorldEdit
-// (main.c:2827, installed once at main.c:3149) down to the discarded arguments: every
+// (main.c:2837, installed once at main.c:3199) down to the discarded arguments: every
 // single-block change on the console reaches the water simulation through world.h's edit hook —
 // world.c:278, `if (s_edit_fn && prev != id)` — and no edit path anywhere in the game calls
 // waterNotify by hand.
@@ -101,9 +106,14 @@ static void resetWorld(void)
 // pours. So halving the ring to 512 inside qPush — a real overrun, and that same build's own
 // testQueueOverflow reported 1595 candidates genuinely refused — still left this whole file at
 // "PASS 149 checks, 0 failed", pad arm included. That is the defect this hook fixes.
-static void wiredEditHook(void* ud, int x, int y, int z, BlockId prev, BlockId now)
+//
+// v1.8.3. `w` is discarded HERE and only here, and that is not a copy of main.c: main.c compares
+// it against s_world because a second World exists there (app/worker.c's staging world). This
+// fixture drives exactly one world, g_world, so there is nothing to filter out and a filter would
+// be dead code. testEditHookReportsWorld() below is where the parameter is actually exercised.
+static void wiredEditHook(void* ud, const World* w, int x, int y, int z, BlockId prev, BlockId now)
 {
-	(void)ud; (void)prev; (void)now;
+	(void)ud; (void)w; (void)prev; (void)now;
 	waterNotify(&g_sim, x, y, z);
 }
 
@@ -731,9 +741,9 @@ static void testStaleEntry(void)
 
 static int g_edits;
 
-static void countingEditHook(void* ud, int x, int y, int z, BlockId prev, BlockId now)
+static void countingEditHook(void* ud, const World* w, int x, int y, int z, BlockId prev, BlockId now)
 {
-	(void)ud; (void)x; (void)y; (void)z; (void)prev; (void)now;
+	(void)ud; (void)w; (void)x; (void)y; (void)z; (void)prev; (void)now;
 	g_edits++;
 }
 
@@ -780,6 +790,84 @@ static void testEditHook(void)
 	g_edits = 0;
 	(void)worldSet(&g_world, 1, 64, 1, BLOCK_STONE);
 	CHECK(g_edits == 0, "a NULL hook is genuinely uninstalled");
+}
+
+// ── v1.8.3. WHICH world the hook reports ─────────────────────────────────────────────
+//
+// testEditHook above checks WHETHER the hook fires. Nothing in this project checked WHICH world
+// it fired for, and that gap is the whole reason the defect below survived a release:
+//
+//   world.c's s_edit_fn is one file static and worldSet fires it for any World* at all. main.c
+//   installs onWorldEdit against s_world (main.c:3199), but app/worker.c generates into a SECOND
+//   world, s_staging (worker.c:52, worker.c:266), and worldgen's decoration pass writes single
+//   blocks into it through worldSet (worldgen.c:339, worldgen.c:458) ON THE WORKER THREAD.
+//   Before WorldEditFn carried a World*, every one of those edits reached waterNotify: candidates
+//   naming cells in a world the simulation does not simulate, pushed from a thread holding no
+//   lock over the ring.
+//
+// So this probe drives TWO worlds through one hook and asserts the callback can tell them apart,
+// with a hook that is a faithful copy of main.c's onWorldEdit filter. It goes red the moment
+// world.c stops passing the world through — which is exactly the sabotage it was built against.
+static World        g_staging;         // the second world, standing in for app/worker.c's
+static const World* g_hook_world;      // the world the last firing named
+static int          g_hook_fires;      // firings seen, whatever world
+static int          g_hook_admitted;   // firings that passed the &g_world filter
+
+static void filteringEditHook(void* ud, const World* w, int x, int y, int z, BlockId prev, BlockId now)
+{
+	(void)ud; (void)prev; (void)now;
+
+	g_hook_fires++;
+	g_hook_world = w;
+
+	// The line under test. main.c:2837 has this exact compare against &s_world.
+	if (w != &g_world) return;
+
+	g_hook_admitted++;
+	waterNotify(&g_sim, x, y, z);
+}
+
+static void testEditHookReportsWorld(void)
+{
+	puts("world: the edit hook reports WHICH world the edit went to");
+
+	resetWorld();
+	buildFloor();
+	worldInit(&g_staging);
+	worldSetEditHook(filteringEditHook, NULL);
+
+	// Arm 1 — an edit to the world this simulation owns. It must be admitted.
+	g_hook_fires = 0; g_hook_admitted = 0; g_hook_world = NULL;
+	const bool live_ok = worldSet(&g_world, 0, 64, 0, BLOCK_WATER);
+	CHECK(live_ok && g_hook_fires == 1, "an edit to the live world fires the hook once");
+	CHECK(g_hook_world == &g_world, "and the callback is told it was the live world");
+	CHECK(g_hook_admitted == 1 && waterPending(&g_sim) == 7,
+	      "so the filter admits it: the cell and its six neighbours are queued");
+
+	// Arm 2 — the identical edit, into the OTHER world. It must be dropped.
+	//
+	// y is 64 because it has to be the SAME cell arm 1 wrote and the same cell the control
+	// below reads back. worldSet's first line is `if (y < 0 || y >= WORLD_HEIGHT) return false`
+	// (world.c:257), so an out-of-range y here returns before the hook can fire — and then
+	// "so the filter drops it" passes because nothing was queued by a write that never
+	// happened, which is the exact wrong reason the control was written to catch.
+	const int pending_before = waterPending(&g_sim);
+	g_hook_fires = 0; g_hook_admitted = 0; g_hook_world = NULL;
+	const bool staging_ok = worldSet(&g_staging, 0, 64, 0, BLOCK_WATER);
+	CHECK(staging_ok && g_hook_fires == 1, "an edit to a second world fires the same hook once");
+	CHECK(g_hook_world == &g_staging && g_hook_world != &g_world,
+	      "and the callback is told THAT world, not the live one");
+	CHECK(g_hook_admitted == 0 && waterPending(&g_sim) == pending_before,
+	      "so the filter drops it: nothing is queued for a world this sim does not simulate");
+
+	// Control, and it is the one that keeps arm 2 from passing for the wrong reason. "Nothing was
+	// queued" is also what a write that never happened produces, so the write is read back.
+	CHECK(worldGet(&g_staging, 0, 64, 0) == BLOCK_WATER &&
+	      worldGet(&g_world,   0, 64, 0) == BLOCK_WATER,
+	      "control: both writes really landed, so arm 2 is a filter result and not a dead write");
+
+	worldSetEditHook(NULL, NULL);
+	worldExit(&g_staging);
 }
 
 static void testDropColumn(void)
@@ -1613,6 +1701,7 @@ int main(void)
 	testChangeHook();
 	testStaleEntry();
 	testEditHook();
+	testEditHookReportsWorld();
 	testDropColumn();
 	testSaveCompat();
 	testQueueOverflow();
@@ -1626,7 +1715,13 @@ int main(void)
 	// v1.8.3. The suite counts itself, and no other suite in this project does — which is exactly
 	// how a 326 -> 318 deletion once passed as "0 failed" here. A red arm whose TOTAL dropped is
 	// deleting checks, not failing them, and nothing in the PASS line below can tell the two
-	// apart on its own. 196 is every check above this one; this check is the 197th.
+	// apart on its own. 203 is every check above this one; this check is the 204th.
+	//
+	// v1.8.3: 196 -> 203. All seven are testEditHookReportsWorld, new below testEditHook: three
+	// arm-1 checks that an edit to the live world is reported as the live world and admitted,
+	// three arm-2 checks that an edit to a second world is reported as that world and dropped,
+	// and one control that reads both writes back so arm 2 cannot pass on a write that never
+	// landed. That probe is the one that goes red if world.c stops passing the World* through.
 	//
 	// v1.8.3: 161 -> 196. Twenty-one of the thirty-five are wiredBuildDone's three-check burst pin
 	// firing at each of its seven call sites; ten are testOverflowKeepsTheNewest, new below
@@ -1639,7 +1734,7 @@ int main(void)
 	// catch. When a check is legitimately added or removed, this number is edited by hand, on
 	// purpose, in the same commit — that edit IS the review.
 	const int counted = g_checks;
-	CHECK(counted == 196, "the suite ran all 196 of its checks: none was deleted or skipped");
+	CHECK(counted == 203, "the suite ran all 203 of its checks: none was deleted or skipped");
 
 	printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);
 	if (g_fails) printf("FAILED - %d of %d checks\n", g_fails, g_checks);

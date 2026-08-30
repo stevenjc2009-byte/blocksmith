@@ -2834,11 +2834,51 @@ static void onWaterLevel(void* ud, int x, int y, int z, BlockId id)
 //
 // Cheap on purpose: it only queues candidates. The recompute happens on the tick, under the
 // budget below, so no edit path can be made to do simulation work inline.
-static void onWorldEdit(void* ud, int x, int y, int z, BlockId prev, BlockId now)
+static void onWorldEdit(void* ud, const World* w, int x, int y, int z, BlockId prev, BlockId now)
 {
 	(void)ud;
 	(void)prev;
 	(void)now;
+
+	// v1.8.3, and the whole reason world.h's hook now carries a World*.
+	//
+	// world.c's s_edit_fn is ONE file static (world.c:217) and worldSet fires it for any World*
+	// at all (world.c:278). This program has two: s_world, which the line below simulates, and
+	// app/worker.c's s_staging (worker.c:52), which worldgenColumn generates into on the WORKER
+	// THREAD (worker.c:266) and whose decoration pass writes single blocks through worldSet
+	// (worldgen.c:339 treePut, worldgen.c:458 tall grass). Until this compare existed, every
+	// decorated cell of every streamed column arrived here and was pushed into s_water.
+	//
+	// Two separate faults, both closed by this one line:
+	//
+	//   * Every one of those candidates was WRONG. The cell it named did not change in the
+	//     player's world, so the recompute it asked for was a guaranteed no-op that displaced
+	//     real work — measured at 8590 firings across 144 streamed columns, worst single column
+	//     221, offering up to 1547 candidates against a ring of 1024, so the ring sat pinned at
+	//     its cap for as long as terrain was streaming.
+	//
+	//   * They arrived on the WORKER THREAD with no synchronisation against this thread's
+	//     waterTick. app/worker.c runs on core 0 by default (BS_WORKER_CORE, worker.c:22), so
+	//     the two never execute at the same instant — but the scheduler is priority-preemptive,
+	//     so the main thread interrupts the worker part-way through qPush and runs a whole tick
+	//     before it resumes. Measured on the host against the real water.c with a single
+	//     preemption point injected into qPush: 64 preemptions left 12 keys in the dedup set
+	//     with no ring entry behind them, 512 left 177, and the count only ever rises — nothing
+	//     in water.c can remove a qset entry except a qPop that finds it in the ring. Each one
+	//     is a coordinate qPush then refuses for ever (water.c:192 short-circuits on qsetFind)
+	//     with nothing queued to examine it: a cell of the player's world permanently outside
+	//     the simulation, while waterPending(), waterFlowCells() and waterQueueFull() all report
+	//     a simulation in perfect health.
+	//
+	// Comparing the POINTER, not the contents: s_water is keyed by world block coordinate and
+	// s_world is a file static that never moves, so identity is exactly the question being asked.
+	//
+	// Safe to evaluate on the worker thread: it reads s_edit_fn, s_edit_ud and &s_world, and
+	// &s_world is a link-time constant. worldSetEditHook is called only at session_start, and
+	// workerStop() joins the worker before either goto back to that label — so there is never a
+	// live worker thread while world.c's statics are being written.
+	if (w != &s_world) return;
+
 	waterNotify(&s_water, x, y, z);
 }
 

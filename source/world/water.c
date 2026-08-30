@@ -179,7 +179,17 @@ static void qsetEraseAt(WaterSim* s, uint32_t i)
 // number in world/water_test.c — the four order-independence hashes included — is unmoved by this
 // change except the one that counts refusals during a fixture build.
 //
-// Why the ring gets full at all is NOT fixed here and is not water.c's to fix; see waterNotify().
+// v1.8.3, later the same day: the flood that produced that 8.0% HAS since been fixed, outside this
+// file — world.h's edit hook now carries the World* and main.c's onWorldEdit drops any world that
+// is not s_world, so app/worker.c's staging generation no longer feeds this ring. See the block
+// above waterNotify() for what that was and what it cost. This eviction is therefore no longer the
+// everyday load-bearing fix; it is the safety net for overflows that arise on their own merits, and
+// those still exist — handbuiltFill() alone is 51364 firings on the MAIN thread, a large diff drain
+// on rejoin is another, a big player-built basin is a third. The ARGUMENT above is untouched by the
+// flood going away: it is a structural asymmetry in this file (a source has no map entry, so a
+// dropped notify for one is unrecoverable), so refusing-the-newest is the wrong loss to take for
+// ANY overflow whatever caused it. And it costs nothing — the byte-identical-final-world result
+// above is what says so. Kept deliberately, demoted deliberately, not left behind as a workaround.
 //
 // gen_remaining is decremented with the eviction because the head of the ring belongs to the
 // generation that is currently open (water.h's WATER_SPREAD_TICKS barrier). Leaving it alone would
@@ -420,36 +430,47 @@ void waterFillScratch(const WaterSim* s, MeshScratch* ms, int cx, int cy, int cz
 	ms->water_any = written > 0;
 }
 
-// ── Why the ring fills up, which is NOT a water.c problem ────────────────────────────
+// ── Why the ring USED to fill up, and where that was closed ──────────────────────────
 //
-// v1.8.3, and recorded here rather than fixed here because the fix is in three files this task
-// does not own. world.c's edit hook is a FILE STATIC (world.c:217) and worldSet fires it for ANY
-// World* with no check of which world the write went to (world.c:278). main.c's onWorldEdit
-// (main.c:2827) calls straight through to waterNotify without a world argument, because the hook's
-// signature does not carry one.
+// v1.8.3. FIXED, outside this file. Kept as the historical record of what the leak cost, because
+// the measurements are the reason the eviction policy above exists and are not reproducible now
+// that the cause is gone.
 //
-// The consequence is that app/worker.c's generation thread feeds this queue. worker.c:266 runs
-// worldgenColumn against its own STAGING world, and worldgen's decoration pass places trees and
-// tall grass one block at a time through worldSet (worldgen.c:339 treePut, worldgen.c:458), so
-// every decorated cell of every streamed column arrives here — naming a coordinate in a world this
-// simulation does not simulate, from a thread that does not hold any lock over it.
+// What it was: world.c's edit hook is a FILE STATIC (world.c:217) and worldSet fires it for ANY
+// World* (world.c:278). main.c's onWorldEdit called straight through to waterNotify, because the
+// hook's signature carried no world argument for it to check. So app/worker.c's generation thread
+// fed this queue: worker.c:266 runs worldgenColumn against its own STAGING world (worker.c:52) and
+// worldgen's decoration pass places trees and tall grass one block at a time through worldSet
+// (worldgen.c:339 treePut, worldgen.c:458 tall grass), so every decorated cell of every streamed
+// column arrived here — naming a coordinate in a world this simulation does not simulate, from a
+// thread that does not hold any lock over it.
 //
 // MEASURED on 2026-08-25, density generator, seed 12345, 144 columns: 8590 firings, worst single
-// column 221, and that one column alone offers up to 1547 candidates against a ring of 1024. The
-// ring is pinned at its cap for as long as terrain is streaming; the drain is 64 cells every
-// WATER_SPREAD_TICKS ticks and cannot begin to keep up. The legacy generator is the same shape
-// (8287 firings, worst column 193), and a BS_WORLD_GEN=0 build is far worse: handbuiltFill()
-// (main.c:3369, hook already live since main.c:3149) is 51364 firings in a single call.
+// column 221, and that one column alone offered up to 1547 candidates against a ring of 1024. The
+// ring was pinned at its cap for as long as terrain was streaming; the drain is 64 cells every
+// WATER_SPREAD_TICKS ticks and could not begin to keep up. The legacy generator is the same shape
+// (8287 firings, worst column 193).
 //
-// Two separate faults, both outside this file:
-//   * every one of those candidates is WRONG — the cell named did not change in the player's
-//     world, so the recompute it asks for is a guaranteed no-op that displaces real work; and
-//   * they arrive on the worker thread with no synchronisation against the main thread's
-//     waterTick, which is a data race on the ring, the dedup set and the counters.
+// Two separate faults, both outside this file, both now closed:
+//   * every one of those candidates was WRONG — the cell named did not change in the player's
+//     world, so the recompute it asked for was a guaranteed no-op that displaced real work; and
+//   * they arrived on the worker thread with no synchronisation against the main thread's
+//     waterTick, which is a data race on the ring, the dedup set and the counters. Not an SMP
+//     race — worker.c:22's BS_WORKER_CORE is 0, so both threads are on core 0 and never run at
+//     the same instant — but a priority-preemption race, which is enough: the main thread
+//     interrupts the worker part-way through qPush and runs a whole tick before it resumes.
+//     Measured on the host against this exact file with one preemption point injected into
+//     qPush: 64 preemptions left 12 keys in the dedup set with no ring entry, 512 left 177, and
+//     the count only ever rises. Each orphan is a coordinate qPush refuses for ever (the
+//     qsetFind short-circuit at the top of qPush) with nothing queued to examine it.
 //
-// The fix belongs in world.h's hook signature (carry the World*) and in main.c's onWorldEdit
-// (ignore any world that is not s_world). Until that lands, qPush's eviction above is what keeps
-// a player's own edit from being the thing that gets thrown away.
+// Where the fix landed: world.h's WorldEditFn now carries a `const World*`, world.c:278 passes the
+// world through, and main.c's onWorldEdit returns immediately for any world that is not s_world.
+// world/water_test.c's testEditHookReportsWorld is the arm that goes red if that stops being true.
+//
+// NOT closed by that fix, and the reason the eviction above stays: handbuiltFill() (main.c:3419,
+// hook live since main.c:3199) is 51364 firings in a single call on the MAIN thread, so a
+// BS_WORLD_GEN=0 build still overflows this ring on its own merits.
 void waterNotify(WaterSim* s, int x, int y, int z)
 {
 	if (s->dropping) return;   // see WaterSim.dropping in water.h

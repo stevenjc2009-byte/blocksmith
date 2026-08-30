@@ -275,7 +275,10 @@ bool worldSet(World* w, int x, int y, int z, BlockId id)
 		return false;
 	}
 
-	if (s_edit_fn && prev != id) s_edit_fn(s_edit_ud, x, y, z, prev, id);
+	// `w` is passed through, not dropped: this one static slot fires for every World* in the
+	// program, and the consumer is the only thing that knows which of them it simulates.
+	// See world.h's WorldEditFn comment for what happens to a consumer that ignores it.
+	if (s_edit_fn && prev != id) s_edit_fn(s_edit_ud, w, x, y, z, prev, id);
 	return true;
 }
 
