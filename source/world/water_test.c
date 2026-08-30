@@ -39,6 +39,13 @@
 //                         its original bytes once waterDropColumn has had it.
 //   testQueueOverflow   - a refused candidate is COUNTED, not silent, and the world converges
 //                         to the reference once the cells are offered again.
+//   testNoOrphanedDedupKeys
+//                       - v1.8.3. The ring and the dedup set still agree. The only probe here
+//                         that reads the two tables against each other rather than asking what
+//                         the water did, because a key left in the set with no ring entry makes
+//                         qPush refuse that cell FOR EVER while every accessor and every world
+//                         hash still reads healthy. Its header carries the sabotage that proves
+//                         no other check in this file can see it.
 //   testTickCost        - real microseconds per tick, settled and active arms interleaved.
 //   testSunkenBasin,
 //   testPadAndShaft     - the two fixture experiments. v1.8.3: both build their terrain and
@@ -1170,6 +1177,124 @@ static void testOverflowKeepsTheNewest(void)
 	      "control: the same source into an empty ring reaches the same 112 flow cells");
 }
 
+// ── The ring and the dedup set, checked against each other ────────────────────────────
+//
+// v1.8.3. Every other probe in this file asks what the water DID. This one asks whether the two
+// tables that decide what gets examined still agree, and it is the only check here that no
+// outcome can stand in for.
+//
+// water.c:202 short-circuits qPush on qsetFind. So a qset entry with no ring entry behind it is a
+// coordinate this simulation refuses to examine FOR EVER, with nothing queued to examine it — and
+// nothing about that is visible from outside. Every index is masked, so there is no crash and no
+// out-of-bounds read; waterPending(), waterFlowCells() and waterQueueFull() all go on reporting a
+// simulation in perfect health while a cell of the player's world sits permanently outside it.
+// Silent, permanent and unrecoverable is a worse outcome here than a crash, because a crash gets
+// reported.
+//
+// MEASURED on 2026-08-30, by sabotaging the real water.c: qPop made to skip its qsetEraseAt for
+// one pop in 64 — the shape of the preemption race main.c's onWorldEdit describes, where the main
+// thread interrupts the worker part-way through qPush — left the 200-arm streaming sweep in
+// scratchpad/ws_sweep.c with an orphaned key in 200 of 200 arms (median 9, max 9), while every one
+// of those same arms still reported 113 wet cells, 0 candidates lost and a ring depth of 0. A
+// 25-source basin pour under that sabotage settled to hash ec667e6cbf27762b, which is byte for
+// byte the hash the healthy build produces, with 43 orphans sitting behind it. So neither an
+// outcome check nor a world hash nor any accessor in this file could have caught it. This probe
+// reads the two tables directly, which is the only thing that can.
+//
+// The primary claim is the tighter of the two available: qPush refuses any key already in the set,
+// so the ring can hold no duplicates, so the number of occupied qset slots must equal
+// waterPending() EXACTLY. That single equality rules out an orphaned key and a lost dedup key at
+// once. The orphan count is checked as well rather than instead, because it is the half that is
+// dangerous and it names the failure in the output when it goes red.
+static int qsetLive(const WaterSim* s)
+{
+	int n = 0;
+	for (uint32_t i = 0; i < WATERQ_SET_SLOTS; i++)
+		if (s->qset[i] != 0) n++;
+	return n;
+}
+
+static int qsetOrphans(const WaterSim* s)
+{
+	int n = 0;
+	for (uint32_t i = 0; i < WATERQ_SET_SLOTS; i++) {
+		if (s->qset[i] == 0) continue;
+		bool in_ring = false;
+		for (int k = 0; k < s->qcount && !in_ring; k++)
+			if (s->ring[(s->qhead + k) & (WATERQ_CAP - 1)] == s->qset[i]) in_ring = true;
+		if (!in_ring) n++;
+	}
+	return n;
+}
+
+static void testNoOrphanedDedupKeys(void)
+{
+	puts("water: the dedup set never holds a key the ring has stopped holding");
+
+	// Arm 1: an ordinary pour, stopped PART WAY so the ring is genuinely occupied. A probe that
+	// only ever looked at a drained simulation would pass on an empty set and prove nothing.
+	resetWorldWired();
+	buildFloor();
+	wiredBuildDone("floor", 8156, 1024);
+	(void)worldSet(&g_world, 0, 64, 0, BLOCK_WATER);
+	for (int t = 0; t < 12; t++) (void)waterTick(&g_sim, &g_world, WATER_TICK_BUDGET, NULL, NULL);
+
+	printf("         mid-pour: %d pending, %d keys in the set, %d orphaned\n",
+	       waterPending(&g_sim), qsetLive(&g_sim), qsetOrphans(&g_sim));
+	CHECK(waterPending(&g_sim) > 0,
+	      "control: the pour was stopped with the ring still occupied, so the set is not empty");
+	CHECK(qsetLive(&g_sim) == waterPending(&g_sim),
+	      "mid-pour, the set holds exactly one key per queued cell");
+	CHECK(qsetOrphans(&g_sim) == 0, "mid-pour, no key in the set has lost its ring entry");
+
+	// Arm 2: the overflow path, which is the one that calls qPop from INSIDE qPush. That is the
+	// only place in this file where an entry leaves the ring anywhere but the top of waterTick,
+	// so it is where a desynchronisation would be introduced.
+	const uint32_t lost_before = waterQueueFull(&g_sim);
+	for (int i = 0; i < 300; i++) waterNotify(&g_sim, 1000 + i * 3, 64, 0);
+	const uint32_t lost = waterQueueFull(&g_sim) - lost_before;
+	printf("         after overflow: %d pending, %d keys in the set, %d orphaned, %u lost\n",
+	       waterPending(&g_sim), qsetLive(&g_sim), qsetOrphans(&g_sim), lost);
+	CHECK(waterPending(&g_sim) == (int)WATERQ_CAP,
+	      "control: the ring really is full, so the eviction path really did run");
+	CHECK(lost > 0, "control: and candidates really were lost, so this is not an empty arm");
+	CHECK(qsetLive(&g_sim) == waterPending(&g_sim),
+	      "after an eviction, the set still holds exactly one key per queued cell");
+	CHECK(qsetOrphans(&g_sim) == 0, "an evicted candidate takes its dedup key with it");
+
+	// Arm 3: drained. With nothing queued, nothing may remain in the set — a key left here is the
+	// permanent refusal in its purest form, because there is no longer anything to pop that could
+	// ever clear it.
+	(void)waterSettle(&g_sim, &g_world, 20000, NULL, NULL);
+	printf("         drained: %d pending, %d keys in the set\n",
+	       waterPending(&g_sim), qsetLive(&g_sim));
+	CHECK(waterPending(&g_sim) == 0, "control: the simulation really did drain");
+	CHECK(qsetLive(&g_sim) == 0, "an empty ring leaves an empty set: nothing is refused for ever");
+
+	// Arm 4: waterDropColumn, which erases map entries and writes blocks with the edit hook live
+	// and `dropping` set. It is the one path that changes the world while deliberately queueing
+	// nothing, so it is the one most able to leave the two tables disagreeing.
+	(void)worldSet(&g_world, 0, 64, 0, BLOCK_WATER);
+	(void)waterSettle(&g_sim, &g_world, 20000, NULL, NULL);
+
+	// Disturbed again and stopped mid-flight, so the drop below runs against an OCCUPIED ring.
+	// Dropping into an empty one would satisfy both checks with a pair of zeroes and could not
+	// have gone red.
+	(void)worldSet(&g_world, 0, 65, 0, BLOCK_WATER);
+	for (int t = 0; t < 3; t++) (void)waterTick(&g_sim, &g_world, WATER_TICK_BUDGET, NULL, NULL);
+	const int before_drop = waterPending(&g_sim);
+	const int cleared     = waterDropColumn(&g_sim, &g_world, 0, 0);
+	printf("         after dropping column (0,0): %d cells cleared, %d pending (was %d), %d keys"
+	       " in the set, %d orphaned\n",
+	       cleared, waterPending(&g_sim), before_drop, qsetLive(&g_sim), qsetOrphans(&g_sim));
+	CHECK(cleared > 0, "control: the drop really did clear flow cells, so this arm is not a no-op");
+	CHECK(before_drop > 0,
+	      "control: and it ran against an occupied ring, so the two checks below are not two zeroes");
+	CHECK(qsetLive(&g_sim) == waterPending(&g_sim),
+	      "after a column drop, the set still holds exactly one key per queued cell");
+	CHECK(qsetOrphans(&g_sim) == 0, "and the drop leaves no key behind with nothing queued for it");
+}
+
 static void testTickCost(void)
 {
 	puts("water: measured cost per tick, settled and active arms interleaved");
@@ -1706,6 +1831,7 @@ int main(void)
 	testSaveCompat();
 	testQueueOverflow();
 	testOverflowKeepsTheNewest();
+	testNoOrphanedDedupKeys();
 	testSunkenBasin();
 	testPadAndShaft();
 	testTickCost();
@@ -1715,7 +1841,16 @@ int main(void)
 	// v1.8.3. The suite counts itself, and no other suite in this project does — which is exactly
 	// how a 326 -> 318 deletion once passed as "0 failed" here. A red arm whose TOTAL dropped is
 	// deleting checks, not failing them, and nothing in the PASS line below can tell the two
-	// apart on its own. 203 is every check above this one; this check is the 204th.
+	// apart on its own. 219 is every check above this one; this check is the 220th.
+	//
+	// v1.8.3: 203 -> 219. All sixteen are testNoOrphanedDedupKeys, new below
+	// testOverflowKeepsTheNewest: four arms — a pour stopped mid-flight, the eviction path, a
+	// fully drained simulation and a column drop — each pinning that the dedup set holds exactly
+	// one key per queued cell and that no key has lost its ring entry, plus the four controls that
+	// stop each arm passing on an empty ring, and wiredBuildDone's own three-check burst pin. It is the only probe in this file that reads the two
+	// tables against each other instead of asking what the water did, and it is there because a
+	// desynchronisation between them is invisible to every accessor and to every world hash: see
+	// the sabotage measurement in its header.
 	//
 	// v1.8.3: 196 -> 203. All seven are testEditHookReportsWorld, new below testEditHook: three
 	// arm-1 checks that an edit to the live world is reported as the live world and admitted,
@@ -1734,7 +1869,7 @@ int main(void)
 	// catch. When a check is legitimately added or removed, this number is edited by hand, on
 	// purpose, in the same commit — that edit IS the review.
 	const int counted = g_checks;
-	CHECK(counted == 203, "the suite ran all 203 of its checks: none was deleted or skipped");
+	CHECK(counted == 219, "the suite ran all 219 of its checks: none was deleted or skipped");
 
 	printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);
 	if (g_fails) printf("FAILED - %d of %d checks\n", g_fails, g_checks);
