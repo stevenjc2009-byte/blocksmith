@@ -49,7 +49,13 @@ ARCH	:=	-march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
 # -O3 gave 5175 ms, an 8% win, for 4,576 more bytes of .3dsx (210,852 -> 215,428). Code
 # size is a real constraint on an Old 3DS, so revisit this if the executable ever gets
 # close to the budget — but 2% of 210 KB is not that day.
-CFLAGS	:=	-g -Wall -Wextra -O3 -mword-relocations \
+# -Werror, same as the host build (tools/run_host_tests.sh) and the server build already
+# carry. Without it the console build has shipped a .3dsx from a compile that emitted two
+# -Wformat= diagnostics and still exited 0, because make only fails on a non-zero compiler
+# exit and a warning is exit 0. A warning here is a defect that reached a release; make it
+# stop the build instead. If a warning ever cannot be fixed, fix the code — do not add
+# -Wno-* and do not exclude the file.
+CFLAGS	:=	-g -Wall -Wextra -Werror -O3 -mword-relocations \
 			-ffunction-sections \
 			$(ARCH)
 
