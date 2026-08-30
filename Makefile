@@ -186,11 +186,33 @@ PROTO_REPO	:=	https://github.com/stevenjc2009-byte/blocksmith-server.git
 # REGISTRY_WIRE_RECORD_BYTES in the server's game/validate.c, the one translation
 # unit that sees both headers.
 #
-# Caveat worth stating: this pin now names a working BRANCH head rather than a
-# released server, which is the opposite of what the 05c14fd6 bump above was for.
-# The fix is server-side-only and no released server carries it yet. This should move
-# again to whichever release absorbs docs/registry-crc-correction.
-PROTO_COMMIT	:=	632d19989b49ac1d38f2a466a7a0c91551d0881c
+# Caveat worth stating: this pin names a working BRANCH head rather than a released
+# server, which is the opposite of what the 05c14fd6 bump above was for. It should
+# move again to whichever release absorbs docs/registry-crc-correction.
+#
+# It moves to 533aee1 for v1.8.3 Phase 4, and this bump is NOT the server-side-only
+# kind the paragraph above describes. 533aee1 adds two app ids -- BS_APP_REGISTRY_DEFS
+# 0x0E and BS_APP_WORLD_GEN 0x0F, the latter S->C only, carrying {gen_version u16 LE}
+# -- so the header genuinely changed shape, and the server's VERSION went 1.8.1 ->
+# 1.9.0 rather than to a patch. A minor bump is this repo's precedent for a wire
+# change (v1.6.0, v1.8.0); v1.5.1 is the fix-only precedent.
+#
+# Release ORDER does not matter here, and that was measured rather than assumed. A
+# probe built against a pristine v1.8.2 client -- whose pinned bs_proto.h, 05c14fd6,
+# contains zero mentions of WORLD_GEN -- was driven through its real networldUpdate()
+# drain with 0x0F wedged between WORLD_INFO and WORLD_SYNC: seed unchanged, the packet
+# BEHIND the unknown id still parsed, nothing sent back. That holds because the S->C
+# dispatch ends in `default: break;` and the framing is message-oriented, not a byte
+# stream -- bsnet_transport.c hands networldApplyPayload() a length taken from the
+# queue slot, never from parsing the type byte, so an unknown id cannot advance a
+# cursor wrongly because there is no cursor. So the server may ship first.
+#
+# The asymmetry is real and one-directional: a new C->S id would meet
+# handle_app_payload()'s `default: send_kick()`, so that direction is server-first
+# ONLY. And none of this licenses WIDENING an existing message -- networld.c's
+# `if (len != BS_WORLD_INFO_BYTES) return;` is strict equality, so BS_APP_WORLD_INFO
+# still cannot grow.
+PROTO_COMMIT	:=	533aee1424b5e6cada86112bd40b8808d00f7601
 PROTO		:=	deps/blocksmith-server
 
 .PHONY: deps
