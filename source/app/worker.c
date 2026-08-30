@@ -89,7 +89,10 @@ static u64      s_save_wait_max_ticks;  // worst single wait
 static char s_world_dir[128];
 
 // Read buffer for the load-before-generate path. Worker-owned, never touched by the main
-// thread, and static rather than on the worker's 32 KB stack — which it would exactly fill.
+// thread, and static rather than on the worker's 32 KB stack — which it would not merely
+// fill but overflow by itself: REGION_COL_MAX is 32,816 bytes (region.h: COLUMN_CHUNKS(8) *
+// (CHUNK_CODEC_MAX(4098) + 2) + 16) against WORKER_STACK_BYTES's 32,768 above — 48 bytes over
+// before any call frame, return address, or other local is counted.
 static uint8_t s_load_buf[REGION_COL_MAX];
 
 // Unpack buffer for workerInstall's staging → world copy. Since step 9.2a a Chunk is opaque
@@ -102,10 +105,13 @@ static uint8_t s_load_buf[REGION_COL_MAX];
 static BlockId s_install_blocks[CHUNK_BLOCKS];
 
 // v1.5.0 adaptive lighting: the BFS worklist lightPropagateColumn fills, allocated only
-// when the engine is enabled (New 3DS) so an Old 3DS never pays for it, and owned by this
-// thread for its whole life — the main thread's edit path uses the queue-free sweep engine
-// precisely so the two never share one. ~64 KB of heap against the worker's measured ~94%
-// idle capacity; propagation is what that headroom is for.
+// when the engine is enabled — which, since v1.8.0 task 24, is BOTH console models: this
+// stopped being New-3DS-only when chunk_render.c's chunkRenderInit started calling
+// lightEngineInit(true) unconditionally (source/scene/chunk_render.c:844), so an Old 3DS
+// pays for this too now. Owned by this thread for its whole life — the main thread's edit
+// path uses the queue-free sweep engine precisely so the two never share one. ~64 KB of
+// heap against the worker's measured ~94% idle capacity; propagation is what that headroom
+// is for.
 static LightQueue* s_lightq;
 
 static bool workerLightQueue(void)
