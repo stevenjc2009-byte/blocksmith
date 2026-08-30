@@ -1134,8 +1134,12 @@ static bool genStart(int32_t cx, int32_t cz)
 	// seed and sends it as BS_APP_WORLD_INFO right after JOIN (net/networld.h): the terrain is
 	// never transmitted, so generating from anything other than the server's seed would put
 	// this player in their own private landscape and make every other player's block edit land
-	// in the wrong hillside. Single player, or a server too old to send one, keeps the client's
-	// own fixed seed — networldWorldSeed() leaves `seed` untouched when it has nothing to say.
+	// in the wrong hillside. networldWorldSeed() leaves `seed` untouched when it has nothing to
+	// say, so a session against a server too old to send one keeps the value below.
+	//
+	// v1.8.3 Phase 1: BS_WORLD_SEED is no longer the answer for single player, only the starting
+	// point. The per-world seed is resolved off the card further down, after the world directory
+	// exists — see the worldSeedResolve block below world/genversion's refusal.
 	uint32_t seed = BS_WORLD_SEED;
 	(void)networldWorldSeed(&seed);
 	s_seed_used = seed;
@@ -1189,6 +1193,54 @@ static bool genStart(int32_t cx, int32_t cz)
 		s_world_refused_why = refusal;
 		loadprofSince(LOAD_STAGE_SETUP, t_setup);
 		return false;
+	}
+
+	// v1.8.3 Phase 1. WHICH world this is, as opposed to which generator shapes it. The whole
+	// rule is in world/worldseed.h; the two lines that matter here are that a single-player
+	// world's seed now comes off the card instead of out of BS_WORLD_SEED, and that a joined
+	// session's seed still comes off the wire and is not touched.
+	//
+	// Deliberately AFTER genVersionResolve and its refusal rather than merged into it. Both are
+	// questions about the same directory and either can refuse, but the generator is the one
+	// that decides whether this build can open the world at all — a world stamped by a newer
+	// build must say so, not report a seed problem it also happens to have. Two resolves in a
+	// row, each with its own refusal, keeps the answers in the order the player needs them.
+	//
+	// The mint is done here rather than inside worldSeedResolve() so that the resolve stays a
+	// pure decision over the filesystem with no clock in it — that is what lets the host suite
+	// drive every branch of it, refusals included (world/worldseed.h, worldSeedMintFrom).
+	// worldSeedMint() answering false is a console with no usable clock at all, and it is passed
+	// through as a fact rather than papered over: only a brand-new world needs it, so an old
+	// world on a console with a dead RTC still opens.
+	uint32_t mint = 0u;
+	const bool mint_ok = worldSeedMint(&mint);
+
+	// NOT `&seed`. worldSeedResolve() always writes through this pointer, including
+	// WORLD_SEED_LEGACY on the WSEED_NO_WORLD_DIR return, and that return is exactly the joined
+	// session — whose seed is already in `seed`, came from the server, and is the one thing in
+	// this function that must not be overwritten with 1337.
+	uint32_t world_seed = WORLD_SEED_LEGACY;
+	const WorldSeedStatus ws = worldSeedResolve(world_dir, mint_ok, mint, &world_seed);
+
+	// Same shape as the generator refusal above and for the same reason — world/genrefuse.h
+	// answers this over the whole enum so a status added later cannot fall through unrouted.
+	// A refusal here is a world that must not be entered: generating from a seed that is not
+	// the one that shaped this world rewrites the landscape under the player's buildings, which
+	// is the identical harm the version stamp refuses for.
+	const char* const seed_refusal = worldSeedRefusalText(ws);
+	if (seed_refusal) {
+		printf("world refused: seed (%s)\n", seed_refusal);
+		s_world_refused_why = seed_refusal;
+		loadprofSince(LOAD_STAGE_SETUP, t_setup);
+		return false;
+	}
+
+	// Adopted only on WSEED_OK, which worldSeedResolve only ever returns when there was a world
+	// directory to resolve against. WSEED_NO_WORLD_DIR is the session, and falls through here
+	// leaving the server's seed exactly as networldWorldSeed() left it.
+	if (ws == WSEED_OK) {
+		seed = world_seed;
+		s_seed_used = seed;   // the gen overlay's readout, kept honest — see s_seed_used above
 	}
 
 	if (!worldgenInit(&s_gen, seed, gen_version)) {

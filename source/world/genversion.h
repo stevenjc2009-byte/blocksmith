@@ -142,6 +142,17 @@ GenVersionStatus genVersionRead(const char* world_dir, uint32_t* out);
 // Writes `version` into `world_dir`, overwriting any existing stamp. False on any IO failure.
 bool genVersionWrite(const char* world_dir, uint32_t version);
 
+// Whether `world_dir` holds a saved region file — i.e. whether this world has ever been
+// played. False for a directory that cannot be listed at all, which is the same answer an
+// empty one gives and is deliberate: both mean "no evidence of a previous save here".
+//
+// v1.8.3 Phase 1. Exposed for world/worldseed.c, which has to make the identical
+// absent-sidecar decision about the identical directory — see genVersionResolve's comment on
+// the derivation, and worldseed.h's file comment for the mirrored rule. Two copies of this
+// scan that were free to drift would let the generator stamp and the seed sidecar disagree
+// about whether a world is old, which rewrites terrain under a world that has buildings in it.
+bool genVersionWorldHasRegionFile(const char* world_dir);
+
 // True if this build can generate `version` at all.
 static inline bool genVersionKnown(uint32_t version)
 {

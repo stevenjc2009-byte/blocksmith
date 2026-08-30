@@ -100,7 +100,14 @@ GenVersionStatus genVersionRead(const char* world_dir, uint32_t* out)
 //
 // region.c names its files r.<rx>.<rz>.bsr and nothing else in a world directory carries that
 // extension, so the extension alone is the whole test.
-static bool hasRegionFile(const char* world_dir)
+//
+// v1.8.3 Phase 1: no longer static. world/worldseed.c has to ask the identical question about
+// the identical directory — is this world old enough that its seed must stay 1337 — and it is
+// asked two lines apart from this one inside main.c's genStart(). A second copy of the scan
+// would be free to drift, and the two disagreeing is precisely how a world gets stamped LEGACY
+// by one and given a freshly minted seed by the other: terrain rewritten under a base the
+// player has already built. Declared in genversion.h; there is no behaviour change here.
+bool genVersionWorldHasRegionFile(const char* world_dir)
 {
 	DIR* d = opendir(world_dir);
 	if (!d) return false;
@@ -141,7 +148,7 @@ GenVersionStatus genVersionResolve(const char* world_dir, uint32_t* out)
 
 	// No stamp. Which generator this world *already* has is a question about its history, and
 	// the only evidence on the card is whether anything was ever saved for it.
-	const bool played = hasRegionFile(world_dir);
+	const bool played = genVersionWorldHasRegionFile(world_dir);
 	const uint32_t chosen = played ? GEN_VERSION_LEGACY : GEN_VERSION_FOR_NEW_WORLDS;
 	*out = chosen;
 

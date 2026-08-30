@@ -988,7 +988,27 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 case "$(uname -s)" in
 MINGW*|MSYS*|CYGWIN*) echo "skipping interop_test on Windows (Unix sockets unavailable)" ;;
 *)
-make -C deps/blocksmith-server/game bsgame
+# v1.8.3: `all`, not `bsgame`. deps/blocksmith-server/game/Makefile:118 is
+# `all: check-world-drift bsgame`, so `all` adds exactly ONE target over `bsgame` — the phony
+# check-world-drift — and nothing else; a diff of `make -n bsgame` against `make -n all` shows
+# only that guard's shell loop appearing. The guard is 11 `cmp -s` calls over the world sources
+# vendored into the server (block.h inventory.h inventory.c crafting.h crafting.c crc32.h crc32.c
+# registry.h registry.c tick.h tick.c) against ../../../source/world/. No network, no devkitPro,
+# no extra compilation, no extra binary, and it self-disables to `@:` when
+# BS_HAVE_CLIENT_WORLD_HEADERS=0 so a standalone server checkout is unaffected.
+#
+# It is not cosmetic, and that was proved by sabotage rather than argued. With one comment line
+# appended to game/world/tick.h:
+#
+#     make bsgame  ->  "make: 'bsgame' is up to date."  rc=0     (completely blind)
+#     make all     ->  "game/Makefile: game/world/tick.h has drifted from
+#                       ../../../source/world/tick.h"           rc=2
+#
+# That holds independently of make's staleness logic, because check-world-drift is not a
+# prerequisite of bsgame at all — `make bsgame` can never run it no matter what got rebuilt. And
+# a drift here does not produce a visible bug, it desyncs players: the eleven files are compiled
+# byte-identically into the client and the dedicated server.
+make -C deps/blocksmith-server/game all
 
 gcc -std=c11 -Wall -Wextra -Werror -O1 -g 	-I source -I deps/blocksmith-server 	source/world/world.c 	source/world/block.c 	source/world/registry.c 	source/world/chunk.c 	source/world/budget.c 	source/net/blockdiff.c 	source/net/networld.c 	source/world/mesher.c 	source/world/visgraph.c 	source/world/scratch.c 	source/net/interop_test.c 	-o "$BH/interop_test"
 
@@ -2677,3 +2697,108 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 "./$BHTK/tick_test"
 
 rm -rf "$BHTK"
+
+# world/worldseed_test.c -- the per-world seed sidecar (v1.8.3 Phase 1). Own binary, own main(),
+# APPENDED rather than folded into the world stanza at the top, for the reason every stanza in
+# this file is appended: an append is the one edit shape that cannot drop another session's work,
+# and this file is shared by live sessions.
+#
+# WHAT IS UNDER TEST AND WHY IT IS WORTH ITS OWN BINARY. Terrain is not stored -- it is generated
+# from a seed and only edits are saved (world/region.h) -- so world/worldseed.c does not return a
+# preference, it returns the landscape the player's base is standing on. Before v1.8.3 that value
+# was one compiled-in constant, BS_WORLD_SEED 1337, for every single-player world on every
+# console. worldseed.c makes it per-world, which means it now has to decide, from a directory
+# alone, whether a world predates the change. Getting that backwards rewrites the terrain under
+# every base every player has ever built, silently, on an update nobody opted into.
+#
+# The link is crc32.c, genversion.c, worldseed.c and the suite. genversion.c is in there because
+# worldseed.c CALLS it: genVersionWorldHasRegionFile() was made non-static in this same commit so
+# the two modules share one has-this-world-been-played scan instead of keeping two copies free to
+# drift. testSeedAndVersionAgreeOnHistory is the check that goes red if a private copy comes back.
+#
+# GREEN, measured on this tree: "PASS 186 checks, 0 failed", RUN_RC=0.
+#
+# ARMS. Every one against the REAL production source, restored immediately afterwards from a
+# byte-for-byte backup, with md5 back to baseline (worldseed.c 98373a4522fd31e372cac3187b65388d,
+# genrefuse.h 63ce13745fd838a7fef8cce90660d6e9, worldseed_test.c
+# 597e1b7ad4fa436578588205ae584718) and `cmp` SILENT for all three after every arm. WHICH checks
+# went red was read, not just how many, and THE TOTAL STAYED 186 IN ALL SIX -- a red arm whose
+# total dropped is deleting checks, not failing them, and nothing in the PASS line can tell those
+# apart on its own.
+#
+#   A  worldSeedResolve's history branch inverted:                     FAIL 186 checks, 18 failed
+#      `if (genVersionWorldHasRegionFile(...))` -> `if (!...)`. The catastrophic one: every
+#      pre-v1.8.3 world gets a freshly minted seed and every new world gets 1337. Red across all
+#      four resolve probes, both refusals and both halves of the agreement test, including
+#      "boot 2: WITH THE SAME SEED - the sidecar outranks the region file" and "with the legacy
+#      seed - the offered mint is NOT used, which is what keeps every existing save
+#      byte-identical". Everything about the mint, the CRC and the sidecar FORMAT stayed green,
+#      which is what says the arm localised to the branch rather than breaking the module.
+#   B  the brand-new sidecar write dropped:                             FAIL 186 checks, 6 failed
+#      `if (!worldSeedWrite(world_dir, mint)) return WSEED_STAMP_FAILED;` -> `(void)mint;`. This
+#      is the defect the file exists to prevent, and it is invisible on the boot that causes it:
+#      the world generates from the right seed, saves a region file, and comes back 1337 on the
+#      NEXT boot. Red at "and the sidecar is written before anything else can happen", both
+#      boot-2 checks, and "a brand-new world whose sidecar the card refuses is REFUSED".
+#   C  the per-process mint counter frozen (`s_nth++;` commented out):   FAIL 186 checks, 3 failed
+#      "two mints from byte-identical readings return DIFFERENT seeds", the 256-mint distinctness
+#      sweep, and the sweep's own falsifiability counter. Nothing else moved -- the wall clock and
+#      tick readings still vary in production, so this is the arm that proves the counter is
+#      load-bearing rather than decorative. It is why the suite freezes the readings.
+#   D  WSEED_MINT_FAILED left unrouted in world/genrefuse.h (-> NULL):   FAIL 186 checks, 5 failed
+#      The exact shape of the bug that file was written to stop: a status that is returned,
+#      tested, and acted on by nobody. Red at "WSEED_MINT_FAILED is a refusal", its predicate, its
+#      length budget and both of its distinctness pairs.
+#   E  the trailing-byte guard neutralised (`fgetc(f) != EOF` -> false): FAIL 186 checks, 2 failed
+#      Exactly two: "a file longer than the record is as wrong as a short one" and "and reports no
+#      seed". A narrow mutation with a narrow red is what says the corruption arms are separable
+#      rather than one check wearing five hats.
+#
+# CONTROL, green in arms A through E: testControlNoWorldDir's eight checks, which touch only the
+# no-world-directory guard at the top of worldSeedRead and worldSeedResolve -- the earliest line
+# in either function. A break in the mint, the CRC, the sidecar format or the two history branches
+# must leave it standing, and in all five it did (8 of 8 `ok control:` lines every time).
+#
+# It is NOT vacuous, and that was measured rather than argued:
+#   F  the control itself pointed at WSEED_OK instead of WSEED_NO_WORLD_DIR on an otherwise
+#      healthy tree                                                     FAIL 186 checks, 1 failed
+#      "FAIL line 245: control: resolving a NULL world directory is WSEED_NO_WORLD_DIR", and the
+#      green control count dropped from 8 to 7. Reverted.
+#
+# THE STANZA IS ALSO THE ENFORCEMENT POINT FOR world/genrefuse.h's -Wswitch CLAIM, which is worth
+# saying out loud because that file's own comment asserts "the host suite and the console build
+# both run -Werror" and the console half of that is NOT true — the client Makefile carries -Wall
+# only. So this gcc line is the only place in the tree where a WorldSeedStatus added without a
+# decision actually stops anything. Measured, arm G, by appending WSEED_SOMETHING_NEW to
+# world/worldseed.h's enum:
+#
+#     source/world/genrefuse.h:106:9: error: enumeration value 'WSEED_SOMETHING_NEW' not handled
+#     in switch [-Werror=switch]
+#     cc1: all warnings being treated as errors            GCC_RC=1
+#
+# Restored, cmp SILENT, md5 back to eb8aba521320cbee18f71376fe39dfac.
+#
+# THE CHECK-COUNT PIN was also made to fire before it was trusted, and not on purpose: the first
+# run of the finished suite carried a placeholder pin and printed
+# "FAIL CHECK COUNT: 45 check(s) were ADDED - expected 141, ran 186." A checker that has never
+# been red is an untested function that runs at the worst possible moment.
+#
+# NOT VERIFIED BY THIS STANZA, stated rather than left implied: main.c's genStart() wiring. main.c
+# cannot be linked into a host binary (see app/session_test.c's header for that problem one module
+# over), so nothing here proves the refusal reaches scene/title.c's status line or that the
+# resolved seed reaches worldgenInit(). The console build compiling and the switch in
+# world/genrefuse.h being total are what stand behind that half; the rest is a playtest.
+BHWS="build-host/run-$$-worldseed"
+mkdir -p "$BHWS"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/crc32.c \
+	source/world/genversion.c \
+	source/world/worldseed.c \
+	source/world/worldseed_test.c \
+	-o "$BHWS/worldseed_test"
+
+"./$BHWS/worldseed_test"
+
+rm -rf "$BHWS"

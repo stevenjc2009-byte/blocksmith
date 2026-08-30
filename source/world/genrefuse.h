@@ -25,12 +25,22 @@
 // only a total function over five enumerators; and because a .c would have to be added to every
 // link line that already compiles genversion.c, which is a build-script change for a function
 // the compiler will inline anyway. world/world_test.c includes it and tests it directly.
+//
+// ── v1.8.3 Phase 1: a second status enum, same two questions ──────────────────────────
+//
+// world/worldseed.h added WorldSeedStatus, which asks main.c's world-entry path exactly the
+// questions above about exactly the same world directory, and it is routed here rather than in
+// a file of its own for one reason: the failure this file was written to stop is a status that
+// nobody decided about. Two refusal files means two places to forget, and the second one would
+// be forgotten in the same way — an author adding an enumerator has to already know the other
+// file exists. One file, one -Wswitch, one thing to open.
 #pragma once
 
 #include <stdbool.h>
 #include <stddef.h>
 
 #include "world/genversion.h"
+#include "world/worldseed.h"
 
 // What the player is told when a world will not open, or NULL when the status is not a refusal
 // at all. NULL is the "carry on" answer for both non-refusals, and they are spelled out as
@@ -74,4 +84,44 @@ static inline const char* genVersionRefusalText(GenVersionStatus st)
 static inline bool genVersionRefuses(GenVersionStatus st)
 {
 	return genVersionRefusalText(st) != NULL;
+}
+
+// v1.8.3 Phase 1. The same pair for world/worldseed.h's WorldSeedStatus, written in the same
+// shape and for the same reasons — switch over the whole enum, no `default:`, non-refusals
+// spelled out one at a time so that adding a status without deciding about it is a build error
+// rather than a world that opens with the wrong landscape in it.
+//
+// Every message below is inside the 47-character budget TitleState.status imposes (scene/title.h
+// is a char[48]) and no two are the same sentence, for the reason above: the three faults ask
+// the player for three different things. A damaged sidecar is something they can only lose. A
+// mint that found no clock is a console whose date is unset, which they can set. A card that
+// would not take the write is free space, a write-lock, or a reseat.
+//
+// These are also distinct from the three GenVersion sentences above, which matters more than it
+// looks: both files write to the same status line, and "world version file is damaged" versus
+// "world seed file is damaged" is the difference between the player deleting the right file and
+// the wrong one.
+static inline const char* worldSeedRefusalText(WorldSeedStatus st)
+{
+	switch (st) {
+	// A usable seed. Nothing to say and nothing to stop.
+	case WSEED_OK:            return NULL;
+
+	// No world directory: a joined server session, whose seed arrives over the wire
+	// (net/networld.h's BS_APP_WORLD_INFO) and never comes from a sidecar. Not a fault.
+	case WSEED_NO_WORLD_DIR:  return NULL;
+
+	case WSEED_DAMAGED:       return "world seed file is damaged";
+	case WSEED_MINT_FAILED:   return "no clock to make a world seed";
+	case WSEED_STAMP_FAILED:  return "world seed failed (sd write)";
+	}
+
+	// Not reachable through the enum, and deliberately AFTER the switch — see the identical
+	// note in genVersionRefusalText above for why this is not a `default:`.
+	return NULL;
+}
+
+static inline bool worldSeedRefuses(WorldSeedStatus st)
+{
+	return worldSeedRefusalText(st) != NULL;
 }
