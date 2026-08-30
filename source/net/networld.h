@@ -273,6 +273,21 @@ void networldUnsubscribeColumn(int col_x, int col_z);
 // own, which is why the seed comes back through an out-parameter.
 bool networldWorldSeed(uint32_t* out);
 
+// v1.8.3 Phase 4. WHICH GENERATOR the server says shaped that world, from BS_APP_WORLD_GEN
+// (proto/bs_proto.h, 0x0F, one uint16 LE sent immediately behind WORLD_INFO).
+//
+// Same contract as networldWorldSeed() above and for the same reasons. False leaves *out
+// untouched, and false is not an error: a pre-v1.8.3 server never sends this message at all,
+// and in single player there is no session. False means "this server did not say", which
+// world/genversion.h's genVersionForSessionResolve() answers with GEN_VERSION_LEGACY — the
+// generator every client that ever joined such a server actually used. It does NOT mean "the
+// version is 0"; 0 is simply not a generator, and the value travels through an out-parameter so
+// a caller cannot read the two as the same thing.
+//
+// The value is the server's claim, verbatim, not something this client has agreed to. Deciding
+// whether it can be honoured is genVersionForSessionResolve()'s job, and refusing is main.c's.
+bool networldServerGenVersion(uint32_t* out);
+
 // ---- block registry sync (v1.6.0) ---------------------------------------------------------
 //
 // True when this client's block table provably agrees with the server's, and "provably" is meant
@@ -314,6 +329,27 @@ bool networldRegistrySynced(void);
 // documented degraded state above rather than a failure to report.
 bool networldRegistryWaiting(void);
 
+// v1.8.3 Phase 4. True while this session is still waiting to hear BS_APP_WORLD_GEN, in exactly
+// the sense networldRegistryWaiting()'s no-INFO arm is: a caller that gates world entry on this
+// will not enter until the server has either answered or run out of grace.
+//
+// It exists to close a one-frame race, and the race is the whole feature failing quietly rather
+// than loudly. WORLD_GEN is sent one line behind WORLD_INFO, so in practice it has always
+// arrived by the time scene/title_nav.c's entry condition is next evaluated — but "in practice"
+// is a timing assumption about two datagrams, not a guarantee. A client that entered on the
+// frame between them would see networldServerGenVersion() answer false, conclude "old server,
+// generate legacy", and walk into a world the server was one packet away from saying was
+// something else. That is precisely the harm this phase exists to stop, delivered by a race
+// instead of by a version disagreement, and with both sides believing they agree.
+//
+// Bounded in every arm, so a caller that spins on it is guaranteed to be let through:
+//   * never armed (single player, or pre-WORLD_INFO)  -> false immediately
+//   * WORLD_GEN heard                                 -> false immediately
+//   * joined, nothing heard (a pre-v1.8.3 server)     -> false after NETWORLD_GEN_GRACE_MS
+// Falling through the last arm leaves networldServerGenVersion() false, which is the documented
+// "server did not say" answer and not a failure to report.
+bool networldGenWaiting(void);
+
 // The bounds behind both functions above, driven off bsSockNowMs(). They are here rather than
 // private to networld.c for the same reason NETWORLD_POSE_INTERVAL_MS is: a timing bound no
 // test can name is a timing bound no test can prove, and net/networld_test.c exercises every
@@ -329,6 +365,17 @@ bool networldRegistryWaiting(void);
 #define NETWORLD_REG_FETCH_MAX_SENDS   4
 #define NETWORLD_REG_SYNC_DEADLINE_MS  2000
 #define NETWORLD_REG_INFO_GRACE_MS     250
+
+// v1.8.3 Phase 4. How long networldGenWaiting() holds entry for BS_APP_WORLD_GEN when nothing
+// has arrived. Here rather than private to networld.c for the reason the four above are: a
+// timing bound no test can name is a timing bound no test can prove.
+//
+// The same 250 ms as REG_INFO_GRACE, and for an identical reason rather than a copied number:
+// both are the wait for a single packet that a server one release older simply does not send,
+// and both are measured from the same instant (the arrival of WORLD_INFO). Stalling every join
+// against a pre-v1.8.3 server for any longer would be a regression the player can feel, for a
+// packet that is never coming.
+#define NETWORLD_GEN_GRACE_MS          250
 
 // Diagnostics, mirroring net/blockdiff.h's own counters — this module owns the store
 // privately, so a HUD or log line reaches these instead of the store directly.

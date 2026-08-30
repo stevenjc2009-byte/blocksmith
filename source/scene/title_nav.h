@@ -37,6 +37,18 @@ typedef struct {
 	// on the very same frame the player pressed it. Nothing else in this struct protects it.
 	bool have_world_seed;
 	bool registry_waiting;
+
+	// v1.8.3 Phase 4. networldGenWaiting(), read in the same place and at the same moment as
+	// the two above, and protected by the same ordering.
+	//
+	// It is a gate rather than a timing assumption because the failure it prevents is silent on
+	// both sides. BS_APP_WORLD_GEN is sent one line behind BS_APP_WORLD_INFO, so a client that
+	// entered as soon as the seed landed would very nearly always have the generator too — and
+	// on the frame it did not, it would read "no answer", conclude "old server, generate
+	// legacy", and enter a world the server was one packet away from calling something else.
+	// Nothing errors and nothing is logged, and the mismatch refusal this phase exists for
+	// cannot fire, because the client never learned there was anything to disagree about.
+	bool gen_waiting;
 } TitleMpNav;
 
 typedef struct {

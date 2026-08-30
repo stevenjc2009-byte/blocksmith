@@ -117,6 +117,19 @@ typedef enum {
 	// can do something about — free some space, take the write-lock off, reseat it — and an
 	// unreadable stamp is not. Folding the two together would cost them that.
 	GENVER_STAMP_FAILED,
+
+	// v1.8.3 Phase 4. A joined SERVER declared a generator this build cannot produce. The
+	// session must NOT be entered: this client would generate a different landscape from the
+	// one every other player in that world is standing on, and every block edit it made would
+	// land in the wrong hillside. *out is left at GEN_VERSION_LEGACY — the wire value is
+	// deliberately not adopted, because the whole point is that it is unusable here.
+	//
+	// A separate code rather than reusing GENVER_TOO_NEW, which is the same shape of fault one
+	// module over. TOO_NEW's sentence is about a save file on the player's own SD card
+	// ("world made by a newer version"), and pointing that at a server would send them looking
+	// for a local world to delete. The fault is the server's world, and the fix is a newer
+	// build of the game, so it gets its own sentence in world/genrefuse.h.
+	GENVER_SESSION_MISMATCH,
 } GenVersionStatus;
 
 // Decides which generator `world_dir` gets, stamping it if it does not have one yet.
@@ -178,3 +191,55 @@ static inline bool genVersionKnown(uint32_t version)
 // it. Making it a named function rather than a bare constant at the call site is so that
 // whoever adds the wire field has one place to change and this comment to read first.
 static inline uint32_t genVersionForSession(void) { return GEN_VERSION_LEGACY; }
+
+// v1.8.3 Phase 4. The wire field the comment above was waiting for now exists — the server
+// declares its world's generator as BS_APP_WORLD_GEN (proto/bs_proto.h, 0x0F, one uint16 LE),
+// and this is the decision that turns that number into an answer.
+//
+// genVersionForSession() above is KEPT, not replaced, and is still the whole answer for the
+// `have_wire == false` row below. It is what a pre-Phase-4 server produces — it sends no
+// WORLD_GEN at all — and legacy is exactly right for one: every client that has ever joined
+// such a server generated legacy, so that is the terrain its diff store's coordinates point
+// into. "Heard nothing" therefore means LEGACY and NOT "refuse", and that is a commitment,
+// not an implementation detail: it is compiled into every client this phase ships, so a later
+// phase that wanted silence to mean refusal could not tell the fielded ones.
+//
+//   have_wire == false                      -> GENVER_OK,               *out = LEGACY
+//   have_wire, genVersionKnown(wire)        -> GENVER_OK,               *out = wire
+//   have_wire, version unknown to this build-> GENVER_SESSION_MISMATCH, *out = LEGACY
+//
+// PURE, and deliberately so. It takes the two impure facts (did a WORLD_GEN arrive, and what
+// did it say) as arguments instead of calling net/networld.h itself, following
+// world/worldseed.h's worldSeedMintFrom(). world/genversion.c must not learn about net/: it is
+// linked into host suites that do not link networld.c at all, and a call in here would drag the
+// whole transport in behind it. Passing the facts in is also what lets a test drive every row
+// above, refusals included, with no socket and no clock.
+//
+// A static inline in the header rather than a function in genversion.c, matching
+// genVersionKnown() just above it: there is no state and no I/O here, only a total function
+// over two arguments, and a header-only resolver can be exercised from any suite that includes
+// this file rather than only from the one that links genversion.c.
+//
+// `*out` is always written, on every row, so a caller cannot read an uninitialised generator by
+// forgetting to check the status. On the refusal row it is LEGACY rather than the wire value:
+// the caller has no use for a version it cannot generate, and leaving the unusable number in an
+// out-parameter named for the generator to use is how it eventually gets used.
+static inline GenVersionStatus genVersionForSessionResolve(bool have_wire, uint32_t wire_version,
+                                                           uint32_t* out)
+{
+	uint32_t dummy;
+	if (!out) out = &dummy;
+
+	if (!have_wire) {
+		*out = genVersionForSession();
+		return GENVER_OK;
+	}
+
+	if (!genVersionKnown(wire_version)) {
+		*out = GEN_VERSION_LEGACY;
+		return GENVER_SESSION_MISMATCH;
+	}
+
+	*out = wire_version;
+	return GENVER_OK;
+}

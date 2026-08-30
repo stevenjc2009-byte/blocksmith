@@ -155,15 +155,16 @@ static void testSinglePlayerQuitToTitleLeavesTheTableJoinable(void)
 	// nothing ever dirtied it.
 	CHECK(enterWorldWithRows(sp_rows, 1) == 1);
 	CHECK(registryFrozen());
-	// Ten core rows since roadmap tasks 17/19 added water and tall grass, plus the
-	// one dynamic row this world registered. (The measured symptom quoted above was
-	// taken when there were eight core rows; the +1/+0 shape of it is what matters.)
-	CHECK(registryCount() == 11);
+	// Fifteen core rows since v1.8.3 Phase 3 added snow, ice, cactus, dead bush and
+	// fern on top of tasks 17/19's water and tall grass, plus the one dynamic row this
+	// world registered. (The measured symptom quoted above was taken when there were
+	// eight core rows; the +1/+0 shape of it is what matters, not the base.)
+	CHECK(registryCount() == 16);
 
 	quitToTitleFromSinglePlayer();
 
 	CHECK(!registryFrozen());
-	CHECK(registryCount() == 10);
+	CHECK(registryCount() == 15);
 	CHECK(registryFind("sp_sidecar") == 0);
 
 	// The join. This is the batch the server sends and the client refused for the whole
@@ -172,7 +173,7 @@ static void testSinglePlayerQuitToTitleLeavesTheTableJoinable(void)
 	packOne(rec, REG_ID_DYN_LO, "srv_blk");
 	CHECK(registryRemoteApply(REG_ID_DYN_LO, rec, 1) == 1);
 	CHECK(registryFind("srv_blk") == REG_ID_DYN_LO);
-	CHECK(registryCount() == 11);
+	CHECK(registryCount() == 16);
 	// The row at that id is the SERVER's row and usable, not merely a row. Checking
 	// registryIsDefined(REG_ID_DYN_LO) alone would have passed against the broken tree —
 	// the single-player world's own row was sitting in that slot, defined and solid — and
@@ -202,7 +203,7 @@ static void testSinglePlayerIntoSinglePlayerGetsItsOwnTable(void)
 	CHECK(registryFind("b_thatch") == REG_ID_DYN_LO);
 	CHECK(registryFind("a_marble") == 0);
 	CHECK(registryFind("a_basalt") == 0);
-	CHECK(registryCount() == 11);
+	CHECK(registryCount() == 16);
 }
 
 // ── 3. every exit from a world lands in the same state ───────────────────────────────────
@@ -235,7 +236,14 @@ static void testEveryExitFromAWorldLandsInTheSameState(void)
 	CHECK(tableStateEq(after_sp, after_mp));
 
 	// And the number itself, so a "they agree" pass cannot be two identically wrong tables.
-	CHECK(cold.count == 10 && !cold.frozen);
+	//
+	// 10 -> 15 on 2026-08-30: v1.8.3 Phase 3 added snow, ice, cactus, dead bush and fern as
+	// core rows 10..14. A cold table is exactly the core rows, so this literal tracks that
+	// count and nothing else. It is spelled `cold.count` rather than `registryCount()`, which
+	// is why the sweep that moved the five registryCount() pins in this file missed it and
+	// the suite caught it instead -- worth recording, because the next core row will hit the
+	// same blind spot.
+	CHECK(cold.count == 15 && !cold.frozen);
 
 	// Both exits leave the NEXT FREE SLOT at REG_ID_DYN_LO too, which the three numbers
 	// above do not cover: registryRemoteApply() refuses any batch that does not start
@@ -271,7 +279,7 @@ static void testTheResetIsHarmlessWhenThereIsNothingToReset(void)
 	sessionBegin();
 	sessionBegin();
 	CHECK(tableStateEq(tableState(), before));
-	CHECK(registryCount() == 10);
+	CHECK(registryCount() == 15);
 }
 
 // ── 5. main.c really calls it ────────────────────────────────────────────────────────────

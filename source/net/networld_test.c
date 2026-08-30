@@ -32,6 +32,8 @@
 #include "net/bsnet_transport.h"
 #include "world/atlas_uv.h"
 #include "world/block.h"
+#include "world/genrefuse.h"
+#include "world/genversion.h"
 #include "world/mesher.h"
 #include "world/registry.h"
 #include "world/scratch.h"
@@ -1082,6 +1084,295 @@ static void test_world_info_carries_the_servers_seed(void)
     check(!networldWorldSeed(NULL), "a short WORLD_INFO is dropped, not misparsed");
 }
 
+/* ------------------------------------------- the server's generator (v1.8.3 Phase 4) ------
+ *
+ * BS_APP_WORLD_GEN, sent by the server on the line immediately after BS_APP_WORLD_INFO. The
+ * seed says WHICH world; this says WHAT SHAPE it is. Until v1.8.3 the shape was assumed —
+ * both ends generated legacy terrain and neither ever said so — and the assumption was
+ * correct only because no server had ever run anything else. The moment one does, a client
+ * that assumes legacy does not fail: it generates a whole different world from the same seed,
+ * silently, and then builds in it.
+ *
+ * BS_APP_WORLD_INFO could not carry the extra bytes. net/networld.c's applyWorldInfo() and the
+ * server's own decoder both compare length with STRICT EQUALITY, so a widened WORLD_INFO is
+ * dropped whole by every client already in the field — no seed, no world, no diagnostic. Hence
+ * a new type at the next free id rather than two more bytes on an old one; see proto/bs_proto.h
+ * on BS_APP_WORLD_GEN for the same reasoning stated where the id is allocated.
+ */
+static void test_world_gen_carries_the_servers_generator(void)
+{
+    puts("BS_APP_WORLD_GEN hands the server's generator declaration to the client");
+
+    networldInit();
+
+    /* Poisoned exactly as the seed case above poisons it, and for the same reason: 0 and 1 are
+     * both values a server can legitimately declare, so "nothing said" cannot be a sentinel. */
+    uint32_t gen = 0xDEADBEEFu;
+    check(!networldServerGenVersion(&gen), "no generator is claimed before the server sends one");
+    check(gen == 0xDEADBEEFu, "a false return does not write the out-parameter");
+
+    uint8_t wg[BS_WORLD_GEN_BYTES];
+    wg[0] = BS_APP_WORLD_GEN;
+    bs_put_u16(wg + 1, 2u);
+    networldApplyPayload(wg, sizeof wg);
+    check(networldServerGenVersion(&gen), "the declaration is available once WORLD_GEN arrives");
+    check(gen == 2u, "and it is the exact value the server sent");
+
+    /* Byte order, asserted against literal bytes rather than through bs_put_u16. Written this
+     * way on purpose: a round trip through the matching putter and getter agrees with itself
+     * whichever order it uses, so it cannot see an endianness bug — it can only see one that
+     * disagrees with ITSELF. The server writes these two bytes with bs_put_u16 and the value
+     * has to survive the wire, so the wire bytes are what this pins. 0x0102 rather than a
+     * palindrome, so low-byte-first and high-byte-first give different answers. */
+    networldInit();
+    wg[0] = BS_APP_WORLD_GEN;
+    wg[1] = 0x02;
+    wg[2] = 0x01;
+    networldApplyPayload(wg, sizeof wg);
+    check(networldServerGenVersion(&gen) && gen == 0x0102u,
+          "the two payload bytes are read little-endian, low byte first");
+
+    /* 0 is not a generator this build can make — world/genversion.h refuses it — but it has to
+     * arrive AS 0 and be refused there, not be mistaken here for silence and resolved to
+     * legacy. The distinction is the whole point of the bool/out-parameter pair. */
+    networldInit();
+    bs_put_u16(wg + 1, 0u);
+    networldApplyPayload(wg, sizeof wg);
+    gen = 0xDEADBEEFu;
+    check(networldServerGenVersion(&gen) && gen == 0u,
+          "a declaration of 0 is a declaration, not silence");
+    check(networldServerGenVersion(NULL), "and the out-parameter is optional");
+
+    /* Short: malformed, dropped whole, same posture as every other decoder in this module. */
+    networldInit();
+    uint8_t truncated_gen[BS_WORLD_GEN_BYTES - 1];
+    truncated_gen[0] = BS_APP_WORLD_GEN;
+    memset(truncated_gen + 1, 0xFF, sizeof truncated_gen - 1);
+    networldApplyPayload(truncated_gen, sizeof truncated_gen);
+    check(!networldServerGenVersion(NULL), "a short WORLD_GEN is dropped, not misparsed");
+
+    /* Long, which is the case that actually protects the NEXT protocol change. If a later
+     * server widens this message, this client must refuse it outright rather than read the
+     * first two bytes of a record whose meaning it does not know. Reading them is worse than
+     * dropping them: dropping resolves to legacy and refuses on mismatch, half-parsing enters
+     * a world on a number it invented. */
+    networldInit();
+    uint8_t widened[BS_WORLD_GEN_BYTES + 1];
+    widened[0] = BS_APP_WORLD_GEN;
+    bs_put_u16(widened + 1, 2u);
+    widened[BS_WORLD_GEN_BYTES] = 0x7F;
+    networldApplyPayload(widened, sizeof widened);
+    check(!networldServerGenVersion(NULL),
+          "a LONGER WORLD_GEN is dropped whole rather than half-parsed for its first two bytes");
+
+    /* Per-session, like the seed beside it. A second join in the same boot — quit to title,
+     * join a different server — must not inherit the first server's declaration; that is a
+     * mismatch nobody would ever be told about. */
+    networldInit();
+    bs_put_u16(wg + 1, 2u);
+    networldApplyPayload(wg, sizeof wg);
+    check(networldServerGenVersion(NULL), "declared in this session");
+    networldInit();
+    check(!networldServerGenVersion(NULL),
+          "and gone in the next: a second join does not inherit the first server's generator");
+}
+
+/* The entry gate's fourth term, against the clock. scene/title_nav_test.c checks that
+ * titleMpNav() honours the bool; this checks that the bool is TRUE when it should be and,
+ * more importantly, that every arm of it is BOUNDED — a gate on a packet a pre-v1.8.3 server
+ * never sends is a title screen with no way into the world at all. Same shape and same
+ * argument as test_registry_gate_holds_entry_until_the_table_settles() below. */
+static void test_gen_gate_holds_entry_until_the_generator_is_known(void)
+{
+    puts("the generator gate holds world entry for one grace, and every arm of it is bounded");
+
+    networldInit();
+    fakeTransportReset();
+    fakeNowSet(1000);
+    check(!networldGenWaiting(), "a client that has not joined anything is never held");
+
+    /* A WORLD_GEN with no WORLD_INFO ahead of it. Nothing arms, so nothing waits — this is
+     * what keeps a single-player boot from being delayed by a stray datagram. */
+    uint8_t wg[BS_WORLD_GEN_BYTES];
+    wg[0] = BS_APP_WORLD_GEN;
+    bs_put_u16(wg + 1, 1u);
+    networldApplyPayload(wg, sizeof wg);
+    check(!networldGenWaiting(),
+          "an unsolicited WORLD_GEN does not put a boot that never joined anything on hold");
+
+    /* Joined: the seed is in, the declaration has not landed yet. This is the one-frame window
+     * between the two packets, and it is the whole reason the gate exists. */
+    networldInit();
+    fakeNowSet(1000);
+    /* Built by hand rather than through buildWorldInfoMsg(): that helper is defined with
+     * the registry scenarios further down this file and is not in scope up here. */
+    uint8_t wi[BS_WORLD_INFO_BYTES];
+    wi[0] = BS_APP_WORLD_INFO;
+    bs_put_u32(wi + 1, 99u);
+    networldApplyPayload(wi, sizeof wi);
+    check(networldGenWaiting(), "the seed alone holds entry while WORLD_GEN could still land");
+
+    networldApplyPayload(wg, sizeof wg);
+    check(!networldGenWaiting(), "the declaration releases entry on the frame it lands");
+    check(networldServerGenVersion(NULL), "with the declaration recorded, not merely awaited");
+
+    /* A pre-v1.8.3 server never sends one at all. Released at the grace, having heard nothing
+     * — which world/genversion.h's genVersionForSessionResolve() resolves to legacy, the
+     * generator such a server's clients have always run. */
+    networldInit();
+    fakeNowSet(1000);
+    networldApplyPayload(wi, sizeof wi);
+    fakeNowAdvance(NETWORLD_GEN_GRACE_MS - 1);
+    check(networldGenWaiting(), "still held one millisecond before the grace expires");
+    fakeNowAdvance(1);
+    check(!networldGenWaiting(), "a pre-v1.8.3 server stops holding entry at the grace");
+    check(!networldServerGenVersion(NULL),
+          "and the client enters having heard nothing, which resolves to legacy rather than "
+          "to a refusal");
+
+    /* Backwards, too. bsSockNowMs() is osGetTime() on hardware — a wall clock that can step
+     * back over a lid-close or a clock change. The bound is `now - base` on uint64_t, so a
+     * backwards step underflows to a huge value and releases rather than traps. */
+    networldInit();
+    fakeNowSet(10000);
+    networldApplyPayload(wi, sizeof wi);
+    check(networldGenWaiting(), "held while the clock is behaving");
+    fakeNowSet(9999);
+    check(!networldGenWaiting(), "a clock that steps backwards releases, never traps");
+
+    /* And a chatty server cannot push the origin out. registryGateArm() latches, which is what
+     * makes this true for both gates riding it; without the latch a server that resent
+     * WORLD_INFO every 200 ms would hold this console on the title screen indefinitely. */
+    networldInit();
+    fakeNowSet(1000);
+    networldApplyPayload(wi, sizeof wi);
+    fakeNowAdvance(NETWORLD_GEN_GRACE_MS - 10);
+    networldApplyPayload(wi, sizeof wi);
+    fakeNowAdvance(10);
+    check(!networldGenWaiting(), "a repeated WORLD_INFO does not extend the grace");
+}
+
+/* The compatibility claim this whole phase rests on, checked rather than argued.
+ *
+ * BS_APP_WORLD_GEN is server-to-client only, and the argument for shipping it is that a client
+ * older than v1.8.3 has no case for the id and skips it. That argument is about code that is
+ * not in this build and cannot be linked here — but the property it depends on IS in this
+ * build and is the same one line of code: networldApplyPayload()'s default arm. So what is
+ * checked here is that arm, driven with an id this build genuinely has no case for.
+ *
+ * 0x10 is chosen because it is the next id after BS_APP_WORLD_GEN. If a later phase allocates
+ * it, this check starts exercising a handled type and stops meaning what it says — so it will
+ * need moving to whatever the next free id is then, not deleting.
+ *
+ * Note what is NOT claimed: this does not prove a v1.8.2 binary is unaffected. It proves the
+ * mechanism that makes it so, in the file that implements it. The real cross-version evidence
+ * is ordering — the server ships first — and that is a release process, not a test. */
+static void test_an_unhandled_app_type_changes_nothing(void)
+{
+    puts("an application type this build has no case for is skipped, not acted on");
+
+    networldInit();
+    fakeTransportReset();
+    fakeNowSet(1000);
+
+    /* Built by hand rather than through buildWorldInfoMsg(): that helper is defined with
+     * the registry scenarios further down this file and is not in scope up here. */
+    uint8_t wi[BS_WORLD_INFO_BYTES];
+    wi[0] = BS_APP_WORLD_INFO;
+    bs_put_u32(wi + 1, 4242u);
+    networldApplyPayload(wi, sizeof wi);
+    uint8_t wg[BS_WORLD_GEN_BYTES];
+    wg[0] = BS_APP_WORLD_GEN;
+    bs_put_u16(wg + 1, 1u);
+    networldApplyPayload(wg, sizeof wg);
+
+    /* Past both graces, so the two gates are already released and a re-arm would be visible as
+     * a gate going back up rather than being masked by one that was still up anyway. */
+    fakeNowAdvance(NETWORLD_REG_INFO_GRACE_MS);
+
+    const int msgs_before  = networldRecvMsgs();
+    const int edits_before = networldAppliedEdits();
+    fake_sent_calls = 0;
+
+    uint8_t future[8];
+    future[0] = 0x10;
+    memset(future + 1, 0xA5, sizeof future - 1);
+    networldApplyPayload(future, sizeof future);
+
+    check(networldRecvMsgs() == msgs_before + 1,
+          "it is counted as received, so the packet was really delivered to the dispatcher");
+    check(fake_sent_calls == 0, "and answered with nothing: no kick, no complaint, no retry");
+    check(networldAppliedEdits() == edits_before, "no world edit came out of it");
+
+    uint32_t seed = 0u;
+    uint32_t gen  = 0u;
+    check(networldWorldSeed(&seed) && seed == 4242u, "the seed already learned is untouched");
+    check(networldServerGenVersion(&gen) && gen == 1u,
+          "so is the generator already declared");
+    check(!networldGenWaiting() && !networldRegistryWaiting(),
+          "and neither gate was pushed back up by it");
+}
+
+/* world/genversion.h's genVersionForSessionResolve() and world/genrefuse.h's refusal sentence:
+ * the decision main.c acts on, exercised here rather than in world_test.c because the inputs
+ * come off the wire and this is the suite that has the wire in it.
+ *
+ * Three rows, and the third is the one this phase exists for. The first two are what keep the
+ * third from being satisfiable by a function that simply refuses everything. */
+static void test_the_session_generator_resolves_and_refuses(void)
+{
+    puts("the declared generator resolves to a session generator, or to a refusal");
+
+    uint32_t out = 0xDEADBEEFu;
+
+    /* Row 1: the server said nothing — every server older than v1.8.3, forever. Not a fault
+     * and not a refusal, because it has exactly one correct answer. */
+    check(genVersionForSessionResolve(false, 0u, &out) == GENVER_OK,
+          "a server that said nothing is not a refusal");
+    check(out == genVersionForSession(),
+          "and the session generates what a joined session has always generated");
+    check(out == GEN_VERSION_LEGACY,
+          "which is legacy: the generator every pre-v1.8.3 server's clients ran");
+    check(genVersionRefusalText(GENVER_OK) == NULL, "GENVER_OK has nothing to say to the player");
+
+    /* Row 2: a declaration this build knows. Taken verbatim — the wire value is the answer,
+     * not a hint that gets re-derived locally. */
+    out = 0xDEADBEEFu;
+    check(genVersionForSessionResolve(true, GEN_VERSION_LEGACY, &out) == GENVER_OK
+              && out == GEN_VERSION_LEGACY,
+          "a declared LEGACY is accepted and used verbatim");
+    out = 0xDEADBEEFu;
+    check(genVersionForSessionResolve(true, GEN_VERSION_DENSITY, &out) == GENVER_OK
+              && out == GEN_VERSION_DENSITY,
+          "and so is a declared DENSITY: the test is what this build KNOWS, not which "
+          "generator Phase 4's server happens to declare");
+
+    /* Row 3: a generator this build cannot produce. */
+    out = 0xDEADBEEFu;
+    const GenVersionStatus st =
+        genVersionForSessionResolve(true, GEN_VERSION_NEWEST + 1u, &out);
+    check(st == GENVER_SESSION_MISMATCH,
+          "a generator newer than this build knows is a session mismatch");
+    check(genVersionRefusalText(st) != NULL,
+          "which is a refusal, so main.c stops instead of entering the wrong world");
+    check(strcmp(genVersionRefusalText(st), "server world needs newer game") == 0,
+          "with the sentence that points at the game, which is the thing the player can fix");
+    check(strcmp(genVersionRefusalText(st), genVersionRefusalText(GENVER_TOO_NEW)) != 0,
+          "and not TOO_NEW's, which would send them hunting a local world that is not the "
+          "problem");
+    check(out == GEN_VERSION_LEGACY,
+          "the out-parameter is left at a safe value rather than at the number it refused");
+
+    /* 0 travels the same road. It is a value the wire can carry and the encoding cannot
+     * reject, so the refusal has to be the thing that catches it. */
+    out = 0xDEADBEEFu;
+    check(genVersionForSessionResolve(true, 0u, &out) == GENVER_SESSION_MISMATCH,
+          "a declaration of 0 is an unknown generator, not 'nothing said'");
+
+    check(genVersionForSessionResolve(true, GEN_VERSION_LEGACY, NULL) == GENVER_OK,
+          "the out-parameter is optional");
+}
+
 /* ---------------------------------------------------- the remesh notification ------------- */
 /* Written after the bug it catches was reported from a live two-player session: a remote
  * player's edits changed the world but nothing on screen changed. Collision reads world
@@ -1836,11 +2127,21 @@ static void test_registry_defs_converge(void)
 
     check(registryFind("wire_a") == REG_ID_DYN_LO && registryFind("wire_b") == REG_ID_DYN_LO + 1,
           "both defs landed under their consecutive ids");
-    check(registryCount() == 12, "count moved from 10 to 12 defined rows");
+    check(registryCount() == 17, "count moved from 15 to 17 defined rows");
     check(blockIsSolid(REG_ID_DYN_LO), "after sync the same id resolves to the real def");
     check(worldGet(&w, 5, 10, 7) == REG_ID_DYN_LO,
           "the stored raw byte needed no rewrite — tables agree around it");
-    check(registryCrc16() != 0x4066u,
+    /* A `!=` pin, and it needed reading rather than bumping. It fails when the table
+     * carrying two extra dynamic rows hashes IDENTICALLY to the core-only table — i.e.
+     * when registryCrc16() has stopped seeing the dynamic range at all. Leaving the old
+     * 0x4066 here would not have failed anything; it would have compared against a number
+     * that is no longer any table's fingerprint, so the check could never go red for the
+     * reason it exists. Updating the literal to the measured core-only value is what KEEPS
+     * it armed; that is the opposite of neutralising it.
+     *
+     * 0x4066 -> 0x189B on 2026-08-30 by v1.8.3 Phase 3, same move as registry_test.c:423
+     * and for the same measured reason: five more 28-byte records now feed the hash. */
+    check(registryCrc16() != 0x189Bu,
           "the converged table no longer hashes like the core-only one");
 }
 
@@ -1858,7 +2159,7 @@ static void test_registry_defs_malformed_dropped_whole(void)
 
     /* Short by one record byte: length-exact posture, drop without parsing. */
     networldApplyPayload(batch, len - 1);
-    check(registryCount() == 10 && registryFind("bad_a") == 0,
+    check(registryCount() == 15 && registryFind("bad_a") == 0,
           "a truncated DEFS applies nothing");
 
     /* Claiming more records than the sender's own cap can carry. */
@@ -1866,14 +2167,14 @@ static void test_registry_defs_malformed_dropped_whole(void)
     memcpy(greedy, batch, sizeof greedy);
     greedy[2] = BS_APP_REGISTRY_DEFS_MAX_N + 1u;
     networldApplyPayload(greedy, sizeof greedy);
-    check(registryCount() == 10, "an over-cap count is refused outright");
+    check(registryCount() == 15, "an over-cap count is refused outright");
 
     /* first below the dyn range would overwrite compiled-in core rows. */
     uint8_t hostile[BS_APP_REGISTRY_DEFS_BYTES(2)];
     memcpy(hostile, batch, sizeof hostile);
     hostile[1] = BLOCK_STONE;
     networldApplyPayload(hostile, sizeof hostile);
-    check(registryCount() == 10 && strcmp(blockInfo(BLOCK_STONE)->name, "stone") == 0,
+    check(registryCount() == 15 && strcmp(blockInfo(BLOCK_STONE)->name, "stone") == 0,
           "a batch aimed at the core range changes nothing");
 
     /* A record whose embedded id disagrees with its slot position: all-or-nothing. */
@@ -1881,7 +2182,7 @@ static void test_registry_defs_malformed_dropped_whole(void)
     memcpy(shuffled, batch, sizeof shuffled);
     shuffled[4] = REG_ID_DYN_LO + 1u;   /* record 0 claims id 0x81 */
     networldApplyPayload(shuffled, sizeof shuffled);
-    check(registryCount() == 10 && registryFind("bad_a") == 0 && registryFind("bad_b") == 0,
+    check(registryCount() == 15 && registryFind("bad_a") == 0 && registryFind("bad_b") == 0,
           "one inconsistent record refuses the WHOLE batch, not just itself");
 }
 
@@ -1940,12 +2241,13 @@ static void buildRegistryInfoFor(uint8_t *out /* BS_APP_REGISTRY_INFO_BYTES */,
     registryInitCore();
 }
 
-/* The ten core rows as world/block.h's own constants spell them, written out here so the
+/* The fifteen core rows as world/block.h's own constants spell them, written out here so the
  * core-only fingerprint below can be DERIVED rather than recorded. This is deliberately not
  * read out of world/registry.c's kCoreDefs (it is static there anyway): a reference built from
  * the table under test would move whenever that table moved, and a pasted hash literal — which
  * is what this replaced — would pin whatever the table happened to hash to on the day it was
- * recorded, wrong answer included. Two independent spellings of the same ten rows can disagree;
+ * recorded, wrong answer included. Two independent spellings of the same fifteen rows can
+ * disagree;
  * a number copied out of a run cannot.
  *
  * The fields the rows never vary are not listed: luminance is 0 on every core row, fluid_class
@@ -1983,6 +2285,28 @@ static const CoreRowSpec kCoreRowSpecs[] = {
       REG_FLAG_TRANSPARENT | REG_FLAG_LIQUID, 0 },
     { 9, "tall_grass", { BTEX_TALL_GRASS, BTEX_TALL_GRASS, BTEX_TALL_GRASS,
                          BTEX_TALL_GRASS, BTEX_TALL_GRASS, BTEX_TALL_GRASS },
+      REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS), 1 },
+
+    /* v1.8.3 Phase 3's five, ids 10..14. Transcribed from world/block.h's constants the
+     * same way every row above was — deliberately NOT copied out of world/registry.c's
+     * kCoreDefs, and deliberately not reconciled against it by eye afterwards. If a field
+     * below disagrees with the shipped row, coreOnlyCrc16() disagrees with registryCrc16()
+     * and the check further down goes red, which is the entire reason this list exists.
+     *
+     * The three cubes carry REG_FLAG_SOLID alone (ice included: its art is opaque, see
+     * world/registry.c's note on the row), the two plants carry TRANSPARENT|SHAPE(CROSS)
+     * exactly as tall grass does. Hardness: snow 8, ice 10, cactus 8, plants 1. */
+    { 10, "snow",   { BTEX_SNOW, BTEX_SNOW, BTEX_SNOW,
+                      BTEX_SNOW, BTEX_SNOW, BTEX_SNOW }, REG_FLAG_SOLID, 8 },
+    { 11, "ice",    { BTEX_ICE, BTEX_ICE, BTEX_ICE,
+                      BTEX_ICE, BTEX_ICE, BTEX_ICE }, REG_FLAG_SOLID, 10 },
+    { 12, "cactus", { BTEX_CACTUS, BTEX_CACTUS, BTEX_CACTUS,
+                      BTEX_CACTUS, BTEX_CACTUS, BTEX_CACTUS }, REG_FLAG_SOLID, 8 },
+    { 13, "dead_bush", { BTEX_DEAD_BUSH, BTEX_DEAD_BUSH, BTEX_DEAD_BUSH,
+                         BTEX_DEAD_BUSH, BTEX_DEAD_BUSH, BTEX_DEAD_BUSH },
+      REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS), 1 },
+    { 14, "fern",   { BTEX_FERN, BTEX_FERN, BTEX_FERN,
+                      BTEX_FERN, BTEX_FERN, BTEX_FERN },
       REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS), 1 },
 };
 
@@ -2113,7 +2437,7 @@ static void test_registry_fetch_retries_a_lost_reply(void)
     uint8_t partial[BS_APP_REGISTRY_DEFS_BYTES(2)];
     len = buildRegistryDefs(partial, REG_ID_DYN_LO, two, 2, false);   /* not the last */
     networldApplyPayload(partial, len);
-    check(registryCount() == 12, "the partial batch landed two rows");
+    check(registryCount() == 17, "the partial batch landed two rows");
     fake_sent_calls = 0;
     fakeNowAdvance(NETWORLD_REG_FETCH_RETRY_MS);
     networldUpdate();
@@ -2272,13 +2596,13 @@ static void test_registry_table_resets_between_sessions(void)
     uint8_t batch[BS_APP_REGISTRY_DEFS_BYTES(2)];
     size_t len = buildRegistryDefs(batch, REG_ID_DYN_LO, defs, 2, true);
     networldApplyPayload(batch, len);
-    check(registryCount() == 12 && registryFind("srv1_a") == REG_ID_DYN_LO,
+    check(registryCount() == 17 && registryFind("srv1_a") == REG_ID_DYN_LO,
           "the first server's two rows are in the table");
 
     /* netDisconnect() runs networldInit() (net/bsnet.c), which is the whole of leaving a
      * session as far as this module is concerned. */
     networldInit();
-    check(registryCount() == 10, "after leaving, only the ten core rows remain");
+    check(registryCount() == 15, "after leaving, only the fifteen core rows remain");
     check(registryFind("srv1_a") == 0 && registryFind("srv1_b") == 0,
           "the first server's names are gone, not merely hidden");
     check(registryCrc16() == coreOnlyCrc16(),
@@ -2304,7 +2628,7 @@ static void test_registry_table_resets_between_sessions(void)
     networldApplyPayload(batch2, len);
     check(registryFind("srv2_only") == REG_ID_DYN_LO,
           "the second server's row takes 0x80, which server one had been holding");
-    check(registryCount() == 11, "and it is the only dynamic row in the table");
+    check(registryCount() == 16, "and it is the only dynamic row in the table");
 }
 
 /* v1.6.0 F2, and the scenario the test directly above could not be: it calls networldInit()
@@ -2342,7 +2666,7 @@ static void test_registry_join_after_a_single_player_quit_to_title(void)
     check(registryRegister(&sp) == REG_ID_DYN_LO,
           "control: the single-player world's sidecar row is really in the table");
     registryFreeze();
-    check(registryFrozen() && registryCount() == 11,
+    check(registryFrozen() && registryCount() == 16,
           "control: and genStart() has frozen it, in single player exactly as in a session");
 
     /* Quit to title. This is the whole of it. */
@@ -2364,7 +2688,7 @@ static void test_registry_join_after_a_single_player_quit_to_title(void)
 
     check(registryFind("srv_blk") == REG_ID_DYN_LO,
           "the server's block is committed at 0x80 rather than refused by the stale freeze");
-    check(registryCount() == 11 && registryFind("sp_sidecar") == 0,
+    check(registryCount() == 16 && registryFind("sp_sidecar") == 0,
           "and it is the only dynamic row: the last world's is gone");
     /* The NAME is checked, not just "a defined solid row exists at 0x80". Against the stale
      * table the single-player world's own row was sitting in that slot, defined and solid, so
@@ -2408,7 +2732,7 @@ static void test_registry_terminator_alone_is_not_a_synced_table(void)
     const size_t tlen = buildRegistryDefs(term, REG_ID_DYN_LO, declared, 0, true);
     networldApplyPayload(term, tlen);
 
-    check(registryCount() == 10,
+    check(registryCount() == 15,
           "the terminator carried no records, so the table is still core-only");
     check(!networldRegistrySynced(),
           "and a table that cannot reproduce the server's crc16 is not a synced table");
@@ -2474,7 +2798,7 @@ static void test_registry_terminator_alone_is_not_a_synced_table(void)
     uint8_t batch[BS_APP_REGISTRY_DEFS_BYTES(2)];
     const size_t blen = buildRegistryDefs(batch, REG_ID_DYN_LO, declared, 2, true);
     networldApplyPayload(batch, blen);
-    check(registryCount() == 10, "the frozen table refused the batch, per registry.h's contract");
+    check(registryCount() == 15, "the frozen table refused the batch, per registry.h's contract");
     check(!networldRegistrySynced(),
           "and a refused batch's LAST flag does not turn the indicator healthy");
 
@@ -2493,7 +2817,7 @@ static void test_registry_terminator_alone_is_not_a_synced_table(void)
     networldApplyPayload(wi, sizeof wi);
 
     networldApplyPayload(batch, blen);
-    check(registryCount() == 12, "the unsolicited batch's rows did land in the table");
+    check(registryCount() == 17, "the unsolicited batch's rows did land in the table");
     check(!networldRegistrySynced(),
           "but with no INFO there is no fingerprint, so nothing is verified");
 
@@ -2517,7 +2841,7 @@ static void test_registry_sync_is_proved_by_the_fingerprint(void)
     uint8_t all[BS_APP_REGISTRY_DEFS_BYTES(3)];
     size_t alen = buildRegistryDefs(all, REG_ID_DYN_LO, declared, 3, true);
     networldApplyPayload(all, alen);
-    check(registryCount() == 13, "all three declared rows landed");
+    check(registryCount() == 18, "all three declared rows landed");
     check(networldRegistrySynced(), "and the table reproduces the server's whole fingerprint");
     check(!networldRegistryWaiting(), "which releases world entry immediately");
 
@@ -2527,7 +2851,7 @@ static void test_registry_sync_is_proved_by_the_fingerprint(void)
     uint8_t two[BS_APP_REGISTRY_DEFS_BYTES(2)];
     const size_t twolen = buildRegistryDefs(two, REG_ID_DYN_LO, declared, 2, true);
     networldApplyPayload(two, twolen);
-    check(registryCount() == 12, "two of the three rows landed");
+    check(registryCount() == 17, "two of the three rows landed");
     check(!networldRegistrySynced(),
           "a short delivery is not a synced table however the LAST flag is set");
     fake_sent_calls = 0;
@@ -2543,7 +2867,7 @@ static void test_registry_sync_is_proved_by_the_fingerprint(void)
     uint8_t wrong[BS_APP_REGISTRY_DEFS_BYTES(3)];
     const size_t wlen = buildRegistryDefs(wrong, REG_ID_DYN_LO, impostor, 3, true);
     networldApplyPayload(wrong, wlen);
-    check(registryCount() == 13, "three rows landed, so rev and count both agree");
+    check(registryCount() == 18, "three rows landed, so rev and count both agree");
     check(registryFind("fp_X") == REG_ID_DYN_LO + 2u, "with the third row under its own name");
     check(!networldRegistrySynced(),
           "but the crc16 disagrees, so this is not the server's table and not synced");
@@ -2575,7 +2899,7 @@ static void test_registry_sync_is_proved_by_the_fingerprint(void)
 
     alen = buildRegistryDefs(all, REG_ID_DYN_LO, declared, 3, true);
     networldApplyPayload(all, alen);
-    check(registryCount() == 13, "control: the rows landed exactly as in the passing case");
+    check(registryCount() == 18, "control: the rows landed exactly as in the passing case");
     check(!networldRegistrySynced(), "but a foreign table revision is never verifiable");
 }
 
@@ -2714,6 +3038,10 @@ int main(void)
     test_edits_before_a_world_exists_are_kept();
     test_setworld_keeps_diffs_until_terrain_exists();
     test_world_info_carries_the_servers_seed();
+    test_world_gen_carries_the_servers_generator();
+    test_gen_gate_holds_entry_until_the_generator_is_known();
+    test_an_unhandled_app_type_changes_nothing();
+    test_the_session_generator_resolves_and_refuses();
     test_edit_hook_fires_for_an_applied_edit();
     test_edit_hook_silent_while_the_edit_is_only_queued();
     test_edit_hook_fires_per_entry_of_a_sync_batch();
@@ -2768,13 +3096,13 @@ int main(void)
      *   report — go and find out which checks stopped running, and why.
      *
      *   Note the number is the count BEFORE this guard itself, so the summary line prints one
-     *   more than it (327 here, 328 on the PASS line). That off-by-one is deliberate: it means
+     *   more than it (368 here, 369 on the PASS line). That off-by-one is deliberate: it means
      *   blind-pasting the number off the PASS line lands you a red, not a false green.
      *
      * This guard is deliberately scoped to THIS suite. The same hole exists in every other
      * host suite under source/ and is a separate, fleet-wide job. */
-    check(g_checks == 327,
-          "check-count guard: every check in this suite actually ran (327 before this line)");
+    check(g_checks == 368,
+          "check-count guard: every check in this suite actually ran (368 before this line)");
 
     printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;

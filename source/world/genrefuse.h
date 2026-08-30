@@ -70,6 +70,18 @@ static inline const char* genVersionRefusalText(GenVersionStatus st)
 	case GENVER_TOO_NEW:      return "world made by a newer version";
 	case GENVER_DAMAGED:      return "world version file is damaged";
 	case GENVER_STAMP_FAILED: return "world stamp failed (sd write)";
+
+	// v1.8.3 Phase 4. A joined server declared a generator this build cannot produce
+	// (genversion.h's genVersionForSessionResolve). None of the three sentences above fits:
+	// this is not the player's world and not their SD card, so there is nothing for them to
+	// delete, free up or unlock. What they can do is update the game, so that is what it
+	// says. Note it is not GENVER_TOO_NEW's sentence — "world made by a newer version" would
+	// send them looking for a local world that is not the problem.
+	//
+	// 29 characters, the same budget as every line above it and well inside scene/title.h's
+	// char[48] TitleState.status. It reaches the player down exactly the path a world refusal
+	// already takes out of main.c's genStart(), which is why Phase 4 needed no new UI.
+	case GENVER_SESSION_MISMATCH: return "server world needs newer game";
 	}
 
 	// Not reachable through the enum, and deliberately AFTER the switch rather than as a

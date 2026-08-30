@@ -311,6 +311,22 @@ static bool     s_pose_sent_once;
 static uint32_t s_world_seed;
 static bool     s_have_world_seed;
 
+// v1.8.3 Phase 4. Which GENERATOR the server says shaped that world, from BS_APP_WORLD_GEN —
+// the packet that rides immediately behind WORLD_INFO, for the same reason WORLD_INFO leads:
+// both have to be known before a single column is generated.
+//
+// "have" is separate from the value for exactly the reason it is above, one step stronger: a
+// server that never sends this message and a server that declares generator 0 must not read as
+// the same thing, and only one of them is a fault. The first is every server older than this
+// release and is answered with legacy; the second is a malformed declaration.
+//
+// uint16 rather than uint32 because that is the width on the wire and the width in the client's
+// own genver.bin sidecar (world/genversion.c) — see BS_WORLD_GEN_BYTES for why the number does
+// not get two widths. It is widened to uint32 only at the accessor, which is where it meets
+// world/genversion.h's uint32 vocabulary.
+static uint16_t s_world_gen;
+static bool     s_have_world_gen;
+
 // Traffic counters — see networld.h for what each one distinguishes. Plain ints, main thread
 // only, reset by networldInit(): they are a diagnostic readout, not part of any protocol.
 static int s_sent_edits;
@@ -419,6 +435,28 @@ static void applyWorldInfo(const uint8_t* msg, size_t len)
 	// concerned — the server sends REGISTRY_INFO immediately behind it, so this is the
 	// instant from which "how long have we waited for the table" is measured.
 	registryGateArm();
+}
+
+// BS_APP_WORLD_GEN (v1.8.3 Phase 4): which generator shaped the world WORLD_INFO named. Exactly
+// BS_WORLD_GEN_BYTES or dropped whole — the same "reject on length, never half-parse" posture
+// applyWorldInfo() above takes, and here it is the difference between refusing a join and
+// entering the wrong world: a half-parsed version is a number, and a number is something this
+// client would act on.
+//
+// Recorded, never judged. Whether the declared generator can be produced by this build is
+// world/genversion.h's genVersionForSessionResolve(), and whether that refuses the world is
+// main.c's. This file's job ends at "the server said N".
+//
+// No registryGateArm() call here, on purpose. The clock is armed by WORLD_INFO, which is sent
+// one line ahead of this packet and is also what admits the client; arming it again from a
+// second message would let a server that resent WORLD_GEN push the origin of every bound
+// forward, which is the exact reason registryGateArm() latches.
+static void applyWorldGen(const uint8_t* msg, size_t len)
+{
+	if (len != BS_WORLD_GEN_BYTES) return;
+
+	s_world_gen      = bs_get_u16(msg + 1);
+	s_have_world_gen = true;
 }
 
 // BS_APP_INV_STATE: the whole inventory, authoritative, exactly BS_INV_STATE_BYTES or dropped
@@ -751,6 +789,7 @@ void networldApplyPayload(const uint8_t* payload, size_t len)
 	case BS_APP_WORLD_SYNC:  applyWorldSync(payload, len);  break;
 	case BS_APP_POS_UPDATE:  applyPosUpdate(payload, len);  break;
 	case BS_APP_WORLD_INFO:  applyWorldInfo(payload, len);  break;
+	case BS_APP_WORLD_GEN:   applyWorldGen(payload, len);   break;
 	case BS_APP_CHUNK_DIFFS: applyChunkDiffs(payload, len); break;
 	case BS_APP_INV_STATE:   applyInvState(payload, len);   break;
 	case BS_APP_PLAYER_STATE: applyPlayerState(payload, len); break;
@@ -869,6 +908,14 @@ void networldInit(void)
 	s_pose_sent_once    = false;
 	s_world_seed        = 0;
 	s_have_world_seed   = false;
+	// v1.8.3 Phase 4. Cleared here for exactly the reason the seed is, and it is load-bearing
+	// in the same way: netDisconnect() reaches this function, so a generator version left over
+	// from the last server would be answered to the NEXT one's join. Two servers can disagree
+	// about their generator, and a stale "have" would let the second session enter on the
+	// first server's answer without ever hearing from the second — which is this phase's harm,
+	// reached by a route that has nothing to do with the wire.
+	s_world_gen         = 0;
+	s_have_world_gen    = false;
 	s_sent_edits        = 0;
 	s_recv_msgs         = 0;
 	s_sync_entries      = 0;
@@ -1018,6 +1065,15 @@ bool networldWorldSeed(uint32_t* out)
 	return true;
 }
 
+// See networld.h. Widened to uint32 here and nowhere else: 16 bits is the width the number has
+// on the wire and in genver.bin, and uint32 is the width world/genversion.h speaks in.
+bool networldServerGenVersion(uint32_t* out)
+{
+	if (!s_have_world_gen) return false;
+	if (out) *out = (uint32_t)s_world_gen;
+	return true;
+}
+
 bool networldRegistrySynced(void)
 {
 	return s_reg_synced;
@@ -1048,6 +1104,34 @@ bool networldRegistryWaiting(void)
 	// deadline, then give up and let the caller in degraded — a hole in the world beats a
 	// title screen that never ends.
 	return waited < (uint64_t)NETWORLD_REG_SYNC_DEADLINE_MS;
+}
+
+// v1.8.3 Phase 4. See networld.h for the contract and for the one-frame race this closes.
+//
+// It rides s_reg_gate_ms rather than opening a second clock. That instant IS the one this
+// question is measured from: registryGateArm() fires inside applyWorldInfo(), and WORLD_GEN is
+// sent by the server on the very next line after WORLD_INFO. A second timestamp set from the
+// same packet would be the same number kept twice, and the two would eventually disagree.
+//
+// The name reads narrower than the field now is — it has two consumers and is no longer only
+// the registry's. Renaming it is a pure rename across this file and was left out of this change
+// deliberately, so the diff that introduces a wire message is not also a diff that touches every
+// registry timing site.
+bool networldGenWaiting(void)
+{
+	// Not joined at all: single player, or a session that has not reached WORLD_INFO. Nothing
+	// to wait for, and a single-player boot must never be delayed by this.
+	if (!s_reg_gate_armed) return false;
+
+	// Answered. Whether the answer is one this build can generate is not this function's
+	// question — see world/genversion.h's genVersionForSessionResolve().
+	if (s_have_world_gen) return false;
+
+	// Nothing heard: a server older than v1.8.3, which never sends this message at all. The
+	// same short grace REGISTRY_INFO gets, and for the same reason — a join must not stall on
+	// a packet that is never coming. Falling through leaves networldServerGenVersion() false,
+	// which resolves to legacy: the generator such a server's clients have always used.
+	return (bsSockNowMs() - s_reg_gate_ms) < (uint64_t)NETWORLD_GEN_GRACE_MS;
 }
 
 // See networld.h's own comment on this pair: the pose accessors hand the retained join

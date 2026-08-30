@@ -124,13 +124,17 @@ static void check(bool cond, const char *what)
  * checks rather than fail them. The suite would then print PASS with a smaller number, and the
  * number is the only place that shows.
  *
- * 56 is the count on 2026-08-25, the first time this binary was ever run in this environment
+ * 56 was the count on 2026-08-25, the first time this binary was ever run in this environment
  * (it is skipped on Windows/MSYS2 - see tools/run_host_tests.sh - and this repo's host is
  * Windows, so it had never executed here at all until it was run from WSL).
  *
+ * 66 on 2026-08-30: v1.8.3 Phase 4 added scenario 9 (BS_APP_WORLD_GEN across the real process
+ * boundary), which makes 10 checks. Recomputed as 56 + 10 by counting the check() calls added,
+ * not read off the run - the paragraph below is the reason that distinction matters.
+ *
  * Legitimately adding or removing a check means editing this by hand. The suite going red until
  * you do is deliberate friction, not an accident. */
-#define INTEROP_TEST_EXPECTED_CHECKS 56
+#define INTEROP_TEST_EXPECTED_CHECKS 66
 
 /* Deliberately NOT routed through check(): it must not perturb the number it is testing, so it
  * bumps g_fails only and leaves g_checks alone. Reporting shape is check()'s, so a failure here
@@ -373,6 +377,18 @@ static void buildCanonicalInvState(uint8_t *out, uint8_t selected_hotbar,
     }
 }
 
+/* v1.8.3 Phase 4. BS_APP_WORLD_GEN, built from proto/bs_proto.h's macros and nothing else — not
+ * copied from bsgame.c's send_world_gen() and not from networld.c's applyWorldGen(), for the
+ * reason the other canonical builders in this section give: a byte layout copied from one of the
+ * two sides it is meant to arbitrate agrees with that side by construction and can only catch
+ * the other one. This is the third, independent statement of the layout, and it is the one the
+ * header actually specifies. */
+static void buildCanonicalWorldGen(uint8_t *out /* BS_WORLD_GEN_BYTES */, uint16_t gen)
+{
+    out[0] = BS_APP_WORLD_GEN;
+    bs_put_u16(out + BS_APP_HDR_BYTES, gen);
+}
+
 /* ------------------------------------------------------------------------------ fake transport
  * Link-time test double for net/bsnet_transport.h, same seam networld_test.c uses (bsnet_
  * transport.c is real Noise XX over a real UDP socket, none of it host-portable). UNLIKE
@@ -417,6 +433,31 @@ static int     g_captured_inv_count;
 static void captureInvReset(void)
 {
     g_captured_inv_count = 0;
+}
+
+/* v1.8.3 Phase 4. The same again for BS_APP_WORLD_GEN, plus a running log of the app ids the
+ * join burst delivered, in arrival order.
+ *
+ * The order log is not decoration. The client's entry gate (net/networld.c's
+ * networldGenWaiting(), and scene/title_nav.c's fourth term) is built on WORLD_GEN arriving in
+ * the same burst as WORLD_INFO and immediately behind it — that is the whole reason its grace is
+ * 250 ms and not two seconds. A check that only asked "did a WORLD_GEN turn up eventually" would
+ * stay green against a server that sent it a second later, by which time every client in the
+ * field would already have entered the world assuming legacy. The ORDER is the property, so it
+ * is recorded here rather than inferred. */
+#define GEN_CAPTURE_MAX 4
+static uint8_t g_captured_gen[GEN_CAPTURE_MAX][BS_MAX_PAYLOAD];
+static size_t  g_captured_gen_len[GEN_CAPTURE_MAX];
+static int     g_captured_gen_count;
+
+#define JOIN_ORDER_MAX 8
+static uint8_t g_join_order[JOIN_ORDER_MAX];
+static int     g_join_order_count;
+
+static void captureGenReset(void)
+{
+    g_captured_gen_count = 0;
+    g_join_order_count   = 0;
 }
 
 /* Registered once per scenario via networldSetInvHook() (networldInit() clears any previous
@@ -477,6 +518,16 @@ int netTransportRecv(uint8_t *out, size_t cap)
         g_captured_inv_len[g_captured_inv_count] = plen;
         g_captured_inv_count++;
     }
+    if (plen > 0 && out[0] == BS_APP_WORLD_GEN && g_captured_gen_count < GEN_CAPTURE_MAX) {
+        memcpy(g_captured_gen[g_captured_gen_count], out, plen);
+        g_captured_gen_len[g_captured_gen_count] = plen;
+        g_captured_gen_count++;
+    }
+    /* Unconditional and type-blind: what the Phase 4 scenario asks of it is the SEQUENCE, so
+     * filtering to the types that scenario cares about would let a packet slipped in between
+     * them go unrecorded and the sequence still read as adjacent. */
+    if (plen > 0 && g_join_order_count < JOIN_ORDER_MAX)
+        g_join_order[g_join_order_count++] = out[0];
     return (int)plen;
 }
 
@@ -510,6 +561,17 @@ static void pumpUntilInvCaptured(int want, unsigned timeout_ms)
 {
     uint64_t deadline = now_ms() + timeout_ms;
     while (g_captured_inv_count < want && now_ms() < deadline) {
+        networldUpdate();
+        msleep(5);
+    }
+    networldUpdate();   /* one last drain in case something landed right at the deadline */
+}
+
+/* v1.8.3 Phase 4, and the same again for BS_APP_WORLD_GEN. */
+static void pumpUntilGenCaptured(int want, unsigned timeout_ms)
+{
+    uint64_t deadline = now_ms() + timeout_ms;
+    while (g_captured_gen_count < want && now_ms() < deadline) {
         networldUpdate();
         msleep(5);
     }
@@ -953,6 +1015,94 @@ static void test_inv_pickup_roundtrip_reflected_in_snapshot(void)
           "must be");
 }
 
+/* ------------------------------------------------------------------------------- scenario 9 --
+ * v1.8.3 Phase 4, and the check this phase actually rests on: BS_APP_WORLD_GEN, from the real
+ * bsgame daemon, decoded by the real net/networld.c, in one measurement.
+ *
+ * Every other Phase 4 check is one side talking to itself. net/networld_test.c builds the packet
+ * with the same macros it decodes with; game/bsgame_test.c drives the real daemon but reads the
+ * reply with a decoder written beside the encoder. Both are worth having and neither can see a
+ * disagreement BETWEEN the two programs, which is the only failure mode that matters for a wire
+ * message — and the one that ends with two builds generating different terrain from the same
+ * seed and never noticing.
+ *
+ * Three independent things are asserted, and it is worth being explicit about why none of them
+ * subsumes the others:
+ *
+ *   * The BYTES on the wire equal buildCanonicalWorldGen()'s, which is written from bs_proto.h
+ *     alone. Neither side's encoder is the reference.
+ *   * The VALUE is INTEROP_SEEDED_WORLD_GEN, written into the daemon's --state-dir before it
+ *     booted (see main()). Deliberately not 1: 1 is BSGAME_WORLD_GEN_DEFAULT, so a server that
+ *     ignored its state dir entirely — or a send_world_gen() with the number baked into it —
+ *     would answer 1 and a check expecting 1 would pass. 258 can only have come from the file.
+ *   * The ORDER is WORLD_INFO then WORLD_GEN, adjacent. The client's entry gate assumes it.
+ *
+ * 258 is also 0x0102, which is not a palindrome, so the low-byte-first check below fails against
+ * a big-endian encoder even though both sides use bs_put_u16/bs_get_u16 and would therefore
+ * agree with each other whichever order those macros used. */
+#define INTEROP_SEEDED_WORLD_GEN 258u
+
+static void test_world_gen_declared_at_join(void)
+{
+    puts("real interop: JOIN alone gets the real client a BS_APP_WORLD_GEN from the real server, "
+         "carrying the generator its state dir declares, immediately behind WORLD_INFO");
+
+    const uint32_t client = 0xC1E00014u;
+
+    networldInit();
+    g_client_sid = client;
+    captureReset();
+    captureInvReset();
+    captureGenReset();
+
+    send_join(client, "genclient1");   /* the ONLY thing this scenario does before pumping */
+
+    pumpUntilGenCaptured(1, 1000);
+    check(g_captured_gen_count == 1,
+          "exactly one BS_APP_WORLD_GEN arrived after JOIN, unprompted — the client asked for "
+          "nothing and there is no request message it could have asked with");
+
+    if (g_captured_gen_count == 1) {
+        check(g_captured_gen_len[0] == BS_WORLD_GEN_BYTES,
+              "it is exactly BS_WORLD_GEN_BYTES (3) long, so networld.c's strict-equality length "
+              "check accepts it rather than dropping it whole");
+
+        uint8_t canon[BS_WORLD_GEN_BYTES];
+        buildCanonicalWorldGen(canon, (uint16_t)INTEROP_SEEDED_WORLD_GEN);
+        check(memcmp(g_captured_gen[0], canon, BS_WORLD_GEN_BYTES) == 0,
+              "and byte-identical to the canonical encoding built from bs_proto.h's macros "
+              "alone, neither side's encoder used as the reference");
+
+        check(g_captured_gen[0][BS_APP_HDR_BYTES]     == 0x02
+              && g_captured_gen[0][BS_APP_HDR_BYTES + 1] == 0x01,
+              "the two payload bytes are 02 01 on the wire — little-endian, low byte first, "
+              "across a real process boundary rather than through a matching put/get pair");
+    }
+
+    /* The client's OWN decode, which is the half a raw byte capture cannot speak for. */
+    uint32_t gen = 0xDEADBEEFu;
+    check(networldServerGenVersion(&gen),
+          "the real networld.c accepted it: this session now has a declared generator");
+    check(gen == INTEROP_SEEDED_WORLD_GEN,
+          "and the value is the one written into the daemon's --state-dir before it booted — "
+          "not BSGAME_WORLD_GEN_DEFAULT, so it was really read from the file it is persisted in");
+
+    uint32_t seed = 0xDEADBEEFu;
+    check(networldWorldSeed(&seed),
+          "control: the seed landed too, so this is a real join burst and not a lone packet");
+
+    check(g_join_order_count >= 2,
+          "at least two packets arrived in the burst");
+    if (g_join_order_count >= 2) {
+        check(g_join_order[0] == BS_APP_WORLD_INFO && g_join_order[1] == BS_APP_WORLD_GEN,
+              "and WORLD_GEN is the packet immediately behind WORLD_INFO, which is the ordering "
+              "networldGenWaiting()'s 250 ms grace is sized for");
+    }
+
+    check(!networldGenWaiting(),
+          "so the entry gate is open by the end of the burst rather than held for the grace");
+}
+
 /* --------------------------------------------------------------------------------------- main */
 
 int main(void)
@@ -966,6 +1116,24 @@ int main(void)
 
     snprintf(g_dir, sizeof g_dir, "/tmp/bsgame_interop_%d", (int)getpid());
     if (mkdir(g_dir, 0700) != 0) die("mkdir state dir");
+
+    /* v1.8.3 Phase 4. Written BEFORE the daemon starts, so bsgame's world_gen_load() finds it on
+     * first boot and adopts it instead of minting BSGAME_WORLD_GEN_DEFAULT. This is what makes
+     * scenario 9's value check mean something: 258 is not the default and is not a number
+     * anywhere in bsgame.c, so it can only have reached the client by being read out of this
+     * file and put on the wire.
+     *
+     * It is emphatically NOT a statement about which generator a real deployment should declare.
+     * This is a throwaway /tmp state dir that is created and torn down inside one test process.
+     * See world/water.h and the Phase 4 commit message for why a real server declares LEGACY. */
+    {
+        char gp[128];
+        snprintf(gp, sizeof gp, "%s/world_gen.txt", g_dir);
+        FILE *gf = fopen(gp, "w");
+        if (gf == NULL) die("write world_gen.txt");
+        fprintf(gf, "%u\n", INTEROP_SEEDED_WORLD_GEN);
+        fclose(gf);
+    }
 
     puts("== interop_test: client (networld.c) <-> real bsgame daemon ==");
 
@@ -987,6 +1155,8 @@ int main(void)
     test_inv_action_gated_on_inv_state();
     test_inv_select_roundtrip_reflected_in_snapshot();
     test_inv_pickup_roundtrip_reflected_in_snapshot();
+
+    test_world_gen_declared_at_join();
 
     reap_daemon();
 

@@ -39,7 +39,12 @@ static char s_first[160];
 // gone green for the reason it names.
 static TitleMpNav readyFrame(void)
 {
-	TitleMpNav in = {false, true, true, false};
+	// {back, connected, have_world_seed, registry_waiting, gen_waiting}. v1.8.3 Phase 4 added
+	// the fifth member, and every positional initialiser in this file names it rather than
+	// letting it zero-fill: -Wextra's -Wmissing-field-initializers plus this suite's -Werror
+	// makes a short initialiser a build failure, and a frame here is meant to read as the
+	// complete set of conditions anyway.
+	TitleMpNav in = {false, true, true, false, false};
 	return in;
 }
 
@@ -47,7 +52,7 @@ static TitleMpNav readyFrame(void)
 // simply stuck on.
 static void testAnIdleFrameNavigatesNowhere(void)
 {
-	TitleMpNav in = {false, false, false, false};
+	TitleMpNav in = {false, false, false, false, false};
 	TitleMpNavOut out = titleMpNav(in);
 	CHECK(!out.leave_to_main);
 	CHECK(!out.start_server);
@@ -75,13 +80,76 @@ static void testTheEntryGateStillOpensWhenItShould(void)
 	TitleMpNav still_syncing = readyFrame();
 	still_syncing.registry_waiting = true;
 	CHECK(!titleMpNav(still_syncing).start_server);
+
+	// v1.8.3 Phase 4. The fourth condition, load-bearing in the same way.
+	TitleMpNav still_asking = readyFrame();
+	still_asking.gen_waiting = true;
+	CHECK(!titleMpNav(still_asking).start_server);
+}
+
+// v1.8.3 Phase 4, frame (i) of three. Everything the pre-Phase-4 gate asked for is true —
+// joined, seed known, registry settled — and BS_APP_WORLD_GEN has not arrived yet. This is the
+// one-frame window between WORLD_INFO and the WORLD_GEN sent immediately behind it, and it must
+// NOT enter.
+//
+// The reason it matters is that entering here does not fail; it succeeds at the wrong thing.
+// networldServerGenVersion() would answer false, world/genversion.h's
+// genVersionForSessionResolve() would read that as "the server did not say" and hand back
+// GEN_VERSION_LEGACY, and the session would generate legacy terrain against a server that was
+// one datagram away from declaring something else. No error, no log line, and the mismatch
+// refusal cannot fire because the client never learned there was a mismatch.
+static void testEntryWaitsForTheGeneratorAnswer(void)
+{
+	TitleMpNav in = readyFrame();
+	in.gen_waiting = true;
+
+	TitleMpNavOut out = titleMpNav(in);
+	CHECK(!out.start_server);
+	CHECK(!out.leave_to_main);
+}
+
+// Frame (ii): WORLD_GEN arrived, so networldGenWaiting() went false and the gate opens. Written
+// as a state change from frame (i) rather than as another call on readyFrame(), so that what is
+// being checked is the transition and not a second copy of the open-gate case above.
+//
+// Frame (iii) — the grace expired against a pre-v1.8.3 server that will never send WORLD_GEN —
+// is deliberately the SAME check and not a separate one. networldGenWaiting() is a single bool
+// and titleMpNav() cannot tell which arm released it, exactly as it cannot for
+// networldRegistryWaiting(); writing frame (iii) out separately would be this assertion typed
+// twice and would suggest a distinction the type does not carry. That an old server is let in
+// at all is networld.c's guarantee (every arm of networldGenWaiting() is bounded) and is
+// checked in net/networld_test.c against a fake clock, which is where the clock is.
+static void testEntryOpensOnceTheGeneratorAnswerSettles(void)
+{
+	TitleMpNav in = readyFrame();
+	in.gen_waiting = true;
+	CHECK(!titleMpNav(in).start_server);
+
+	in.gen_waiting = false;
+	TitleMpNavOut out = titleMpNav(in);
+	CHECK(out.start_server);
+	CHECK(!out.leave_to_main);
+}
+
+// The Phase 4 member joins the same race every other member of this struct is already in: BACK
+// held down on the exact frame the wait clears. Leaving still wins, for the reason title_nav.h
+// gives — the player asked to leave, the gate merely stopped being closed.
+static void testBackOnTheFrameTheGeneratorAnswerArrivesDoesNotEnterTheWorld(void)
+{
+	TitleMpNav in = readyFrame();
+	in.back        = true;
+	in.gen_waiting = false;
+
+	TitleMpNavOut out = titleMpNav(in);
+	CHECK(out.leave_to_main);
+	CHECK(!out.start_server);
 }
 
 // Backing out of a screen the player is merely SITTING on: nothing else is true, so this only
 // proves BACK is wired at all.
 static void testBackFromAnIdleScreenLeaves(void)
 {
-	TitleMpNav in = {true, false, false, false};
+	TitleMpNav in = {true, false, false, false, false};
 	TitleMpNavOut out = titleMpNav(in);
 	CHECK(out.leave_to_main);
 	CHECK(!out.start_server);
@@ -122,22 +190,24 @@ static void testBackOnTheFrameTheSyncDeadlineExpiresDoesNotEnterTheWorld(void)
 // work: BACK on the frame BS_APP_WORLD_INFO's seed arrives, with no registry wait involved.
 static void testBackOnTheFrameTheSeedArrivesDoesNotEnterTheWorld(void)
 {
-	TitleMpNav in = {true, true, true, false};
+	TitleMpNav in = {true, true, true, false, false};
 	TitleMpNavOut out = titleMpNav(in);
 	CHECK(out.leave_to_main);
 	CHECK(!out.start_server);
 }
 
 // The two outputs are mutually exclusive over the whole input space, not just the frames above.
-// Sixteen combinations is small enough to check exhaustively rather than argue about.
+// Thirty-two combinations (sixteen before v1.8.3 Phase 4 added gen_waiting) is small enough to
+// check exhaustively rather than argue about.
 static void testLeavingAndEnteringAreNeverBothTrue(void)
 {
-	for (int bits = 0; bits < 16; bits++) {
+	for (int bits = 0; bits < 32; bits++) {
 		TitleMpNav in;
 		in.back             = (bits & 1) != 0;
 		in.connected        = (bits & 2) != 0;
 		in.have_world_seed  = (bits & 4) != 0;
 		in.registry_waiting = (bits & 8) != 0;
+		in.gen_waiting      = (bits & 16) != 0;
 
 		TitleMpNavOut out = titleMpNav(in);
 		CHECK(!(out.leave_to_main && out.start_server));
@@ -145,6 +215,17 @@ static void testLeavingAndEnteringAreNeverBothTrue(void)
 		// BACK always leaves, whatever else is true — the screen must never become one the
 		// player cannot get out of.
 		CHECK(out.leave_to_main == in.back);
+
+		// v1.8.3 Phase 4. The entry gate written out as its whole predicate, over the whole
+		// input space, so that dropping ANY term from title_nav.c reddens here and not only in
+		// whichever hand-written frame happens to name that term. Written as an equality rather
+		// than an implication on purpose: an implication would still pass against a gate that
+		// had stopped opening at all.
+		CHECK(out.start_server == (!in.back
+		                           && in.connected
+		                           && in.have_world_seed
+		                           && !in.registry_waiting
+		                           && !in.gen_waiting));
 	}
 }
 
@@ -156,6 +237,9 @@ int main(void)
 	testBackOnTheFrameTheSyncCompletesDoesNotEnterTheWorld();
 	testBackOnTheFrameTheSyncDeadlineExpiresDoesNotEnterTheWorld();
 	testBackOnTheFrameTheSeedArrivesDoesNotEnterTheWorld();
+	testEntryWaitsForTheGeneratorAnswer();
+	testEntryOpensOnceTheGeneratorAnswerSettles();
+	testBackOnTheFrameTheGeneratorAnswerArrivesDoesNotEnterTheWorld();
 	testLeavingAndEnteringAreNeverBothTrue();
 
 	if (s_fails == 0)

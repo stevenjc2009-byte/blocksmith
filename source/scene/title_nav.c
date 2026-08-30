@@ -28,7 +28,13 @@ TitleMpNavOut titleMpNav(TitleMpNav in)
 		return out;
 	}
 
-	if (in.connected && in.have_world_seed && !in.registry_waiting)
+	// v1.8.3 Phase 4 added !in.gen_waiting. Same shape as the registry term beside it and for
+	// the same kind of reason: both are bounded waits for a single packet, and both let the
+	// session in once their grace runs out rather than holding the player forever. What differs
+	// is the cost of entering early. A registry that has not settled paints holes; entering
+	// before BS_APP_WORLD_GEN has been heard picks the WRONG GENERATOR, and then this client
+	// and the server agree with each other about it for the whole session.
+	if (in.connected && in.have_world_seed && !in.registry_waiting && !in.gen_waiting)
 		out.start_server = true;
 
 	return out;

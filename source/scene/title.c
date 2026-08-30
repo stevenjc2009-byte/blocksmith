@@ -916,6 +916,9 @@ static TitleResult drawMultiplayer(TitleState* ts, const TitleInput* in, bool ta
 		.connected        = connected,
 		.have_world_seed  = networldWorldSeed(NULL),
 		.registry_waiting = networldRegistryWaiting(),
+		// v1.8.3 Phase 4. Gathered here with the other two and for the same reason: it is
+		// cleared by netDisconnect() -> networldInit() on the frame DISCONNECT is pressed.
+		.gen_waiting      = networldGenWaiting(),
 	};
 	const TitleMpNavOut nav_out = titleMpNav(nav);
 
