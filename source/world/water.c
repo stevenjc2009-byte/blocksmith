@@ -183,13 +183,71 @@ static void qsetEraseAt(WaterSim* s, uint32_t i)
 // file — world.h's edit hook now carries the World* and main.c's onWorldEdit drops any world that
 // is not s_world, so app/worker.c's staging generation no longer feeds this ring. See the block
 // above waterNotify() for what that was and what it cost. This eviction is therefore no longer the
-// everyday load-bearing fix; it is the safety net for overflows that arise on their own merits, and
-// those still exist — handbuiltFill() alone is 51364 firings on the MAIN thread, a large diff drain
-// on rejoin is another, a big player-built basin is a third. The ARGUMENT above is untouched by the
-// flood going away: it is a structural asymmetry in this file (a source has no map entry, so a
-// dropped notify for one is unrecoverable), so refusing-the-newest is the wrong loss to take for
-// ANY overflow whatever caused it. And it costs nothing — the byte-identical-final-world result
-// above is what says so. Kept deliberately, demoted deliberately, not left behind as a workaround.
+// everyday load-bearing fix; it is the safety net for overflows that arise on their own merits.
+// The ARGUMENT above is untouched by the flood going away: it is a structural asymmetry in this
+// file (a source has no map entry, so a dropped notify for one is unrecoverable), so
+// refusing-the-newest is the wrong loss to take for ANY overflow whatever caused it. And it costs
+// nothing — the byte-identical-final-world result above is what says so. Kept deliberately,
+// demoted deliberately, not left behind as a workaround.
+//
+// ── 2026-08-30: WHICH overflow path this is actually the safety net for ────────────────
+//
+// The paragraph above used to finish by naming handbuiltFill() as the first of three surviving
+// overflow paths — "51364 firings on the MAIN thread" — and the block above waterNotify() went
+// on to call it "the reason the eviction above stays". Both were measured and both were true as
+// far as they went, but they picked the wrong path to lean on, and the correction matters enough
+// to write down rather than quietly delete.
+//
+// handbuiltFill() DOES lose water under refuse-newest. Measured 2026-08-30 on the host, against
+// the real handbuiltFill() and the real edit hook: 64 of 64 source positions disagreed between
+// the policies, refuse-newest settling to 1 wet cell every time against a reference arm of min 4,
+// p50 238, p90 636, max 693, and evict-oldest disagreeing on 0 of 64. So the claim was sound.
+//
+// What was wrong is that it does not ship. BS_WORLD_GEN defaults to 1 (main.c:435-441: it is 0
+// only when BS_REMESH_STRESS, BS_DIG_OUT or BS_EDIT_STRESS is on, and all three default to 0),
+// and handbuiltFill()'s boot call at main.c:3471 sits in the #else arm of the #if BS_WORLD_GEN
+// opened at main.c:3289. It is compiled out of every build a player ever runs, its window is one
+// tick, and the Makefile passes no -D that would turn it on. Leaning the eviction's justification
+// on it left the code correct and the reasoning unloadbearing.
+//
+// The overflow path that IS in every shipping build is the multiplayer diff replay, and it is
+// orthogonal to BS_WORLD_GEN — it lives INSIDE the #if BS_WORLD_GEN arm, not the #else:
+//
+//     main.c:4136  genInstallOne()  (once per frame, one column)
+//       -> main.c:1362  networldOnColumnLoad()
+//         -> net/networld.c:936  blockdiffDrain()   <- an uncapped while walk, no budget
+//           -> net/networld.c:920 applyDrained -> worldSet(s_world, ...)
+//             -> main.c:2889 onWorldEdit -> waterNotify()   (the world-pointer filter PASSES:
+//                                                            applyDrained writes s_world itself)
+//
+// MEASURED 2026-08-30 on the host, real world.c / water.c / blockdiff.c, main.c's frame order
+// modelled exactly (install+drain, then the 20 TPS tick clock, then the player's edit), 49
+// columns of 200 diffs each over 60 frames at 60 fps:
+//
+//     no replay at all (reference)   the player's source settles to 113 water blocks, 112 flow
+//                                    cells, in 41 ticks, q_full 0
+//     with the replay                9800 diffs drained -> 9800 hook firings -> 68600 pushes,
+//                                    q_full 29095, ring depth min 657 max 1024, at cap on 33 of
+//                                    60 frames, and the player's own source placed on ANY of
+//                                    frames 0..46 settles to ONE water block, 0 flow cells.
+//                                    47 of 60 placements lost, 78.3%.
+//
+// THE EVICTION DOES NOT RESCUE THAT PATH, and this comment says so rather than implying the
+// safety net covers everything. Evicting the oldest keeps the newest entry only until the next
+// WATERQ_CAP pushes arrive, and the replay offers about 1400 pushes per frame (200 diffs x 7
+// keys) while the ring drains at most WATER_TICK_BUDGET cells per tick, one tick per three
+// frames at 20 TPS off 60 fps, and WATER_SPREAD_TICKS then holds four ticks in five — roughly 64
+// cells per fifteen frames. The player's source is admitted and then evicted again within the
+// same frame. The 2026-08-30 sweep measured refuse-newest at 43 of 60 lost against evict-oldest's
+// 47 of 60 on this path, which is the one place the eviction is very slightly WORSE; it is kept
+// anyway, on the argument above and on the byte-identical-final-world result, and because 43 of
+// 60 is not a fix either. The fix for the diff replay is NOT in this file and is not this policy.
+//
+// Also measured 2026-08-30, and the reason nothing here is load-bearing during ordinary play:
+// with 993acbb's world-pointer filter in place, normal streamed worldgen no longer reaches this
+// ring at all — 157918 hook firings, 22600 admitted, 85.7% dropped by the filter, ring depth min
+// 0 p50 0 max 0, and all 200 arms of that sweep reached the full 113 wet cells under BOTH
+// policies. On the everyday path there is nothing left for a policy to decide.
 //
 // gen_remaining is decremented with the eviction because the head of the ring belongs to the
 // generation that is currently open (water.h's WATER_SPREAD_TICKS barrier). Leaving it alone would
@@ -468,9 +526,54 @@ void waterFillScratch(const WaterSim* s, MeshScratch* ms, int cx, int cy, int cz
 // world through, and main.c's onWorldEdit returns immediately for any world that is not s_world.
 // world/water_test.c's testEditHookReportsWorld is the arm that goes red if that stops being true.
 //
-// NOT closed by that fix, and the reason the eviction above stays: handbuiltFill() (main.c:3419,
-// hook live since main.c:3199) is 51364 firings in a single call on the MAIN thread, so a
-// BS_WORLD_GEN=0 build still overflows this ring on its own merits.
+// NOT closed by that fix, and CORRECTED on 2026-08-30. This paragraph used to read "the reason
+// the eviction above stays: handbuiltFill() (main.c:3419, hook live since main.c:3199) is 51364
+// firings in a single call on the MAIN thread, so a BS_WORLD_GEN=0 build still overflows this
+// ring on its own merits." Every number in that sentence is real and the conclusion drawn from it
+// was still wrong, because BS_WORLD_GEN defaults to 1 and handbuiltFill()'s boot call (now
+// main.c:3471, hook armed unconditionally at main.c:3251) sits in the #else arm of the #if
+// BS_WORLD_GEN opened at main.c:3289. It is compiled out of every shipping build. See the long
+// note above qPush for the measurement, and for why the eviction is kept regardless.
+//
+// The overflow path that IS shipped, and that this fix does not close either, is the multiplayer
+// diff replay on rejoin: main.c:4136 genInstallOne -> main.c:1362 networldOnColumnLoad ->
+// net/networld.c:936 blockdiffDrain -> net/networld.c:920 applyDrained -> worldSet(s_world, ...),
+// and the hook's world-pointer filter passes every one of them because applyDrained writes the
+// live world itself. net/blockdiff.c:126 is an uncapped while walk with no budget and no
+// per-column cap, so one column's whole backlog lands inside one frame. Measured 2026-08-30 on
+// the host with main.c's frame order modelled exactly: 49 columns x 200 diffs is 9800 hook
+// firings, 68600 pushes, q_full 29095, the ring at WATERQ_CAP on 33 of 60 frames, and the
+// player's own water source lost — one wet cell instead of 113 — on 47 of the 60 frames they
+// could have placed it on.
+//
+// Two candidate fixes were measured on 2026-08-30 and are recorded here so neither is tried
+// again blind:
+//
+//   * A per-column budget inside blockdiffDrain(). Dead on its own arithmetic. blockdiffDrain is
+//     called only when a column loads (net/networld.c:936, and world.c:250 for a column that
+//     worldSet itself creates), so there is no re-drain pump: a budget of 4 — the largest that
+//     kept 0 of 7 sampled placements alive — left 9604 of 9800 diffs stranded in the store for
+//     ever, which is precisely the "my house is gone" failure net/blockdiff.h exists to prevent.
+//     Even with a hypothetical ideal per-frame pump added, a budget of 4 takes 2450 frames
+//     (40.8 s) to replay one rejoin, and a budget of 8 is already back to losing placements.
+//   * Blanket suppression of the notify while the drain is walking. Fixes the player's placement
+//     completely (47 of 60 lost -> 0 of 60) but REGRESSES water that arrives AS a diff: a water
+//     source replayed into an unsaturated ring spreads to 117 blocks / 608 flow cells today and
+//     to 1 block / 0 flow cells with blanket suppression. It moves the bug from the local player
+//     onto the remote one.
+//
+// What DID measure clean on all three arms is suppressing the notify during the drain only when
+// there is no water within Manhattan distance 2 of the written cell — which is exactly the radius
+// a notify can influence, since waterNotify pushes the cell and its six neighbours and examining
+// a cell reads its own neighbours, so the filter drops nothing that could have mattered. 0 of 60
+// placements lost; a replayed water source spreads to 117 blocks under a full replay load where
+// today it reaches 1; and the unsaturated case is bit-for-bit what it is today (117 blocks, 608
+// flow cells). Cost, measured: 25 worldGet calls per drained diff, 245000 for a 9800-diff rejoin,
+// spread over the 49 frames the columns install on. NOT measured on hardware.
+//
+// It is not done here because it is not this file's to do: the flag belongs beside the drain and
+// the skip belongs in main.c's onWorldEdit, and net/networld.c is owned elsewhere. Recorded, with
+// the numbers, so that whoever owns it does not have to re-derive them.
 void waterNotify(WaterSim* s, int x, int y, int z)
 {
 	if (s->dropping) return;   // see WaterSim.dropping in water.h
