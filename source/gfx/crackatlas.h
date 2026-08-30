@@ -10,7 +10,17 @@
 // from MeshVertex.v being a uint8_t holding an atlas PIXEL row, not from the sheet height.
 //
 // v1.8.2's task 13b lifted that: v now holds a slot-EDGE index, the sheet is 1024 px tall,
-// and there are 52 free slots. So the original reason has expired — but the sheet stays
+// and all 64 slots became addressable. This line used to say "and there are 52 free slots",
+// which was true the day it was written and is not true now: v1.8.3's faeaa63 painted snow,
+// ice, cactus, dead bush and fern into slots 12..16, so tools/make_atlas.py's TILES list
+// fills 0..16 — SEVENTEEN slots — leaving 17..62 free (46 of them) with slot 63 reserved
+// for ever as ATLAS_TILE_MISSING (world/atlas_uv.h:120). Note that the free count follows
+// what is PAINTED, not what is named: gfx/atlas_tiles.h's TILE_USED_COUNT is still twelve,
+// because faeaa63 landed the art for 12..16 ahead of any TILE_*/BTEX_* id for them. The
+// number moves every time a tile is appended and nothing checks it, which is exactly how it
+// went stale here; it is restated rather than dropped because the sentence below compares
+// against it. tools/make_atlas.py's TILES list is the authority, not this line.
+// So the original reason has expired — but the sheet stays
 // separate anyway, for reasons that have nothing to do with slot budget. The overlay is a
 // second textured pass over the SAME triangles (scene/crackoverlay.c binds its own shader
 // and its own texture unit state); folding it into the block sheet would mean rebinding one
