@@ -56,9 +56,9 @@ install anything, `blocksmith.3dsx` runs from the Homebrew Launcher instead.
   torn-write recovery, so a power cut during a write costs you that one region
   and nothing else.
 * **Multiple worlds**, created and picked from a title screen. They keep their
-  own saved edits, but not their own terrain: single-player worlds currently
-  share one fixed seed, so a newly created world starts out as the same
-  landscape as every other one. Per-world seeds are planned.
+  own saved edits and their own terrain: each single-player world gets a unique
+  randomly minted seed, written to a sidecar, so each newly created world starts
+  as a different landscape.
 * **Multiplayer.** Connect from the title screen and you are in the server's
   world — its seed, and every block edit anyone has made in it. Terrain is never
   transmitted: each console generates the same landscape from the same seed and
@@ -247,7 +247,7 @@ prose is true; that is still a human read.
 
 ### Change notes
 
-`sh tools/make_whatsnew.sh 1.8.2` creates `whatsnew1.8.2.txt` from a template if
+`sh tools/make_whatsnew.sh <version>` creates `whatsnew<version>.txt` from a template if
 it doesn't exist, then checks it against the caps in `source/app/whatsnew.h` —
 which it *reads out of that header* rather than repeating, so the checker can't
 sign off a file the console would then truncate. The format is two optional
