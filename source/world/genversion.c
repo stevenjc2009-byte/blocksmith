@@ -13,9 +13,23 @@
 // only works because of that is a trap for whoever ports it.
 static const uint8_t GENVER_MAGIC[4] = {'B', 'S', 'G', 'V'};
 
-static void pathFor(char* out, size_t cap, const char* world_dir)
+// Returns false, and leaves `out` empty, when the joined path does not fit.
+//
+// Third copy of this helper to be corrected: world/worldseed.c and (on the day/night branch)
+// world/daytime.c carried the identical eight lines, because each new sidecar module was
+// cloned from the last one. Discarding snprintf's return does not produce a broken path, it
+// produces a perfectly openable name for a DIFFERENT file — and since the writer and the
+// reader truncate identically they agree about the wrong name and a round trip reads back
+// perfectly. Widening the buffer only moves the cliff. world/inventory.c and
+// world/playerpose.c already used the return; these three did not.
+static bool pathFor(char* out, size_t cap, const char* world_dir)
 {
-	snprintf(out, cap, "%s/%s", world_dir, GEN_VERSION_FILE);
+	const int n = snprintf(out, cap, "%s/%s", world_dir, GEN_VERSION_FILE);
+	if (n < 0 || (size_t)n >= cap) {
+		if (cap) out[0] = '\0';
+		return false;
+	}
+	return true;
 }
 
 bool genVersionWrite(const char* world_dir, uint32_t version)
@@ -36,7 +50,11 @@ bool genVersionWrite(const char* world_dir, uint32_t version)
 	buf[11] = (uint8_t)((crc >> 24) & 0xFFu);
 
 	char path[160];
-	pathFor(path, sizeof path, world_dir);
+	// Reported the same way a failed fopen is: the stamp is not written and the caller is
+	// told so. genStart() turns that into GENVER_STAMP_FAILED and refuses the world, which
+	// is the safe direction — writing to the truncated name instead would stamp whichever
+	// other world shares the prefix, and a wrong generator stamp rewrites terrain.
+	if (!pathFor(path, sizeof path, world_dir)) return false;
 
 	// Written whole in one fwrite of a fixed 12 bytes. There is no double-buffering here the
 	// way region.c has it, and deliberately not: the file is written once when the world is
@@ -60,7 +78,11 @@ GenVersionStatus genVersionRead(const char* world_dir, uint32_t* out)
 	if (!world_dir || !*world_dir) return GENVER_NO_WORLD_DIR;
 
 	char path[160];
-	pathFor(path, sizeof path, world_dir);
+	// DAMAGED, not OK/LEGACY. The absent-file branch below is deliberately forgiving because
+	// an unstamped world is what every pre-versioning world looks like — but a name this
+	// build cannot even form is not that, and answering OK would hand the caller LEGACY for
+	// a world whose stamp was never read. LEGACY is the answer that rewrites terrain.
+	if (!pathFor(path, sizeof path, world_dir)) return GENVER_DAMAGED;
 
 	FILE* f = fopen(path, "rb");
 	if (!f) {
@@ -136,7 +158,14 @@ GenVersionStatus genVersionResolve(const char* world_dir, uint32_t* out)
 	uint32_t stamped = GEN_VERSION_LEGACY;
 	{
 		char path[160];
-		pathFor(path, sizeof path, world_dir);
+		// Refusing here rather than falling through to the played/unplayed guess below: the
+		// guess answers LEGACY or FOR_NEW_WORLDS from a directory scan, and handing back a
+		// generator choice for a world whose stamp could not even be addressed is exactly
+		// the terrain rewrite the stamp exists to prevent.
+		if (!pathFor(path, sizeof path, world_dir)) {
+			*out = GEN_VERSION_LEGACY;
+			return GENVER_DAMAGED;
+		}
 		FILE* f = fopen(path, "rb");
 		if (f) {
 			fclose(f);

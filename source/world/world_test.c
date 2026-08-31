@@ -9960,6 +9960,141 @@ static void testGenverStampPath(void)
 	}
 }
 
+// Builds a REAL directory whose whole PATH is exactly `want` bytes, nesting components under
+// testWorldDir() so every parent exists. A path length is not a name length, and the cliff in
+// genversion.c is on the joined path, so the only honest way to reach it is to build one.
+static bool genverDirOfLength(char* out, size_t out_cap, const char* root, size_t want)
+{
+	testMkdir("build-host");
+	testMkdir(testWorldDir());
+	testMkdir(root);
+	if (want + 1 > out_cap || want <= strlen(root) + 1) return false;
+
+	snprintf(out, out_cap, "%s", root);
+	size_t n = strlen(out);
+	while (n < want) {
+		// One component at a time, capped at 32 bytes, so the PATH grows to any length asked
+		// for while no single NAME approaches a filesystem limit — otherwise a refusal could
+		// come from the OS rather than from the code under test.
+		const size_t room = want - n - 1;
+		if (room == 0) return false;
+		size_t take = room > 32 ? 32 : room;
+		// Never leave exactly ONE byte behind. That byte can only hold a separator, and a
+		// component with an empty name is not a path — the next round would find room == 0
+		// and give up one byte short of the target. Measured: root 31, want 131 stopped at
+		// 130 before this line existed, and the whole collision scenario failed with it.
+		if (room - take == 1) take--;
+		out[n++] = '/';
+		for (size_t i = 0; i < take; i++) out[n++] = 'd';
+		out[n] = '\0';
+		testMkdir(out);
+	}
+	return strlen(out) == want;
+}
+
+// v1.8.3: genversion.c's pathFor() discarded snprintf's return, the same defect world/
+// worldseed.c carried until 10d176f. A truncated path is not a broken path — it is an
+// openable name for a DIFFERENT file, and writer and reader truncate identically, so they
+// agree about the wrong name and a round trip looks perfect. What it costs here is worse than
+// a lost sidecar: an unreadable stamp resolves to LEGACY, and LEGACY on a world built with the
+// new generator rewrites its terrain under whatever the player has already put there.
+static void testGenVersionPathTooLong(void)
+{
+	// Measured, not pinned, so this still means something if the buffer or the filename move.
+	// The buffer is the one number that cannot be read from the header, so it is stated once.
+	const size_t cap    = 160;                          // char path[160] in genversion.c
+	const size_t suffix = 1 + strlen(GEN_VERSION_FILE); // "/" + "genver.bin"
+	const size_t fits   = cap - 1 - suffix;
+	printf("  genver path: buffer %zu, suffix \"/%s\" is %zu, longest dir that fits %zu\n",
+	       cap, GEN_VERSION_FILE, suffix, fits);
+
+	char root[128];
+	snprintf(root, sizeof root, "%s/gv-len", testWorldDir());
+	testRmTree(root);
+
+	char dir[512];
+	uint32_t v;
+
+	// The last length that works. Not decoration: a refusal firing one byte early would pass
+	// every check below while breaking worlds that are perfectly legal, and nothing else in
+	// this suite uses a directory long enough to notice.
+	CHECK(genverDirOfLength(dir, sizeof dir, root, fits));
+	CHECK(strlen(dir) == fits);
+	CHECK(genVersionWrite(dir, GEN_VERSION_DENSITY));
+	v = 0xDEADu;
+	CHECK(genVersionRead(dir, &v) == GENVER_OK);
+	CHECK(v == GEN_VERSION_DENSITY);
+	v = 0xDEADu;
+	CHECK(genVersionResolve(dir, &v) == GENVER_OK);
+	CHECK(v == GEN_VERSION_DENSITY);
+	testRmTree(root);
+
+	// One byte past it. GENVER_DAMAGED and not GENVER_OK: the absent-stamp branch answers
+	// OK/LEGACY on purpose, so a refusal falling through to it would be invisible AND would
+	// hand back the one answer that rewrites terrain.
+	CHECK(genverDirOfLength(dir, sizeof dir, root, fits + 1));
+	CHECK(!genVersionWrite(dir, GEN_VERSION_DENSITY));
+	v = 0xDEADu;
+	CHECK(genVersionRead(dir, &v) == GENVER_DAMAGED);
+	CHECK(v == GEN_VERSION_LEGACY);
+	v = 0xDEADu;
+	CHECK(genVersionResolve(dir, &v) == GENVER_DAMAGED);
+	CHECK(v == GEN_VERSION_LEGACY);
+	CHECK(genVersionRefuses(GENVER_DAMAGED));
+	testRmTree(root);
+
+	// The showstopper. Truncating the FILENAME only makes a wrong file inside the right
+	// directory. Once the joined path passes cap-1 the DIRECTORY half is cut too, and two
+	// worlds agreeing on their first cap-1 bytes both resolve to ONE file in their common
+	// parent: world A's stamp becomes world B's.
+	{
+		char parent[512];
+		const size_t child_name = 34;                       // differs only in its LAST byte
+		const size_t parent_len = cap + 6 - 1 - child_name;
+		CHECK(genverDirOfLength(parent, sizeof parent, root, parent_len));
+
+		char a[512], b[512];
+		// snprintf's return is USED at every site here, and in a test about exactly that it
+		// had better be: gcc cannot prove these joins fit char[512], so discarding it is
+		// -Werror=format-truncation and this file stops compiling.
+		const int an = snprintf(a, sizeof a, "%s/", parent);
+		CHECK(an > 0 && (size_t)an < sizeof a);
+		for (size_t i = 1; i < child_name; i++) strcat(a, "c");
+		const int bn = snprintf(b, sizeof b, "%s", a);
+		CHECK(bn > 0 && (size_t)bn < sizeof b);
+		strcat(a, "A");
+		strcat(b, "B");
+		testMkdir(a);
+		testMkdir(b);
+
+		CHECK(strncmp(a, b, cap - 1) == 0);   // identical for the whole buffer
+		CHECK(strcmp(a, b) != 0);             // and still different directories
+
+		// The name the OLD code wrote for BOTH: the joined path, cut at the buffer. Built
+		// here rather than assumed, so the check below looks for the real collision file.
+		char collide[512];
+		const int cn = snprintf(collide, sizeof collide, "%s/%s", a, GEN_VERSION_FILE);
+		CHECK(cn > 0 && (size_t)cn < sizeof collide);
+		collide[cap - 1] = '\0';
+		remove(collide);
+
+		CHECK(!genVersionWrite(a, GEN_VERSION_DENSITY));
+		CHECK(!genVersionWrite(b, GEN_VERSION_LEGACY));
+
+		FILE* leaked = fopen(collide, "rb");
+		if (leaked) fclose(leaked);
+		CHECK(leaked == NULL);   // the check that goes red when the truncation comes back
+
+		v = 0xDEADu;
+		CHECK(genVersionResolve(a, &v) == GENVER_DAMAGED);
+		v = 0xDEADu;
+		CHECK(genVersionResolve(b, &v) == GENVER_DAMAGED);
+
+		remove(collide);
+	}
+	testRmTree(root);
+}
+
 static void testGenVersionSidecar(void)
 {
 	char dir[256];
@@ -10538,6 +10673,7 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testRegionCompactPowerCut();
 	testRegionCompactCache();
 	testRegionCompactKeepsPowerCutFallback();
+	testGenVersionPathTooLong();
 	testGenVersionSidecar();
 	testRmTree(testWorldDir());   // the per-process directory those eight worked in
 #endif
@@ -10589,6 +10725,20 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	// independent. The CHECK_QUIET in the new test's 121-column generation loop and in its
 	// legacy 3 x 3 loops contributes nothing while it passes, per the rule stated above.
 	//
+	// v1.8.3, genversion.c path-truncation fix: 5360 + 25 = 5385, from testGenVersionPathTooLong.
+	// Counted off the source first, then confirmed by the run -- and the count was WRONG on the
+	// first attempt for an honest reason worth recording: the scenario's third arm failed
+	// (`root 31, want 131` stopped at 130) because the directory builder could leave exactly one
+	// byte to fill, which only holds a separator. The guard reported 5385 both before and after
+	// that repair, because a FAILED check still counts as a check -- so the total agreeing is
+	// not by itself evidence the scenario worked, and the FAIL line is what said it had not.
+	//
+	//   +7  the boundary arm: build, length, write, read+value, resolve+value at 148 bytes.
+	//   +7  one byte over: build, write refuses, read DAMAGED + value, resolve DAMAGED + value,
+	//       genVersionRefuses.
+	//  +11  the collision arm: build parent, 3 snprintf-fits guards, 2 prefix/difference checks,
+	//       2 refused writes, 1 "nothing at the shared truncated name", 2 resolves.
+	//
 	// **Host only, and this is a real gap.** Nine tests above are inside `#ifndef __3DS__`
 	// and the console total is a different number, which cannot be measured right now: the
 	// devkitPro build is red tree-wide for an unrelated reason (source/world/block.h has
@@ -10597,18 +10747,18 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 #ifndef __3DS__
 	{
 		const int ran = s_checks;
-		if (ran != 5360)
+		if (ran != 5385)
 			printf("\nCHECK-COUNT GUARD: %d checks ran, %d expected.\n"
 			       "  %s\n"
 			       "  This is NOT an ordinary assertion failure.\n"
 			       "  Read the comment above this guard in world/world_test.c before"
 			       " touching the pinned number.\n",
-			       ran, 5360,
-			       ran < 5360
+			       ran, 5385,
+			       ran < 5385
 			           ? "Checks went MISSING: checks that should have run never ran at all."
 			           : "Extra checks appeared: either you added checks and did not update"
 			             " the pin, or something is emitting checks it should not.");
-		CHECK(ran == 5360);
+		CHECK(ran == 5385);
 	}
 #endif
 
