@@ -19,6 +19,12 @@
 #include <stdio.h>
 #include <string.h>
 
+#if defined(_WIN32)
+#include <process.h>   // _getpid — MinGW keeps it here, not in <unistd.h>
+#else
+#include <unistd.h>    // getpid
+#endif
+
 #include "world/block.h"
 #include "world/registry.h"
 
@@ -473,7 +479,26 @@ static void testRegistrySidecar(void)
 {
 	puts("registry: sidecar round-trip restores dynamic rows exactly");
 
-	static const char *const path = "build-host/registry_sidecar_probe.bin";
+	// Derived from the pid rather than the fixed "build-host/registry_sidecar_probe.bin" it
+	// used to be. tools/run_host_tests.sh already gives every binary a pid-scoped build
+	// directory, so two concurrent runs get two different EXECUTABLES writing to one shared
+	// SIDECAR -- and the remove() at the bottom of this function then lands between another
+	// run's save and its load.
+	//
+	// That is not a hypothetical: it is the measured cause of an earlier "FAIL 89 checks,
+	// 5 failed" on a suite that passed on re-run, and a flake that moves with system load is
+	// the worst kind to leave in, because the next person to see it spends the time ruling
+	// out whatever they had just changed. Same fix and same reasoning as world_test.c's
+	// testWorldDir(), which pid-scopes its region directory for exactly this history.
+	static char path[64];
+	if (path[0] == '\0') {
+#if defined(_WIN32)
+		const long pid = (long)_getpid();
+#else
+		const long pid = (long)getpid();
+#endif
+		snprintf(path, sizeof path, "build-host/registry_sidecar_probe-%ld.bin", pid);
+	}
 	registryInitCore();
 
 	BlockDef a = makeDef("side_a");
