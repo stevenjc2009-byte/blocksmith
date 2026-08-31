@@ -96,6 +96,15 @@ typedef enum {
 	// A sidecar is present and cannot be trusted — wrong magic, failed CRC, short or long.
 	// The world must NOT be entered. *out is left at WORLD_SEED_LEGACY, which the caller
 	// must not use: the status is the answer, not the value.
+	//
+	// Also returned when `world_dir` is so long that "<world_dir>/seed.bin" does not fit the
+	// path buffer, because then this module cannot tell whether a sidecar is present at all.
+	// It is the same answer for the same reason — a seed was intended here and cannot be
+	// read, so it stops — and it is deliberately NOT the "absent" answer: reporting a path
+	// that could not be built as "no sidecar" is a fault answered as a fact about the world's
+	// history, and it resolves to WORLD_SEED_LEGACY for a world that may have a minted seed.
+	// See world/worldseed.c's pathFor() for the measurement. Not a separate enumerator only
+	// because adding one is a world/genrefuse.h change, which that commit did not own.
 	WSEED_DAMAGED,
 
 	// No world directory at all (a joined server session). Not an error and not a refusal:

@@ -102,7 +102,18 @@ static void checkAt(bool cond, const char* what, int line)
 // This number must never be computed from a loop bound, a production constant, or anything else
 // the code under test can also move. Adding or removing a check means editing this by hand in
 // the same commit — the suite going red until you do is the review, not an accident.
-#define WORLDSEED_TEST_EXPECTED_CHECKS 186
+// v1.8.3, the path-buffer refusal: testSeedPathTooLongIsRefused adds 39 checks in four blocks —
+// 7 at the 150-character boundary that must still work, 9 one byte over it, 13 on the planted
+// neighbouring file, and 10 on the two directories that used to collapse onto one sidecar.
+// 186 + 39 = 225. Counted off the source by hand FIRST and confirmed against the run second,
+// in that order and not the other one.
+// Then +1, to 226, for the snprintf-fits check in the neighbour/155 block. That one is not a
+// claim about worldseed.c at all: `dir` is a char[256] and gcc cannot prove "/see" fits it, so
+// the file did not compile at all under -Werror=format-truncation until the return was used,
+// and using it is worth a check because it separates "the code under test is wrong" from "the
+// harness planted at a name it did not mean to". Found by this guard rather than by reading:
+// it printed "1 check(s) were ADDED - expected 225, ran 226", which is what it is for.
+#define WORLDSEED_TEST_EXPECTED_CHECKS 226
 
 // Deliberately NOT routed through CHECK(): it must not perturb the number it is testing, so it
 // bumps g_fails only. Copied in shape from world/tick_test.c's checkCountPin.
@@ -215,6 +226,62 @@ static void seedPoke(const char* dir, long off, const uint8_t* bytes, size_t len
 	if (!f) return;
 	if (fseek(f, off, SEEK_SET) == 0) fwrite(bytes, 1, len, f);
 	fclose(f);
+}
+
+// How many entries `dir` holds, ignoring . and .., or -1 if it cannot be listed. This is the
+// check that "nothing was written" is made of in the path-length test below, and it has to count
+// entries rather than ask for seed.bin specifically: the whole defect there is a write landing
+// under a DIFFERENT name, which a seedSize() of -1 cannot see.
+static int dirEntryCount(const char* dir)
+{
+	DIR* d = opendir(dir);
+	if (!d) return -1;
+
+	int n = 0;
+	for (const struct dirent* e = readdir(d); e; e = readdir(d)) {
+		if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+		n++;
+	}
+	closedir(d);
+	return n;
+}
+
+static bool plantFile(const char* path, const uint8_t* bytes, size_t n)
+{
+	FILE* f = fopen(path, "wb");
+	if (!f) return false;
+	const bool ok = fwrite(bytes, 1, n, f) == n;
+	return (fclose(f) == 0) && ok;
+}
+
+// Bytes of `path` into `buf`, or -1 if it will not open. Returns how many were read.
+static long readWholeFile(const char* path, uint8_t* buf, size_t cap)
+{
+	FILE* f = fopen(path, "rb");
+	if (!f) return -1;
+	const size_t n = fread(buf, 1, cap, f);
+	fclose(f);
+	return (long)n;
+}
+
+// A REAL directory under the sandbox whose full path is exactly `want` characters long, padded
+// with a single 'w' component ending in `tag` so two cases of the same length are two different
+// directories. False if the sandbox root is already too long for that, which is a broken fixture
+// rather than a failing assertion and is checked as one.
+static bool seedTestPaddedDir(char* out, size_t cap, size_t want, char tag)
+{
+	const size_t rootlen = strlen(g_root);
+	if (want < rootlen + 2 || want >= cap) return false;
+
+	memcpy(out, g_root, rootlen);
+	out[rootlen] = '/';
+	memset(out + rootlen + 1, 'w', want - rootlen - 1);
+	out[want - 1] = tag;
+	out[want]     = '\0';
+
+	testRmTree(out);
+	testMkdir(out);
+	return strlen(out) == want && dirEntryCount(out) == 0;
 }
 
 // A region file, i.e. the evidence that this world has been played. region.c names them
@@ -527,6 +594,218 @@ static void testSidecarDamagedFiveWays(void)
 	}
 
 	testRmTree(dir);
+}
+
+// ── The path buffer ──────────────────────────────────────────────────────────────────────
+//
+// worldseed.c builds "<world_dir>/seed.bin" into a fixed `char path[160]`. Until this test the
+// truncating branch was UNEXECUTED by the suite, not merely unasserted: every world_dir above is
+// a short sandbox path. It was not hypothetical either — it bit a live session host-testing from
+// a deep WSL path, and it was measured on the unfixed module before the fix went in:
+//
+//   dirlen  write  created-file  read-status  seed
+//      150  true   seed.bin      OK           0xFEEDFACE     <- the last length that works
+//      151  true   seed.bi       OK           0xFEEDFACE
+//      155  true   see           OK           0xFEEDFACE
+//
+// Every one reported SUCCESS, and that is the shape of the bug: the writer and the reader
+// truncate identically, so they agree with each other about the wrong filename and a round trip
+// reads back perfectly. Nothing in a PASS line can see it. Past 159 the directory half is cut as
+// well, and two world directories sharing their first 159 bytes become ONE world — writing
+// 0xAAAAAAAA into A and then resolving B, which had never been stamped, answered WSEED_OK with
+// 0xAAAAAAAA and threw B's own mint away. That is the landscape moving under a base the player
+// has already built, arriving as a success code, which is the single harm this module exists to
+// prevent.
+//
+// THE NUMBERS BELOW ARE HAND-WRITTEN LITERALS derived from `char path[160]` and "seed.bin":
+// 160 - 1 (NUL) - 1 ('/') - 8 ("seed.bin") = 150 is the longest world_dir that fits, and 159 is
+// the longest path that can be written. They are deliberately NOT derived from anything
+// worldseed.c exports — a check parameterised by the thing under test cannot detect that thing
+// moving. If that buffer is ever resized these go red, and that is the review, not an accident.
+//
+// Note what is NOT asserted here: that the buffer is 160. Widening it is not the fix and does not
+// need to be forbidden; refusing what does not fit is the fix, and refusing is what every check
+// below is about.
+static void testSeedPathTooLongIsRefused(void)
+{
+	char dir[256];
+	uint32_t v;
+
+	// ── 150: the last world_dir that fits. Everything must still work. ───────────────────
+	//
+	// The near half of the boundary, and the reason it is here is that a "fix" which refuses
+	// one byte too early is a fix that stops opening perfectly good worlds. An off-by-one in
+	// either direction has to be visible.
+	{
+		const uint32_t kFits = 0x15150150u;
+		CHECK(seedTestPaddedDir(dir, sizeof dir, 150, 'a'),
+		      "boundary: a real 150-character world directory exists and starts empty");
+		CHECK(worldSeedWrite(dir, kFits),
+		      "boundary/150: the sidecar write succeeds - 150 + '/' + 'seed.bin' + NUL is exactly "
+		      "160 and fits");
+		CHECK(seedSize(dir) == WORLD_SEED_BYTES,
+		      "boundary/150: and lands in seed.bin at the full 12 bytes");
+		v = 0xDEADBEEFu;
+		CHECK(worldSeedRead(dir, &v) == WSEED_OK, "boundary/150: and reads back OK");
+		CHECK(v == kFits, "boundary/150: with the seed it was given");
+		v = 0xDEADBEEFu;
+		CHECK(worldSeedResolve(dir, true, 0x77770000u, &v) == WSEED_OK,
+		      "boundary/150: and resolve reads the sidecar rather than minting");
+		CHECK(v == kFits, "boundary/150: returning the stored seed");
+		testRmTree(dir);
+	}
+
+	// ── 151: one byte over. Refused, and NOTHING is created under any name. ──────────────
+	//
+	// On the unfixed module this wrote a 12-byte record into a file called "seed.bi" and
+	// answered true. seedSize() cannot see that — it asks for seed.bin — so the "nothing was
+	// written" claim is made with a directory listing instead.
+	{
+		CHECK(seedTestPaddedDir(dir, sizeof dir, 151, 'b'),
+		      "over/151: a real 151-character world directory exists and starts empty");
+		CHECK(!worldSeedWrite(dir, 0x0BADBAD0u),
+		      "over/151: the write is REFUSED rather than performed into a truncated name");
+		CHECK(dirEntryCount(dir) == 0,
+		      "over/151: and the directory is still EMPTY - not a file called seed.bi, which is "
+		      "what a truncating write leaves behind and what seedSize() cannot see");
+		CHECK(seedSize(dir) == -1, "over/151: there is no seed.bin either");
+
+		v = 0xDEADBEEFu;
+		CHECK(worldSeedRead(dir, &v) == WSEED_DAMAGED,
+		      "over/151: the read REFUSES rather than reporting WSEED_OK - 'the path did not fit' "
+		      "is not 'this world has no sidecar'");
+		CHECK(v == WORLD_SEED_LEGACY,
+		      "over/151: and leaves *out at the legacy seed, which the caller must not use");
+
+		v = 0xDEADBEEFu;
+		CHECK(worldSeedResolve(dir, true, 0x5EED5EEDu, &v) == WSEED_DAMAGED,
+		      "over/151: resolve refuses too, rather than minting for a world it cannot inspect");
+		CHECK(v != 0x5EED5EEDu, "over/151: and does not report the mint it was offered");
+		CHECK(dirEntryCount(dir) == 0,
+		      "over/151: and the refused resolve created nothing either");
+		testRmTree(dir);
+	}
+
+	// ── 155: the truncated name is a REAL file, and it is somebody else's. ───────────────
+	//
+	// "<dir>/seed.bin" at dirlen 155 is 164 characters, truncated to 159: "<dir>/see". A file of
+	// that name is planted with a GENUINE record — produced by worldSeedWrite in a short
+	// directory, not hand-built — so that the unfixed behaviour is not "an open that fails" but
+	// "an open that succeeds and answers about the wrong file". That is the whole point of
+	// refusing instead of truncating, and it is the only case here that can show it.
+	{
+		const uint32_t kPlanted = 0xFEEDFACEu;
+		uint8_t record[WORLD_SEED_BYTES];
+
+		char src[256];
+		seedTestDir(src, sizeof src, "neighbour-src");
+		CHECK(worldSeedWrite(src, kPlanted), "neighbour: a genuine 12-byte record is produced");
+		{
+			char sp[256];
+			seedPath(sp, sizeof sp, src);
+			CHECK(readWholeFile(sp, record, sizeof record) == WORLD_SEED_BYTES,
+			      "neighbour: and its twelve bytes are read back out");
+		}
+		testRmTree(src);
+
+		CHECK(seedTestPaddedDir(dir, sizeof dir, 155, 'c'),
+		      "neighbour/155: a real 155-character world directory exists and starts empty");
+
+		// snprintf's return is USED rather than discarded, which is not decoration here: `dir`
+		// is a char[256] and gcc cannot prove the "/see" suffix fits it, so discarding the
+		// return is -Werror=format-truncation at -Wall and this file does not compile. That is
+		// the same warning, asking for the same thing, as the one that motivates the fix under
+		// test -- so the test buffer is held to the contract the production buffer now is.
+		char victim[256];
+		const int victim_n = snprintf(victim, sizeof victim, "%s/see", dir);
+		CHECK(victim_n > 0 && (size_t)victim_n < sizeof victim,
+		      "neighbour/155: the truncated name this test plants at fits the test's own buffer, "
+		      "so a failure below is the code under test and not the harness");
+		CHECK(plantFile(victim, record, sizeof record),
+		      "neighbour/155: the file the truncated path names, '<dir>/see', is planted with it");
+
+		v = 0xDEADBEEFu;
+		CHECK(worldSeedRead(dir, &v) == WSEED_DAMAGED,
+		      "neighbour/155: the read REFUSES - the neighbour opens perfectly well and parses "
+		      "perfectly well, and it is still not this world's sidecar");
+		CHECK(v != kPlanted,
+		      "neighbour/155: and specifically does NOT report the neighbour's seed as this "
+		      "world's, which is the silent wrong answer the refusal exists to stop");
+		CHECK(v == WORLD_SEED_LEGACY, "neighbour/155: *out is left at the legacy seed");
+
+		v = 0xDEADBEEFu;
+		CHECK(worldSeedResolve(dir, true, 0x24242424u, &v) == WSEED_DAMAGED,
+		      "neighbour/155: resolve refuses on the same evidence");
+		CHECK(v != kPlanted, "neighbour/155: and does not adopt the neighbour's seed either");
+
+		CHECK(!worldSeedWrite(dir, 0x31313131u),
+		      "neighbour/155: and a write is refused rather than landing on top of it");
+
+		uint8_t after[WORLD_SEED_BYTES + 4];
+		const long got = readWholeFile(victim, after, sizeof after);
+		CHECK(got == WORLD_SEED_BYTES,
+		      "neighbour/155: the neighbouring file is still exactly twelve bytes");
+		CHECK(got == WORLD_SEED_BYTES && memcmp(after, record, WORLD_SEED_BYTES) == 0,
+		      "neighbour/155: and byte-for-byte what was planted - a refused write CLOBBERED it "
+		      "before this fix");
+		CHECK(dirEntryCount(dir) == 1,
+		      "neighbour/155: and nothing new appeared beside it");
+		testRmTree(dir);
+	}
+
+	// ── Two worlds, one sidecar. The catastrophic shape. ─────────────────────────────────
+	//
+	// Both directories are 170 characters and differ only at byte 159 — past the 159 the buffer
+	// can hold, so the truncated path is IDENTICAL for the two of them. On the unfixed module
+	// that made them the same world: A's seed was written and B, which had never been stamped,
+	// read it straight back as its own and discarded its mint. Different landscape, no error.
+	{
+		const uint32_t kA = 0xAAAAAAAAu;
+		char a[256], b[256];
+		const size_t rootlen = strlen(g_root);
+		const size_t want    = 170;
+
+		CHECK(rootlen + 1 < 159 && 159 < want,
+		      "collision: the fixture's differing byte falls inside the padding, past the 159 "
+		      "characters the path buffer can hold");
+
+		memcpy(a, g_root, rootlen);
+		a[rootlen] = '/';
+		memset(a + rootlen + 1, 'w', want - rootlen - 1);
+		a[want] = '\0';
+		memcpy(b, a, want + 1);
+		a[159] = 'A';
+		b[159] = 'B';
+		testRmTree(a); testMkdir(a);
+		testRmTree(b); testMkdir(b);
+
+		CHECK(strlen(a) == want && strlen(b) == want && strcmp(a, b) != 0,
+		      "collision: two DIFFERENT 170-character world directories");
+		CHECK(memcmp(a, b, 159) == 0,
+		      "collision: identical for the first 159 bytes, so a truncated path cannot tell them "
+		      "apart");
+		CHECK(dirEntryCount(a) == 0 && dirEntryCount(b) == 0,
+		      "collision: both exist on disk and both start empty");
+
+		CHECK(!worldSeedWrite(a, kA),
+		      "collision: stamping A is refused rather than writing to the shared truncated name");
+
+		v = 0xDEADBEEFu;
+		CHECK(worldSeedRead(b, &v) == WSEED_DAMAGED,
+		      "collision: reading B refuses");
+		CHECK(v != kA,
+		      "collision: and B does NOT come back holding A's seed - two worlds sharing one "
+		      "sidecar is the same landscape under two different bases");
+
+		v = 0xDEADBEEFu;
+		CHECK(worldSeedResolve(b, true, 0xBBBBBBBBu, &v) == WSEED_DAMAGED,
+		      "collision: resolving B refuses");
+		CHECK(v != kA, "collision: and still does not adopt A's seed");
+		CHECK(seedSize(b) == -1, "collision: and B was given no sidecar of its own");
+
+		testRmTree(a);
+		testRmTree(b);
+	}
 }
 
 // ── The two history branches ─────────────────────────────────────────────────────────────
@@ -883,6 +1162,7 @@ int main(void)
 
 	testSidecarRoundTrip();
 	testSidecarDamagedFiveWays();
+	testSeedPathTooLongIsRefused();
 
 	testResolveBrandNewWorldMints();
 	testResolveBrandNewWorldKeepsItsSeedAfterSaving();

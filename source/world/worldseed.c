@@ -14,9 +14,44 @@
 // construction, exactly as world/genversion.c argues for its own magic.
 static const uint8_t WSEED_MAGIC[4] = {'B', 'S', 'S', 'D'};
 
-static void pathFor(char* out, size_t cap, const char* world_dir)
+// Builds "<world_dir>/seed.bin". Answers false, and leaves `out` empty, when it does not fit.
+//
+// The truncation is REFUSED rather than performed, and that is the whole point: a truncated
+// path is not a broken path, it is a perfectly openable name for a DIFFERENT file. This was
+// measured on the unfixed code rather than argued, at cap 160:
+//
+//   dirlen  write  created-file  read-status  seed
+//      150  true   seed.bin      OK           0xFEEDFACE     <- the last length that works
+//      151  true   seed.bi       OK           0xFEEDFACE
+//      155  true   see           OK           0xFEEDFACE
+//
+// Every one of those reported success. The writer and the reader truncate identically, so they
+// agree with each other about the wrong name and a round-trip reads back perfectly — which is
+// exactly why nothing caught it. Worse, past 159 the DIRECTORY half is cut too, and two world
+// directories sharing their first 159 bytes become one world: writing 0xAAAAAAAA into A and
+// then resolving B, which has never been stamped, answered WSEED_OK with 0xAAAAAAAA and B's
+// own mint discarded. That is the landscape moving under a base the player has already built,
+// which is the single harm this file exists to prevent, arriving as a success code.
+//
+// Widening `out` is not the fix and was rejected. It moves the cliff without removing it;
+// there is no width at which "it fits" is a property of this code rather than of today's
+// callers. It also gives up the diagnostic: -Wformat-truncation at level 1 — the level -Wall
+// turns on — fires precisely when snprintf's result is UNUSED, i.e. when the code cannot tell
+// whether it truncated, so USING the result is the fix the warning asks for. Same shape and
+// same reasoning as 1a3c7e4's genverStampPath() one module over.
+//
+// An empty `out` is the refusal because it is the one name no fopen can mistake for a
+// neighbour. It is a belt-and-braces second line only: all three callers below check the bool
+// and stop before they ever open it. At cap 0 there is nowhere to put even the NUL, so nothing
+// is written at all.
+static bool pathFor(char* out, size_t cap, const char* world_dir)
 {
-	snprintf(out, cap, "%s/%s", world_dir, WORLD_SEED_FILE);
+	const int n = snprintf(out, cap, "%s/%s", world_dir, WORLD_SEED_FILE);
+	if (n < 0 || (size_t)n >= cap) {
+		if (cap) out[0] = '\0';
+		return false;
+	}
+	return true;
 }
 
 // ── Minting ───────────────────────────────────────────────────────────────────────────
@@ -82,8 +117,12 @@ bool worldSeedWrite(const char* world_dir, uint32_t seed)
 	buf[10] = (uint8_t)((crc >> 16) & 0xFFu);
 	buf[11] = (uint8_t)((crc >> 24) & 0xFFu);
 
+	// A path that does not fit is a refused write, not a write somewhere else. Reported through
+	// the return value the header already documents as "false on any IO failure", so
+	// worldSeedResolve's brand-new branch turns it into WSEED_STAMP_FAILED and the world does
+	// not open — rather than stamping a neighbouring file and reporting success.
 	char path[160];
-	pathFor(path, sizeof path, world_dir);
+	if (!pathFor(path, sizeof path, world_dir)) return false;
 
 	// One fwrite of a fixed 12 bytes, no double-buffering, for world/genversion.c's stated
 	// reason: the file is written once in a world's whole life, so the torn-write window is
@@ -105,8 +144,21 @@ WorldSeedStatus worldSeedRead(const char* world_dir, uint32_t* out)
 
 	if (!world_dir || !*world_dir) return WSEED_NO_WORLD_DIR;
 
+	// THE SILENT FAILURE THIS FUNCTION USED TO HAVE, and the reason the refusal cannot simply
+	// fall through to the fopen below. A truncated path that does not happen to open would
+	// reach the `if (!f)` branch and be reported as WSEED_OK / "no sidecar" — a fault answered
+	// as a fact about history, which main.c then turns into WORLD_SEED_LEGACY for a world that
+	// may have a minted seed. A truncated path that DOES open is worse still: it reports some
+	// other file's seed as this world's. Neither is a question this function can answer, so it
+	// stops instead.
+	//
+	// WSEED_DAMAGED rather than a status of its own: the enum's refusals are routed by
+	// world/genrefuse.h's switch, that file is not this commit's to edit, and DAMAGED is the
+	// one that already means "a seed was intended here and cannot be trusted, do not enter the
+	// world" — which is precisely the situation. *out stays at WORLD_SEED_LEGACY, as the header
+	// documents for DAMAGED: the status is the answer, not the value.
 	char path[160];
-	pathFor(path, sizeof path, world_dir);
+	if (!pathFor(path, sizeof path, world_dir)) return WSEED_DAMAGED;
 
 	FILE* f = fopen(path, "rb");
 	if (!f) {
@@ -153,8 +205,13 @@ WorldSeedStatus worldSeedResolve(const char* world_dir, bool mint_ok, uint32_t m
 	// "unreadable" are the same WSEED_DAMAGED-or-OK pair to a reader and completely
 	// different questions here.
 	{
+		// Refused here too, and not left to the two branches below. A path that does not fit
+		// makes the probe unable to say whether a sidecar exists, and BOTH of the answers it
+		// would otherwise fall through to are wrong for a world that has one: the played
+		// branch stamps it LEGACY and the brand-new branch mints over it. Same status and
+		// same reasoning as worldSeedRead's refusal above.
 		char path[160];
-		pathFor(path, sizeof path, world_dir);
+		if (!pathFor(path, sizeof path, world_dir)) return WSEED_DAMAGED;
 		FILE* f = fopen(path, "rb");
 		if (f) {
 			fclose(f);
