@@ -75,10 +75,32 @@ static int slotOf(int32_t cx, int32_t cz)
 	return (int)((cz & (REGION_DIM - 1)) * REGION_DIM + (cx & (REGION_DIM - 1)));
 }
 
-static void regionPath(char* out, size_t cap, const char* world_dir, int32_t rx, int32_t rz,
+// Returns false, and leaves `out` empty, when the joined path does not fit.
+//
+// Fourth and last copy of a defect that travelled by clone through world/worldseed.c,
+// world/daytime.c and world/genversion.c: discarding snprintf's return does not produce a
+// broken path, it produces a perfectly openable name for a DIFFERENT file. The writer and
+// the reader truncate identically, so they agree about the wrong name and every round trip
+// looks healthy. It only bites once the cut reaches past the directory half, and here that
+// is worse than in the sidecars: this is the region file, so a collision would let one world
+// read another's chunks, and regionRecover's rename/remove pair would act on them.
+//
+// UNREACHABLE with a console-valid world directory, and said plainly rather than left for
+// someone to assume otherwise. app/worker.c:89 holds the world directory in char[128] and
+// app/worker.c:332 rejects anything longer; the console builds it as "sdmc:/blocksmith/worlds/"
+// (24) plus a name scene/worldlist.h:30 caps at 31, so 55 bytes, and the longest suffix this
+// function appends is "/r." + two longs + ".bsr", 30 bytes. 85 of 256. What the guard covers
+// is the host suites, which construct directory names directly, and any future caller that
+// does not come through workerSetWorldDir.
+static bool regionPath(char* out, size_t cap, const char* world_dir, int32_t rx, int32_t rz,
                        const char* ext)
 {
-	snprintf(out, cap, "%s/r.%ld.%ld.%s", world_dir, (long)rx, (long)rz, ext);
+	const int n = snprintf(out, cap, "%s/r.%ld.%ld.%s", world_dir, (long)rx, (long)rz, ext);
+	if (n < 0 || (size_t)n >= cap) {
+		if (cap) out[0] = '\0';
+		return false;
+	}
+	return true;
 }
 
 // ── Directory read and write ──────────────────────────────────────────────────────────
@@ -303,9 +325,16 @@ static bool fileExists(const char* path)
 static void regionRecover(const char* world_dir, int32_t rx, int32_t rz)
 {
 	char src[256], tmp[256], bak[256];
-	regionPath(src, sizeof(src), world_dir, rx, rz, "bsr");
-	regionPath(tmp, sizeof(tmp), world_dir, rx, rz, "tmp");
-	regionPath(bak, sizeof(bak), world_dir, rx, rz, "bak");
+	// Doing nothing is the whole answer here. This function is best-effort recovery already —
+	// it returns silently when there is nothing to resolve — and it is the only place in the
+	// file that calls remove() and rename(). Acting on a truncated name would delete or
+	// overwrite whichever region happened to share the prefix, which is the one outcome worse
+	// than leaving an interrupted compaction where it lies for the next boot to find.
+	if (!regionPath(src, sizeof(src), world_dir, rx, rz, "bsr") ||
+	    !regionPath(tmp, sizeof(tmp), world_dir, rx, rz, "tmp") ||
+	    !regionPath(bak, sizeof(bak), world_dir, rx, rz, "bak")) {
+		return;
+	}
 
 	if (fileExists(bak)) {
 		// Either way the .tmp is worthless: it has either been promoted already or it is
@@ -340,7 +369,12 @@ static FILE* openRegion(const char* world_dir, int32_t rx, int32_t rz, bool crea
 	if (create) regionCacheClose();
 
 	regionRecover(world_dir, rx, rz);
-	regionPath(path, sizeof(path), world_dir, rx, rz, "bsr");
+	// NULL is already every caller's "this region is not available" answer — the three call
+	// sites at regionWriteColumn, regionReadColumn and cacheFill all test it — so a refusal
+	// needs nothing downstream. A writer reports the save as failed rather than writing into
+	// another region's file; a reader reports no data rather than serving another region's
+	// columns as this one's.
+	if (!regionPath(path, sizeof(path), world_dir, rx, rz, "bsr")) return NULL;
 
 	PROBE_BUMP(g_region_fopens);
 	FILE* f = fopen(path, "r+b");
@@ -569,9 +603,15 @@ bool regionCompact(const char* world_dir, int32_t rx, int32_t rz)
 	regionCacheClose();
 
 	char src[256], tmp[256], bak[256];
-	regionPath(src, sizeof(src), world_dir, rx, rz, "bsr");
-	regionPath(tmp, sizeof(tmp), world_dir, rx, rz, "tmp");
-	regionPath(bak, sizeof(bak), world_dir, rx, rz, "bak");
+	// false is already this function's "not worth doing" answer — it returns false when the
+	// file is not wasteful enough to repack — and compaction is an optimisation, so declining
+	// it costs a world nothing but disk. The alternative is a rename() of a truncated name,
+	// which would move one world's live region file on top of another's.
+	if (!regionPath(src, sizeof(src), world_dir, rx, rz, "bsr") ||
+	    !regionPath(tmp, sizeof(tmp), world_dir, rx, rz, "tmp") ||
+	    !regionPath(bak, sizeof(bak), world_dir, rx, rz, "bak")) {
+		return false;
+	}
 
 	// This is the one entry point into region.c that does not go through openRegion, so it
 	// does its own recovery: a .bak or .tmp left by an interrupted compaction has to be

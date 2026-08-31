@@ -9962,8 +9962,14 @@ static void testGenverStampPath(void)
 
 // Builds a REAL directory whose whole PATH is exactly `want` bytes, nesting components under
 // testWorldDir() so every parent exists. A path length is not a name length, and the cliff in
-// genversion.c is on the joined path, so the only honest way to reach it is to build one.
-static bool genverDirOfLength(char* out, size_t out_cap, const char* root, size_t want)
+// genversion.c and region.c is on the joined path, so the only honest way to reach it is to
+// build one.
+//
+// Named for what it does rather than for its first caller, and shared by both path-truncation
+// tests deliberately. A second copy taken for region.c would have been the fifth instance of
+// exactly the defect these two tests exist to pin: this project has now lost four rounds to a
+// helper that was cloned instead of called.
+static bool testDirOfLength(char* out, size_t out_cap, const char* root, size_t want)
 {
 	testMkdir("build-host");
 	testMkdir(testWorldDir());
@@ -9992,6 +9998,147 @@ static bool genverDirOfLength(char* out, size_t out_cap, const char* root, size_
 	return strlen(out) == want;
 }
 
+// v1.8.3: region.c's regionPath() discarded snprintf's return — the fourth and last copy of
+// the defect, and the worst-placed one. The sidecars hold a seed, a clock or a stamp; this
+// holds the player's chunks. A collision here does not just mix two worlds' data on read, it
+// puts regionRecover's remove() and rename() on the wrong file.
+//
+// The guard is UNREACHABLE from the console and this test says so rather than implying a live
+// bug was caught: app/worker.c:332 rejects a world directory that does not fit char[128], and
+// the console builds one of 55 bytes at most against a 256-byte region buffer. What is pinned
+// here is the guard itself, for the host suites and for the next caller.
+static void testRegionPathTooLong(void)
+{
+	// Measured from the code under test, not pinned, so this keeps meaning something if the
+	// buffer or the name format move. The buffer is the one number not readable from a header.
+	const size_t cap    = 256;              // char src/tmp/bak/path[256] in region.c
+	const size_t suffix = strlen("/r.0.0.bsr");
+	const size_t fits   = cap - 1 - suffix;
+	printf("  region path: buffer %zu, suffix \"/r.0.0.bsr\" is %zu, longest dir that fits %zu\n",
+	       cap, suffix, fits);
+
+	char root[128];
+	snprintf(root, sizeof root, "%s/rg-len", testWorldDir());
+	testRmTree(root);
+
+	const uint8_t payload_a[8] = {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7};
+	const uint8_t payload_b[8] = {0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7};
+	char    dir[512];
+	uint8_t back[64];
+
+	regionCacheClose();
+
+	// The last length that works. A refusal firing one byte early would pass every check
+	// below while refusing to save worlds that are perfectly legal, and nothing else in this
+	// suite uses a directory long enough to notice. This is the control: it stays green in
+	// the red arm, because the bug and the fix agree about every path that fits.
+	CHECK(testDirOfLength(dir, sizeof dir, root, fits));
+	CHECK(strlen(dir) == fits);
+	CHECK(regionWriteColumn(dir, 0, 0, payload_a, sizeof payload_a));
+	CHECK(regionReadColumn(dir, 0, 0, back, sizeof back) == sizeof payload_a);
+	CHECK(memcmp(back, payload_a, sizeof payload_a) == 0);
+	regionCacheClose();
+	testRmTree(root);
+
+	// One byte past it. false and 0 are already every caller's "this region is unavailable"
+	// answer, so the refusal needs nothing downstream — see the three call sites in region.c.
+	CHECK(testDirOfLength(dir, sizeof dir, root, fits + 1));
+	CHECK(!regionWriteColumn(dir, 0, 0, payload_a, sizeof payload_a));
+	CHECK(regionReadColumn(dir, 0, 0, back, sizeof back) == 0);
+	CHECK(!regionCompact(dir, 0, 0));
+	regionCacheClose();
+	testRmTree(root);
+
+	// The showstopper, and the reason truncating the FILENAME alone is not the interesting
+	// case: that only ever makes a wrong file inside the RIGHT directory. Once the joined path
+	// passes cap-1 the DIRECTORY half is cut too, and two worlds agreeing on their first cap-1
+	// bytes both resolve to ONE region file in their common parent.
+	{
+		char parent[512];
+		const size_t child_name = 34;                       // differs only in its LAST byte
+		const size_t parent_len = cap + 6 - 1 - child_name;
+		CHECK(testDirOfLength(parent, sizeof parent, root, parent_len));
+
+		char a[512], b[512];
+		// snprintf's return is used at every site here, and in a test about exactly that it
+		// had better be: gcc cannot prove these joins fit char[512], so discarding it is
+		// -Werror=format-truncation and this file stops compiling.
+		const int an = snprintf(a, sizeof a, "%s/", parent);
+		CHECK(an > 0 && (size_t)an < sizeof a);
+		for (size_t i = 1; i < child_name; i++) strcat(a, "c");
+		const int bn = snprintf(b, sizeof b, "%s", a);
+		CHECK(bn > 0 && (size_t)bn < sizeof b);
+		strcat(a, "A");
+		strcat(b, "B");
+		testMkdir(a);
+		testMkdir(b);
+
+		CHECK(strncmp(a, b, cap - 1) == 0);   // identical for the whole buffer
+		CHECK(strcmp(a, b) != 0);             // and still two different directories
+
+		// The name the OLD code built for BOTH: the joined path, cut at the buffer. Built
+		// here rather than assumed, so the check below is looking for the real collision file.
+		char collide[512];
+		const int cn = snprintf(collide, sizeof collide, "%s/r.0.0.bsr", a);
+		CHECK(cn > 0 && (size_t)cn < sizeof collide);
+		collide[cap - 1] = '\0';
+		remove(collide);
+
+		regionCacheClose();
+		CHECK(!regionWriteColumn(a, 0, 0, payload_a, sizeof payload_a));
+		CHECK(!regionWriteColumn(b, 0, 0, payload_b, sizeof payload_b));
+
+		FILE* leaked = fopen(collide, "rb");
+		if (leaked) fclose(leaked);
+		CHECK(leaked == NULL);   // the check that goes red when the truncation comes back
+
+		// What the red arm actually does, which is worse than serving the wrong chunk, and is
+		// recorded here because the first version of this test got it wrong. Two checks stood
+		// here asserting that a read of `a` and a read of `b` both return 0. Both PASSED with
+		// the guard removed, so they proved nothing and had to go: they were neutralised, not
+		// satisfied. The reason is regionRecover. It builds three names — .bsr, .tmp and .bak —
+		// and truncation at cap-1 cuts the extension off ALL THREE, so they collapse into one
+		// identical string. fileExists(bak) is then true because it IS the region file, the
+		// remove(tmp) on the next line DELETES it, and fileExists(src) is now false so the
+		// rename(bak, src) that should have put it back has nothing to move. Opening a region
+		// for READING destroys it.
+		//
+		// So the discriminating check is not what a read returns, it is whether a file that was
+		// there before the read is still there after it. Made by hand rather than reused from
+		// above, because in the fixed arm the writes above create nothing at all.
+		regionCacheClose();
+		{
+			FILE* planted = fopen(collide, "wb");
+			CHECK(planted != NULL);
+			if (planted) {
+				CHECK(fwrite(payload_b, 1, sizeof payload_b, planted) == sizeof payload_b);
+				fclose(planted);
+			}
+
+			// Return value deliberately not asserted: it is 0 in both arms, for two different
+			// reasons, and asserting it would put a second non-discriminating check back.
+			(void)regionReadColumn(a, 0, 0, back, sizeof back);
+
+			FILE* survived = fopen(collide, "rb");
+			if (survived) fclose(survived);
+			// GREEN: regionPath refused, regionRecover returned without touching anything, the
+			// planted file is untouched. RED: the read deleted a file belonging to a directory
+			// it was never asked about.
+			CHECK(survived != NULL);
+		}
+		regionCacheClose();
+
+		// Not a discriminator and labelled as one would be a lie: with the guard removed
+		// regionCompact opens a truncated source that does not exist, fopen fails, and it
+		// returns false for its own reasons. Kept because a refusal must still be a clean
+		// false rather than a crash or a rename of the wrong file.
+		CHECK(!regionCompact(a, 0, 0));
+
+		remove(collide);
+	}
+	testRmTree(root);
+}
+
 // v1.8.3: genversion.c's pathFor() discarded snprintf's return, the same defect world/
 // worldseed.c carried until 10d176f. A truncated path is not a broken path — it is an
 // openable name for a DIFFERENT file, and writer and reader truncate identically, so they
@@ -10018,7 +10165,7 @@ static void testGenVersionPathTooLong(void)
 	// The last length that works. Not decoration: a refusal firing one byte early would pass
 	// every check below while breaking worlds that are perfectly legal, and nothing else in
 	// this suite uses a directory long enough to notice.
-	CHECK(genverDirOfLength(dir, sizeof dir, root, fits));
+	CHECK(testDirOfLength(dir, sizeof dir, root, fits));
 	CHECK(strlen(dir) == fits);
 	CHECK(genVersionWrite(dir, GEN_VERSION_DENSITY));
 	v = 0xDEADu;
@@ -10032,7 +10179,7 @@ static void testGenVersionPathTooLong(void)
 	// One byte past it. GENVER_DAMAGED and not GENVER_OK: the absent-stamp branch answers
 	// OK/LEGACY on purpose, so a refusal falling through to it would be invisible AND would
 	// hand back the one answer that rewrites terrain.
-	CHECK(genverDirOfLength(dir, sizeof dir, root, fits + 1));
+	CHECK(testDirOfLength(dir, sizeof dir, root, fits + 1));
 	CHECK(!genVersionWrite(dir, GEN_VERSION_DENSITY));
 	v = 0xDEADu;
 	CHECK(genVersionRead(dir, &v) == GENVER_DAMAGED);
@@ -10051,7 +10198,7 @@ static void testGenVersionPathTooLong(void)
 		char parent[512];
 		const size_t child_name = 34;                       // differs only in its LAST byte
 		const size_t parent_len = cap + 6 - 1 - child_name;
-		CHECK(genverDirOfLength(parent, sizeof parent, root, parent_len));
+		CHECK(testDirOfLength(parent, sizeof parent, root, parent_len));
 
 		char a[512], b[512];
 		// snprintf's return is USED at every site here, and in a test about exactly that it
@@ -10673,6 +10820,7 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testRegionCompactPowerCut();
 	testRegionCompactCache();
 	testRegionCompactKeepsPowerCutFallback();
+	testRegionPathTooLong();
 	testGenVersionPathTooLong();
 	testGenVersionSidecar();
 	testRmTree(testWorldDir());   // the per-process directory those eight worked in
@@ -10739,26 +10887,43 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	//  +11  the collision arm: build parent, 3 snprintf-fits guards, 2 prefix/difference checks,
 	//       2 refused writes, 1 "nothing at the shared truncated name", 2 resolves.
 	//
-	// **Host only, and this is a real gap.** Nine tests above are inside `#ifndef __3DS__`
-	// and the console total is a different number, which cannot be measured right now: the
-	// devkitPro build is red tree-wide for an unrelated reason (source/world/block.h has
-	// drifted from its vendored server copy). A console-side pin needs its own measured
-	// literal and is not guessable from this one.
+	// v1.8.3, region.c path-truncation fix: 5385 + 22 = 5407, from testRegionPathTooLong.
+	// region.c is the fourth and last copy of the same defect. The first two arms mirror the
+	// genversion ones because the failure mode is identical; the third does NOT, and the
+	// difference was found by reading the red arm rather than its count. 20 was the first
+	// number here, and two of those 20 were checks that PASSED with the bug present -- see the
+	// long note in the collision arm. They are gone, replaced by three that cannot pass by luck.
+	//
+	//   +5  the boundary arm at 245 bytes: build, length, write, read length, payload compare.
+	//   +4  one byte over: build, write refuses, read returns 0, compact refuses.
+	//  +13  the collision arm: build parent, 3 snprintf-fits guards, 2 prefix/difference
+	//       checks, 2 refused writes, 1 "nothing at the shared truncated name", 3 for the
+	//       planted file that a READ must not delete, 1 refused compact.
+	//
+	// **Host only, and this is a real gap.** Ten tests above are inside `#ifndef __3DS__` and
+	// the console total is a different number, which is still unmeasured. The reason recorded
+	// here previously -- that the devkitPro build was red tree-wide because source/world/block.h
+	// had drifted from its vendored server copy -- is no longer true and is corrected rather
+	// than left to mislead: measured 2026-08-31 23:36, `make clean` then `make -j4` from
+	// devkitPro MSYS2 gave BUILD_RC=0 with 0 warnings and 0 errors, and `make check-world-drift`
+	// returned 0 with all 11 mirrored files byte-for-byte identical. What is still missing is
+	// only the console-side pin itself: it needs its own measured literal and is not guessable
+	// from this one, because the count depends on which tests the ifndef excludes.
 #ifndef __3DS__
 	{
 		const int ran = s_checks;
-		if (ran != 5385)
+		if (ran != 5407)
 			printf("\nCHECK-COUNT GUARD: %d checks ran, %d expected.\n"
 			       "  %s\n"
 			       "  This is NOT an ordinary assertion failure.\n"
 			       "  Read the comment above this guard in world/world_test.c before"
 			       " touching the pinned number.\n",
-			       ran, 5385,
-			       ran < 5385
+			       ran, 5407,
+			       ran < 5407
 			           ? "Checks went MISSING: checks that should have run never ran at all."
 			           : "Extra checks appeared: either you added checks and did not update"
 			             " the pin, or something is emitting checks it should not.");
-		CHECK(ran == 5385);
+		CHECK(ran == 5407);
 	}
 #endif
 
