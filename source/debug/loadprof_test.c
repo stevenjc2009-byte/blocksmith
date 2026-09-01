@@ -616,8 +616,37 @@ int main(void)
 	//   * GEN_VERSION_LEGACY did not move: the same probe run with genv 1 printed
 	//     0x5261168a27a7fa18 / 0xb5dca6b8b125ef35 against BOTH commits, so no existing
 	//     pre-v1.7.0 save re-generates.
-	CHECK(hash_fresh  == 0xb51487523ffaaf9bULL);
-	CHECK(hash_reload == 0x4a9b3a1d2fffd77aULL);
+	//
+	// ── WHY THEY MOVED A THIRD TIME (2026-08-31) ─────────────────────────────────────
+	//
+	// They were 0xb51487523ffaaf9b / 0x4a9b3a1d2fffd77a. Roadmap task 52, "per-biome
+	// tree silhouettes", gave every biome its own trunk range, canopy width range and
+	// crown shape (round / conifer / broad) plus a 2 x 2 jungle trunk, so biome worlds
+	// grow different foliage than they used to. That is precisely the change this pin
+	// exists to notice, and it went red as it is supposed to.
+	//
+	// Not re-derived from a standalone probe this time. A probe is what you build when
+	// the failing value cannot be trusted to have come from the code under test; here
+	// the suite prints the pair it computed itself, on the same ring it always uses:
+	//
+	//   identity  fresh=e959bfae490df573  reload=f4bc0b9d80bb2f8e
+	//
+	// The two literals below are that line, transcribed. What makes them safe to take
+	// at face value is the A/B cell census run against the parent commit c8c9e90 over
+	// the same 81-column ring of seed 1337, 2,654,208 cells:
+	//
+	//   * 2,123 cells differ, 0.0800% of the ring, every one of them in y 71..99.
+	//   * AIR -> LEAVES 1,539, LEAVES -> AIR 512, LEAVES -> WOOD 63, WOOD -> LEAVES 2,
+	//     AIR -> WOOD 1, WOOD -> AIR 1, and 5 cells trading a flora id for leaves.
+	//   * ZERO ground-to-ground transitions. No height, no density, no cave, no biome
+	//     surface and no water moved — only what grows on top of them, which is all
+	//     task 52 was allowed to touch.
+	//
+	// GEN_VERSION_LEGACY and GEN_VERSION_DENSITY worlds are unaffected: the new tree
+	// table is only consulted at genv >= GEN_VERSION_BIOME, so no existing save
+	// re-generates.
+	CHECK(hash_fresh  == 0xe959bfae490df573ULL);
+	CHECK(hash_reload == 0xf4bc0b9d80bb2f8eULL);
 
 	regionCacheClose();
 	testRmTree(testDir());

@@ -7674,18 +7674,28 @@ static void testWorldgenBiomes(void)
 	// ── The per-biome table ───────────────────────────────────────────────────────────
 	//
 	// The silhouette bounds are a CORRECTNESS constraint, not a style one: worldgenDecorate
-	// derives its tree-cell scan from GEN_TREE_RADIUS, so a canopy wider than that would be
-	// clipped at a column border depending on which column was generated first — an
-	// order-dependence bug. The trunk bounds are what keeps treeInCell's world-ceiling check
+	// derives its tree-cell scan from GEN_TREE_REACH_MAX, so a canopy reaching further than
+	// that would be clipped at a column border depending on which column was generated first —
+	// an order-dependence bug. The trunk bounds are what keeps treeInCell's world-ceiling check
 	// honest.
+	//
+	// v1.8.3 task 52 widened all of this: a canopy radius is now a per-tree draw out of
+	// canopy_min..canopy_max, and a tree may stand on a 2 x 2 trunk whose far column is one
+	// block further out again. `canopy_max + (big_chance ? 1 : 0) <= GEN_TREE_REACH_MAX` is
+	// the bound that actually protects the scan, and it is checked per row rather than as one
+	// statement about the widest row, because the row that breaks it is the row that gets
+	// edited next.
 	{
 		int max_grass = 0;
 		for (int b = 0; b < BIOME_COUNT; b++) {
 			const BiomeParams* p = worldgenBiomeParams((BiomeId)b);
 			CHECK_QUIET(p != NULL);
-			CHECK_QUIET(p->canopy_radius >= 1 && p->canopy_radius <= GEN_TREE_RADIUS);
+			CHECK_QUIET(p->canopy_min >= 1 && p->canopy_min <= p->canopy_max);
+			CHECK_QUIET(p->canopy_max <= GEN_TREE_RADIUS_MAX);
+			CHECK_QUIET((int)p->canopy_max + (p->big_chance ? 1 : 0) <= GEN_TREE_REACH_MAX);
+			CHECK_QUIET(p->shape < TREE_SHAPE_COUNT);
 			CHECK_QUIET(p->trunk_min >= GEN_TREE_MIN_H);
-			CHECK_QUIET(p->trunk_max <= GEN_TREE_MAX_H);
+			CHECK_QUIET(p->trunk_max <= GEN_TREE_TRUNK_MAX);
 			CHECK_QUIET(p->trunk_min <= p->trunk_max);
 			if (p->grass_chance > max_grass) max_grass = p->grass_chance;
 		}
@@ -7713,14 +7723,32 @@ static void testWorldgenBiomes(void)
 		CHECK(worldgenBiomeParams(BIOME_FOREST)->tree_chance == 128);
 		CHECK(worldgenBiomeParams(BIOME_DESERT)->tree_chance == 0);
 		CHECK(worldgenBiomeParams(BIOME_JUNGLE)->tree_chance == 160);
-		// The three silhouettes: jungle tall and broad, taiga tall and narrow, the other
-		// four unchanged. Each of the two differs from the default in one field only.
-		CHECK(worldgenBiomeParams(BIOME_JUNGLE)->trunk_min == 6);
-		CHECK(worldgenBiomeParams(BIOME_JUNGLE)->canopy_radius == 2);
+		// The three silhouettes, v1.8.3 task 52. Until 2026-09-01 this block asserted that
+		// jungle and plains carried the SAME canopy radius, which is exactly how the "three
+		// shapes" claim survived while only two existed: the assertions agreed with the table
+		// and the table was the bug. Each row below now names the field that makes its tree
+		// look unlike the others.
+		CHECK(worldgenBiomeParams(BIOME_JUNGLE)->shape == TREE_SHAPE_BROAD);
+		CHECK(worldgenBiomeParams(BIOME_JUNGLE)->trunk_min == 8);
+		CHECK(worldgenBiomeParams(BIOME_JUNGLE)->trunk_max == GEN_TREE_TRUNK_MAX);
+		CHECK(worldgenBiomeParams(BIOME_JUNGLE)->big_chance > 0);
+		CHECK(worldgenBiomeParams(BIOME_TAIGA)->shape == TREE_SHAPE_CONIFER);
 		CHECK(worldgenBiomeParams(BIOME_TAIGA)->trunk_min == 6);
-		CHECK(worldgenBiomeParams(BIOME_TAIGA)->canopy_radius == 1);
+		CHECK(worldgenBiomeParams(BIOME_TAIGA)->canopy_min == 1);
+		CHECK(worldgenBiomeParams(BIOME_TAIGA)->big_chance == 0);
+		CHECK(worldgenBiomeParams(BIOME_PLAINS)->shape == TREE_SHAPE_ROUND);
 		CHECK(worldgenBiomeParams(BIOME_PLAINS)->trunk_min == GEN_TREE_MIN_H);
-		CHECK(worldgenBiomeParams(BIOME_PLAINS)->canopy_radius == GEN_TREE_RADIUS);
+		CHECK(worldgenBiomeParams(BIOME_PLAINS)->canopy_min == GEN_TREE_RADIUS);
+		CHECK(worldgenBiomeParams(BIOME_PLAINS)->canopy_max == GEN_TREE_RADIUS);
+
+		// Two biomes draw a width per tree rather than one fixed width, and this is the
+		// check that the RANGE exists at all. Without it every canopy_min == canopy_max row
+		// would satisfy the bounds sweep above and task 52's per-instance variation could be
+		// deleted without a single check going red.
+		const BiomeParams* pf = worldgenBiomeParams(BIOME_FOREST);
+		const BiomeParams* pj = worldgenBiomeParams(BIOME_JUNGLE);
+		CHECK(pf->canopy_max > pf->canopy_min);
+		CHECK(pj->canopy_max > pj->canopy_min);
 	}
 
 	// ── Reachability ──────────────────────────────────────────────────────────────────
@@ -8291,12 +8319,17 @@ static void testWorldgenBiomeSurface(void)
 	      trunks[BIOME_FOREST] * usable[BIOME_TAIGA]);
 
 	// ── Silhouette ────────────────────────────────────────────────────────────────────
-	// Taiga and jungle trunks start at 6; everything else may still be as short as 4, and
-	// forest measured a 4 here, which is what keeps the first pair from being satisfied by
-	// some global change to GEN_TREE_MIN_H.
-	CHECK(tmin[BIOME_TAIGA] >= 6 && tmax[BIOME_TAIGA] <= GEN_TREE_MAX_H);
-	CHECK(tmin[BIOME_JUNGLE] >= 6 && tmax[BIOME_JUNGLE] <= GEN_TREE_MAX_H);
+	// Taiga trunks start at 6 and jungle at 8; everything else may still be as short as 4,
+	// and forest measured a 4 here, which is what keeps the first pair from being satisfied
+	// by some global change to GEN_TREE_MIN_H.
+	CHECK(tmin[BIOME_TAIGA] >= 6 && tmax[BIOME_TAIGA] <= 9);
+	CHECK(tmin[BIOME_JUNGLE] >= 8 && tmax[BIOME_JUNGLE] <= GEN_TREE_TRUNK_MAX);
 	CHECK(tmin[BIOME_FOREST] < 6);
+
+	// v1.8.3 task 52: the jungle canopy is carried higher than any other, so the version of
+	// "jungle is tall" that a reader cares about is the one measured off the world rather
+	// than read back out of the table two blocks above.
+	CHECK(tmax[BIOME_JUNGLE] > tmax[BIOME_FOREST]);
 
 	// The narrow taiga canopy, the only Phase 2 shape change with no constant to read back:
 	// a radius-1 canopy is two 3 x 3 layers where a radius-2 one is two 5 x 5 layers less
@@ -8306,6 +8339,261 @@ static void testWorldgenBiomeSurface(void)
 	// wrong side — which can only ever blunt this check, never manufacture it.
 	CHECK(leaves[BIOME_TAIGA] * trunks[BIOME_FOREST] <
 	      leaves[BIOME_FOREST] * trunks[BIOME_TAIGA]);
+}
+
+// ── v1.8.3 task 52: tree variants, measured off the world ─────────────────────────────
+//
+// Roadmap task 52 asks for species and for per-INSTANCE variation in height, trunk width and
+// canopy size/shape. Before 2026-09-01 only trunk height varied per instance; the "species"
+// were two canopy radii and one shared layer loop, and every check written about them read the
+// table back to itself, so the whole of the missing half could be deleted without a single
+// check going red. This test never reads the table. It generates a world, finds the trunks,
+// and measures the leaves that actually landed.
+//
+// Canopies of neighbouring trees legitimately overlap — in a jungle at 160 tree cells out of
+// 256 they overlap almost everywhere — so a leaf is attributed to the trunk it is strictly
+// closest to, and a leaf equidistant from two trunks is attributed to neither. The first draft
+// of this test instead measured only ISOLATED trees, no trunk within 9 blocks, and that filter
+// emptied the sample in exactly the two biomes the test is about: forest and jungle are the
+// dense ones, so almost no tree in either qualified and three checks failed for want of trees
+// rather than for want of variety. Attribution keeps every tree and costs one pass over the
+// trunk list per candidate leaf.
+#define TV_TREES_MAX 512
+#define TV_REACH     GEN_TREE_REACH_MAX
+
+typedef struct {
+	int32_t x, z;      // anchor column: the -x/-z corner of the trunk footprint
+	int     base;      // y of the lowest trunk block
+	int     ht;        // trunk blocks
+	bool    wide;      // 2 x 2 trunk
+	bool    usable;    // far enough from the generated area's edge to have a whole canopy
+	int     biome;
+	int     reach[8];  // widest leaf offset at each canopy layer, dy = -6..1, -1 if empty
+} TvTree;
+
+static TvTree s_tv[TV_TREES_MAX];
+static int    s_tv_n;
+
+// Chebyshev distance from a block to a trunk's footprint, in the horizontal plane.
+static int tvFootprintDist(const TvTree* t, int32_t x, int32_t z)
+{
+	const int ext = t->wide ? 1 : 0;
+	const int dx = (int)(x - t->x), dz = (int)(z - t->z);
+	const int fx = dx < 0 ? -dx : (dx > ext ? dx - ext : 0);
+	const int fz = dz < 0 ? -dz : (dz > ext ? dz - ext : 0);
+	return fx > fz ? fx : fz;
+}
+
+// Widest offset from the trunk footprint of any leaf on one layer that belongs to THIS tree,
+// or -1 for an empty layer. A leaf belongs to the tree it is strictly closest to; one that ties
+// belongs to nobody, which costs a little reach on two trees standing side by side and can only
+// ever understate a canopy, never invent one.
+static int tvLayerReach(int self, int y)
+{
+	const TvTree* t   = &s_tv[self];
+	const int     ext = t->wide ? 1 : 0;
+	int best = -1;
+	for (int dz = -TV_REACH; dz <= TV_REACH + ext; dz++) {
+		for (int dx = -TV_REACH; dx <= TV_REACH + ext; dx++) {
+			const int32_t bx = t->x + dx, bz = t->z + dz;
+			if (worldGet(&s_world, bx, y, bz) != BLOCK_LEAVES)
+				continue;
+			const int f = tvFootprintDist(t, bx, bz);
+			bool mine = true;
+			for (int j = 0; j < s_tv_n && mine; j++) {
+				if (j == self)
+					continue;
+				// Only trees whose canopy could reach this height compete for the leaf.
+				const int jtop = s_tv[j].base + s_tv[j].ht;
+				if (y < jtop - 6 || y > jtop + 1)
+					continue;
+				if (tvFootprintDist(&s_tv[j], bx, bz) <= f)
+					mine = false;
+			}
+			if (mine && f > best)
+				best = f;
+		}
+	}
+	return best;
+}
+
+static void testWorldgenTreeVariants(void)
+{
+	// Same seed and origin as testWorldgenPhase3Flora below, for the same measured reason:
+	// this is the area that carries all six biomes. r4 rather than r5 — 81 columns against
+	// 121 — because the sample only has to hold enough isolated jungle and taiga trees, and
+	// the counts below are what says whether it does.
+	const uint32_t seed = 90210u;
+	const int32_t  ox = 10, oz = -20;
+	const int      r  = 4;
+
+	WorldGen g;
+	CHECK(worldgenInit(&g, seed, GEN_VERSION_BIOME));
+	worldInit(&s_world);
+	for (int32_t cz = oz - r; cz <= oz + r; cz++)
+		for (int32_t cx = ox - r; cx <= ox + r; cx++)
+			CHECK_QUIET(worldgenColumn(&g, &s_world, cx, cz));
+
+	// ── Find every trunk ──────────────────────────────────────────────────────────────
+	//
+	// A trunk anchor is a wood block with no wood below it, none to its -x and none to its
+	// -z, which picks exactly one cell out of a 2 x 2 trunk and the only cell of a 1 x 1.
+	// Two single trunks can never be adjacent — treeInCell's cell offsets keep trunks three
+	// blocks apart — so wood beside wood at the same base means one wide tree, not two.
+	s_tv_n = 0;
+	const int32_t bx0 = (ox - r) * CHUNK_DIM, bx1 = (ox + r + 1) * CHUNK_DIM;
+	const int32_t bz0 = (oz - r) * CHUNK_DIM, bz1 = (oz + r + 1) * CHUNK_DIM;
+	for (int32_t z = bz0; z < bz1; z++) {
+		for (int32_t x = bx0; x < bx1; x++) {
+			for (int y = 1; y < WORLD_HEIGHT - 1; y++) {
+				if (worldGet(&s_world, x, y, z) != BLOCK_WOOD)
+					continue;
+				if (worldGet(&s_world, x, y - 1, z) == BLOCK_WOOD)
+					break;                       // not the base of this column
+				if (worldGet(&s_world, x - 1, y, z) == BLOCK_WOOD
+				    || worldGet(&s_world, x, y, z - 1) == BLOCK_WOOD)
+					break;                       // not the anchor of a wide trunk
+				if (s_tv_n >= TV_TREES_MAX)
+					break;
+				TvTree* t = &s_tv[s_tv_n++];
+				t->x = x; t->z = z; t->base = y;
+				t->wide = worldGet(&s_world, x + 1, y, z)     == BLOCK_WOOD
+				       && worldGet(&s_world, x,     y, z + 1) == BLOCK_WOOD
+				       && worldGet(&s_world, x + 1, y, z + 1) == BLOCK_WOOD;
+				t->ht = 0;
+				while (worldGet(&s_world, x, y + t->ht, z) == BLOCK_WOOD)
+					t->ht++;
+				t->biome  = (int)worldgenBiomeAt(&g, x, z);
+				t->usable = true;
+				break;
+			}
+		}
+	}
+
+	// The sample is real. Without this the whole test is satisfied by a world with no trees.
+	CHECK(s_tv_n > 40);
+	CHECK(s_tv_n < TV_TREES_MAX);
+
+	// The layer profile. Trees near the edge of the generated area are dropped: their canopies
+	// reach into columns that were never generated, which reads as a clipped tree for a reason
+	// that is not a bug.
+	for (int i = 0; i < s_tv_n; i++) {
+		TvTree* t = &s_tv[i];
+		if (t->x - bx0 < TV_REACH + 1 || bx1 - t->x <= TV_REACH + 1
+		    || t->z - bz0 < TV_REACH + 1 || bz1 - t->z <= TV_REACH + 1)
+			t->usable = false;
+		for (int k = 0; k < 8; k++)
+			t->reach[k] = t->usable ? tvLayerReach(i, t->base + t->ht + (k - 6)) : -1;
+	}
+
+	// ── Trunk width: task 52's third axis ─────────────────────────────────────────────
+	int wide_by_biome[BIOME_COUNT] = {0};
+	int usable_by_biome[BIOME_COUNT] = {0};
+	for (int i = 0; i < s_tv_n; i++) {
+		if (s_tv[i].biome < 0 || s_tv[i].biome >= BIOME_COUNT)
+			continue;
+		if (s_tv[i].wide) wide_by_biome[s_tv[i].biome]++;
+		if (s_tv[i].usable) usable_by_biome[s_tv[i].biome]++;
+
+		// A wide trunk stands on four columns of equal ground height, because treeInCell
+		// refuses it otherwise. This is the check on that refusal: a 2 x 2 trunk anchored to
+		// one column's height on a slope would float or bury itself, and nothing else in this
+		// file would notice — a buried trunk is still an unbroken run of wood.
+		if (s_tv[i].wide) {
+			const int32_t x = s_tv[i].x, z = s_tv[i].z;
+			CHECK_QUIET(worldgenHeight(&g, x + 1, z)     == worldgenHeight(&g, x, z));
+			CHECK_QUIET(worldgenHeight(&g, x,     z + 1) == worldgenHeight(&g, x, z));
+			CHECK_QUIET(worldgenHeight(&g, x + 1, z + 1) == worldgenHeight(&g, x, z));
+			CHECK_QUIET(s_tv[i].base == worldgenHeight(&g, x, z));
+		}
+	}
+	// Jungle draws them, at 64/256, and no other biome may: big_chance is 0 everywhere else,
+	// so a wide trunk outside the jungle means the draw is reading the wrong row.
+	CHECK(wide_by_biome[BIOME_JUNGLE] > 0);
+	CHECK(wide_by_biome[BIOME_FOREST] == 0);
+	CHECK(wide_by_biome[BIOME_TAIGA] == 0);
+	CHECK(wide_by_biome[BIOME_PLAINS] == 0);
+
+	// ── Per-instance canopy width ─────────────────────────────────────────────────────
+	//
+	// The widest layer of each isolated tree, per biome. Forest and jungle draw out of a
+	// range, so both have to show more than one value; a table with canopy_min == canopy_max
+	// on those rows would leave exactly one.
+	int widths_forest = 0, widths_jungle = 0;
+	int seen_f[GEN_TREE_RADIUS_MAX + 2] = {0}, seen_j[GEN_TREE_RADIUS_MAX + 2] = {0};
+	int taiga_max_reach = 0, jungle_max_reach = 0;
+	for (int i = 0; i < s_tv_n; i++) {
+		if (!s_tv[i].usable) continue;
+		int w = -1;
+		for (int k = 0; k < 8; k++)
+			if (s_tv[i].reach[k] > w) w = s_tv[i].reach[k];
+		if (w < 0 || w > GEN_TREE_RADIUS_MAX + 1) continue;
+		if (s_tv[i].biome == BIOME_FOREST && !seen_f[w]) { seen_f[w] = 1; widths_forest++; }
+		if (s_tv[i].biome == BIOME_JUNGLE && !seen_j[w]) { seen_j[w] = 1; widths_jungle++; }
+		if (s_tv[i].biome == BIOME_TAIGA  && w > taiga_max_reach)  taiga_max_reach  = w;
+		if (s_tv[i].biome == BIOME_JUNGLE && w > jungle_max_reach) jungle_max_reach = w;
+	}
+	CHECK(usable_by_biome[BIOME_FOREST] > 0);
+	CHECK(usable_by_biome[BIOME_JUNGLE] > 0);
+	CHECK(usable_by_biome[BIOME_TAIGA] > 0);
+	CHECK(widths_forest >= 2);
+	CHECK(widths_jungle >= 2);
+
+	// The taiga tree is the narrow one and the jungle tree is the wide one, measured rather
+	// than asserted about the table.
+	CHECK(taiga_max_reach <= 2);
+	CHECK(jungle_max_reach >= 3);
+
+	// ── The silhouettes are three, not one loop wearing three names ───────────────────
+	//
+	// reach[] is indexed by dy + 6, so reach[6] is the layer at the top of the trunk, reach[7]
+	// the layer above it and reach[5], reach[4], reach[3] the ones below.
+	//
+	// CONIFER: tiers alternate, so somewhere down the tree a layer is NARROWER than the one
+	// under it and than the one over it. A ROUND canopy never does that — its widths only
+	// ever fall going up.
+	// BROAD: three layers at full width, so the layer at the top of the trunk is as wide as
+	// the one below it. A ROUND canopy's top-of-trunk layer is 1 while the one below is 2 or
+	// more, so this check fails the moment jungle is drawn with the round loop.
+	int conifer_seen = 0, broad_seen = 0, round_seen = 0;
+	for (int i = 0; i < s_tv_n; i++) {
+		if (!s_tv[i].usable) continue;
+		const int* rc = s_tv[i].reach;
+		if (s_tv[i].biome == BIOME_TAIGA)
+			for (int k = 3; k <= 5; k++)
+				if (rc[k] >= 0 && rc[k - 1] > rc[k] && rc[k + 1] > rc[k])
+					conifer_seen++;
+		if (s_tv[i].biome == BIOME_JUNGLE && rc[6] >= 2 && rc[6] == rc[5])
+			broad_seen++;
+		if (s_tv[i].biome == BIOME_FOREST && rc[5] >= 2 && rc[6] == 1)
+			round_seen++;
+	}
+	CHECK(conifer_seen > 0);
+	CHECK(broad_seen > 0);
+	CHECK(round_seen > 0);
+
+	// ── Determinism ───────────────────────────────────────────────────────────────────
+	//
+	// Same seed, same columns, generated again in the opposite order: every block identical.
+	// The shape draw takes a second hash off SALT_TSHAPE, and a hash that accidentally
+	// depended on generation order would show up here and nowhere else in this file.
+	uint32_t before[9];
+	int n = 0;
+	for (int32_t cz = oz - 1; cz <= oz + 1; cz++)
+		for (int32_t cx = ox - 1; cx <= ox + 1; cx++)
+			before[n++] = colHash(cx, cz);
+
+	worldExit(&s_world);
+	worldInit(&s_world);
+	for (int32_t cz = oz + r; cz >= oz - r; cz--)
+		for (int32_t cx = ox + r; cx >= ox - r; cx--)
+			CHECK_QUIET(worldgenColumn(&g, &s_world, cx, cz));
+	n = 0;
+	for (int32_t cz = oz - 1; cz <= oz + 1; cz++)
+		for (int32_t cx = ox - 1; cx <= ox + 1; cx++)
+			CHECK_QUIET(before[n++] == colHash(cx, cz));
+
+	worldExit(&s_world);
 }
 
 // ── v1.8.3 Phase 3: where the five new blocks actually land ───────────────────────────
@@ -8568,9 +8856,25 @@ static void testWorldgenWaterAndGrass(void)
 	// Eight of twelve unchanged is itself evidence rather than luck: the four that moved are
 	// exactly the four the cell diff found cells in, and 4242 has no cold, no desert and no
 	// taiga/jungle undergrowth in any of its four sampled columns.
+	//
+	// **Four of the twelve moved again on 2026-09-01, and only four: task 52's tree variants.**
+	// Measured the same way, this build against the pre-task-52 commit c8c9e90, over the same
+	// 81-column ring of seed 1337 -- 2,123 differing cells of 2,654,208 (0.0800 %), every one
+	// of them between y 71 and y 99:
+	//
+	//     air    -> leaves  1539     leaves -> air       512
+	//     leaves -> wood      63     tall_grass -> leaves  3
+	//     wood   -> leaves     2     fern -> leaves        2
+	//     wood   -> air        1     air  -> wood          1
+	//
+	// **Zero ground-to-ground transitions** -- the probe classifies stone/dirt/grass/sand/water
+	// as ground and counts any pair of them, and the count is 0. So this is foliage moving
+	// over ground that did not, which is what a change to canopy shape and trunk width is
+	// allowed to be. The eight columns of seeds 4242 and 90210 did not move at all, and their
+	// hashes below are the same literals they were before task 52.
 	static const struct { uint32_t seed; int32_t cx, cz; uint32_t hash; } pinned[] = {
-		{1337u,   0,  0, 0x5d83eac5u}, {1337u,   1,  0, 0xec6b57dfu},
-		{1337u,  -1, -1, 0x12fc3aceu}, {1337u,   7, -3, 0x479464fdu},
+		{1337u,   0,  0, 0x84080715u}, {1337u,   1,  0, 0xc3709efbu},
+		{1337u,  -1, -1, 0xfe5fc66eu}, {1337u,   7, -3, 0x34522ed6u},
 		{4242u,   0,  0, 0x40c702cbu}, {4242u,   1,  0, 0xa038a451u},
 		{4242u,  -1, -1, 0xe4b4d7c1u}, {4242u,   7, -3, 0x7fb8f23fu},
 		{90210u,  0,  0, 0x8bb38a6eu}, {90210u,  1,  0, 0xea29565au},
@@ -10789,6 +11093,7 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testDensityDistribution();
 	testWorldgenWaterAndGrass();
 	testWorldgenBiomeSurface();
+	testWorldgenTreeVariants();
 	testWorldgenPhase3Flora();
 	testRaycast();
 	testBodyBlocked();
@@ -10942,21 +11247,37 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	// The consequence for whoever trips this next: if you change worldgen output at all, this
 	// guard can move without you having added or removed a single CHECK. Read WHICH checks
 	// went red first. If none did, the count moving is terrain, not test coverage.
+	//
+	// v1.8.3 task 52, tree variants: 5418 + 26 = 5444, and this one IS countable off the
+	// source, unlike the eleven above it. All 26 are loud CHECKs:
+	//
+	//   +17  testWorldgenTreeVariants -- worldgenInit, the two sample-size checks, 4 for where
+	//        wide trunks may and may not appear, 3 usable-count, 2 width-variety, 2 reach and
+	//        3 for the three silhouettes.
+	//   +8   the per-biome table block, which went from 6 assertions naming two fields to 14
+	//        naming the shape, both trunk bounds, both canopy bounds and big_chance.
+	//   +1   the measured "jungle carries its canopy higher than forest".
+	//
+	// It is countable because that test's per-tree assertions are all CHECK_QUIET, and a
+	// CHECK_QUIET that passes contributes nothing to the count -- the rule already stated
+	// above. Checked rather than assumed: with the 2 x 2 trunk draw disabled in worldgen.c the
+	// survey found 77 trees and 0 wide ones instead of 77 and 5, and the total stayed at 5444
+	// with exactly one check red.
 #ifndef __3DS__
 	{
 		const int ran = s_checks;
-		if (ran != 5418)
+		if (ran != 5444)
 			printf("\nCHECK-COUNT GUARD: %d checks ran, %d expected.\n"
 			       "  %s\n"
 			       "  This is NOT an ordinary assertion failure.\n"
 			       "  Read the comment above this guard in world/world_test.c before"
 			       " touching the pinned number.\n",
-			       ran, 5418,
-			       ran < 5418
+			       ran, 5444,
+			       ran < 5444
 			           ? "Checks went MISSING: checks that should have run never ran at all."
 			           : "Extra checks appeared: either you added checks and did not update"
 			             " the pin, or something is emitting checks it should not.");
-		CHECK(ran == 5418);
+		CHECK(ran == 5444);
 	}
 #endif
 

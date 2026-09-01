@@ -238,6 +238,19 @@
 #define GEN_TREE_MAX_H    7
 #define GEN_TREE_RADIUS   2             // canopy half-width, in blocks
 
+// v1.8.3 task 52. The four constants above are the LEGACY and DENSITY shape and none of them
+// move; these are the ceilings a BIOME world's per-instance draws are allowed to reach.
+//
+// GEN_TREE_REACH_MAX is the one that is load-bearing rather than descriptive. worldgenDecorate
+// scans the tree cells that can reach a column, and a tree whose canopy reaches further than
+// the scan assumes is not a cosmetic bug: the column that owns the far cells would never look
+// at that tree, so the same block would be leaves or air depending on which column asked. It
+// is `GEN_TREE_RADIUS_MAX + 1` because a wide tree stands on a 2 x 2 trunk whose far column is
+// one block further out than its anchor, and the suite asserts every table row against it.
+#define GEN_TREE_TRUNK_MAX  12          // tallest trunk any biome may draw (jungle)
+#define GEN_TREE_RADIUS_MAX 3           // widest canopy half-width any biome may draw
+#define GEN_TREE_REACH_MAX  (GEN_TREE_RADIUS_MAX + 1)
+
 // ── Biomes (v1.8.3 Phase 2) ───────────────────────────────────────────────────────────
 //
 // **Reached only by a GEN_VERSION_DENSITY world.** Every rule below is behind the version
@@ -412,22 +425,46 @@ typedef enum {
 	(GEN_FLORA_DESERT_TOTAL > GEN_FLORA_FERN_MAX ? \
 	 GEN_FLORA_DESERT_TOTAL : GEN_FLORA_FERN_MAX)
 
-// Silhouette, from trunk length and canopy radius ONLY — no new block ids, no new tiles.
-// Three shapes: jungle tall and broad, taiga tall and narrow, everything else the existing
-// shape. Canopy shape reads at distances where colour does not, which is what matters on a
+// Silhouette, from trunk length, canopy radius and layer pattern ONLY — no new block ids, no
+// new tiles. Canopy shape reads at distances where colour does not, which is what matters on a
 // 400x240 screen.
 //
-// **Every trunk length stays inside GEN_TREE_MIN_H..GEN_TREE_MAX_H and every radius inside
-// GEN_TREE_RADIUS, and that is a correctness bound rather than a style one.**
-// worldgenDecorate's scan bounds are written in terms of GEN_TREE_RADIUS, so a canopy wider
-// than it would be clipped at a column border depending on which column was generated first
-// — an order-dependence bug, not a cosmetic one. Asserted in the suite.
+// **v1.8.3 task 52 — corrected 2026-09-01.** Until this change the "three shapes" this comment
+// claimed were two: jungle and plains both drew canopy radius 2 with the identical layer
+// pattern, so jungle differed by trunk length alone. There was also no per-INSTANCE variation
+// of anything but trunk length, which is the half of task 52 that had been designed
+// (SALT_TREE_SHAPE, in the v1.8.3 design page) and never written. Both are now real:
+//
+//   * `shape` picks the layer pattern — TREE_SHAPE_ROUND, _CONIFER or _BROAD — and the three
+//     are different silhouettes, not three names for one loop.
+//   * `canopy_min..canopy_max` is drawn PER TREE, so one forest holds several widths.
+//   * `big_chance` is the per-tree draw for a 2 x 2 trunk, which is task 52's "trunk width".
+//     A wide tree only stands where its four columns share one ground height; that is checked
+//     rather than assumed, because a 2 x 2 trunk anchored off one column's height would float
+//     or bury itself on any slope.
+//
+// **Every trunk length stays inside GEN_TREE_MIN_H..GEN_TREE_TRUNK_MAX, every radius inside
+// GEN_TREE_RADIUS_MAX, and radius + (wide ? 1 : 0) inside GEN_TREE_REACH_MAX — correctness
+// bounds, not style ones.** worldgenDecorate's scan bounds are written in terms of
+// GEN_TREE_REACH_MAX, so a canopy reaching past it would be clipped at a column border
+// depending on which column was generated first — an order-dependence bug, not a cosmetic
+// one. Asserted in the suite, row by row.
+typedef enum {
+	TREE_SHAPE_ROUND = 0,   // two wide layers with clipped corners, two narrow above — the oak
+	TREE_SHAPE_CONIFER,     // alternating narrow/wide tiers rising to a single tip — the spruce
+	TREE_SHAPE_BROAD,       // one deep flat crown carried on a long trunk — the jungle tree
+	TREE_SHAPE_COUNT
+} TreeShape;
+
 typedef struct {
 	uint8_t grass_chance;    // out of 256 eligible surface cells
 	uint8_t tree_chance;     // out of 256 tree cells
 	uint8_t trunk_min;       // trunk blocks, before the canopy
 	uint8_t trunk_max;
-	uint8_t canopy_radius;   // half-width of the two wide canopy layers, in blocks
+	uint8_t canopy_min;      // per-tree canopy half-width is drawn from this range, in blocks
+	uint8_t canopy_max;
+	uint8_t shape;           // a TreeShape
+	uint8_t big_chance;      // out of 256 trees: a 2 x 2 trunk instead of a single column
 } BiomeParams;
 
 typedef struct {

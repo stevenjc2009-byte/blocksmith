@@ -80,6 +80,18 @@ static inline fx caveCoordY(int32_t block)
 // scatters would be one field wearing two textures.
 #define SALT_FLORA  0x464C4F52U   // 'FLOR'
 
+// v1.8.3 task 52. The per-tree shape draw's salt — canopy width, layer count and whether the
+// trunk is 2 x 2. Same house convention, checked against all eleven existing salts — BIOM TREE
+// PLNT CAVE CAV2 HUMD FLOR DLOW DHIG DSEL and the BLKS seed mix — and it collides with none.
+//
+// It has to be its own salt rather than more bits of SALT_TREE's hash, and the reason is
+// arithmetic rather than taste: SALT_TREE's 32 bits are fully spent already — 0..7 the spawn
+// draw, 8..12 the x offset, 13..17 the z offset, 18..31 the trunk length — so there is no
+// unclaimed field left to widen into. Taking bits that another draw already reads would tie
+// the two answers together: every cell that spawned a tree at a particular offset would get
+// the same canopy, and a forest would repeat on the cell lattice.
+#define SALT_TSHAPE 0x54534850U   // 'TSHP'
+
 bool worldgenInit(WorldGen* g, uint32_t seed, uint32_t version)
 {
 	// Refused rather than coerced. A WorldGen carrying a version this build cannot generate
@@ -122,17 +134,32 @@ fx worldgenHumidity(const WorldGen* g, int32_t x, int32_t z)
 // world/worldgen.h rather than from bare numbers here, so the derived bound
 // GEN_GRASS_CHANCE_MAX cannot drift away from the column it bounds.
 //
-// The trunk range and the canopy radius are the whole of the silhouette. Jungle is tall and
-// broad, taiga tall and narrow, and the other four keep the shape the game already had —
-// three distinguishable canopies rather than two and a variant.
+// The trunk range, the canopy range and the layer pattern are the whole of the silhouette.
+//
+// **Corrected 2026-09-01, v1.8.3 task 52.** The table this replaces gave jungle and plains the
+// identical canopy radius and the identical layer loop, so the "three distinguishable canopies"
+// the old comment claimed were two: jungle was a plains tree on a longer trunk. Each biome now
+// names a shape, and the two forest biomes draw a width per tree rather than sharing one.
+//
+// Tundra and desert keep a full row even though their tree_chance is 0 and no tree is ever
+// drawn there. A row that cannot be reached is still asserted by the suite's bounds sweep, and
+// leaving it at the baseline shape is what makes "trees were switched on for this biome" a
+// one-number change rather than a table edit that has to invent a silhouette under time
+// pressure.
 static const BiomeParams s_biome_params[BIOME_COUNT] = {
-	// grass, tree, trunk_min, trunk_max, radius
-	{GEN_GRASS_TUNDRA, GEN_TREE_TUNDRA, GEN_TREE_MIN_H, GEN_TREE_MAX_H, GEN_TREE_RADIUS},
-	{GEN_GRASS_TAIGA,  GEN_TREE_TAIGA,  6,              GEN_TREE_MAX_H, 1},
-	{GEN_GRASS_PLAINS, GEN_TREE_PLAINS, GEN_TREE_MIN_H, GEN_TREE_MAX_H, GEN_TREE_RADIUS},
-	{GEN_GRASS_FOREST, GEN_TREE_FOREST, GEN_TREE_MIN_H, GEN_TREE_MAX_H, GEN_TREE_RADIUS},
-	{GEN_GRASS_DESERT, GEN_TREE_DESERT, GEN_TREE_MIN_H, GEN_TREE_MAX_H, GEN_TREE_RADIUS},
-	{GEN_GRASS_JUNGLE, GEN_TREE_JUNGLE, 6,              GEN_TREE_MAX_H, GEN_TREE_RADIUS},
+	// grass, tree, trunk_min, trunk_max, canopy_min, canopy_max, shape, big_chance
+	{GEN_GRASS_TUNDRA, GEN_TREE_TUNDRA, GEN_TREE_MIN_H, GEN_TREE_MAX_H,
+	 GEN_TREE_RADIUS, GEN_TREE_RADIUS, TREE_SHAPE_ROUND, 0},
+	{GEN_GRASS_TAIGA,  GEN_TREE_TAIGA,  6,              9,
+	 1,               2,               TREE_SHAPE_CONIFER, 0},
+	{GEN_GRASS_PLAINS, GEN_TREE_PLAINS, GEN_TREE_MIN_H, GEN_TREE_MAX_H,
+	 GEN_TREE_RADIUS, GEN_TREE_RADIUS, TREE_SHAPE_ROUND, 0},
+	{GEN_GRASS_FOREST, GEN_TREE_FOREST, GEN_TREE_MIN_H, 8,
+	 GEN_TREE_RADIUS, GEN_TREE_RADIUS_MAX, TREE_SHAPE_ROUND, 0},
+	{GEN_GRASS_DESERT, GEN_TREE_DESERT, GEN_TREE_MIN_H, GEN_TREE_MAX_H,
+	 GEN_TREE_RADIUS, GEN_TREE_RADIUS, TREE_SHAPE_ROUND, 0},
+	{GEN_GRASS_JUNGLE, GEN_TREE_JUNGLE, 8,              GEN_TREE_TRUNK_MAX,
+	 GEN_TREE_RADIUS, GEN_TREE_RADIUS_MAX, TREE_SHAPE_BROAD, 64},
 };
 
 const BiomeParams* worldgenBiomeParams(BiomeId b)
@@ -258,16 +285,21 @@ static inline BlockId blockAtDepth(int depth, bool sandy)
 // having to talk to each other.
 typedef struct {
 	bool    exists;
-	int32_t x, z;    // world block coordinates of the trunk
+	int32_t x, z;    // world block coordinates of the trunk, its -x/-z corner when wide
 	int     ground;  // y of the first air above the ground, i.e. the trunk's base
 	int     trunk;   // trunk blocks
-	int     radius;  // canopy half-width of the two wide layers — the silhouette
+	int     radius;  // canopy half-width of the widest layer — with `shape`, the silhouette
+	int     shape;   // a TreeShape
+	int     tiers;   // TREE_SHAPE_CONIFER only: how many narrow/wide tier pairs
+	bool    wide;    // 2 x 2 trunk rather than one column
 } Tree;
 
 static Tree treeInCell(const WorldGen* g, int32_t tcx, int32_t tcz)
 {
 	Tree t = {0};
 	t.radius = GEN_TREE_RADIUS;
+	t.shape  = TREE_SHAPE_ROUND;
+	t.tiers  = 2;
 
 	const uint32_t h = rngHash2(rngMix(g->seed ^ SALT_TREE), tcx, tcz);
 
@@ -291,12 +323,14 @@ static Tree treeInCell(const WorldGen* g, int32_t tcx, int32_t tcz)
 	// see genversion.h on GEN_VERSION_BIOME.
 	int trunk_min = GEN_TREE_MIN_H, trunk_max = GEN_TREE_MAX_H;
 	uint32_t chance = (uint32_t)GEN_TREE_CHANCE;
+	const BiomeParams* bp = NULL;
 	if (g->version >= GEN_VERSION_BIOME) {
-		const BiomeParams* bp = worldgenBiomeParams(worldgenBiomeAt(g, t.x, t.z));
+		bp        = worldgenBiomeParams(worldgenBiomeAt(g, t.x, t.z));
 		chance    = bp->tree_chance;
 		trunk_min = bp->trunk_min;
 		trunk_max = bp->trunk_max;
-		t.radius  = bp->canopy_radius;
+		t.shape   = bp->shape;
+		t.radius  = bp->canopy_min;
 	}
 
 	// The draw uses the same low 8 bits it always has, compared against the biome's chance
@@ -331,9 +365,36 @@ static Tree treeInCell(const WorldGen* g, int32_t tcx, int32_t tcz)
 	t.trunk  = trunk_min +
 	           (int)((h >> 18) % (uint32_t)(trunk_max - trunk_min + 1));
 
-	// Nothing may be written above the world ceiling. This cannot fire at the current
-	// surface band — 68 + 7 + 1 is 76 against a 128-block world — but the band is a tuning
-	// constant and the canopy loop below writes without re-checking.
+	// v1.8.3 task 52. The per-tree shape draw, off its own salt for the reason SALT_TSHAPE
+	// states. Only trees that actually spawn reach it, so the cost is one hash per tree rather
+	// than one per cell scanned.
+	if (bp != NULL) {
+		const uint32_t hs = rngHash2(rngMix(g->seed ^ SALT_TSHAPE), tcx, tcz);
+
+		t.radius = (int)bp->canopy_min +
+		           (int)((hs & 0xFFu) % (uint32_t)(bp->canopy_max - bp->canopy_min + 1));
+
+		// Conifer only: two tiers or three, which is a 4-block canopy or a 6-block one. Drawn
+		// from bits the radius did not use.
+		t.tiers = 2 + (int)((hs >> 8) & 1u);
+
+		// The 2 x 2 trunk — task 52's "trunk width". Two conditions, and the second is the one
+		// that matters: the four columns must share a ground height. A wide trunk is anchored
+		// at one column's ground, so on a slope the other three would either hang in the air or
+		// start underground, and the canopy would sit crooked on top of it. Refusing rather
+		// than levelling keeps every tree a pure function of its cell — no terrain is edited to
+		// make a tree fit.
+		if (bp->big_chance > 0u && ((hs >> 16) & 0xFFu) < (uint32_t)bp->big_chance
+		    && worldgenHeight(g, t.x + 1, t.z)     == t.ground
+		    && worldgenHeight(g, t.x,     t.z + 1) == t.ground
+		    && worldgenHeight(g, t.x + 1, t.z + 1) == t.ground)
+			t.wide = true;
+	}
+
+	// Nothing may be written above the world ceiling. A conifer's tip sits one block above the
+	// trunk like every other shape, so the trunk plus one still bounds the tallest cell written
+	// — 68 + 12 + 1 is 81 against a 128-block world — but the surface band and the trunk
+	// ceiling are both tuning constants and the canopy loop below writes without re-checking.
 	if (t.ground + t.trunk + 1 >= WORLD_HEIGHT)
 		return t;
 
@@ -362,6 +423,60 @@ static bool treePut(World* w, int32_t cx, int32_t cz, int32_t x, int y, int32_t 
 	return worldSet(w, x, y, z, id);
 }
 
+// v1.8.3 task 52. The three silhouettes, as two pure functions of the tree and the layer.
+//
+// They are functions rather than a table because the conifer's depth varies per tree. They stay
+// static: the suite does not call them, it measures the leaves that actually land in a
+// generated world, which is the only version of "a taiga tree is narrower than a jungle tree"
+// that a shape helper agreeing with itself could not fake.
+//
+// dy is measured from `top`, the first cell above the trunk. A negative radius means the layer
+// is empty; only CONIFER uses it, for the gaps between its tiers.
+static int canopyLowest(const Tree* t)
+{
+	switch (t->shape) {
+	case TREE_SHAPE_CONIFER: return -(2 * t->tiers - 1);
+	case TREE_SHAPE_BROAD:   return -2;
+	default:                 return -2;
+	}
+}
+
+static int canopyRadiusAt(const Tree* t, int dy)
+{
+	switch (t->shape) {
+	case TREE_SHAPE_CONIFER:
+		// A single leaf above the trunk, a narrow collar at the top of it, then tiers
+		// alternating wide and narrow all the way down. The alternation is the whole reason a
+		// spruce reads as a spruce at 400x240: a straight taper is a cone, and a cone at this
+		// block count is indistinguishable from a ball.
+		if (dy == 1)  return 0;
+		if (dy == 0)  return 1;
+		return ((-dy) & 1) ? t->radius : 1;
+
+	case TREE_SHAPE_BROAD:
+		// Three layers at full width with a narrow cap. Deep and flat, so from below it is a
+		// ceiling and from a distance it is a plateau rather than a lollipop.
+		return (dy == 1) ? 1 : t->radius;
+
+	default:
+		// ROUND, and byte-for-byte the shape every world before v1.8.3 was drawn with: two
+		// wide layers at and below the top, two narrow above.
+		return (dy <= -1) ? t->radius : 1;
+	}
+}
+
+// Distance from a coordinate offset to the trunk's footprint along one axis. `ext` is 1 for a
+// 2 x 2 trunk and 0 for a single column, so a wide tree's crown is clipped around a 2-block
+// footprint instead of around a point — which is what keeps it centred rather than lopsided.
+static int footprintDist(int d, int ext)
+{
+	if (d < 0)
+		return -d;
+	if (d > ext)
+		return d - ext;
+	return 0;
+}
+
 bool worldgenDecorate(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 {
 	// Tree cells that can reach this column. The column covers blocks [cx*16, cx*16+15]
@@ -369,10 +484,18 @@ bool worldgenDecorate(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 	// cell at each end covers integer division truncating towards zero on the negative
 	// side, which is cheaper than writing a floor-divide for a bound that is scanned once
 	// per column and costs one hash per extra cell.
-	const int32_t x0 = (cx * CHUNK_DIM - GEN_TREE_RADIUS) / GEN_TREE_CELL - 1;
-	const int32_t x1 = (cx * CHUNK_DIM + CHUNK_DIM - 1 + GEN_TREE_RADIUS) / GEN_TREE_CELL + 1;
-	const int32_t z0 = (cz * CHUNK_DIM - GEN_TREE_RADIUS) / GEN_TREE_CELL - 1;
-	const int32_t z1 = (cz * CHUNK_DIM + CHUNK_DIM - 1 + GEN_TREE_RADIUS) / GEN_TREE_CELL + 1;
+	//
+	// v1.8.3 task 52: GEN_TREE_REACH_MAX, not GEN_TREE_RADIUS. A biome world can now draw a
+	// canopy of radius 3 on a 2 x 2 trunk, which reaches 4 blocks from the tree's anchor
+	// column. Scanning to the old bound would have left the far cells of a wide jungle tree
+	// to columns that never looked at it — the block would be leaves or air depending on which
+	// column was generated first. Legacy and density worlds never draw more than
+	// GEN_TREE_RADIUS, so widening the scan costs them at most one extra hashed cell per side
+	// and changes nothing they produce.
+	const int32_t x0 = (cx * CHUNK_DIM - GEN_TREE_REACH_MAX) / GEN_TREE_CELL - 1;
+	const int32_t x1 = (cx * CHUNK_DIM + CHUNK_DIM - 1 + GEN_TREE_REACH_MAX) / GEN_TREE_CELL + 1;
+	const int32_t z0 = (cz * CHUNK_DIM - GEN_TREE_REACH_MAX) / GEN_TREE_CELL - 1;
+	const int32_t z1 = (cz * CHUNK_DIM + CHUNK_DIM - 1 + GEN_TREE_REACH_MAX) / GEN_TREE_CELL + 1;
 
 	bool ok = true;
 	for (int32_t tcz = z0; tcz <= z1; tcz++) {
@@ -383,26 +506,46 @@ bool worldgenDecorate(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 
 			// Trunk. Written over whatever is there, so a trunk cannot be hollowed out by
 			// a canopy block from a neighbouring tree that happened to be placed first.
-			for (int i = 0; i < t.trunk; i++)
-				ok &= treePut(w, cx, cz, t.x, t.ground + i, t.z, BLOCK_WOOD, false);
-
-			// Canopy. Two wide layers around the top of the trunk and two narrow ones
-			// above it, with the corners of the wide layers left out so the silhouette is
-			// round-ish rather than a cube on a stick.
 			//
-			// v1.8.3 Phase 2. The wide layers' half-width is the biome's (t.radius) rather
-			// than GEN_TREE_RADIUS, which is what makes a taiga spruce narrow. It is never
-			// LARGER than GEN_TREE_RADIUS, and that bound is load-bearing: the cell scan
-			// above is written in terms of GEN_TREE_RADIUS, so a wider canopy would be
-			// clipped at a column border depending on which column was generated first.
-			// The corner clip still keys on GEN_TREE_RADIUS, so a radius-1 canopy keeps all
-			// nine of its cells — there are no corners to round off a 3 x 3.
+			// v1.8.3 task 52: one column or four. The four share a ground height by
+			// construction — treeInCell refuses `wide` otherwise — so one loop covers them.
+			const int span = t.wide ? 2 : 1;
+			for (int i = 0; i < t.trunk; i++)
+				for (int dz = 0; dz < span; dz++)
+					for (int dx = 0; dx < span; dx++)
+						ok &= treePut(w, cx, cz, t.x + dx, t.ground + i, t.z + dz,
+						              BLOCK_WOOD, false);
+
+			// Canopy. v1.8.3 task 52 replaced one loop with three silhouettes, and the
+			// layer pattern is chosen per shape rather than shared:
+			//
+			//   ROUND    two wide layers at and just below the top of the trunk, two narrow
+			//            ones above — the shape the game has always drawn.
+			//   CONIFER  tiers alternating narrow and wide from the bottom up, finishing in a
+			//            single leaf above the trunk. Two tiers or three, drawn per tree.
+			//   BROAD    a deep flat crown: three layers at full width and a narrow cap, so a
+			//            jungle canopy reads as a ceiling rather than as a ball.
+			//
+			// The corner clip is what stops any of them being a cube on a stick, and it is
+			// written against the tree's own radius rather than a constant so that a radius-1
+			// canopy keeps all nine of its cells (a 3 x 3 has no corner to round off) while a
+			// radius-3 one is clipped like the radius-2 one always was.
+			//
+			// `wide` shifts nothing: the loops below run dx over -r..r+1 when the trunk is
+			// 2 x 2, and the clip measures distance to the trunk FOOTPRINT rather than to a
+			// point, so the crown sits centred over four columns instead of one.
 			const int top = t.ground + t.trunk;   // first y above the trunk
-			for (int dy = -2; dy <= 1; dy++) {
-				const int r = (dy <= -1) ? t.radius : 1;
-				for (int dz = -r; dz <= r; dz++) {
-					for (int dx = -r; dx <= r; dx++) {
-						if (r == GEN_TREE_RADIUS && dx * dx + dz * dz > r * r)
+			const int ext = t.wide ? 1 : 0;
+
+			for (int dy = canopyLowest(&t); dy <= 1; dy++) {
+				const int r = canopyRadiusAt(&t, dy);
+				if (r < 0)
+					continue;
+				for (int dz = -r; dz <= r + ext; dz++) {
+					for (int dx = -r; dx <= r + ext; dx++) {
+						const int fx = footprintDist(dx, ext);
+						const int fz = footprintDist(dz, ext);
+						if (r >= 2 && fx * fx + fz * fz > r * r)
 							continue;                        // clipped corners
 						ok &= treePut(w, cx, cz, t.x + dx, top + dy, t.z + dz,
 						              BLOCK_LEAVES, true);
