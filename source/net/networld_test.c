@@ -348,6 +348,129 @@ static void test_explicit_column_load_drains_pending(void)
     check(networldPendingCount() == 0, "store is empty after the drain");
 }
 
+/* v1.8.5. networld.c's pending store used to be a `static BlockDiffStore` — 0x104010 =
+ * 1064976 bytes of .bss, committed from boot whether or not the player ever opened
+ * Multiplayer, and invisible to both mallinfo() and linearSpaceFree(). It is now a pointer,
+ * NULL for the whole of a single-player session and malloc'd on the first server packet that
+ * actually needs somewhere to queue an edit.
+ *
+ * Every scenario above this one reaches the store by queueing into it first, so all of them
+ * run against a store that exists. This one is the other half: the state single player is in
+ * for its entire run, where every path into the store has to answer without one. */
+static void test_pending_store_is_absent_in_single_player(void)
+{
+    puts("with no store allocated, every pending-store path is safe and answers 0");
+
+    World w;
+    worldInit(&w);
+    networldInit();               /* frees whatever store the scenario before this allocated */
+    networldSetWorld(&w);
+
+    check(!networldTestPendingStoreAllocated(),
+          "no store exists at all after init — not an empty one");
+    check(networldPendingCount() == 0, "count reads 0 with no store");
+    check(networldPendingRefusals() == 0, "refusals reads 0 with no store");
+
+    /* Draining while absent. This is the single-player hot path, not an edge case: main.c
+     * calls networldOnColumnLoad() for every column the streamer installs, so in a solo world
+     * this runs hundreds of times and must never touch — or create — a store. */
+    worldColumnCreate(&w, 0, 0);
+    worldSet(&w, 3, 12, 3, BLOCK_GRASS);
+    networldOnColumnLoad(&w, 0, 0);
+    check(worldGet(&w, 3, 12, 3) == BLOCK_GRASS,
+          "a column load with no store leaves the world exactly as it was");
+    check(networldPendingCount() == 0, "and still reports nothing queued");
+    /* The count above cannot carry this on its own — an allocated empty store answers 0 too,
+     * and a drain that called pendingStore() passed the count check unchanged when it was
+     * injected. This is the check that actually holds the reclaim. */
+    check(!networldTestPendingStoreAllocated(),
+          "and did not allocate a store on the way past just to find it empty");
+
+    /* Recording while absent: the first edit that genuinely needs the store is what creates
+     * it, which is the only trigger there is — nothing tells this module a session began. */
+    uint8_t msg[BS_BLOCK_EDIT_BYTES];
+    buildBlockEdit(msg, 40, 10, 5, BLOCK_STONE);   /* column (2,0), never created */
+    networldApplyPayload(msg, sizeof msg);
+    check(networldTestPendingStoreAllocated(), "the store exists once an edit has needed it");
+    check(networldPendingCount() == 1,
+          "the first edit that needs a store allocates one and queues into it");
+    check(networldPendingRefusals() == 0, "and nothing was refused doing it");
+
+    /* And networldInit() hands the megabyte back — the disconnect path, net/bsnet.c's
+     * netDisconnect(). */
+    networldInit();
+    check(networldPendingCount() == 0, "networldInit() drops everything in the store");
+    check(!networldTestPendingStoreAllocated(),
+          "and gives the megabyte back rather than merely emptying it — which is the whole "
+          "reclaim on the disconnect path");
+
+    /* Freed and re-creatable, not freed and abandoned. Without this check a pendingDestroy()
+     * that failed to NULL the pointer, or a pendingStore() that refused to allocate twice,
+     * would leave a rejoin in the same boot silently queueing nothing — which looks exactly
+     * like a working client right up until the player's building is missing. */
+    networldSetWorld(&w);
+    networldApplyPayload(msg, sizeof msg);
+    check(networldPendingCount() == 1,
+          "a fresh store is created for the next session's first edit");
+}
+
+/* The out-of-memory branch. A 1.02 MB malloc on a 3DS with the mesh pool already up is not a
+ * theoretical failure, and the wrong answer to it is the one that costs nothing to write:
+ * return quietly, having neither queued the edit nor said so. That is the "my house is gone"
+ * bug reached from a different direction, and it is why blockdiff.h argues at length that a
+ * refused diff has to be countable. So an allocation failure is reported through the same
+ * counter a full store is — networldPendingRefusals(), which main.c already renders as "X". */
+static void test_pending_store_allocation_failure_is_counted_not_swallowed(void)
+{
+    puts("an edit that cannot be queued because the store will not allocate is counted, not swallowed");
+
+    World w;
+    worldInit(&w);
+    networldInit();
+    networldSetWorld(&w);
+
+    networldTestForcePendingAllocFail(true);
+
+    uint8_t m1[BS_BLOCK_EDIT_BYTES];
+    buildBlockEdit(m1, 40, 10, 5, BLOCK_STONE);   /* column (2,0), never created */
+    networldApplyPayload(m1, sizeof m1);
+
+    check(networldPendingCount() == 0, "nothing is queued when the store cannot be allocated");
+    check(worldGet(&w, 40, 10, 5) == BLOCK_AIR,
+          "and the edit was not written into the world as a consolation instead");
+    check(worldColumn(&w, 2, 0) == NULL, "nor was a phantom column created to hold it");
+    check(networldPendingRefusals() == 1,
+          "the lost edit is counted as a refusal, which is what lights main.c's \"X\" marker");
+
+    /* Every failed attempt counts, not only the first. A join sync that spent its whole length
+     * failing must not report one lost edit. */
+    uint8_t m2[BS_BLOCK_EDIT_BYTES];
+    buildBlockEdit(m2, 41, 11, 6, BLOCK_SAND);    /* also column (2,0) */
+    networldApplyPayload(m2, sizeof m2);
+    check(networldPendingRefusals() == 2, "a second failed edit is counted too");
+
+    /* Transient, not latched. The allocation is retried on the next edit, so a console that
+     * could not spare a megabyte during one frame is not desynced for the rest of the session. */
+    networldTestForcePendingAllocFail(false);
+    networldApplyPayload(m2, sizeof m2);
+    check(networldPendingCount() == 1,
+          "once allocation succeeds again the store is created and used");
+    check(networldPendingRefusals() == 2,
+          "and the two edits already lost stay on the record rather than being reset");
+
+    /* A store created late still drains normally — the failure path must not leave it in a
+     * state that only looks initialised. */
+    worldColumnCreate(&w, 2, 0);
+    networldOnColumnLoad(&w, 2, 0);
+    check(worldGet(&w, 41, 11, 6) == BLOCK_SAND, "the edit that did get queued lands on load");
+    check(networldPendingCount() == 0, "leaving nothing pending");
+
+    /* Disarm the seam for every scenario after this one — it is a process-wide static, in the
+     * same way the registry table the scenarios at the bottom of main() are grouped for is. */
+    networldTestForcePendingAllocFail(false);
+    networldInit();
+}
+
 static void test_column_load_ignores_foreign_world(void)
 {
     puts("networldOnColumnLoad() for a World other than the registered live one is a no-op");
@@ -3011,6 +3134,8 @@ int main(void)
     test_loaded_column_applies_directly();
     test_unloaded_column_queues_not_drops();
     test_explicit_column_load_drains_pending();
+    test_pending_store_is_absent_in_single_player();
+    test_pending_store_allocation_failure_is_counted_not_swallowed();
     test_column_load_ignores_foreign_world();
     test_worldset_hook_autodrains();
     test_validation_rejects_hostile_input();
@@ -3101,8 +3226,11 @@ int main(void)
      *
      * This guard is deliberately scoped to THIS suite. The same hole exists in every other
      * host suite under source/ and is a separate, fleet-wide job. */
-    check(g_checks == 368,
-          "check-count guard: every check in this suite actually ran (368 before this line)");
+    /* 368 -> 389. Delta computed from what was added, per the instructions above, not pasted
+     * off a failing run: test_pending_store_is_absent_in_single_player adds 12 and
+     * test_pending_store_allocation_failure_is_counted_not_swallowed adds 9. Nothing removed. */
+    check(g_checks == 389,
+          "check-count guard: every check in this suite actually ran (389 before this line)");
 
     printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;

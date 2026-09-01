@@ -712,6 +712,22 @@ void gpuTestPreflight(void)
 	          "first frame the world draws and are appended below.\n");
 	selfFlush(len);
 
+	// The 256 KB scratch pair was only ever needed by the tests above. Nothing else in this
+	// file touches s_src/s_dst without calling scratchInit() first — including
+	// gpuTestPostMortem()'s own step 1, which is the only other caller and only runs if the
+	// GPU ever actually wedges — and scratchInit() is written to be idempotent and re-callable
+	// (it checks `s_src && s_dst` before allocating), so freeing here and letting a later
+	// wedge re-allocate it lazily costs nothing except that render distance gets the 512 KB
+	// back for every boot that never wedges, which on the numbers this whole battery was
+	// written to chase is every boot so far.
+	if (s_src) { linearFree(s_src); s_src = NULL; }
+	if (s_dst) { linearFree(s_dst); s_dst = NULL; }
+	len = app(s_self, sizeof(s_self), len,
+	          "\nscratch buffers   : %s\n",
+	          (!s_src && !s_dst) ? "freed (s_src NULL, s_dst NULL)"
+	                             : "STILL HELD -- free did not clear both pointers");
+	selfFlush(len);
+
 	#undef REPORT
 }
 
@@ -745,6 +761,10 @@ void gpuTestListProbe(const uint8_t* list, uint32_t len_bytes)
 		          "\nlist replay  : SKIPPED, list is %lu B (need 64 .. %lu).\n",
 		          (unsigned long)len_bytes, (unsigned long)LIST_MAX);
 		selfFlush(len);
+		// replayInit() above already allocated s_replay; this call is bailing before using it,
+		// and gpuTestListProbe() never runs again (s_probe_done). Give it back the same way the
+		// bottom of this function does — see the comment down there.
+		if (s_replay) { linearFree(s_replay); s_replay = NULL; }
 		return;
 	}
 
@@ -830,6 +850,19 @@ void gpuTestListProbe(const uint8_t* list, uint32_t len_bytes)
 		}
 		selfFlush(len);
 	}
+
+	// The 32 KB replay buffer was only needed for R1-R3 above. gpuTestListProbe() runs exactly
+	// once per process (s_probe_done, top of this function), so nothing here will ever call
+	// replayInit() again — the only other caller is gpuTestPostMortem()'s steps 2 and 3, which
+	// call replayInit() themselves before touching s_replay and only run if the GPU actually
+	// wedges later. replayInit() is idempotent (it checks `!s_replay` before allocating), so
+	// freeing here and letting a real wedge re-allocate it lazily is safe, and it gives render
+	// distance the 32 KB back for every boot that never wedges.
+	if (s_replay) { linearFree(s_replay); s_replay = NULL; }
+	len = app(s_self, sizeof(s_self), len,
+	          "\nreplay buffer     : %s\n",
+	          s_replay ? "STILL HELD -- free did not clear the pointer" : "freed (s_replay NULL)");
+	selfFlush(len);
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -4,6 +4,58 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.8.5] - 2026-09-01
+
+Render distance. There were two ceilings on how far you could see, and only one of them was
+the one everybody talks about. Raising the number of chunks the game loads was the easy half;
+the half that actually decided what you saw was the fog, which had been quietly closing the
+world in at about fourteen blocks no matter what the render-distance slider said. Both are
+gone. **This release makes the view further on both consoles, and further still on a New 3DS**
+— those are two separate changes and the notes below keep them separate.
+
+### Added
+
+- **A New 3DS can now be set to render distance 5.** The slider, the title-screen stepper and
+  the saved settings file all go to 5 on a New 3DS; an Old 3DS still stops at 3, which is what
+  its memory holds. *This is the only setting in the release where the two consoles differ.*
+  It is a ceiling, not a default — a New 3DS still starts at 2, the same as before, and 4 and 5
+  are yours to opt into. Nothing about an Old 3DS's limits changed.
+- **A settings file from a New 3DS is safe in an Old 3DS.** Move the SD card and a render
+  distance of 5 is quietly brought down to 3 on load, instead of being handed to a console that
+  cannot hold it.
+
+### Changed
+
+- **You can actually see to the edge of what is loaded now.** The fade to sky used to be drawn
+  by a piece of fixed hardware whose steps bunch up close to the camera, and the first step past
+  the near plane landed at just under 21 blocks — so the world was half-faded by about 14 blocks
+  at *every* render distance. Turning the distance up loaded more chunks and showed you none of
+  them. The fade is now drawn by the game itself and scales with the setting: **the world is
+  half-faded at 28.5 blocks at distance 3, 38 at distance 4, and 47.5 at distance 5** — a clean
+  9.5 blocks per step. **Old 3DS owners get most of this release right here**: distance 3 is
+  unchanged as a limit, but what you can see at distance 3 roughly doubles.
+- **Other players fade into the distance the same way the blocks around them do.** Previously a
+  distant player was drawn at full brightness against a hazed-out world and stood out like a
+  sticker.
+
+### Fixed
+
+- **Chunks could go permanently missing at a wide render distance.** The queue that holds
+  not-yet-built chunk meshes was sized for the old limit and could refuse work during the first
+  big load of a world. A refused chunk was never asked for again — it left a hole in the terrain
+  that stayed there, with nothing on screen or in any log to say why. The queue is now sized
+  from the limit rather than set beside it, and the build fails outright if the two ever drift
+  apart again.
+- **The relight queue was undersized in the same way**, caught by a test that the mesh queue did
+  not have. It has one now.
+
+### Compatibility
+
+Worlds, saves and multiplayer are untouched by this release. Nothing in the world format, the
+generator or the network protocol changed, so a 1.8.5 client and a 1.8.4 client see the same
+world and can play together. Your existing settings file is read as-is; the only value that can
+change is the render distance, and only on an Old 3DS reading a file a New 3DS wrote.
+
 ## [1.8.4] - 2026-09-01
 
 A New 3DS has been running this game as if it were an Old 3DS. Same 268 MHz, no L2 cache, one

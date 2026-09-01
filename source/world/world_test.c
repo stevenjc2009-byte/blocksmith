@@ -6439,7 +6439,12 @@ static void testRenderDist(void)
 	CHECK(renderDistDefault(true) != RENDER_DIST_MAX);
 	CHECK(renderDistDefault(true) >= RENDER_DIST_MIN && renderDistDefault(true) <= RENDER_DIST_MAX);
 	CHECK(renderDistDefault(false) == 1);
-	CHECK(RENDER_DIST_MAX == 3);
+	// v1.8.5: the ceiling moved 3 -> 5 and this line is the tripwire that made that a deliberate
+	// act rather than a silent one — it went red, was read, and is being updated on purpose. The
+	// defaults did NOT move with it: renderDistDefault is still 1 and 2, which is exactly what
+	// the three checks above are here to keep true. See scene/render_dist.h for why the fog
+	// rewrite is what unblocked the ceiling.
+	CHECK(RENDER_DIST_MAX == 5);
 
 	const RenderDist lo = renderDistFor(RENDER_DIST_MIN);
 	const RenderDist hi = renderDistFor(RENDER_DIST_MAX);
@@ -6456,9 +6461,11 @@ static void testRenderDist(void)
 	// COLUMN_CHUNKS, so the absolute pin below moves 294 -> 392. It stays an absolute number
 	// next to the relative one on purpose: the relative check cannot notice
 	// RENDER_DIST_SLOTS_PER_COLUMN itself moving, and it moving is what broke the pool.
+	// v1.8.5 moved the ceiling 3 -> 5, so the ring is 121 columns and the absolute pin moves
+	// 392 -> 968. Both numbers are re-stated rather than made relative, for the reason above.
 	CHECK(lo.slots == 9 * RENDER_DIST_SLOTS_PER_COLUMN);
-	CHECK(hi.slots == 49 * RENDER_DIST_SLOTS_PER_COLUMN);
-	CHECK(hi.slots == 392);
+	CHECK(hi.slots == 121 * RENDER_DIST_SLOTS_PER_COLUMN);
+	CHECK(hi.slots == 968);
 	CHECK(hi.slots > lo.slots);
 
 	// v1.7.0. The pool must cover a ring in which EVERY chunk of every column is meshed, not
@@ -6471,7 +6478,7 @@ static void testRenderDist(void)
 
 	// The slot count the pool is actually cut against, kept in step with the setting's own
 	// arithmetic. scene/chunk_render.c splits exactly this many slots across its three tiers.
-	CHECK(RENDER_DIST_MAX_COLUMNS == 49);
+	CHECK(RENDER_DIST_MAX_COLUMNS == 121);   // v1.8.5: was 49 at the old ceiling of 3
 	CHECK(RENDER_DIST_MAX_SLOTS == hi.slots);
 
 	// Radius 1 keeps the near plane it has always had, so raising the setting is the only
@@ -6503,7 +6510,7 @@ static void testRenderDist(void)
 	// target by then at every setting. This is the criterion step 6.4 established and it has
 	// to survive the setting becoming variable.
 	CHECK(lo.boundary > 15.9f && lo.boundary < 16.1f);
-	CHECK(hi.boundary > 47.9f && hi.boundary < 48.1f);   // radius 3 x 16 blocks
+	CHECK(hi.boundary > 79.9f && hi.boundary < 80.1f);   // v1.8.5: radius 5 x 16 blocks
 	CHECK(lo.fog_hides);
 	CHECK(hi.fog_hides);
 	CHECK(renderDistVisibility(&lo, lo.boundary) <= RENDER_DIST_TARGET_VIS * 1.01f);
@@ -6543,9 +6550,79 @@ static void testRenderDist(void)
 
 	// Zero density is "no fog" through this same code path, which is what makes the
 	// -DFOG_DENSITY=0.0f check able to go red rather than merely different.
+	//
+	// v1.8.5: the field stopped being a density and became the strength of the whole fade, but
+	// 0 still means the same thing here and this line is deliberately unchanged. The threshold
+	// is 0.999 rather than 1.0 and that is now load-bearing rather than slack: with the fog off
+	// every knot value is 1.0, and the hardware stores a value in 11 bits of 1/2048ths, so the
+	// most transparent thing a PICA200 fog LUT can hold is 2047/2048 = 0.99951. A future edit
+	// that "tightens" this to 0.9999 is asserting something the hardware cannot represent.
 	RenderDist off = lo;
 	off.fog_density = 0.0f;
 	CHECK(renderDistVisibility(&off, 100.0f) > 0.999f);
+
+	// ── v1.8.5. The LUT is filled directly instead of being asked for an exponential ───────
+
+	// The payoff, as an absolute number rather than as a ratio against itself. FogLut_Exp
+	// reached the boundary target by fogging the near field as well, because a single
+	// exponential cannot do one without the other, and radius 3 measured 9.4950 blocks of
+	// half_vis on the old code. This line is RED at 9.4950 and green at the measured 14.3358,
+	// so it cannot pass by luck or by the check being vacuous — it is the change, stated as a
+	// number. 14.0 sits under the measurement by enough to absorb float noise between compilers
+	// and nowhere near enough to be reachable by the curve it replaced.
+	CHECK(renderDistFor(3).half_vis >= 14.0f);
+
+	// And the constraint that was NOT relaxed to buy it. The fade must still be complete at the
+	// load boundary at every setting in the range, or the player sees the edge of the loaded
+	// world — which is the entire reason there is fog at all. Every radius rather than the two
+	// ends: the ends are the ones that get looked at, and a middle radius that stopped hiding
+	// its boundary would draw no attention to itself until someone was standing in it.
+	for (int r = RENDER_DIST_MIN; r <= RENDER_DIST_MAX; r++) {
+		const RenderDist rd = renderDistFor(r);
+		CHECK_QUIET(renderDistVisibility(&rd, rd.boundary) <= RENDER_DIST_TARGET_VIS * 1.01f);
+		CHECK_QUIET(rd.fog_hides);
+	}
+
+	// The table's two halves have to agree. FogLut_FromArray packs data[i] as knot i's value and
+	// data[128+i] as the step from knot i to knot i+1, and the hardware evaluates
+	// value + frac * step — so the differences are what actually draws the slope and the values
+	// only place its ends. A difference array that did not match its values would draw a curve
+	// present in neither half, and nothing on screen would say which half was wrong.
+	//
+	// Exact equality rather than a tolerance, and deliberately: renderDistFogTable computes each
+	// difference BY subtracting the two values, so if this ever fails it has failed structurally
+	// — someone filled the halves independently — and not by rounding. A tolerance here would
+	// pass the one bug the check exists to catch.
+	for (int r = RENDER_DIST_MIN; r <= RENDER_DIST_MAX; r++) {
+		const RenderDist rd = renderDistFor(r);
+		float lut[RENDER_DIST_FOG_FLOATS];
+		renderDistFogTable(&rd, lut);
+
+		for (int i = 0; i + 1 < RENDER_DIST_FOG_KNOTS; i++)
+			CHECK_QUIET(lut[RENDER_DIST_FOG_KNOTS + i] == lut[i + 1] - lut[i]);
+
+		// The last entry has no knot inside the table to subtract from: it is the step to a
+		// 129th knot at index01 = 1.0, the near plane, which citro3d's own FogLut_Exp evaluates
+		// and stores the same way. This curve is flat clear from knot 2 inward, so that knot
+		// equals knot 127 and the step is 0.
+		CHECK_QUIET(lut[RENDER_DIST_FOG_FLOATS - 1] == 0.0f);
+	}
+
+	// The shape itself, written where it can go red instead of only in a comment. Knot 0 is the
+	// far plane and fully fogged; knot 1 carries the entire boundary constraint and is the
+	// curve's one solved number; everything from knot 2 inward is clear, and that is precisely
+	// where the extra 4.8 blocks of visible world came from.
+	{
+		const RenderDist rd = renderDistFor(RENDER_DIST_MAX);
+		float lut[RENDER_DIST_FOG_FLOATS];
+		renderDistFogTable(&rd, lut);
+
+		CHECK(lut[0] == 0.0f);
+		CHECK(lut[1] == rd.knot_vis);        // exact: see renderDistFogTable's blend spelling
+		CHECK(lut[1] > 0.0f && lut[1] < 0.05f);
+		for (int i = 2; i < RENDER_DIST_FOG_KNOTS; i++)
+			CHECK_QUIET(lut[i] == 1.0f);
+	}
 }
 
 // ── Step 8.1, the save format ─────────────────────────────────────────────────────────
@@ -11547,21 +11624,52 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 //   +4   testPlayerWiresSwimming, for the four things that have to be true of the call in
 //        scene/player.c: it exists, it is after the step, its result reaches the eye, and
 //        it is handed the post-step wet state.
+//
+// v1.8.5, the directly-filled fog LUT: 5476 + 4 = 5480, all four in testRenderDist and all four
+// countable off the source -- 1 for half_vis clearing 14 blocks at radius 3, and 3 for the
+// shape of the table itself (knot 0 fully fogged, knot 1 equal to the solved knot_vis, knot 1
+// inside a sane range). Everything else that block adds is CHECK_QUIET inside a loop over the
+// radii and over the 128 knots, which is 1,152 assertions that cost the count nothing while
+// they pass and name themselves the moment one does not.
+//
+// Verified by ablation rather than by counting alone, because this file's own comment above
+// says counting is what goes wrong here: with the four loud CHECKs rewritten to (void) the run
+// printed 5476 and the guard passed, so those four cost exactly four and the quiet ones cost
+// nothing.
+//
+// v1.8.5, the runtime mesh pool: 5480 + 576 = 6056. Every one of the 576 comes from ONE line,
+// world/dirtyq.h's DIRTYQ_MAX going 392 -> 968 to cover a radius-5 ring, because testDirtyq at
+// line 3707 is `for (int i = 0; i < DIRTYQ_MAX; i++) CHECK(dirtyqMark(&q, i));` — one loud CHECK
+// per slot. 968 - 392 = 576 exactly.
+//
+// Established by ABLATION, not by attributing the difference to whatever changed that day, and
+// the distinction mattered: three things moved in the same session and the obvious suspect was
+// wrong. Building the same tree with each candidate reverted on its own gave —
+//
+//     tree as-is                 6056 checks
+//     DIRTYQ_MAX 968 -> 392      5480 checks, guard silent   <- the whole 576
+//     JOBQ_CAP  1024 -> 512      6056 checks, no change
+//     RENDER_DIST_MAX 5 -> 4     6056 checks, no change
+//     RENDER_DIST_MAX 5 -> 3     6056 checks, no change
+//
+// So the ceiling lift this version is named for contributes exactly ZERO checks, which is worth
+// writing down: the pin moving in the same commit as RENDER_DIST_MAX is a coincidence of timing,
+// and a future reader who assumes the two are connected will mis-derive the next number.
 #ifndef __3DS__
 	{
 		const int ran = s_checks;
-		if (ran != 5476)
+		if (ran != 6056)
 			printf("\nCHECK-COUNT GUARD: %d checks ran, %d expected.\n"
 			       "  %s\n"
 			       "  This is NOT an ordinary assertion failure.\n"
 			       "  Read the comment above this guard in world/world_test.c before"
 			       " touching the pinned number.\n",
-			       ran, 5476,
-			       ran < 5476
+			       ran, 6056,
+			       ran < 6056
 			           ? "Checks went MISSING: checks that should have run never ran at all."
 			           : "Extra checks appeared: either you added checks and did not update"
 			             " the pin, or something is emitting checks it should not.");
-		CHECK(ran == 5476);
+		CHECK(ran == 6056);
 	}
 #endif
 

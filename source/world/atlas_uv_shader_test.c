@@ -218,9 +218,28 @@ static double absd(double v) { return v < 0.0 ? -v : v; }
 // loadLines() is one fgets() per line and joins NO continuations. That is a real limit and it
 // has bitten this project once already (water_alpha_test.c's BLEND_ON_TAIL); it does not bite
 // here, because a .pica instruction is always exactly one line.
-
+//
+// COMMENTS (v1.9.0). Every needle below is a fragment of picasso assembly, and picasso's
+// comment character is ';' — so a line of PROSE that names an instruction is indistinguishable
+// from the instruction itself under a plain strstr(). That is not hypothetical: the fog work
+// added a comment to both .pica files explaining why the fog coordinate could NOT ride on the
+// spare z/w lanes of outtc0, and naming `mov outtc0, r2.xyxy` to say which instruction it was
+// talking about. This file promptly reported 4 failures — two per shader — claiming the
+// texcoord output was written twice and that the multiply came after the output, the second
+// only because the "output" it had found was a comment 50 lines above the real one.
+//
+// Both shaders were correct. The guard was wrong, and wrong in a way that punishes documenting
+// an instruction by name, which this project does constantly. So a .pica line is now truncated
+// at its first ';' BEFORE matching, and every needle is asserted against code only.
+//
+// The flag is a parameter rather than always-on because loadLines() is also pointed at
+// scene/chunk_render.c, where ';' ends a statement and cutting at it would silently discard
+// most of every line. Callers say which language they are reading.
 #define MAX_LINES 4096
 #define MAX_LINE  512
+
+#define PICA_COMMENTS true   // ';' starts a comment (picasso assembly)
+#define C_COMMENTS    false  // ';' ends a statement (C)
 
 static char s_lines[MAX_LINES][MAX_LINE];
 static int  s_nlines;
@@ -240,15 +259,26 @@ static void squash(const char* in, char* out, size_t cap)
 // Returns the number of lines read, or -1 if the file could not be opened. The caller turns
 // -1 into a failure; it is never treated as "no lines, therefore nothing to complain about" —
 // the same rule the header of this file states for every other parse in it.
-static int loadLines(const char* path)
+//
+// `strip_semicolon` truncates each line at its first ';' — pass PICA_COMMENTS for a .pica file
+// and C_COMMENTS for a .c one. See the comment block above for what it is protecting against.
+// Note the line NUMBERS are unaffected: a comment-only line becomes empty and matches nothing,
+// but it still occupies its slot, so an L%d in a failure message still points at the real line
+// of the real file.
+static int loadLines(const char* path, bool strip_semicolon)
 {
 	FILE* f = fopen(path, "r");
 	if (!f) return -1;
 
 	s_nlines = 0;
 	char raw[4096];
-	while (s_nlines < MAX_LINES && fgets(raw, sizeof raw, f))
+	while (s_nlines < MAX_LINES && fgets(raw, sizeof raw, f)) {
+		if (strip_semicolon) {
+			char* c = strchr(raw, ';');
+			if (c) *c = '\0';
+		}
 		squash(raw, s_lines[s_nlines++], MAX_LINE);
+	}
 
 	fclose(f);
 	return s_nlines;
@@ -273,28 +303,41 @@ static int countLines(const char* needle, int* first_line)
 // and the first two parse cleanly as numbers with nothing left over). Otherwise fills errbuf
 // with which step failed and returns false, so the caller can turn that into a real failure
 // instead of silently passing.
+//
+// COMMENTS (v1.9.0). This used to run its own fopen/fgets loop and match NEEDLE against the raw
+// text, which made it blind in exactly the way checkShaderUsesUvScale() was — a line of PROSE
+// naming `.constf uvScale(` would be picked up as the declaration itself, and then parsed. The
+// two failure modes are worse here than they were there, because this function does not merely
+// count: a comment that happens to contain a parenthesis parses into NUMBERS, so the wrong
+// values could be checked against the header and reported as a wrong constant in a file whose
+// constant is right. Left alone it was a trap waiting on the day someone documents uvScale by
+// name, so it now shares loadLines(path, PICA_COMMENTS) with every other parse in this file and
+// there is one definition of "a line" for the whole suite.
 static bool readShaderUvScale(const char* path, double* outU, double* outV,
                               char* errbuf, size_t errbufsz)
 {
-	FILE* f = fopen(path, "r");
-	if (!f) {
+	const int nlines = loadLines(path, PICA_COMMENTS);
+	if (nlines < 0) {
 		snprintf(errbuf, errbufsz, "cannot open %s", path);
 		return false;
 	}
 
-	char line[512];
-	char found[512];
-	found[0] = '\0';
-	while (fgets(line, sizeof(line), f)) {
-		if (strstr(line, NEEDLE)) {
-			snprintf(found, sizeof(found), "%s", line);
-			break;
-		}
+	// A pointer INTO s_lines rather than a copy of it. Copying needed a bound gcc could not
+	// see through the flattened [MAX_LINES][MAX_LINE] index, and -Werror=format-truncation
+	// rejected it; nothing reloads s_lines between here and the parse below, so borrowing the
+	// line is both correct and one less buffer to size.
+	const char* found = NULL;
+	for (int i = 0; i < nlines; i++) {
+		if (!strstr(s_lines[i], NEEDLE)) continue;
+		found = s_lines[i];
+		break;
 	}
-	fclose(f);
 
-	if (!found[0]) {
-		snprintf(errbuf, errbufsz, "no '%s' line found in %s", NEEDLE, path);
+	if (!found) {
+		snprintf(errbuf, errbufsz,
+		         "no '%s' line found in %s. Note comments are stripped before matching, so a "
+		         "commented-out declaration reads as no declaration — which is what it is",
+		         NEEDLE, path);
 		return false;
 	}
 
@@ -403,7 +446,7 @@ static void checkShaderUsesUvScale(const char* path, bool bound)
 {
 	const char* role = bound ? "BOUND on both console models" : "compiled, never bound";
 
-	const int n = loadLines(path);
+	const int n = loadLines(path, PICA_COMMENTS);
 	CHECK(n >= 0, "cannot open %s to check that uvScale is used (%s)", path, role);
 	if (n < 0) return;
 
@@ -440,6 +483,119 @@ static void checkShaderUsesUvScale(const char* path, bool bound)
 	      path, role, mul_line, out_line);
 }
 
+// ── The v1.9.0 fog wiring, in BOTH shaders ──────────────────────────────────────────────────
+//
+// The same duplication problem uvScale has, for the same reason. world.v.pica is compiled and
+// never bound (see checkBoundShaderIsTheDynamicOne below), and it is kept precisely so this
+// file can hold the two copies to each other — so an edit that lands in one and not the other
+// is caught by a test rather than by a console. The fog coordinate is now a second thing
+// duplicated across them, so it is checked the same way.
+//
+// The wiring, and what each needle is actually protecting:
+//
+//   .fvec fogParams[1]   the uniform chunk_render.c uploads (inv_range, bias). The whole fade
+//                        is those two numbers; without the declaration nothing uploads.
+//   .out outtc1 texcoord1  the varying. NOT outtc0's spare z/w lanes — texcoord0 is a
+//                        two-component semantic and those lanes are discarded, and not vertex
+//                        colour either, because greedy merging requires flat AO so no merged
+//                        quad in this game has ever interpolated colour across a long run.
+//   dp4 r7.w, projection[3], r1   LINEAR eye depth, kept in a register instead of being thrown
+//                        straight at outpos.w. Row 3 of Mtx_PerspTilt is (0,0,-1,0) — measured
+//                        with objdump on the shipped libcitro3d.a, quoted in both .pica files —
+//                        so this dp4 is -z_eye, i.e. positive distance in blocks. It must be
+//                        eye-space Z and not a Euclidean length: mesher.c merges only coplanar
+//                        cells, Z is linear across a plane and interpolates exactly, and a
+//                        per-vertex sqrt() would flatten the fade toward the middle of every
+//                        big merged run.
+//   mov outpos.w, r7.wwww   the clip w that dp4 used to write directly. If this is ever lost
+//                        the world does not fog wrongly, it does not draw at all.
+//   mul / add / mov      u = depth * inv_range + bias, then out. The ORDER of these is the
+//                        wiring claim; presence alone would pass with them shuffled.
+//
+// Comment stripping matters here more than anywhere: the .pica files explain this design in
+// prose that names these very instructions. See the loadLines() comment block.
+#define FOG_UNIFORM_NEEDLE ".fvec fogParams[1]"
+#define FOG_OUTDECL_NEEDLE ".out outtc1 texcoord1"
+#define FOG_DEPTH_NEEDLE   "dp4 r7.w, projection[3], r1"
+#define FOG_CLIPW_NEEDLE   "mov outpos.w, r7.wwww"
+#define FOG_MUL_NEEDLE     "mul r7.x, fogParams.xxxx, r7.wwww"
+#define FOG_ADD_NEEDLE     "add r7.x, fogParams.yyyy, r7.xxxx"
+#define FOG_OUT_NEEDLE     "mov outtc1, r7.xxxx"
+
+// The old hardware path, which must be GONE from the shaders' point of view. Nothing in a
+// .pica ever mentioned the fog LUT — this is here for the OTHER half of the double-fog risk:
+// `dp4 outpos.w, projection[3], r1` is the instruction the depth capture replaced, and if it
+// comes back alongside the new one the shader writes clip w twice.
+#define FOG_OLD_CLIPW_NEEDLE "dp4 outpos.w, projection[3], r1"
+
+static void checkShaderFogWiring(const char* path, bool bound)
+{
+	const char* role = bound ? "BOUND on both console models" : "compiled, never bound";
+
+	const int n = loadLines(path, PICA_COMMENTS);
+	CHECK(n >= 0, "cannot open %s to check the fog wiring (%s)", path, role);
+	if (n < 0) return;
+
+	int depth_line = -1, mul_line = -1, add_line = -1, out_line = -1;
+
+	CHECK(countLines(FOG_UNIFORM_NEEDLE, NULL) == 1,
+	      "%s (%s) does not declare `%s`. scene/chunk_render.c looks that uniform up by name "
+	      "with shaderInstanceGetUniformLocation and uploads (inv_range, bias) into it every "
+	      "frame; with no declaration the lookup returns -1 and the entire fade is silently "
+	      "whatever register 0 happens to hold", path, role, FOG_UNIFORM_NEEDLE);
+
+	CHECK(countLines(FOG_OUTDECL_NEEDLE, NULL) == 1,
+	      "%s (%s) does not declare `%s`. The fog factor is a VARYING — it has to be "
+	      "interpolated per fragment for the fade to be smooth across a face, and TEV stage 1 "
+	      "reads it as texture unit 1's coordinate", path, role, FOG_OUTDECL_NEEDLE);
+
+	CHECK(countLines(FOG_DEPTH_NEEDLE, &depth_line) == 1,
+	      "%s (%s) does not compute linear eye depth with `%s`. This is the only source of the "
+	      "fog coordinate; there is no vertex attribute carrying distance and there cannot be "
+	      "one — world/mesh_vertex.h pins MeshVertex at 8 bytes with a _Static_assert and its "
+	      "one spare-looking byte carries the smooth-light nibbles",
+	      path, role, FOG_DEPTH_NEEDLE);
+
+	CHECK(countLines(FOG_CLIPW_NEEDLE, NULL) == 1,
+	      "%s (%s) has no `%s`, so clip w is never written. Capturing the depth into r7.w is "
+	      "only half the edit — the perspective divide still needs that value in outpos.w and "
+	      "without it nothing rasterises at all", path, role, FOG_CLIPW_NEEDLE);
+
+	CHECK(countLines(FOG_OLD_CLIPW_NEEDLE, NULL) == 0,
+	      "%s (%s) still contains `%s`. That is the instruction the depth capture REPLACED; "
+	      "having both writes clip w twice", path, role, FOG_OLD_CLIPW_NEEDLE);
+
+	CHECK(countLines(FOG_MUL_NEEDLE, &mul_line) == 1,
+	      "%s (%s) does not scale the depth by fogParams.x: expected exactly one `%s`. Without "
+	      "it the ramp is sampled with raw block distances, so every fragment past 1 block "
+	      "clamps to fully fogged", path, role, FOG_MUL_NEEDLE);
+
+	CHECK(countLines(FOG_ADD_NEEDLE, &add_line) == 1,
+	      "%s (%s) does not add the fogParams.y bias: expected exactly one `%s`. The bias is "
+	      "what holds the near end of the fade at `start` blocks; without it the fog begins at "
+	      "the camera", path, role, FOG_ADD_NEEDLE);
+
+	CHECK(countLines(FOG_OUT_NEEDLE, &out_line) == 1,
+	      "%s (%s) does not write the fog coordinate out: expected exactly one `%s`. A correct "
+	      "computation left in a register nothing outputs looks exactly like no fog",
+	      path, role, FOG_OUT_NEEDLE);
+
+	// ORDER. Four instructions each of which is individually correct still produce nothing if
+	// they run in the wrong sequence, and a PICA200 register holds the PREVIOUS vertex's value,
+	// so a mis-ordered chain draws a world one vertex out of step and errors nowhere. Same
+	// reasoning as the uvScale order check above.
+	CHECK(depth_line > 0 && mul_line > 0 && depth_line < mul_line,
+	      "%s (%s) captures the depth at L%d but scales it at L%d — the depth must come FIRST, "
+	      "or the multiply reads whatever r7.w held from the previous vertex",
+	      path, role, depth_line, mul_line);
+	CHECK(mul_line > 0 && add_line > 0 && mul_line < add_line,
+	      "%s (%s) scales at L%d but biases at L%d — the multiply must come FIRST",
+	      path, role, mul_line, add_line);
+	CHECK(add_line > 0 && out_line > 0 && add_line < out_line,
+	      "%s (%s) biases at L%d but outputs at L%d — the bias must come FIRST",
+	      path, role, add_line, out_line);
+}
+
 // WHICH of the two programs the renderer actually binds.
 //
 // This file has said "a New 3DS binds world_dynamic.v.pica instead" in prose since v1.6.0 and
@@ -452,7 +608,7 @@ static void checkShaderUsesUvScale(const char* path, bool bound)
 // same argument in world/water_alpha_test.c's checkOneShader calls with them.
 static void checkBoundShaderIsTheDynamicOne(void)
 {
-	const int n = loadLines(RENDERER_PATH);
+	const int n = loadLines(RENDERER_PATH, C_COMMENTS);
 	CHECK(n >= 0, "cannot open %s to find out which shader program is bound", RENDERER_PATH);
 	if (n < 0) return;
 
@@ -761,6 +917,15 @@ int main(void)
 	checkBoundShaderIsTheDynamicOne();
 	checkShaderUsesUvScale(DYNAMIC_SHADER_PATH, true);
 	checkShaderUsesUvScale(WORLD_SHADER_PATH, false);
+
+	// ── The fog wiring (v1.9.0) ─────────────────────────────────────────────────────────
+	// Second thing duplicated across the two .pica files, checked for the same reason as
+	// uvScale: world.v.pica exists to be the copy that goes stale, and this is what notices.
+	// The fade itself — its shape, and the half_vis it produces — is tests/fogramp_test.c;
+	// this pair only asserts that the shader computes a fog coordinate at all and in the
+	// right order.
+	checkShaderFogWiring(DYNAMIC_SHADER_PATH, true);
+	checkShaderFogWiring(WORLD_SHADER_PATH, false);
 
 	// H2. The two shaders against each other, not only against the header. An Old 3DS binds
 	// one and a New 3DS the other, so they have to agree or the same world looks different on

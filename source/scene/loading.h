@@ -44,7 +44,15 @@ typedef struct {
 	int  meshes;          // chunk meshes built since the boot began
 	int  mesh_queued;     // mesh jobs still waiting
 	bool spawn_ready;     // the player's own column is installed
-	bool ring_ready;      // its eight neighbours are too, so its chunks can be meshed
+	// Corrected 2026-09-01. This said "its eight neighbours are too", describing a 3x3 gate.
+	// The implementation has never done that: main.c sets it from `in >= total`, where total is
+	// span*span — the WHOLE ring, 49 columns at radius 3. The difference is not academic. Read
+	// as 3x3, the loading screen looks like it should close as soon as the player's immediate
+	// surroundings exist, which makes reordering the build queue nearest-first look like a
+	// direct fix for pop-in. It is not: loading.c's exit test is a conjunction over the entire
+	// ring, so reordering changes which column is built first and cannot close the screen one
+	// frame sooner. Measured in v1.8.6's evidence pass; the optimisation was dropped over it.
+	bool ring_ready;      // every column the ring wants is installed, so chunks can be meshed
 	bool worker_busy;     // the generator thread still has work outstanding
 	int  columns_failed;  // installed with holes
 	int  submit_failed;   // never made it into the worker's queue at all

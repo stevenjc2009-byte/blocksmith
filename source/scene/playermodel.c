@@ -3,6 +3,8 @@
 #include <stdio.h>
 
 #include "gfx/font.h"
+#include "gfx/fogramp.h"          // the fade's shape, shared with the terrain pass
+#include "gfx/fogtex.h"           // the ramp texture on unit 1, owned by gfx/, bound by both
 #include "gfx/sprite.h"
 #include "net/networld.h"
 #include "scene/chunk_render.h"   // for the world's projection, which this must match
@@ -81,6 +83,16 @@ static DVLB_s*         s_dvlb;
 static shaderProgram_s s_program;
 static int             s_uloc_projection;
 static int             s_uloc_modelview;
+static int             s_uloc_fogparams;
+
+// v1.9.0. The same override scene/chunk_render.c defines, spelled the same way and for the
+// same reason: -DFOG_DENSITY=0.0f has to take the fog off the PLAYERS too, or the red arm
+// would leave them fading against terrain that no longer fades and the check would be
+// measuring two different things. The default expands to the field, so a normal build reads
+// exactly what the terrain reads.
+#ifndef FOG_DENSITY
+#define FOG_DENSITY  (chunkRenderDistance()->fog_density)
+#endif
 
 static PmVertex* s_verts;      // linearAlloc'ed once at init, rebuilt never
 static bool      s_ready;
@@ -169,6 +181,7 @@ bool playerModelInit(void)
 
 		s_uloc_projection = shaderInstanceGetUniformLocation(s_program.vertexShader, "projection");
 		s_uloc_modelview  = shaderInstanceGetUniformLocation(s_program.vertexShader, "modelView");
+		s_uloc_fogparams  = shaderInstanceGetUniformLocation(s_program.vertexShader, "fogParams");
 		s_shader_ready = true;
 	}
 
@@ -223,6 +236,49 @@ void playerModelDraw(const C3D_Mtx* view)
 	C3D_TexEnvInit(env);
 	C3D_TexEnvSrc(env, C3D_Both, GPU_CONSTANT, 0, 0);
 	C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
+
+	// v1.9.0. TEV stage 1 and the fog unit, both explicitly OWNED here instead of inherited.
+	// See the same block in scene/highlight.c for the pre-existing leak this closes.
+	//
+	// This is the one pass of the four that genuinely WANTS the fade. Player bodies were fogged
+	// before v1.9.0, though by accident rather than design — the hardware fog unit the world
+	// pass left switched on applied to them too — and unlike the cage and the crack overlay a
+	// player can be at any distance, so a distant one really did fade toward the sky. Dropping
+	// that with the fixed-function unit would have been a regression, and a conspicuous one at
+	// this version's render distances: half-visibility moves from 14.34 blocks to 28.5 at
+	// radius 3 and 47.5 at radius 5, so there is far more depth in which a player can stand at
+	// full contrast against terrain that is fading out behind them.
+	//
+	// So the fade is reproduced deliberately, on the SAME curve rather than on a similar one:
+	// source/shaders/highlight.v.pica now emits the identical fog coordinate world_dynamic
+	// does, this binds the same ramp texture, and the uniform below is built by the same
+	// fogShapeFor() from the same boundary. One curve, three call sites, no drift.
+	fogTexBind();
+
+	C3D_TexEnv* fog = C3D_GetTexEnv(1);
+	C3D_TexEnvInit(fog);
+	C3D_TexEnvSrc(fog, C3D_RGB, GPU_CONSTANT, GPU_PREVIOUS, GPU_TEXTURE1);
+	C3D_TexEnvOpRgb(fog, GPU_TEVOP_RGB_SRC_COLOR, GPU_TEVOP_RGB_SRC_COLOR,
+	                GPU_TEVOP_RGB_SRC_ALPHA);
+	C3D_TexEnvFunc(fog, C3D_RGB, GPU_INTERPOLATE);
+	// Alpha is passed through untouched. Stage 0 replaced it with the player-colour constant's
+	// alpha and the blend unit is off in this pass, but writing it explicitly keeps the stage
+	// from inheriting an alpha combiner from whatever ran before it.
+	C3D_TexEnvSrc(fog, C3D_Alpha, GPU_PREVIOUS, 0, 0);
+	C3D_TexEnvFunc(fog, C3D_Alpha, GPU_REPLACE);
+	C3D_TexEnvColor(fog, SKY_FOG_BGR | 0xFF000000u);
+
+	// The hardware unit stays off. It is not a second opinion about the same fade — its LUT is
+	// indexed by 1/w and is the exact ceiling this version exists to remove — so leaving it on
+	// would fog these bodies twice, once on the new curve and once on the old broken one.
+	C3D_FogGasMode(GPU_NO_FOG, GPU_PLAIN_DENSITY, false);
+
+	// chunkRenderDistance() is documented never-NULL in scene/chunk_render.h. Read every draw
+	// rather than cached at init, because chunkRenderSetDistance() can change the radius at
+	// runtime and a cached shape would fade players on the previous render distance's curve.
+	const FogShape pm_fog = fogShapeFor(chunkRenderDistance()->boundary, FOG_DENSITY);
+	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uloc_fogparams,
+	              pm_fog.inv_range, pm_fog.bias, 0.0f, 0.0f);
 
 	// Culling off, matching highlightDraw: 36 triangles per player against at most fifteen
 	// players is not a triangle count worth risking a hand-derived winding over.

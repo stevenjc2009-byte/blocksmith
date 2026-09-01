@@ -45,6 +45,12 @@ void networldSetWorld(World* w);
 // Clears the pending block-diff store and the remote-player table (see networldResetRemotes()
 // below), and resets networldSendPose()'s own send-interval timer. Call once at boot alongside
 // netInit(); safe to call again later (e.g. leaving a session) to drop anything still queued.
+//
+// v1.8.5: "clears the pending block-diff store" now also means FREES it. The store is a
+// 1064976-byte heap allocation this module makes the first time a server packet actually needs
+// somewhere to queue an edit, not a static that exists from boot — see networld.c's comment on
+// s_pending for the whole lifecycle and why the allocation could not be hung off this call.
+// Nothing about the contract above changes: after this returns, nothing is queued.
 void networldInit(void);
 
 // Pumps the transport once: drains up to NETWORLD_MAX_MSGS_PER_FRAME decrypted application
@@ -379,6 +385,13 @@ bool networldGenWaiting(void);
 
 // Diagnostics, mirroring net/blockdiff.h's own counters — this module owns the store
 // privately, so a HUD or log line reaches these instead of the store directly.
+//
+// Both are safe, and both are honest, when there is no store at all — which is the whole of a
+// single-player session, since v1.8.5 made the store a lazy allocation (networld.c, s_pending).
+// Count reads 0 because nothing has been queued. Refusals reads the number of edits dropped,
+// which since v1.8.5 includes any dropped because the store could not be ALLOCATED as well as
+// the ones blockdiff.c turned away for being full: to the player both mean "this session lost
+// remote edits", which is the one question main.c's "X" marker asks of this.
 int networldPendingCount(void);
 int networldPendingRefusals(void);
 
@@ -451,3 +464,30 @@ void networldResetRemotes(void);
 // handle_block_edit() without a live socket. Not "internal" in the sense of being unstable —
 // networldUpdate() is a two-line loop around exactly this call.
 void networldApplyPayload(const uint8_t* payload, size_t len);
+
+#ifndef __3DS__
+// Forces the next pending-store allocation (networld.c, pendingStore()) to fail, so the host
+// suite can drive the out-of-memory branch that decides whether a dropped remote edit is
+// counted or silently swallowed.
+//
+// Compiled out of every console build, and gated on __3DS__ rather than a -D switch for a
+// concrete reason: tools/run_host_tests.sh builds networld.c with no extra defines, so a
+// switch nothing turns on would leave the branch exactly as unreachable as it is without this.
+// A 1 MB malloc does not fail on demand on a host with gigabytes free, and an unreachable
+// branch is an unchecked one — which is how a silent-loss path gets shipped.
+//
+// Latching: while `on` is true EVERY attempt fails, so a test can prove the retry path counts
+// each dropped edit rather than only the first. Turn it back off to let the store be created.
+void networldTestForcePendingAllocFail(bool on);
+
+// True while the pending store exists.
+//
+// This is here because the reclaim's actual claim — single player never allocates the
+// megabyte — turned out to be unobservable from outside without it. networldPendingCount()
+// answers 0 for an absent store AND for an allocated empty one, so a check written on the
+// count alone stays green against a networldOnColumnLoad() that allocates one per column.
+// MEASURED, not argued: that regression was injected (the drain guard replaced with a
+// pendingStore() call) and the count-only check did not move — "PASS 386 checks, 0 failed",
+// identical to the healthy run. This probe is what makes it go red.
+bool networldTestPendingStoreAllocated(void);
+#endif

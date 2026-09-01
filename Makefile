@@ -903,6 +903,19 @@ font.t3x: font.png
 # way round to the same one-line fix.
 crackatlas.t3x: crackatlas.png
 
+# v1.9.0 distance fog. The same trap a FOURTH time, with a wrinkle worth writing down: the stem
+# collision here is with source/gfx/fogramp.c, whose compiler deps land in build/fogramp.d
+# exactly where tex3ds writes the dep naming gfx/fogramp.png. Two files called fogramp, one a
+# .png and one a .c, is the same collision the three rules above describe.
+#
+# Without this line, regenerating the ramp with tools/make_fog_ramp.py would leave the console
+# sampling the previous curve while the .png on disk showed the new one. On a fog ramp that
+# reads as the RENDER DISTANCE being wrong rather than as a stale texture — a stale ramp is a
+# stale fade SHAPE, so half_vis would silently be whatever the old curve gave and no amount of
+# reading source/gfx/fogramp.c would explain it. Same one-line fix, stated plainly for the same
+# reason.
+fogramp.t3x: fogramp.png
+
 -include $(DEPSDIR)/*.d
 
 #---------------------------------------------------------------------------------------

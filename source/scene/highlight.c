@@ -39,6 +39,7 @@ static DVLB_s*         s_dvlb;
 static shaderProgram_s s_program;
 static int             s_uloc_projection;
 static int             s_uloc_modelview;
+static int             s_uloc_fogparams;
 
 static HlVertex* s_verts;      // linearAlloc'ed once, rebuilt never
 static bool      s_ready;
@@ -133,6 +134,7 @@ bool highlightInit(void)
 
 		s_uloc_projection = shaderInstanceGetUniformLocation(s_program.vertexShader, "projection");
 		s_uloc_modelview  = shaderInstanceGetUniformLocation(s_program.vertexShader, "modelView");
+		s_uloc_fogparams  = shaderInstanceGetUniformLocation(s_program.vertexShader, "fogParams");
 		s_shader_ready = true;
 	}
 
@@ -196,6 +198,44 @@ void highlightDraw(const C3D_Mtx* view, const RayHit* hit)
 	C3D_TexEnvSrc(env, C3D_Both, GPU_CONSTANT, 0, 0);
 	C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
 	C3D_TexEnvColor(env, 0xFF202020);
+
+	// v1.9.0. TEV stage 1 and the fog unit, both explicitly OWNED here instead of inherited
+	// from whatever the world pass left behind.
+	//
+	// This closes a pre-existing bug as well as preventing a new one. GPU_NO_FOG appeared
+	// NOWHERE in the tree before v1.9.0: scene/chunk_render.c's pipelineBind turned the
+	// hardware fog unit on every frame and nothing ever turned it off, so this pass, the crack
+	// overlay, the player models and the entire UI batch were all drawn with the terrain's fog
+	// live. It never showed, and that was luck rather than design — the cage is only ever drawn
+	// on a block within the player's reach, where the old LUT was clear anyway.
+	//
+	// v1.9.0 moves the world's fade into TEV stage 1 (see pipelineBind), so what would leak
+	// into this pass now is a stage that INTERPOLATES toward the sky colour by texture unit 1,
+	// for which this shader writes no coordinate at all. Resetting stage 1 to citro3d's
+	// REPLACE(previous) passthrough is what stops that; GPU_NO_FOG is what stops the old leak
+	// from coming back if anything ever enables the fixed-function unit again.
+	//
+	// The cage is therefore UNFOGGED at any distance. That is a change only in principle: the
+	// highlight exists only on the block the player is pointing at, which is inside the reach
+	// limit and inside FOG_START_FRAC of the fade at every render distance.
+	C3D_TexEnv* fog = C3D_GetTexEnv(1);
+	C3D_TexEnvInit(fog);
+	C3D_FogGasMode(GPU_NO_FOG, GPU_PLAIN_DENSITY, false);
+
+	// ...and the vertex half of the same ownership. source/shaders/highlight.v.pica gained a
+	// fogParams uniform and a texcoord1 output so scene/playermodel.c could fade remote players
+	// on the terrain's curve; this file shares that program, so it has to say what it wants
+	// from it. (0, 0) drives the ramp coordinate to 0 at every vertex, which samples texel 0,
+	// which gfx/fogramp.c pins at exactly 0 — no fade.
+	//
+	// This is an upload, not a comment about a default, and the difference matters. Uniform
+	// registers are global GPU state and scene/playermodel.c writes real values into this one
+	// on any frame a remote player is on screen. Leaving it unwritten would let the cage
+	// inherit those, and it would then fog or not depending on whether anyone else was
+	// visible — an intermittent that would be miserable to track down. The stage-1 passthrough
+	// above already makes the coordinate unsampled, so this is the second of two independent
+	// reasons the cage cannot fog; both are cheap and neither relies on the other holding.
+	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uloc_fogparams, 0.0f, 0.0f, 0.0f, 0.0f);
 
 	// Winding should already be correct (see addBox), but the cage is only 144 triangles
 	// and a transposed corner would show up as bars missing from one side only, which is

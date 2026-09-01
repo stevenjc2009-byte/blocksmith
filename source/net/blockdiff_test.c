@@ -400,6 +400,51 @@ static void test_drain_empties_store(void)
     blockdiffFree(&s);
 }
 
+/* v1.8.5. The store the console actually runs stopped being a static and became a malloc
+ * (net/networld.c's pendingStore()), so blockdiffInit() is now handed memory that has never
+ * been zeroed. Everything else in this file inits a `static BlockDiffStore`, which .bss hands
+ * over as zeros — so every check above would stay green even if blockdiffClear() forgot a
+ * scalar entirely, and the console would be the thing that found out.
+ *
+ * 0xAA rather than 0 or 0xFF on purpose: 0xFF is BLOCKDIFF_NIL in every uint32_t field, which
+ * is a legal end-of-chain marker and would accidentally look correct, and 0 is what the old
+ * static already gave. 0xAAAAAAAA is a large in-range-looking index that is not NIL, not zero,
+ * and past BLOCKDIFF_MAX_PENDING — the shape of value that turns into a wild read if a chain
+ * head or the free list survives init.
+ *
+ * This drives the store afterwards rather than only reading its counters: a count that reads 0
+ * proves one field was written, and the bug this guards against is any of five not being. */
+static void test_uninitialised_memory_is_safe(void)
+{
+    puts("init over uninitialised memory (the malloc'd store the console now runs)");
+
+    static BlockDiffStore garbage;
+    memset(&garbage, 0xAA, sizeof garbage);
+
+    blockdiffInit(&garbage);
+
+    check(blockdiffCount(&garbage) == 0, "count reads 0 after init over 0xAA memory");
+    check(blockdiffRefusals(&garbage) == 0, "refusals reads 0 after init over 0xAA memory");
+
+    static struct applied_log log; log.n = 0;
+    check(blockdiffDrain(&garbage, 0, 0, logApply, &log) == 0,
+          "drain finds nothing rather than walking a chain head left as garbage");
+    check(log.n == 0, "and applies nothing");
+
+    check(blockdiffRecord(&garbage, 33, 7, 33, BLOCK_STONE),
+          "a record into it is accepted, so the free list and high water mark are usable");
+    check(blockdiffCount(&garbage) == 1, "and is the store's only entry");
+
+    static struct applied_log log2; log2.n = 0;
+    check(blockdiffDrain(&garbage, 33 >> 4, 33 >> 4, logApply, &log2) == 1,
+          "it drains back out of the bucket it was filed in");
+    check(loggedContains(&log2, 33, 7, 33, BLOCK_STONE),
+          "carrying the coordinate and block it went in with, not garbage from around it");
+    check(blockdiffCount(&garbage) == 0, "leaving the store empty");
+
+    blockdiffFree(&garbage);
+}
+
 /* ------------------------------------------------------------------------- main */
 
 int main(void)
@@ -415,6 +460,7 @@ int main(void)
     test_capacity();
     test_server_replay_overflow();
     test_drain_empties_store();
+    test_uninitialised_memory_is_safe();
 
     /* Latched BEFORE the pin's own check() runs, because check() increments g_checks: read
      * after, the pin would be comparing against a total that includes itself and would have to
@@ -425,7 +471,10 @@ int main(void)
      * feature: a check silently DELETED still leaves "PASS", just with a smaller total, and
      * nobody reads a total they were not given something to compare against. */
     const int ran = g_checks;
-    check(ran == 80, "check-count pin: 80 checks ran (update deliberately, never to go green)");
+    /* 80 -> 89: test_uninitialised_memory_is_safe adds nine, and nothing was removed. Computed
+     * from the delta, not pasted off the failing run — see networld_test.c's own guard for why
+     * pasting the observed number is the failure this pin exists to catch. */
+    check(ran == 89, "check-count pin: 89 checks ran (update deliberately, never to go green)");
 
     printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;

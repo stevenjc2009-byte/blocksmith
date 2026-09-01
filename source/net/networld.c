@@ -1,5 +1,6 @@
 #include "net/networld.h"
 
+#include <stdlib.h>   // malloc/free for the pending store — see s_pending below
 #include <string.h>
 
 #include "net/blockdiff.h"
@@ -20,7 +21,118 @@ static World* s_world;
 
 // The whole point of this module: remote edits aimed at a column we have not streamed in yet,
 // held here instead of being dropped, until networldOnColumnLoad() says that column exists.
-static BlockDiffStore s_pending;
+//
+// A POINTER, and NULL for the whole of a single-player session. That is the entire v1.8.5
+// reclaim on this file. As a plain `static BlockDiffStore` this was 0x104010 = 1064976 bytes
+// of .bss — measured, `arm-none-eabi-nm -S --size-sort blocksmith.elf` reporting
+// "0026cb48 00104010 b s_pending", which is blockdiff.h's own 1.02 MB cost figure to the byte
+// — and .bss is committed for the life of the process the
+// instant it starts, whether or not the player ever opens Multiplayer. It is also invisible to
+// both mallinfo() and linearSpaceFree(), which is why main.c's memProbeBootMark("net+networld")
+// could only ever see the cost as an absence: nothing it reads counts .bss at all.
+//
+// Allocated on the ORDINARY heap, never linearAlloc. linear is the scarce heap on this console
+// and the mesh pool needs all of it; the pending store is CPU-only data that the GPU never
+// reads, so it has no business there. malloc rather than calloc because blockdiffInit() ->
+// blockdiffClear() deliberately does not touch the 1 MB entry array (blockdiff.c says why), and
+// blockdiffRecord() writes every field of a slot before anything can read it — zeroing a
+// megabyte the store is documented not to read would spend the time this change is trying to
+// save. blockdiff_test.c's test_uninitialised_memory_is_safe pins that: it inits a store over
+// deliberate 0xAA garbage and drives it, so the day blockdiffClear() stops setting one of its
+// five scalars, the suite says so instead of the console doing it.
+//
+// WHERE IT IS CREATED, and why not at a "connect" call: nothing in this module is told that a
+// session has begun. networldInit() looks like the place and is not — main.c calls it once at
+// boot, right after netInit() (main.c, the comment above memProbeBootMark("net+networld")),
+// precisely so the server's post-JOIN WORLD_SYNC has somewhere to land while the player is
+// still on the title screen. Hanging the allocation off it would therefore reclaim nothing.
+// net/bsnet.c's netConnect() is the real "multiplayer starts" moment and belongs to another
+// module. So the store is created on FIRST NEED instead — pendingStore(), reached only from
+// applyOrQueue(), which is reached only from a decoded server packet. A single-player session
+// receives no packets and so never allocates, which is the property that matters, and it holds
+// without this file having to be told anything about session state.
+//
+// WHERE IT IS DESTROYED: networldInit(), which is also the only thing that used to clear it.
+// net/bsnet.c's netDisconnect() calls it on leaving a session, so the megabyte goes back to the
+// heap on the way out, and the boot-time call frees a NULL that was never allocated.
+static BlockDiffStore* s_pending;
+
+// Edits dropped because the store could not be ALLOCATED, as opposed to the ones blockdiff.c
+// refuses because the store is full. Kept out here for the blunt reason that there is no store
+// to keep them in, and folded into networldPendingRefusals() below so both kinds reach the one
+// consumer that exists: main.c's HUD prints "X" on any non-zero refusal count, and an
+// out-of-memory drop means exactly what a full-store drop means to the player — this session
+// lost remote edits and the world on screen may be stale. Reset by networldInit() with every
+// other per-session counter in this file.
+static int s_pending_alloc_refusals;
+
+#ifndef __3DS__
+// Host-test seam, compiled out of every console build. The out-of-memory branch below is
+// otherwise unreachable from a test: tools/run_host_tests.sh builds networld.c with no extra
+// -D and is not this task's file to change, so a compile-time switch would never be turned on,
+// and a 1 MB malloc does not fail on demand on a host with gigabytes free. A branch nothing can
+// reach is a branch nothing has checked, and this one decides whether a dropped edit is
+// reported or silently swallowed. networld_test.c drives it through
+// networldTestForcePendingAllocFail().
+static bool s_force_pending_alloc_fail;
+
+void networldTestForcePendingAllocFail(bool on) { s_force_pending_alloc_fail = on; }
+
+// Whether the store exists at all. See networld.h for why this had to exist: the count cannot
+// tell an absent store from an empty one, and the reclaim's whole claim is about the former.
+bool networldTestPendingStoreAllocated(void) { return s_pending != NULL; }
+#endif
+
+// The pending store, created on first need. Returns NULL only when the allocation failed;
+// every caller must handle that rather than dereference.
+//
+// Retried on every call rather than latched after one failure: a console that could not spare
+// a megabyte while the mesh pool was at its peak may well be able to a second later, and the
+// alternative — giving up on the store for the rest of the session after one bad moment —
+// turns a transient shortage into a permanently desynced world. A retry costs one malloc that
+// returns NULL, and every failed attempt is counted, so a session that spent the whole join
+// sync failing shows the count rather than hiding it.
+static BlockDiffStore* pendingStore(void)
+{
+	if (s_pending) return s_pending;
+
+#ifndef __3DS__
+	if (s_force_pending_alloc_fail) return NULL;
+#endif
+
+	BlockDiffStore* s = (BlockDiffStore*)malloc(sizeof *s);
+	if (!s) return NULL;
+
+	blockdiffInit(s);
+	s_pending = s;
+	return s_pending;
+}
+
+// Queues one already-validated remote edit, or counts it as lost if there is no store and none
+// can be made. Deliberately NOT silent on the failure path: pretending an edit was recorded
+// when it was not is the "my house is gone" bug's exact shape, arrived at from a different
+// direction, and blockdiff.h's whole argument for refusing rather than evicting is that the
+// loss has to be countable.
+static void pendingRecord(int32_t x, int32_t y, int32_t z, uint8_t block)
+{
+	BlockDiffStore* s = pendingStore();
+	if (!s) {
+		s_pending_alloc_refusals++;
+		return;
+	}
+	blockdiffRecord(s, x, y, z, block);
+}
+
+// Drops the store and the megabyte with it. Safe on a session that never allocated one.
+static void pendingDestroy(void)
+{
+	if (s_pending) {
+		blockdiffFree(s_pending);
+		free(s_pending);
+		s_pending = NULL;
+	}
+	s_pending_alloc_refusals = 0;
+}
 
 // Who to tell when a remote edit actually lands in the world. See networld.h's own comment for
 // why this is a hook rather than a direct chunkRenderTouch() call.
@@ -372,7 +484,7 @@ static void applyOrQueue(int32_t x, int32_t y, int32_t z, uint8_t block)
 	// — a column that does not exist yet is not different in kind from one that has not
 	// streamed in yet — and networldSetWorld() flushes whatever landed before the world did.
 	if (!s_world) {
-		blockdiffRecord(&s_pending, x, y, z, block);
+		pendingRecord(x, y, z, block);
 		return;
 	}
 
@@ -381,7 +493,7 @@ static void applyOrQueue(int32_t x, int32_t y, int32_t z, uint8_t block)
 		s_applied_edits++;
 		notifyEdit(x, y, z);
 	} else {
-		blockdiffRecord(&s_pending, x, y, z, block);
+		pendingRecord(x, y, z, block);
 	}
 }
 
@@ -853,7 +965,13 @@ void networldSetInvHook(NetworldInvFn fn, void* userdata)
 
 void networldInit(void)
 {
-	blockdiffInit(&s_pending);
+	// Was blockdiffInit(&s_pending) on a store that always existed. Now the store is heap-backed
+	// and created on demand (see s_pending), so "clear it" and "give the megabyte back" are the
+	// same action, and this is the right place for both: net/bsnet.c's netDisconnect() reaches
+	// here on leaving a session, and main.c's boot call frees a NULL. Every caller that used to
+	// get an emptied store still gets one — an absent store and an empty one are the same thing
+	// to every reader below, which is what pendingStore()/networldPendingCount() enforce.
+	pendingDestroy();
 	networldResetRemotes();
 
 	// Cleared with everything else: a hook left over from a previous session would point at
@@ -980,7 +1098,14 @@ static void applyDrained(void* userdata, int x, int y, int z, BlockId id)
 void networldOnColumnLoad(World* w, int cx, int cz)
 {
 	if (!s_world || w != s_world) return;
-	blockdiffDrain(&s_pending, cx, cz, applyDrained, s_world);
+
+	// No store means nothing was ever queued — single player takes this branch on every column
+	// it streams in, which is the hot path this whole change is for. Deliberately does NOT call
+	// pendingStore(): draining is a read, and creating a megabyte to discover it is empty would
+	// hand the single-player boot back the exact cost being reclaimed, on the first column.
+	if (!s_pending) return;
+
+	blockdiffDrain(s_pending, cx, cz, applyDrained, s_world);
 }
 
 bool networldSendBlockEdit(int x, int y, int z, uint8_t block)
@@ -1193,8 +1318,21 @@ bool networldSendPlayerReport(const NetworldPlayerMeters* m)
 #endif
 }
 
-int networldPendingCount(void)     { return blockdiffCount(&s_pending); }
-int networldPendingRefusals(void)  { return blockdiffRefusals(&s_pending); }
+// Both answer for a store that may not exist. 0 pending with no store is not a placeholder for
+// "don't know" — a store that was never created has never been handed an edit, so nothing is
+// queued, and that is the true answer rather than a stand-in for one.
+//
+// Refusals are the case where the two kinds of loss have to be added rather than picked
+// between: blockdiff.c counts the edits it turned away for being full, and only the store can
+// hold that count, so an allocation that never happened has to keep its own (see
+// s_pending_alloc_refusals). main.c's HUD asks one question of this — "is it non-zero" — and
+// both kinds have to make it answer yes.
+int networldPendingCount(void)     { return s_pending ? blockdiffCount(s_pending) : 0; }
+
+int networldPendingRefusals(void)
+{
+	return s_pending_alloc_refusals + (s_pending ? blockdiffRefusals(s_pending) : 0);
+}
 
 int networldSentEdits(void)    { return s_sent_edits; }
 int networldRecvMsgs(void)     { return s_recv_msgs; }

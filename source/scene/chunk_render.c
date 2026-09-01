@@ -7,11 +7,14 @@
 #include "app/watchdog.h"
 #include "debug/metrics.h"
 #include "gfx/atlas.h"
+#include "gfx/fogramp.h"
+#include "gfx/fogtex.h"
 #include "world/dirtyq.h"
 #include "world/light.h"
 #include "world/mesher.h"
 #include "world/remesh.h"
 #include "scene/frustum.h"
+#include "scene/mesh_pool_sizing.h"
 #include "scene/render_dist.h"
 #include "world/scratch.h"
 #include "world/visgraph.h"
@@ -184,6 +187,13 @@ static int             s_uloc_faceshade;
 // checked repo-wide before removal and matched nothing but its own definition.
 static int             s_uloc_daylevel;
 
+// v1.9.0. The vertex shader's fog uniform (fogParams in BOTH .pica files) and the arithmetic
+// behind it. Recomputed only in chunkRenderSetDistance — the fade is a function of the render
+// distance and of nothing else — and re-uploaded every frame in pipelineBind with the rest of
+// the shared uniform state. See source/gfx/fogramp.h for the design and for what it replaced.
+static int             s_uloc_fogparams;
+static FogShape        s_fog;
+
 // Step 7.7. The clip planes and the fog now come from the render distance setting instead of
 // being constants here, because they are functions of it — see render_dist.h, where the whole
 // relationship and the reason `near` has to move with distance are written down. Held in one
@@ -215,10 +225,12 @@ static RenderDist s_dist;
 // renderDistFor() in render_dist.c, which is where all of that reasoning now lives and where
 // the host suite can check it.
 //
-// Overridable so the check can go red: -DFOG_DENSITY=0.0f makes every LUT entry exp(-0) = 1,
-// which is "no fog" through this exact code path rather than a different one. The override
-// replaces the derived value; there is deliberately no override for the gradient, which is
-// constant across the whole distance range anyway.
+// Overridable so the check can go red: -DFOG_DENSITY=0.0f leaves every LUT entry at full
+// visibility, which is "no fog" through this exact code path rather than a different one. The
+// override replaces the derived value. v1.8.5: the field it names is no longer a density fed
+// to an exponential but the STRENGTH of the directly-filled fade (1 = the solved curve,
+// 0 = clear) — same override, same meaning, different mechanism. See scene/render_dist.h.
+// There is no gradient any more, so the note about not overriding one has gone with it.
 #ifndef FOG_DENSITY
 #define FOG_DENSITY  (s_dist.fog_density)
 #endif
@@ -241,7 +253,12 @@ static RenderDist s_dist;
 #define STEREO_MAX_IOD    0.20f
 #define STEREO_FOCAL_LEN  4.0f
 
-static C3D_FogLut s_fog_lut;
+// 2026-09-01: `static C3D_FogLut s_fog_lut;` removed from here. It backed the hardware fog LUT
+// upload that used to run at the end of chunkRenderSetDistance (FogLut_FromArray into this,
+// then C3D_FogLutBind) — dead since v1.9.0 turned the fixed-function fog unit off for good
+// (pipelineBind's GPU_NO_FOG, a few hundred lines down) and nothing else in the tree touches
+// citro3d's C3D_FogLut/FogLut_FromArray/C3D_FogLutBind API. See the note at the top of
+// chunkRenderSetDistance for the grep evidence and for what did NOT come out alongside it.
 
 static C3D_Mtx  s_projection;
 
@@ -382,6 +399,17 @@ _Static_assert(TIER_S_SLOTS + TIER_M_SLOTS + TIER_L_SLOTS == MESH_SLOTS,
                "tier slot counts must add up to the whole pool");
 _Static_assert(TIER_L_SLOTS > 0, "tier sizes leave nothing for the largest tier");
 
+// scene/mesh_pool_sizing.h keeps its own copy of these four numbers (MESH_POOL_TIER_*),
+// because it is the pure-C file the host suite links to prove the pool's byte total without
+// pulling in <3ds.h>. Tied together here rather than left as two hand-synced constants: a
+// change to one side with the other forgotten now fails the console build instead of
+// quietly making the host suite check a pool that no longer matches what chunkRenderInit
+// allocates.
+_Static_assert(TIER_S_FACES == MESH_POOL_TIER_S_FACES && TIER_M_FACES == MESH_POOL_TIER_M_FACES &&
+               TIER_S_SLOTS == MESH_POOL_TIER_S_SLOTS && TIER_M_SLOTS == MESH_POOL_TIER_M_SLOTS,
+               "chunk_render.c's tier constants have drifted from scene/mesh_pool_sizing.h's "
+               "copy of them; the host suite's byte total would stop matching this pool");
+
 // v1.6.0 task 12. The suffix constraint above, asserted HERE — next to the constants it
 // constrains — rather than in a test. The tier counts are file-private #defines, so a test
 // could only check its own copy of them, which is the exact failure this project has recorded
@@ -418,8 +446,76 @@ _Static_assert(TIER_S_FACES == 512 && TIER_M_FACES == 1024,
                "the tier occupancy measurement is stated against these two cut points; "
                "re-measure before changing either");
 
+// ── v1.8.5: the arenas stop being sized by MESH_SLOTS ─────────────────────────────────────
+//
+// Everything above this line is the pool at the compile-time CEILING, and it stays exactly as
+// it was: TIER_L_SLOTS is still MESH_SLOTS - S - M, and the three measured-worst asserts still
+// hold the ceiling pool up. What changes is that chunkRenderInit no longer allocates that pool
+// unconditionally — it allocates for the radius it is handed, because the two are about to be
+// different numbers on different consoles (9,199,616 bytes at radius 3 against 46,948,352 at
+// radius 5, on an Old 3DS whose whole linear heap is 33,554,432).
+//
+// The floor under the runtime pool, and it is not a formality. S and M are FIXED counts, so a
+// pool asked for fewer slots than S + M drives the L tier negative — and meshPoolTierBytes()
+// casts the slot count to size_t, so a negative L does not underflow the total by a little, it
+// wraps it to ~1.8e19. tools/run_host_tests.sh's mesh_pool_bytes_test stanza records ARM 2
+// being REJECTED as a red arm for landing in exactly that wrap. TIER_MEASURED_WORST_1024 is
+// the same floor the assert above already puts under the compile-time L tier, so a runtime
+// pool can never be weaker in the tier that has no tier above it to spill into.
+#define TIER_L_MIN_SLOTS  TIER_MEASURED_WORST_1024
+#define POOL_MIN_SLOTS    (TIER_S_SLOTS + TIER_M_SLOTS + TIER_L_MIN_SLOTS)
+
+// The floor must fit inside the arrays, or poolSlotsForRadius() clamping UP would hand out
+// slot indices past the end of s_slots — a write past a .bss array, which on this console is
+// silent corruption rather than a fault. Strictly stronger than the TIER_L_SLOTS > 0 assert
+// above, and kept as well as it rather than instead of it: that one is about the ceiling pool
+// being buildable at all, this one is about the runtime pool being indexable.
+_Static_assert(MESH_SLOTS >= POOL_MIN_SLOTS,
+               "the compile-time slot tables must be able to hold the smallest pool the "
+               "runtime sizing can produce");
+
 static const int kTierFaces[3] = { TIER_S_FACES, TIER_M_FACES, TIER_L_FACES };
-static const int kTierSlots[3] = { TIER_S_SLOTS, TIER_M_SLOTS, TIER_L_SLOTS };
+
+// v1.8.5. Slots the pool actually backs with arena, for the widest radius this console will be
+// allowed to select. Everything that walks the pool walks THIS, never MESH_SLOTS: a slot past
+// it has a NULL `verts` and no arena behind it, so handing one out is a DMA out of a linear
+// buffer that was never claimed. Set once, in chunkRenderInit, and never moved after.
+static int s_pool_slots;
+
+// v1.8.5. The pool's slot count for a ceiling radius. Pure arithmetic over constants — no
+// state, no allocation — so tools/run_host_tests.sh lifts this function's real source text out
+// of this file and proves it on the host, the same way it already does for horizonHidden() and
+// chunkRenderProfileReset(). A hand-copy in the test would pass forever with this one wrong.
+//
+// meshSlotsForRadius() rather than a second (2r+1)^2 here: that is the same function
+// tests/mesh_pool_bytes_test.c totals the pool's bytes through, and it is tied back to
+// render_dist.h's own RENDER_DIST_MAX_SLOTS by a check in that file.
+static int poolSlotsForRadius(int max_radius)
+{
+	// Clamped rather than rejected, and clamped at BOTH ends. The upper clamp is the safety
+	// one: MESH_SLOTS is what the .bss tables can index, so nothing may ever exceed it even if
+	// a caller passes a radius from a newer options file than this binary understands.
+	if (max_radius < RENDER_DIST_MIN) max_radius = RENDER_DIST_MIN;
+	if (max_radius > RENDER_DIST_MAX) max_radius = RENDER_DIST_MAX;
+
+	int slots = meshSlotsForRadius(max_radius, RENDER_DIST_SLOTS_PER_COLUMN);
+
+	if (slots > MESH_SLOTS)     slots = MESH_SLOTS;
+	if (slots < POOL_MIN_SLOTS) slots = POOL_MIN_SLOTS;
+	return slots;
+}
+
+// v1.8.5. The three tier counts for a runtime pool size. S and M are the fixed measured
+// constants and every slot a wider ring adds lands in L — see the long comment on TIER_S_FACES
+// above for why the split is NOT re-cut per radius, and scene/mesh_pool_sizing.h's
+// meshPoolTotalBytes(), which assumes exactly this relationship when it totals the bytes. It is
+// code here and arithmetic there, on purpose: chunkRenderInit checks the two agree at runtime.
+static void poolTierSlots(int pool_slots, int out[3])
+{
+	out[0] = TIER_S_SLOTS;
+	out[1] = TIER_M_SLOTS;
+	out[2] = pool_slots - TIER_S_SLOTS - TIER_M_SLOTS;
+}
 
 // One linearAlloc per tier, carved into kTierSlots[t] equal pieces of kTierFaces[t]*4
 // vertices each — see chunkRenderInit. s_tier_start/s_tier_count say which range of
@@ -626,7 +722,7 @@ static void cullInvalidate(void)
 // slot must eventually be handed back.
 static MeshSlot* findSlot(int cx, int cy, int cz)
 {
-	for (int i = 0; i < MESH_SLOTS; i++) {
+	for (int i = 0; i < s_pool_slots; i++) {
 		MeshSlot* s = &s_slots[i];
 		if (s->used && s->cx == cx && s->cy == cy && s->cz == cz)
 			return s;
@@ -744,15 +840,68 @@ static void pipelineBind(void)
 	// in effect and none of them changes.
 	C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ZERO, GPU_ONE, GPU_ZERO);
 
-	// Fog, re-established per frame for the same reason everything else here is: this is
-	// global GPU state, not per-program state, and the moment a second pass touches it there
-	// is no owner. The gas mode argument is only read when the fog mode is GPU_GAS, and the
-	// zFlip argument is false because Mtx_PerspTilt is fed the same near/far the LUT was
-	// built from — flipping it would run the curve backwards, fogging the player's hands and
-	// leaving the horizon sharp, which is what this was checked against.
-	C3D_FogGasMode(GPU_FOG, GPU_PLAIN_DENSITY, false);
-	C3D_FogColor(SKY_FOG_BGR);
-	C3D_FogLutBind(&s_fog_lut);
+	// v1.9.0. The hardware fog unit is OFF, everywhere, permanently.
+	//
+	// It is not "also on, harmlessly". Leaving it enabled alongside the TEV fog below would
+	// apply BOTH fades to the same fragment — the fixed-function unit runs after the TEV, so
+	// the terrain would be blended toward the sky by the ramp and then blended toward the sky
+	// AGAIN by the LUT, which at radius 3 would put the world at the sky colour by about 12
+	// blocks instead of 45. Double fog is not a subtle bug; it is most of the visible world.
+	//
+	// Turned off here rather than simply not turned on, and re-asserted every frame, because
+	// fog mode is global GPU state with no owner — that is the whole reason this function
+	// exists. The gas mode argument is only read when the mode is GPU_GAS.
+	//
+	// 2026-09-01: the paragraph that used to sit here said scene/render_dist.c still solves
+	// and chunkRenderSetDistance still uploads a fog LUT that nothing binds any more, left on
+	// purpose for steve to reconcile. That reconciliation happened: chunkRenderSetDistance no
+	// longer calls FogLut_FromArray/C3D_FogLutBind (nor does anything else in the tree — grep
+	// found no other caller), and the C3D_FogLut this GAS mode call would have raced against is
+	// gone with it. See the note at the top of chunkRenderSetDistance in this file for the
+	// evidence and for what render_dist.c kept, and why.
+	C3D_FogGasMode(GPU_NO_FOG, GPU_PLAIN_DENSITY, false);
+
+	// The fog ramp on texture unit 1, rebound here for the same reason atlasBind() is above
+	// it: a texture binding is global state and this function is where the world pass takes
+	// ownership of all of it.
+	fogTexBind();
+
+	// TEV stage 1: the fade itself.
+	//
+	//   rgb   = GPU_INTERPOLATE(constant, previous, texture1.alpha)
+	//         = sky * f + terrain * (1 - f)
+	//   alpha = GPU_REPLACE(previous)
+	//
+	// The alpha half is the load-bearing line, not boilerplate. Stage 0 modulated the atlas
+	// alpha by the vertex alpha, which is WATER_ALPHA (0.70) for water and the leaf cutout's 0
+	// or 1 for everything else; the alpha TEST at GPU_GREATER 127 and the transparent pass's
+	// SRC_ALPHA blend both read the result. A stage that touched alpha here would make water
+	// opaque or make leaves solid depending on which way it moved it, and neither would look
+	// like a fog bug. REPLACE(previous) hands stage 0's alpha through untouched.
+	//
+	// The constant is SKY_FOG_BGR with an opaque alpha bolted on: C3D_FogColor takes 0xBBGGRR
+	// and C3D_TexEnvColor takes 0xAABBGGRR, so the same three bytes serve both and the world
+	// fades to exactly the colour the screen is cleared to. The alpha byte is never read (the
+	// alpha half of this stage does not source the constant) and is set for the sake of not
+	// leaving a component undefined.
+	//
+	// Stages 2..5 stay at citro3d's REPLACE(previous) passthrough, as they always have been.
+	C3D_TexEnv* fog = C3D_GetTexEnv(1);
+	C3D_TexEnvInit(fog);
+	C3D_TexEnvSrc(fog, C3D_RGB, GPU_CONSTANT, GPU_PREVIOUS, GPU_TEXTURE1);
+	C3D_TexEnvOpRgb(fog, GPU_TEVOP_RGB_SRC_COLOR, GPU_TEVOP_RGB_SRC_COLOR,
+	                GPU_TEVOP_RGB_SRC_ALPHA);
+	C3D_TexEnvFunc(fog, C3D_RGB, GPU_INTERPOLATE);
+	C3D_TexEnvSrc(fog, C3D_Alpha, GPU_PREVIOUS, 0, 0);
+	C3D_TexEnvFunc(fog, C3D_Alpha, GPU_REPLACE);
+	C3D_TexEnvColor(fog, SKY_FOG_BGR | 0xFF000000u);
+
+	// The vertex shader's half of it: texcoord per block, and the coordinate at zero distance.
+	// Recomputed in chunkRenderSetDistance and only re-uploaded here, alongside every other
+	// uniform this function re-asserts, because a uniform register is shared with every other
+	// program the frame binds.
+	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uloc_fogparams,
+	              s_fog.inv_range, s_fog.bias, 0.0f, 0.0f);
 
 	// v1.8.0 task 22b. 64 rows, not 6: MeshVertex.nrm packs a face index in its low three
 	// bits and a water height drop in the next three (world/mesher.h), and the shader indexes
@@ -788,8 +937,15 @@ static void pipelineBind(void)
 	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uloc_daylevel, 1.0f, 1.0f, 1.0f, 1.0f);
 }
 
-bool chunkRenderInit(void)
+bool chunkRenderInit(int max_radius)
 {
+	// v1.8.5. The whole point of the argument: the three tier arenas below are claimed for THIS
+	// many slots, not for MESH_SLOTS. At radius 3 that is 392 slots and 9,199,616 bytes, which
+	// is byte-for-byte what every build before this one allocated; at radius 5 it is 968 slots
+	// and 46,948,352, which no Old 3DS could survive. Which of the two happens is now a runtime
+	// answer. See poolSlotsForRadius above for the clamping.
+	s_pool_slots = poolSlotsForRadius(max_radius);
+
 	// Fails if the pool ever outgrows DIRTYQ_MAX, at startup, rather than writing past
 	// the flag array the first time a chunk in a high slot is edited.
 	//
@@ -800,11 +956,19 @@ bool chunkRenderInit(void)
 	// mismatch it guards against is now caught by the compiler in the one translation unit
 	// that can see both constants — dirtyq.h cannot include chunk_render.h (it must stay
 	// free of <3ds.h>), so this is the only place the two can be compared at all.
+	//
+	// v1.8.5: the CAPACITY asked for is the runtime pool, but the _Static_assert is still
+	// against MESH_SLOTS and deliberately so. s_pool_slots can never exceed MESH_SLOTS
+	// (poolSlotsForRadius clamps it there), so DIRTYQ_MAX >= MESH_SLOTS is the compile-time
+	// statement that covers every radius this binary can be asked for — including the ones no
+	// console in the room selects. Asserting against the runtime number is not possible and
+	// asserting against the radius-3 one would go quiet exactly when the ceiling moved, which
+	// is how v1.6.0 shipped unbootable.
 	_Static_assert(DIRTYQ_MAX >= MESH_SLOTS,
 	               "the remesh backlog needs one flag per mesh slot: DIRTYQ_MAX in "
 	               "world/dirtyq.h is a hand-maintained copy of MESH_SLOTS and has gone "
 	               "under it, which makes chunkRenderInit fail and the game refuse to boot");
-	if (!dirtyqInit(&s_dirty, MESH_SLOTS))
+	if (!dirtyqInit(&s_dirty, s_pool_slots))
 		return false;
 
 	// v1.5.0 adaptive lighting, v1.8.0 task 24: BOTH console models now.
@@ -850,12 +1014,28 @@ bool chunkRenderInit(void)
 	s_uloc_modelview  = shaderInstanceGetUniformLocation(s_program.vertexShader, "modelView");
 	s_uloc_faceshade  = shaderInstanceGetUniformLocation(s_program.vertexShader, "faceShade");
 	s_uloc_daylevel   = shaderInstanceGetUniformLocation(s_program.vertexShader, "dayLevel");
+	s_uloc_fogparams  = shaderInstanceGetUniformLocation(s_program.vertexShader, "fogParams");
 
 	// Step 9.2b. The one shared index buffer every slot draws from, built once and never
 	// written again — see the comment on s_shared_indices. Every quad's pattern is
 	// {v, v+1, v+2, v, v+2, v+3} relative to its own base vertex v = 4 * (quad's position in
 	// the slot), the same fill sprite.c already uses for its one shared quad buffer.
-	s_shared_indices = (uint16_t*)linearAlloc(sizeof(uint16_t) * MESH_SLOT_INDICES);
+	// meshPoolIndexBytes (scene/mesh_pool_sizing.h) is the same "sizeof(uint16_t) * 6 *
+	// slot_faces" arithmetic this used to spell out inline three times over — extracted so
+	// the host suite can total the pool's bytes without hand-copying it. index_bytes is
+	// computed once and reused below rather than calling it again at each site, so a
+	// mismatch between the alloc size, the flush size and the byte total cannot arise.
+	const size_t index_bytes = meshPoolIndexBytes(MESH_SLOT_FACES);
+
+	// v1.8.5. Zeroed rather than left to accumulate, because the equality check at the end of
+	// this function compares it against meshPoolTotalBytes() and that comparison has to mean
+	// "this pool", not "every pool this process has ever claimed". Nothing calls this function
+	// twice today (main.c calls it once, outside its session loop, and chunkRenderReleaseAll
+	// exists precisely so a second world does not need a second init) — this is one store that
+	// keeps the check exact if that ever changes.
+	s_bytes = 0;
+
+	s_shared_indices = (uint16_t*)linearAlloc(index_bytes);
 	if (!s_shared_indices)
 		return false;
 	for (int q = 0; q < MESH_SLOT_FACES; q++) {
@@ -867,8 +1047,8 @@ bool chunkRenderInit(void)
 	// Written by the CPU, read by the GPU, never written again — so one flush here, and the
 	// indices in RAM match the indices in the cache for the rest of the run. See the flush in
 	// chunkRenderBuild for what happens without one.
-	GSPGPU_FlushDataCache(s_shared_indices, sizeof(uint16_t) * MESH_SLOT_INDICES);
-	s_bytes += sizeof(uint16_t) * MESH_SLOT_INDICES;   // once, not once per slot
+	GSPGPU_FlushDataCache(s_shared_indices, index_bytes);
+	s_bytes += index_bytes;   // once, not once per slot
 
 	// Step 9.2c. The vertex buffers, one linearAlloc per TIER now rather than per slot —
 	// see the comment on TIER_S_FACES for the measurement this sizing comes from. Each
@@ -876,10 +1056,23 @@ bool chunkRenderInit(void)
 	// per-slot loop did for one uniform size; what changed is that there are three sizes
 	// instead of one; If the console cannot give us this much linear memory we want to
 	// know at startup, not when the player walks somewhere new — same rule as before.
+	//
+	// bytes is meshPoolTierBytes (scene/mesh_pool_sizing.h) now rather than this loop's own
+	// inline multiply, so the host suite's mesh_pool_bytes_test.c totals the same pool this
+	// allocates and not a hand-copied guess at it.
+	//
+	// v1.8.5: the tier counts come from poolTierSlots(s_pool_slots) rather than from a
+	// compile-time kTierSlots[], which is the whole of the runtime sizing. S and M are the same
+	// fixed numbers at every radius; L absorbs the difference, so a wider ring costs L-tier
+	// slots — the most expensive kind — which is exactly what makes the pool's cost grow faster
+	// than linearly and why this had to stop being a compile-time constant.
+	int tier_slots[3];
+	poolTierSlots(s_pool_slots, tier_slots);
+
 	int next_slot = 0;
 	for (int t = 0; t < 3; t++) {
 		const uint32_t cap_verts = (uint32_t)kTierFaces[t] * 4;
-		const size_t   bytes     = sizeof(MeshVertex) * (size_t)cap_verts * (size_t)kTierSlots[t];
+		const size_t   bytes     = meshPoolTierBytes(kTierFaces[t], tier_slots[t], sizeof(MeshVertex));
 
 		s_tier_arena[t] = (MeshVertex*)linearAlloc(bytes);
 		if (!s_tier_arena[t])
@@ -887,15 +1080,42 @@ bool chunkRenderInit(void)
 		s_bytes += bytes;
 
 		s_tier_start[t] = next_slot;
-		s_tier_count[t] = kTierSlots[t];
-		for (int i = 0; i < kTierSlots[t]; i++) {
+		s_tier_count[t] = tier_slots[t];
+		for (int i = 0; i < tier_slots[t]; i++) {
 			s_slots[next_slot + i].verts    = s_tier_arena[t] + (size_t)i * cap_verts;
 			s_slots[next_slot + i].vert_cap = cap_verts;
 		}
-		next_slot += kTierSlots[t];
+		next_slot += tier_slots[t];
 	}
 
+	// v1.8.5. The two halves of the sizing, checked against each other rather than trusted.
+	//
+	// The first is the one that matters most on this console: every slot index in [0,
+	// s_pool_slots) must have had a `verts` pointer written into it by the loop above, because
+	// every loop in this file now walks 0..s_pool_slots and hands those slots to the GPU. If
+	// the tier counts did not add up to s_pool_slots, the shortfall would be slots with a NULL
+	// `verts` inside the range the acquire path is allowed to use — a DMA out of address 0
+	// plus whatever the mesher wrote there, which on a 3DS is silent corruption rather than a
+	// fault.
+	//
+	// The second ties this function's real allocation to scene/mesh_pool_sizing.h's formula,
+	// which is what tests/mesh_pool_bytes_test.c gates the per-console ceilings with. That test
+	// asserts a New 3DS fits at radius 5 and an Old 3DS does not; if this pool ever stopped
+	// being the pool that formula describes, those assertions would be arithmetic about
+	// something that does not exist. Cheap: two integers, once, at boot.
+	if (next_slot != s_pool_slots)
+		return false;
+	if (s_bytes != meshPoolTotalBytes(s_pool_slots, MESH_SLOT_FACES, sizeof(MeshVertex)))
+		return false;
+
 	if (!atlasInit())
+		return false;
+
+	// v1.9.0. The fog ramp on unit 1. Here rather than in main.c for the same reason atlasInit
+	// is here: this function owns every piece of GPU state the world pass needs, and a fog
+	// texture the world draws against but nobody loaded is a black screen rather than an
+	// error. Failing the same way the atlas does means main.c already reports it.
+	if (!fogTexInit())
 		return false;
 
 	// Step 7.7. The fog LUT and the projection both come from here, and both have to exist
@@ -907,25 +1127,58 @@ bool chunkRenderInit(void)
 	return true;
 }
 
-// Step 7.7. Points the renderer at a render distance: rebuilds the fog LUT for it and rebuilds
-// the projection, which has a different near plane at each distance.
+// Step 7.7. Points the renderer at a render distance: rebuilds the fog shape for it and
+// rebuilds the projection, which has a different near plane at each distance.
 //
-// Both, together, always. The LUT's knots are placed by `near` (see render_dist.h), so a fog
-// table built for one near plane and a projection built for another put the fade at distances
-// that do not exist — which is the exact failure 6.4's comment warned about, made reachable
-// by the setting becoming variable.
+// Both, together, always. The near plane pins where render_dist.c's diagnostics (first_knot,
+// half_vis, fog_hides — still read by app/debugmenu and asserted by world_test.c) land, so a
+// fog shape built for one near plane and a projection built for another would put the
+// diagnostics at distances the depth buffer never produces — the exact failure 6.4's comment
+// warned about, made reachable by the setting becoming variable.
 //
-// Called before the first frame and again on every change. Cost is 128 exponentials and a
-// matrix, on a player action, so there is nothing to defer.
+// Called before the first frame and again on every change. Cost is a bisection solve inside
+// renderDistFor and a matrix, on a player action, so there is nothing to defer.
+//
+// ── 2026-09-01. The hardware fog LUT upload that used to live here is gone ────────────────
+//
+// Until v1.9.0 this function also filled a 128-entry table via renderDistFogTable and handed
+// it to the PICA200 through FogLut_FromArray/C3D_FogLutBind. v1.9.0's own comment (see
+// pipelineBind's GPU_NO_FOG call, a few hundred lines up) already said nothing binds that LUT
+// any more and left the upload standing on purpose, as steve's to reconcile.
+//
+// Proven dead rather than assumed: grep for C3D_FogLutBind and FogLut_FromArray across the
+// whole tree (source/, tests/, tools/) turned up nothing but this call site and this file's
+// own s_fog_lut declaration — no other TU references citro3d's fog-LUT API at all, and
+// pipelineBind's GPU_NO_FOG means the fixed-function stage that would have sampled it never
+// runs. Removed: the FogLut_FromArray/C3D_FogLutBind pair, the `fog_table`/`shaped` locals
+// that only fed them, and the `static C3D_FogLut s_fog_lut;` declaration a few hundred lines
+// up (see the note left there).
+//
+// What did NOT come out with it, and why: renderDistFogTable, renderDistVisibility,
+// renderDistLutZ, and the RenderDist fields knot_vis/first_knot/half_vis/fog_hides all stay in
+// scene/render_dist.c/.h untouched. They are not dead — world_test.c's testRenderDist asserts
+// every one of them directly (first_knot against 12.0–12.1 blocks, half_vis against a 14.0
+// floor, fog_hides, the LUT table's value/difference halves, all of it), rd.boundary and
+// rd.fog_density are what fogShapeFor below is actually built from, and main.c's debug
+// overlay prints rd->half_vis/rd->boundary/rd->fog_hides on its `dist` line every frame it is
+// open. Deleting any of that would fail a host test this task was told not to touch, or blank
+// a debug readout nobody asked to lose. Only the console-side upload that fed the disabled
+// hardware unit was ever provably unreachable, so only it came out.
 void chunkRenderSetDistance(int radius)
 {
 	s_dist = renderDistFor(radius);
 
-	// 512 bytes of exponentials, and nothing about it changes per frame — only the three
-	// register writes that point the GPU at it are repeated, in pipelineBind.
-	FogLut_Exp(&s_fog_lut, FOG_DENSITY, s_dist.fog_gradient, s_dist.near_plane,
-	           s_dist.far_plane);
-	C3D_FogLutBind(&s_fog_lut);
+	// v1.9.0. The fade that is actually drawn. s_dist.boundary, not the radius: the boundary
+	// IS the constraint (the fade has to be finished before the player can see the edge of the
+	// loaded world) and it is the only number the shape needs. Passing it rather than the
+	// radius is also what lets tests/fogramp_test.c evaluate radii above RENDER_DIST_MAX,
+	// which renderDistFor clamps.
+	//
+	// FOG_DENSITY carries over verbatim: -DFOG_DENSITY=0.0f collapses inv_range and bias to
+	// exactly 0, every vertex emits fog coordinate 0, every fragment samples ramp texel 0, and
+	// texel 0 is 0. Still "no fog through this exact code path", still the red arm — through
+	// the new mechanism instead of the old one.
+	s_fog = fogShapeFor(s_dist.boundary, FOG_DENSITY);
 
 	// The mono projection, which is also what a 2D frame uses. A 3D frame overwrites it twice
 	// per frame from drawEye anyway, so there is no eye state to preserve here.
@@ -980,6 +1233,7 @@ const C3D_Mtx* chunkRenderProjection(void)
 void chunkRenderExit(void)
 {
 	atlasExit();
+	fogTexExit();
 	// Step 9.2c. Three arenas now, not MESH_SLOTS individual allocations — every slot's
 	// `verts` pointer is an offset into one of these, so freeing per-slot would free the
 	// same block up to kTierSlots[t] times.
@@ -1170,7 +1424,7 @@ bool chunkRenderBuild(const World* w, int cx, int cy, int cz)
 int chunkRenderReleaseColumn(int cx, int cz)
 {
 	int released = 0;
-	for (int i = 0; i < MESH_SLOTS; i++) {
+	for (int i = 0; i < s_pool_slots; i++) {
 		MeshSlot* s = &s_slots[i];
 		if (!s->used || s->cx != cx || s->cz != cz) continue;
 
@@ -1212,7 +1466,7 @@ int chunkRenderReleaseColumn(int cx, int cz)
 // bookkeeping is per-world, so only the slot bookkeeping is reset.
 void chunkRenderReleaseAll(void)
 {
-	for (int i = 0; i < MESH_SLOTS; i++) {
+	for (int i = 0; i < s_pool_slots; i++) {
 		MeshSlot* s = &s_slots[i];
 		if (!s->used) continue;
 
@@ -1243,7 +1497,7 @@ int chunkRenderTouch(const World* w, int x, int y, int z)
 		// Only chunks that already have a mesh. A chunk with no slot is not on screen,
 		// so meshing it here would be inventing a streaming policy — that is Phase 5,
 		// and doing it early would also let one edit eat the pool.
-		for (int k = 0; k < MESH_SLOTS; k++) {
+		for (int k = 0; k < s_pool_slots; k++) {
 			MeshSlot* s = &s_slots[k];
 			if (!s->used || s->cx != list[i].cx || s->cy != list[i].cy || s->cz != list[i].cz)
 				continue;
@@ -1273,7 +1527,7 @@ int chunkRenderDrainDirty(const World* w, float budget_ms, int max_chunks)
 	const u64 budget_ticks = (budget_ms > 0.0f) ? (u64)(budget_ms * ticks_per_ms) : 0;
 
 	int completed = 0;
-	for (int i = 0; i < MESH_SLOTS; i++) {
+	for (int i = 0; i < s_pool_slots; i++) {
 		MeshSlot* s = &s_slots[i];
 		if (!dirtyqIsMarked(&s_dirty, i)) continue;
 
@@ -1366,7 +1620,7 @@ static void caveWalk(void)
 	int max_x = 0, max_y = 0, max_z = 0;
 	bool any = false;
 
-	for (int i = 0; i < MESH_SLOTS; i++) {
+	for (int i = 0; i < s_pool_slots; i++) {
 		const MeshSlot* s = &s_slots[i];
 		if (!s->used) continue;
 		if (!any) {
@@ -1392,7 +1646,7 @@ static void caveWalk(void)
 	// make it a hole in the box — which reads as open sky, so in this direction the mistake
 	// would be harmless. Putting it in is still right, because its real connectivity is what
 	// the walk should use the day step 7.5 gives an "empty" chunk water in it.
-	for (int i = 0; i < MESH_SLOTS; i++) {
+	for (int i = 0; i < s_pool_slots; i++) {
 		const MeshSlot* s = &s_slots[i];
 		if (!s->used) continue;
 		visWalkSet(&s_walk, s->cx, s->cy, s->cz, s->vis_mask, s->index_count != 0);
@@ -1434,7 +1688,7 @@ static void caveWalk(void)
 static void horizonBuild(void)
 {
 	s_hzn_n = 0;
-	for (int i = 0; i < MESH_SLOTS; i++) {
+	for (int i = 0; i < s_pool_slots; i++) {
 		const MeshSlot* s = &s_slots[i];
 		if (!s->used || s->index_count == 0) continue;
 
@@ -1804,7 +2058,7 @@ static void cullFrame(const C3D_Mtx* view)
 
 	s_vis_n = 0;
 
-	for (int i = 0; i < MESH_SLOTS; i++) {
+	for (int i = 0; i < s_pool_slots; i++) {
 		const MeshSlot* s = &s_slots[i];
 		if (!s->used || s->index_count == 0) continue;
 
@@ -2054,7 +2308,7 @@ int chunkRenderMeshes(void)
 	// but it is not a mesh and reporting it as one would make the figure drift upwards
 	// every time someone cleared a chunk.
 	int n = 0;
-	for (int i = 0; i < MESH_SLOTS; i++)
+	for (int i = 0; i < s_pool_slots; i++)
 		if (s_slots[i].used && s_slots[i].index_count) n++;
 	return n;
 }
@@ -2062,7 +2316,7 @@ int chunkRenderMeshes(void)
 uint32_t chunkRenderTris(void)
 {
 	uint32_t t = 0;
-	for (int i = 0; i < MESH_SLOTS; i++)
+	for (int i = 0; i < s_pool_slots; i++)
 		if (s_slots[i].used) t += s_slots[i].index_count / 3;
 	return t;
 }
@@ -2074,7 +2328,7 @@ uint32_t chunkRenderChecksum(void)
 	// coordinates are folded in, so two chunks swapping meshes would not cancel out.
 	uint32_t total = 0;
 
-	for (int i = 0; i < MESH_SLOTS; i++) {
+	for (int i = 0; i < s_pool_slots; i++) {
 		const MeshSlot* s = &s_slots[i];
 		// vert_count, not `used`: a claimed slot holding no geometry contributes nothing
 		// the GPU ever reads, so folding its coordinates in would change the checksum

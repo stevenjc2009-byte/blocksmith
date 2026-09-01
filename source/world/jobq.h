@@ -62,7 +62,25 @@ typedef struct {
 // The capacity is only half of what made this dangerous. See main.c's genQueueReadyColumns and
 // world/meshq.h for the other half: a refused push used to leave the column marked queued, so
 // the chunks it lost were never asked for again.
-#define JOBQ_CAP 512
+//
+// ── v1.8.5: 512 → 1024, because the paragraph above went stale for the SECOND time ─────────
+//
+// RENDER_DIST_MAX moved 3 → 5 in this version, so the ring is 121 columns and the structural
+// bound is 121 * COLUMN_CHUNKS = 968 mesh jobs. 512 no longer clears it. This is not memory
+// corruption — jobqPush refuses and counts `dropped` (jobq.c:12) — but a refusal during the
+// wide first load is a column whose chunks are never meshed, which is a permanent hole in the
+// terrain until the player walks away and back.
+//
+// 1024 is the next power of two above 968, on the same ARM11 reasoning as before.
+//
+// **Note what happened here twice.** This capacity has now gone stale under a render-distance
+// change on two separate occasions, both times silently, because nothing tied the number to
+// the thing that determines it. A MAX=5 build compiled completely clean with 512 in place and
+// said nothing. The _Static_assert that fixes that permanently lives in main.c beside
+// genQueueReadyColumns, which is the function that actually creates the burst — not here,
+// because source/world deliberately does not include source/scene (see world/dirtyq.h, which
+// hand-maintains its copy of MESH_SLOTS for exactly this reason and is checked the same way).
+#define JOBQ_CAP 1024
 
 typedef struct {
 	Job slots[JOBQ_CAP];

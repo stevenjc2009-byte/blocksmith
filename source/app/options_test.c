@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 
 #include "app/options.h"
+#include "app/hw.h"
 
 static int  s_checks;
 static int  s_fails;
@@ -30,6 +31,23 @@ static char s_first[160];
 				snprintf(s_first, sizeof(s_first), "L%d %.140s", __LINE__, #cond);  \
 		}                                                                        \
 	} while (0)
+
+// v1.8.5. optionsLoad's render_dist clamp stopped being an absolute and became a per-console
+// one — renderDistMaxFor(hwIsNew3ds()) — so three checks in this file that spelled the ceiling
+// RENDER_DIST_MAX went red the moment the lift landed. They were read before they were changed
+// and the failures were correct, not spurious: the host reports Old 3DS (hwIsNew3ds() answers
+// false until hwInit() is told otherwise), so here the ceiling is 3 while RENDER_DIST_MAX is 5,
+// and a saved 5 comes back as 3 exactly as it must on an Old 3DS handed a New 3DS's ini.
+//
+// Respelling those three as ceilingNow() would clear the red without testing anything new, so
+// testPerConsoleCeiling() below drives BOTH models through the real app/hw.c seam. That matters
+// more than it looks: with the host permanently answering "Old", every other check in this file
+// exercises one branch of a two-branch clamp, and a renderDistMaxFor() that ignored its argument
+// entirely would still pass all of them.
+static int ceilingNow(void)
+{
+	return renderDistMaxFor(hwIsNew3ds());
+}
 
 // MinGW's <sys/stat.h> declares the one-argument MSVC mkdir; POSIX takes a mode. Copied
 // from world/world_test.c's testMkdir rather than re-derived, since it is solving the
@@ -125,7 +143,7 @@ static void testRoundTrip(void)
 
 	Options out;
 	optionsDefaults(&out);
-	out.render_dist       = RENDER_DIST_MAX;
+	out.render_dist       = ceilingNow();   // v1.8.5: still away from the default, which is 1 here
 	out.slider_3d          = 0.75f;
 	out.invert_look        = true;
 	out.look_sensitivity   = 2.25f;
@@ -207,7 +225,7 @@ static void testOutOfRangeClamps(void)
 	// A value that parsed cleanly but landed outside its range is clamped, not defaulted —
 	// see options.h's optionsLoad comment for why that is not the same thing as "bad".
 	CHECK(bad == 0);
-	CHECK(o.render_dist == RENDER_DIST_MAX);
+	CHECK(o.render_dist == ceilingNow());
 	CHECK(o.slider_3d == OPTIONS_SLIDER_MAX);
 	CHECK(o.look_sensitivity == OPTIONS_SENS_MIN);
 
@@ -287,7 +305,7 @@ static void testCrashRecovery(void)
 
 	Options saved;
 	optionsDefaults(&saved);
-	saved.render_dist = RENDER_DIST_MAX;
+	saved.render_dist = ceilingNow();
 	CHECK(optionsSave(&saved, path));
 
 	// Simulate the cut: put the bytes back as a .tmp and remove the real file, which is
@@ -305,7 +323,7 @@ static void testCrashRecovery(void)
 	int bad = -1;
 	CHECK(optionsLoad(&recovered, path, &bad));
 	CHECK(bad == 0);
-	CHECK(recovered.render_dist == RENDER_DIST_MAX);
+	CHECK(recovered.render_dist == ceilingNow());
 
 	// Recovery must have promoted the tmp back to the real path, not merely read through it
 	// — a second load has to see the same thing without the .tmp still sitting there.
@@ -315,6 +333,52 @@ static void testCrashRecovery(void)
 	FILE* leftover = fopen(tmp, "rb");
 	CHECK(leftover == NULL);
 	if (leftover) fclose(leftover);
+}
+
+// v1.8.5. The clamp optionsLoad applies is per-console, and the host answers "Old 3DS" for the
+// whole rest of this file, so without this every render_dist check here proves one branch of a
+// two-branch decision. app/hw.h's host-only seam exists precisely for this: hwTestReset() forgets
+// that hwInit() ran, hwTestSetNew3ds() says what the next hwInit() will report.
+//
+// The interesting direction is the SECOND half — a New 3DS ini (render_dist=5) loaded on an Old
+// 3DS. That is not hypothetical: options.ini travels with the SD card, and before this clamp
+// existed a 5 out of that file would have been handed straight to a mesh pool allocated for 3.
+//
+// Written to fail if the clamp stops consulting the model: with renderDistMaxFor() ignoring its
+// argument, "new=5" and "old rejects 5" cannot both hold whatever constant it returns.
+static void testPerConsoleCeiling(void)
+{
+	const char* path = TEST_DIR "/console_ceiling.ini";
+	Options o;
+	int bad = -1;
+
+	// A New 3DS may keep 5.
+	hwTestReset();
+	hwTestSetNew3ds(true);
+	hwInit();
+	CHECK(hwIsNew3ds());
+	CHECK(ceilingNow() == RENDER_DIST_MAX_NEW);
+	CHECK(writeText(path, "render_dist=5\n"));
+	CHECK(optionsLoad(&o, path, &bad));
+	CHECK(bad == 0);
+	CHECK(o.render_dist == 5);
+
+	// The same file on an Old 3DS is clamped down, not honoured and not defaulted — an
+	// out-of-range value that parsed cleanly is still not a parse failure.
+	hwTestReset();
+	hwTestSetNew3ds(false);
+	hwInit();
+	CHECK(!hwIsNew3ds());
+	CHECK(ceilingNow() == RENDER_DIST_MAX_OLD);
+	CHECK(optionsLoad(&o, path, &bad));
+	CHECK(bad == 0);
+	CHECK(o.render_dist == RENDER_DIST_MAX_OLD);
+
+	// Leave the process reporting Old 3DS, which is what it reported before this ran and what
+	// every other test in this file was written against. A test that changes global state and
+	// does not put it back makes the ORDER of the calls in main() load-bearing.
+	CHECK(!hwIsNew3ds());
+	remove(path);
 }
 
 int main(void)
@@ -327,6 +391,7 @@ int main(void)
 	testUnknownKeyIgnored();
 	testMalformedFallsBackAndCounted();
 	testOutOfRangeClamps();
+	testPerConsoleCeiling();
 	testMissingFileGivesDefaults();
 	testTruncatedGarbageDoesNotCrash();
 	testCrashRecovery();

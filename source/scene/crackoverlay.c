@@ -234,6 +234,21 @@ void crackOverlayDraw(const C3D_Mtx* view, int bx, int by, int bz, int stage)
 	C3D_TexEnvSrc(env, C3D_Both, GPU_TEXTURE0, 0, 0);
 	C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
 
+	// v1.9.0. TEV stage 1 and the fog unit, both explicitly OWNED here instead of inherited.
+	// See the same block in scene/highlight.c for the full account of the pre-existing leak
+	// this closes (nothing in the tree ever called GPU_NO_FOG before v1.9.0) and of what a
+	// left-over stage 1 would do to a pass that writes no texcoord1.
+	//
+	// It matters slightly more here than in the highlight, for one reason worth writing down:
+	// stage 0 is REPLACE, so a leaked stage 1 would blend the crack ART toward the sky colour
+	// and the break would read as a lighter break rather than as a fog bug — the same class of
+	// mistake as the crack atlas going stale, which is the failure mode this file's Makefile
+	// note is about. Depth and alpha-test state are still deliberately inherited from the world
+	// pass; only the fog state is claimed.
+	C3D_TexEnv* fog = C3D_GetTexEnv(1);
+	C3D_TexEnvInit(fog);
+	C3D_FogGasMode(GPU_NO_FOG, GPU_PLAIN_DENSITY, false);
+
 	// The alpha TEST, not blending. The crack art is binary — a texel is a black crack or
 	// it is nothing — so there is no partial coverage for a blend to resolve, and RGBA5551
 	// could not carry one anyway with its single alpha bit. Same threshold and the same

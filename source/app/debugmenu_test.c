@@ -8,6 +8,7 @@
 
 #include "app/debugmenu.h"
 #include "app/options.h"
+#include "app/hw.h"   // v1.8.5: the load-time render-distance ceiling is per-console now
 
 // Pulled in as source, not linked, on purpose. tools/run_host_tests.sh builds this
 // binary from options.c + debugmenu.c + this file; debugmenu_ui.c's console half is
@@ -464,13 +465,22 @@ static void testMainDebugSaveWritesNewRenderDist(void)
 // Red-armed: delete the `opts.render_dist = new_radius;` line below and the last CHECK
 // fails with in.render_dist == 1 instead of 3 — the exact reboot symptom.
 //
-// The numbers are RENDER_DIST_MIN (1) and RENDER_DIST_MAX (3), measured from
-// scene/render_dist.h, not picked: options.c:277 clamps render_dist into that range on
-// load, so a bigger "new" value would come back clamped and the test would pass for the
-// wrong reason.
+// The numbers are RENDER_DIST_MIN (1) and the load-time ceiling, measured rather than
+// picked: options.c clamps render_dist into that range on load, so a bigger "new" value
+// would come back clamped and the test would pass for the wrong reason.
+//
+// v1.8.5: that ceiling used to be spelled RENDER_DIST_MAX and this check went red when the
+// lift made RENDER_DIST_MAX 5 while the clamp became per-console — the host reports Old 3DS,
+// so the ini came back at 3 and the assertion wanted 5. The failure was the intended one and
+// the reasoning in the paragraph above is exactly why: the constant this test needs has always
+// been "whatever optionsLoad will clamp to", which is now renderDistMaxFor(hwIsNew3ds()), so
+// it is asked for by that name instead of by a number that was only incidentally equal to it.
+// This test is about the debug menu's save path, not about the ceiling, so it does not drive
+// both console models — app/options_test.c's testPerConsoleCeiling does that.
 static void testDebugSaveRoundTripsNewRenderDist(void)
 {
 	const char* path = TEST_DIR "/debug_roundtrip.ini";
+	const int   ceiling = renderDistMaxFor(hwIsNew3ds());
 
 	Options opts;
 	optionsDefaults(&opts);
@@ -478,7 +488,7 @@ static void testDebugSaveRoundTripsNewRenderDist(void)
 	CHECK(optionsSave(&opts, path));
 
 	// What genSetRadius clamped to and s_mesh_radius now reads back as, live.
-	const int new_radius = RENDER_DIST_MAX;
+	const int new_radius = ceiling;
 	CHECK(new_radius != RENDER_DIST_MIN);   // otherwise this test could not go red
 
 	opts.render_dist = new_radius;
@@ -488,7 +498,7 @@ static void testDebugSaveRoundTripsNewRenderDist(void)
 	int bad = -1;
 	CHECK(optionsLoad(&in, path, &bad));
 	CHECK(bad == 0);
-	CHECK(in.render_dist == RENDER_DIST_MAX);
+	CHECK(in.render_dist == ceiling);
 }
 
 // ── Main ────────────────────────────────────────────────────────────────

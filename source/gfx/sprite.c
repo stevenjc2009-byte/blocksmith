@@ -180,6 +180,28 @@ void spriteBegin(int w, int h)
 	C3D_TexEnvSrc(env, C3D_Both, GPU_TEXTURE0, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR);
 	C3D_TexEnvFunc(env, C3D_Both, GPU_MODULATE);
 
+	// v1.9.0. TEV stage 1 and the fog unit, both explicitly OWNED here instead of inherited
+	// from the world pass. This is the one of the four that would actually have shown.
+	//
+	// The pre-existing bug: nothing in the tree called GPU_NO_FOG before v1.9.0, so every UI
+	// batch was drawn with the terrain's hardware fog live. It never tinted anything, and the
+	// reason is a coincidence rather than a decision — this batch draws through an ORTHO
+	// projection, so every vertex has w = 1, the fog LUT is indexed by 1/w, and w = 1 lands
+	// around entry 23 of 128, which the v1.8.5 table holds at fully clear. Move the table's
+	// clear point inward by twenty entries and the entire HUD would have gone sky blue with
+	// nothing in this file changed.
+	//
+	// v1.9.0's fade is a TEV stage instead, and a leaked one is worse than the old leak was:
+	// it would INTERPOLATE every glyph and panel toward the sky colour by whatever texture
+	// unit 1 returned for a texcoord1 this shader never writes — i.e. by an undefined amount,
+	// which is a bug that looks different every frame. Both halves are claimed explicitly:
+	// stage 1 back to citro3d's REPLACE(previous) passthrough, and the fixed-function unit
+	// off. Unit 1 stays BOUND (citro3d has no unbind — see gfx/fogtex.c) but is now sourced by
+	// no stage, so nothing samples it here.
+	C3D_TexEnv* fog = C3D_GetTexEnv(1);
+	C3D_TexEnvInit(fog);
+	C3D_FogGasMode(GPU_NO_FOG, GPU_PLAIN_DENSITY, false);
+
 	// Straight alpha blending, and depth off. The UI is drawn in submission order on top
 	// of a finished world; a depth test would need every panel to carry a z that agreed
 	// with the order it was written in, which is a bug waiting to happen for no gain.

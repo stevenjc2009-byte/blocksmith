@@ -396,9 +396,21 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 # above. It carries its own main() — the world suite is driven by tests/host_test.c — and
 # two mains cannot share a link. Separate binaries also mean a broken options parser cannot
 # stop the world suite from running, which is the half that guards the save format.
+#
+# v1.8.5: scene/render_dist.c and app/hw.c joined the link because optionsLoad now clamps
+# render_dist against renderDistMaxFor(hwIsNew3ds()) — an ini carried over from a New 3DS
+# must not hand an Old 3DS a radius its mesh pool was never sized for. Both files are the
+# REAL ones, not stubs: render_dist.c has no <3ds.h> at all, and hw.c keeps its libctru half
+# behind #ifdef __3DS__ with a host-only hwTestSetNew3ds() seam (source/app/hw.h) — which is
+# also why linking them here costs nothing and buys options_test the ability to exercise
+# both console models. All four stanzas that link options.c needed the same two files; the
+# link failure that found this was in THIS one and said only "undefined reference to
+# `hwIsNew3ds'", so the other three were fixed by grep, not by waiting for each to go red.
 gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	-I source \
 	source/app/options.c \
+	source/app/hw.c \
+	source/scene/render_dist.c \
 	source/app/options_test.c \
 	-o "$BH/options_test"
 
@@ -411,6 +423,8 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	-I source \
 	source/app/options.c \
+	source/app/hw.c \
+	source/scene/render_dist.c \
 	source/app/remap.c \
 	source/app/remap_test.c \
 	-o "$BH/remap_test"
@@ -1011,6 +1025,65 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 "./$BH/updater_retry_test"
 
+# memprobe_test.c, source/app/memprobe.c — the v1.8.5 boot memory probe. Own main(), own
+# binary, same reason as every one above it.
+#
+# The module exists because every memory number in this project is arithmetic on paper and
+# main.c cannot be host compiled, so the only part of the probe a test can reach is the part
+# that was deliberately split out: the subtraction, its sign, the overflow behaviour and the
+# formatting. Both halves are red-armed and BOTH arms were needed —
+#
+#   * `(long)(before - after)` instead of `(long)before - (long)after`, which wraps before the
+#     cast and turns gputest.c's 512 KB release into 4,294,443,008 bytes of apparent cost:
+#     "FAIL 3/80", first failure "L78 memProbeLinearCost(&p, 1) == -524288".
+#   * MEMPROBE_LINE_MAX cut below the real worst line: "longest formatted line: 141 of 112
+#     budgeted", "FAIL 1/80 L270 longest <= MEMPROBE_LINE_MAX".
+#
+# The second arm is the reason this comment is here. The obvious check for a line-budget
+# mistake — "does the whole report still fit in MEMPROBE_REPORT_MAX" — stayed GREEN under the
+# first version of exactly that mistake (80 budgeted against a 94-character line), because the
+# cap carries four spare lines of slack that absorbed the shortfall. The report fitting was
+# luck, not design. testNoLineExceedsTheLineBudget measures the longest line the formatter
+# actually emits and asserts against the budget directly, and that one goes red.
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/app/memprobe.c \
+	tests/memprobe_test.c \
+	-o "$BH/memprobe_test"
+
+"./$BH/memprobe_test"
+
+# heapsplit_test.c, source/app/heapsplit.c — the v1.8.5 linear/application heap split policy.
+#
+# app/heapsplit.c overrides libctru's weak __system_allocateHeaps, which runs before main and
+# before the crash handler, and whose failure mode is svcBreak(USERBREAK_PANIC) — a console that
+# does not boot, with no log. Only the policy half is host-reachable, and it was split out for
+# exactly that reason. The console half is verified by booting a CXI in each memory mode and
+# reading /blocksmith/memprobe.txt; both readings are in the vault log for 2026-09-01.
+#
+# The numbers in the test are measured, not chosen: `remaining` is the sum of the two heaps a
+# real boot reported (New 3DS 126,824,448; Old 3DS 63,909,888), and the expected New 3DS
+# application heap of 59,715,584 is what the emulator printed after the change went in.
+#
+# Both arms were needed, and both are the same failure the hardware already demonstrated —
+# asking for more than the process was granted:
+#
+#   * application-heap floor removed: "FAIL 25/553", first failure at the sweep's
+#     "L65 app >= HEAPSPLIT_APP_FLOOR_BYTES", then "L81 heapSplitChoose(exact - 4096u, ...)".
+#   * undersized-grant guard removed, so `remaining - linear` wraps: "FAIL 5/722", starting
+#     "L46 heapSplitChoose(REMAINING_OLD_3DS, &lin, &app) == false".
+#
+# The second arm is the one worth keeping in mind. A fixed 64 MB linear heap — the naive version
+# of this change — was actually built and booted in Old 3DS memory mode, and the console never
+# reached chunkRenderInit: no probe file, no error. That is what the policy refuses.
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/app/heapsplit.c \
+	tests/heapsplit_test.c \
+	-o "$BH/heapsplit_test"
+
+"./$BH/heapsplit_test"
+
 # interop_test.c, source/net's real client (networld.c) speaking to a REAL bsgame daemon over a
 # real Unix socket — see that file's own header comment for why networld_test.c and bsgame_test.c
 # (deps/blocksmith-server/game/) each passing on their own proves nothing about whether the two
@@ -1068,6 +1141,8 @@ esac
 gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	-I source \
 	source/app/options.c \
+	source/app/hw.c \
+	source/scene/render_dist.c \
 	source/app/debugmenu.c \
 	source/app/debugmenu_test.c \
 	-o "$BH/debugmenu_test"
@@ -1184,6 +1259,8 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/world/chunk.c \
 	source/world/budget.c \
 	source/app/options.c \
+	source/app/hw.c \
+	source/scene/render_dist.c \
 	source/app/input_map.c \
 	source/world/mining.c \
 	source/scene/interact.c \
@@ -2939,5 +3016,412 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	-o "$BHRD/relight_drain_test"
 
 "./$BHRD/relight_drain_test"
+
+# tests/mesh_pool_bytes_test.c -- the chunk mesh pool's linear-heap cost, byte-exact, at a
+# render radius. Written to settle a 2x disagreement between two paper derivations of that
+# cost (one walking scene/chunk_render.c's tiered arena formula by hand, one probing a flat
+# per-slot average) for radii above RENDER_DIST_MAX, the console's current ceiling.
+#
+# scene/mesh_pool_sizing.h is a pure extraction of the arithmetic scene/chunk_render.c's
+# chunkRenderInit calls to size its three linearAlloc's (see that file's TIER_S_FACES
+# comment for the measurement behind the tier split) -- MESH_SLOT_FACES/VERTS/INDICES and
+# the two fixed tier constants (256 S-tier slots, 120 M-tier slots) moved there from
+# chunk_render.h so this binary can total the pool's bytes without pulling in <3ds.h>.
+# chunk_render.c keeps its own copy of the four tier constants (with their measurement
+# history intact in the comments) and _Static_asserts it against mesh_pool_sizing.h's, so
+# the two cannot silently drift apart, and its byte arithmetic now calls
+# meshPoolTierBytes()/meshPoolIndexBytes() instead of inlining the multiply -- this binary
+# calls those same functions, not a hand-copy of them.
+#
+# Needs no other source file linked: everything it calls is a static inline function in a
+# header, and the only macros it reads from scene/render_dist.h (RENDER_DIST_MAX,
+# RENDER_DIST_MAX_OLD/_NEW, RENDER_DIST_MAX_SLOTS, RENDER_DIST_SLOTS_PER_COLUMN,
+# RENDER_DIST_LINEAR_OVERHEAD_BYTES, RENDER_DIST_LINEAR_HEAP_OLD/_NEW) are compile-time
+# constants, not functions that file defines.
+#
+# ── v1.8.5. It is no longer only a probe: it is the per-console ceiling GATE ───────────────
+#
+# Everything above describes what this binary was WRITTEN for -- settling a paper disagreement
+# by printing real numbers. v1.8.5 added five more checks (2 -> 7) that make it the thing
+# standing between RENDER_DIST_MAX_NEW and somebody's console failing to boot. The printing is
+# unchanged; the gate is new. See tests/mesh_pool_bytes_test.c lines 64-106 for the reasoning
+# behind each one.
+#
+# GREEN, verbatim, WSL gcc -O1:
+#   radius 3: columns=49  mesh_slots=392  bytes=9199616  MB=8.77
+#   radius 4: columns=81  mesh_slots=648  bytes=25976832 MB=24.77
+#   radius 5: columns=121 mesh_slots=968  bytes=46948352 MB=44.77
+#   radius 6: columns=169 mesh_slots=1352 bytes=72114176 MB=68.77
+#   Old 3DS  max radius 3  pool 9199616 + overhead 1874944 = 11074560  vs heap 33554432
+#   New 3DS  max radius 5  pool 46948352 + overhead 1874944 = 48823296 vs heap 67108864
+#   one further (radius 6) needs 73989120, which is 6880256 over the New 3DS heap
+#   mesh pool bytes self-test: PASS / 7 checks / exit=0
+# The r3 figure is not host arithmetic checked against itself: a New 3DS CXI boot probe printed
+# `chunkRenderInit  cost lin +9199616` at radius 3, and L78 pins the host formula to it. The two
+# heap sizes and the 1874944 overhead are likewise Azahar readings, not derivations.
+#
+# The arms were run from a SHADOW copy of scene/render_dist.h on the include path, never by
+# editing the tree -- a red arm left behind in production code compiles and reads as a
+# deliberate constant, which has happened on this project before.
+#
+# ARM 1 -- "just raise it a bit more". RENDER_DIST_MAX_NEW 5 -> 6. Result: "FAIL L91", exit=1.
+# That is the fit check for the New 3DS, and the maximality check at L100 is what stops the
+# same edit passing at 3 or 4 as well.
+#
+# ARM 2 -- REJECTED, recorded because rejecting it is the point. MESH_POOL_TIER_S_SLOTS
+# 256 -> 4096 does go red, but for the wrong reason: it drives the L tier negative
+# (392 - 4096 - 120), meshPoolTierBytes casts that to size_t, and the total wraps to ~1.8e19.
+# The checks fired against a wrapped number, which says nothing about whether they catch a pool
+# that is merely too big. A red arm that goes red by arithmetic accident is not evidence.
+#
+# ARM 3 -- the replacement, with every tier staying positive. MESH_SLOT_FACES 2048 -> 3072.
+# Result: "FAIL L78" and "FAIL L91", pool_new 68234240 against a 67108864 heap. L90 correctly
+# did NOT fire -- an Old 3DS still fits at 11611136 -- which is what says the two fit checks are
+# independent rather than one condition written twice.
+#
+# NOT VERIFIED BY THIS STANZA:
+#   * That the console actually allocates what this formula says. L78 ties it to ONE reading at
+#     ONE radius; radii 4 and 5 have never been allocated on anything.
+#   * GPU cost. Radius 5 draws 2.47x the columns of radius 3 and this binary counts bytes, not
+#     frames. Whether a New 3DS holds a frame rate at radius 5 is a playtest, not a check.
+#   * RENDER_DIST_MAX itself is deliberately still 3. Until chunkRenderInit sizes its arenas
+#     from the SELECTED radius rather than the compile-time ceiling, raising it would allocate
+#     the wide pool on both consoles; L106 is the check that states that ordering constraint.
+#
+# Own build directory rather than the shared $BH — $BH was already rm -rf'd at line 1200,
+# same reason playerpose_test above keeps its own: every stanza below that point cleans up
+# after itself individually.
+BHMP="build-host/run-$$-meshpool"
+mkdir -p "$BHMP"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	tests/mesh_pool_bytes_test.c \
+	-o "$BHMP/mesh_pool_bytes_test"
+
+"./$BHMP/mesh_pool_bytes_test"
+
+rm -rf "$BHMP"
+
+# tests/render_dist_ceiling_test.c -- v1.8.5. The PER-CONSOLE render-distance ceiling API:
+# renderDistMaxFor(), renderDistClampFor(), renderDistDefault(). The stanza above gates whether a
+# radius FITS; this one gates whether a console is ever OFFERED it.
+#
+# renderDistMaxFor returns min(per-model ceiling, RENDER_DIST_MAX), and that min is the whole
+# point. RENDER_DIST_MAX_OLD/_NEW say what each console's linear HEAP holds; RENDER_DIST_MAX says
+# what the mesh pool was ALLOCATED for, because MESH_SLOTS is still RENDER_DIST_MAX_SLOTS and
+# chunkRenderInit claims that from the compile-time constant. Returning 5 for a New 3DS before
+# the pool is that wide hands it a radius whose slots do not exist -- acquireSlot returns NULL and
+# the chunk never meshes. That is the v1.7.0 permanent-terrain-hole failure, exactly.
+#
+# ---- READ THIS BEFORE TRUSTING A GREEN RUN ----------------------------------------------------
+# At RENDER_DIST_MAX 3 both consoles are legitimately pinned to 3, so a renderDistMaxFor that
+# IGNORES new_3ds entirely is observationally identical to a correct one and this stanza passes.
+# That is not a defect in the test, it is the truth about today's constants -- but it means the
+# green run below does NOT by itself prove the New 3DS branch works. The proof is the wide arm:
+# a shadow copy of render_dist.h with RENDER_DIST_MAX 3->5 and nothing else changed, which must
+# report "Old 3DS 3   New 3DS 5" and PASS 136 (two extra divergence checks that cannot run while
+# the two models are equal). Verified from the main thread 2026-09-01, verbatim:
+#
+#     real header : renderDistMaxFor  Old 3DS 3   New 3DS 3   -> PASS 134 checks, exit=0
+#     wide shadow : renderDistMaxFor  Old 3DS 3   New 3DS 5   -> PASS 136 checks, exit=0
+#
+# RED ARM, main thread, shadow copy only (tree md5 confirmed identical after): renderDistMaxFor
+# rewritten to "return model;", dropping the pool clamp. Result 10 of 136 failed, exit=1 --
+#     FAIL L73  max_new == EXPECT_MAX_FOR(RENDER_DIST_MAX_NEW)
+#     FAIL L85  max_new <= RENDER_DIST_MAX
+#     FAIL L103 max_new == RENDER_DIST_MAX
+#     FAIL L105 max_new == max_old
+#     FAIL L144 renderDistFor(c).radius == c   (x6)
+# L84 (max_old <= RENDER_DIST_MAX) correctly did NOT fire: the two fit checks are independent,
+# not one condition written twice.
+#
+# NOT VERIFIED: nothing here has run on a console. The ARM compile proves render_dist.c and the
+# header's static asserts build for the 3DS; it says nothing about behaviour on hardware, and at
+# today's RENDER_DIST_MAX the New 3DS branch returns 3 in the shipped build regardless.
+BHRC="build-host/run-$$-rdceil"
+mkdir -p "$BHRC"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	tests/render_dist_ceiling_test.c \
+	source/scene/render_dist.c \
+	-lm \
+	-o "$BHRC/render_dist_ceiling_test"
+
+"./$BHRC/render_dist_ceiling_test"
+
+rm -rf "$BHRC"
+
+# tests/mesh_pool_runtime_test.c -- v1.8.5. The RUNTIME sizing of the mesh pool's three
+# linearAlloc tier arenas: poolSlotsForRadius() and poolTierSlots(), both `static` inside
+# scene/chunk_render.c. The stanza above (render_dist_ceiling_test) gates whether a console is
+# ever OFFERED a radius; the mesh_pool_bytes stanza further above gates whether the CEILING pool
+# fits; this one is the one that proves the pool chunkRenderInit actually claims is sized from
+# the radius it was HANDED and not from the compile-time ceiling -- the change that makes
+# RENDER_DIST_MAX_NEW 5 safe for an Old 3DS to link against at all. See the file's own header
+# comment for the full defect statement.
+#
+# ── Extracted, not hand-copied, same reason as horizon_test/profile_reset_test/cavewalk_test
+# above: chunk_render.c includes <3ds.h> and <citro3d.h> and cannot be compiled on the host. The
+# awk below lifts poolSlotsForRadius()/poolTierSlots() and the tier #defines they read
+# (TIER_S_SLOTS, TIER_M_SLOTS, TIER_MEASURED_WORST_1024, TIER_L_MIN_SLOTS, POOL_MIN_SLOTS) out of
+# chunk_render.c, in file order, which is also the order they must be defined in.
+#
+# One extra line the other three extractions never needed: poolSlotsForRadius()'s body reads the
+# bare identifier MESH_SLOTS, and MESH_SLOTS is `#define`d in scene/chunk_render.h, not in
+# chunk_render.c -- it is not one of "the tier #defines they read" from the .c file, it is
+# infrastructure the .c file gets from its own header. Hand-typing that line into the generated
+# .inc would be exactly the "test carries its own copy of the logic" failure this whole mechanism
+# exists to avoid, so a first awk pass lifts the real `#define MESH_SLOTS (RENDER_DIST_MAX_SLOTS)`
+# line out of chunk_render.h itself, the same extraction technique applied to a second file.
+#
+# tests/mesh_pool_runtime_test.c has no #ifndef/#error sentinel check of its own (unlike
+# cavewalk_test.c's BS_CAVEWALK_EXTRACT_OK) -- it just #includes pool_sizing_extract.inc and
+# calls the two functions. So the anchor's receipt is written the other way round here: the awk
+# END block emits "#define BS_POOL_SIZING_EXTRACT_OK 1" only if every #define and both function
+# signatures were seen, and emits `#error "..."` INTO the .inc itself otherwise. Break an anchor
+# (a rename, a reformat that moves the closing brace out of column 0) and the .inc fails to
+# compile with that #error naming the file it failed to extract from; there is no fallback copy
+# in the test that could quietly keep passing.
+#
+# Sabotaged and measured, both arms against a COPY of the tree (this file is source/ and off
+# limits to a red arm left in place), never by editing the real tree -- confirmed by md5 before
+# and after, real source/scene/chunk_render.c unchanged (c2bd6bcbe97362f7616a8f6318f30593
+# throughout). GREEN, verbatim, WSL gcc -O1, real tree at RENDER_DIST_MAX=5:
+#
+#   built at RENDER_DIST_MAX=5  MESH_SLOTS=968  POOL_MIN_SLOTS=384  DIRTYQ_MAX=968
+#   asked radius 3 -> slots= 392  tiers S256/M120/L16    bytes=   9199616
+#   asked radius 5 -> slots= 968  tiers S256/M120/L592   bytes=  46948352
+#   mesh pool runtime self-test: PASS / 123 checks, exit=0
+#
+# ARM A -- the wrong-answer case. poolSlotsForRadius's body replaced with "(void)max_radius;
+# return 392;" in the copy, so it answers the radius-3 slot count at every radius. Result:
+# "FAILED - 5 of 123 checks failed, first: L120 poolSlotsForRadius(5) == 968", exit=1. The other
+# 118 checks -- including every radius-3 check and testNoTierCanGoNegative's absurd-radius sweep,
+# which the sabotage answers "correctly" by construction -- stay GREEN, which is what says these
+# five are the ones actually discriminating "sized for the radius" from "always the same pool".
+#
+# ARM B -- the anchor-breaks case, proving the #error fires instead of a silent pass. poolTierSlots
+# renamed to poolTierSlotsRENAMED in the copy, so the extraction's second signature pattern never
+# matches. Result: the generated .inc ends in the #error line above instead of the OK sentinel,
+# and gcc fails immediately on it:
+#   error: #error "pool_sizing_extract.inc did not carry poolSlotsForRadius()/poolTierSlots() and
+#   their tier #defines out of source/scene/chunk_render.c"
+# followed by "implicit declaration of function 'poolTierSlots'" from the test itself -- there is
+# no second definition anywhere that could paper over the missing one. COMPILE_RC=1.
+#
+# NOT VERIFIED BY THIS STANZA: anything on hardware. No console has run any build since v1.2.5,
+# and this binary counts .bss/linearAlloc arithmetic, not bytes an allocator has actually handed
+# back.
+BHMR="build-host/run-$$-meshpoolrt"
+mkdir -p "$BHMR"
+
+awk '
+/^#define MESH_SLOTS[[:space:]]/ { print; saw=1 }
+END { if (!saw) print "#error \"pool_sizing_extract.inc did not carry MESH_SLOTS out of source/scene/chunk_render.h\"" }
+' source/scene/chunk_render.h > "$BHMR/pool_sizing_extract.inc"
+
+awk '
+/^#define TIER_S_SLOTS[[:space:]]/             { print; sawS=1 }
+/^#define TIER_M_SLOTS[[:space:]]/             { print; sawM=1 }
+/^#define TIER_MEASURED_WORST_1024[[:space:]]/ { print; sawW=1 }
+/^#define TIER_L_MIN_SLOTS[[:space:]]/         { print; sawL=1 }
+/^#define POOL_MIN_SLOTS[[:space:]]/           { print; sawP=1 }
+/^static int poolSlotsForRadius\(int max_radius\)$/           { inf=1; sawA=1 }
+/^static void poolTierSlots\(int pool_slots, int out\[3\]\)$/ { inf=1; sawB=1 }
+inf { print; if ($0 == "}") inf=0 }
+END {
+	if (sawS && sawM && sawW && sawL && sawP && sawA && sawB)
+		print "#define BS_POOL_SIZING_EXTRACT_OK 1"
+	else
+		print "#error \"pool_sizing_extract.inc did not carry poolSlotsForRadius()/poolTierSlots() and their tier #defines out of source/scene/chunk_render.c\""
+}
+' source/scene/chunk_render.c >> "$BHMR/pool_sizing_extract.inc"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source -I "$BHMR" \
+	tests/mesh_pool_runtime_test.c \
+	-o "$BHMR/mesh_pool_runtime_test"
+
+"./$BHMR/mesh_pool_runtime_test"
+
+rm -rf "$BHMR"
+
+# tests/world_budget_bytes_test.c -- the WORLD STORE's cost at a render radius, and the gate on
+# world/budget.h's WORLD_BUDGET_BYTES. The sibling of the mesh pool stanza directly above, and
+# deliberately a separate binary, because they are separate heaps:
+#
+#   * the chunk mesh pool is linearAlloc  -> 46,948,352 B of the New 3DS's 64 MB linear heap at
+#     radius 5, gated by mesh_pool_bytes_test.c
+#   * the world store is calloc/malloc    -> 11,160,160 B of the 59,715,584 B of APPLICATION
+#     heap left beside it, gated here
+#
+# app/heapsplit.h is where that distinction was established and measured. It is the reason
+# raising the New 3DS render distance is affordable at all: the two do not compete.
+#
+# ── The numbers, and why the console ones are carried rather than computed ─────────────────
+#
+# `struct Chunk` is defined only in world/chunk.c and `LightColumn` only in world/light.c, so
+# no host binary can sizeof() either. The test carries the TARGET sizes as constants measured
+# off the console toolchain -- arm-none-eabi-gcc (devkitARM) 16.1.0, -march=armv6k -mtune=mpcore
+# -mfloat-abi=hard -mtp=soft, compiled to assembly and read out of the emitted .word values --
+# and pins each to the host figure it CAN reach (sizeof(Column), chunkFormBytes(CHUNK_FORM_RAW),
+# 2 * LIGHT_COL_BYTES), so that adding a field anywhere moves the host number, fails a check,
+# and forces the target number to be re-measured rather than quietly rotting.
+#
+#     sizeof(Column)         48 console / 88 host     chunkFormBytes(RAW)  4,104 / 4,112
+#     sizeof(LightColumn) 32,768 both                 one column          65,648 / 65,752
+#
+# The chunk header is 8 bytes on the console, not the 12 a hand derivation gives: the pointer is
+# 4 bytes AND the ARM EABI defaults to -fshort-enums, so ChunkForm collapses to one byte. Every
+# host term is the larger, so the host arithmetic is a 0.16 % upper bound on the console's, and
+# both are checked to reach the same verdict at every radius.
+#
+# GREEN, verbatim, WSL gcc -O1:
+#   per column: Column 48 + 8 chunks x 4104 (RAW) + light 32768 = 65648 B  console
+#   radius 3: loaded ring 9x9 =  81 columns +1 staging  bytes= 5383136  MB= 5.13  fits
+#   radius 5: loaded ring 13x13 = 169 columns +1 staging  bytes=11160160  MB=10.64  fits
+#   radius 6: loaded ring 15x15 = 225 columns +1 staging  bytes=14836448  MB=14.15  OVER CAP
+#   Old 3DS  max radius 3  world store 5383136 of cap 12582912  (42.8 %)
+#   New 3DS  max radius 5  world store 11160160 of cap 12582912  (88.7 %)
+#   one further (radius 6) needs 14836448, which is 2253536 over the cap
+#   world budget bytes self-test: PASS / 25 checks / exit=0
+# The one "BUDGET REFUSED 14836448 B (used 0 of 12582912)" line in a GREEN run is expected and
+# is printed by the real budgetClaim(): the last four checks run the shipped claim path against
+# the shipped cap rather than comparing numbers to a macro.
+#
+# ── What this settled, which was a v1.8.5 open question ───────────────────────────────────
+#
+# The world store was believed to be the remaining blocker on the New 3DS's wider ring, on the
+# strength of budget.h's own comment: a "17x17-column worst case of ~9.25 MB against a 12 MB
+# cap". That comment was v1.4.x arithmetic -- 289 x 8 x 4,096 bytes of block data, counting
+# neither the chunk headers nor the 32 KiB LightColumn that has hung off every loaded column
+# since v1.5.0 and on BOTH models since v1.8.0 task 24. The real 17x17 figure is 289 x 65,648 =
+# 18,972,272 B (18.09 MB), a 2x understatement -- and a case that would NOT fit the 12 MB the
+# comment was justifying. It is why nobody could tell whether radius 5 fitted.
+#
+# It does. 12 MB holds radius 5 at 88.7 % and refuses radius 6 by 2,253,536 bytes, so the cap
+# did not need raising and did not need to become per-console -- and a per-console cap would
+# have bought nothing anyway, because world/budget.c is three scalars and a comparison and
+# reserves no memory at all, so an Old 3DS charged the shared figure is charged nothing.
+#
+# ── Red arms. All four ran from a SHADOW header on the include path, never by editing the ──
+# tree, and none of them goes red by unsigned wrap (every total here is a sum of positive
+# terms; the one subtraction is in a printf and is guarded, so a red run stays readable).
+#
+# ARM 1 -- scene/render_dist.h shadowed, RENDER_DIST_MAX_NEW 5 -> 6, i.e. "just one more".
+#   "FAIL L144: need_new <= WORLD_BUDGET_BYTES", plus the host mirror at L157 and the real
+#   claim at L184. exit=1, 3 of 25. Printed "New 3DS max radius 6 world store 14836448 of cap
+#   12582912 (117.9 %)".
+#
+# ARM 2 -- the one that matters. world/budget.h shadowed, cap 12 MB -> 16 MB. Both fit checks
+#   stay GREEN and only the maximality half fires: "FAIL L151: need_over > WORLD_BUDGET_BYTES",
+#   L158, and the two real-budget checks L188/L189. exit=1, 4 of 25. Without L151 this stanza
+#   would pass with the cap at any size at all and would be asserting nothing about which cap
+#   is right.
+#
+# ARM 3 -- cap 12 MB -> 8 MB. "FAIL L144", L157, L184, and also "FAIL L166: need_old * 2u <=
+#   WORLD_BUDGET_BYTES" -- the Old 3DS margin check, which is what says one cap can serve both
+#   consoles. exit=1, 4 of 25.
+#
+# ARM 4 -- the historical bug itself, reintroduced: the light term dropped from
+#   budgetColumnBytes(), which is exactly what the old ~9.25 MB comment omitted. Per column
+#   falls 65,648 -> 32,880 and radius 6 starts "fitting". "FAIL L112: col_target == 65648u"
+#   first, then L113, L151, L158, L188, L189. exit=1, 6 of 25.
+#
+# NOT VERIFIED BY THIS STANZA:
+#   * Anything on hardware. No console has run any build since v1.2.5, and radius 5 has never
+#     been loaded anywhere. This counts bytes the allocator would be asked for, not bytes it
+#     handed back -- a fragmented application heap can refuse a request that fits the cap.
+#   * The application-heap sizes. 59,715,584 is an Azahar reading via app/memprobe, not a
+#     hardware one; HEAPSPLIT_APP_FLOOR_BYTES is a policy floor, not a measurement.
+#   * That the ring never transiently exceeds (2*(radius+1)+1)^2 columns. That is read off
+#     main.c's genRecenter/genSetRadius, both of which unload before they request, and off
+#     app/worker.c emptying its staging world in workerInstall -- read, not instrumented.
+#   * GPU cost, frame time, and whether radius 5 is playable. Bytes are not frames.
+#
+# Own build directory, same reason as the mesh pool stanza above: $BH was rm -rf'd at line 1200.
+BHWB="build-host/run-$$-worldbudget"
+mkdir -p "$BHWB"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/chunk.c \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/budget.c \
+	tests/world_budget_bytes_test.c \
+	-o "$BHWB/world_budget_bytes_test"
+
+"./$BHWB/world_budget_bytes_test"
+
+rm -rf "$BHWB"
+
+# tests/fogramp_test.c -- v1.8.5's distance fog, decoded out of the artefact the console is
+# actually handed rather than recomputed from the source that generated it.
+#
+# Links source/gfx/fogramp.c ONLY. That file has no <3ds.h> in it precisely so that the fade
+# the GPU runs can be evaluated here on the host: the console and this binary run the same
+# arithmetic, not two implementations of the same intent.
+#
+# It reads build/fogramp.t3x at RUNTIME, so it must run AFTER a devkitPro build. With no t3x
+# present it exits 1 with a message rather than passing vacuously -- a check that silently
+# skips when its input is missing is the check most likely to be green on the day it matters.
+#
+# WHY THIS EXISTS. The old fog was a PICA200 hardware LUT: 128 entries indexed by 1/w, whose
+# knots bunch near the camera. With `near` pinned at 0.18 the first knot past the far plane
+# sits at 20.6767 blocks and everything beyond it is one unshapeable linear segment, which
+# capped half-visibility at ~14.4 blocks AT ANY RADIUS. Measured: 14.3358 / 14.3651 / 14.4065
+# at radius 3 / 4 / 5 -- raising the radius bought 0.20%. Fog was the render-distance ceiling
+# just as much as memory was, and a New 3DS drawing 121 columns it cannot see through would
+# have been pure cost. The fade now comes from a ramp texture sampled through TexEnv stage 1
+# off linear eye depth carried in texcoord1, and the ceiling is gone:
+#
+#   radius 1  half_vis   9.5    radius 4  half_vis  38.0
+#   radius 2  half_vis  19.0    radius 5  half_vis  47.5
+#   radius 3  half_vis  28.5    radius 6  half_vis  57.0
+#
+# Exactly linear at 9.5 blocks per radius step, against 0.03 before. Green: PASS 40 checks.
+#
+# RED ARMS, all verbatim-verified by the agent that wrote it and all restored afterwards:
+#   * Python curve changed to linear and the t3x rebuilt -> "first mismatch at texel 0:
+#     t3x=1, fogRampTexel=0". This is the arm that proves the binary reads the ARTEFACT and
+#     not the source, and it also proves the Makefile's hand-written `fogramp.t3x: fogramp.png`
+#     prerequisite works -- without it, editing the PNG rebuilds nothing (a .d stem collision).
+#   * FOG_END_FRAC 0.95 -> 1.30  ->  "FAIL bvis <= 0.005f" x4: terrain no longer reaches full
+#     fog by the load boundary, i.e. you would see the world end.
+#   * The OLD CEILING reinstated (s.end pinned) -> "half_vis 15.0000" at every radius and
+#     "FAIL half - prev_half >= 8.0f" x5. This is the arm that proves the check would have
+#     caught the very bug the version was written to fix.
+#   * No t3x present -> exits 1 with a message, does not skip.
+#
+# One defect the probe caught in ITSELF on first run, recorded because the lesson generalises:
+# the step check was first written as `half > prev_half * 1.4f`, which FAILS at radius 4, 5
+# and 6 because a linear series has ratio r/(r-1) -> 1.333, 1.25, 1.2. A ratio test on a
+# linear series tests curvature, not the claim being made. Replaced with an absolute step of
+# >= 8.0 blocks, against a real 9.5 and an old 0.03.
+#
+# NOT VERIFIED BY THIS STANZA -- three GPU facts no host binary can reach:
+#   * that the PICA200 interpolates texcoord1 perspective-correctly. This is the load-bearing
+#     one. The strongest evidence is that the block atlas already depends on it (GPU_REPEAT
+#     with u past 16 on greedy-merged quads) and the world renders correctly. If it did NOT
+#     hold, large merged quads would BAND -- that is the thing to look for on a console.
+#   * that GPU_INTERPOLATE is src0*src2 + src1*(1-src2).
+#   * that fogParams arrives in the shader intact.
+#
+# Own build directory: $BH was rm -rf'd at line 1259, same as every stanza past that point.
+BHFR="build-host/run-$$-fogramp"
+mkdir -p "$BHFR"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/gfx/fogramp.c \
+	tests/fogramp_test.c \
+	-o "$BHFR/fogramp_test"
+
+"./$BHFR/fogramp_test"
+
+rm -rf "$BHFR"
 
 rm -rf "$BHRD"

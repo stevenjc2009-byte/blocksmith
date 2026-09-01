@@ -134,6 +134,16 @@ static void checkAt(bool cond, const char* what, int line)
 // resizes HZN_MAX_COLUMNS for the same reason, in the other direction.
 #define MESH_SLOTS 64
 
+// v1.8.5: that bound stopped being MESH_SLOTS in the extracted function. chunk_render.c's pool
+// is now claimed for a radius chosen at boot, so every loop over it walks 0..s_pool_slots — a
+// runtime count set by chunkRenderInit — and MESH_SLOTS is only the ALLOCATION ceiling. The
+// extracted caveWalk refers to it by name, so it has to exist here; it is pinned to MESH_SLOTS
+// so the pool this file builds and the range caveWalk walks are still the same range, which is
+// what testNoSlotOverrun's sentinels depend on (it plants a slot at MESH_SLOTS - 1 and requires
+// the loop to have reached it). resetPool() re-pins it, so a test that narrows it to prove
+// something about a partly-claimed pool cannot leak that into the next test.
+static int s_pool_slots = MESH_SLOTS;
+
 typedef struct {
 	int      cx, cy, cz;
 	uint32_t index_count;
@@ -189,6 +199,7 @@ static void resetPool(void)
 	s_walk_cx = s_walk_cy = s_walk_cz = 0;
 	s_walk_runs = 0;
 	s_cave_ran  = false;
+	s_pool_slots = MESH_SLOTS;   // v1.8.5: see the s_pool_slots declaration above
 }
 
 static bool guardsIntact(void)

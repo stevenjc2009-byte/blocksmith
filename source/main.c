@@ -17,6 +17,7 @@
 #include <math.h>
 #include <dirent.h>
 #include <stdio.h>
+#include <malloc.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -26,6 +27,7 @@
 #include "app/debugmenu_ui.h"
 #include "app/hw.h"
 #include "app/input_map.h"
+#include "app/memprobe.h"
 #include "app/options.h"
 #include "app/remap.h"
 #include "app/remap_ui.h"
@@ -823,6 +825,25 @@ static float s_frame_save_ms;
 // real thing, and — the actual fix — the column is marked queued only if every push was
 // accepted. It used to be marked first and unconditionally, which made a refused push a
 // permanent hole in the world. See world/meshq.h for the full account.
+//
+// v1.8.5. This function is the burst that sizes JOBQ_CAP: on a distance change or a boot it can
+// push one JOB_MESH per non-air chunk of every column in the ring, all in one pass, before
+// anything drains. The structural worst case is therefore every column times every chunk.
+//
+// The assert lives here rather than in world/jobq.h because source/world deliberately does not
+// include source/scene, so jobq.h cannot see RENDER_DIST_MAX (world/dirtyq.h has the same
+// problem and is handled the same way). It exists because JOBQ_CAP has silently gone stale under
+// a render-distance change TWICE — at RENDER_DIST_MAX 2 and again at 5 — and on both occasions
+// the build was completely clean. A refused push is not corruption, jobqPush counts it in
+// `dropped`, but it is a column that never gets meshed and so a hole in the terrain.
+_Static_assert(JOBQ_CAP >= RENDER_DIST_MAX_COLUMNS * COLUMN_CHUNKS,
+               "world/jobq.h's JOBQ_CAP is smaller than one full ring of mesh jobs, so a boot "
+               "or a distance change can overflow the queue and silently drop chunks. It is a "
+               "hand-maintained number; raise it to the next power of two above "
+               "RENDER_DIST_MAX_COLUMNS * COLUMN_CHUNKS.");
+_Static_assert((JOBQ_CAP & (JOBQ_CAP - 1)) == 0,
+               "JOBQ_CAP must stay a power of two: jobq.c wraps head/tail with % JOBQ_CAP and "
+               "ARM11 has no integer divide instruction.");
 static void genQueueReadyColumns(void)
 {
 	bool still_short = false;
@@ -950,8 +971,9 @@ static void genRecenter(int32_t cx, int32_t cz)
 // before genStart, which then requests the right shape first time.
 static void genInitRadius(int radius)
 {
-	if (radius < RENDER_DIST_MIN) radius = RENDER_DIST_MIN;
-	if (radius > RENDER_DIST_MAX) radius = RENDER_DIST_MAX;
+	// v1.8.5: the ceiling is the CONSOLE's, not the compile-time one. An Old 3DS must still
+	// stop at 3 in a binary whose pool can hold 5.
+	radius = renderDistClampFor(radius, hwIsNew3ds());
 	s_mesh_radius = radius;
 	s_area_radius = radius + 1;
 	chunkRenderSetDistance(radius);
@@ -971,8 +993,8 @@ static void genInitRadius(int radius)
 // generation, not a rebuild of the world.
 static void genSetRadius(int radius)
 {
-	if (radius < RENDER_DIST_MIN) radius = RENDER_DIST_MIN;
-	if (radius > RENDER_DIST_MAX) radius = RENDER_DIST_MAX;
+	// v1.8.5: per-console ceiling, same reasoning as genInitRadius above.
+	radius = renderDistClampFor(radius, hwIsNew3ds());
 	if (radius == s_mesh_radius) return;
 
 	const int old_area = s_area_radius, old_mesh = s_mesh_radius;
@@ -1126,7 +1148,7 @@ static void bsDebugRegister(void)
 		e->getInt     = bsDbgGetDist;
 		e->setInt     = bsDbgSetDist;
 		e->slider_min = RENDER_DIST_MIN;
-		e->slider_max = RENDER_DIST_MAX;
+		e->slider_max = renderDistMaxFor(hwIsNew3ds());   // v1.8.5: per-console, not compile-time
 		e->ctx        = &s_dctx;
 	}
 
@@ -3043,6 +3065,123 @@ static void onInvState(void* userdata, const NetworldInvState* state)
 	(void)invBridgeApplyState(&s_inv, state);
 }
 
+// v1.8.5. What the boot actually costs, read off the console instead of derived on paper.
+//
+// Every memory figure this project quotes is arithmetic: the mesh pool is 9,199,616 bytes
+// because four constants multiply to that, the world store is 12 MB because world/budget.h
+// says so, and the 24,348,874 byte total is a sum of fourteen such derivations. The only
+// hardware reading on record — 25.83 MB of linear free — was taken before v1.7.0, when the
+// pool was 4.24 MB. v1.8.5 is being asked how much further a New 3DS can see, and answering
+// that by subtracting one unverified number from another is how this project has been wrong
+// before. So mark the free heap at each milestone and let the console do the subtraction.
+//
+// The arithmetic, the sign handling and the formatting live in app/memprobe.c, which is
+// <3ds.h>-free and host-tested (tests/memprobe_test.c, 73 checks, red-armed two ways). All
+// that happens here is the two libctru readings and the SD write.
+static MemProbe s_memprobe;
+
+// Three readings, because no two of them can see the same allocations.
+//
+// linearSpaceFree/vramSpaceFree cover linearAlloc and VRAM — the mesh pool, the framebuffers,
+// the atlas. mallinfo().uordblks covers the ordinary heap, which is where net/blockdiff.h's
+// 1.02 MB pending-edit store and most of the rest of the game live. The first Azahar run of
+// this probe is what proved the third column necessary: linearSpaceFree() read 0 through
+// hwInit, psInit, netInit and networldInit and only became meaningful after screenInit, so
+// against linear alone the entire pre-graphics boot looked free.
+static void memProbeBootMark(const char* name)
+{
+	const struct mallinfo mi = mallinfo();
+	memProbeMark(&s_memprobe, name,
+	             (unsigned)linearSpaceFree(), (unsigned)vramSpaceFree(),
+	             (unsigned)mi.uordblks);
+}
+
+// Written once, at the end of the boot, to sdmc:/blocksmith/memprobe.txt.
+//
+// watchdogWriteFile rather than stdio for the same reason app/gputest.c uses it: it takes the
+// raw-FS path the hang report uses and sizes the file to exactly the length written, so a
+// shorter report cannot leave the tail of a longer previous one trailing it and be read as
+// this boot's numbers. A refused format is reported in the file rather than swallowed — an
+// empty memprobe.txt with no explanation is the failure this whole module exists to avoid.
+//
+// The path is absolute and must stay that way. watchdog.c's fileWrite() opens ARCHIVE_SDMC at
+// the root and creates "/blocksmith" as a directory, then passes this string straight to
+// FSUSER_OpenFile — so a bare "memprobe.txt" is not a file in the game's folder, it is a path
+// the open silently refuses. That was the first version of this line, and the emulator boot
+// that was supposed to prove the probe works produced no file at all and no error: bootid.txt
+// and frames.csv were freshly written by the same boot, so the game plainly ran and reached
+// here. Matches app/gputest.c's SELFTEST_REL, which is "/blocksmith/selftest.txt" for exactly
+// this reason.
+#define MEMPROBE_REL  "/blocksmith/memprobe.txt"
+
+// Room for the stage table plus the region summary appended after it. memProbeFormat is still
+// handed only MEMPROBE_REPORT_MAX, so its "never truncates" contract is unchanged and the host
+// suite still tests the real cap; the tail is main.c's, and only main.c can write it because
+// osGetMemRegion* is libctru and memprobe.c is deliberately free of <3ds.h>.
+#define MEMPROBE_REGION_TAIL 512
+
+static void memProbeBootFlush(void)
+{
+	static char report[MEMPROBE_REPORT_MAX + MEMPROBE_REGION_TAIL];
+	const int len = memProbeFormat(&s_memprobe, report, MEMPROBE_REPORT_MAX);
+	if (len <= 0) {
+		static const char kFailed[] = "boot memory probe: memProbeFormat refused\n";
+		watchdogWriteFile(MEMPROBE_REL, kFailed, sizeof(kFailed) - 1);
+		return;
+	}
+
+	// The stage table alone answered the wrong question. It measures the LINEAR HEAP, and a
+	// New 3DS CXI boot (ExHeader SystemModeExt : 124MB, game correctly reporting "New 3DS")
+	// read 31,679,488 bytes of linear free — byte for byte the same as the same build booted
+	// as a .3dsx under the homebrew launcher. libctru reserves its linear heap once at
+	// startup, so linearSpaceFree() reports free space INSIDE that reservation and never the
+	// console's budget. The extra New 3DS memory is real but sits outside it, unmapped, and
+	// invisible to every reading taken so far.
+	//
+	// osGetMemRegionSize(MEMREGION_APPLICATION) is the actual ceiling, and the gap between it
+	// and the linear heap is the honest answer to how much further the render distance can
+	// go. Printed as three regions because APPLICATION is the only one the game may spend,
+	// and quoting a total that includes SYSTEM and BASE would overstate it.
+	// APPLICATION came back size == used, free == 0, which is not "the console is full": the
+	// process claims its whole region at startup and then sub-divides it. So the split is what
+	// has to be printed, not the region total. envGetLinearHeapSize() and envGetHeapSize() are
+	// the two halves libctru carved out, and mallinfo's arena/fordblks say how much of the
+	// app-heap half has actually been touched. Anything in the region that neither half claims
+	// is memory the game paid for and cannot currently reach — which is the number that decides
+	// how much further the render distance can go.
+	const u32 app_size  = osGetMemRegionSize(MEMREGION_APPLICATION);
+	const u32 app_used  = osGetMemRegionUsed(MEMREGION_APPLICATION);
+	const u32 lin_size  = envGetLinearHeapSize();
+	const u32 heap_size = envGetHeapSize();
+	const struct mallinfo mi = mallinfo();
+
+	const int n = snprintf(report + len, MEMPROBE_REGION_TAIL,
+	                       "memory regions at end of boot\n"
+	                       "  APPLICATION  size %10lu used %10lu free %10lu\n"
+	                       "  SYSTEM       size %10lu\n"
+	                       "  BASE         size %10lu\n"
+	                       "  linear heap  size %10lu free %10lu\n"
+	                       "  app heap     size %10lu arena %10lu free-in-arena %10lu\n"
+	                       "  unclaimed by either heap %10ld\n"
+	                       "  vram         free %10lu\n",
+	                       (unsigned long)app_size, (unsigned long)app_used,
+	                       (unsigned long)(app_size - app_used),
+	                       (unsigned long)osGetMemRegionSize(MEMREGION_SYSTEM),
+	                       (unsigned long)osGetMemRegionSize(MEMREGION_BASE),
+	                       (unsigned long)lin_size, (unsigned long)linearSpaceFree(),
+	                       (unsigned long)heap_size, (unsigned long)mi.arena,
+	                       (unsigned long)mi.fordblks,
+	                       (long)app_size - (long)lin_size - (long)heap_size,
+	                       (unsigned long)vramSpaceFree());
+
+	// A short tail is still worth writing; a mangled one is not. Anything that did not fit is
+	// dropped rather than half-printed, and the table above is unaffected either way.
+	const size_t total = (n > 0 && n < MEMPROBE_REGION_TAIL)
+	                   ? (size_t)len + (size_t)n
+	                   : (size_t)len;
+	watchdogWriteFile(MEMPROBE_REL, report, total);
+}
+
 int main(void)
 {
 	// Step 8.5, first of everything. It only writes this thread's TLS exception slot — no
@@ -3059,6 +3198,18 @@ int main(void)
 	// runs before main(), which is the same reason the old APT_CheckNew3DS calls further
 	// down worked. See app/hw.h for why the clock is asked for here and not in app/sleep.c.
 	hwInit();
+
+	// The baseline, and taken here rather than at the top of main() on purpose: hwInit() is
+	// what asks a New 3DS for its 124 MB memory mode, so a reading taken before it would be
+	// the Old 3DS heap on both models and every cost below would be measured against the
+	// wrong ceiling.
+	//
+	// The linear and VRAM columns will both read 0 here and stay there until screenInit(),
+	// which is not a fault and is why the heap column exists — see memProbeBootMark. The
+	// mark is still taken, because the heap column IS meaningful this early and the two
+	// claims v1.8.5 is reclaiming are both made before graphics come up.
+	memProbeReset(&s_memprobe);
+	memProbeBootMark("boot");
 
 	// Before anything that could reach for crypto. libhydrogen's 3DS entropy
 	// source is PS_GenerateRandomBytes, and hydro_init() aborts the process
@@ -3080,8 +3231,20 @@ int main(void)
 	// applied it. Leaving a session clears it instead — see netDisconnect() in net/bsnet.c.
 	networldInit();
 
+	// v1.8.5: this mark used to justify itself by the 1.02 MB the pending block-diff store cost
+	// at boot whether or not the player ever opened Multiplayer. That is no longer true, and the
+	// note stays rather than being deleted because the mark's VALUE changed and a reader
+	// comparing against an older probe log needs to know why. The store is now allocated lazily
+	// on the first server packet that needs it and freed on leaving a session, so this mark
+	// should read about 1,064,976 bytes lighter than it did before — measured off .bss
+	// (1,725,944 → 660,968 in arm-none-eabi-size), not estimated. The mark is kept separate from
+	// the net stage precisely so that drop is visible here instead of being averaged into it.
+	// Not yet confirmed on a console: nothing has run the memprobe since the change.
+	memProbeBootMark("net+networld");
+
 	screenInit();
 	metricsInit();
+	memProbeBootMark("screenInit+metrics");
 
 #if BS_GPU_TESTS && BS_GPU_PREFLIGHT
 	// Before the title screen and before a world exists, so a console that fails one of these
@@ -3090,7 +3253,16 @@ int main(void)
 	gpuTestPreflight();
 #endif
 
-	if (!chunkRenderInit()) {
+	// Marked unconditionally, so the report has the same five rows in every build and a
+	// release build's row reads 0 rather than being absent. gputest.c holds 512 KB of linear
+	// scratch for the whole run in a preflight build; this is the row that will show whether
+	// that is really what it costs.
+	memProbeBootMark("gpuTestPreflight");
+
+	// v1.8.5. The mesh pool is claimed once and never resized, so it is sized for the widest
+	// radius this console will ever be OFFERED, not the radius selected now — which does not
+	// exist yet, because optionsLoad is still ~90 lines below. hwInit() has already run.
+	if (!chunkRenderInit(renderDistMaxFor(hwIsNew3ds()))) {
 		printf("\x1b[2;1Hshader/atlas/pool init FAILED\n");
 		printf("press START to exit\n");
 		while (aptMainLoop()) {
@@ -3102,6 +3274,15 @@ int main(void)
 		screenExit();
 		return 1;
 	}
+
+	// The row this whole probe was added for. chunkRenderInit claims all three mesh tier
+	// arenas at boot, sized from the COMPILE-TIME RENDER_DIST_MAX rather than from the
+	// radius the player has selected — so this number is what raising the ceiling would
+	// charge an Old 3DS whose owner never touches the slider. The formula says 9,199,616
+	// bytes at radius 3 (confirmed exactly by tests/mesh_pool_bytes_test.c). If the console
+	// disagrees, the console is right.
+	memProbeBootMark("chunkRenderInit");
+	memProbeBootFlush();
 
 	// Step 8.3. The GUI's batch and its font, brought up together because they are one
 	// thing in practice: spriteRect() samples the solid white texel that lives *inside*
@@ -4826,7 +5007,7 @@ session_start:
 					.world_budget = (uint32_t)budgetCap(),
 					.render_dist  = s_mesh_radius,
 					.dist_min     = RENDER_DIST_MIN,
-					.dist_max     = RENDER_DIST_MAX,
+					.dist_max     = renderDistMaxFor(hwIsNew3ds()),
 					.stereo       = s_stereo,
 				};
 				pauseMenuDraw(&pstats);
@@ -4847,7 +5028,7 @@ session_start:
 			} else if (s_debug_open) {
 				s_dctx.render_dist     = s_mesh_radius;
 				s_dctx.render_dist_min = RENDER_DIST_MIN;
-				s_dctx.render_dist_max = RENDER_DIST_MAX;
+				s_dctx.render_dist_max = renderDistMaxFor(hwIsNew3ds());
 				s_dctx.set_render_dist = bsDebugSetRenderDist;
 				s_dctx.frame_ms        = metricsFrameMs();
 				s_dctx.meshes          = chunkRenderMeshes();

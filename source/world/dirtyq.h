@@ -56,7 +56,30 @@
 // so it would compile, but source/world must not depend on source/scene — render_dist.h already
 // includes world/world.h, so it would put a cycle in the directory graph to save one line the
 // static assert already protects.
-#define DIRTYQ_MAX 392
+//
+// ── v1.8.5: 392 -> 968, ahead of the ceiling rather than behind it ────────────────────────
+//
+// 392 is the radius-3 ring: 49 columns x COLUMN_CHUNKS. 968 is the radius-5 ring: 121 columns x
+// COLUMN_CHUNKS, which is RENDER_DIST_MAX_NEW's ring and the largest pool the New 3DS's linear
+// heap can hold (46,948,352 of 67,108,864 bytes — see scene/render_dist.h and the gate in
+// tests/mesh_pool_bytes_test.c). It is raised NOW, while RENDER_DIST_MAX is still 3, precisely
+// because the failure recorded above is what happens when this constant is raised second: the
+// _Static_assert in scene/chunk_render.c's chunkRenderInit fires the moment MESH_SLOTS passes
+// this number, so the ceiling lift becomes a build error instead of a boot failure — but only
+// if somebody is there to fix it. Moving this first means the lift is a one-line change to
+// RENDER_DIST_MAX and nothing else.
+//
+// What it costs, and it is a real cost paid on BOTH consoles today, including the Old 3DS that
+// will never have a pool this wide: `marked` grows from 392 to 968 bytes, so sizeof(DirtyQ)
+// goes from 404 to 980 — +576 bytes of .bss, once, for the single static DirtyQ in
+// scene/chunk_render.c. That is the same trade the four slot-indexed tables in chunk_render.c
+// make (42,336 bytes between them): the arrays are cheap enough to size at the ceiling, and it
+// is the 37.7 MB of linearAlloc that had to become a runtime decision instead.
+//
+// dirtyqInit is still asked for the RUNTIME pool size, not for this number — see the
+// dirtyqInit call in chunkRenderInit. The flags past that capacity are never marked, never
+// scanned by dirtyqConsistent, and never handed to a drain.
+#define DIRTYQ_MAX 968
 
 typedef struct {
 	bool marked[DIRTYQ_MAX];

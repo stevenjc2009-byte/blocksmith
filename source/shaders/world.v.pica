@@ -69,9 +69,39 @@
 .alias  aoFloor aoMix.xxxx
 .alias  aoRange aoMix.yyyy
 
+; v1.9.0 distance fog. .x is texcoord per block, .y is the coordinate at zero distance, so
+; the fog coordinate is u = depth * .x + .y — an affine map of LINEAR eye-space depth onto
+; the 128-texel ramp on texture unit 1. .z and .w are unused. Filled by
+; scene/chunk_render.c's pipelineBind from fogShapeFor() (source/gfx/fogramp.c), which is
+; also where the whole design and its measurement live.
+;
+; This replaced the PICA200's fixed-function fog unit, which is a 128-entry LUT indexed by
+; 1/w: the knots bunch against the camera, the first one past the far plane sits at 20.6767
+; blocks with the near plane at its cap, and everything beyond it is one straight line — so
+; the fade could not be shaped past ~20.7 blocks at ANY render distance, and half_vis
+; saturated at 14.34 / 14.37 / 14.41 blocks for radius 3 / 4 / 5. Eye-space depth has no
+; knots in it.
+;
+; This file is COMPILED AND NEVER BOUND (see the note in scene/chunk_render.c), so nothing
+; the fog does here reaches a screen. It is mirrored anyway for exactly the reason uvScale is:
+; source/world/atlas_uv_shader_test.c parses the fog declarations and the fog instruction
+; block out of BOTH files and fails if they drift, and that guard is only worth having while
+; the two are actually kept identical.
+.fvec fogParams[1]
+
 .out outpos position
 .out outtc0 texcoord0
 .out outclr color
+
+; v1.9.0. The fog coordinate, on its own varying.
+;
+; It could NOT ride on the spare lanes of outtc0. `mov outtc0, r2.xyxy` does write z and w,
+; but texcoord0 is a TWO-component output semantic on this hardware — the assembler maps .x
+; and .y and the rasterizer never sees the other two, so those lanes are discarded rather
+; than spare. The only other route into texcoord0 is the separate `texcoord0w` semantic,
+; which feeds texture unit 0's third coordinate and cannot be sampled by unit 1 at all.
+; texcoord1 is unwritten everywhere else in the tree, so this costs nothing that was in use.
+.out outtc1 texcoord1
 
 .alias inpos v0
 .alias inpack v1
@@ -109,7 +139,16 @@
 	dp4 outpos.x, projection[0], r1
 	dp4 outpos.y, projection[1], r1
 	dp4 outpos.z, projection[2], r1
-	dp4 outpos.w, projection[3], r1
+
+	; w is kept in a temp on the way out, because it IS the fog distance and output registers
+	; are write-only. Row 3 of both projections this game builds is (0, 0, -1, 0) — MEASURED,
+	; arm-none-eabi-objdump on mtx_persptilt.o and mtx_perspstereotilt.o out of the shipped
+	; libcitro3d.a, both storing the constant 0xbf800000 into r[3].z and leaving the rest of
+	; the row at the memset zero — so this dot product is exactly -z_eye, i.e. the eye-space
+	; depth in blocks, positive in front of the camera. One extra instruction over the
+	; `dp4 outpos.w, ...` it replaces.
+	dp4 r7.w, projection[3], r1
+	mov outpos.w, r7.wwww
 
 	; --- texture coordinates ---------------------------------------------
 	; Atlas coords come in unnormalised because PICA byte attributes are not scaled.
@@ -119,6 +158,21 @@
 	; and multiply the normal index and ao into r2.zw, which the swizzle below throws away.
 	mul r2, uvScale, inpack
 	mov outtc0, r2.xyxy
+
+	; --- fog coordinate ----------------------------------------------------
+	; u = depth * fogParams.x + fogParams.y, on the linear eye-space depth held in r7.w.
+	; Deliberately NOT clamped here: gfx/fogtex.c sets GPU_CLAMP_TO_EDGE on the ramp, so the
+	; sampler does it for free at every fragment, which is both cheaper and more correct than
+	; clamping per vertex would be (a clamp before interpolation flattens the fade across a
+	; quad that straddles either end of the ramp).
+	;
+	; Uniforms sit in the first source, same constraint as world_dynamic.v.pica's light unpack.
+	;
+	; Both components of outtc1 get the same value. All 8 rows of the ramp are identical, so v
+	; is free; writing it from the same register costs one instruction instead of two.
+	mul r7.x, fogParams.xxxx, r7.wwww
+	add r7.x, fogParams.yyyy, r7.xxxx
+	mov outtc1, r7.xxxx
 
 	; --- baked lighting ---------------------------------------------------
 	; r3 was fetched at the top of main — see the note there for why, and for the v1.2.4

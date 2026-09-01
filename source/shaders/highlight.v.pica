@@ -14,13 +14,27 @@
 ;        block's own faces (see HL_MARGIN in highlight.c) — a value that small does not
 ;        survive an 8-bit attribute.
 
-.fvec projection[4], modelView[4]
+; v1.9.0 — DISTANCE FOG. Two callers share this one program (scene/highlight.c draws the
+; selection cage, scene/playermodel.c draws remote players), and they want opposite things
+; from it, so the fade is a uniform rather than a property of the shader:
+;
+;   playermodel.c  uploads the SAME (inv_range, bias) pair scene/chunk_render.c gives the
+;                  terrain, so a player fades into the sky on exactly the terrain's curve.
+;   highlight.c    uploads (0, 0), which drives the ramp coordinate to 0 at every vertex and
+;                  samples texel 0, which gfx/fogramp.c pins at exactly 0. The cage is a
+;                  selection indicator and must stay crisp at any reach distance.
+;
+; Uploading (0, 0) is a real instruction rather than a comment about the default: uniform
+; registers are global GPU state, so with no upload the cage would silently inherit whatever
+; the terrain pass last wrote and fog itself as the render distance changed.
+.fvec projection[4], modelView[4], fogParams[1]
 
 .constf consts(0.0, 1.0, 0.0, 0.0)
 .alias  ones consts.yyyy
 
 .out outpos position
 .out outclr color
+.out outtc1 texcoord1
 
 .alias inpos v0
 
@@ -36,7 +50,29 @@
 	dp4 outpos.x, projection[0], r1
 	dp4 outpos.y, projection[1], r1
 	dp4 outpos.z, projection[2], r1
-	dp4 outpos.w, projection[3], r1
+
+	; Clip w is captured into r7.w on the way out instead of being written straight to
+	; outpos.w, because output registers are WRITE-ONLY on the PICA200 and the fog block
+	; below has to read this value back. Row 3 of both Mtx_PerspTilt and Mtx_PerspStereoTilt
+	; is (0, 0, -1, 0) — measured with arm-none-eabi-objdump on the shipped libcitro3d.a,
+	; both storing 0xbf800000 into r[3].z with the rest of the row left at the memset zero —
+	; so this dp4 is -z_eye, i.e. positive linear distance from the camera in blocks.
+	;
+	; It must be eye-space Z and not a Euclidean length, for the same reason the terrain
+	; shader uses Z: Z is linear across a plane, so perspective-correct interpolation
+	; reconstructs it exactly at every fragment of a face, and a per-vertex sqrt() would
+	; flatten the fade toward the middle of a large one.
+	dp4 r7.w, projection[3], r1
+	mov outpos.w, r7.wwww
+
+	; --- fog coordinate ----------------------------------------------------
+	; u = depth * fogParams.x + fogParams.y, the same two-instruction form and the same
+	; uniform layout as source/shaders/world_dynamic.v.pica, so a player and the terrain
+	; behind them are shaded by one curve rather than by two that have to be kept in step.
+	; The uniform is the FIRST source operand in both because picasso only accepts it there.
+	mul r7.x, fogParams.xxxx, r7.wwww
+	add r7.x, fogParams.yyyy, r7.xxxx
+	mov outtc1, r7.xxxx
 
 	; Unused by TEV (constant-colour source), but left defined rather than omitted.
 	mov outclr, ones

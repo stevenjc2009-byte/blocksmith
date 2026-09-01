@@ -10,6 +10,7 @@
 #include <3ds.h>
 #include <citro3d.h>
 
+#include "scene/mesh_pool_sizing.h"
 #include "scene/render_dist.h"
 #include "world/water.h"
 #include "world/world.h"
@@ -18,9 +19,11 @@
 // no terrain produces; 2,048 faces is comfortably past a fully exposed chunk surface
 // (1,536) and keeps a slot at 88 KB. A chunk that will not fit is counted and skipped
 // rather than half-drawn.
-#define MESH_SLOT_FACES    2048
-#define MESH_SLOT_VERTS    (MESH_SLOT_FACES * 4)
-#define MESH_SLOT_INDICES  (MESH_SLOT_FACES * 6)
+//
+// MESH_SLOT_FACES/VERTS/INDICES themselves now live in scene/mesh_pool_sizing.h, included
+// above — that file is deliberately free of <3ds.h> so the host suite can size a pool
+// without pulling in this header's citro3d dependency. Nothing outside chunk_render.h/.c
+// refers to the three names, so there is exactly one definition of them, not two.
 
 // Step 9.2b: this is also the size of the ONE index buffer every slot now draws from — see
 // s_shared_indices in chunk_render.c. It used to size MESH_SLOTS separate linearAlloc's.
@@ -36,6 +39,24 @@
 // 65 KB in L) rather than 88 KB. The exact idle cost therefore depends on which tiers stay
 // empty; the pool's total is worked out in scene/render_dist.h. The benefit is that the
 // setting can move at any moment, on any model, without an allocation that can fail.
+//
+// ── v1.8.5: this is now the CEILING, not the pool ─────────────────────────────────────────
+//
+// Everything above still describes the *arrays*, and only the arrays. MESH_SLOTS is the
+// compile-time widest ring any console the binary runs on may select, and it sizes the four
+// plain-.bss tables in scene/chunk_render.c that are indexed by slot — s_slots, s_vis_list,
+// s_vis_depth (and, by columns rather than slots, s_hzn_cols). Those stay compile-time on
+// purpose: taking all four from the radius-3 ring to the radius-5 one costs 42,336 bytes of
+// FCRAM on both models, and making them dynamic would be a large refactor of the hottest file
+// in the renderer to save 41 KB.
+//
+// What is NO LONGER sized from this constant is the part that actually costs memory: the three
+// linearAlloc tier arenas. Those are 9,199,616 bytes at radius 3 and 46,948,352 at radius 5 —
+// and an Old 3DS has a 33,554,432-byte linear heap, so a pool sized at the compile-time
+// ceiling would stop an Old 3DS booting the moment the ceiling moved past 4. chunkRenderInit
+// now takes the radius to size for and claims arena for exactly that many slots; the slots
+// past it exist as .bss table entries with a NULL `verts` and are never handed out. See
+// chunkRenderInit below, and s_pool_slots in the .c.
 #define MESH_SLOTS         (RENDER_DIST_MAX_SLOTS)
 
 // The sky colour, in one place because step 6.4's fog has to be the same colour as the
@@ -49,7 +70,24 @@
 
 // Loads the shader, the atlas and the buffer pool. False if any of it failed. Leaves the
 // renderer at RENDER_DIST_MIN; main.c sets the console's default straight after.
-bool chunkRenderInit(void);
+//
+// v1.8.5. `max_radius` is the widest render distance THIS console will ever be allowed to
+// select — the per-model ceiling, not the player's current setting — and it is what the three
+// linearAlloc tier arenas are sized from. One int, passed in, for three reasons:
+//
+//   * the pool is claimed once and never resized (see the comment on MESH_SLOTS above and the
+//     one on s_shared_indices in the .c), so the number it needs is a ceiling and not a
+//     setting. Sizing from the player's selection would mean re-allocating on a slider press,
+//     which is exactly the linear-heap churn the pool exists to avoid.
+//   * main.c calls this BEFORE it loads options.ini, so the selection does not exist yet.
+//     The model does: hwInit() has already run.
+//   * the per-model ceiling is scene/render_dist.h's policy, not this file's. Taking the
+//     answer rather than a `bool new_3ds` keeps the renderer out of that decision, and keeps
+//     this function callable at any radius by a test.
+//
+// Clamped into [RENDER_DIST_MIN, RENDER_DIST_MAX] and then into what the .bss tables can
+// index, so a wrong argument costs memory or draw distance — never a write past an array.
+bool chunkRenderInit(int max_radius);
 void chunkRenderExit(void);
 
 // Step 7.7. Sets the render distance, in columns, and rebuilds the two things that are
@@ -135,7 +173,9 @@ int chunkRenderTouch(const World* w, int x, int y, int z);
 // force the queue empty in a single call — chunkRenderChecksum() needs this, since it
 // compares an incrementally remeshed pool against a fully rebuilt one and a straggling dirty
 // chunk would make them disagree for a reason that has nothing to do with a real bug — call
-// with a large budget and MESH_SLOTS, which is every slot the pool has.
+// with a large budget and MESH_SLOTS, which is at least every slot the pool has (v1.8.5: the
+// pool may be narrower than the compile-time ceiling, so MESH_SLOTS is now an upper bound on
+// the slot count rather than exactly it — which is all this cap needs it to be).
 int chunkRenderDrainDirty(const World* w, float budget_ms, int max_chunks);
 
 int  chunkRenderDirtyCount(void);      // chunks still waiting to be remeshed

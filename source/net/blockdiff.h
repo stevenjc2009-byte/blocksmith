@@ -14,11 +14,19 @@
 // through a caller-supplied callback, so whoever owns the World (menu/scene code, not this
 // module) decides how and when to call worldSet() with them.
 //
-// Bounded and array-backed on purpose, with no heap use at all. Remote input drives this
-// store — a buggy or hostile peer must not be able to queue diffs forever and eat into the
-// 12 MB world budget (world/budget.h) with nothing on screen to show for it. See
-// BLOCKDIFF_MAX_PENDING and blockdiffRecord() below for the fixed cap and what happens when
-// it is hit.
+// Bounded and array-backed on purpose, and this module allocates nothing itself: a
+// BlockDiffStore is one flat object of a fixed size that the caller places wherever it likes,
+// and record() never grows it. Remote input drives this store — a buggy or hostile peer must
+// not be able to queue diffs forever and eat into the 12 MB world budget (world/budget.h) with
+// nothing on screen to show for it. See BLOCKDIFF_MAX_PENDING and blockdiffRecord() below for
+// the fixed cap and what happens when it is hit.
+//
+// WHERE the object lives is the caller's business and changed in v1.8.5: net/networld.c's
+// s_pending used to be a static, and is now one malloc made the first time a server packet
+// needs to queue an edit, so single player pays nothing. That is why the paragraph below says
+// "of RAM" and not "of static RAM", and why blockdiffInit() must not assume it is being handed
+// zeroed memory — see blockdiffClear() in blockdiff.c, and blockdiff_test.c's
+// test_uninitialised_memory_is_safe, which drives a store inited over deliberate 0xAA garbage.
 #pragma once
 
 #include <stdbool.h>
@@ -68,7 +76,7 @@
 // writing NOTHING outside the test suites reads either. The store is loud; the client is deaf.
 // See this header's note on blockdiffRefusals() below.
 //
-// Cost: 65536 * sizeof(BlockDiffEntry) = 1048576 bytes (1 MB) of static RAM, plus the
+// Cost: 65536 * sizeof(BlockDiffEntry) = 1048576 bytes (1 MB) of RAM, plus the
 // BLOCKDIFF_BUCKETS index below; the whole BlockDiffStore measures 1064976 bytes (1.02 MB).
 // That size is only affordable because record() and drain() no longer scan the whole array —
 // see the chaining fields on BlockDiffEntry.
@@ -129,11 +137,17 @@ typedef struct {
 	int      refusals;     // record() calls turned away because the store was full
 } BlockDiffStore;
 
+// Puts a store into its empty state. `s` may point at completely uninitialised memory — this
+// is called on a fresh malloc (net/networld.c's pendingStore()), so it must not depend on any
+// field arriving zeroed. blockdiffClear() sets every scalar the rest of this module reads;
+// blockdiff_test.c's test_uninitialised_memory_is_safe is what holds that true.
 void blockdiffInit(BlockDiffStore* s);
 
-// No heap resources today, so this only zeroes the store. Kept as its own call — matching
-// worldInit()/worldExit()'s pairing — so a future change to how entries are backed does not
-// have to go find every call site.
+// Releases whatever the store itself owns, which is nothing: entries are inside the object.
+// It does NOT free the object — the caller owns that, and since v1.8.5 net/networld.c's copy
+// is a malloc, so pendingDestroy() there calls this and then free(). Kept as its own call —
+// matching worldInit()/worldExit()'s pairing — so a future change to how entries are backed
+// does not have to go find every call site.
 void blockdiffFree(BlockDiffStore* s);
 
 // Records a remote edit at world block (x, y, z). If a pending diff already targets that

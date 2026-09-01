@@ -33,9 +33,21 @@
 //
 // Bounded by construction rather than by hope: only a column that is already loaded can be
 // pushed (net/networld.c's applyOrQueue refuses to apply an edit to a column that is not
-// there), and the render distance caps loaded columns at RENDER_DIST_MAX_COLUMNS = 49. The
+// there), and the render distance caps loaded columns at RENDER_DIST_MAX_COLUMNS. The
 // capacity below is above that with room to spare. A push that overflows anyway returns
 // false and the caller relights inline exactly as it did before — slow, never wrong.
+//
+// v1.8.5: 64 -> 128, because RENDER_DIST_MAX moved 3 -> 5 and the ring went 49 -> 121 columns.
+// 64 no longer cleared the structural bound. This is the ONE capacity in the project that
+// caught its own staleness — world_test.c's `CHECK(RELIGHTQ_CAP >= RENDER_DIST_MAX_COLUMNS)`
+// went red the moment the ceiling moved, which is exactly what world/jobq.h's JOBQ_CAP did NOT
+// do (it had no assert, compiled clean, and would have silently dropped mesh jobs; it now has
+// one, in main.c beside genQueueReadyColumns). Cost of the lift: the struct is two int16 arrays,
+// so 64 more entries is 256 bytes.
+//
+// Overflow here is graceful and always was — worth restating, because it is why 128 rather than
+// some larger number with a comfort margin is the right size: 121 is a hard structural ceiling,
+// not a busy-case estimate, so nothing can ever ask for a 122nd column.
 //
 // No <3ds.h>: host-testable like the rest of source/world, and the same shape as the
 // worklists already here (dirtyq.h, jobq.h, meshq.h).
@@ -44,7 +56,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define RELIGHTQ_CAP 64
+#define RELIGHTQ_CAP 128
 
 typedef struct {
 	int16_t cx[RELIGHTQ_CAP];

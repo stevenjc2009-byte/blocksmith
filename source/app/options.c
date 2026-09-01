@@ -6,9 +6,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "app/hw.h"
+
 // Nothing in here includes <3ds.h>. Same reasoning as world/region.c: the SD card is a
 // devoptab mounted at "sdmc:/", so plain fopen/fgets/fwrite reach it on console exactly as
 // they reach a host temp directory in the test build — see options.h's file comment.
+//
+// v1.8.5: app/hw.h above does not break that. It is the cached-answer seam, not libctru — it
+// has no <3ds.h> in its interface and carries an explicit host-only setter (hwSetNew3dsForTest)
+// so options_test.c can drive both consoles. It is needed because the render_dist clamp is now
+// per-console.
 
 const uint32_t OPTIONS_VALID_KEYS[OPTIONS_VALID_KEY_COUNT] = {
 	OPT_KEY_A, OPT_KEY_X, OPT_KEY_Y,
@@ -274,7 +281,10 @@ bool optionsLoad(Options* o, const char* path, int* bad_keys_out)
 			matched = true;
 			long v;
 			if (parseInt(val, &v))
-				o->render_dist = clampLongToInt(v, RENDER_DIST_MIN, RENDER_DIST_MAX);
+				// v1.8.5: an ini carried over from a New 3DS must not hand an Old 3DS a
+				// radius its mesh pool was never sized for.
+				o->render_dist = clampLongToInt(v, RENDER_DIST_MIN,
+				                                renderDistMaxFor(hwIsNew3ds()));
 			else
 				bad++;
 		} else if (!strcmp(key, "slider_3d")) {

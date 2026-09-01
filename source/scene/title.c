@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "app/hw.h"           // v1.8.5: the render-distance stepper's ceiling is per-console
 #include "app/updater.h"
 #include "app/updater_retry.h"
 #include "gfx/font.h"
@@ -541,8 +542,10 @@ static void drawOptionsGeneral(TitleState* ts, Options* opts, const TitleInput* 
 	snprintf(buf, sizeof(buf), "%d", opts->render_dist);
 	step = settingRowStepper(optRowRect(0), "RENDER DIST", buf, ts->cursor == 0,
 	                          tap, in->touch_x, in->touch_y, left, right);
-	if (step) opts->render_dist = clampInt(opts->render_dist + step,
-	                                        RENDER_DIST_MIN, RENDER_DIST_MAX);
+	// v1.8.5: per-console ceiling. Without this the stepper refuses at 3 on a New 3DS while
+	// the pause-menu slider and the ini clamp both allow 5 — the setting would look raisable
+	// in one place and silently refuse in another.
+	if (step) opts->render_dist = renderDistClampFor(opts->render_dist + step, hwIsNew3ds());
 
 	snprintf(buf, sizeof(buf), "%.1f", (double)opts->slider_3d);
 	step = settingRowStepper(optRowRect(1), "3D DEPTH", buf, ts->cursor == 1,

@@ -2,7 +2,10 @@
 
 #include <string.h>
 
-// Fixed capacity, no heap use — see blockdiff.h for why.
+// Fixed capacity, and this module allocates nothing — see blockdiff.h for why. The one store
+// the console runs is malloc'd by its owner (net/networld.c's pendingStore()) rather than
+// static since v1.8.5, which is why blockdiffClear() below has to write every scalar it reads:
+// it can be handed memory that has never been zeroed.
 //
 // Every entry lives in exactly one singly-linked chain, threaded through BlockDiffEntry.next:
 // either the chain for the column-hash bucket its coordinate falls in, or the free list. That
@@ -41,6 +44,13 @@ void blockdiffClear(BlockDiffStore* s)
 	// does NOT touch s->entry: that is 1 MB, and with every chain head reset and high_water
 	// back to zero, nothing in it is reachable. Whatever bytes are left there are re-written
 	// before they can be read, by the field-by-field fill in blockdiffRecord().
+	//
+	// That "whatever bytes are left there" became load-bearing in v1.8.5: the store is now a
+	// malloc (net/networld.c), so on the first init those bytes are not the zeros .bss used to
+	// hand over, they are whatever the allocator last had. The five scalars below are therefore
+	// an exhaustive list, not a convenience — every field anything reads before writing has to
+	// be one of them. blockdiff_test.c's test_uninitialised_memory_is_safe fills a store with
+	// 0xAA and drives it, so dropping one of these goes red instead of shipping.
 	memset(s->bucket, 0xFF, sizeof s->bucket);
 
 	s->free_head  = BLOCKDIFF_NIL;
