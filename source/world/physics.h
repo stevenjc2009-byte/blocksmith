@@ -113,6 +113,37 @@
 #define PLAYER_WATER_VDRAG       6.0f
 #define PLAYER_WET_HYSTERESIS    0.25f
 
+// v1.8.3 — the surface swell, and it is CAMERA ONLY.
+//
+// Reported as: "I said to remove bobbing up and down on top of the water, but I want you to
+// add it back but way calmer, similar to how actual Minecraft does it."
+//
+// Two separate things were asked for in that sentence and they are answered in two separate
+// places. The FUNCTION of the bob — being able to get out of the water — is not a bob at
+// all, it is a climb, and it lives in physics.c's trySwimUp. What is left is the LOOK of
+// floating, and that is this.
+//
+// The bob v1.8.2 removed was a physics limit cycle: 0.223 blocks at 4.4 Hz, the BODY
+// oscillating because three individually correct rules met badly, and its worst symptom was
+// the water plane strobing through the camera. Putting a bob back into the body would put
+// that whole failure mode back with it. So this one is not in the body: it is an offset
+// added to the eye after the physics has finished. It cannot move the box, cannot affect
+// collision, cannot creep, and cannot form a loop with anything, because nothing reads it.
+//
+//   SURFACE_BOB       blocks, peak offset — 5.5 cm up and the same down. The resting float
+//                     leaves the eye 0.485 blocks clear of the water, so the trough still
+//                     has nearly nine times the amplitude in hand and the swell can never
+//                     dip the camera under the surface. That margin is the point: dipping
+//                     it is exactly the strobe this file spent v1.8.2 removing.
+//   SURFACE_BOB_RATE  cycles per second. 0.35 Hz is one slow swell every 2.9 seconds,
+//                     against 4.4 Hz for the bob that was taken out. "Way calmer" is a
+//                     twelfth of the frequency at a quarter of the amplitude.
+//   SURFACE_BOB_FADE  1/s. How fast the swell arrives on entering the water and leaves on
+//                     climbing out, so neither transition snaps the view.
+#define PLAYER_SURFACE_BOB       0.055f
+#define PLAYER_SURFACE_BOB_RATE  0.35f
+#define PLAYER_SURFACE_BOB_FADE  3.0f
+
 // There is deliberately no step-height constant. Auto-step is a flat one-block rise
 // gated by a headroom probe, because every block in this game is a full 1.0 cube and
 // there is nothing shorter to measure a sub-block threshold against. See tryStepUp in
@@ -248,3 +279,17 @@ float bodyWalkSpeed(bool submerged);
 // (hidKeysDown), `jump_held` the level (hidKeysHeld), and `dt_s` the same frame time
 // bodyStep is about to be handed — the water branch is rate-based, so it needs it.
 void bodyJump(Body* b, BodyWet wet, bool jump_held, bool jump_pressed, float dt_s);
+
+// The camera's vertical offset for one frame, in blocks — the surface swell described above
+// the three PLAYER_SURFACE_BOB_* constants. Returns the offset and advances the two floats
+// it is handed.
+//
+// The state is the CALLER's (scene/player.h's Player carries it), not Body's, and that is
+// the whole design: a physics body must not carry a view effect, or something will
+// eventually read it and the offset will stop being cosmetic. Nothing in world/ reads these
+// two floats but this function.
+//
+// Kept in this file rather than in scene/player.c even though it is a view effect, for the
+// reason stated on bodyWalkSpeed: player.c includes <3ds.h>, cannot be linked into the host
+// suite, and a rule left there is a rule nothing checks.
+float bodySurfaceBob(BodyWet wet, float dt_s, float* phase, float* envelope);

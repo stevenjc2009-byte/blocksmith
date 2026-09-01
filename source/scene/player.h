@@ -26,6 +26,13 @@
 typedef struct {
 	Body   body;   // feet position, in blocks
 	Camera cam;    // position derived from the body; yaw and pitch owned here
+
+	// v1.8.3 — the surface swell's two floats, owned here rather than by Body so that a
+	// view effect can never be mistaken for physics state. Both are advanced by, and only
+	// meaningful to, world/physics.c's bodySurfaceBob; see the PLAYER_SURFACE_BOB_*
+	// constants for what they are and why the effect is not in the body.
+	float  bob_phase;
+	float  bob_env;
 } Player;
 
 // Places the feet at (x,y,z) and points the camera at the given yaw and pitch.

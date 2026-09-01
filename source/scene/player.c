@@ -16,6 +16,9 @@ void playerInit(Player* p, float x, float y, float z, float yaw, float pitch)
 {
 	bodyInit(&p->body, x, y, z);
 
+	p->bob_phase = 0.0f;
+	p->bob_env   = 0.0f;
+
 	cameraInit(&p->cam);
 	p->cam.yaw   = yaw;
 	p->cam.pitch = pitch;
@@ -92,7 +95,14 @@ void playerUpdate(Player* p, const World* w, float dt_ms)
 
 	bodyStep(&p->body, w, dt);
 
+	// v1.8.3 — the surface swell. Added to the eye AFTER the step, and read back by
+	// nothing: the body is where the physics left it, and this is the only line in the
+	// game that knows the camera is a few centimetres off it. p->body.wet rather than the
+	// `wet` above, because bodyStep has just re-answered the question at the position the
+	// body actually ended the frame at.
+	const float bob = bodySurfaceBob(p->body.wet, dt, &p->bob_phase, &p->bob_env);
+
 	p->cam.x = p->body.x;
-	p->cam.y = p->body.y + PLAYER_EYE;
+	p->cam.y = p->body.y + PLAYER_EYE + bob;
 	p->cam.z = p->body.z;
 }

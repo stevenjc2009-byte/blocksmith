@@ -188,18 +188,75 @@ static bool resolveZ(Body* b, const World* w, float dz)
 // than one block, this is where a real height comparison belongs: the rise would become
 // "however tall the obstruction actually is, up to some threshold" instead of a flat 1.0,
 // and that threshold is the constant to introduce at that point -- not before.
-// There is no swim or sneak state in the game yet. When they arrive, the line below is
-// the one place they belong: sneaking suppresses the step entirely (the player is
-// deliberately moving carefully, and a sneaking player who auto-climbed would be
-// astonished), and swimming replaces it rather than gating it, because a swimmer rises by
-// buoyancy through water that is not solid here at all and so never reaches this code.
-// Both are one more term on this same condition -- deliberately NOT built ahead of the
-// states themselves, which would be a guess about fields that do not exist.
+// There is no sneak state in the game yet. When it arrives, the line below is the one
+// place it belongs: sneaking suppresses the step entirely, because a sneaking player is
+// deliberately moving carefully and one that auto-climbed would be astonished. That is one
+// more term on this same condition -- deliberately NOT built ahead of the state itself,
+// which would be a guess about a field that does not exist.
+//
+// Swimming was the other half of that note and it has since arrived. It did NOT become a
+// term on this condition: a swimmer does not step, he pulls himself up onto the waterline,
+// which is a different distance and a different rule. See trySwimUp below.
 static bool tryStepUp(Body* b, const World* w, float target_x, float target_z)
 {
 	if (!b->on_ground) return false;   // must never fire mid-air
 
 	const float step_y = b->y + 1.0f;
+	if (bodyBlocked(w, target_x, step_y, target_z)) return false;
+
+	b->x = target_x;
+	b->y = step_y;
+	b->z = target_z;
+	return true;
+}
+
+// v1.8.3 — the swimmer's climb, and the reason the comment above says swimming "replaces"
+// the step rather than gating it.
+//
+// tryStepUp refuses outright unless b->on_ground, which is right for a walker and left a
+// swimmer with no way out of a lake at all. A body floating at the waterline settles with
+// its feet 1.135 blocks BELOW the shore -- the top water cell is under it, and the bank at
+// sea level has its top face on the water plane -- so pressing into the bank simply zeroed
+// vx, every frame, forever. Reported as "I am unable to leave the water".
+//
+// Deliberately NOT a flat one-block rise like the walker's. The gap between a floating
+// body's feet and the waterline is not a whole number and is not even a constant: it falls
+// out of PLAYER_WET_HYSTERESIS plus however far the body coasted on arrival, and it
+// measures 11.865 at 60 fps against 11.894 at 30. A flat +1.0 from either of those lands
+// INSIDE the bank and is refused by the headroom probe, so the fix would not have worked
+// at any frame rate.
+//
+// So the target is found, not assumed: walk up from the feet to the first non-liquid cell
+// and stand on its floor, which is the water plane by definition. That makes the rule the
+// player's own -- "you can pull yourself onto anything level with the water" -- rather
+// than a number, and it is self-limiting in the direction that matters, because a bank a
+// block PROUD of the water still has its own block sitting in the way and bodyBlocked
+// refuses the lift exactly as it refuses a walker's two-block step.
+//
+// The three-cell bound is what stops a body under a waterfall, or one swimming up a
+// flooded shaft, from finding a surface far overhead and teleporting to it. Two cells is
+// all a legitimate float ever needs; the third is slack.
+static bool trySwimUp(Body* b, const World* w, float target_x, float target_z)
+{
+	// Feet in liquid, eyes in air. A submerged body must NOT get this -- otherwise a
+	// diver pressed against a cliff would climb it a block at a time -- and a dry one
+	// already has tryStepUp.
+	if (b->wet != BODY_SURFACE) return false;
+
+	const int bx = floorToInt(b->x);
+	const int bz = floorToInt(b->z);
+
+	int cy   = floorToInt(b->y);
+	int lift = 0;
+	while (lift < 3 && blockInfo(worldGet(w, bx, cy, bz))->liquid) { cy++; lift++; }
+
+	// lift == 0: the feet cell was not liquid after all, so there is nothing to climb out
+	// of. lift == 3: the loop ran out of slack without finding air, which is a column of
+	// water taller than any float, i.e. not a shoreline.
+	if (lift == 0 || lift >= 3) return false;
+
+	const float step_y = (float)cy;
+	if (step_y <= b->y) return false;
 	if (bodyBlocked(w, target_x, step_y, target_z)) return false;
 
 	b->x = target_x;
@@ -245,7 +302,8 @@ int bodyMove(Body* b, const World* w, float dx, float dy, float dz)
 
 		const float pre_x = b->x;
 		bool blocked_x = resolveX(b, w, sx);
-		if (blocked_x && tryStepUp(b, w, pre_x + sx, b->z)) {
+		if (blocked_x && (tryStepUp(b, w, pre_x + sx, b->z)
+		                  || trySwimUp(b, w, pre_x + sx, b->z))) {
 			blocked_x = false;
 			stepped   = true;
 		}
@@ -253,7 +311,9 @@ int bodyMove(Body* b, const World* w, float dx, float dy, float dz)
 
 		const float pre_z = b->z;
 		bool blocked_z = resolveZ(b, w, sz);
-		if (blocked_z && !stepped && tryStepUp(b, w, b->x, pre_z + sz)) blocked_z = false;
+		if (blocked_z && !stepped && (tryStepUp(b, w, b->x, pre_z + sz)
+		                              || trySwimUp(b, w, b->x, pre_z + sz)))
+			blocked_z = false;
 		if (blocked_z) { b->vz = 0.0f; blocked |= BLOCKED_Z; }
 	}
 
@@ -334,6 +394,39 @@ static float dampAlpha(float rate, float dt_s)
 float bodyWalkSpeed(bool submerged)
 {
 	return submerged ? PLAYER_WALK_SPEED * PLAYER_WATER_SPEED_MUL : PLAYER_WALK_SPEED;
+}
+
+// A smooth bipolar wave over one cycle, without <math.h> — see the note at the top of this
+// file for why there is no sinf here to call.
+//
+// A triangle folded out of the phase, then a cubic that rounds its corners off. The cubic
+// is x * (1.5 - 0.5 * x*x), which is the standard cheap stand-in for sin(pi/2 * x): exact at
+// -1, 0 and +1, and 0.6875 against a true 0.7071 at the quarter point. That worst error,
+// 0.02, lands on an amplitude of 0.055 blocks and is therefore about one millimetre of
+// camera. Nothing here is a measurement, so a millimetre of shape error costs nothing; the
+// alternative was linking libm into source/world, which costs the host suite its
+// independence from the ARM11's float behaviour.
+static float bobWave(float t)
+{
+	float tri = 4.0f * t - 1.0f;             // t 0..1 -> -1..3
+	if (tri > 1.0f) tri = 2.0f - tri;        // fold the top half back down: 1..3 -> 1..-1
+	return tri * (1.5f - 0.5f * tri * tri);
+}
+
+float bodySurfaceBob(BodyWet wet, float dt_s, float* phase, float* envelope)
+{
+	// Only at the waterline. A submerged body is not floating on anything, and a dry one is
+	// walking; both fade the swell out rather than dropping it, or the eye would step by up
+	// to 5.5 cm on the frame the state changed.
+	const float target = (wet == BODY_SURFACE) ? 1.0f : 0.0f;
+	*envelope += (target - *envelope) * dampAlpha(PLAYER_SURFACE_BOB_FADE, dt_s);
+
+	// Advanced unconditionally, so the swell has no memory of where it was interrupted and
+	// two entries into the same lake do not look identical.
+	*phase += PLAYER_SURFACE_BOB_RATE * dt_s;
+	while (*phase >= 1.0f) *phase -= 1.0f;
+
+	return bobWave(*phase) * PLAYER_SURFACE_BOB * *envelope;
 }
 
 void bodyJump(Body* b, BodyWet wet, bool jump_held, bool jump_pressed, float dt_s)

@@ -14,6 +14,7 @@
 #ifndef __3DS__
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -129,6 +130,60 @@ static void testChargingRoundTrip(void)
 	CHECK(!batteryCharging());
 }
 
+// v1.8.3 — the critical gauge blinks. Asked for as "whenever it gets low on, like, one
+// bar, it should start blinking", and the whole cadence lives in batteryBlinkOn() rather
+// than in batteryDraw() so that this file can hold it to account; the drawing half is
+// behind __3DS__ and nothing here can link it.
+static void testBlink(void)
+{
+	// A healthy battery is lit at every instant of the cycle. Not "mostly lit" — the
+	// caller applies this unconditionally, so a single dark millisecond at level 5 would
+	// be a gauge that flickers on a full console.
+	setReading(5, false);
+	for (uint64_t t = 0; t < 2000; t += 7) CHECK(batteryBlinkOn(t));
+
+	setReading(2, false);
+	CHECK(batteryBlinkOn(0));
+	CHECK(batteryBlinkOn(800));
+
+	// One bar, on battery: on for the first BATTERY_BLINK_ON_MS of each period, off for
+	// the rest of it, and the same in the second period as in the first.
+	setReading(1, false);
+	CHECK(batteryBlinkOn(0));
+	CHECK(batteryBlinkOn(BATTERY_BLINK_ON_MS - 1));
+	CHECK(!batteryBlinkOn(BATTERY_BLINK_ON_MS));
+	CHECK(!batteryBlinkOn(BATTERY_BLINK_PERIOD_MS - 1));
+	CHECK(batteryBlinkOn(BATTERY_BLINK_PERIOD_MS));
+	CHECK(!batteryBlinkOn(BATTERY_BLINK_PERIOD_MS + BATTERY_BLINK_ON_MS));
+
+	// It really does spend time in both states rather than passing the boundary checks by
+	// being stuck near one of them. Over two whole periods the duty must come out at
+	// BATTERY_BLINK_ON_MS in BATTERY_BLINK_PERIOD_MS, exactly.
+	{
+		int on = 0;
+		for (uint64_t t = 0; t < 2 * BATTERY_BLINK_PERIOD_MS; t++)
+			if (batteryBlinkOn(t)) on++;
+		CHECK(on == 2 * BATTERY_BLINK_ON_MS);
+	}
+
+	// Empty is critical too, and it is the case the warning matters most in. batteryDraw
+	// dims the outline for it, because at zero bars there is nothing else to hide.
+	setReading(0, false);
+	CHECK(batteryBlinkOn(0));
+	CHECK(!batteryBlinkOn(BATTERY_BLINK_ON_MS));
+
+	// On the charger, a low battery is not a warning and must not blink.
+	setReading(1, true);
+	for (uint64_t t = 0; t < 2000; t += 7) CHECK(batteryBlinkOn(t));
+
+	// And neither must a reading nobody can trust: BATTERY_LEVEL_UNKNOWN satisfies
+	// "level <= 1", so a blink that tested the level itself would strobe the gauge on a
+	// full console whose PTM:U failed to open. Gating on batteryLow() is what prevents it.
+	batteryApplyReading(0, false, false);
+	CHECK(!batteryLow());
+	for (uint64_t t = 0; t < 2000; t += 7) CHECK(batteryBlinkOn(t));
+}
+
 int main(void)
 {
 	testBarMapping();
@@ -137,6 +192,7 @@ int main(void)
 	testEdgeCases();
 	testUnknownState();
 	testChargingRoundTrip();
+	testBlink();
 
 	printf("battery bar mapping: %s\n",
 	       s_fails ? "FAILED" : "PASS");

@@ -46,6 +46,33 @@ int batteryBars(void);
 // than no warning, and BATTERY_LEVEL_UNKNOWN would otherwise satisfy "level <= 1".
 bool batteryLow(void);
 
+// ── v1.8.3: the critical gauge blinks ───────────────────────────────────────────────────
+//
+// Asked for as "the battery indicator, whenever it gets low on, like, one bar, it should
+// start blinking". One bar is level 1, and batteryLow() already means exactly "level <= 1,
+// on battery, and the reading is trustworthy" — so the blink is gated on that rather than
+// on a second, nearly identical predicate that would be free to drift away from it.
+//
+// Level 0 has no bar left to hide, so batteryDraw dims the OUTLINE on the off phase as
+// well. An empty battery therefore still pulses, which is the case the warning matters
+// most in.
+//
+// One second a cycle, lit for the first 600 ms of it. Slow enough to read as a warning
+// rather than as a fault or a dropped frame, and a whole multiple of battery.c's 1000 ms
+// poll interval so the blink cannot beat against its own data.
+#define BATTERY_BLINK_PERIOD_MS 1000
+#define BATTERY_BLINK_ON_MS      600
+
+// True when the gauge should be lit this instant, given a free-running millisecond clock.
+// ALWAYS true unless batteryLow() is: a healthy gauge does not blink, so every caller can
+// apply this unconditionally instead of asking the same question twice.
+//
+// Pure, and public for the same reason batteryBars() is. The console half of battery.c
+// cannot be linked into the host suite, so a cadence decided inside batteryDraw would be a
+// decision nothing checks — the exact defect the v1.6.0 note at the top of battery.c
+// describes.
+bool batteryBlinkOn(uint64_t now_ms);
+
 // ── PTM:U service and rendering — console build only ────────────────────────────────────
 #ifdef __3DS__
 

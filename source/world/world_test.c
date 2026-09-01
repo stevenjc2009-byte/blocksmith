@@ -4592,6 +4592,222 @@ static void testSurfaceSwim(void)
 	worldExit(&s_world);
 }
 
+// v1.8.3 — GETTING OUT AGAIN, which is the half of the waterline testSurfaceSwim above
+// never asked about.
+//
+// Reported as: "I said to remove bobbing up and down on top of the water, but I want you
+// to add it back but way calmer, similar to how actual Minecraft does it in the sense
+// that I can bob to get out of the water. because as of right now, I am unable to leave
+// the water."
+//
+// He is not asking for a cosmetic bob. He is describing the bob BY ITS FUNCTION — it is
+// the thing that lifts you onto the bank — and reporting that without it the water is a
+// trap. Both halves of that were true, and for two separate reasons:
+//
+//   * PLAYER_SURFACE_RISE was 0.0, so holding the swim button at the surface held the
+//     body at eye level and never lifted it any further. The float settled with its feet
+//     at y 11.865 under a shoreline whose top face is y 13.0, so the feet were 1.135
+//     blocks BELOW the ground they needed to stand on and nothing could raise them.
+//   * tryStepUp refuses outright unless b->on_ground, and a floating body is not on the
+//     ground, so the one-block auto-climb that gets a walker over a kerb never fired for
+//     a swimmer at all. Pressed against the bank the body simply had vx zeroed, every
+//     frame, forever.
+//
+// This fixture is the shoreline of a real generated world: water to x < 8, solid ground
+// from x >= 8 whose top face is the water plane exactly, which is what sea level means.
+// The success criterion is the player's, not the code's — hold swim, swim at the shore,
+// end up standing on it.
+static void testSwimOutOfWater(void)
+{
+	const float dt = 1.0f / 60.0f;
+
+	worldInit(&s_world);
+	for (int x = 0; x < 16; x++)
+		for (int z = 0; z < 16; z++)
+			CHECK_QUIET(worldSet(&s_world, x, 3, z, BLOCK_STONE));
+	// Water y 4..12 over x < 8, so the surface plane is y = 13.0.
+	for (int y = 4; y <= 12; y++)
+		for (int x = 0; x < 8; x++)
+			for (int z = 0; z < 16; z++)
+				CHECK_QUIET(worldSet(&s_world, x, y, z, BLOCK_WATER));
+	// The bank, filled to the same plane: the top face of the y=12 stone is y = 13.0.
+	for (int y = 4; y <= 12; y++)
+		for (int x = 8; x < 16; x++)
+			for (int z = 0; z < 16; z++)
+				CHECK_QUIET(worldSet(&s_world, x, y, z, BLOCK_STONE));
+
+	// Five seconds of held swim from the lake bed, which is enough for testSurfaceSwim's
+	// run to have arrived and settled.
+	Body b; bodyInit(&b, 4.5f, 4.5f, 4.5f);
+	for (int i = 0; i < 300; i++) {
+		bodyJump(&b, bodyWetUpdate(&s_world, &b), true, i == 0, dt);
+		bodyStep(&b, &s_world, dt);
+	}
+	// Control, green in every arm: the body did leave the lake bed. If this goes red the
+	// fixture is broken and nothing below it means anything.
+	CHECK(b.y > 8.0f);
+	const float floated_y = b.y;
+
+	// Now swim at the shore with the button still held, five more seconds. vx is re-set
+	// every frame because bodyMove zeroes it on a blocked axis, which is what scene/player.c
+	// does too — a test that set it once would measure one frame of walking and then a
+	// stationary body no matter what the physics did.
+	for (int i = 0; i < 300; i++) {
+		b.vx = bodyWalkSpeed(true);
+		bodyJump(&b, bodyWetUpdate(&s_world, &b), true, false, dt);
+		bodyStep(&b, &s_world, dt);
+	}
+
+	CHECK(b.x > 8.0f);              // past the waterline, over the bank
+	CHECK(b.on_ground == true);     // and standing on it, not treading water against it
+	CHECK(b.y > 12.9f && b.y < 13.1f);
+	CHECK(bodyWetState(&s_world, &b) == BODY_DRY);
+
+	// The rise that carries him out is a rise, not a launch: the body must not be thrown
+	// clear of the lake the way v1.8.1 threw it. Measured against where it floated.
+	CHECK(b.y - floated_y < 2.0f);
+
+	// Second arm: the same hold with NO shore to reach. Open water must still float the
+	// body at the waterline rather than letting the climb find a surface and lift it out
+	// of the lake into the sky, which is the regression this change could plausibly
+	// introduce. No horizontal drive at all, because nothing here is blocked and the climb
+	// must therefore never be consulted.
+	{
+		Body o; bodyInit(&o, 4.5f, 4.5f, 4.5f);
+		for (int i = 0; i < 600; i++) {
+			bodyJump(&o, bodyWetUpdate(&s_world, &o), true, i == 0, dt);
+			bodyStep(&o, &s_world, dt);
+		}
+		CHECK(o.y > 11.7f && o.y < 12.0f);     // the v1.8.2 float, untouched: 11.865423
+		CHECK(o.on_ground == false);           // still swimming, not standing on the lake
+	}
+
+	// Third arm: a wall one block PROUD of the water. The climb finds the water plane, not
+	// "wherever there is room", so a bank the player could not reach in Minecraft either is
+	// refused — and refused by the headroom probe, the same one that stops a walker
+	// climbing a two-block step. Stone filled to y=13 on the far side of the lake, whose
+	// top face is 14.0, a block above the surface.
+	{
+		for (int z = 0; z < 16; z++)
+			CHECK_QUIET(worldSet(&s_world, 8, 13, z, BLOCK_STONE));
+
+		Body h; bodyInit(&h, 4.5f, 4.5f, 4.5f);
+		for (int i = 0; i < 300; i++) {
+			bodyJump(&h, bodyWetUpdate(&s_world, &h), true, i == 0, dt);
+			bodyStep(&h, &s_world, dt);
+		}
+		for (int i = 0; i < 300; i++) {
+			h.vx = bodyWalkSpeed(true);
+			bodyJump(&h, bodyWetUpdate(&s_world, &h), true, false, dt);
+			bodyStep(&h, &s_world, dt);
+		}
+		CHECK(h.x < 8.0f);                     // held back by the ledge
+		CHECK(h.on_ground == false);           // still in the water where it started
+		CHECK(h.y > 11.7f && h.y < 12.0f);
+	}
+
+	worldExit(&s_world);
+}
+
+// v1.8.3 — the surface swell, the LOOK half of "add the bobbing back but way calmer".
+//
+// Tested here rather than in scene/player.c for the reason bodyWalkSpeed is: player.c
+// includes <3ds.h> and cannot be linked into this binary, so the rule was put in physics.c
+// where it can be. What this file cannot check is that player.c actually calls it — that is
+// testPlayerWiresSwimming's job, by reading the source as text.
+//
+// The bound that matters most is the third one. The swell must never dip the camera under
+// the water, because the water plane crossing the near plane is precisely the strobe
+// v1.8.2 was written to remove, and reintroducing it under the name "bob" would be the
+// same defect wearing the label of the fix.
+static void testSurfaceBob(void)
+{
+	const float dt = 1.0f / 60.0f;
+
+	// --- Dry: no swell at all, ever. Not "small" — exactly zero, because the envelope
+	// starts at zero and its target is zero, so nothing can lift it.
+	{
+		float ph = 0.0f, env = 0.0f;
+		float worst = 0.0f;
+		for (int i = 0; i < 600; i++) {
+			const float b = bodySurfaceBob(BODY_DRY, dt, &ph, &env);
+			if (b > worst)  worst = b;
+			if (-b > worst) worst = -b;
+		}
+		CHECK(worst == 0.0f);
+		CHECK(env == 0.0f);
+	}
+
+	// --- Submerged: also nothing. A diver is not floating on a surface.
+	{
+		float ph = 0.0f, env = 0.0f;
+		float worst = 0.0f;
+		for (int i = 0; i < 600; i++) {
+			const float b = bodySurfaceBob(BODY_SUBMERGED, dt, &ph, &env);
+			if (b > worst)  worst = b;
+			if (-b > worst) worst = -b;
+		}
+		CHECK(worst == 0.0f);
+	}
+
+	// --- At the surface: ten seconds, which is three and a half cycles at 0.35 Hz.
+	static float trace[600];
+	float ph = 0.0f, env = 0.0f;
+	for (int i = 0; i < 600; i++) trace[i] = bodySurfaceBob(BODY_SURFACE, dt, &ph, &env);
+
+	{
+		float hi = trace[0], lo = trace[0], sum = 0.0f;
+		for (int i = 0; i < 600; i++) {
+			if (trace[i] > hi) hi = trace[i];
+			if (trace[i] < lo) lo = trace[i];
+			sum += trace[i];
+		}
+
+		// Bounded by its own constant, in both directions, with no overshoot.
+		CHECK(hi <=  PLAYER_SURFACE_BOB + 0.0001f);
+		CHECK(lo >= -PLAYER_SURFACE_BOB - 0.0001f);
+
+		// And it actually gets there, so a wave flattened to nothing goes red rather than
+		// passing the bound above by doing nothing at all.
+		CHECK(hi > PLAYER_SURFACE_BOB * 0.9f);
+		CHECK(lo < -PLAYER_SURFACE_BOB * 0.9f);
+
+		// The clearance check. testSurfaceSwim measures the resting eye at 0.485 blocks
+		// above the water plane; the swell's trough must stay well inside that or the
+		// camera goes under and the water plane strobes. Stated as a margin rather than as
+		// a comparison to 0.485 so that this goes red if either number moves.
+		CHECK(PLAYER_SURFACE_BOB < 0.20f);
+		CHECK(lo > -0.20f);
+
+		// Zero mean over the run: a swell, not a slow lift. 600 frames is 3.5 cycles, so
+		// the half cycle left over is what the bound has to absorb.
+		const float mean = sum / 600.0f;
+		CHECK(mean < 0.01f && mean > -0.01f);
+	}
+
+	// --- It really is periodic and really is slow. 0.35 Hz over ten seconds is 3.5 cycles,
+	// which is seven sign changes. A wave running at the 4.4 Hz of the bob that was removed
+	// would count 87 of them here.
+	{
+		int crossings = 0;
+		for (int i = 1; i < 600; i++)
+			if ((trace[i] > 0.0f) != (trace[i - 1] > 0.0f)) crossings++;
+		CHECK(crossings >= 6 && crossings <= 8);
+	}
+
+	// --- Leaving the water fades the swell out instead of dropping it. Measured from the
+	// state above, which is mid-swell, so this is a real decay and not a value that was
+	// already near zero.
+	{
+		const float at_exit = trace[599] > 0.0f ? trace[599] : -trace[599];
+		CHECK(at_exit >= 0.0f);
+		float b = 0.0f;
+		for (int i = 0; i < 120; i++) b = bodySurfaceBob(BODY_DRY, dt, &ph, &env);
+		CHECK(b < 0.001f && b > -0.001f);
+		CHECK(env < 0.01f);
+	}
+}
+
 #ifndef __3DS__
 // The half of task 25 that lives in source/scene/player.c, which includes <3ds.h> through
 // app/input_map.h and so cannot be linked into this binary at all.
@@ -4660,6 +4876,24 @@ static void testPlayerWiresSwimming(void)
 	const char* step = strstr(src, "bodyStep(");
 	CHECK(step != NULL);
 	if (ask && step) CHECK(ask < step);
+
+	// v1.8.3 — the surface swell. testSurfaceBob proves the wave is right; only this can
+	// prove the camera is ever given it. A build that computed the offset and dropped it
+	// would pass every check in that test and show a dead-flat waterline, which is the
+	// defect this whole function exists for.
+	const char* bob = strstr(src, "bodySurfaceBob(");
+	CHECK(bob != NULL);
+	if (bob && step) CHECK(bob > step);   // after the step, or it lags a frame behind the body
+
+	// And the offset must reach the eye. `+ bob` on the camera's y is the only line that
+	// spends it; without this, `bodySurfaceBob(...)` could be called for its side effects on
+	// the phase alone and the check above would still be green.
+	CHECK(strstr(src, "PLAYER_EYE + bob") != NULL);
+
+	// It must be the POST-step wet state. `wet` is the pre-step answer and would fade the
+	// swell in and out a frame late at every waterline crossing — small, but it is the kind
+	// of "works, mostly" wiring this file was written to refuse.
+	CHECK(strstr(src, "bodySurfaceBob(p->body.wet,") != NULL);
 }
 #endif
 
@@ -11103,6 +11337,8 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testBuoyancy();
 	testSwimming();
 	testSurfaceSwim();
+	testSwimOutOfWater();
+	testSurfaceBob();
 #ifndef __3DS__
 	testPlayerWiresSwimming();
 #endif
@@ -11263,21 +11499,33 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	// above. Checked rather than assumed: with the 2 x 2 trunk draw disabled in worldgen.c the
 	// survey found 77 trees and 0 wide ones instead of 77 and 5, and the total stayed at 5444
 	// with exactly one check red.
+//
+// v1.8.3, the swimmer's climb: 5444 + 11 = 5455, all eleven loud and all of them in
+// testSwimOutOfWater -- 1 fixture control, 4 for the shore exit plus the rise bound, 2 for
+// the open-water float and 3 for a wall a block proud of the water. Every CHECK_QUIET in
+// that test is a fixture worldSet, which passes and therefore counts for nothing.
+//
+// v1.8.3, the surface swell: 5455 + 18 = 5473, again all loud.
+//   +14  testSurfaceBob -- 2 dry, 1 submerged, 7 for the envelope and the bounds, 1 for the
+//        cycle count and 3 for the fade-out.
+//   +4   testPlayerWiresSwimming, for the four things that have to be true of the call in
+//        scene/player.c: it exists, it is after the step, its result reaches the eye, and
+//        it is handed the post-step wet state.
 #ifndef __3DS__
 	{
 		const int ran = s_checks;
-		if (ran != 5444)
+		if (ran != 5473)
 			printf("\nCHECK-COUNT GUARD: %d checks ran, %d expected.\n"
 			       "  %s\n"
 			       "  This is NOT an ordinary assertion failure.\n"
 			       "  Read the comment above this guard in world/world_test.c before"
 			       " touching the pinned number.\n",
-			       ran, 5444,
-			       ran < 5444
+			       ran, 5473,
+			       ran < 5473
 			           ? "Checks went MISSING: checks that should have run never ran at all."
 			           : "Extra checks appeared: either you added checks and did not update"
 			             " the pin, or something is emitting checks it should not.");
-		CHECK(ran == 5444);
+		CHECK(ran == 5473);
 	}
 #endif
 

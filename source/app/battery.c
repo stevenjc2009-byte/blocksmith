@@ -52,6 +52,15 @@ bool batteryLow(void)
 	return s_known && s_level <= 1 && !s_charging;
 }
 
+bool batteryBlinkOn(uint64_t now_ms)
+{
+	// Gated on batteryLow() rather than on a second copy of the same rule, so the gauge can
+	// never blink on a battery the rest of this module calls healthy, nor sit steady on one
+	// it calls critical.
+	if (!batteryLow()) return true;
+	return (now_ms % BATTERY_BLINK_PERIOD_MS) < BATTERY_BLINK_ON_MS;
+}
+
 // ── PTM:U service and rendering — console build only ────────────────────────────────────
 #ifdef __3DS__
 
@@ -125,10 +134,16 @@ void batteryDraw(float x, float y)
 	const int bars = batteryBars();
 	const bool known = batteryKnown();
 
+	// v1.8.3 — the critical blink. Always true unless batteryLow() is, so nothing above a
+	// critical battery moves at all. On the off phase the filled bars are not drawn AND the
+	// outline drops to the dim grey: at one bar the bar is what pulses, and at zero bars
+	// there is no bar left to hide, so the outline has to carry the warning on its own.
+	const bool lit = batteryBlinkOn(tickMs());
+
 	// An unknown reading draws the same zero bars as a flat battery, so the outline is
 	// what tells them apart: dimmed to the empty-cell grey when there is no reading, so
 	// a dead PTM:U looks switched-off rather than looking like a console about to die.
-	const uint32_t outline_col = known
+	const uint32_t outline_col = (known && lit)
 		? SPRITE_RGBA(200, 200, 200, 255)
 		: SPRITE_RGBA(90, 90, 90, 255);
 	const uint32_t fill_col    = batteryLow()
@@ -144,8 +159,9 @@ void batteryDraw(float x, float y)
 	spriteRect(x + outline, y + outline,
 	           bar_w * 4 + gap * 3, bar_h, empty_col);
 
-	// Filled bars
-	for (int i = 0; i < bars; i++) {
+	// Filled bars — none of them on the blink's off phase.
+	const int drawn = lit ? bars : 0;
+	for (int i = 0; i < drawn; i++) {
 		float bx = x + outline + (float)i * (bar_w + gap);
 		spriteRect(bx, y + outline, bar_w, bar_h, fill_col);
 	}
