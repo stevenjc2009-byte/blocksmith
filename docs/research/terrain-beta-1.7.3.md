@@ -265,9 +265,28 @@ point"*). **The same cave carve as legacy runs on top of this, unchanged** — `
 the identical `worldgenIsCave` (`worldgen_density.c:657-670`, explicit comment: *"The existing
 one... Reused rather than reinvented"*).
 
-The 2,975-per-column figure is corroborated independently by `docs/ROADMAP.md:73-76` (v1.8.6
-plan): *"each of those [tree-height] questions costs roughly 476 noise evaluations, against
-about 2,975 for an entire column"* — same number, different source in the same tree, agreeing.
+**Corrected 2026-09-01 — this paragraph previously claimed corroboration it does not have.**
+It read that the 2,975 figure was "corroborated independently by `docs/ROADMAP.md:73-76`
+(v1.8.6 plan)", quoting *"each of those [tree-height] questions costs roughly 476 noise
+evaluations, against about 2,975 for an entire column"*. Both halves of that were wrong:
+
+- The line anchor is dead. `docs/ROADMAP.md` was rewritten on 2026-09-01 and lines 73-76 are
+  now part of the fog section, not a cost figure.
+- The sentence it quoted is one the ROADMAP itself **retracts**. `docs/ROADMAP.md:128-131`
+  records the measurement that replaced it: over 1,271 columns and 6 seeds, a height query
+  costs **208** noise evaluations and a whole column costs **24,204** — not ~476 and ~2,975.
+  Citing it as agreement was citing a known-wrong number as support for another number.
+
+**What 2,975 actually is, and it is still correct:** the octave-evaluation count for the
+lattice ALONE — 425 lattice points × 7 octaves (2 low + 3 high + 2 selector) = 2,975, which
+is the arithmetic derived immediately above. It is not, and never was, the cost of an entire
+column. The whole-column figure is the measured **24,204**, of which `wgdColumn` is 91%
+(22,031 evaluations — `docs/ROADMAP.md:145-148`). So 2,975 is a component of 22,031, which is
+a component of 24,204; there is no disagreement between the three, only three different
+scopes that this document had conflated.
+
+The 77.1× interpolation win computed in the next paragraph is unaffected: both of its terms
+(229,376 per-block against 2,975 lattice) are lattice-scope figures, so the ratio stands.
 
 **Cost multiplier of interpolation vs. per-block**: without the lattice, the same density
 question asked at every one of 32,768 blocks would cost 32,768 × 7 = 229,376 `value3At`

@@ -225,10 +225,26 @@ immediately before it and needs the same instrument.
 
 **Not changed: the world height.** 128 already matches Beta, and the code's own
 measurement says amplitude, not height, is the overhang lever. Going taller is also not
-free — the world store is capped at 12 MB against a 17×17-column worst case of ~9.25 MB
-(`world/budget.h:3,18,21`), and a 192-block world would push that toward ~13.9 MB, over
-the cap outright. That last figure is straight-line arithmetic on the stated 9.25 MB,
-not a measurement.
+free — by a much wider margin than this paragraph claimed when it was first written.
+
+Corrected 2026-09-01, second pass. The original text quoted a 17×17 worst case of
+"~9.25 MB" and derived "~13.9 MB" for a 192-block world from it. That 9.25 MB is the
+figure the v1.8.5 section of this same document retracts as a 2× understatement, and
+`world/budget.h:26-31` retracts it too: it counted block data only, omitting both the
+per-chunk header and the 32 KiB `LightColumn` that has hung off every loaded column
+since v1.5.0. Deriving from a retracted number produced a retracted answer.
+
+The real arithmetic, from `world/budget.h:24-68` (compiled for ARM and read out of the
+emitted constants, not derived on paper): one loaded column is **65,648 B** — 48 B of
+`Column`, 32,832 B of chunks (8 × an 8-byte header plus 4,096 cells) and a 32,768 B
+`LightColumn`. Everything but the 48 B struct scales with height, so at 192 blocks a
+column costs ~98,464 B, and the 17×17 case — render radius 7, plus the worker's one
+staging column — reaches **~28,554,560 B against a 12 MB cap** (`world/budget.h:75`).
+That is **~2.27×** the cap, not the 1.16× the old figure implied.
+
+The conclusion does not change, it only stops being marginal: 192 does not fit, and no
+plausible trimming makes it fit. Still straight-line arithmetic rather than a
+measurement — but arithmetic on the figure the compiler produced, not on a retracted one.
 
 Full research, with sources and file:line evidence: `docs/research/terrain-beta-1.7.3.md`.
 
