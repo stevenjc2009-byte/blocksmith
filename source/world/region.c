@@ -385,6 +385,118 @@ static FILE* openRegion(const char* world_dir, int32_t rx, int32_t rz, bool crea
 	return f;
 }
 
+// Matches app/worker.c's s_world_dir[128], which is the only thing that ever supplies a
+// world_dir in the game. A path longer than this is not cached at all rather than cached
+// under a truncated key — two different worlds whose names differ past byte 127 would
+// otherwise share an entry, which is the same lost-blocks failure the invalidation below is
+// written to prevent.
+//
+// v1.8.6: moved up from beside the load-side region cache (it lived just above
+// RegionCacheEnt) so the write-side hint immediately below — which needs the same bound —
+// can be defined ahead of regionWriteColumn without a forward declaration. Untouched
+// otherwise; the load-side cache further down still uses this exact definition.
+#define REGION_CACHE_DIR_MAX 128
+
+// ── v1.8.6 "Speed": the save-side compaction hint ──────────────────────────────────────
+//
+// regionMaintain (region.c, below) runs regionCompact immediately after every successful
+// regionWriteColumn — that pairing is app/worker.c's workerWriteSave, the only production
+// caller. Before this, regionCompact's own first move, on EVERY one of those calls, was to
+// re-derive exactly what regionWriteColumn had just finished deriving a moment earlier: it
+// re-ran regionRecover (two fopen probes, for .bak and then .tmp), reopened the file (a
+// third fopen) and re-parsed both directory copies (6176 bytes across two dirRead calls,
+// DIR_BYTES=3088 each) — all of it just to reach the half-dead gate a few lines later and,
+// 26 times out of 27 in the measured workload (960/36, see region.h), be told "no".
+//
+// This hint is that leftover state, handed forward instead of re-derived. It is written by
+// regionWriteColumn once a save fully succeeds, and it is a HINT, not a cache: it is
+// consumed (cleared) the instant regionMaintain reads it, and it is invalidated by anything
+// that could make it stale before that — another regionWriteColumn (overwrites it),
+// regionCompact or anything else that calls regionCacheClose (writeHintClear rides along,
+// see there). If regionMaintain's (world_dir, rx, rz) does not match exactly, or the hint
+// was never set, or was already taken, writeHintTake says so and regionMaintain falls
+// through to the untouched regionCompact — byte-for-byte what ran here before this. So the
+// ONLY thing this changes is how the common "no, nothing to reclaim" answer is reached; the
+// rare "yes" answer, and everything regionCompact does once it actually fires, is
+// unchanged code running on freshly re-read state, exactly as before.
+//
+// Why this is safe to treat as equivalent to a fresh read, and not merely faster: the file
+// cannot change between regionWriteColumn's write and the very next regionMaintain call —
+// both run on the worker thread (region.h says so of every writer here), nothing else in
+// this translation unit touches a region file without going through regionCacheClose first
+// (which clears this hint before it does anything else — see regionCompact and openRegion),
+// and the hinted Dir is the SAME "newer" directory regionCompact's own gate would compute:
+// dirLoad's merge already folds the older copy's extent into arena_end before
+// regionWriteColumn picks its append offset `at`, so `at` already sits at or past every
+// existing entry's tail; this column's new tail (`at + len`) is therefore unconditionally
+// the new arena_end, and `dir.ent[]` after the in-place slot update is byte-identical to
+// what dirWrite persisted. A fresh dirLoadPair immediately afterward could not compute
+// anything different. See region_test.c's testMaintainHintMatchesFreshRead, which checks
+// that directly by comparing the hinted decision against one taken with the hint disabled.
+//
+// What was rejected instead: folding regionCompact's gate check bodily into
+// regionWriteColumn, so a caller never asks a second time at all. regionCompact is also
+// called directly, by tests and by anything future that wants an unconditional repack, and
+// it would still need its own gate — so the two would either duplicate the half-dead
+// threshold (the exact drift region.h already warns regionMaintain vs regionCompact
+// against) or regionWriteColumn would have to call regionCompact itself, which changes
+// what a caller can observe about a save: today a save can succeed while compaction
+// separately declines or fails, and folding the two would erase that distinction for a
+// question nobody asked to have answered. The gate's own cost was never the problem here —
+// it is three comparisons over an in-memory array either way — the redundant ASKING was,
+// and that is all this removes.
+//
+// Byte cost, stated rather than left to be discovered: one Dir (~3084 bytes, see the
+// load-side cache's comment below for how that number is reached) plus a 128-byte path and
+// three words, all static — g_region_writehint_bytes in the probe build is the measurement,
+// not this arithmetic. Not doubled per cache slot the way the load-side cache is: there is
+// exactly one hint, because there is exactly one write in flight on the worker thread at a
+// time.
+typedef struct {
+	bool     valid;
+	char     dir[REGION_CACHE_DIR_MAX];
+	int32_t  rx, rz;
+	Dir      dir_state;      // post-write "newer" directory; arena_end already advanced
+} WriteHint;
+
+static WriteHint s_write_hint;
+
+#ifdef BS_REGION_PROBE
+const unsigned long g_region_writehint_bytes = (unsigned long)sizeof(s_write_hint);
+#endif
+
+static void writeHintClear(void)
+{
+	s_write_hint.valid = false;
+}
+
+// Called only from regionWriteColumn, after its own regionCacheClose() below — that call
+// clears this same hint (see writeHintClear), so setting it any earlier would just have it
+// wiped a line later.
+static void writeHintSet(const char* world_dir, int32_t rx, int32_t rz, const Dir* dir)
+{
+	if (strlen(world_dir) >= REGION_CACHE_DIR_MAX) return;   // too long to key; see cacheFill
+	snprintf(s_write_hint.dir, sizeof(s_write_hint.dir), "%s", world_dir);
+	s_write_hint.rx        = rx;
+	s_write_hint.rz        = rz;
+	s_write_hint.dir_state = *dir;
+	s_write_hint.valid     = true;
+}
+
+// Consumes the hint if it matches exactly, leaving it cleared either way it is read. False
+// on any mismatch or when nothing was stashed, which is regionMaintain's signal to fall back
+// to the real regionCompact — never a signal that anything is wrong.
+static bool writeHintTake(const char* world_dir, int32_t rx, int32_t rz, Dir* out)
+{
+	if (!s_write_hint.valid)                            return false;
+	if (s_write_hint.rx != rx || s_write_hint.rz != rz)  return false;
+	if (strcmp(s_write_hint.dir, world_dir) != 0)        return false;
+
+	*out = s_write_hint.dir_state;
+	s_write_hint.valid = false;
+	return true;
+}
+
 bool regionWriteColumn(const char* world_dir, int32_t cx, int32_t cz,
                        const uint8_t* data, uint32_t len)
 {
@@ -419,6 +531,22 @@ bool regionWriteColumn(const char* world_dir, int32_t cx, int32_t cz,
 	// was in flight. Costs two comparisons and at most two fclose per SD write, against a
 	// stale entry costing the player a column of blocks.
 	regionCacheClose();
+
+	// v1.8.6. Stashed AFTER regionCacheClose() above, not before — that call clears this same
+	// hint (writeHintClear rides along with it, see there), so setting it any earlier would
+	// just have it wiped a line later.
+	//
+	// arena_end is brought up to date here because nothing above this point ever needed to:
+	// it was only ever read to compute `at`, never written back. `at + len` is the correct
+	// new value without re-deriving it — `at` already sits at or past everything either
+	// directory copy pointed to (dirLoadPair's merge inside dirLoad, above), so this column's
+	// freshly appended payload is unconditionally the new tail. See the hint's own comment,
+	// above regionWriteColumn, for why a caller reading it back is equivalent to a fresh
+	// read of the file.
+	if (ok) {
+		dir.arena_end = at + len;
+		writeHintSet(world_dir, regionOf(cx), regionOf(cz), &dir);
+	}
 	return ok;
 }
 
@@ -486,12 +614,9 @@ uint32_t regionReadColumn(const char* world_dir, int32_t cx, int32_t cz,
 // step, and should re-run the probe rather than trust this line.
 #define REGION_CACHE_ENTS    2
 
-// Matches app/worker.c's s_world_dir[128], which is the only thing that ever supplies a
-// world_dir in the game. A path longer than this is not cached at all rather than cached
-// under a truncated key — two different worlds whose names differ past byte 127 would
-// otherwise share an entry, which is the same lost-blocks failure the invalidation above is
-// written to prevent.
-#define REGION_CACHE_DIR_MAX 128
+// REGION_CACHE_DIR_MAX moved up to just above regionWriteColumn in v1.8.6, so the write-side
+// compaction hint defined there could use the same bound ahead of this cache without a
+// forward declaration. Full comment is there; this cache's use of it is unchanged.
 
 typedef struct {
 	bool     used;
@@ -520,6 +645,13 @@ static void cacheEvict(RegionCacheEnt* e)
 void regionCacheClose(void)
 {
 	for (int i = 0; i < REGION_CACHE_ENTS; i++) cacheEvict(&s_cache[i]);
+
+	// v1.8.6. The write-side compaction hint rides along with the load-side cache's
+	// invalidation rather than getting its own call sites: anything that is a reason to
+	// distrust the read cache — a world directory change, the worker stopping, a compaction
+	// about to run — is equally a reason the hint might no longer describe the file. See the
+	// hint's own comment, above regionWriteColumn, for the full invalidation argument.
+	writeHintClear();
 }
 
 static RegionCacheEnt* cacheFind(const char* world_dir, int32_t rx, int32_t rz)
@@ -619,6 +751,11 @@ bool regionCompact(const char* world_dir, int32_t rx, int32_t rz)
 	// of the two the last cut happened to leave in place.
 	regionRecover(world_dir, rx, rz);
 
+	// v1.8.6. Counted for the first time: this fopen (and the one on `out` below) always ran,
+	// even on the "declined, nothing to do" path, and the pre-v1.8.6 probe build never
+	// charged them because they bypass fileExists/openRegion. Left uncounted they would have
+	// made the hint's saving look bigger than it is — see region_test.c's fopen count.
+	PROBE_BUMP(g_region_fopens);
 	FILE* in = fopen(src, "rb");
 	if (!in) return false;
 
@@ -637,6 +774,7 @@ bool regionCompact(const char* world_dir, int32_t rx, int32_t rz)
 		return false;
 	}
 
+	PROBE_BUMP(g_region_fopens);   // see the note on `in`'s fopen above
 	FILE* out = fopen(tmp, "w+b");
 	if (!out) { fclose(in); return false; }
 
@@ -779,10 +917,35 @@ bool regionCompact(const char* world_dir, int32_t rx, int32_t rz)
 // can rule out from the host.
 void regionMaintain(const char* world_dir, int32_t rx, int32_t rz)
 {
-	// Deliberately just the gated compaction, with no policy of its own. The threshold lives
-	// inside regionCompact where the numbers it tests are, and a second threshold here would
-	// be a way for the two to disagree. This function exists so that the wiring itself sits
-	// in region.c and can be reached by a host test — a call in worker.c alone would be a
-	// line no suite links.
+	// v1.8.6 "Speed". Before touching regionCompact at all: if the write that just landed
+	// left its post-write directory state in the hint (the common case — see the hint's own
+	// comment, above regionWriteColumn), the half-dead gate can be answered from that alone,
+	// with no recovery probe, no reopen and no directory reread. writeHintTake already
+	// checked that this is the SAME region the hint was stashed for and that nothing has
+	// cleared it since; see there for why that makes the hinted state exactly what a fresh
+	// read would show.
+	Dir hinted;
+	if (writeHintTake(world_dir, rx, rz, &hinted)) {
+		uint32_t live = 0;
+		for (int i = 0; i < REGION_COLS; i++) live += hinted.ent[i].len;
+		if (hinted.arena_end <= ARENA_OFF || live * 2 >= hinted.arena_end - ARENA_OFF) {
+			// The gate's own "not worth it" answer, reached without opening the file. This
+			// is the 26-out-of-27 case (960/36, see region.h) and it is the entire point of
+			// the hint: declining now costs nothing beyond the loop above.
+			return;
+		}
+		// The rare branch: the gate says yes. Falls through to the real regionCompact rather
+		// than repacking from the hinted state here — repacking IS regionCompact, and
+		// re-deriving from disk on this branch keeps the threshold living in exactly one
+		// place, which is the same reason this function had no policy of its own before
+		// v1.8.6 either. regionCompact reopens the file itself, so it sees this write's
+		// bytes regardless of where the hint came from.
+	}
+
+	// Deliberately just the gated compaction, with no policy of its own beyond the hint fast
+	// path above. The threshold lives inside regionCompact where the numbers it tests are,
+	// and a second threshold here would be a way for the two to disagree. This function
+	// exists so that the wiring itself sits in region.c and can be reached by a host test —
+	// a call in worker.c alone would be a line no suite links.
 	(void)regionCompact(world_dir, rx, rz);
 }

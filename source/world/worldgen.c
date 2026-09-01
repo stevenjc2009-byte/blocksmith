@@ -294,7 +294,8 @@ typedef struct {
 	bool    wide;    // 2 x 2 trunk rather than one column
 } Tree;
 
-static Tree treeInCell(const WorldGen* g, int32_t tcx, int32_t tcz)
+static Tree treeInCell(const WorldGen* g, int32_t tcx, int32_t tcz,
+                       int32_t col_x0, int32_t col_x1, int32_t col_z0, int32_t col_z1)
 {
 	Tree t = {0};
 	t.radius = GEN_TREE_RADIUS;
@@ -316,6 +317,36 @@ static Tree treeInCell(const WorldGen* g, int32_t tcx, int32_t tcz)
 	// rest of the struct. The twelve legacy fingerprints are the check on this.
 	t.x = tcx * GEN_TREE_CELL + 1 + (int32_t)((h >> 8) % (GEN_TREE_CELL - 2));
 	t.z = tcz * GEN_TREE_CELL + 1 + (int32_t)((h >> 13) % (GEN_TREE_CELL - 2));
+
+	// **v1.8.6 "Speed".** The horizontal-reach reject, and the reason it lives here rather
+	// than in worldgenDecorate's caller loop: this is the earliest point at which the
+	// tree's actual position is known, and everything below it — the biome resolve (two
+	// fBms), the draw, the sandy test and the height query at the bottom of this function —
+	// is wasted work for a tree whose canopy cannot possibly land a block in the column
+	// being decorated. worldgenDecorate's scan window is deliberately wider than one column
+	// (it has to catch a canopy standing in a neighbouring cell), which is exactly what
+	// makes most of the cells it visits belong to a tree that treePut() was always going to
+	// clip into nothing — see docs/ROADMAP.md's v1.8.6 entry for the measured fraction.
+	//
+	// The bound is GEN_TREE_REACH_MAX on both sides of both axes, the same conservative
+	// constant worldgenDecorate's own scan window is built from (worldgen.h's comment on it
+	// states why: it is `GEN_TREE_RADIUS_MAX + 1`, wide enough for the widest canopy this
+	// build can draw standing on a 2 x 2 trunk). Symmetric rather than tight — a real
+	// canopy's reach is asymmetric, `-radius .. +radius+ext` — because tightening it would
+	// need `bp` and the per-tree shape draw, both of which are exactly the work this reject
+	// exists to skip. A reject built from a bound that is never smaller than the true reach
+	// can only be conservative: it may let an unreachable tree through to the height query
+	// on the far side of that slack, but it can never throw away one that could have placed
+	// a block, which is what keeps the generated world byte-identical.
+	//
+	// A pure function of t.x, t.z and the column being decorated, with no side effect on
+	// `t` beyond what every other early-return in this function already leaves it at — so a
+	// rejected cell returns the same zeroed-out, `exists == false` struct the draw-chance
+	// and sandy rejects below return, and every caller already ignores every field but
+	// `exists` in that case.
+	if (t.x + GEN_TREE_REACH_MAX < col_x0 || t.x - GEN_TREE_REACH_MAX > col_x1 ||
+	    t.z + GEN_TREE_REACH_MAX < col_z0 || t.z - GEN_TREE_REACH_MAX > col_z1)
+		return t;
 
 	// v1.8.3 Phase 2. Tree density and silhouette per biome on a BIOME world; the single
 	// global constants on a legacy or density one, which is what keeps every existing world's
@@ -497,10 +528,19 @@ bool worldgenDecorate(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 	const int32_t z0 = (cz * CHUNK_DIM - GEN_TREE_REACH_MAX) / GEN_TREE_CELL - 1;
 	const int32_t z1 = (cz * CHUNK_DIM + CHUNK_DIM - 1 + GEN_TREE_REACH_MAX) / GEN_TREE_CELL + 1;
 
+	// v1.8.6. The column's own block bounds, passed down to treeInCell() so its
+	// horizontal-reach reject can run before the height query — see the comment there.
+	// Computed once here rather than once per cell: cx and cz do not change inside this
+	// loop, so the four multiplies belong outside it.
+	const int32_t col_x0 = cx * CHUNK_DIM;
+	const int32_t col_x1 = col_x0 + CHUNK_DIM - 1;
+	const int32_t col_z0 = cz * CHUNK_DIM;
+	const int32_t col_z1 = col_z0 + CHUNK_DIM - 1;
+
 	bool ok = true;
 	for (int32_t tcz = z0; tcz <= z1; tcz++) {
 		for (int32_t tcx = x0; tcx <= x1; tcx++) {
-			const Tree t = treeInCell(g, tcx, tcz);
+			const Tree t = treeInCell(g, tcx, tcz, col_x0, col_x1, col_z0, col_z1);
 			if (!t.exists)
 				continue;
 

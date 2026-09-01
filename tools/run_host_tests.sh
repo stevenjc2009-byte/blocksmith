@@ -2632,6 +2632,82 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 rm -rf "$BHRG"
 
+# source/world/region_test.c -- v1.8.6. The write-hint that lets regionMaintain skip re-reading
+# from disk what regionWriteColumn already knew. Its own binary for the usual reason, and its own
+# file rather than more tests in region_growth_test.c because the thing under test is different:
+# growth is about a file getting bigger safely, this is about a CACHED DECISION matching the
+# decision a cold read would have made.
+#
+# The test that matters here is testHintMatchesFreshRead, and it is the shape every cache change
+# in this tree should be held to. It runs the hinted path against a path forced to miss (via
+# regionCacheClose() before every call, i.e. the pre-v1.8.6 behaviour) over an identical 400-save
+# sequence, and requires that both compact at the SAME points and produce byte-identical files.
+# Aggregate agreement would not be enough -- two paths can compact the same NUMBER of times at
+# different moments and diverge on disk.
+#
+# testForcedCompaction exists because the gate being wrapped fired zero times in 162 saves during
+# the v1.8.6 measurement. A gate that never fires is not evidence that it is dead; it is a reason
+# to force it. That test resaves 20 columns 30 times each to drive the arena past the 50%-dead
+# threshold, and the run fires 26 real compactions -- so the compacting branch is covered by a
+# check that can actually go red, not merely present.
+BHRT="build-host/run-$$-regiontest"
+mkdir -p "$BHRT"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/chunk_codec.c \
+	source/world/crc32.c \
+	source/world/region.c \
+	source/world/world.c \
+	source/world/budget.c \
+	tests/net_stub.c \
+	source/world/region_test.c \
+	-lm \
+	-o "$BHRT/region_test"
+
+"./$BHRT/region_test"
+
+rm -rf "$BHRT"
+
+# tests/mesher_hashcheck.c -- v1.8.6. meshChunk() geometry equality over 408 chunks (12 seeds x
+# 5 world kinds), synthesised with worldSet() directly so it depends on neither worldgen.c nor
+# region.c and cannot go green or red because one of those changed.
+#
+# Why this exists alongside world_test.c's testMesherFullCubeBytesUnchanged, which already pins
+# four mesh hashes: four is a sample, not a distribution. This harness self-checks against those
+# same four fixtures FIRST and refuses to report anything if its own wiring cannot reproduce
+# them -- so a broken harness fails loudly instead of printing 408 confident matching hashes.
+#
+# Proven able to go red: pointing CELL_DRAW_WORD at CELL_FLAG_OCCL instead of CELL_FLAG_DRAW (a
+# plausible copy-paste slip, and one the four pinned fixtures alone do NOT all catch) makes
+# leaves stop emitting geometry entirely -- the self-check reports the all-leaves case at
+# verts=0 idx=0 faces=0 and exits non-zero.
+BHMH="build-host/run-$$-mesherhash"
+mkdir -p "$BHMH"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/chunk_codec.c \
+	source/world/crc32.c \
+	source/world/world.c \
+	source/world/scratch.c \
+	source/world/mesher.c \
+	source/world/budget.c \
+	tests/net_stub.c \
+	tests/mesher_hashcheck.c \
+	-lm \
+	-o "$BHMH/mesher_hashcheck"
+
+"./$BHMH/mesher_hashcheck" 12
+
+rm -rf "$BHMH"
+
 # tests/light_luminance_test.c -- BlockDef.luminance reaching world/light.c (v1.8.2). Own binary,
 # own main(), appended for the same reason every stanza here is appended.
 #

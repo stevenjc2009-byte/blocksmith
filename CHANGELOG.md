@@ -4,6 +4,88 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.8.6] - 2026-09-02
+
+Speed. No new features and nothing that looks different on screen — this release is four
+pieces of work that make the game do less, plus two test harnesses to stop that work quietly
+undoing itself later. **Every change here is byte-for-byte invisible: the world generates the
+same terrain, the mesher draws the same geometry, and saves are unchanged.** That was the
+acceptance condition, not a hoped-for side effect, and it is proved below rather than asserted.
+
+Nothing here is Old-3DS-only or New-3DS-only. Both consoles get all of it.
+
+### Changed
+
+- **Trees stop asking a question they cannot use the answer to.** Decorating a column
+  considered tree positions in a margin around it, and asked each one how tall the terrain was
+  there — an expensive noise query — before working out that the tree was too far away to put
+  a single block inside the column. The reach test now happens first. It is a deliberately
+  conservative symmetric bound, so it can reject a tree only when that tree provably cannot
+  reach; it can never discard one that could have placed something.
+
+  **73.28%** of height queries during decoration are now skipped. The decoration pass itself
+  runs **3.3–3.7× faster**, worth **2.8–6.2%** off generating a whole column. (Host x86-64
+  ratios. A host ratio is not a console frame cost and is not quoted as one.)
+
+- **The mesher keeps one array where it kept three.** Per-cell solid/occludes/draws flags were
+  three parallel byte arrays; they are now one array of packed bits. That is **17,496 bytes of
+  scratch down to 5,832**, and about **7–10% faster** on host — not the 25% an earlier
+  estimate claimed, which did not survive being measured.
+
+- **Saving a column no longer re-reads from disk what it just wrote.** After writing, the
+  region layer immediately asked whether the file needed compacting, and answered by reopening
+  the file and re-reading its directory — recomputing state the write had just finished
+  producing. The write now hands that state forward directly. A save that declines compaction
+  drops from **6 file opens to 3**, and stops re-reading **6,176 bytes** of directory each time.
+
+  The old cold-read path is untouched and is still used whenever the hint does not apply.
+
+### Added
+
+- **A geometry-equality guard for the mesher** (`tests/mesher_hashcheck.c`), 408 chunks across
+  12 seeds and 5 world kinds. The existing pin was four fixtures; four is a sample, not a
+  distribution. It self-checks against those same four first and refuses to report anything if
+  its own wiring cannot reproduce them.
+- **A region write-hint test** (`source/world/region_test.c`), 5,660 checks. Its central test
+  runs the hinted path against a path forced to read cold, over an identical 400-save sequence,
+  and requires that they compact at the *same points* and produce *byte-identical files* —
+  not merely the same number of compactions.
+
+### Fixed
+
+- **The interaction tests were never testing the lighting paths.** `interact_test.c` never
+  started the light engine, so `lightEnabled()` was false and the relight branches taken on
+  every block break and place had **never once executed in a test run**. They do now: 169
+  checks became 193, and the lighting paths are covered for the first time.
+- **A leak in that same test's fixture.** Each fixture called `worldInit` without `worldExit`
+  first, and `worldInit` is a bare memset that releases nothing — so every fixture leaked the
+  previous one's memory claims. Harmless to players (test-only code), but it was hiding real
+  budget behaviour from the tests that check budget behaviour.
+
+### Not changed, deliberately
+
+- **The New 3DS per-frame work caps** (`DRAIN_MAX_CHUNKS`, `RELIGHT_MAX_COLUMNS`). The plan was
+  to raise them if the count, rather than the time budget, was the limit. The measurement taken
+  to decide that was contaminated — unrelated processes on the measuring machine inflated every
+  frame time by almost exactly 2×, including frames with no work queued at all. Correcting for
+  that puts the figure directly on the budget line rather than either side of it. **Neither
+  constant is being changed on evidence that cannot support the change**, and the relight cap
+  got no evidence at all, because a plain walk never engages it.
+
+### Compatibility
+
+Worlds, saves and multiplayer are all untouched, and this is stronger than the usual "no
+format change" claim. Generated terrain is byte-identical: 484 columns across 4 seeds hash the
+same before and after (`820dd26ab8db0d7a`). Emitted geometry is byte-identical across 408
+chunks. Saved regions round-trip identically, verified in both write orders across 5,280
+column-saves. A 1.8.6 client and a 1.8.5 client see the same world and can play together.
+
+### Not verified
+
+Nothing in this release has run on real 3DS hardware. Every timing figure is a host x86-64
+ratio, and the in-game numbers that should move as a result — `LOAD_STAGE_GENERATE` for
+worldgen, and the save-side counters for the region change — can only be read on a console.
+
 ## [1.8.5] - 2026-09-01
 
 Render distance. There were two ceilings on how far you could see, and only one of them was

@@ -19,6 +19,7 @@
 #ifndef __3DS__
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "app/input_map.h"
@@ -26,6 +27,7 @@
 #include "scene/interact.h"
 #include "world/block.h"
 #include "world/inventory.h"
+#include "world/light.h"
 #include "world/registry.h"
 
 static int  s_checks;
@@ -98,6 +100,17 @@ static BlockId registerDynBlock(const char* name)
 static void freshAimedAt(Interact* it, BlockId target_block)
 {
 	registryInitCore();
+	// v1.8.6: worldExit() BEFORE the reset, not just worldInit(). s_world is one static
+	// instance reused by every case in this file, and worldInit() only memsets it — it does
+	// not walk the previous incarnation's columns, so nothing released the Column, its
+	// Chunk(s), or (now that lightEngineInit(true) runs below in main) its attached 32 KiB
+	// LightColumn. Measured on the unpatched line: lightColumnsAttached() read 2 by the
+	// second fixture in the file, climbing by one on every case that reaches a relight —
+	// once nothing here ever turned lighting on, that leak was silent and free; it stops
+	// being free the moment a relight is actually reachable, so it is fixed here rather than
+	// carried forward. worldExit() is a no-op on the very first call: a static World starts
+	// zeroed, so every slot is already NULL.
+	worldExit(&s_world);
 	worldInit(&s_world);
 	s_edits_sent = 0;
 	s_last_block = 0xFF;
@@ -711,8 +724,119 @@ static void testPlaceIsStillOnePressAndIgnoresTheClock(void)
 	CHECK(it.placed == 1);
 }
 
+// ── v1.8.6: the light engine is actually on in here now ────────────────────────────────
+//
+// docs/ROADMAP.md: this file never called lightEngineInit(true), so lightEnabled() was false
+// for the whole binary and the two relight calls in scene/interact.c — L114 in the break
+// path, L308 in the place path, both guarded by `if (lightEnabled())` — had never once run
+// here. Every case above this point still passes with that guard closed; none of them assert
+// anything about light, so none of them could have told the difference. Confirmed by
+// instrumentation, not by reading: a print dropped inside both guarded bodies, run against
+// this file unmodified, never fired once across all 169 checks that existed before this
+// version. main() now calls lightEngineInit(true) once, which is also what the shipping
+// binary does — both console models turn the gate on unconditionally at boot
+// (scene/chunk_render.c) and leave it on for the session, so an always-on gate here matches
+// production rather than testing something narrower than it.
+//
+// The two cases below are what actually exercises the two guarded calls, rather than letting
+// them ride along unasserted inside cases written for something else. Both take a real
+// baseline reading with lightPropagateColumn (the same engine world_test.c's own light suite
+// uses) BEFORE the edit, then read the identical cells again after the edit runs through the
+// real interactEdit() path. Nothing else in this file ever writes to a light array, so if
+// breakComplete's or the place path's relight call were skipped, the baseline reading would
+// still be sitting there unchanged — a check that only asked "did anything crash" could not
+// tell a skipped relight from a working one, and now these can.
+
+// TY = 40 is a single stone cell in an otherwise empty column (see freshAimedAt), not a
+// sealed floor like world_test.c's lightFloor() — so straight down through the seven other
+// open columns of the same layer is unobstructed and leaks in sideways at -1 per step. That
+// is why the cell directly under the slab reads 14 rather than 0: one step of falloff from
+// its lit neighbours, not the "sealed underneath" shape a full floor would give. All three
+// readings below are measured off a real build of this exact fixture, not assumed from the
+// falloff rule in the abstract.
+static void testABreakRelightsTheColumnItLeftBehind(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_STONE);
+
+	LightQueue* q = (LightQueue*)malloc(sizeof(LightQueue));
+	CHECK(q != NULL);
+	if (!q) return;
+	lightQueueInit(q);
+
+	CHECK(lightPropagateColumn(&s_world, TX >> 4, TZ >> 4, q));
+	free(q);   // lightRelightColumn owns its own queue below; this one's job is done
+
+	Column* col = worldColumn(&s_world, TX >> 4, TZ >> 4);
+	CHECK(col != NULL);
+	// TX and TZ double as the column-local coordinates here: TX>>4 == TZ>>4 == 0 (see
+	// world/world.h's coordinate note), so the world coordinate and the local one are the
+	// same number.
+	CHECK(lightGetSky(col, TX, TY,     TZ) == 0);    // the slab itself stops light
+	CHECK(lightGetSky(col, TX, TY - 1, TZ) == 14);   // one step of sideways leak, not sealed
+	CHECK(lightGetSky(col, TX, TY + 1, TZ) == 15);   // open sky above the slab
+	CHECK(lightColumnsAttached() == 1);
+
+	const Body body = farAwayBody();
+	CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) > 0);
+	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_AIR);
+
+	// Same column, same three cells, read again with nothing else able to have touched
+	// them in between. The whole shaft is open air now, and sky light travels straight
+	// down through open air at full strength — no per-cell falloff going straight down,
+	// only when it spreads sideways (see world/light.h) — so all three read full sun.
+	col = worldColumn(&s_world, TX >> 4, TZ >> 4);
+	CHECK(col != NULL);
+	CHECK(lightGetSky(col, TX, TY,     TZ) == 15);
+	CHECK(lightGetSky(col, TX, TY - 1, TZ) == 15);
+	CHECK(lightGetSky(col, TX, TY + 1, TZ) == 15);
+	CHECK(lightColumnsAttached() == 1);   // still one column — the fix above, not a leak
+}
+
+// The place-path twin. The probe cell is the place cell itself: open sky before anything is
+// put there, and the placed block's own cell the instant it lands — no falloff arithmetic to
+// get right, just "did the write actually get seen by the light arrays or not".
+static void testAPlaceRelightsTheColumnItLeftBehind(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_STONE);
+	it.holding = BLOCK_PLANKS;
+
+	LightQueue* q = (LightQueue*)malloc(sizeof(LightQueue));
+	CHECK(q != NULL);
+	if (!q) return;
+	lightQueueInit(q);
+
+	CHECK(lightPropagateColumn(&s_world, TX >> 4, TZ >> 4, q));
+	free(q);
+
+	Column* col = worldColumn(&s_world, TX >> 4, TZ >> 4);
+	CHECK(col != NULL);
+	CHECK(lightGetSky(col, TX, TY + 1, TZ) == 15);   // the place cell: open sky, nothing there
+	CHECK(lightColumnsAttached() == 1);
+
+	const Body body = farAwayBody();
+	interactEdit(&it, &s_world, &body, placeKey(), 0, 0);
+	CHECK(it.placed == 1);
+	CHECK(worldGet(&s_world, TX, TY + 1, TZ) == BLOCK_PLANKS);
+
+	// The cell the plank now occupies is opaque, and an opaque cell stores no light — if
+	// the place path's relight call were skipped, this would still read the 15 taken above,
+	// which nothing else in this file would ever have overwritten.
+	col = worldColumn(&s_world, TX >> 4, TZ >> 4);
+	CHECK(col != NULL);
+	CHECK(lightGetSky(col, TX, TY + 1, TZ) == 0);
+	CHECK(lightColumnsAttached() == 1);
+}
+
 int main(void)
 {
+	// v1.8.6: see the section comment above testABreakRelightsTheColumnItLeftBehind for why
+	// this line exists. Left on for the rest of main(), the same way it stays on for the rest
+	// of a real session once scene/chunk_render.c calls it at boot — nothing below needs the
+	// gate closed, so there is no matching lightEngineInit(false).
+	lightEngineInit(true);
+
 	testTheCarryCeilingIsWhereItSays();
 	testABreakOnACarryUnholdableBlockChangesNothing();
 	testTallGrassBreaksAndDropsNothing();
@@ -736,6 +860,10 @@ int main(void)
 	testCatchUpTicksStillLandTheBreak();
 	testZeroAndNegativeTicksKeepTheHold();
 	testPlaceIsStillOnePressAndIgnoresTheClock();
+
+	// v1.8.6.
+	testABreakRelightsTheColumnItLeftBehind();
+	testAPlaceRelightsTheColumnItLeftBehind();
 
 	if (s_fails == 0)
 		printf("interact self-test: PASS  %d checks\n", s_checks);

@@ -96,23 +96,66 @@ typedef struct {
 // Solidity of the scratch itself, resolved once per chunk. The mesher asks "is this
 // cell solid?" about 44,000 times per chunk, and going through the block id every time
 // is two dependent loads; resolving all 5,832 cells up front makes each of those one.
-static uint8_t  s_cell_solid[SCRATCH_BLOCKS];
-
+//
 // Step 9.1. Whether each cell *occludes* — solid and opaque. Solidity alone was the test until
 // the 2026-08-18 audit, and it culled the face between an opaque block and a see-through one:
 // the stone under a leaf, and the trunk inside its own canopy, lost the faces pointing at the
 // leaves and showed sky through the alpha holes instead. A second table rather than a second
-// condition on the block id, for the same reason s_cell_solid is a table: this is read once per
+// condition on the block id, for the same reason solidity is a table: this is read once per
 // face, about 24,000 times a chunk, and it has to stay a single byte load.
-static uint8_t  s_cell_occl[SCRATCH_BLOCKS];
-
+//
 // v1.6.0 task 13. Whether each cell emits geometry at all. Until this task that was the
-// same question as s_cell_solid — every block that was not air was solid — and
-// emitCollect's scan below read the solidity table for it. It is its own table now
-// because the shapes this task exists for split the two apart: a plant draws and does
-// not collide, and so will water. Air is 0 here exactly as it is 0 in s_cell_solid, so
-// the four-at-a-time word scan is unaffected.
-static uint8_t  s_cell_draw[SCRATCH_BLOCKS];
+// same question as solidity — every block that was not air was solid — and emitCollect's
+// scan below read the solidity table for it. It is its own question now because the shapes
+// this task exists for split the two apart: a plant draws and does not collide, and so will
+// water. Air answers no to all three here exactly as it always has, so the four-at-a-time
+// word scan below is unaffected.
+//
+// ── v1.8.6: one packed table instead of three ────────────────────────────────
+//
+// Until this task the three questions above were three separate uint8_t[SCRATCH_BLOCKS]
+// arrays — s_cell_solid, s_cell_occl, s_cell_draw — each resolved from the block id in the
+// same loop in meshChunk and each read back from a different address by the callers below.
+// That is 3 * 5,832 = 17,496 bytes of .bss for three answers that are decided together, from
+// the same BlockId, in the same loop, and never disagree about which cell they describe.
+//
+// Packed into one table the three answers are three bits of one byte, chosen so cornerAO's
+// arithmetic below needs no shift: CELL_FLAG_SOLID is bit 0, so `flags & CELL_FLAG_SOLID` is
+// already exactly 0 or 1, the same int cornerAO summed straight out of s_cell_solid before.
+// .bss for the merged table is 5,832 bytes — a third of the three separate arrays — and every
+// caller below reads one byte and masks it instead of reading one of three byte arrays,
+// which is either the same cost (a caller that only ever asked one question) or cheaper (any
+// caller — none exist today — that wants more than one answer for the same cell).
+//
+// The one place this had to be done carefully rather than just swapped in is emitCollect's
+// four-at-a-time word scan a little further down: the old code tested `word == 0`, true only
+// when four consecutive s_cell_draw bytes were all zero. Four consecutive packed bytes read as
+// a zero word only when SOLID, OCCL and DRAW are all clear for all four cells — a strictly
+// narrower condition — so the scan now masks the word down to just the four DRAW bits before
+// comparing: `(word & CELL_DRAW_WORD) == 0`. That is exact for any future registry, not merely
+// exact for today's, where solid and occluding always implies drawn — see the scan's own
+// comment for why the narrower literal test would have been a coincidence dressed as a proof.
+//
+// Considered and rejected: packing only two of the three (leaving s_cell_draw on its own
+// array) so the word-scan needed no change at all. Rejected because it saves 5,832 bytes
+// instead of 11,664 for the same amount of new code, and the masked comparison the full merge
+// needs is one AND more than the two-table version would have needed anyway — the safer
+// version is not the more expensive one here.
+//
+// Verified hash-identical over 408 synthetic chunks across 12 seeds and 5 fixtures (buried
+// stone, surface terrain with water, an exact checkerboard, sparse cross-shape scatter, and a
+// leaf canopy) plus the four hashes world/world_test.c already pins — see
+// scratchpad/mesher_hashcheck.c in the v1.8.6 session's tooling. Not re-measured on console;
+// nothing has run on real 3DS hardware since v1.2.5 (code-vault).
+#define CELL_FLAG_SOLID  ((uint8_t)(1u << 0))   // fills its cell: AO and occlusion read this
+#define CELL_FLAG_OCCL   ((uint8_t)(1u << 1))   // solid and opaque: hides the face behind it
+#define CELL_FLAG_DRAW   ((uint8_t)(1u << 2))   // emits geometry at all
+// The DRAW bit, replicated into all four byte lanes of a uint32_t — 0x01010101 times the bit
+// value rather than the literal 0x04040404, so the constant stays correct if the bit position
+// above ever moves. Byte-lane replication does not care about host endianness: byte i of the
+// word is CELL_FLAG_DRAW on every platform, whichever end "byte 0" is.
+#define CELL_DRAW_WORD   ((uint32_t)CELL_FLAG_DRAW * 0x01010101u)
+static uint8_t  s_cell_flags[SCRATCH_BLOCKS];
 
 // v1.8.0 task 22b. How far below its cell's top a flowing water surface sits, in eighths of a
 // block, per scratch cell. 0 is a full cube, which is every block in the game except a flowing
@@ -137,7 +180,7 @@ static inline uint8_t cellDrop(int si)
 
 static FacePlan s_plan[BLOCK_FACES];
 static uint8_t  s_solid[256];                       // indexed by a raw BlockId byte
-static uint8_t  s_draws[256];                       // emits geometry: see s_cell_draw
+static uint8_t  s_draws[256];                       // emits geometry: see s_cell_flags
 static uint8_t  s_shape[256];                       // BLOCK_SHAPE_*
 
 // Step 7.5: does this block's geometry belong in the transparent pass? Solid *and*
@@ -296,9 +339,12 @@ static inline int avgByCnt(int sum, int cnt)
 // own way would drift from the rule that bakes it. One copy, two callers.
 static inline uint8_t cornerAO(int si, const CornerPlan* c)
 {
-	const int s1 = s_cell_solid[si + c->ao1];
-	const int s2 = s_cell_solid[si + c->ao2];
-	return (s1 && s2) ? 0 : (uint8_t)(3 - s1 - s2 - s_cell_solid[si + c->aoc]);
+	// CELL_FLAG_SOLID is bit 0 (see s_cell_flags), so masking it out of the packed byte is
+	// already exactly 0 or 1 — the same int this arithmetic summed straight out of the old
+	// s_cell_solid array, no shift needed.
+	const int s1 = s_cell_flags[si + c->ao1] & CELL_FLAG_SOLID;
+	const int s2 = s_cell_flags[si + c->ao2] & CELL_FLAG_SOLID;
+	return (s1 && s2) ? 0 : (uint8_t)(3 - s1 - s2 - (s_cell_flags[si + c->aoc] & CELL_FLAG_SOLID));
 }
 
 // Smooth per-corner light: average the four cells touching this corner from outside the
@@ -314,7 +360,7 @@ static inline uint8_t cornerLight(const MeshScratch* s, int si, const FacePlan* 
 	const int taps[4] = { si + p->neighbour, si + c->ao1, si + c->ao2, si + c->aoc };
 	int ssum = 0, bsum = 0, cnt = 0;
 	for (int t = 0; t < 4; t++) {
-		if (s_cell_occl[taps[t]]) continue;
+		if (s_cell_flags[taps[t]] & CELL_FLAG_OCCL) continue;
 		ssum += s->light[taps[t]] >> 4;
 		bsum += s->light[taps[t]] & 15;
 		cnt++;
@@ -453,7 +499,7 @@ static uint8_t s_face_done[SCRATCH_BLOCKS];
 static inline bool sameMaterialCovers(const MeshScratch* s, int ni, uint8_t id, int face,
                                       uint8_t drop)
 {
-	if (!s_cell_draw[ni] || s->blocks[ni] != id) return false;
+	if (!(s_cell_flags[ni] & CELL_FLAG_DRAW) || s->blocks[ni] != id) return false;
 	if (!s_any_drop) return true;
 	if (face == FACE_TOP || face == FACE_BOTTOM) return true;
 	return s_cell_drop[ni] <= drop;
@@ -473,7 +519,7 @@ static inline bool mergeCandidate(const MeshScratch* s, int nb, int face, uint8_
 	if (cellDrop(nb) != drop) return false;
 
 	const int ni = nb + s_plan[face].neighbour;
-	if (s_cell_occl[ni]) return false;
+	if (s_cell_flags[ni] & CELL_FLAG_OCCL) return false;
 	if (deferred && sameMaterialCovers(s, ni, id, face, drop)) return false;
 	return true;
 }
@@ -683,7 +729,7 @@ static int      s_emit_alpha_lo;   // transparent cells, [s_emit_alpha_lo, CHUNK
 
 // v1.7.1 task 49. Which of a listed cell's six faces is NOT covered by the neighbour it looks
 // at, one bit per FACE_* index, parallel to s_emit by list position. Written once here, read
-// by the seven walks in meshPass instead of each of them re-reading s_cell_occl at its own
+// by the seven walks in meshPass instead of each of them re-reading the OCCL bit at its own
 // neighbour offset.
 //
 // This is the measured fix for task 49, so the reasoning belongs next to it. The opaque
@@ -747,19 +793,18 @@ static void emitCollect(const MeshScratch* s)
 		for (int lz = 0; lz < CHUNK_DIM; lz++) {
 			int si = scratchIndex(1, ly + 1, lz + 1);
 
-			// Step 9.4b. BLOCK_AIR == 0 and s_cell_draw[BLOCK_AIR] is false by
-			// construction, so four consecutive s_cell_draw bytes reading back as the
-			// word 0 mean four consecutive cells that draw nothing at all, and nothing
-			// in a run of four cells like that can ever emit. A 16-wide chunk row is
-			// exactly four uint32_t words, so testing the word first turns "4 byte loads
-			// + 4 branches" into "1 word load + 1 branch" for every such run, which is
-			// most of an open-sky chunk.
+			// Step 9.4b. BLOCK_AIR == 0 and its DRAW bit is clear by construction, so four
+			// consecutive cells with the DRAW bit clear are four consecutive cells that draw
+			// nothing at all, and nothing in a run of four cells like that can ever emit. A
+			// 16-wide chunk row is exactly four uint32_t words, so testing the word first
+			// turns "4 byte loads + 4 branches" into "1 word load + 1 branch" for every such
+			// run, which is most of an open-sky chunk.
 			//
-			// v1.6.0 task 13 moved this off s_cell_solid. The two tables agree on every
-			// block in the registry today — air draws nothing and everything else is a
-			// solid cube — so the scan skips exactly the runs it has always skipped; what
-			// changes is that a block which draws without colliding (a plant now, water
-			// next) reaches the emit list instead of being passed over as "not solid".
+			// v1.6.0 task 13 moved this off solidity. The two questions agree on every block
+			// in the registry today — air draws nothing and everything else is a solid cube
+			// — so the scan skips exactly the runs it has always skipped; what changes is
+			// that a block which draws without colliding (a plant now, water next) reaches
+			// the emit list instead of being passed over as "not solid".
 			//
 			// This is the loop that SCANS FOR drawable cells to build the emit list — the
 			// only place in this file eligible for an air-skip. meshPass() below tests
@@ -767,31 +812,37 @@ static void emitCollect(const MeshScratch* s)
 			// four of; skipping there would also risk stepping over the exact
 			// transparent-neighbour check step 9.1 added. Not touched.
 			//
-			// (The array the cast note below is about is s_cell_draw now, not
-			// s_cell_solid; both are plain uint8_t[SCRATCH_BLOCKS] and the argument is
-			// unchanged in every other respect.)
+			// v1.8.6: solidity, occlusion and draw-at-all now live packed in one byte per cell
+			// (s_cell_flags, declared above) instead of three separate arrays, so the word read
+			// below is no longer "draw, and only draw" for each of the four bytes — a packed
+			// byte can be non-zero from SOLID or OCCL alone. The word is masked down to just
+			// the four DRAW bits (CELL_DRAW_WORD) before the zero test, which is exact for the
+			// same reason the old unmasked test was: BLOCK_AIR's packed byte is 0 in every bit,
+			// so a masked word of 0 still means, and only means, "these four cells draw
+			// nothing" — it is no longer true only by the coincidence that nothing in today's
+			// registry is solid-or-occluding without also drawing.
 			//
 			// si is NOT provably 4-byte aligned: it is scratchIndex(1, ly+1, lz+1) + lx,
 			// and SCRATCH_DIM (18, world/scratch.h:17) is not a multiple of 4, so the
 			// row's starting address cycles through all four byte phases as ly and lz
-			// vary — there is no fixed alignment to assert. A `(uint32_t*)&s_cell_solid[si]`
+			// vary — there is no fixed alignment to assert. A `(uint32_t*)&s_cell_flags[si]`
 			// cast would be an unaligned load the ARM11 is not guaranteed to tolerate.
 			// memcpy's semantics don't depend on alignment at all: GCC lowers a
 			// fixed-size memcpy to a single load when it can prove one is safe for the
 			// target and to a safe byte sequence when it can't, so this is correct
 			// either way without knowing the CPU's unaligned-access policy at compile
-			// time. s_cell_solid itself (world/mesher.c) is a plain uint8_t[]; nothing
+			// time. s_cell_flags itself (world/mesher.c) is a plain uint8_t[]; nothing
 			// about its declaration promises 4-byte alignment either, which is exactly
 			// why the row offset can't be trusted and memcpy is the right tool, not a
 			// cast plus an alignment attribute.
 			for (int lx = 0; lx < CHUNK_DIM; lx += 4, si += 4) {
 				uint32_t word;
-				memcpy(&word, &s_cell_draw[si], sizeof(word));
-				if (word == 0) continue;   // four cells that draw nothing
+				memcpy(&word, &s_cell_flags[si], sizeof(word));
+				if ((word & CELL_DRAW_WORD) == 0) continue;   // four cells that draw nothing
 
 				for (int k = 0; k < 4; k++) {
 					const int sik = si + k;
-					if (!s_cell_draw[sik]) continue;
+					if (!(s_cell_flags[sik] & CELL_FLAG_DRAW)) continue;
 
 					const BlockId id = s->blocks[sik];
 
@@ -806,7 +857,7 @@ static void emitCollect(const MeshScratch* s)
 					// geometry and this must not become a second copy of it.
 					uint8_t mask = 0;
 					for (int face = 0; face < BLOCK_FACES; face++)
-						if (!s_cell_occl[sik + s_plan[face].neighbour])
+						if (!(s_cell_flags[sik + s_plan[face].neighbour] & CELL_FLAG_OCCL))
 							mask |= (uint8_t)(1u << face);
 
 					// A shape that is not a full cube is emitted whole by emitCross and never
@@ -820,7 +871,7 @@ static void emitCollect(const MeshScratch* s)
 						// Nothing exposed: every one of the six walks would reach this cell,
 						// test the neighbour, and skip. Leaving it off the list is exact, not
 						// an approximation — mergeRun cannot pull it back in either, because
-						// mergeCandidate applies the same s_cell_occl test to a run's next
+						// mergeCandidate applies the same CELL_FLAG_OCCL test to a run's next
 						// cell before absorbing it.
 						if (!mask) continue;
 					} else {
@@ -876,7 +927,7 @@ static void meshPass(MeshOut* out, const MeshScratch* s, const EmitCell* cells,
 		// exposed in the direction THIS pass emits costs one byte load and one test, and the
 		// six-byte EmitCell beside it is never touched. An opaque pass over a buried chunk is
 		// almost entirely this branch. Correctness is unchanged — the bit is exactly the
-		// `!s_cell_occl[si + s_plan[face].neighbour]` the loop below used to compute for
+		// `!(s_cell_flags[...] & CELL_FLAG_OCCL)` the loop below used to compute for
 		// itself, written once by emitCollect from the same s_plan table.
 		const uint8_t fm = masks[idx];
 		if (!(fm & want)) continue;
@@ -921,7 +972,7 @@ static void meshPass(MeshOut* out, const MeshScratch* s, const EmitCell* cells,
 			// instead of guessing air.
 			//
 			// Since v1.7.1 task 49 it is read out of the cell's exposure byte rather than
-			// out of s_cell_occl at the neighbour's offset. Same answer, from the same
+			// out of CELL_FLAG_OCCL at the neighbour's offset. Same answer, from the same
 			// table, computed once per cell by emitCollect instead of once per cell per
 			// walk — see s_emit_face. It stays first because it is now a test against a
 			// value already in hand, so it is the cheapest of the three.
@@ -940,7 +991,7 @@ static void meshPass(MeshOut* out, const MeshScratch* s, const EmitCell* cells,
 			// alone is what hid the trunk faces inside a canopy — see
 			// testMesherOpaqueBehindTransparent.
 			//
-			// s_cell_draw, not s_cell_solid: the pair of blocks this rule is about is
+			// CELL_FLAG_DRAW, not CELL_FLAG_SOLID: the pair of blocks this rule is about is
 			// "two of the same thing touching", which is a question about geometry and
 			// not about collision. Identical today — leaves are the only transparent
 			// block and they are solid — and it is what will keep a body of water from
@@ -1050,11 +1101,14 @@ void meshChunk(MeshOut* out, const MeshScratch* s)
 
 	if (!s_ready) planBuild();
 
+	// v1.8.6: one packed byte per cell instead of three separate arrays — see s_cell_flags'
+	// own comment above for the reasoning and for why the word-scan in emitCollect needed a
+	// mask, not just a renamed array, to stay exact.
 	for (int i = 0; i < SCRATCH_BLOCKS; i++) {
 		const BlockId id = s->blocks[i];
-		s_cell_solid[i] = s_solid[id];
-		s_cell_occl[i]  = s_occludes[id];
-		s_cell_draw[i]  = s_draws[id];
+		s_cell_flags[i] = (uint8_t)((s_solid[id]    ? CELL_FLAG_SOLID : 0) |
+		                            (s_occludes[id] ? CELL_FLAG_OCCL  : 0) |
+		                            (s_draws[id]    ? CELL_FLAG_DRAW  : 0));
 	}
 
 	// v1.6.0 task 11. No face has been claimed by a greedy run yet. One memset of 5,832

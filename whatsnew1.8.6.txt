@@ -1,0 +1,8 @@
+[features]
+Nothing looks different. The game does less work to draw exactly the same world.
+Worlds generate faster: trees no longer measure ground they could never reach.
+Chunk meshing now uses 5,832 bytes of working memory where it used 17,496.
+Saving a column does half the file work it used to, with no change to your saves.
+
+[fixes]
+The tests covering block breaking and placing never ran the lighting code. Now they do.

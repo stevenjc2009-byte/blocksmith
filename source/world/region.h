@@ -127,6 +127,51 @@
 // devoptab at all, the FIRST rename below fails and nothing has been touched — the old .bsr
 // is still there and still correct, and regionCompact returns false. The old sequence had
 // already removed the .bsr by the time it found out.
+//
+// ── v1.8.6 "Speed": the redundant ASKING is gone, the gate itself is untouched ─────────
+//
+// The task that produced this said, and it was right to say so as a hypothesis rather than a
+// fact: regionMaintain's gated call to regionCompact removed 3 fopens and 6176 bytes of
+// directory buffer per save, for a check that fired 0 times in 162 observed saves. What that
+// figure actually is: regionCompact re-derives, from a cold reopen of the file, exactly the
+// state regionWriteColumn had just finished deriving a moment earlier on the same file, same
+// thread — a regionRecover probe (fopen x2), a fresh open (fopen x3rd) and a full dirLoadPair
+// (6176 bytes across two 3088-byte reads) — purely to reach the SAME half-dead threshold
+// check regionCompact has always had, a few lines later.
+//
+// Considered and rejected: folding the gate's threshold check bodily into regionWriteColumn,
+// so the question is only ever asked once, anywhere. Rejected because regionCompact is also
+// a public entry point in its own right — called directly by world_test.c's four
+// testRegionCompact* tests and by region_growth_test.c's crash-recovery arm — and any of
+// those callers still needs an answer to "is this worth compacting", so the threshold would
+// have to live in two places or regionWriteColumn would have to call regionCompact itself.
+// The latter changes what regionWriteColumn's caller can observe: today a save's success and
+// a region's compaction are independent outcomes (worker.c counts them separately,
+// s_saved and the compaction counter in region_growth_test.c), and collapsing them would
+// erase that distinction to save nothing further — the per-call cost of evaluating the
+// threshold was never the expensive part; re-deriving its INPUTS from disk was.
+//
+// So what shipped instead is a hint: regionWriteColumn already computes the post-write
+// directory state (to pick its append offset) and already knows it is correct, because
+// nothing else touches a region file outside this translation unit. It hands that state
+// forward for exactly one regionMaintain call — the one workerWriteSave always makes
+// immediately afterward — and regionMaintain answers the gate from it directly when it is
+// still valid, or falls through to the untouched regionCompact when it is not (wrong region,
+// already consumed, or invalidated by anything that calls regionCacheClose). The gate's
+// THRESHOLD and its BEHAVIOUR when it fires are unchanged code, still living in regionCompact,
+// still reached exactly the same way on the rare "yes"; only the setup work behind the common
+// "no" moved from "reopen and reread" to "read what is already in hand". See region.c, the
+// comment above regionWriteColumn, for the full mechanism and the argument for why the hinted
+// state is provably identical to a fresh read rather than merely a fast approximation of one.
+//
+// Measured (host, scratchpad probe binary built with -DBS_REGION_PROBE against a real
+// existing region file, one steady-state save that declines compaction): fopen count per
+// save 6 -> 3 (regionWriteColumn's own 3 unchanged; regionMaintain's 3 -> 0), and the 6176
+// bytes of directory-copy stack buffer the redundant regionRecover+dirLoadPair pair cost are
+// gone from that path entirely. Full numbers, including the forced-compaction case proving
+// the rare branch is untouched, are in region_test.c and this session's report rather than
+// restated here to avoid a second set of figures this comment would have to be kept in sync
+// with.
 #pragma once
 
 #include <stdbool.h>
@@ -199,8 +244,19 @@ bool regionCompact(const char* world_dir, int32_t rx, int32_t rz);
 // v1.8.2. Call after saving a column. Compacts that region if — and only if — at least half
 // its payload arena is dead, and does nothing at all otherwise, which is twenty-six saves out of
 // twenty-seven in the measured workload (960/36, and it read "sixteen out of seventeen" while
-// that compaction count was the fixture-inflated 56). Cheap when it declines: three file-existence probes,
-// one open and two 3088-byte directory reads.
+// that compaction count was the fixture-inflated 56).
+//
+// v1.8.6: cheap when it declines is now three comparisons over an in-memory array and
+// nothing else, when this call is the one that always follows the regionWriteColumn that
+// produced the state it needs — which is every production call, app/worker.c's
+// workerWriteSave. Before v1.8.6 declining still cost three file-existence probes, one open
+// and two 3088-byte directory reads, because regionCompact re-derived that state from disk
+// from scratch on every call rather than being handed it. See the save-side compaction hint
+// above regionWriteColumn in region.c for the mechanism and why reusing that state is exactly
+// equivalent to a fresh read, not an approximation of one. Any call whose (world_dir, rx, rz)
+// does not match the immediately preceding write falls through to the pre-v1.8.6 behaviour
+// unchanged — the fast path never changes what gets decided, only how the "no" answer is
+// reached.
 //
 // This is the wiring, and it lives in region.c rather than as a bare regionCompact call in
 // app/worker.c so that a host test can drive the same line the game does. Measured by
@@ -257,6 +313,9 @@ void regionCacheClose(void);
 extern unsigned long g_region_fopens;
 extern unsigned long g_region_dirreads;
 extern const unsigned long g_region_cache_bytes;
+// v1.8.6. sizeof the save-side compaction hint (region.c, above regionWriteColumn) — one
+// Dir plus a path and three words, static, exactly one instance. See there for what it is.
+extern const unsigned long g_region_writehint_bytes;
 #endif
 
 // Region coordinate for a column coordinate. Arithmetic shift, so it floors on the negative
