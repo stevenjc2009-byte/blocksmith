@@ -67,12 +67,38 @@
 // stamp at all rather than by carrying the number.
 #define GEN_VERSION_LEGACY   1u
 
-// v1.7.0: the Beta 1.7.3-style 5x5x17 density field, trilinearly interpolated.
+// v1.7.0: the Beta 1.7.3-style 5x5x17 density field, trilinearly interpolated. The biome
+// FIELD already shapes this one — task 16's height/amplitude table is sampled per column —
+// but nothing else in the world knows which biome it is standing in.
 #define GEN_VERSION_DENSITY  2u
+
+// v1.8.3: biome IDENTITY on top of that field. Desert sand by classification rather than by
+// the old hot-field expression, tundra snow, sea ice on tundra and taiga coasts, per-biome
+// tree density and canopy shape, and the cactus/dead-bush/fern flora pass.
+//
+// **Why this is a separate version rather than a change to GEN_VERSION_DENSITY.** It was
+// nearly the latter, and the difference was measured rather than argued: with the biome work
+// gated on `== GEN_VERSION_DENSITY`, a host probe generated the twelve columns world_test.c
+// pins for legacy (seeds 1337 / 4242 / 90210 crossed with columns (0,0) (1,0) (-1,-1) (7,-3))
+// at GEN_VERSION_DENSITY against the v1.8.2 tag and against the v1.8.3 tip, and SEVEN OF THE
+// TWELVE HASHES MOVED. Every world made by v1.7.0 through v1.8.2 carries stamp 2, so every
+// one of them would have come back a different shape under its player's buildings on an
+// update nobody opted into — the exact thing the rule at the top of this file exists to stop,
+// arriving through the one door marked "the stamp is already correct".
+//
+// blocksmith-roadmap.md said so before the code did: "A new GEN_VERSION_BIOMES has to be
+// minted and stamped at world creation" is listed there as one of the unresolved forks
+// blocking biomes. It was never done, and the biome work landed on version 2.
+//
+// The dispatch rule that follows from this, and the one to keep to when the next generator
+// lands: the density FIELD is `version >= GEN_VERSION_DENSITY`, because a biome world is a
+// density world with more on top. Biome IDENTITY is `version >= GEN_VERSION_BIOME`. Anything
+// written as `== GEN_VERSION_DENSITY` from here on is a bug waiting for version 4.
+#define GEN_VERSION_BIOME    3u
 
 // The newest generator this build can produce. A stamp above this is a world from the
 // future and is refused — see genVersionResolve.
-#define GEN_VERSION_NEWEST   GEN_VERSION_DENSITY
+#define GEN_VERSION_NEWEST   GEN_VERSION_BIOME
 
 // What a new world made by this build gets stamped with.
 #define GEN_VERSION_FOR_NEW_WORLDS GEN_VERSION_NEWEST

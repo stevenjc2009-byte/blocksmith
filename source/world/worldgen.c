@@ -163,12 +163,16 @@ BiomeId worldgenBiomeAt(const WorldGen* g, int32_t x, int32_t z)
 bool worldgenIsSandy(const WorldGen* g, int32_t x, int32_t z)
 {
 	// v1.8.3 Phase 2. **The version gate, and the reason world/worldgen.h documents it at
-	// length.** A density world's sand is the desert cap and nothing else; a legacy world
-	// keeps the expression it has always had, evaluated on the same field with the same
+	// length.** A biome world's sand is the desert cap and nothing else; a legacy or density
+	// world keeps the expression it has always had, evaluated on the same field with the same
 	// constant, so its beaches and deserts cannot move. The two rules disagree at about a
 	// fifth of all columns — every column that is hot AND wet is sand under the old rule and
 	// jungle under the new one — so this branch is load-bearing rather than tidy.
-	if (g->version == GEN_VERSION_DENSITY)
+	//
+	// The gate was `== GEN_VERSION_DENSITY` until 2026-09-01, which put the new rule into
+	// every world v1.7.0 through v1.8.2 had already stamped. See genversion.h's note on
+	// GEN_VERSION_BIOME for the measurement that caught it.
+	if (g->version >= GEN_VERSION_BIOME)
 		return worldgenBiomeAt(g, x, z) == BIOME_DESERT;
 
 	return worldgenBiome(g, x, z) < GEN_SAND_BELOW;
@@ -227,7 +231,10 @@ static int legacyHeight(const WorldGen* g, int32_t x, int32_t z)
 
 int worldgenHeight(const WorldGen* g, int32_t x, int32_t z)
 {
-	return (g->version == GEN_VERSION_DENSITY) ? wgdHeight(g, x, z)
+	// `>=`, not `==`: a biome world is a density world with more on top, and the field itself
+	// is shared. genversion.h states the rule — the FIELD is >= GEN_VERSION_DENSITY, biome
+	// IDENTITY is >= GEN_VERSION_BIOME.
+	return (g->version >= GEN_VERSION_DENSITY) ? wgdHeight(g, x, z)
 	                                           : legacyHeight(g, x, z);
 }
 
@@ -278,12 +285,13 @@ static Tree treeInCell(const WorldGen* g, int32_t tcx, int32_t tcz)
 	t.x = tcx * GEN_TREE_CELL + 1 + (int32_t)((h >> 8) % (GEN_TREE_CELL - 2));
 	t.z = tcz * GEN_TREE_CELL + 1 + (int32_t)((h >> 13) % (GEN_TREE_CELL - 2));
 
-	// v1.8.3 Phase 2. Tree density and silhouette per biome on a density world; the single
-	// global constants on a legacy one, which is what keeps every existing world's forest
-	// exactly where it was.
+	// v1.8.3 Phase 2. Tree density and silhouette per biome on a BIOME world; the single
+	// global constants on a legacy or density one, which is what keeps every existing world's
+	// forest exactly where it was. The gate read `== GEN_VERSION_DENSITY` until 2026-09-01 —
+	// see genversion.h on GEN_VERSION_BIOME.
 	int trunk_min = GEN_TREE_MIN_H, trunk_max = GEN_TREE_MAX_H;
 	uint32_t chance = (uint32_t)GEN_TREE_CHANCE;
-	if (g->version == GEN_VERSION_DENSITY) {
+	if (g->version >= GEN_VERSION_BIOME) {
 		const BiomeParams* bp = worldgenBiomeParams(worldgenBiomeAt(g, t.x, t.z));
 		chance    = bp->tree_chance;
 		trunk_min = bp->trunk_min;
@@ -314,7 +322,10 @@ static Tree treeInCell(const WorldGen* g, int32_t tcx, int32_t tcz)
 	// that nothing new reaches an old world.
 	//
 	// Task 17 fills the oceans; this is what stops it filling them around tree trunks.
-	if (g->version == GEN_VERSION_DENSITY && t.ground <= GEN_SEA_LEVEL)
+	// `>=`: the waterline exists on every generator from the density field upward, so a biome
+	// world must keep this rule too. Only the legacy path, which has no concept of water, is
+	// excluded.
+	if (g->version >= GEN_VERSION_DENSITY && t.ground <= GEN_SEA_LEVEL)
 		return t;
 
 	t.trunk  = trunk_min +
@@ -458,11 +469,22 @@ bool worldgenScatter(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 			// first test can only reject cells the second would have rejected anyway — the
 			// answer is identical to resolving the biome for all 256 cells, at a fraction of
 			// the cost. The suite asserts the bound really does bound the table.
+			//
+			// Gated on GEN_VERSION_BIOME as of 2026-09-01. A world stamped
+			// GEN_VERSION_DENSITY keeps the single global GEN_GRASS_CHANCE 24 it was made
+			// with — this pass is reachable from the density path, so leaving the per-biome
+			// table ungated changed the tall grass in every v1.7.0-v1.8.2 world. See
+			// genversion.h on GEN_VERSION_BIOME.
 			const uint32_t draw = rngHash2(salt, x, z) & 0xFFu;
-			if (draw >= (uint32_t)GEN_GRASS_CHANCE_MAX)
+			if (g->version >= GEN_VERSION_BIOME) {
+				if (draw >= (uint32_t)GEN_GRASS_CHANCE_MAX)
+					continue;
+				if (draw >= (uint32_t)worldgenBiomeParams(worldgenBiomeAt(g, x, z))
+				                          ->grass_chance)
+					continue;
+			} else if (draw >= (uint32_t)GEN_GRASS_CHANCE) {
 				continue;
-			if (draw >= (uint32_t)worldgenBiomeParams(worldgenBiomeAt(g, x, z))->grass_chance)
-				continue;
+			}
 
 			// Grass only — not sand, not the bare stone of a cliff face, not a dirt scar.
 			if (worldGet(w, x, y - 1, z) != BLOCK_GRASS)
@@ -479,7 +501,13 @@ bool worldgenScatter(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 		}
 	}
 
-	return worldgenFlora(g, w, cx, cz, tops) && ok;
+	// v1.8.3 Phase 3, and BIOME-only: cactus, dead bush and fern are biome identity, and a
+	// world stamped GEN_VERSION_DENSITY was made before any of them existed. Running it there
+	// would put plants into worlds their players have already walked through.
+	if (g->version >= GEN_VERSION_BIOME)
+		return worldgenFlora(g, w, cx, cz, tops) && ok;
+
+	return ok;
 }
 
 // v1.8.3 Phase 3. Are the `n` cells from (x, y, z) upwards inside the world AND all air?
@@ -615,7 +643,10 @@ bool worldgenColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 	// v1.7.0. The two generators share the decoration pass and nothing else — the tree rules
 	// are about where a tree may stand, not about how the ground got there, so duplicating
 	// them per generator would be two copies of one answer.
-	if (g->version == GEN_VERSION_DENSITY) {
+	//
+	// `>=`: the density FIELD builds every world from version 2 upward. What differs above it
+	// is biome identity, and that is decided inside the passes, not here. See genversion.h.
+	if (g->version >= GEN_VERSION_DENSITY) {
 		if (!wgdColumn(g, w, cx, cz))
 			return false;
 		// Both are run even if the first fails, and both results are reported: a refused

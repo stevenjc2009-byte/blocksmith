@@ -60,13 +60,26 @@ static WorldGen    s_gen;
 static MeshScratch s_scratch;
 
 // render_dist.h caps RENDER_DIST_MAX at 3, a 7x7 = 49 column area — that is the widest
-// ring the game ever meshes today. RADIUS below is still 2 (a 5x5 = 25 column area, the
-// cap before v1.6.0 task 12 raised it), so this bench no longer covers the shipped worst
-// case; whether to raise it to 3 to match is a scope decision for whoever owns this file,
-// not taken here. Benching a wide ring rather than one chunk keeps the form mix (UNIFORM
+// ring the game ever meshes today, and RADIUS matches it. It was 2 (a 5x5 = 25 column
+// area, the cap before v1.6.0 task 12 raised it) until 2026-09-01, which meant this bench
+// did not cover the shipped worst case at all: the ring it timed was half the area the
+// game actually meshes. Raised on steve's instruction to fix the open items before the
+// v1.8.3 release. Benching a wide ring rather than one chunk keeps the form mix (UNIFORM
 // deep rock, PALETTE4 surface, RAW where cave noise perforates) representative instead of
 // whatever a hand-built chunk happens to be.
-#define RADIUS 2
+//
+// Numbers from before the change are NOT comparable to numbers after it — the chunk count
+// and the form mix both move. Measured on this machine (WSL, gcc -O2), same binary flags,
+// two runs each:
+//   RADIUS 2   124 chunks, uniform 10  palette4 114  raw 0,  2480 fills/pass,
+//              8.189 - 9.811 us per fill over six passes
+//   RADIUS 3   240 chunks, uniform 12  palette4 228  raw 0,  4800 fills/pass,
+//              8.513 - 9.251 us per fill over six passes
+// The per-fill cost did not move — the two ranges overlap almost exactly — which is the
+// useful result: the gather is per-chunk and does not degrade as the ring widens. What
+// changed is that the figure now describes the ring the game really builds, over 240
+// chunks instead of 124.
+#define RADIUS 3
 
 static double nowSeconds(void)
 {

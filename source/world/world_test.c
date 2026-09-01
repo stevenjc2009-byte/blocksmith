@@ -7536,9 +7536,13 @@ static void testWorldgenLegacySandyWideSweep(void)
 
 	long swept = 0;
 	for (int s = 0; s < 3; s++) {
+		// The NEW rule lives at GEN_VERSION_BIOME as of 2026-09-01, not at
+		// GEN_VERSION_DENSITY — a density world keeps the old expression, which is what stops
+		// v1.8.3 reshaping every world v1.7.0-v1.8.2 stamped. The variable keeps its name
+		// because what it stands for here is "the arm the new rule is on".
 		WorldGen legacy, density;
 		CHECK(worldgenInit(&legacy,  seeds[s], GEN_VERSION_LEGACY));
-		CHECK(worldgenInit(&density, seeds[s], GEN_VERSION_DENSITY));
+		CHECK(worldgenInit(&density, seeds[s], GEN_VERSION_BIOME));
 
 		long mismatch = 0, disagree = 0, old_sandy = 0, new_sandy = 0, n = 0;
 		for (int32_t z = -512; z <= 512; z += 7) {
@@ -7587,7 +7591,7 @@ static void testWorldgenLegacySandyWideSweep(void)
 static void testWorldgenBiomes(void)
 {
 	WorldGen g;
-	CHECK(worldgenInit(&g, 1337u, GEN_VERSION_DENSITY));
+	CHECK(worldgenInit(&g, 1337u, GEN_VERSION_BIOME));
 
 	// **GEN_TEMP_HOT is an arithmetic identity, not a tuning constant**, and this is the
 	// check that says so. `temp > FX_ONE - GEN_SAND_BELOW` must be the same predicate as
@@ -7751,12 +7755,14 @@ static void testGenVersionContract(void)
 	// Append-only and ordered. A renumber would re-point every stamp already on a card.
 	CHECK(GEN_VERSION_LEGACY == 1u);
 	CHECK(GEN_VERSION_DENSITY == 2u);
-	CHECK(GEN_VERSION_NEWEST == GEN_VERSION_DENSITY);
+	CHECK(GEN_VERSION_BIOME == 3u);
+	CHECK(GEN_VERSION_NEWEST == GEN_VERSION_BIOME);
 	CHECK(GEN_VERSION_FOR_NEW_WORLDS == GEN_VERSION_NEWEST);
 
 	CHECK(!genVersionKnown(0u));
 	CHECK(genVersionKnown(GEN_VERSION_LEGACY));
 	CHECK(genVersionKnown(GEN_VERSION_DENSITY));
+	CHECK(genVersionKnown(GEN_VERSION_BIOME));
 	CHECK(!genVersionKnown(GEN_VERSION_NEWEST + 1u));
 	CHECK(!genVersionKnown(0xFFFFFFFFu));
 
@@ -7774,6 +7780,8 @@ static void testGenVersionContract(void)
 	CHECK(g.version == GEN_VERSION_LEGACY);
 	CHECK(worldgenInit(&g, 1337u, GEN_VERSION_DENSITY));
 	CHECK(g.version == GEN_VERSION_DENSITY);
+	CHECK(worldgenInit(&g, 1337u, GEN_VERSION_BIOME));
+	CHECK(g.version == GEN_VERSION_BIOME);
 
 	// The seed mix must not depend on the version, or stamping an existing world would move
 	// its noise even on the legacy path.
@@ -7781,6 +7789,9 @@ static void testGenVersionContract(void)
 	CHECK(worldgenInit(&a, 4242u, GEN_VERSION_LEGACY));
 	CHECK(worldgenInit(&b, 4242u, GEN_VERSION_DENSITY));
 	CHECK(a.seed == b.seed);
+	WorldGen c;
+	CHECK(worldgenInit(&c, 4242u, GEN_VERSION_BIOME));
+	CHECK(a.seed == c.seed);
 }
 
 // The biome table (task 16): shape, bounds, and the fact that it reads the EXISTING biome
@@ -8150,7 +8161,7 @@ static int genTestTerrainTop(const World* w, int32_t x, int32_t z)
 static void testWorldgenBiomeSurface(void)
 {
 	WorldGen g;
-	CHECK(worldgenInit(&g, 90210u, GEN_VERSION_DENSITY));
+	CHECK(worldgenInit(&g, 90210u, GEN_VERSION_BIOME));
 	worldInit(&s_world);
 	const int32_t ox = 10, oz = -20, r = 3;
 	for (int32_t cz = oz - r; cz <= oz + r; cz++)
@@ -8328,7 +8339,7 @@ static void testWorldgenPhase3Flora(void)
 	const int      r  = 5;
 
 	WorldGen g;
-	CHECK(worldgenInit(&g, seed, GEN_VERSION_DENSITY));
+	CHECK(worldgenInit(&g, seed, GEN_VERSION_BIOME));
 	worldInit(&s_world);
 	for (int32_t cz = oz - r; cz <= oz + r; cz++)
 		for (int32_t cx = ox - r; cx <= ox + r; cx++)
@@ -8567,7 +8578,7 @@ static void testWorldgenWaterAndGrass(void)
 	};
 	for (size_t i = 0; i < sizeof(pinned) / sizeof(pinned[0]); i++) {
 		WorldGen g;
-		CHECK(worldgenInit(&g, pinned[i].seed, GEN_VERSION_DENSITY));
+		CHECK(worldgenInit(&g, pinned[i].seed, GEN_VERSION_BIOME));
 		worldInit(&s_world);
 		CHECK(worldgenColumn(&g, &s_world, pinned[i].cx, pinned[i].cz));
 		CHECK_QUIET(genTestHashColumnTerrain(&s_world, pinned[i].cx, pinned[i].cz)
@@ -8638,7 +8649,7 @@ static void testWorldgenWaterAndGrass(void)
 	for (int si = 0; si < 2; si++) {
 		const int32_t ox = areas[si].cx, oz = areas[si].cz;
 		WorldGen g;
-		CHECK(worldgenInit(&g, areas[si].seed, GEN_VERSION_DENSITY));
+		CHECK(worldgenInit(&g, areas[si].seed, GEN_VERSION_BIOME));
 		worldInit(&s_world);
 		for (int32_t cz = oz - 2; cz <= oz + 2; cz++)
 			for (int32_t cx = ox - 2; cx <= ox + 2; cx++)
@@ -10909,21 +10920,43 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	// returned 0 with all 11 mirrored files byte-for-byte identical. What is still missing is
 	// only the console-side pin itself: it needs its own measured literal and is not guessable
 	// from this one, because the count depends on which tests the ifndef excludes.
+	// v1.8.3, GEN_VERSION_BIOME mint: 5407 + 11 = 5418. This one was NOT counted off the
+	// source and must not be, because five of the eleven are data-dependent. What was done
+	// instead, measured 2026-09-01:
+	//
+	//   +6  the version-contract additions. Measured by ablation, not by counting: the six
+	//       new lines (GEN_VERSION_BIOME == 3u, genVersionKnown, the BIOME worldgenInit and
+	//       its g.version pair, the WorldGen c init and its a.seed compare) were rewritten
+	//       from CHECK( to (void)( -- the calls still ran, only the counting was dropped --
+	//       and the run printed exactly 5412. So those six cost six.
+	//   +5  the six generator inits flipped from GEN_VERSION_DENSITY to GEN_VERSION_BIOME.
+	//       This is the part that cannot be read off the source. Those tests generate real
+	//       terrain and check per item found, so the number of checks they emit depends on
+	//       what the generator produced. There is no clean arm to attribute it more finely:
+	//       putting all six inits back to DENSITY (with the six new checks still ablated)
+	//       gives 5424 checks and 40 FAILURES, because those tests assert biome behaviour a
+	//       density world does not have -- and a red arm's total is not a measurement of
+	//       anything. 5418 is what the green tree prints, and green is the only arm whose
+	//       total means what this guard assumes it means.
+	//
+	// The consequence for whoever trips this next: if you change worldgen output at all, this
+	// guard can move without you having added or removed a single CHECK. Read WHICH checks
+	// went red first. If none did, the count moving is terrain, not test coverage.
 #ifndef __3DS__
 	{
 		const int ran = s_checks;
-		if (ran != 5407)
+		if (ran != 5418)
 			printf("\nCHECK-COUNT GUARD: %d checks ran, %d expected.\n"
 			       "  %s\n"
 			       "  This is NOT an ordinary assertion failure.\n"
 			       "  Read the comment above this guard in world/world_test.c before"
 			       " touching the pinned number.\n",
-			       ran, 5407,
-			       ran < 5407
+			       ran, 5418,
+			       ran < 5418
 			           ? "Checks went MISSING: checks that should have run never ran at all."
 			           : "Extra checks appeared: either you added checks and did not update"
 			             " the pin, or something is emitting checks it should not.");
-		CHECK(ran == 5407);
+		CHECK(ran == 5418);
 	}
 #endif
 

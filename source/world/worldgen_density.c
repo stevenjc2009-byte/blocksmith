@@ -551,11 +551,25 @@ bool wgdColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 	// one of the 256 cells. The identity is not left as an argument in a comment; the suite
 	// asserts worldgenIsSandy() and the classifier agree at every position of a wide sweep,
 	// which is the check that goes red if the two ever drift apart.
+	//
+	// **A world stamped GEN_VERSION_DENSITY has no biome identity, and gets the vocabulary
+	// rather than the feature.** Added 2026-09-01. Below GEN_VERSION_BIOME this array carries
+	// only the old sandy/not-sandy answer, spelled as BIOME_DESERT and BIOME_PLAINS, and both
+	// consumers then reproduce v1.8.2 exactly with no version test of their own:
+	// surfaceBlock() caps DESERT with sand (which is what `sandy` meant) and never sees
+	// TUNDRA, so nothing is capped with snow; seaBlockAt() never sees TUNDRA or TAIGA, so
+	// every sea cell is water. Expressing the old state in the new vocabulary is what keeps
+	// the two helpers single-bodied — the alternative was a `bool biomes` threaded through
+	// both and a second copy of each rule, which is the shape that drifts.
+	const bool biomes = (g->version >= GEN_VERSION_BIOME);
 	uint8_t biome[CHUNK_DIM][CHUNK_DIM];
 	for (int z = 0; z < CHUNK_DIM; z++)
-		for (int x = 0; x < CHUNK_DIM; x++)
-			biome[z][x] = (uint8_t)worldgenBiomeAt(g, cx * CHUNK_DIM + x,
-			                                       cz * CHUNK_DIM + z);
+		for (int x = 0; x < CHUNK_DIM; x++) {
+			const int32_t bx = cx * CHUNK_DIM + x, bz = cz * CHUNK_DIM + z;
+			biome[z][x] = biomes
+				? (uint8_t)worldgenBiomeAt(g, bx, bz)
+				: (uint8_t)(worldgenIsSandy(g, bx, bz) ? BIOME_DESERT : BIOME_PLAINS);
+		}
 
 	if (!worldColumnCreate(w, cx, cz))
 		return false;
