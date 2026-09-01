@@ -1,0 +1,22 @@
+# Release notes shown on the 3DS top screen before the update downloads.
+# Attach this to the v1.8.3 GitHub release alongside blocksmith1.8.3.cia.
+# Checked with: sh tools/make_whatsnew.sh 1.8.3
+#
+# v1.8.3 ONLY. This release is biomes, per-world seeds, and getting out of the water.
+# Player-facing prose only - it wraps at 61 characters on a 400px screen.
+# Items are capped at 95 characters each by source/app/whatsnew.h.
+# The developer-facing story lives in CHANGELOG.md.
+
+[features]
+Every new world now gets its own seed, so no two worlds look the same any more.
+Six kinds of place to find: tundra, taiga, plains, forest, desert and jungle.
+Snow, ice, cactus, dead bushes and ferns, each growing where they belong.
+Trees are different in every biome now - round crowns, tall conifers, broad jungle ones.
+Joining a server that builds its world differently now tells you, instead of going wrong.
+
+[fixes]
+You can climb out of the water again. Swim to a shore, press into it and you are out.
+Gentle bobbing is back on the water surface, much calmer than before.
+The battery gauge blinks when the battery is nearly flat.
+Lighting after a big water spill no longer stutters the game while it catches up.
+Old worlds open exactly as they were. Nothing in this update reshapes them.
