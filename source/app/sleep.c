@@ -121,6 +121,15 @@ static void onAptHook(APT_HookType hook, void* param)
 	// assumption that the clock it was told about is the clock it is running at. Setting
 	// the CPU speed is not this module's business in either direction: whoever wants
 	// speedup should ask for it once, visibly, at boot.
+	//
+	// v1.8.4: that is now app/hw.c, called from the top of main(). The timing worry above --
+	// that battery.c's tickMs() divides by SYSCLOCK_ARM11 and would be wrong at 804 MHz -- was
+	// checked and does NOT apply. devkitPro/libctru/include/3ds/os.h:16 documents the constant
+	// as "the clock rate for the Arm11 in CTR mode and in svcGetSystemTick"; the separate
+	// SYSCLOCK_ARM11_LGR2 (os.h:21) is the *core* clock. The system tick counter runs at
+	// SYSCLOCK_ARM11 whatever LGR mode the ARM11 is in, so every tick-to-milliseconds division
+	// in the tree stays correct and none of them were touched. The objection to putting the
+	// call HERE stands and is why it is not here -- a lid-close is not a decision point.
 }
 
 void sleepInit(void)

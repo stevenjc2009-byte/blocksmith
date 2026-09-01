@@ -60,6 +60,20 @@
 // is a hardware risk no emulator can measure. So the request is implemented, measured, and
 // off. Set -DBS_WORKER_CORE=1 to turn it back on; workerCore() reports where it landed.
 //
+// v1.8.4: **none of the table above applies to core 2**, and it must not be read as if it
+// did. Every row of it is core 1 -- the system core, rationed by APT_SetAppCpuTimeLimit and
+// shared with the OS. Core 2 exists only on a New 3DS, is granted by the exheader's
+// CanAccessCore2 rather than by an APT ration, and has nothing else running on it. So on a
+// New 3DS the worker now asks for core 2 **by default**, with BS_WORKER_CORE left at 0, and
+// falls back to core 0 when the grant is refused. BS_WORKER_CORE still means exactly what
+// it meant: may the worker have the system core. It is still off.
+//
+// What that is NOT: a measurement. It is a hardware request that cannot be measured here --
+// no emulator models the New 3DS core layout, and nothing in this project has run on real
+// hardware since v1.2.5. What IS verified is that the ladder returns {2,0} for a New 3DS
+// with no CPU-time grant (tests/hw_test.c) and that the fallback to core 0 is the same path
+// the console has always taken. The win itself is unproven until it runs on a New 3DS.
+//
 // It falls back to core 0 if either the APT call or the thread creation is refused, and
 // workerCore() reports where it actually landed — a silent fallback would leave every
 // measurement afterwards labelled with a core it never ran on.

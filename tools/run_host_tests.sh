@@ -977,6 +977,40 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 "./$BH/battery_test"
 
+# v1.8.4: hw.c's console-model policy -- the worker core ladder and the cached New 3DS
+# flag. Own binary, own main(), and the REAL source/app/hw.c is in the link for exactly
+# the reason the battery comment above records: hw.c's libctru half (APT_CheckNew3DS,
+# osSetSpeedupEnable) sits behind an #ifdef __3DS__, so the half with the decision in it
+# compiles here with nothing stubbed and nothing faked.
+#
+# No ordinal in this comment on purpose. The "Nth binary" counting in the stanzas above
+# has drifted -- this file has two "Tenth binary" comments (lines 407 and 785) and two
+# "Eleventh binary" (909 and 986) -- so a number here would be a fourteenth claim on a
+# count that is already wrong rather than a description of anything.
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/app/hw.c \
+	tests/hw_test.c \
+	-o "$BH/hw_test"
+
+"./$BH/hw_test"
+
+# The Update screen's action-button decision (v1.8.4). Links the REAL
+# source/app/updater_retry.c. The rest of app/updater.c is libcurl + AM + SOC and cannot be
+# host-compiled at all, which is exactly why the decision was split out into its own file:
+# "what does this button do" is the part the player experiences and it had no test.
+#
+# The bug it pins: every failure used to put CHECK NOW on the button, so recovering from a
+# dropped download meant re-asking GitHub for the release list before you could download
+# again. A failed download now offers RETRY DOWNLOAD and goes straight back to downloading.
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/app/updater_retry.c \
+	tests/updater_retry_test.c \
+	-o "$BH/updater_retry_test"
+
+"./$BH/updater_retry_test"
+
 # interop_test.c, source/net's real client (networld.c) speaking to a REAL bsgame daemon over a
 # real Unix socket — see that file's own header comment for why networld_test.c and bsgame_test.c
 # (deps/blocksmith-server/game/) each passing on their own proves nothing about whether the two

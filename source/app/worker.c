@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "app/hw.h"
 #include "debug/loadprof.h"
 #include "world/jobq.h"
 #include "world/light.h"
@@ -372,14 +373,46 @@ bool workerStart(const WorldGen* g)
 	// priority step below the main thread is the step 5.5 arrangement and it works: the
 	// worker gets the CPU while the main thread is blocked on the GPU, which is ~15.7 ms of
 	// every 16.71 ms frame. Refusing to start would turn "no second core" into "no world".
+	//
+	// v1.8.4 adds core 2 in front of that on a New 3DS. Cores 2 and 3 are the New 3DS's extra
+	// pair and core 2 is the one an application may be granted; nothing else on the console
+	// runs on it, so a worker there stops competing with the system for core 1's slice. It is
+	// a request like the others: the exheader has to have asked for it (cia/blocksmith.rsf's
+	// CanAccessCore2, added in the same version), and under the Homebrew Launcher the .3dsx
+	// inherits the launcher's exheader rather than ours, so this is expected to fail on the
+	// .3dsx and succeed on the installed CIA. The ladder handles both without a branch here.
+	//
+	// The order itself lives in app/hw.c, not in this loop, because it is the part with a
+	// decision in it and this file cannot be compiled on the host. tests/hw_test.c links the
+	// real hwPreferredWorkerCore() and checks all four input combinations.
+	int cores[HW_CORE_LADDER_MAX];
+
+	// Two separate questions, deliberately not sharing a flag.
+	//
+	// Core 1 is the system core. It is rationed by APT_SetAppCpuTimeLimit, it is shared
+	// with the OS services, and the measurement in worker.h says taking it makes the world
+	// fill 2.5x slower at the ration every libctru example asks for. That stays behind
+	// BS_WORKER_CORE, off by default, exactly as measured.
+	//
+	// Core 2 is a different thing entirely and the measurement above says nothing about it.
+	// It exists only on a New 3DS, it is granted by the exheader's CanAccessCore2 rather
+	// than by an APT ration, and nothing else on the console runs on it -- so there is no
+	// ration to be starved by and no OS service to steal from. Gating it on BS_WORKER_CORE
+	// was a mistake earlier in this same version: the flag defaults to 0, so the ladder
+	// returned {0} on every console and the core-2 path was unreachable in a default build.
+	//
+	// If the exheader did not grant core 2 -- which is the expected answer under the
+	// Homebrew Launcher, where the .3dsx inherits the launcher's exheader -- threadCreate
+	// refuses and the ladder falls through to core 0, which is where it ran before any of
+	// this. workerCore() reports where it actually landed.
+	const bool cpu_time_limit_ok =
+		BS_WORKER_CORE && R_SUCCEEDED(APT_SetAppCpuTimeLimit(WORKER_CPU_TIME_LIMIT));
+	const int ncores = hwPreferredWorkerCore(hwIsNew3ds(), cpu_time_limit_ok, cores);
+
 	s_thread = NULL;
-	if (BS_WORKER_CORE && R_SUCCEEDED(APT_SetAppCpuTimeLimit(WORKER_CPU_TIME_LIMIT))) {
-		s_thread = threadCreate(workerMain, NULL, WORKER_STACK_BYTES, prio, 1, false);
-		if (s_thread) s_core = 1;
-	}
-	if (!s_thread) {
-		s_thread = threadCreate(workerMain, NULL, WORKER_STACK_BYTES, prio, 0, false);
-		if (s_thread) s_core = 0;
+	for (int i = 0; i < ncores && !s_thread; i++) {
+		s_thread = threadCreate(workerMain, NULL, WORKER_STACK_BYTES, prio, cores[i], false);
+		if (s_thread) s_core = cores[i];
 	}
 	if (!s_thread) {
 		worldExit(&s_staging);

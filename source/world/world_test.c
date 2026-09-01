@@ -4658,6 +4658,38 @@ static void testSwimOutOfWater(void)
 		bodyStep(&b, &s_world, dt);
 	}
 
+	// v1.8.4 turns that loop into the NEGATIVE arm. steve, after playing v1.8.3: "I don't
+	// want you just to be able to press forward and walk out the water... you just stuck
+	// there in the water until you press jump, then you get out of it, but in the correct
+	// way. just how Minecraft does it."
+	//
+	// The loop above holds the button and never freshly presses it, and that combination is
+	// the whole point. Holding A is what floating at the surface IS -- release it and the
+	// body sinks out of BODY_SURFACE, which is trySwimUp's own precondition -- so an arm that
+	// RELEASED the button could never reach the gate and could never discriminate. That is
+	// measured, not reasoned: attempt 1 gated the climb on the button level and wrote exactly
+	// that released-button arm, and deleting the gate line from physics.c left the whole
+	// suite green at 5482 checks.
+	CHECK(b.x < 8.0f);              // still in the water, pressed against the bank
+	CHECK(b.y < 12.9f);             // and NOT up on the bank's top face at 13.0
+	CHECK(bodyWetState(&s_world, &b) != BODY_DRY);
+
+	// Now press it. Same body, same held button, same walk -- the only new thing in the loop
+	// is the edge on frame 0. If this went red the fix would have turned water into the trap
+	// steve reported in v1.8.2, which is the failure mode to be afraid of here, so it is
+	// stated as loudly as the refusal above.
+	//
+	// One second, not five, and the difference is measured rather than tidied: at 300
+	// frames the body climbed out correctly and then kept walking east under its own
+	// drive, off the edge of the 16-block fixture, ending at x=18.4500 y=0.0000. The
+	// exit fires inside the first 15 frames (PLAYER_SWIM_EXIT_WINDOW at 60 fps), so a
+	// second is ample and leaves the body at about x=11.7, well inside the platform.
+	for (int i = 0; i < 60; i++) {
+		b.vx = bodyWalkSpeed(true);
+		bodyJump(&b, bodyWetUpdate(&s_world, &b), true, i == 0, dt);
+		bodyStep(&b, &s_world, dt);
+	}
+
 	CHECK(b.x > 8.0f);              // past the waterline, over the bank
 	CHECK(b.on_ground == true);     // and standing on it, not treading water against it
 	CHECK(b.y > 12.9f && b.y < 13.1f);
@@ -11506,6 +11538,10 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 // that test is a fixture worldSet, which passes and therefore counts for nothing.
 //
 // v1.8.3, the surface swell: 5455 + 18 = 5473, again all loud.
+// v1.8.4, the water-exit gate: 5473 + 8 = 5476. Counted off the source, and countable
+// because all eight are loud CHECKs in one new block in testSwimOutOfWater with no loop
+// around any of them -- three for the released-button arm that must NOT leave the water,
+// four for the held-button arm that must, and one control that the float happened first.
 //   +14  testSurfaceBob -- 2 dry, 1 submerged, 7 for the envelope and the bounds, 1 for the
 //        cycle count and 3 for the fade-out.
 //   +4   testPlayerWiresSwimming, for the four things that have to be true of the call in
@@ -11514,18 +11550,18 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 #ifndef __3DS__
 	{
 		const int ran = s_checks;
-		if (ran != 5473)
+		if (ran != 5476)
 			printf("\nCHECK-COUNT GUARD: %d checks ran, %d expected.\n"
 			       "  %s\n"
 			       "  This is NOT an ordinary assertion failure.\n"
 			       "  Read the comment above this guard in world/world_test.c before"
 			       " touching the pinned number.\n",
-			       ran, 5473,
-			       ran < 5473
+			       ran, 5476,
+			       ran < 5476
 			           ? "Checks went MISSING: checks that should have run never ran at all."
 			           : "Extra checks appeared: either you added checks and did not update"
 			             " the pin, or something is emitting checks it should not.");
-		CHECK(ran == 5473);
+		CHECK(ran == 5476);
 	}
 #endif
 

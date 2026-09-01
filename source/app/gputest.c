@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "app/hw.h"
 #include "app/watchdog.h"
 #include "version.h"
 
@@ -534,8 +535,9 @@ static void selfFlush(size_t len)
 
 void gpuTestPreflight(void)
 {
-	bool n3ds = false;
-	APT_CheckNew3DS(&n3ds);
+	// main() calls hwInit() before this runs, so this is the same answer every other
+	// model-dependent decision in the boot was made from.
+	const bool n3ds = hwIsNew3ds();
 
 	size_t len = 0;
 	len = app(s_self, sizeof(s_self), len,

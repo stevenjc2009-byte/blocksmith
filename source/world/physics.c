@@ -59,6 +59,7 @@ void bodyInit(Body* b, float x, float y, float z)
 	// world pointer.
 	b->wet = BODY_DRY;
 	b->swim_drive = false;
+	b->swim_exit_t = 0.0f;
 }
 
 // blockIsSolid, and that is the whole of v1.6.0 task 13's collision story: nothing here
@@ -243,6 +244,17 @@ static bool trySwimUp(Body* b, const World* w, float target_x, float target_z)
 	// already has tryStepUp.
 	if (b->wet != BODY_SURFACE) return false;
 
+	// v1.8.4, and the whole of the behaviour change: the lift is an ANSWER TO AN INPUT,
+	// not a consequence of bumping into geometry. Everything below this line is unchanged
+	// -- the three-cell bound, the bodyBlocked headroom refusal, all of it -- because the
+	// old code was right about HOW to leave the water and wrong only about WHEN.
+	//
+	// Note what this does NOT do: it does not make water a trap. tryStepUp is tried first
+	// at both call sites in bodyMove, so a body whose feet have already reached dry land
+	// walks up an ordinary one-block step exactly as it always did. This gate only covers
+	// the case where the thing being climbed is the water itself.
+	if (b->swim_exit_t <= 0.0f) return false;
+
 	const int bx = floorToInt(b->x);
 	const int bz = floorToInt(b->z);
 
@@ -258,6 +270,11 @@ static bool trySwimUp(Body* b, const World* w, float target_x, float target_z)
 	const float step_y = (float)cy;
 	if (step_y <= b->y) return false;
 	if (bodyBlocked(w, target_x, step_y, target_z)) return false;
+
+	// Consumed on success, so one press buys one climb. Without this a single press at a
+	// staircase of banks would carry the body up all of them inside the same window, which
+	// is the auto-climb being removed wearing a fifteen-frame disguise.
+	b->swim_exit_t = 0.0f;
 
 	b->x = target_x;
 	b->y = step_y;
@@ -431,6 +448,14 @@ float bodySurfaceBob(BodyWet wet, float dt_s, float* phase, float* envelope)
 
 void bodyJump(Body* b, BodyWet wet, bool jump_held, bool jump_pressed, float dt_s)
 {
+	// Armed on the EDGE, and BEFORE the early return below, so a press that arrives on the
+	// same frame the body is still deciding whether it is wet is not lost. `jump_pressed`
+	// and not `jump_held`: holding A is how you swim, so a held gate would arm the climb
+	// permanently for anyone at the surface and gate nothing at all. Never cleared here --
+	// bodyStep counts it down and trySwimUp consumes it -- because a release is not a
+	// cancellation, it is just the player letting go after asking.
+	if (jump_pressed && wet != BODY_DRY) b->swim_exit_t = PLAYER_SWIM_EXIT_WINDOW;
+
 	if (wet != BODY_DRY) {
 		if (!jump_held) return;
 
@@ -480,6 +505,17 @@ int bodyStep(Body* b, const World* w, float dt_s)
 	// snapped to the water terminal on this very tick, before it moves.
 	const BodyWet wet      = bodyWetUpdate(w, b);
 	const bool    in_water = (wet != BODY_DRY);
+
+	// The exit window ages here rather than in bodyJump, because bodyJump is only called
+	// for the player and the window has to expire for a body that stops being driven. It
+	// is decremented BEFORE the move below, so the frame the press lands still has very
+	// nearly the whole window left and the last frame of the window still gets a move.
+	// A body out of the water has nothing to climb out of, so the window is dropped.
+	if (!in_water) b->swim_exit_t = 0.0f;
+	else if (b->swim_exit_t > 0.0f) {
+		b->swim_exit_t -= dt_s;
+		if (b->swim_exit_t < 0.0f) b->swim_exit_t = 0.0f;
+	}
 	const float   terminal = in_water ? PLAYER_WATER_TERMINAL : PLAYER_TERMINAL;
 
 	// Consumed, not merely read: the flag describes THIS frame's input and must not

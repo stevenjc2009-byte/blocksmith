@@ -24,6 +24,7 @@
 #include "app/crash.h"
 #include "app/debugmenu.h"
 #include "app/debugmenu_ui.h"
+#include "app/hw.h"
 #include "app/input_map.h"
 #include "app/options.h"
 #include "app/remap.h"
@@ -2848,8 +2849,9 @@ static void diagFenceBoot(void)
 		remove(p);
 	}
 
-	bool n3ds = false;
-	APT_CheckNew3DS(&n3ds);
+	// hwInit() asked this at the top of main(); asking again here would be a second answer
+	// that can disagree with the one the worker and the render distance were built on.
+	const bool n3ds = hwIsNew3ds();
 
 	FILE* f = fopen("sdmc:/blocksmith/bootid.txt", "wb");
 	if (!f) return;
@@ -3049,6 +3051,15 @@ int main(void)
 	// because there is not yet a screen to print the error on.
 	crashInit();
 
+	// Second of everything, and before anything that branches on the console model or
+	// starts a thread. hwInit() asks APT_CheckNew3DS once and, on a New 3DS, asks for the
+	// 804 MHz clock and the L2 cache -- so it has to run before workerStart() picks a core,
+	// before the render-distance default is read at step 8.4, and before gpuTestPreflight()
+	// writes a report that names the model. APT is already open here: libctru's __appInit
+	// runs before main(), which is the same reason the old APT_CheckNew3DS calls further
+	// down worked. See app/hw.h for why the clock is asked for here and not in app/sleep.c.
+	hwInit();
+
 	// Before anything that could reach for crypto. libhydrogen's 3DS entropy
 	// source is PS_GenerateRandomBytes, and hydro_init() aborts the process
 	// rather than failing softly if PS is not open — so this cannot be done
@@ -3133,8 +3144,7 @@ int main(void)
 	//
 	// Hoisted out of the BS_WORLD_GEN block below, where it used to be the only caller,
 	// because the options default needs the same answer — see the first-run block.
-	bool new_3ds = false;
-	APT_CheckNew3DS(&new_3ds);
+	const bool new_3ds = hwIsNew3ds();
 
 	// optionsSave writes into sdmc:/blocksmith, which nothing has created yet at this point
 	// in the boot: saveWorldDir() makes it, and that does not run until genStart. Made here

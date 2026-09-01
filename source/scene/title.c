@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "app/updater.h"
+#include "app/updater_retry.h"
 #include "gfx/font.h"
 #include "gfx/sprite.h"
 #include "net/bsnet.h"
@@ -950,12 +951,16 @@ static TitleResult drawUpdate(TitleState* ts, const TitleInput* in, bool tap)
 	// (CHECKING/DOWNLOADING/INSTALLING) or while the updater never got its services up -
 	// updaterBusy()'s own contract is that the player must not be offered a way out then,
 	// and updaterStartCheck()/updaterStartInstall() are both no-ops when !updaterAvailable().
-	const char* action_label = NULL;
-	if (available && !busy) {
-		if (st == UPDATE_AVAILABLE)     action_label = "INSTALL";
-		else if (st == UPDATE_DONE)     action_label = "RESTART";
-		else                             action_label = "CHECK NOW";   // IDLE, UP_TO_DATE, FAILED
-	}
+	//
+	// v1.8.4 moved the decision itself into app/updater_retry.c so it could be host-tested;
+	// this is now the four comparisons and nothing else. The state it added: a FAILED that
+	// was a failed download now offers RETRY DOWNLOAD and starts the download, where before
+	// every FAILED alike offered CHECK NOW and made the player walk the whole check ->
+	// available -> install path again to recover from a dropped transfer.
+	const updaterAction action =
+		updaterActionFor(available, busy, st == UPDATE_AVAILABLE, st == UPDATE_DONE,
+		                 st == UPDATE_FAILED, updaterDownloadFailed());
+	const char* action_label = updaterActionLabel(action);
 	// Back stays offered right up to and including UPDATE_DONE - only the three busy states
 	// take it away, per the task's own "BACK whenever !updaterBusy()" rule.
 	const bool show_back = !busy;
@@ -1069,9 +1074,11 @@ static TitleResult drawUpdate(TitleState* ts, const TitleInput* in, bool tap)
 		const TRect action_r = {10, (float)LIST_BTN1_Y, SCR_W - 20, LIST_BTN_H};
 		if (uiButton(action_r, action_label, ts->cursor == action_idx, tap,
 		             in->touch_x, in->touch_y, a)) {
-			if (st == UPDATE_AVAILABLE) {
+			// Both of the two download verbs run the same call, which is the point: RETRY
+			// DOWNLOAD is INSTALL with an honest label on it, not a second code path.
+			if (action == UPD_ACT_INSTALL || action == UPD_ACT_RETRY_DOWNLOAD) {
 				updaterStartInstall();
-			} else if (st == UPDATE_DONE) {
+			} else if (action == UPD_ACT_RESTART) {
 				// updaterRelaunch() only arms the chainloader - the jump itself happens on
 				// exit (see updater.h) - so the caller has to fall out of its main loop
 				// right after calling it. TITLE_QUIT is exactly that: it is already what

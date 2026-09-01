@@ -144,6 +144,23 @@
 #define PLAYER_SURFACE_BOB_RATE  0.35f
 #define PLAYER_SURFACE_BOB_FADE  3.0f
 
+// v1.8.4. How long a fresh press of the jump button keeps the climb-onto-the-bank armed,
+// in seconds. 0.25 is fifteen frames at 60 fps.
+//
+// A window rather than a single frame, because the press and the blocked horizontal move
+// have to coincide for trySwimUp to be reached at all, and a player who taps A as he
+// arrives rather than after he arrives would otherwise get nothing and read it as the
+// game ignoring him. A window rather than a level (button held) because A is BOTH the
+// swim input and the jump button: a body floating at the surface is already holding it,
+// so a level gate is true exactly when the climb is reachable and gates nothing. That is
+// not a guess -- it was measured: with the level gate in place, deleting the gate line
+// altogether left the whole suite green.
+//
+// Short enough that it cannot be mistaken for auto-climb: at PLAYER_WALK_SPEED x
+// PLAYER_WATER_SPEED_MUL the body covers well under a block inside the window, so an
+// exit only happens at a bank the player was already pressed against when he pressed.
+#define PLAYER_SWIM_EXIT_WINDOW  0.25f
+
 // There is deliberately no step-height constant. Auto-step is a flat one-block rise
 // gated by a headroom probe, because every block in this game is a full 1.0 cube and
 // there is nothing shorter to measure a sub-block threshold against. See tryStepUp in
@@ -195,6 +212,20 @@ typedef struct {
 	// the tests — and only one of them knows anything about a jump button; the comment on
 	// bodyStep below is about exactly that mistake. A body nobody calls bodyJump for is
 	// simply never driven, which is the right answer for a walk probe.
+	// v1.8.4. Seconds left on an armed climb-out. Set to PLAYER_SWIM_EXIT_WINDOW by
+	// bodyJump on a fresh press of the jump button while in water, counted down by
+	// bodyStep, and required (and consumed) by trySwimUp before it will lift a floating
+	// body onto a bank.
+	//
+	// Before v1.8.4, walking into the shore climbed you out on its own with no input at
+	// all. steve asked for Minecraft's rule instead: you stay in the water, bobbing
+	// against the bank, until you press jump.
+	//
+	// An edge with a window, NOT the button level -- see PLAYER_SWIM_EXIT_WINDOW for the
+	// measurement that rules the level out. A body nobody calls bodyJump for is never
+	// armed and so is never lifted, which is the right answer for main.c's walk-stress
+	// probe and for every test that steps a body without an input.
+	float   swim_exit_t;
 	BodyWet wet;
 	bool    swim_drive;
 } Body;

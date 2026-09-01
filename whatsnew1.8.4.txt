@@ -1,0 +1,15 @@
+# Release notes shown on the 3DS top screen before the update downloads.
+#
+# Two sections, both optional, one item per line. Plain English, no markdown: this is read
+# by a player on a 400 px screen, not by a developer. A leading "- " is optional.
+#
+# One item per line, 95 characters each. Long lines are cut, they do not wrap.
+
+[features]
+New 3DS: the game now runs at the full 804 MHz with the L2 cache switched on.
+New 3DS: world loading moves onto the spare CPU core. An Old 3DS is unchanged.
+A failed download now offers RETRY DOWNLOAD and goes straight back to downloading.
+
+[fixes]
+You can no longer walk out of water by pressing forward: swim up and press jump.
+The New 3DS core request was written but switched off by mistake. It is on now.

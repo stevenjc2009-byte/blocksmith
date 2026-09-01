@@ -60,9 +60,23 @@ bool updaterAvailable(void);
 // the updater is idle or settled from a previous attempt.
 void updaterStartCheck(void);
 
-// Starts the download and install, also on the worker thread. Only meaningful once a check
-// has reported UPDATE_AVAILABLE; ignored otherwise.
+// Starts the download and install, also on the worker thread. Meaningful once a check has
+// reported UPDATE_AVAILABLE, and -- new in v1.8.4 -- again after a download that failed,
+// because the asset URL the check resolved is still in hand and is still correct. Ignored
+// otherwise.
 void updaterStartInstall(void);
+
+// v1.8.4. Which of the two things failed, for a caller looking at UPDATE_FAILED.
+//
+// True when the job that failed was the download/install, false when it was the version
+// check. UPDATE_FAILED alone cannot tell them apart, and they need different offers: a
+// failed download can go straight back to downloading, a failed check has nothing to retry
+// but the check. Meaningless unless updaterState() is UPDATE_FAILED -- read the state
+// first, as with everything else here.
+//
+// steve, after a download dropped on hardware: "just make sure you click retry then it read
+// as a download, not, like, rechecking". app/updater_retry.h turns this into a button.
+bool updaterDownloadFailed(void);
 
 // Where things are. Cheap; call every frame.
 updateState updaterState(void);

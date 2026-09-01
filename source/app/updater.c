@@ -763,9 +763,33 @@ void updaterStartCheck(void)
 
 void updaterStartInstall(void)
 {
-	if (!s_available || s_state != UPDATE_AVAILABLE) return;
+	if (!s_available) return;
+
+	// v1.8.4 widens this by exactly one state. UPDATE_AVAILABLE is the ordinary route in;
+	// a failed download is the new one, and it is safe for the same reason the ordinary
+	// route is: runInstall() reads s_assetUrl, runCheck() is the only thing that writes it,
+	// and nothing on any failure path clears it. So the URL a retry uses is the URL the
+	// successful check produced, byte for byte.
+	//
+	// The half-written title the retry would otherwise land on top of is already handled:
+	// every failure inside runInstall() calls AM_CancelCIAInstall on the way out (see the
+	// comment above that block), so a retry starts a genuinely fresh install handle rather
+	// than resuming a broken one.
+	const bool retrying_download = (s_state == UPDATE_FAILED) && (s_job == JOB_INSTALL) &&
+	                               (s_assetUrl[0] != '\0');
+	if (s_state != UPDATE_AVAILABLE && !retrying_download) return;
 
 	startWorker(JOB_INSTALL);
+}
+
+bool updaterDownloadFailed(void)
+{
+	// s_job is written by startWorker() on the main thread BEFORE the worker exists, so it
+	// is already correct by the time any state the worker sets becomes visible. That is the
+	// reason this reads s_job rather than a flag set alongside s_state = UPDATE_FAILED: a
+	// flag written after the state would break the ordering rule this file runs on (fill the
+	// data, then move the state) and could be read stale for a frame.
+	return (s_state == UPDATE_FAILED) && (s_job == JOB_INSTALL) && (s_assetUrl[0] != '\0');
 }
 
 updateState updaterState(void)
