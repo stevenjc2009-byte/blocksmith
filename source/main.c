@@ -26,6 +26,7 @@
 #include "app/debugmenu.h"
 #include "app/debugmenu_ui.h"
 #include "app/hw.h"
+#include "audio/audio.h"
 #include "app/input_map.h"
 #include "app/memprobe.h"
 #include "app/options.h"
@@ -37,8 +38,12 @@
 #include "app/gputest.h"
 #include "app/watchdog.h"
 #include "app/worker.h"
+#include "debug/biomeinfo.h"
+#include "debug/biomeborder.h"        // v1.8.8 debug overlay: the toggle, and the geometry
+#include "debug/biomeborder_draw.h"   // ...and the half that binds a shader
 #include "debug/loadprof.h"
 #include "debug/metrics.h"
+#include "entity/entity.h"
 #include "gfx/atlas.h"
 #include "gfx/font.h"
 #include "gfx/screen.h"
@@ -61,6 +66,7 @@
 #include "scene/title.h"
 #include "scene/ui.h"
 #include "world/budget.h"
+#include "world/daynight.h"
 #include "world/genrefuse.h"
 #include "world/handbuilt.h"
 #include "world/inventory.h"
@@ -92,6 +98,13 @@
 
 static World s_world;
 
+// v1.8.8 entity foundation. Owns nothing but a fixed pool -- see entity/entity.h. Initialised
+// once a world is entered (worker_ok, beside the sleep hooks below) and ticked alongside water
+// in the per-tick loop. No renderer reads it yet: entity/entity.h's own "Rendering seam" comment
+// designs the draw side but nothing in scene/ implements it, so a spawned entity is simulated
+// and never drawn. See this session's report for why that half was left undone.
+static EntityWorld s_entities;
+
 // v1.8.0. Columns whose light a remote edit has invalidated, coalesced. Pushed by
 // onRemoteEdit, drained once per frame ahead of the mesh drain — see world/relightq.h for
 // why the relight cannot stay inline in the hook.
@@ -108,6 +121,13 @@ static uint64_t relightNowTicks(void) { return (uint64_t)svcGetSystemTick(); }
 // render frame, so a mechanic runs at the same speed whether the console is holding 59.83 fps or
 // struggling at 30. See world/tick.h.
 static TickClock s_tickclock;
+
+// v1.8.9 day/night. The world clock -- ticks within the current day plus elapsed-day count -- see
+// world/daynight.h. Initialised from the world's time.bin sidecar (or DAY_START_TICKS on a fresh
+// world / damaged file) once genStart() succeeds, advanced once per real tick alongside water and
+// entities, and read back every frame in drawEye() to drive the sky colour and the chunk shader's
+// dayLevel uniform.
+static DayNight s_daynight;
 
 // v1.8.0 task 22. The water simulation: sources, flow levels, spread and drainage. Its state is
 // the flow-level side map and the candidate queue — see world/water.h for why the level is not a
@@ -1177,6 +1197,13 @@ static const char* bsDbgInfoPlayer(char* buf, int cap, void* ctx)
 	return buf;
 }
 
+// v1.8.8 NEON BIOME BORDERS. Thin wrappers because DebugEntry's TOGGLE callbacks take a void*
+// ctx and debug/biomeborder.h's do not — the flag has no per-entry state to carry, so rather
+// than widen the module's API to fit the menu, the menu's shape is absorbed here. (void)ctx
+// and not an unnamed parameter: -Werror=unused-parameter is on.
+static bool bsDbgGetBiomeBorders(void* ctx)          { (void)ctx; return biomeBorderEnabled(); }
+static void bsDbgSetBiomeBorders(void* ctx, bool on) { (void)ctx; biomeBorderSetEnabled(on); }
+
 // The menu's rows, registered once at boot. Weather and Dimension are the spec'd systems
 // that do not exist yet: registered unavailable so they show greyed and the menu visibly
 // reserves their place, and a later version flips available=true instead of redesigning.
@@ -1194,6 +1221,30 @@ static void bsDebugRegister(void)
 		e->slider_min = RENDER_DIST_MIN;
 		e->slider_max = renderDistMaxFor(hwIsNew3ds());   // v1.8.5: per-console, not compile-time
 		e->ctx        = &s_dctx;
+	}
+
+	// v1.8.8 NEON BIOME BORDERS. A DEBUG_TOGGLE and nothing else: this is the ONLY place in
+	// the tree that can switch the overlay on. There is no options.c key for it, so it does
+	// not persist across a boot; there is no hotkey and no bottom-screen control; and the row
+	// itself is only reachable through pause -> Options -> Debug. That is the whole of "make
+	// sure this is only a debug option, not a regular game feature".
+	//
+	// No ctx: the flag is a file static in debug/biomeborder.c and these two functions are its
+	// only accessors, so there is nothing per-entry to carry. The other rows pass &s_dctx
+	// because they read live per-frame numbers out of it; this one has no such state, and an
+	// unused ctx pointer would be a thing to keep in step for no reason.
+	//
+	// Registered ABOVE Weather rather than appended, so the two unavailable placeholders stay
+	// at the bottom of the working rows instead of a real toggle appearing under two greyed
+	// ones. app/debugmenu_test.c builds its own entries and pins no index from this function,
+	// so the order here is a readability choice and not a contract — checked, not assumed.
+	e = debugMenuRegister();
+	if (e) {
+		e->name      = "Biome borders";
+		e->kind      = DEBUG_TOGGLE;
+		e->available = true;
+		e->getBool   = bsDbgGetBiomeBorders;
+		e->setBool   = bsDbgSetBiomeBorders;
 	}
 
 	// A "Minimap" toggle used to sit here, between Render distance and Weather. It went
@@ -1397,6 +1448,14 @@ static bool genStart(int32_t cx, int32_t cz)
 		s_seed_used = seed;   // the gen overlay's readout, kept honest — see s_seed_used above
 	}
 
+	// v1.8.9 day/night. Reloads the world's time.bin sidecar; dayNightRead always writes
+	// day_ticks (DAY_START_TICKS on a fresh world, a missing file, or no world_dir at all —
+	// e.g. a server session), so this is safe unconditionally, unlike the seed/version reads
+	// above which are gated on WSEED_OK.
+	uint64_t day_ticks = DAY_START_TICKS;
+	(void)dayNightRead(world_dir, &day_ticks);
+	dayNightInit(&s_daynight, day_ticks);
+
 	if (!worldgenInit(&s_gen, seed, gen_version)) {
 		// Unreachable while genVersionResolve only ever returns OK for a known version — this
 		// is the same predicate asked twice, on purpose, at the one other place a WorldGen can
@@ -1406,6 +1465,28 @@ static bool genStart(int32_t cx, int32_t cz)
 		loadprofSince(LOAD_STAGE_SETUP, t_setup);
 		return false;
 	}
+
+	// v1.8.8 biome tint. Handed over HERE, immediately after the one call that makes a
+	// WorldGen valid, rather than beside chunkRenderSetWater further down: s_gen is a static
+	// that never moves, but a renderer holding a generator that worldgenInit had REFUSED would
+	// tint the world from uninitialised salts. The refusal path above returns before this line.
+	chunkRenderSetGen(&s_gen);
+
+	// v1.8.8 debug biome row. Same place, same reason, and a POINTER on purpose: worldgenInit
+	// stores rngMix(seed ^ 'BLKS'), not the seed it was given, so anything that re-derived a
+	// generator from an exposed seed would classify the player against a different noise field
+	// and print a valid-looking WRONG biome name. Nothing here exposes a seed accessor.
+	debugBiomeSetWorldGen(&s_gen);
+
+	// v1.8.8 NEON BIOME BORDERS, the debug overlay. Same place, same pointer, and the same
+	// trap avoided for the third time — see debug/biomeborder.h. The cached fence is dropped
+	// as well: it was built around the PREVIOUS world's noise field, and a fence left standing
+	// across a re-generation would be a seam drawn where this world has none.
+	//
+	// This hands the world over; it does NOT switch the overlay on. The toggle is .bss and
+	// stays false until someone presses A on its row in the debug menu.
+	biomeBorderSetWorldGen(&s_gen);
+	biomeBorderDrawInvalidate();
 
 	jobqInit(&s_meshq);
 	memset(s_col_queued, 0, sizeof(s_col_queued));
@@ -1656,11 +1737,13 @@ static bool runLoadingScreen(bool draw, const char* heading, const char* world_n
 		const bool tap = touch_down && !touch_prev;
 		touch_prev = touch_down;
 
-		// Feed the world. The worker stages one column at a time and waits for it to be taken,
-		// so in practice this installs one per frame; the bound is for the case genInstallOne
+		// Feed the world. Each generator lane stages one column at a time and waits for it to be
+		// taken, so in practice this installs one per frame per lane — one on an Old 3DS, two on
+		// a New 3DS running the v1.8.8 second lane; the bound of 8 is for the case genInstallOne
 		// returns true without consuming a staged column (a column that arrived for a ring
 		// position already left behind), which must not become an unbounded loop in here of all
-		// places.
+		// places. Left at 8 rather than tied to workerLanes() precisely because that case is
+		// what it is for, and it is not bounded by the lane count.
 		watchdogPhase(WD_PHASE_LOAD_GEN);
 		for (int i = 0; i < 8 && genInstallOne(); i++) { }
 		watchdogPhase(WD_PHASE_LOAD_MESH);
@@ -2296,13 +2379,37 @@ static void drawEye(C3D_RenderTarget* target, const C3D_Mtx* view, const RayHit*
 	drawStage(WD_DRAW_EYE_SETUP, eye);
 	(void)eye;   // the markers are the only reader; a non-probe build has none
 	chunkRenderSetEye(iod);
-	C3D_RenderTargetClear(target, C3D_CLEAR_ALL, CLEAR_COLOR, 0);
+	// v1.8.9 day/night. Only this clear -- the one the player actually walks around in --
+	// tracks the world clock. The loading-screen and title-screen clears elsewhere in this
+	// file keep the literal CLEAR_COLOR/SKY_CLEAR_RGBA8 constant on purpose: neither screen
+	// has a world clock to follow.
+	C3D_RenderTargetClear(target, C3D_CLEAR_ALL,
+	                      dayNightSkyClearRgba8(dayNightTimeOfDay(&s_daynight), SKY_CLEAR_RGBA8), 0);
 	C3D_FrameDrawOn(target);
 	// Round 1's cuts were here. They are gone because round 1 is answered: on real hardware
 	// every arm froze except the one that skipped this call, so the bisect has moved inside
 	// chunkRenderDraw and this file draws the whole frame again in every arm.
 	chunkRenderDraw(view);
 	for (int i = 0; i < BS_GPU_STRESS; i++) chunkRenderDraw(view);
+
+	// v1.8.8 NEON BIOME BORDERS — the debug overlay, and the ONLY line of the world pass it
+	// costs. There is no render hook in this file and none was invented for it: every stage
+	// below is a direct symbol call and this is one more, which is the smallest draw site that
+	// works and the shape the four calls under it already have.
+	//
+	// HERE, after the terrain and before the highlight, for two reasons. It has to be after
+	// chunkRenderDraw so the fence is depth-tested against the world and a seam behind a hill
+	// is hidden by the hill — an overlay that showed through terrain would be a different and
+	// much less useful feature. It has to be before highlightDraw so the selection cage is
+	// drawn over the fence rather than under it: the cage says what you are about to break and
+	// must never be the thing that is obscured.
+	//
+	// Unconditional, like playerModelDraw two stages down and for the same reason: the
+	// function's own first line is the toggle test, so there is exactly one place that decides
+	// whether this feature happens. A second copy of the condition here is the kind of thing
+	// that goes out of step. With the toggle off this is a call, a byte loaded and a return,
+	// and the frame is unchanged.
+	biomeBorderDraw(view);
 
 	// After the world, because it re-binds the GPU for its own vertex format and does not
 	// put it back — chunkRenderDraw re-establishes everything it needs at the top of its
@@ -2476,8 +2583,14 @@ static void worldReportDraw(int refused, bool built,
 	// how far the fade lets you see, and whether it finishes before the load boundary. `hides`
 	// reading NO is the one failure mode that looks like scenery — chunks appearing out of
 	// clear air at a fixed distance — so it is stated rather than left to be noticed.
+	//
+	// v1.9.1: `see` used to read rd->half_vis, which comes from the retired PICA200
+	// fixed-function fog LUT model and has had no GPU path since v1.9.0 — it barely moved
+	// across render distances (~14.3-14.4 regardless of radius) while what the player actually
+	// saw scaled hugely with the setting. chunkRenderFogHalfVis() reads the live shader-fog
+	// ramp instead — see its comment in scene/chunk_render.c.
 	const RenderDist* rd = chunkRenderDistance();
-	printf("dist %d  see %4.1f  edge %4.1f %s\n", rd->radius, rd->half_vis, rd->boundary,
+	printf("dist %d  see %4.1f  edge %4.1f %s\n", rd->radius, chunkRenderFogHalfVis(), rd->boundary,
 	       rd->fog_hides ? "hid" : "NO!");
 	printf("vbo pool %5.2f MB  refused %2d  \n", chunkRenderBytes() / mb,
 	       chunkRenderRefusals());
@@ -2543,7 +2656,17 @@ static void worldReportDraw(int refused, bool built,
 		// most chunks meshed in one frame. Read `strm` against the 16.71 ms frame.
 		printf("strm %5.2f rc %5.2f qp%3d n%d  \n", gen->worst_stream_ms,
 		       gen->worst_recenter_ms, jobqPeak(&s_meshq), gen->worst_built);
+		// v1.8.8. `lanes` is how many generator lanes actually started and `core`/`c1` where
+		// each of them landed, because both are requests the system may refuse: an Old 3DS and
+		// a New 3DS whose exheader did not grant core 2 both read "lanes 1 core 0 c1 -1" and
+		// that is the v1.8.7 arrangement unchanged, not a fault. `pk` is the ready ring's
+		// high-water mark — 2 is the only value that says the two lanes ever really overlapped
+		// — and `dup` counts columns the second lane was refused because the first already had
+		// them, which is expected traffic when the player walks out of a column and back, not
+		// a hole in the world (app/worker.h).
 		printf("fill %4d frames  core %d      \n", gen->fill_frames, workerCore());
+		printf("lanes %d c1 %2d pk%d dup %-3d  \n", workerLanes(), workerLaneCore(1),
+		       workerReadyPeak(), workerDupDropped());
 #endif
 	}
 
@@ -3243,6 +3366,11 @@ int main(void)
 	// down worked. See app/hw.h for why the clock is asked for here and not in app/sleep.c.
 	hwInit();
 
+	// v1.8.9 audio. Mixer/channel setup only -- no romfs access happens here, so this cannot
+	// collide with updaterInit()'s romfsInit() further down. audioLoad() mounts and unmounts
+	// romfs per-read internally for exactly that reason; see audio/audio.h.
+	audioInit();
+
 	// The baseline, and taken here rather than at the top of main() on purpose: hwInit() is
 	// what asks a New 3DS for its 124 MB memory mode, so a reading taken before it would be
 	// the Old 3DS heap on both models and every cost below would be measured against the
@@ -3404,6 +3532,17 @@ int main(void)
 		opts.render_dist = renderDistDefault(new_3ds);
 		optionsSave(&opts, TITLE_OPTIONS_PATH);
 	}
+
+	// v1.8.9 audio. The saved volume, applied once opts is loaded; and the three sound effects,
+	// loaded by fixed id (1=block break, 2=block place, 3=footstep) so every later audioPlay*
+	// call can reference them without re-reading romfs. audioLoad mounts/unmounts romfs per call
+	// internally (see audio/audio.h and audio.c's own comment) and never disturbs updaterInit's
+	// mount if one happens to still be up, so this is safe regardless of call order against
+	// updaterInit() above.
+	audioSetMasterVolume(opts.audio_volume);
+	audioLoad("romfs:/sfx/block_break.bsnd");
+	audioLoad("romfs:/sfx/block_place.bsnd");
+	audioLoad("romfs:/sfx/footstep.bsnd");
 
 	// ── One session ─────────────────────────────────────────────────────────────────────
 	//
@@ -3719,6 +3858,10 @@ session_start:
 		s_sleep_pose_done    = false;   // v1.7.1 task 46b: a new world starts owing a pose write
 		sleepSetFlushHook(sleepFlushOneColumn);
 		sleepSetLeaveHook(sleepLeaveSession);
+		// v1.8.9 entity foundation. There is now a world in memory, which is the same gate
+		// the sleep hooks above are keyed on -- entityCapFor sizes the fixed pool per console
+		// the same way the render distance default above does.
+		entityWorldInit(&s_entities, entityCapFor(hwIsNew3ds()));
 	}
 	BOOT_WRITE();
 
@@ -3844,6 +3987,17 @@ session_start:
 	// completely irrelevant in single player, and either way is not a reason to refuse to
 	// boot. playerModelDraw checks its own ready flag, so nothing downstream needs this.
 	(void)playerModelInit();
+
+	// v1.8.8 NEON BIOME BORDERS. Same not-load-bearing footing as the three above: a failure
+	// costs a debug overlay nobody has switched on, and biomeBorderDraw checks its own ready
+	// flag, so nothing downstream needs the answer.
+	//
+	// Called in every boot even though the overlay starts off, rather than lazily on the first
+	// switch-on. Deliberate: a linearAlloc on the frame the player presses A would be a
+	// hitch — and, worse, a failure at that moment would be a debug feature that silently does
+	// nothing when asked for, which is the hardest kind of bug to believe. It costs one DVLB
+	// parse of a shader already in the binary and 36,864 bytes of linear memory.
+	(void)biomeBorderDrawInit();
 
 	// The v1.4.0 minimap claimed its 64x64 texture and loaded this world's fog-of-war here.
 	// Removed entirely in v1.5.1, not repaired: scene/minimap.c:251 called worldGet(NULL, wx,
@@ -4340,6 +4494,13 @@ session_start:
 			opts.render_dist = s_mesh_radius;
 			optionsSave(&opts, TITLE_OPTIONS_PATH);
 		}
+		// v1.8.9 audio. Same "save immediately, not on menu exit" reasoning as render_dist
+		// above: the pause menu's own volume slider already wrote the live mixer value via
+		// audioSetMasterVolume, and this only mirrors it into opts once so it survives a reboot.
+		if (pauseMenuTakeVolumeChanged()) {
+			opts.audio_volume = audioGetMasterVolume();
+			optionsSave(&opts, TITLE_OPTIONS_PATH);
+		}
 		if (pause_action == PAUSE_ACTION_QUIT) {
 			quit_to_title = true;
 			break;
@@ -4402,6 +4563,12 @@ session_start:
 		networldSendPose(player.body.x, player.body.y, player.body.z,
 		                  player.cam.yaw, player.cam.pitch);
 
+		// v1.8.9 audio. Once a frame, ahead of any positional audioPlayAt call this frame:
+		// the listener has to be current before a sound's pan/attenuation can be computed
+		// against it, and audioUpdate is what retires finished voices and mixes the frame.
+		audioSetListener(player.body.x, player.body.y, player.body.z, player.cam.yaw);
+		audioUpdate();
+
 #if BS_WORLD_GEN && !BS_FLY
 		// Step 7.7. L and R change the render distance. They are free in walking mode — only
 		// the free-fly camera uses them, for up and down — and this is the one control the
@@ -4460,9 +4627,20 @@ session_start:
 		// per drain whatever the budget says (see DRAIN_BUDGET_MS at the top of this file).
 		// Install has never been inside that budget: it is timed here, separately, before
 		// the drain runs, and the fix only makes the same call cheaper.
+		//
+		// v1.8.8. Bounded by the LANE COUNT rather than fixed at one. With two generator lanes
+		// there can be two finished columns waiting, and workerInstall() takes exactly one per
+		// call — so a fixed single install would leave the second lane parked on its claim,
+		// unable to take another job until the following frame, and the second lane would
+		// deliver at most the same one column per frame the first already did. The bound is
+		// workerLanes() and not a constant because that is the real ceiling: a lane holds its
+		// claim until its result is installed, so there can never be more than one column
+		// waiting per lane, and on an Old 3DS this is literally the v1.8.7 loop with one
+		// iteration. The install cost per column is unchanged; the worst case is that this
+		// frame pays for two of them instead of one.
 		watchdogPhase(WD_PHASE_INSTALL);
 		const u64 t_install = svcGetSystemTick();
-		if (!paused) genInstallOne();
+		if (!paused) for (int i = 0; i < workerLanes() && genInstallOne(); i++) { }
 		const float install_ms =
 			(float)((double)(svcGetSystemTick() - t_install) / CPU_TICKS_PER_MSEC);
 #endif
@@ -4571,12 +4749,26 @@ session_start:
 		const int ticks_now = paused ? 0
 		                             : tickClockAdvance(&s_tickclock,
 		                                                (int64_t)(metricsFrameMs() * 1000.0f));
+
+		// v1.8.9 day/night. Advanced by the same n this frame's catch-up loop is about to
+		// consume below, not once per iteration -- dayNightAdvance takes the tick COUNT, the
+		// same shape tickClockAdvance already returned, per world/daynight.h's own header
+		// comment. paused already zeroed ticks_now above, so the guard here is redundant with
+		// dayNightAdvance's own n<=0 no-op but kept for symmetry with the loop it sits beside.
+		if (ticks_now > 0) dayNightAdvance(&s_daynight, ticks_now);
 		//
 		// Not separately timed into the CSV row below: MetricsWork lives in app/metrics.h,
 		// which this task does not own, and the cost is bounded by construction and measured
 		// directly in world/water_test.c against a real body of water.
-		for (int t = 0; t < ticks_now; t++)
+		for (int t = 0; t < ticks_now; t++) {
 			(void)waterTick(&s_water, &s_world, WATER_TICK_BUDGET, onWaterChange, NULL);
+			// v1.8.9 entity foundation. Ticked alongside water, once per simulation tick and
+			// not once per frame, for the same reason water is: a creature must not move
+			// faster on a console holding 60 fps than on one struggling at 30. No renderer
+			// reads s_entities yet -- see the s_entities declaration above.
+			(void)entityTick(&s_entities, &s_world, tickClockCount(&s_tickclock),
+			                  player.body.x, player.body.z, NULL, NULL);
+		}
 
 		// Aim first, then edit, so the highlight and the edit in the same frame cannot
 		// disagree about which block was being pointed at.
@@ -5044,6 +5236,10 @@ session_start:
 			// v1.8.1 task 50. Read once, outside the two calls, so both eyes cannot possibly
 			// disagree about how cracked the block is.
 			const int crack_stage = interactBreakStage(&it);
+			// v1.8.9 day/night. Same reasoning as crack_stage above: read once, outside the
+			// two eye calls, so a stereo frame's left and right eye cannot land on opposite
+			// sides of a tick boundary and disagree about the sky.
+			chunkRenderSetTimeOfDay(dayNightTimeOfDay(&s_daynight));
 			drawEye(screenTop(), &view, &it.target, crack_stage, s_stereo ? -iod : 0.0f, 0);
 			if (s_stereo)
 				drawEye(screenTopRight(), &view, &it.target, crack_stage, iod, 1);
@@ -5281,6 +5477,10 @@ session_start:
 		(void)playerPoseSave(&pose, inv_dir);
 	}
 
+	// v1.8.9 day/night. Same guard, same reasoning, as the inventory and pose saves above: a
+	// refused world must leave time.bin exactly as it was found, same as everything else here.
+	if (inv_dir && !world_refused) (void)dayNightWrite(inv_dir, dayNightTicks(&s_daynight));
+
 	// The v1.4.0 explored-fog map was saved here on the way out. Gone with the feature in
 	// v1.5.1; existing sdmc:/blocksmith/fog/*.bin files are left orphaned by design.
 
@@ -5337,6 +5537,14 @@ session_start:
 	crackOverlayExit();
 	playerModelExit();
 
+	// v1.8.8 NEON BIOME BORDERS. Frees the vertex buffer and drops the world pointer, so a
+	// fence cannot outlive the WorldGen it was classified from. biomeBorderReset also puts the
+	// toggle back to OFF, which is the behaviour a debug option should have across a quit to
+	// title: the next world starts in the shipped state, not in whatever state the last
+	// session's debugging left behind.
+	biomeBorderDrawExit();
+	biomeBorderReset();
+
 	// Leaving a server session hangs up, and it has to happen before the menu is drawn again
 	// for two separate reasons. The polite one: the gateway frees the slot and the other
 	// players stop seeing a ghost, instead of the session ageing out on a timeout. The
@@ -5367,6 +5575,10 @@ app_shutdown:
 	updaterExit();
 	sleepExit();
 	batteryExit();
+	// v1.8.9 audio. Before netExit for no ordering reason of its own -- audio and net do not
+	// touch each other -- placed here simply because this is the last line before netExit and
+	// the task's own recipe put it there.
+	audioShutdown();
 	netExit();
 	psExit();
 	crashExit();

@@ -6,6 +6,7 @@
 #include "world/inventory.h"
 #include "world/light.h"
 #include "world/mining.h"
+#include "world/rng.h"
 
 // ── the edit decision and the world write ───────────────────────────────────────────────
 //
@@ -157,6 +158,51 @@ void interactInit(Interact* it)
 	breakCancel(it);
 }
 
+// ── apples (v1.8.8: "apples dropping from leaves, pickable and functional") ─────────────
+//
+// registry.c's row for BLOCK_APPLE says apples "grow in oak and birch canopies", so only
+// BLOCK_LEAVES and BLOCK_BIRCH_LEAVES roll for one; BLOCK_SPRUCE_LEAVES never does, on that
+// same authority. Every other broken block keeps dropping itself exactly as before.
+//
+// The roll is POSITIONAL (world/rng.h's rngHash3), not a running RNG stream, for the same
+// reason worldgen uses it and never a stream: a stream's output depends on how many times it
+// has already been called, which for a break would mean "whether this apple falls depends on
+// how many OTHER blocks this player broke first" — order-dependent, and rng.h's own header
+// says a stream must never be used for exactly that reason. rngHash3(seed, x, y, z) is a pure
+// function of the cell and nothing else, so the same cell always answers the same way.
+//
+// MULTIPLAYER SAFETY. This is a client-local pickup choice, not a world edit. The write this
+// break sends over the wire is always "this cell becomes air" (sendEditOrRevert, below,
+// unchanged by which item the break yields), so there is nothing here for two clients to
+// disagree about in the TERRAIN. The bag side is already advisory: main.c reads it->broke_id
+// once per break and sends BS_INV_OP_PICKUP, which the server takes on trust
+// (deps/blocksmith-server/game/bsgame.c's handle_inv_action; see world/inventory.h's note on
+// the periodic BS_APP_INV_STATE snapshot repairing the bag and never the block). A randomised
+// choice of WHICH item that one pickup names introduces no divergence beyond what already
+// exists for every ordinary pickup.
+//
+// APPLE_DROP_ONE_IN is not Minecraft's rate — that game rolls saplings, apples and sticks
+// independently per leaf-decay tick, a mechanic this game does not have (no decay, only a
+// direct break). 1-in-200 is chosen so an apple is a find, not a routine harvest: a canopy of
+// thirty-odd leaf cells yields roughly one every few trees, not one a cube.
+#define APPLE_DROP_ONE_IN  200u
+#define APPLE_DROP_SALT    0xA9D1E0u
+
+static bool blockIsAppleBearingLeaves(BlockId id)
+{
+	return id == BLOCK_LEAVES || id == BLOCK_BIRCH_LEAVES;
+}
+
+// True on roughly one cell in APPLE_DROP_ONE_IN, decided purely from the leaf's id and
+// position — see the note above for why positional and not a stream. The salt only
+// decorrelates this roll from any other rngHash3 use seeded off the same coordinates
+// (worldgen's own decoration hashes among them); it carries no other meaning.
+static bool appleDropRoll(BlockId leaf_id, int x, int y, int z)
+{
+	const uint32_t h = rngHash3(APPLE_DROP_SALT ^ ((uint32_t)leaf_id * 0x1000193u), x, y, z);
+	return h < (0xFFFFFFFFu / APPLE_DROP_ONE_IN);
+}
+
 // The world write, once the hold has earned it. Everything here is the pre-v1.8.1 break
 // path verbatim; the only change is that it is now reached by running out of ticks instead
 // of by a button edge.
@@ -201,7 +247,13 @@ static int breakComplete(Interact* it, World* w, int x, int y, int z, BlockId br
 		// plant is removed from the world, the edit goes to the server as an ordinary air
 		// write (id 0, legal on the wire and below every ceiling on both sides), and no
 		// unholdable id is ever offered to the inventory.
-		it->broke_id = no_drop ? BLOCK_AIR : broken;
+		// An apple-bearing leaf substitutes BLOCK_APPLE for itself on the roll — see the
+		// apple block above for the whole argument. Every other block, leaves included on a
+		// miss, drops itself exactly as it always has.
+		BlockId drop = broken;
+		if (!no_drop && blockIsAppleBearingLeaves(broken) && appleDropRoll(broken, x, y, z))
+			drop = BLOCK_APPLE;
+		it->broke_id = no_drop ? BLOCK_AIR : drop;
 	} else {
 		it->refused++;
 	}
@@ -251,8 +303,31 @@ static int breakProgress(Interact* it, World* w, const RayHit* t, int ticks, boo
 		// (deps/blocksmith-server/game/bsgame.c mirrors the same ceiling), destroying the
 		// block for every player on the server, not just this one.
 		//
-		// ⚠ Delete this branch when inventory becomes registry-aware — i.e. when
-		// inventoryCanHold() widens past BLOCK_COUNT on both this client and the server.
+		// v1.8.8 made inventoryCanHold() registry-aware, which is the change the ⚠ that used
+		// to sit here said would come. The branch is KEPT rather than deleted, and the reason
+		// is worth writing down because deleting it is the tempting move:
+		//
+		// inventoryCanHold() is now "defined, not air, not a liquid" and blockIsTargetable()
+		// is "drawn, not a liquid" — the SAME SET. Said plainly rather than softened: through
+		// world/raycast.c, which stops the ray on blockIsTargetable() and nothing else, no hit
+		// can hand this function an id the bag refuses. In ordinary play this branch is now
+		// unreachable, and that is checked rather than assumed — scene/interact_test.c's
+		// testTheBreakGuardStillRefusesTheUncarryable() walks the whole core id space and
+		// asserts the two predicates give the identical answer for every id in it.
+		//
+		// It is kept anyway, and not out of timidity. "No ray can produce it" is not "it
+		// cannot happen": an id whose row never arrived — a registry sync that failed, or a
+		// server ahead of this client — sits in the world as a raw byte and reaches here the
+		// moment anything aims at it. And this is the seam where "can I aim at it" and "may
+		// the bag hold it" separate again, which world/inventory.h says is scheduled: the
+		// first ItemId that is not a BlockId (a tool, or the apple v1.8.8 is being built for)
+		// is carryable and not targetable, and the first block that is targetable and not
+		// carryable (a bucket away from a liquid, an unmineable bedrock) puts a live case
+		// straight back through here. Deleting it means rediscovering the v1.6.0 defect above
+		// the day one of those lands.
+		//
+		// That same test also drives an undefined id through this branch and asserts it still
+		// refuses, so it cannot rot into code nothing has executed.
 		if (!blockDropsNothing(here) && !inventoryCanHold(here)) {
 			breakCancel(it);
 			// `refused` is the module's existing idiom for "the press did nothing", already

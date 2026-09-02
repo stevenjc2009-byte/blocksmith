@@ -60,6 +60,22 @@ void bodyInit(Body* b, float x, float y, float z)
 	b->wet = BODY_DRY;
 	b->swim_drive = false;
 	b->swim_exit_t = 0.0f;
+
+	// v1.8.8. The player box, so that a body nobody calls bodySetBox on behaves exactly as
+	// every body did before this field existed. This is the line that makes the entity
+	// parameterisation additive rather than a breaking change: the 68 call sites in
+	// world_test.c and the one in scene/player.c all go through here.
+	b->half_w = PLAYER_WIDTH * 0.5f;
+	b->height = PLAYER_HEIGHT;
+	b->eye    = PLAYER_EYE;
+}
+
+void bodySetBox(Body* b, float width, float height, float eye_frac)
+{
+	if (!b) return;
+	if (width  > 0.0f) b->half_w = width * 0.5f;
+	if (height > 0.0f) b->height = height;
+	if (height > 0.0f && eye_frac > 0.0f) b->eye = height * eye_frac;
 }
 
 // blockIsSolid, and that is the whole of v1.6.0 task 13's collision story: nothing here
@@ -71,17 +87,15 @@ void bodyInit(Body* b, float x, float y, float z)
 // Every solid block is still a full 1.0 cube (see tryStepUp), so the AABB test remains
 // exact. A shape that is solid AND smaller than its cell — a slab, a stair — is the case
 // that would need a real per-shape box here, and it does not exist yet.
-bool bodyBlocked(const World* w, float x, float y, float z)
+bool bodyBlockedBox(const World* w, float x, float y, float z, float half, float height)
 {
-	const float half = PLAYER_WIDTH * 0.5f;
-
 	// Min edges are inclusive (the box genuinely starts there), so a plain floor
 	// is correct even when the edge sits exactly on a grid line. Max edges are
 	// exclusive, which is what the -BOX_EPS is for.
 	const int x0 = floorToInt(x - half);
 	const int x1 = floorToInt(x + half - BOX_EPS);
 	const int y0 = floorToInt(y);
-	const int y1 = floorToInt(y + PLAYER_HEIGHT - BOX_EPS);
+	const int y1 = floorToInt(y + height - BOX_EPS);
 	const int z0 = floorToInt(z - half);
 	const int z1 = floorToInt(z + half - BOX_EPS);
 
@@ -92,6 +106,15 @@ bool bodyBlocked(const World* w, float x, float y, float z)
 					return true;
 
 	return false;
+}
+
+// The player-box call, kept as the four-argument function it has always been. Written as a
+// forward to the widened one rather than as a second copy of the loop, so there is exactly
+// one AABB sweep in this file: two copies is how the entity path and the player path start
+// answering the same question differently.
+bool bodyBlocked(const World* w, float x, float y, float z)
+{
+	return bodyBlockedBox(w, x, y, z, PLAYER_WIDTH * 0.5f, PLAYER_HEIGHT);
 }
 
 // Resolves vertical motion in isolation. This is where the "only one new layer"
@@ -105,6 +128,16 @@ bool bodyBlocked(const World* w, float x, float y, float z)
 // index can be read straight off the target position with floorToInt(), and the
 // stopping point is exactly that cell's near face: no search, no residual gap,
 // no risk of resting a hair's width above or below a surface.
+// v1.8.8. "Is THIS body blocked there", as opposed to "is the player box blocked there".
+// Every internal collision question in this file goes through it, so the box a body was
+// given is the box every one of its own resolvers, step-ups and probes uses. A body that
+// was never handed a box carries the player's from bodyInit, which is why nothing outside
+// this file changed.
+static inline bool bodyHits(const Body* b, const World* w, float x, float y, float z)
+{
+	return bodyBlockedBox(w, x, y, z, b->half_w, b->height);
+}
+
 static bool resolveY(Body* b, const World* w, float dy)
 {
 	if (dy == 0.0f) return false;
@@ -113,15 +146,15 @@ static bool resolveY(Body* b, const World* w, float dy)
 
 	b->y += dy;
 
-	if (!bodyBlocked(w, b->x, b->y, b->z)) {
+	if (!bodyHits(b, w, b->x, b->y, b->z)) {
 		if (dy < 0.0f) b->on_ground = false;   // falling clear, not resting on anything
 		return false;
 	}
 
 	if (dy > 0.0f) {
 		// Leading face is the head, which is bodyBlocked's "max" bound.
-		const int cell = floorToInt(b->y + PLAYER_HEIGHT - BOX_EPS);
-		b->y = (float)cell - PLAYER_HEIGHT;
+		const int cell = floorToInt(b->y + b->height - BOX_EPS);
+		b->y = (float)cell - b->height;
 	} else {
 		// Leading face is the feet, which is bodyBlocked's "min" bound.
 		const int cell = floorToInt(b->y);
@@ -136,10 +169,10 @@ static bool resolveX(Body* b, const World* w, float dx)
 {
 	if (dx == 0.0f) return false;
 
-	const float half = PLAYER_WIDTH * 0.5f;
+	const float half = b->half_w;
 	b->x += dx;
 
-	if (!bodyBlocked(w, b->x, b->y, b->z)) return false;
+	if (!bodyHits(b, w, b->x, b->y, b->z)) return false;
 
 	if (dx > 0.0f) {
 		const int cell = floorToInt(b->x + half - BOX_EPS);
@@ -155,10 +188,10 @@ static bool resolveZ(Body* b, const World* w, float dz)
 {
 	if (dz == 0.0f) return false;
 
-	const float half = PLAYER_WIDTH * 0.5f;
+	const float half = b->half_w;
 	b->z += dz;
 
-	if (!bodyBlocked(w, b->x, b->y, b->z)) return false;
+	if (!bodyHits(b, w, b->x, b->y, b->z)) return false;
 
 	if (dz > 0.0f) {
 		const int cell = floorToInt(b->z + half - BOX_EPS);
@@ -203,7 +236,7 @@ static bool tryStepUp(Body* b, const World* w, float target_x, float target_z)
 	if (!b->on_ground) return false;   // must never fire mid-air
 
 	const float step_y = b->y + 1.0f;
-	if (bodyBlocked(w, target_x, step_y, target_z)) return false;
+	if (bodyHits(b, w, target_x, step_y, target_z)) return false;
 
 	b->x = target_x;
 	b->y = step_y;
@@ -269,7 +302,7 @@ static bool trySwimUp(Body* b, const World* w, float target_x, float target_z)
 
 	const float step_y = (float)cy;
 	if (step_y <= b->y) return false;
-	if (bodyBlocked(w, target_x, step_y, target_z)) return false;
+	if (bodyHits(b, w, target_x, step_y, target_z)) return false;
 
 	// Consumed on success, so one press buys one climb. Without this a single press at a
 	// staircase of banks would carry the body up all of them inside the same window, which
@@ -358,7 +391,7 @@ static BodyWet wetAt(const World* w, const Body* b, float eye_bias)
 	// the feet are in once it is true: a body head-first under a waterfall lip is
 	// submerged even with air below it, which is the case the two-cell probe was written
 	// for in the first place.
-	if (blockInfo(worldGet(w, bx, floorToInt(b->y + PLAYER_EYE + eye_bias), bz))->liquid)
+	if (blockInfo(worldGet(w, bx, floorToInt(b->y + b->eye + eye_bias), bz))->liquid)
 		return BODY_SUBMERGED;
 	if (blockInfo(worldGet(w, bx, floorToInt(b->y), bz))->liquid)
 		return BODY_SURFACE;

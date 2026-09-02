@@ -20,25 +20,72 @@
 //
 // ── The one invariant that makes this safe ────────────────────────────────────────────
 //
-// **The live World is written by the main thread and by nothing else.** The worker
+// **The live World is written by the main thread and by nothing else.** Each generator lane
 // generates into a staging World it owns exclusively, and the main thread copies the
 // result across in workerInstall(). Nothing that renders, raycasts or walks the player
 // ever reads a half-generated column, and none of the per-frame world reads need a lock.
 //
-// The second thing that would otherwise be shared is the memory budget (world/budget.c):
-// its counters are three plain statics and a claim from two threads at once would corrupt
-// them. Rather than make them atomic, the handshake below makes allocation strictly
-// alternate — the worker allocates only while the main thread is waiting for it, and the
-// main thread allocates only while the worker is waiting for the main thread:
+// The second thing that would otherwise be shared is the memory budget (world/budget.c).
+// That used to be argued from the handshake below; it is not any more and has not been since
+// v1.8.x — budget.c's own header explains why (the main thread allocates outside the
+// handshake every time the player builds into an unallocated sky chunk) and its counters are
+// a compare-and-swap loop rather than a plain `+=`. The handshake is about the STAGING
+// WORLD, and about that it is exact:
 //
-//   worker:  wait(work) -> pop job -> generate into staging -> signal(ready) -> wait(work)
-//   main:    see ready  -> copy staging into the world -> free staging -> signal(work)
+//   lane:  wait(work) -> pop job (+claim) -> generate into staging -> push ready -> wait(work)
+//   main:  pop ready  -> copy staging into the world -> free staging -> drop claim -> signal
 //
-// The cost of that choice, stated plainly: the worker produces **at most one column per
-// install**, so with one install per frame the world fills at one column per frame — 25
+// The cost of that choice, stated plainly: a lane produces **at most one column per install**,
+// so with one lane and one install per frame the world fills at one column per frame — 25
 // columns in 25 frames, about 0.42 s. That is far more than Phase 6 needs (walking at the
 // measured 4.31 blocks/s crosses a column boundary every 3.7 s) and it buys a design with
 // no locking on any per-frame path.
+//
+// ── v1.8.8: the SECOND lane, and what "one lane" now means ────────────────────────────
+//
+// On a New 3DS that actually got core 2, this file runs **two** generator lanes instead of
+// one. Everything above still describes each lane; what changed is that there are two of
+// them, each with its own staging World, its own 16,256-byte WorldGenScratch
+// (world/worldgen_scratch.h) and its own lighting worklist, and they take jobs from the one
+// shared queue.
+//
+// The pieces that make that safe, and where each of them lives:
+//
+//   * **The generator is re-entrant.** v1.8.7 moved ten file statics out of
+//     world/worldgen.c and world/worldgen_density.c into a caller-owned WorldGenScratch.
+//     tests/worldgen_mt_test.c is the guard: before that change two threads on COMPLETELY
+//     DIFFERENT columns produced 25 of 32 columns wrong and 145 of 192 generations refused
+//     outright; after it, "96+96 refused 0+0 wrong 0/32 missing 0".
+//   * **No column can be handed to both lanes.** app/lanes.h's claim set. A JobQueue pop
+//     already hands each JOB out once, but main.c can legitimately submit the same COLUMN
+//     twice — genUnloadColumn clears its `asked` mark the moment it leaves the ring and
+//     genRequestArea re-asks if the player walks back — so "each job once" is not "each
+//     column once". A duplicate is refused at the pop and counted in workerDupDropped().
+//   * **The finished columns queue up.** app/lanes.h's ready ring, one slot per lane, popped
+//     in completion order so a lane that finished first is not made to wait behind the other.
+//   * **The SD card is still single-threaded.** Every entry into world/region.c from this
+//     file is inside one lock (worker.c's s_fs_lock), and saves are drained by lane 0 alone.
+//     Generation — the expensive half — runs outside that lock, which is the whole point.
+//   * **The lighting worklist is per-lane**, and the shared fallback queue in world/light.c
+//     is CAS-claimed (its s_edit_queue_busy, added in v1.8.7 after tests/light_race_test.c
+//     measured 116 of 120 relights disagreeing with the single-threaded answer).
+//
+// **What the second lane costs, and who pays.** Nothing on an Old 3DS: lane 0 is a static
+// and lane 1 is malloc'd only when it is actually started, so an Old 3DS session allocates
+// and reserves exactly what it did in v1.8.7. On a New 3DS the extra is roughly 114 KB of
+// APPLICATION heap — the Lane struct (~49 KB, dominated by the 16,256-byte scratch), a 32 KB
+// thread stack, and a 65,544-byte LightQueue allocated on first use — out of the measured
+// 59,715,584 bytes app/heapsplit.h leaves. None of that is the linear heap and none of it is
+// charged against WORLD_BUDGET_BYTES.
+//
+// **What the second lane cost world/budget.h, and where that was settled.** Each lane owns
+// its own staging world, so two lanes can hold two staged columns at once — which is the
+// point of the second lane, not an accident. BUDGET_STAGING_COLUMNS was 1 and understated the
+// radius-5 worst case by exactly one column. It is 2 as of v1.8.8, and the derivation there
+// now reads "169 cols + 2 staging = 11,225,808 B, 89.2 %" of the 12,582,912-byte cap. Radius
+// 5 still fits and radius 6 is still refused, by 2,319,184 B. budgetClaim() never read that
+// constant anyway — it compares against WORLD_BUDGET_BYTES directly — so the correction moved
+// a comment, a printout and one test bound, and changed nothing a player can select.
 //
 // ── Which core, and the cache review that had to happen first ────────────────────────
 //
@@ -60,8 +107,21 @@
 // is a hardware risk no emulator can measure. So the request is implemented, measured, and
 // off. Set -DBS_WORKER_CORE=1 to turn it back on; workerCore() reports where it landed.
 //
-// v1.8.4: **none of the table above applies to core 2**, and it must not be read as if it
-// did. Every row of it is core 1 -- the system core, rationed by APT_SetAppCpuTimeLimit and
+// **v1.8.8, and read this before you set that flag on an installed CIA: it cannot work
+// today.** cia/blocksmith.rsf:112 sets `AffinityMask : 1`. That field is the exheader's
+// two-bit core-permission mask — bit 0 core 0, bit 1 core 1 — so 1 permits core 0 and
+// forbids core 1 outright, whatever APT_SetAppCpuTimeLimit answers. BS_WORKER_CORE=1 would
+// therefore succeed at the APT call, fail at the threadCreate, and fall silently down the
+// ladder to core 0, which is where it already runs. Making it work needs `AffinityMask : 3`
+// in the RSF and a reinstall, and that is a hardware change nothing here can measure.
+//
+// Note what this does NOT block: core 2 is granted by the separate New3DS exheader flag
+// `CanAccessCore2 : true` (cia/blocksmith.rsf:130) and not by AffinityMask, so lane 0 on
+// core 2 and lane 1 on core 0 are both permitted by the exheader exactly as it stands. The
+// two-lane split needed no RSF change and got none.
+//
+// v1.8.4: **none of the core-1 table above applies to core 2**, and it must not be read as if
+// it did. Every row of it is core 1 -- the system core, rationed by APT_SetAppCpuTimeLimit and
 // shared with the OS. Core 2 exists only on a New 3DS, is granted by the exheader's
 // CanAccessCore2 rather than by an APT ration, and has nothing else running on it. So on a
 // New 3DS the worker now asks for core 2 **by default**, with BS_WORKER_CORE left at 0, and
@@ -76,9 +136,11 @@
 //
 // It falls back to core 0 if either the APT call or the thread creation is refused, and
 // workerCore() reports where it actually landed — a silent fallback would leave every
-// measurement afterwards labelled with a core it never ran on.
+// measurement afterwards labelled with a core it never ran on. v1.8.8 hangs the second lane
+// off exactly that answer: if lane 0 did not get core 2 there is no second core for a second
+// lane to use, so none is started and workerLanes() says 1.
 //
-// Either way it runs one priority step *below* the main thread (higher number = lower
+// Either way each lane runs one priority step *below* the main thread (higher number = lower
 // priority on this console), so on core 0 it can never delay a frame: it only gets the CPU
 // when the main thread blocks, which it does for ~15.7 ms of every 16.71 ms frame inside
 // C3D_FrameBegin(C3D_FRAME_SYNCDRAW).
@@ -89,12 +151,14 @@
 // devkitPro's libctru.a: LightLock_Unlock opens with `mcr p15, 0, r3, c7, c10, 5`, which
 // is the ARM11 Data Memory Barrier, before its ldrex/strex pair; LightLock_Lock,
 // LightEvent_Signal and LightEvent_WaitTimeout each contain two of the same instruction.
-// Every byte the worker writes into the staging world is published by a LightLock_Unlock
+// Every byte a lane writes into its staging world is published by a LightLock_Unlock
 // and read after a LightLock_Lock, so the barriers sit on exactly the edges that matter.
+// That argument is unchanged by there being two lanes: the ready ring is pushed under the
+// same lock the install pops it under.
 //
-// The handshake itself does the rest: the main thread only touches the staging world while
-// s_ready is set and the worker is parked in LightEvent_Wait, so the two never write the
-// same memory at the same time on either core.
+// The handshake itself does the rest: the main thread only touches a lane's staging world
+// while that lane's claim is held and the lane is parked in LightEvent_Wait, so the two never
+// write the same memory at the same time on either core.
 #pragma once
 
 #include <stdbool.h>
@@ -105,15 +169,19 @@
 
 // ── Step 8.1: why the save file is the worker's job too ───────────────────────────────
 //
-// Every byte that goes to or comes from the SD card is read and written on this thread, and
-// on no other. That is not about frame time — though it is worth 5-20 ms a write on a real
-// card, which is a dropped frame — it is about the card itself: libctru reaches the SD
+// Every byte that goes to or comes from the SD card is read and written on a worker lane, and
+// on no other thread. That is not about frame time — though it is worth 5-20 ms a write on a
+// real card, which is a dropped frame — it is about the card itself: libctru reaches the SD
 // through one FS service session shared by the whole process, and two threads inside it at
-// once is not a race this project wants to reason about. One thread, one file at a time,
-// and the question never comes up.
+// once is not a race this project wants to reason about. One file at a time, and the question
+// never comes up.
+//
+// v1.8.8 keeps that promise with two lanes rather than dropping it: writes are lane 0's alone,
+// and every read is inside worker.c's s_fs_lock, which the writes also take. What is NOT
+// serialised is generation, which touches no file at all.
 //
 // The main thread's half is the part that needs the World, which it owns: it encodes a
-// column into a save slot and hands the *bytes* over. The worker never looks at a live
+// column into a save slot and hands the *bytes* over. No lane ever looks at a live
 // column, and the main thread never touches a file.
 //
 // Loading works the same way in reverse and needs no new job type: a JOB_GENERATE first
@@ -127,11 +195,12 @@
 // and none is ever written, which is what the hand-built world and the host tests want.
 void workerSetWorldDir(const char* dir);
 
-// Starts the thread. `g` must outlive the worker — it is read, never written, and the
-// worker keeps the pointer. False if the thread or its staging world could not be created.
+// Starts the lanes. `g` must outlive them — it is read, never written, and the worker keeps
+// the pointer. False only if the FIRST lane or its staging world could not be created; a
+// refused second lane is not a failure and leaves workerLanes() reporting 1.
 bool workerStart(const WorldGen* g);
 
-// Signals the thread to finish the column it is on, then joins it. Safe to call twice.
+// Signals every lane to finish the column it is on, then joins them. Safe to call twice.
 void workerStop(void);
 
 // Queues a column for generation. False if the job ring is full, which is counted in
@@ -139,10 +208,14 @@ void workerStop(void);
 bool workerSubmitColumn(int32_t cx, int32_t cz);
 
 // MAIN THREAD ONLY. If a generated column is waiting, copies it into `w`, releases the
-// staging copy and lets the worker start the next one. Returns true when a column was
+// staging copy and lets that lane start the next one. Returns true when a column was
 // installed, and writes its coordinates and whether every chunk of it made it across —
 // false in *ok means the budget or the column table refused part of the column, which is
 // a hole the caller should report rather than ignore.
+//
+// It installs ONE column per call whatever the lane count, so with two lanes a caller that
+// wants both results in the same frame has to call it twice. main.c's loading screen and its
+// frame loop both do; see the workerLanes() bound at each call site.
 bool workerInstall(World* w, int32_t* cx, int32_t* cz, bool* ok);
 
 // True while any column is queued, being generated, or waiting to be installed. Goes false
@@ -150,7 +223,7 @@ bool workerInstall(World* w, int32_t* cx, int32_t* cz, bool* ok);
 // final report.
 bool workerBusy(void);
 
-// MAIN THREAD ONLY. Encodes `col` into a free save slot and hands it to the worker to write.
+// MAIN THREAD ONLY. Encodes `col` into a free save slot and hands it to lane 0 to write.
 // Returns false only when the column could not be encoded — a corrupt column, which is not a
 // condition this game has a way to produce — so a false here is a bug report, not a retry.
 //
@@ -173,11 +246,23 @@ int   workerSaved(void);            // columns written to the card
 int   workerSaveFailed(void);       // columns whose write was refused by the card
 int   workerDropped(void);          // submissions refused because the ring was full
 int   workerQueued(void);           // jobs still waiting to be picked up
-float workerBusyMs(void);           // wall time the worker spent inside the generator
+float workerBusyMs(void);           // wall time the lanes spent inside the generator, SUMMED
 float workerInstallMs(void);        // wall time the main thread spent copying columns
 
+// v1.8.8. Jobs thrown away at the pop because the other lane already held that column.
+// **Not a hole in the world and not an error**: the copy in flight is the one that arrives,
+// and main.c re-asks for anything that genuinely does not. It is here so that a hole can be
+// told apart from a duplicate rather than both being invisible. Zero on an Old 3DS, and zero
+// on a New 3DS until the player walks out of a column and back while it is being generated.
+int   workerDupDropped(void);
+
+// v1.8.8. High-water mark of the ready ring. **This is the number that says the second lane
+// is really doing something**: 1 means the two lanes never once both had a finished column
+// waiting, 2 means they did. It cannot exceed the lane count.
+int   workerReadyPeak(void);
+
 // v1.7.1 task 48b. The save-slot wait inside workerSubmitSave, which blocks the MAIN thread
-// on a worker sharing the same core. Since-launch totals, like the two above.
+// on a lane sharing the same core. Since-launch totals, like the two above.
 //
 // These exist because `save_ms` alone cannot answer the question it was added for: a frame
 // that never had a dirty column to save reports 0.0 ms, and so does a frame that submitted
@@ -189,9 +274,18 @@ int   workerSaveWaits(void);        // ...of which this many blocked the main th
 float workerSaveWaitMs(void);       // total main-thread time lost to that wait
 float workerSaveWaitMaxMs(void);    // the worst single wait, which is the frame spike
 
-// Which CPU core the worker actually ended up on, not which one it asked for: 1 only if
-// APT_SetAppCpuTimeLimit and the thread creation both succeeded, 0 otherwise, -1 before
-// workerStart. Reported rather than assumed, because the second core is a request the
-// system is allowed to refuse and a silent fallback would make every measurement taken
-// afterwards mean something other than what it says.
+// Which CPU core LANE 0 actually ended up on, not which one it asked for: 2 on a New 3DS
+// whose exheader granted core 2, 1 only if APT_SetAppCpuTimeLimit and the thread creation
+// both succeeded, 0 otherwise, -1 before workerStart. Reported rather than assumed, because
+// every core above 0 is a request the system is allowed to refuse and a silent fallback would
+// make every measurement taken afterwards mean something other than what it says.
 int workerCore(void);
+
+// v1.8.8. How many generator lanes are actually running: 1 or 2, and 0 before workerStart.
+// **Two only on a New 3DS whose lane 0 got core 2** — see the block comment at the top of
+// this file for why a second lane on the same core as the first is not worth starting.
+int workerLanes(void);
+
+// v1.8.8. Which core lane `lane` landed on, or -1 if that lane is not running. Lane 0 is
+// workerCore(); lane 1 is core 0 when it exists at all.
+int workerLaneCore(int lane);

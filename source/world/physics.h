@@ -228,9 +228,49 @@ typedef struct {
 	float   swim_exit_t;
 	BodyWet wet;
 	bool    swim_drive;
+
+	// v1.8.8 entity foundation. The collision box, in blocks, carried by the body instead
+	// of being the compile-time constants above.
+	//
+	// This is ADDITIVE and it is deliberately additive. Before this, bodyBlocked/resolveY/
+	// resolveX/resolveZ/wetAt read PLAYER_WIDTH, PLAYER_HEIGHT and PLAYER_EYE directly, so
+	// bodyMove could only ever sweep the player's box. An entity subsystem that wanted its
+	// own box had exactly two options: parameterise these, or write a second collision
+	// routine. A second routine is the worse one by a long way — it drifts from this one,
+	// and the resulting bugs appear for mobs but not for the player (or the reverse), which
+	// is the hardest shape of bug to see.
+	//
+	// bodyInit() sets all three to the player's values, so EVERY existing caller — the
+	// player, main.c's walk-stress probe, world_test.c's 68 call sites — is unchanged and
+	// none of them had to be touched. bodyBlocked() likewise keeps its four-argument
+	// signature and its player box; bodyBlockedBox() is the widened one.
+	//
+	// `eye` is a separate field rather than a fraction of `height` on purpose. The obvious
+	// economy — eye = height * (PLAYER_EYE / PLAYER_HEIGHT), a ratio that is exactly 0.9 in
+	// decimal — is not exactly 0.9 in float32, so it would move the player's eye probe by
+	// up to an ulp and the "player is bit-identical" claim would stop being true. Four bytes
+	// is cheaper than an unprovable claim.
+	//
+	// half_w, not width, because every use site was already `PLAYER_WIDTH * 0.5f` and a
+	// stored half-extent removes a multiply from the inner loop as well as a chance to
+	// forget it.
+	float half_w;   // half the box's x/z extent
+	float height;   // full box height, feet to head
+	float eye;      // height the wet probe reads the "eye" cell at, above the feet
 } Body;
 
+// Initialises at (x, y, z), at rest, dry, with the PLAYER box.
 void bodyInit(Body* b, float x, float y, float z);
+
+// Overrides the box on an already-initialised body. Call AFTER bodyInit.
+//
+// `width` is the full x/z extent (it is halved in here) so the argument reads the same way
+// PLAYER_WIDTH does; `eye_frac` is the eye height as a fraction of `height`, because an
+// entity's wet probe has no absolute number of its own to quote. Non-positive arguments are
+// ignored rather than stored: a zero-width box would collide with nothing and a zero-height
+// one would read the same cell twice, and both are the kind of value that arrives from an
+// uninitialised struct rather than from a deliberate choice.
+void bodySetBox(Body* b, float width, float height, float eye_frac);
 
 // Moves the body by the given delta, resolving collisions one axis at a time and
 // sliding along whatever it hits. Returns a BLOCKED_* mask. Sets on_ground when a
@@ -255,8 +295,15 @@ int bodyMove(Body* b, const World* w, float dx, float dy, float dz);
 // not fit through a one-block gap.
 int bodyStep(Body* b, const World* w, float dt_s);
 
-// True if the body would overlap a solid block at the given position.
+// True if the body would overlap a solid block at the given position, testing the PLAYER
+// box. Signature and meaning unchanged since before v1.8.8 — world_test.c and scene/ both
+// call it and neither had to move.
 bool bodyBlocked(const World* w, float x, float y, float z);
+
+// The same test for an arbitrary box. bodyBlocked(w, x, y, z) is exactly
+// bodyBlockedBox(w, x, y, z, PLAYER_WIDTH * 0.5f, PLAYER_HEIGHT) and is implemented as
+// that call, so there is one sweep in this file and not two.
+bool bodyBlockedBox(const World* w, float x, float y, float z, float half_w, float height);
 
 // The INSTANTANEOUS wet state: what the two cells say right now, with no memory and no
 // band. This is the honest reading of the world, and it is what bodySubmerged() and the

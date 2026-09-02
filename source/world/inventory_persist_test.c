@@ -269,24 +269,141 @@ static void testEmptyInventoryRoundTrips(void)
 	CHECK(invEqual(&out, &in));
 }
 
-/* The item-id ceiling, both sides: BLOCK_LEAVES (BLOCK_COUNT-1) is the highest id the
- * bag can hold and must round-trip like any other; BLOCK_WATER (== BLOCK_COUNT, the
- * first id past the ceiling) is covered separately below since inventoryAdd() can never
- * put it on disk in the first place — only a hand-built file can, and only the loader's
- * defence in depth stands between that file and a slot nothing has validated. */
+/* The item-id ceiling, both sides.
+ *
+ * v1.8.8 MOVED what "the highest id the bag can hold" means, and the old text is worth quoting
+ * because it dates the defect precisely. It read:
+ *
+ *     BLOCK_LEAVES (BLOCK_COUNT-1) is the highest id the bag can hold
+ *
+ * BLOCK_LEAVES is 6. There were fifteen core rows by then. It was the highest id below the
+ * CONSTANT, and this file called that the ceiling because inventoryCanHold() did.
+ *
+ * The ceiling is now the edge of the DEFINED table. It was fern at 14 when this case was
+ * written; v1.8.8's twelve per-biome rows (ids 15..26) moved it to apple at 26, and the
+ * premise check below caught the move exactly the way its own comment said it would — id 15
+ * is BLOCK_BIRCH_LOG now, not an undefined row, so `!inventoryCanHold(BLOCK_FERN + 1)` went
+ * red. Re-pointed to the real edge rather than patched in place, so the fixture keeps testing
+ * the actual maximum rather than a row that stopped being one. The fixture carries both: an id
+ * the old build could store and one it could not. The first-invalid side is covered separately
+ * below, since inventoryAdd() can never put one on disk in the first place — only a hand-built
+ * file can, and only the loader's defence in depth stands between that file and a slot nothing
+ * has validated. */
 static void testMaxValidItemIdRoundTrips(void)
 {
 	freshDir();
 
+	/* The premise, checked rather than assumed: these really are the two sides of the edge.
+	 * If a future row lands at 27 this goes red and the case gets re-pointed, instead of
+	 * quietly testing the middle of the table while calling it the boundary. */
+	CHECK(inventoryCanHold((ItemId)BLOCK_APPLE));
+	CHECK(!inventoryCanHold((ItemId)(BLOCK_APPLE + 1)));
+
 	Inventory in;
 	inventoryInit(&in);
-	in.slots[0] = (InvSlot){ .item = BLOCK_LEAVES, .count = INV_STACK_MAX };
+	in.slots[0] = (InvSlot){ .item = BLOCK_LEAVES, .count = INV_STACK_MAX };  /* 6: the old top */
+	in.slots[1] = (InvSlot){ .item = BLOCK_APPLE,  .count = INV_STACK_MAX };  /* 26: the real one */
 
 	CHECK(inventorySave(&in, INV_DIR));
 	Inventory out;
 	inventoryInit(&out);
 	CHECK(inventoryLoad(&out, INV_DIR));
 	CHECK(invEqual(&out, &in));
+	/* Spelled out as well as compared, so a failure says WHICH id was lost rather than only
+	 * that two structs differ. invEqual is the check; this is the error message. */
+	CHECK(out.slots[1].item == BLOCK_APPLE && out.slots[1].count == INV_STACK_MAX);
+}
+
+/* ── v1.8.8: the widened capacity, on disk ──────────────────────────────────────────────
+ *
+ * The cactus through the whole persistence path. This is the deliverable's last mile: it is not
+ * enough that the bag accepts id 12 in memory — if the loader threw it away on the next boot
+ * the player would watch it vanish overnight, which is the v1.6.0 "gone from both places"
+ * defect with a longer fuse.
+ *
+ * Every check here is red against the pre-v1.8.8 loader: inventoryLoad()'s per-slot guard calls
+ * inventoryCanHold(), which refused 12, so the slot came back empty and the file loaded
+ * "cleanly" with the cactus silently gone. */
+static void testAnIdPastTheOldCeilingRoundTrips(void)
+{
+	freshDir();
+
+	Inventory in;
+	inventoryInit(&in);
+	in.slots[0] = (InvSlot){ .item = BLOCK_CACTUS, .count = 3 };
+	in.slots[1] = (InvSlot){ .item = BLOCK_SNOW,   .count = INV_STACK_MAX };
+	in.slots[2] = (InvSlot){ .item = BLOCK_ICE,    .count = 1 };
+	in.slots[3] = (InvSlot){ .item = BLOCK_STONE,  .count = 9 };   /* control: an old-era id */
+
+	CHECK(inventorySave(&in, INV_DIR));
+	Inventory out;
+	inventoryInit(&out);
+	CHECK(inventoryLoad(&out, INV_DIR));
+	CHECK(invEqual(&out, &in));
+
+	CHECK(out.slots[0].item == BLOCK_CACTUS && out.slots[0].count == 3);
+	CHECK(out.slots[1].item == BLOCK_SNOW);
+	CHECK(out.slots[2].item == BLOCK_ICE);
+	CHECK(out.slots[3].item == BLOCK_STONE && out.slots[3].count == 9);
+}
+
+/* SAVE COMPATIBILITY, in the direction that matters: a file written by the build BEFORE the
+ * ceiling moved must still load, unchanged, slot for slot.
+ *
+ * What makes this provable inside one binary rather than needing two: v1.8.8 changed a
+ * PREDICATE, not a format. world/inventory.c is untouched — same magic 0x31495342, same
+ * INVENTORY_VERSION 1, same 20-byte header, same 24 x (u8 item, u8 count), same crc32 over
+ * bytes 16..EOF. So the byte image an old build produced is exactly the byte image buildFile()
+ * produces here, and buildFile() is this suite's own writer rather than a call back into the
+ * code under test.
+ *
+ * The contents are constrained the way an old file really was: ids 1..7 only, because that is
+ * everything the old inventoryCanHold() would let into a slot. If the widened predicate had
+ * accidentally NARROWED anywhere — an off-by-one at the bottom of the range, air handled
+ * differently, a liquid rule that caught something it should not — one of these seven slots
+ * comes back empty and this goes red.
+ *
+ * (The reverse direction is not symmetric, and is not a defect: a NEW save holding a cactus,
+ * read by an OLD build, loses that one slot and keeps the rest, because inventoryLoad()'s
+ * per-slot guard `continue`s rather than rejecting the file. Written down here because it is
+ * the question a downgrade raises and the answer is not recorded anywhere else.) */
+static void testASaveWrittenBeforeTheCeilingChangeStillLoads(void)
+{
+	freshDir();
+
+	Inventory old;
+	inventoryInit(&old);
+	/* Every id the pre-v1.8.8 bag could hold, one per slot, with distinct counts so a slot
+	 * that came back holding its NEIGHBOUR's contents is caught too. */
+	old.slots[0] = (InvSlot){ .item = BLOCK_GRASS,  .count = 1 };
+	old.slots[1] = (InvSlot){ .item = BLOCK_DIRT,   .count = 2 };
+	old.slots[2] = (InvSlot){ .item = BLOCK_STONE,  .count = 3 };
+	old.slots[3] = (InvSlot){ .item = BLOCK_SAND,   .count = 4 };
+	old.slots[4] = (InvSlot){ .item = BLOCK_WOOD,   .count = 5 };
+	old.slots[5] = (InvSlot){ .item = BLOCK_LEAVES, .count = 6 };
+	old.slots[6] = (InvSlot){ .item = BLOCK_PLANKS, .count = 7 };
+	old.selected_hotbar = 3;
+
+	uint8_t buf[TEST_FILE_BYTES];
+	buildFile(buf, EXPECT_MAGIC, EXPECT_VERSION, (uint32_t)INV_SLOT_COUNT, &old);
+	CHECK(writeBytes(invFile(), buf, TEST_FILE_BYTES));
+
+	Inventory out;
+	memset(&out, 0xAA, sizeof(out));
+	CHECK(inventoryLoad(&out, INV_DIR));
+
+	/* Not one slot lost, not one count altered. */
+	CHECK(invEqual(&out, &old));
+	for (int i = 0; i < 7; i++)
+		CHECK(out.slots[i].item == old.slots[i].item
+		      && out.slots[i].count == old.slots[i].count);
+	CHECK(out.selected_hotbar == 3);
+
+	/* And the version stamp did NOT move. This is what catches a "compatible" change that
+	 * quietly re-versioned the file: it must be the same format, not a new one that happens
+	 * to be able to read the old one. */
+	CHECK(EXPECT_VERSION == 1u);
+	CHECK(buf[4] == 1 && buf[5] == 0 && buf[6] == 0 && buf[7] == 0);
 }
 
 /* ── 3. every degradation path the header check ────────────────────────────────────── */
@@ -447,17 +564,39 @@ static void testTrailingBytesAreRejected(void)
  * the only way to reach this code at all.
  */
 
-/* An id at or past BLOCK_COUNT — BLOCK_WATER is the first one — must drop to empty
- * rather than hand the rest of the game an item id nothing registered, and every OTHER
- * slot in the same file must still load normally: this is a per-slot fallback, not a
- * whole-file refusal. */
+/* An id the bag cannot hold must drop to empty rather than hand the rest of the game an item
+ * id nothing registered, and every OTHER slot in the same file must still load normally: this
+ * is a per-slot fallback, not a whole-file refusal.
+ *
+ * v1.8.8 had to REPOINT this case, and the reason is the interesting part. It used to say "an
+ * id at or past BLOCK_COUNT — BLOCK_WATER is the first one" and it used water for the fixture.
+ * Water is still refused, so this case would still have passed verbatim — for a completely
+ * different reason. It is refused now for being a LIQUID, and the fact that liquid happens to
+ * sit at id 8, exactly where the old constant was, is a coincidence of the table. A check that
+ * keeps passing while the reason underneath it changes is the most expensive kind to leave
+ * alone, so BOTH reasons are now spelled out, each with its own slot:
+ *
+ *   slot 0  an UNDEFINED id — the real "past the end of the table" case, and the one that
+ *           actually reaches a player: a server whose registry this client never received.
+ *   slot 2  a LIQUID — defined, in range, and still refused, because a bucket of water is not
+ *           a thing this game has.
+ *
+ * A predicate that had simply been widened to `id < registryCount()` passes on slot 2 and
+ * fails on nothing; a predicate that dropped the definedness test passes slot 2 and fails
+ * slot 0. Neither can be green here. */
 static void testOutOfRangeItemIdSlotIsDropped(void)
 {
 	freshDir();
 	Inventory bad;
 	inventoryInit(&bad);
-	bad.slots[0] = (InvSlot){ .item = BLOCK_WATER, .count = 10 };   /* == BLOCK_COUNT, refused */
+	/* Premise, so the fixture cannot rot into "an id that happens to be defined after all". */
+	CHECK(!inventoryCanHold((ItemId)0x40));
+	CHECK(!inventoryCanHold((ItemId)BLOCK_WATER));
+
+	bad.slots[0] = (InvSlot){ .item = 0x40,        .count = 10 };   /* undefined: no row at all */
 	bad.slots[1] = (InvSlot){ .item = BLOCK_DIRT,  .count = 7  };   /* neighbour: must still load */
+	bad.slots[2] = (InvSlot){ .item = BLOCK_WATER, .count = 5  };   /* defined, but a liquid */
+	bad.slots[3] = (InvSlot){ .item = BLOCK_CACTUS, .count = 2 };   /* past the OLD ceiling: keep */
 
 	uint8_t buf[TEST_FILE_BYTES];
 	buildFile(buf, EXPECT_MAGIC, EXPECT_VERSION, (uint32_t)INV_SLOT_COUNT, &bad);
@@ -468,6 +607,10 @@ static void testOutOfRangeItemIdSlotIsDropped(void)
 	CHECK(inventoryLoad(&out, INV_DIR));   /* still a clean load, not a refusal */
 	CHECK(out.slots[0].item == ITEM_NONE && out.slots[0].count == 0);
 	CHECK(out.slots[1].item == BLOCK_DIRT && out.slots[1].count == 7);
+	CHECK(out.slots[2].item == ITEM_NONE && out.slots[2].count == 0);
+	/* The other half of the same file, and the half that makes this a test of the NEW rule
+	 * rather than of a rule that refuses everything unfamiliar. */
+	CHECK(out.slots[3].item == BLOCK_CACTUS && out.slots[3].count == 2);
 }
 
 /* ITEM_NONE (== BLOCK_AIR == 0) paired with a nonzero count: the exact malformed slot
@@ -662,6 +805,10 @@ int main(void)
 	testEmptyInventoryRoundTrips();
 	testMaxValidItemIdRoundTrips();
 
+	/* v1.8.8 — the widened item ceiling, and the save-compatibility proof that goes with it. */
+	testAnIdPastTheOldCeilingRoundTrips();
+	testASaveWrittenBeforeTheCeilingChangeStillLoads();
+
 	testMissingFileGivesEmptyInventory();
 	testBadMagicGivesEmptyInventory();
 	testBadVersionGivesEmptyInventory();
@@ -725,19 +872,35 @@ int main(void)
 	 *   there silently wants a number one higher. This file's CHECK expands to a checkAt()
 	 *   CALL, so it does not have that hazard today — the latch is what keeps it from
 	 *   acquiring one if the macro is ever rewritten to increment inline. */
+	/* 78 -> 105 on 2026-09-02 (v1.8.8). Arrived at by DELTA, exactly as the paragraph above
+	 * insists, and written out so the arithmetic can be disagreed with:
+	 *
+	 *   testMaxValidItemIdRoundTrips            3 -> 6   (+3)  two premise checks, one
+	 *                                                          spell-out of the fern slot
+	 *   testAnIdPastTheOldCeilingRoundTrips     0 -> 7   (+7)  new
+	 *   testASaveWrittenBeforeTheCeilingChange  0 -> 13  (+13) new; 7 of those are the loop
+	 *                                                          over the seven old-era slots
+	 *   testOutOfRangeItemIdSlotIsDropped       4 -> 8   (+4)  two premise checks, plus the
+	 *                                                          liquid and cactus slots
+	 *
+	 *   +3 +7 +13 +4 = +27, and 78 + 27 = 105.
+	 *
+	 * The observed count from the run agreed. That agreement is the point of doing it this way
+	 * round: had it printed anything other than 105, the number to chase would have been the
+	 * discrepancy, not the pin. */
 	const int ran = g_checks;
-	if (ran != 78)
+	if (ran != 105)
 		printf("\nCHECK-COUNT GUARD: %d checks ran, %d expected.\n"
 		       "  %s\n"
 		       "  This is NOT an ordinary assertion failure.\n"
 		       "  Read the comment above this guard in world/inventory_persist_test.c before"
 		       " touching the pinned number.\n",
-		       ran, 78,
-		       ran < 78
+		       ran, 105,
+		       ran < 105
 		           ? "Checks went MISSING: checks that should have run never ran at all."
 		           : "Extra checks appeared: either you added checks and did not update the"
 		             " pin, or something is emitting checks it should not.");
-	CHECK(ran == 78);
+	CHECK(ran == 105);
 
 	printf("\ninventory persistence self-test: %s %d checks, %d failed\n",
 	       g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);

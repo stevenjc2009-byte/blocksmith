@@ -40,11 +40,16 @@
 //   mesh       main.c genDrainMesh()          chunkRenderBuild, once per chunk
 //   present    main.c runLoadingScreen()      C3D_FrameBegin(SYNCDRAW) .. C3D_FrameEnd
 //
-// region_io, decode, generate and light accumulate on the WORKER thread; everything else on the
-// main thread. No stage is written by both, which is the whole of the thread-safety argument:
-// each slot has exactly one writer, and the reader (loadprofEnd, main thread) runs after the
-// ring is complete and the worker is parked with nothing outstanding. There are no locks here
-// on purpose — a lock on the worker's generate path would be measuring the instrument.
+// region_io, decode, generate and light accumulate on the WORKER threads; everything else on the
+// main thread. No stage is written by both sides, and the reader (loadprofEnd, main thread) runs
+// after the ring is complete and every worker lane is parked with nothing outstanding. There are
+// no locks here on purpose — a lock on a lane's generate path would be measuring the instrument.
+//
+// **v1.8.8 retracts the sentence that used to follow: "each slot has exactly one writer".** It
+// stopped being true when app/worker.c gained a second generator lane on the New 3DS, because
+// those four worker stages are now written by both of them. The accumulators in loadprofSince
+// are `__atomic_fetch_add` RELAXED instead — see the comment at that line for why a plain `+=`
+// on a uint64_t is not merely a lost count on a 32-bit part but a torn value. Still no locks.
 //
 // The remainder — wall minus the sum of the stages — is real and is reported as `other`. On a
 // vsynced loading screen most of it is the wait for VBlank inside the present stage's own

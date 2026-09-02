@@ -9,6 +9,7 @@
 #include "gfx/atlas.h"
 #include "gfx/fogramp.h"
 #include "gfx/fogtex.h"
+#include "world/daynight.h"
 #include "world/dirtyq.h"
 #include "world/light.h"
 #include "world/mesher.h"
@@ -116,6 +117,41 @@ static const WaterSim* s_water_sim;
 void chunkRenderSetWater(const WaterSim* sim)
 {
 	s_water_sim = sim;
+}
+
+// v1.8.8 biome tint. The world's generator, or NULL. Set once by main.c the moment a WorldGen
+// becomes valid; read only by chunkRenderBuild, on the thread that meshes.
+//
+// NULL is a working build and is what every host binary and every pre-v1.8.8 console frame
+// looks like: nothing fills the tint band, so every vertex carries row 0, the identity.
+static const WorldGen* s_gen;
+
+void chunkRenderSetGen(const WorldGen* gen)
+{
+	s_gen = gen;
+}
+
+// v1.8.9 day/night. The tick within the current day, forwarded from main.c's DayNight clock
+// once a frame. DAY_START_TICKS — full daylight — is the value every host binary and every
+// pre-v1.8.9 console frame carries, so a build that never calls the setter below draws exactly
+// what it drew before this file existed.
+static uint32_t s_tod = DAY_START_TICKS;
+
+void chunkRenderSetTimeOfDay(uint32_t tod)
+{
+	s_tod = tod;
+}
+
+// One column's palette row, in the shape world/scratch.h's ScratchTintFn asks for.
+//
+// This adapter is the ONLY place the renderer's two halves meet: scratch.c owns the walk over
+// the 18x18 band and knows nothing about biomes, worldgen.c owns the biome and knows nothing
+// about a scratch, and this turns a BiomeId into a palette index with the macro world/mesher.h
+// already defines for the purpose. Nothing new is computed here, so there is nothing here to
+// drift out of step with the mesher.
+static uint8_t genColumnTint(const void* ctx, int32_t wx, int32_t wz)
+{
+	return MESH_TINT_ROW_FOR_BIOME(worldgenBiomeAt((const WorldGen*)ctx, wx, wz));
 }
 
 // Baked per-face brightness, the values Phase 1 proved on the single cube: a high sun
@@ -228,6 +264,12 @@ static int             s_uloc_daylevel;
 // distance and of nothing else — and re-uploaded every frame in pipelineBind with the rest of
 // the shared uniform state. See source/gfx/fogramp.h for the design and for what it replaced.
 static int             s_uloc_fogparams;
+
+// v1.8.8. The base register of the biome tint palette (tintPalette in BOTH .pica files). Eight
+// consecutive rows, filled from meshTintRow() in pipelineBind. See world/mesher.h for the
+// encoding, the palette itself, and why the numbers live in that header and not here.
+static int             s_uloc_tintpalette;
+
 static FogShape        s_fog;
 
 // Step 7.7. The clip planes and the fog now come from the render distance setting instead of
@@ -929,7 +971,7 @@ static void pipelineBind(void)
 	C3D_TexEnvFunc(fog, C3D_RGB, GPU_INTERPOLATE);
 	C3D_TexEnvSrc(fog, C3D_Alpha, GPU_PREVIOUS, 0, 0);
 	C3D_TexEnvFunc(fog, C3D_Alpha, GPU_REPLACE);
-	C3D_TexEnvColor(fog, SKY_FOG_BGR | 0xFF000000u);
+	C3D_TexEnvColor(fog, dayNightSkyFogBgr(s_tod, SKY_CLEAR_RGBA8) | 0xFF000000u);
 
 	// The vertex shader's half of it: texcoord per block, and the coordinate at zero distance.
 	// Recomputed in chunkRenderSetDistance and only re-uploaded here, alongside every other
@@ -970,10 +1012,37 @@ static void pipelineBind(void)
 		C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uloc_faceshade + (int)i, s, dy, s, a);
 	}
 
-	// The dynamic shader's day-night multiplier. No cycle exists yet (v1.5.0 scope
-	// honesty), so it is pinned to full day: max(sky*1, block)/15 is exactly the
-	// baked look wherever sky light is 15 and only underground does it fall.
-	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uloc_daylevel, 1.0f, 1.0f, 1.0f, 1.0f);
+	// v1.8.9. The dynamic shader's day-night multiplier, tracking world/daynight.h's clock via
+	// s_tod (chunkRenderSetTimeOfDay, called once a frame by main.c). max(sky*dayLevel, block)/15
+	// is the baked look wherever sky light is 15 and dayLevel is 1.0 — i.e. full day, which is
+	// also what a host binary and every pre-v1.8.9 console frame drew, since s_tod defaults to
+	// DAY_START_TICKS and nothing else here changed.
+	const float dl = dayNightLevel(s_tod);
+	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uloc_daylevel, dl, dl, dl, dl);
+
+	// v1.8.8 biome tint. Eight RGB multipliers, indexed by bits 2..4 of the vertex's ao byte
+	// (MESH_TINT_BITS in world/mesher.h) and multiplied into outclr.xyz by both shaders.
+	//
+	// Re-uploaded on every bind for the same reason faceShade above it is, and it is the same
+	// reason: the vertex shader's float uniform bank is shared hardware, scene/highlight.c's
+	// program lands its own uniforms in these registers, and a table asserted once at init
+	// would be whatever the last program left behind by the time the world drew again.
+	//
+	// The numbers are READ from meshTintRow() and not restated here. That is deliberate and it
+	// is the same split WATER_ALPHA uses: world/mesher.h has no <3ds.h> in it, so
+	// world/biome_tint_test.c can link the real function, and this loop is then checked BY TEXT
+	// to call it. A local copy of the table here would let the two drift with every check in
+	// the suite still green.
+	//
+	// .w is written 1.0 and NOT read: outclr.w is the water alpha and comes from the faceShade
+	// row (v1.8.2). If the tint owned it too, every tinted face in the world would go
+	// see-through. It is filled rather than left alone for the same reason faceShade's
+	// unreachable rows are — an unwritten uniform register holds whatever the last program put
+	// in it.
+	for (unsigned i = 0; i < MESH_TINT_ROWS; i++) {
+		const MeshTint t = meshTintRow((uint8_t)i);
+		C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uloc_tintpalette + (int)i, t.r, t.g, t.b, 1.0f);
+	}
 }
 
 bool chunkRenderInit(int max_radius)
@@ -1040,9 +1109,10 @@ bool chunkRenderInit(int max_radius)
 	// So there is one shader now, not two. A third "baked light" variant was rejected: it would
 	// differ from this one by a single instruction (the dayLevel multiply), and the project
 	// already has a whole test file, world/atlas_uv_shader_test.c, about what duplicating a
-	// constant across .pica files costs. dayLevel is pinned to 1.0 below for both models until a
-	// day/night cycle exists, and at 1.0 a fully sunlit face is byte-identical to the old baked
-	// output — only shaded places change.
+	// constant across .pica files costs. dayLevel now tracks world/daynight.h's clock for both
+	// models (v1.8.9, chunkRenderSetTimeOfDay) and defaults to 1.0 — full day — until main.c
+	// calls that setter, at which point a fully sunlit face is byte-identical to the old baked
+	// output and only shaded places change.
 	//
 	// Still asked here rather than in main.c because this is the one place that owns the shader
 	// program's lifetime and it runs before workerStart, so the gate is published before the
@@ -1060,6 +1130,11 @@ bool chunkRenderInit(int max_radius)
 	s_uloc_faceshade  = shaderInstanceGetUniformLocation(s_program.vertexShader, "faceShade");
 	s_uloc_daylevel   = shaderInstanceGetUniformLocation(s_program.vertexShader, "dayLevel");
 	s_uloc_fogparams  = shaderInstanceGetUniformLocation(s_program.vertexShader, "fogParams");
+
+	// v1.8.8 biome tint. The base register of the eight-row palette bank; pipelineBind fills
+	// rows 0..MESH_TINT_ROWS-1 from meshTintRow() at s_uloc_tintpalette + i, exactly as it
+	// does for faceShade.
+	s_uloc_tintpalette = shaderInstanceGetUniformLocation(s_program.vertexShader, "tintPalette");
 
 	// Step 9.2b. The one shared index buffer every slot draws from, built once and never
 	// written again — see the comment on s_shared_indices. Every quad's pattern is
@@ -1244,6 +1319,25 @@ const RenderDist* chunkRenderDistance(void)
 	return &s_dist;
 }
 
+// v1.9.1. RenderDist.half_vis above comes from renderDistVisibility()'s retired PICA200
+// fixed-function fog LUT model and has had no GPU path since v1.9.0 turned that unit off
+// (pipelineBind now calls C3D_FogGasMode(GPU_NO_FOG, ...) and nothing in the tree still
+// calls FogLut_FromArray or C3D_FogLutBind) -- it is not what the player sees. This is: it
+// reads s_fog, the FogShape this file actually shaped the ramp from and uploaded fogParams
+// for (see the C3D_FVUnifSet call just above chunkRenderSetDistance), through fogHalfVis()
+// and fogRampTexel() -- the same reference texel generator tests/fogramp_test.c cross-checks
+// texel-by-texel against the compiled build/fogramp.t3x, so this is not a second copy of the
+// ramp that can drift from what the console renders, just the one table read from a second
+// place. Never NULL-unsafe: s_fog defaults to the zeroed FogShape (start=end=inv_range=
+// bias=0) until chunkRenderSetDistance first runs, at which point fogHalfVis returns exactly
+// 0 rather than reading uninitialised memory -- a working, if uninteresting, answer.
+float chunkRenderFogHalfVis(void)
+{
+	uint8_t texels[FOGRAMP_W];
+	for (int i = 0; i < FOGRAMP_W; i++) texels[i] = fogRampTexel(i);
+	return fogHalfVis(&s_fog, texels);
+}
+
 // Step 7.6. Rebuilds the projection for one eye, and everything downstream — the frustum
 // test, the sight walk, the draw, and the highlight, which reads this same matrix — follows
 // it without knowing which eye it is looking through.
@@ -1345,6 +1439,20 @@ bool chunkRenderBuild(const World* w, int cx, int cy, int cz)
 
 	const u64 t0 = svcGetSystemTick();
 	scratchFill(&s_scratch, w, cx, cy, cz);
+	// v1.8.8 biome tint, and it must come AFTER scratchFill, which clears the band.
+	//
+	// Gated on GEN_VERSION_BIOME and not merely on `s_gen != NULL`, which is the rule
+	// world/genversion.h states outright: "Biome IDENTITY is `version >= GEN_VERSION_BIOME`."
+	// worldgenBiomeAt() will happily classify a LEGACY or DENSITY world -- it is a pure
+	// function of two noise fields and does not consult the version -- but those worlds put
+	// their sand and their trees down by a different rule, so tinting them by biome would
+	// paint a desert colour across ground that is grass. Below the gate nothing fills the band
+	// and those worlds render exactly what they rendered before v1.8.8.
+	//
+	// Inside the t0/t1 pair on purpose: this is new per-chunk cost on the streaming drain and
+	// it belongs in the scratch bucket with the other two fills, not hidden between them.
+	if (s_gen && s_gen->version >= GEN_VERSION_BIOME)
+		scratchFillTint(&s_scratch, cx, cz, genColumnTint, s_gen);
 	// v1.5.0: the light band alongside the blocks, only when the engine is on.
 	// The mesher reads s_scratch.light behind the same gate, so when this is
 	// skipped the band is never looked at and pad comes out zero as always.

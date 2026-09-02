@@ -46,16 +46,17 @@
 // carries the number and the host suite checks it can still be reached.
 //
 // Against that, what each console's render-distance ceiling actually needs. The loaded ring
-// is one column wider than the drawn one (main.c's s_area_radius = radius + 1), and the
-// worker's staging world holds at most one more (app/worker.c installs then empties it):
+// is one column wider than the drawn one (main.c's s_area_radius = radius + 1), and each
+// world-worker lane's staging world holds at most one more (app/worker.c installs then empties
+// it). Two lanes since v1.8.8, so two staging columns — see BUDGET_STAGING_COLUMNS below:
 //
-//     radius 3 (RENDER_DIST_MAX_OLD)    9x9  =  81 cols + 1 staging =  5,383,136 B   42.8 %
-//     radius 5 (RENDER_DIST_MAX_NEW)   13x13 = 169 cols + 1 staging = 11,160,160 B   88.7 %
-//     radius 6                         15x15 = 225 cols + 1 staging = 14,836,448 B  over
+//     radius 3 (RENDER_DIST_MAX_OLD)    9x9  =  81 cols + 2 staging =  5,448,784 B   43.3 %
+//     radius 5 (RENDER_DIST_MAX_NEW)   13x13 = 169 cols + 2 staging = 11,225,808 B   89.2 %
+//     radius 6                         15x15 = 225 cols + 2 staging = 14,902,096 B  over
 //
 // So 12 MB is not headroom over the Old 3DS case that happens to survive the New 3DS one: it
 // is very nearly exactly the largest radius this constant can hold, and radius 6 is excluded
-// by 2,253,536 bytes. tests/world_budget_bytes_test.c asserts BOTH halves — that radius 5
+// by 2,319,184 bytes. tests/world_budget_bytes_test.c asserts BOTH halves — that radius 5
 // fits and that radius 6 does not — so the day a field is added to Column, or a chunk form
 // grows, or lighting gains a third channel, the ceiling fails the host suite instead of
 // failing as a hole in somebody's terrain.
@@ -71,12 +72,30 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-// 12 MB. See the derivation above: it holds radius 5 at 88.7 % and refuses radius 6.
+// 12 MB. See the derivation above: it holds radius 5 at 89.2 % and refuses radius 6.
 #define WORLD_BUDGET_BYTES  (12u * 1024u * 1024u)
 
-// The worker's staging world (app/worker.c's s_staging) holds one generated column at a time
-// and is emptied by workerInstall, so it adds exactly one column to whatever the ring costs.
-#define BUDGET_STAGING_COLUMNS  1
+// Staging columns. Each world worker LANE owns its own staging world (app/worker.c's
+// Lane.staging), holds exactly one generated column in it at a time, and is emptied by
+// workerInstall — so the ring's cost is charged one column per lane that can be running.
+//
+// This was 1 until v1.8.8 and it was WRONG the moment the New 3DS gained a second generator
+// lane: two lanes can hold a staged column simultaneously, which is the entire point of the
+// second lane. The v1.8.8 figure is 2. Radius 5 goes from 170 * 65,648 = 11,160,160 B
+// (88.7 %) to 171 * 65,648 = 11,225,808 B (89.2 %) of the 12,582,912-byte cap. It still fits
+// and radius 6 is still refused by 2,187,888 B, so nothing the player can select changes —
+// what changed is that the formula now describes the worst case instead of understating it
+// by one column. app/worker.h had recorded the understatement rather than fixing it, because
+// this file was out of that change's scope.
+//
+// It is the CEILING (app/lanes.h's WORKER_LANES_MAX), not the count of lanes actually
+// started, for the same two reasons the cap itself is shared: an Old 3DS runs one lane and is
+// charged for two, which costs it nothing because this constant allocates nothing; and this
+// header deliberately owes no #include to anything, so it cannot read WORKER_LANES_MAX here.
+// The two are pinned together by a check in tests/world_budget_bytes_test.c, which CAN
+// include app/lanes.h — so a third lane would fail the host suite rather than quietly
+// re-introduce the same understatement.
+#define BUDGET_STAGING_COLUMNS  2
 
 // ── The sizing, as functions rather than as a paragraph ───────────────────────────────────
 //

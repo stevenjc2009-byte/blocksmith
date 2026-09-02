@@ -189,7 +189,7 @@ static char s_first[512];
 // the enum. What the enum's count governs is TILE_USED_COUNT in gfx/atlas_tiles.h, which
 // world/block_tiles_check.c asserts against the BTEX_* mirror - a separate guard over a
 // separate pair of lists, untouched by this and still reading 12 on both sides.
-#define ATLAS_PAINTED_SLOTS 17
+#define ATLAS_PAINTED_SLOTS 31
 
 // Slots 10 and 11 within that: water and tall grass (roadmap tasks 17 and 19). Named here
 // because the two texel-content checks further down are about what these two tiles ARE, not
@@ -1322,12 +1322,26 @@ int main(void)
 				0x1D3D3D0320D56934ull,   //  8 leaves
 				0x3E149457CC8AF270ull,   //  9 planks
 				0x55BDFF89F02B7891ull,   // 10 water
-				0x8CD474E09FA7C22Cull,   // 11 tall_grass
+				0xE871B2103AED0C10ull,   // 11 tall_grass (re-pinned 2026-09-02, see below)
 				0x655A7DA542F30C5Eull,   // 12 snow
 				0x8A6AD29F1C304552ull,   // 13 ice
 				0x27AD124F58810F53ull,   // 14 cactus
-				0x2DF2ECEF5259A5A2ull,   // 15 dead_bush
+				0x8D130377E070C1C8ull,   // 15 dead_bush
 				0x003F0B7EA35C1195ull,   // 16 fern
+				0x18EAA54174ABCA86ull,   // 17 birch_log_side
+				0x42572688DE3DB8B0ull,   // 18 birch_log_top
+				0xD5B2EFCCB6417411ull,   // 19 birch_planks
+				0xAD007E727D8E18BBull,   // 20 birch_leaves
+				0xD531DCF2AC78969Aull,   // 21 spruce_log_side
+				0x4024EABA6796618Eull,   // 22 spruce_log_top
+				0x42175E8CBD4AA317ull,   // 23 spruce_planks
+				0xB1F8341FF32D51DCull,   // 24 spruce_leaves
+				0xA6707A2554C90076ull,   // 25 tall_grass_top (re-pinned 2026-09-02, see below)
+				0xBCB5DD8C5298FBCCull,   // 26 poppy
+				0x062B8992508D6F0Aull,   // 27 daisy
+				0xB3DEE21405C3F1B3ull,   // 28 bluebell
+				0xEF709703CD95BB3Eull,   // 29 orchid
+				0xAC89049AACB76209ull,   // 30 apple
 			};
 			for (int slot = 0; slot < ATLAS_PAINTED_SLOTS; slot++) {
 				const uint64_t got = slotFingerprint(SLOT_PNG_TOP(slot));
@@ -1339,6 +1353,36 @@ int main(void)
 				      "addressing is wrong and re-pinning would ship it",
 				      slot, got, kPaintedFingerprint[slot]);
 			}
+
+			// ── 2026-09-02: slots 11 and 25 re-pinned, and why that was allowed ─────────
+			//
+			// steve, playing v1.8.7: "the grass block color is sort of like a dark green
+			// whereas the actual grass grass, like, that stands up, is like a lime green,
+			// and it's really weird." tools/make_atlas.py's tile_tall_grass (:543) and
+			// tile_tall_grass_top (:1311) were repainted to reuse tile_grass_top's own
+			// colours, so the standing grass matches the ground it grows out of.
+			//
+			//   11 tall_grass      0x8CD474E09FA7C22C -> 0xE871B2103AED0C10
+			//   25 tall_grass_top  0x71A3BF68C0F61181 -> 0xA6707A2554C90076
+			//
+			// The CHECK above names the one cause that must NOT be re-pinned — a sheet
+			// resize, which would move slot addressing and silently ship a wrong atlas —
+			// so that was ruled out before touching these two numbers, not after:
+			//
+			//   * gfx/atlas.png is 16x1024 on disk, matching ATLAS_W_PX/ATLAS_H_PX exactly.
+			//     Neither constant moved.
+			//   * All 64 slots were hashed from sheets rebuilt off the identical seed,
+			//     before and after. ONLY 11 and 25 differ. A resize shifts every slot after
+			//     the first; a two-slot delta cannot be one.
+			//   * grass_top and grass_side are byte-identical, 0/256 texels changed. That is
+			//     also the check that the half-grass/half-dirt block steve said he likes was
+			//     not disturbed, and that the seeded RNG stream feeding every later tile is
+			//     undisturbed — the palette lists were kept the SAME LENGTH deliberately, so
+			//     no tile painted after these two moved.
+			//
+			// The pins are the artefact of an intentional art change, not evidence of a bug.
+			// Anything that moves them WITHOUT a matching deliberate edit to make_atlas.py
+			// still means what the CHECK says it means.
 
 			// ── What the two new tiles ARE, not merely that they are stable ──────────────
 			//

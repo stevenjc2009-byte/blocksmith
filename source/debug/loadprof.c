@@ -113,8 +113,24 @@ void loadprofSince(LoadStage s, uint64_t mark)
 	// tick is a free-running 64-bit counter, so this cannot go backwards — but an underflow
 	// here would add roughly 2^64 ticks to a stage and make the whole report unreadable, and
 	// the test is one compare.
-	if (t > mark) s_p.ticks[s] += t - mark;
-	s_p.calls[s]++;
+	//
+	// ── v1.8.8: atomic, because a stage can now have TWO writers ──────────────────────
+	//
+	// loadprof.h's thread-safety argument was "each slot has exactly one writer": region_io,
+	// decode, generate and light on the worker thread and everything else on the main thread.
+	// The second generator lane (app/worker.c, New 3DS only) breaks that — those four stages
+	// are now written by both lanes — and `+=` on a uint64_t is a load, an add and a store,
+	// which on this 32-bit part is TWO stores. Two of them interleaved does not merely lose an
+	// accumulation: it can publish a torn 64-bit value and report a `generate` figure that is
+	// wrong by billions of ticks, which is worse than no instrument at all.
+	//
+	// RELAXED because these are accumulators with no ordering relationship to anything: the
+	// only requirement is that each add lands exactly once and no half-value is ever visible,
+	// and the reader (loadprofEnd, main thread) runs after every lane is parked with nothing
+	// outstanding. On ARM11 __atomic_fetch_add on a uint64_t lowers to an ldrexd/strexd loop,
+	// so it is a handful of instructions on a path that already read the system tick twice.
+	if (t > mark) __atomic_fetch_add(&s_p.ticks[s], t - mark, __ATOMIC_RELAXED);
+	__atomic_fetch_add(&s_p.calls[s], 1, __ATOMIC_RELAXED);
 }
 
 void loadprofFrame(void)

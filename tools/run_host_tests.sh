@@ -445,9 +445,17 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 # Step 8.2's inventory and crafting model. crc32.c is in the link because inventory.c's
 # save file is checksummed the same way a region file is, and the checksum implementation
 # is shared rather than duplicated.
+#
+# registry.c joined this link in v1.8.8. inventoryCanHold() stopped being `item < BLOCK_COUNT`
+# and became a registry lookup (registryIsDefined + registryView), so inventory.c no longer
+# links on its own. block.c is deliberately NOT added alongside it: registry.c references
+# nothing from block.c, and the vendored server builds this exact pair with no block.o at all
+# (its game/Makefile says so outright). Keeping this link matched to the server's is what stops
+# a test passing here against a combination the server cannot actually build.
 gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	-I source \
 	source/world/inventory.c \
+	source/world/registry.c \
 	source/world/crafting.c \
 	source/world/crc32.c \
 	source/world/inventory_test.c \
@@ -1493,9 +1501,13 @@ rm -rf "$BHP"
 BHI="build-host/run-$$-invpersist"
 mkdir -p "$BHI"
 
+# registry.c joined this link in v1.8.8, for the same reason it joined inventory_test's above:
+# inventoryCanHold() is a registry lookup now, and inventoryLoad() calls it on every slot it
+# reads back, so the persistence tests cannot link without it.
 gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	-I source \
 	source/world/inventory.c \
+	source/world/registry.c \
 	source/world/crc32.c \
 	source/world/inventory_persist_test.c \
 	-o "$BHI/inventory_persist_test"
@@ -2886,6 +2898,76 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 rm -rf "$BHTK"
 
+# entity/entity_test.c -- the fixed-pool entity foundation wired into main.c this session
+# (v1.8.9). Own binary, own main(), appended rather than merged into any stanza above for the
+# reason every stanza in this file is appended: an append is the one edit shape that cannot
+# silently drop another session's work, and this file is shared by live sessions.
+#
+# The link is the world stanza's minimum (block.c, registry.c, chunk.c, chunk_codec.c, crc32.c,
+# world.c, budget.c, tests/net_stub.c for networldOnColumnLoad) plus physics.c, since Entity
+# embeds a Body and entityTick's collision sweep calls the real bodyStep, and tick.c, since
+# entity.h's tickPeriodForDistSq/entityTickDue take the tick shape world/tick.h defines. -lm is
+# for isfinite/floorf/sqrtf, same as every other physics-adjacent stanza in this file.
+BHEN="build-host/run-$$-entity"
+mkdir -p "$BHEN"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	tests/net_stub.c \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/chunk_codec.c \
+	source/world/crc32.c \
+	source/world/world.c \
+	source/world/physics.c \
+	source/world/budget.c \
+	source/world/tick.c \
+	source/entity/entity.c \
+	source/entity/entity_test.c \
+	-lm \
+	-o "$BHEN/entity_test"
+
+"./$BHEN/entity_test"
+
+rm -rf "$BHEN"
+
+# tests/fog_overlay_test.c -- v1.9.1's fog-overlay fix. The debug overlay's "see" field used to
+# print RenderDist.half_vis, which comes from the retired PICA200 fixed-function fog LUT
+# (renderDistVisibility/renderDistFogTable in scene/render_dist.c) and has had no GPU path since
+# v1.9.0 turned that unit off -- it barely moved across render distances while what the player
+# actually saw scaled hugely with the setting. chunkRenderFogHalfVis(), added to
+# scene/chunk_render.c/.h this session, reads the live shader-fog ramp (s_fog) through
+# gfx/fogramp.h's fogHalfVis()/fogRampTexel() instead, and main.c's overlay now calls it.
+#
+# chunkRenderFogHalfVis()'s own source text is lifted out of chunk_render.c by an awk range from
+# its signature to its closing brace, the same idiom horizon_test/cavewalk_test above use, since
+# chunk_render.c includes <3ds.h>/<citro3d.h> and cannot be compiled on the host. The test file
+# also asserts over main.c's own source text that the overlay calls the new accessor and no
+# longer reads rd->half_vis in code (comments aside) -- the same "is the caller still asking"
+# idiom horizon_test.c's testTheRendererStillCallsIt() uses, so deleting the wiring in main.c
+# without touching chunk_render.c still goes red here.
+BHFO="build-host/run-$$-fogoverlay"
+mkdir -p "$BHFO"
+
+awk '
+/^float chunkRenderFogHalfVis\(void\)$/ { inf=1; saw=1 }
+inf { print; if ($0 == "}") { done=1; inf=0 } }
+END { if (saw && done) print "#define BS_FOG_OVERLAY_EXTRACT_OK 1" }
+' source/scene/chunk_render.c > "$BHFO/fog_overlay_extract.inc"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source -I "$BHFO" \
+	source/gfx/fogramp.c \
+	source/scene/render_dist.c \
+	tests/fog_overlay_test.c \
+	-lm \
+	-o "$BHFO/fog_overlay_test"
+
+"./$BHFO/fog_overlay_test"
+
+rm -rf "$BHFO"
+
 # world/worldseed_test.c -- the per-world seed sidecar (v1.8.3 Phase 1). Own binary, own main(),
 # APPENDED rather than folded into the world stanza at the top, for the reason every stanza in
 # this file is appended: an append is the one edit shape that cannot drop another session's work,
@@ -3766,3 +3848,427 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 "./$BHMT/worldgen_mt_test"
 
 rm -rf "$BHMT"
+
+# tests/lanes_test.c -- v1.8.8. The SECOND generator lane. worldgen_mt_test above proved the
+# generator is re-entrant; this one proves the thing built on top of it is correct and is
+# actually faster. app/worker.c cannot be compiled on the host (it includes <3ds.h> on line 1
+# and carries the thread bodies), so the parts that can be WRONG were moved into
+# source/app/lanes.c -- no <3ds.h>, no locking, the same split world/jobq.c uses -- and this
+# test links THAT FILE, not a retyped copy of the rule. It drives it from two pthreads over the
+# real worldgenColumn, the real JobQueue and the real budget.
+#
+# WHAT IT MEASURES. Four arms, seed 0x5EEDCAFE, GEN_VERSION_NEWEST, 32 fixed columns, each
+# column digested FNV-1a over all 32,768 blocks read back through worldGet().
+#   UNIT      the claim set and the ready ring on their own, including laneCountFor().
+#   BASELINE  one thread, no lanes: the reference digests.
+#   TWO-LANE  every column submitted TWICE (64 jobs, interleaved c0,c0,c1,c1,...) into two
+#             pthread lanes. This is not a contrived input: main.c genUnloadColumn() clears a
+#             column's "asked" mark when it leaves the ring (main.c:976) and genRequestArea()
+#             re-submits it, so a duplicate COLUMN is reachable even though jobqPop hands each
+#             JOB out exactly once.
+#   TIMING    64 distinct columns, 1 lane vs 2 lanes, 3 repeats, best-of with the spread.
+#
+# MEASURED, host gcc -O1 under WSL, "two-lane generator self-test: PASS - 77 of 77 checks",
+# exit 0:
+#   TWO-LANE  installed 32  dup 32  ready-peak 2  popped 16+16  16.4 ms
+#             wrong 0/32  missing 0  installs 32  refused 0  violations 0  lost 0
+#             -- 32 installs + 32 duplicates refused == 64 jobs exactly, and the work really
+#             was split (popped 16+16). ready-peak is NOT asserted and is NOT stable: it read
+#             2 in the standalone runs and 1 in the in-suite run, because it depends on
+#             whether the installer happened to be between the two lanes' completions. Both
+#             are correct; only the accounting above is a claim.
+#   TIMING    best 1 lane 44.6 ms (spread 2.2), best 2 lanes 22.9 ms (spread 4.4) = 1.95x.
+#             Second full run after the restore: 42.3 / 21.8 = 1.94x, third 42.7 / 22.4 =
+#             1.91x. The spread is the noise floor and it is 4-12% of the figure, so the
+#             speedup is far outside it. THIS IS A HOST NUMBER on an x86 desktop, NOT a
+#             console number, and it is not evidence about the ARM11 -- nothing has run on
+#             real 3DS hardware since v1.2.5.
+#   budget used 0 B after every arm, refusals 0.
+#
+# RED ARM 1 -- the claim set. laneClaimTake()'s duplicate test in source/app/lanes.c
+# (the laneClaimHeld guard that bumps collisions and returns false) was commented out, which
+# is exactly "hand both lanes the same column". Result: "2 lanes: installed 64 dup 0
+# ready-peak 2 popped 32+32", "violations 32" -- both lanes generating the same square of
+# terrain simultaneously, 32 times -- with seven UNIT failures (lines 155/156/157/158/161/163/
+# 168) plus "violations == 0" (:483) and "dups > 0" (:487): "FAILED - 9 of 77 checks", exit 1.
+#
+# RED ARM 2 -- the ready ring. LANE_READY_SLOTS in source/app/lanes.h changed from
+# WORKER_LANES_MAX to 1, so a lane finishing while the ring already holds an uninstalled result
+# has its work thrown away. Result: "STALLED after 20 s: installed 32 + dup 31 of 64 jobs",
+# "ready-peak 1", "lost 1", failing "total_installs + dups == NCOLS * 2" (:474) and
+# "lost == 0" (:480), and the TIMING arm degenerated to "best 2 lanes 20000.0 ms ...
+# speedup 0.00x" failing "best2 < best1" (:520): "FAILED - 6 of 77 checks", exit 1. The 20 s
+# STALL deadline in runMachine() exists for this arm -- without it a dropped result is a hang,
+# not a failure, and a suite that hangs reports nothing.
+#
+# Both files were restored afterwards and both restores confirmed by md5:
+# source/app/lanes.c 6bcd10cac72fa04b8b0aeccfadec0bc9,
+# source/app/lanes.h 65bc28440038957356b2ce6e72fd27a0.
+#
+# NOT proved here: anything about app/worker.c's thread bodies, the LightLock/LightEvent
+# handoff, the s_fs_lock that now serialises world/region.c, or that hwIsNew3ds() grants core
+# 2 on a real console. Those are <3ds.h> code and can only be checked by reading them and by
+# an ARM compile.
+BHLN="build-host/run-$$-lanes"
+mkdir -p "$BHLN"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/chunk_codec.c \
+	source/world/crc32.c \
+	source/world/world.c \
+	source/world/scratch.c \
+	source/world/noise.c \
+	source/world/budget.c \
+	source/world/jobq.c \
+	source/world/worldgen.c \
+	source/world/worldgen_density.c \
+	source/world/genversion.c \
+	source/app/lanes.c \
+	tests/net_stub.c \
+	tests/lanes_test.c \
+	-pthread \
+	-lm \
+	-o "$BHLN/lanes_test"
+
+"./$BHLN/lanes_test"
+
+rm -rf "$BHLN"
+
+# world/biome_tint_test.c -- BIOME TINT (v1.8.8): the packing, the merge key, the palette and
+# both shaders. Own binary, own main(), appended rather than merged into the mesher stanzas
+# above for the reason every stanza in this file is appended: an append is the one edit shape
+# that cannot drop another session's work, and this file is shared.
+#
+# WHAT THIS OWNS. Biome identity is carried by COLOUR, not by a block id per biome: one grass
+# block and one tall-grass strand in world/registry.c, and the biome multiplies what they draw.
+# The index rides in bits 2..4 of MeshVertex.ao (meshAoPack, world/mesher.h), so it costs ZERO
+# bytes per vertex -- sizeof(MeshVertex) is still 8, offsetof(u) still 4, the mesh pool still
+# 46,948,352 bytes on a New 3DS, and the PICA attribute alignment hazard is untouched because
+# the vertex layout did not change at all.
+#
+# THE ONE THAT MATTERS IS THE SMEAR. world/mesher.c is GREEDY along one axis and has been since
+# v1.6.0 task 11, while world/mesher.h's header still claimed it was "deliberately *not* greedy"
+# three minor versions later. mergeRun() joins coplanar faces of the same block id into one quad
+# up to ATLAS_MAX_MERGE_BLOCKS (15) cells wide iff faceFlatKey() gives them the same signature,
+# and until this task that signature was ambient occlusion and light and nothing else. A tint is
+# per COLUMN, so two grass tops either side of a biome border are the same id, the same shape,
+# the same AO and the same light -- they hash identically, merge, and the merged quad takes the
+# FIRST cell's vertices. The border then does not fade, it JUMPS up to fifteen blocks. Nothing
+# else in this tree catches that: the face count is unchanged, the coverage is perfect, and
+# every pinned mesh hash still matches. Only the colour is wrong.
+#
+# RED ARMS, all run, all restored, every restore confirmed by md5. Green is "PASS 71 checks".
+#
+#  1. THE SMEAR ITSELF. faceTint()'s term removed from faceFlatKey's return in
+#     source/world/mesher.c: "return 0x10000u | ((uint32_t)ao << 8) | pad;". Result:
+#     "FAIL L496  border along z at x/z=8: every cell is drawn in its own biome's colour
+#     (112 cells were not)", "(border along z: 16 merged quads, widest covers 15 cells)",
+#     "FAILED - 1 of 71 checks". Green reports 0 cells and a widest of 8.
+#     READ THE WHOLE RED RUN: the "border along x" case stayed GREEN in that arm, because a top
+#     face merges along z. One orientation alone would have been a check that could not fail,
+#     which is why testBiomeBorderIsExact runs both.
+#  2. The BOUND shader reads the raw ao byte again ("mul r4.x, aoScale, inpack.wwww" restored in
+#     source/shaders/world_dynamic.v.pica): "FAIL L683", "FAIL L685", 2 of 71.
+#  3. Grass SIDES tinted -- blockFaceTintable returning face != FACE_BOTTOM for BLOCK_GRASS:
+#     "FAIL L365  no side face is tinted ... (4 were)", 1 of 71.
+#     The FIRST attempt at this arm returned true unconditionally and did not compile
+#     ("error: unused parameter 'face' [-Werror=unused-parameter]", BUILD_EXIT=1). A sabotage
+#     that does not compile proves nothing and it was redone, exactly as the note above the
+#     water stanza in this file records for the same mistake.
+#  4. emitCross drops the tint: "FAIL L419  tall grass carries the ground's biome row on every
+#     quad (0 of 4)" and the same for fern, 2 of 71.
+#  5. emitFace packs MESH_TINT_NONE: 5 of 71, including both border orientations at 256 cells.
+#  6. Palette row 0 changed to (0.90, 1, 1): "FAIL L579 ... (0.90 1.00 1.00)", 1 of 71.
+#  7. scene/chunk_render.c restates the table instead of calling meshTintRow(): "FAIL L632", 1
+#     of 71.
+#  8. The stale "Deliberately *not* greedy" line put back on world/mesher.h: "FAIL L721", 1 of
+#     71.
+#  9. faceTint ignoring its tintable argument: "FAIL L365" and "FAIL L382  a whole plane of dirt
+#     in a tinted column stays untinted (256 of 256 vertices were not)", 2 of 71. NOTE this arm
+#     did NOT turn testUntintableRunsStillMerge red -- stone runs split at the border but still
+#     merge in 8-cell runs, so "widest > 1" held. Arm 10 is what proves that check can fail.
+# 10. mergeRun capped to width 1: "FAIL L517 (0 + 0 quads)", "FAIL L536 (widest 1 cells)",
+#     "FAIL L567 (widest 1 cells)", 3 of 71. This is the guard that stops the smear test from
+#     passing because nothing merged.
+# 11. world.v.pica (compiled, never bound) drifted to a 7-row bank: "FAIL L656", 1 of 71.
+# 12. Every face given tint bit 0: 8 of 71, including "FAIL L328  every ao byte is still 0..3,
+#     so the pinned mesh hashes cannot have moved (128 were not)" -- the check that stands
+#     between this feature and the four pinned hashes in world/world_test.c.
+# 13. meshAoTint unpacking from bit 3: 8 of 71, starting at "FAIL L291".
+#
+# MEASURED, not reasoned:
+#   world/world_test.c            PASS 6065 checks before AND after -- no pinned hash moved.
+#   ARM .text (arm-none-eabi-gcc -O3)  mesher.o 13,080 -> 13,888 (+808 B), scratch.o 2,272 ->
+#                                 2,300 (+28 B). Total +836 bytes.
+#   sizeof(MeshScratch) on ARM    17,498 -> 17,823 (+325 B of .bss: a 324-byte 18x18 column
+#                                 band plus the flag). Per PROCESS, not per chunk.
+#   sizeof(MeshVertex)            8, unchanged. Mesh pool cost: exactly 0 bytes.
+#   Vertex uniform registers      world_dynamic 78 -> 86 of 96. The 8-row cap was MEASURED, not
+#                                 assumed: a scratchpad copy with tintPalette[18] fails picasso
+#                                 with "error: not enough space for local constant 'aoMix'" and
+#                                 [17] assembles.
+#
+# VISUAL, because a compiling and test-passing diff on this project has rendered garbage before.
+# An offline software rasterizer linking this same mesher.c, sampling gfx/atlas.png and
+# replaying world_dynamic.v.pica instruction for instruction produced: a dead-straight
+# jungle/desert border with each strand the colour of its own ground; and on a tinted grass
+# block, 5,472 of 6,842 lid pixels changed, 258 of 258 strand pixels changed, and 0 of 2,102
+# grass-crust side pixels and 0 of 13,316 DIRT side pixels changed -- the half-grass/half-dirt
+# tile is pixel-identical tinted or not. With arm 1 applied the same scene lost its border
+# entirely: 16,919 of 22,580 near-half pixels wrong, far half identical.
+#
+# NOT PROVED BY ANY OF THIS: that the tint reaches the game. This binary gates the MECHANISM
+# and deliberately does not link world/worldgen.c -- see world/scratch.h on why the filler takes
+# a function pointer, and why 10 of the 15 host binaries linking scratch.c must not be made to
+# drag in the generator. The FILLER is gated by tests/scratch_tint_fill_test.c below, which was
+# added at v1.8.8 consolidation once scene/chunk_render.c:1420 was wired to call it. Nor has any
+# of it run on real 3DS hardware; nothing on this project has since v1.2.5.
+BHBT="build-host/run-$$-biometint"
+mkdir -p "$BHBT"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	tests/net_stub.c \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/budget.c \
+	source/world/world.c \
+	source/world/scratch.c \
+	source/world/mesher.c \
+	source/world/biome_tint_test.c \
+	-lm \
+	-o "$BHBT/biome_tint_test"
+
+"./$BHBT/biome_tint_test"
+
+rm -rf "$BHBT"
+
+# tests/scratch_tint_fill_test.c -- the OTHER half of biome tint: world/scratch.c's
+# scratchFillTint, the walk that decides WHICH column gets which palette row.
+#
+# It is a separate binary from the stanza above for the reason that stanza gives: biome_tint_test
+# must not link world/worldgen.c, because scratch.c's whole design point is that it stays
+# linkable by the 10 host binaries that have no generator in them. Adding worldgen.c up there to
+# get coverage of the filler would have contradicted the file it was testing. So the filler gets
+# its own binary, which is free to link the generator, and the split is deliberate rather than
+# an accident of who wrote what.
+#
+# WHAT IT CATCHES that nothing else in this suite can. scratch.c says it itself:
+#
+#     "An off-by-one here does not crash, drop a face or move a vertex: it draws every chunk in
+#      the world one block of COLOUR out of step with its own terrain, which is invisible to
+#      every hash and every face count in the tree."
+#
+# Comparing the tint walk against a re-typed copy of its own index expression would not catch
+# that -- drop the -1 from both copies and it still passes. So the anchor is the BLOCK band,
+# filled by scratchFill: the world is built so a column's blocks identify it, the callback
+# derives the same identity from the coordinates it is handed, and the two bands must agree cell
+# for cell. Different code, different walk, written years apart.
+#
+# RED ARMS, all six run against a sabotaged COPY of scratch.c compiled in place of the real one,
+# with the repo never edited:
+#
+#   -1 dropped from the walk's X ......... FAILED - 3 of 359  (band mismatch + generator arm)
+#   -1 dropped from the walk's Z ......... FAILED - 3 of 359
+#   callback trusted instead of masked ... FAILED - 1 of 359  (0xFF spills into the ao bits)
+#   tint_any set to true unconditionally . FAILED - 1 of 359
+#   scratchFill stops clearing the band .. FAILED - 1 of 359
+#   the two axes transposed .............. FAILED - 3 of 359  (no cell COUNT can see this one)
+#
+# The fourth arm had to be rewritten once: `s->tint_any = true;` alone died on
+# -Werror=unused-but-set-variable, and an arm that dies at COMPILE time has not tested anything.
+# It is `(any || true)` for that reason.
+#
+# It also pins the SEED DOUBLE-MIX trap, which cost a v1.8.8 lane an afternoon. worldgenInit does
+# not store the seed it is given -- it stores rngMix(seed ^ 'BLKS') -- so re-deriving a generator
+# from a live one's stored seed classifies against a different noise field, silently, with a
+# result that looks entirely valid. The lane hit it and got 324 columns of one flat row. The
+# check requires the two generators to DISAGREE; it currently measures 239 of 289 probed columns
+# classifying differently.
+#
+# NOT PROVED HERE: that the colours look right (biome_tint_test's offline rasterizer is that
+# question), that scene/chunk_render.c calls the filler at the right moment (its call site is one
+# line in a file with <3ds.h> on it), or anything at all on real hardware.
+BHTF="build-host/run-$$-tintfill"
+mkdir -p "$BHTF"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	tests/net_stub.c \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/budget.c \
+	source/world/world.c \
+	source/world/scratch.c \
+	source/world/noise.c \
+	source/world/genversion.c \
+	source/world/crc32.c \
+	source/world/worldgen.c \
+	source/world/worldgen_density.c \
+	tests/scratch_tint_fill_test.c \
+	-lm \
+	-o "$BHTF/scratch_tint_fill_test"
+
+"./$BHTF/scratch_tint_fill_test"
+
+rm -rf "$BHTF"
+
+# source/debug/blocklist_test.c -- the debug menu's BLOCK LIST (v1.8.8), which steve asked for
+# explicitly: small icons and names of every block, on the BOTTOM screen rather than the top.
+#
+# The reason this is a host binary at all is that the list is REGISTRY-DRIVEN rather than a
+# hand-written table, and that claim is exactly the kind that rots. It was demonstrated the
+# strongest way available during v1.8.8: with no edit to blocklist.c at any point, its count read
+# 16, then 15, then 27 as a sibling lane added and reshaped registry rows. A hand-written list
+# would have sat at its first number.
+#
+# It links only block.c and registry.c: the file is pure layout arithmetic over the registry and
+# world/atlas_uv.h, with the console half kept in app/debugmenu_ui.c where <3ds.h> lives. That
+# split is what makes the paging, the quad budget and the icon geometry testable here.
+#
+# The quad ceiling matters and is checked: a full page costs 195 quads against gfx/sprite.h's
+# SPRITE_MAX_QUADS of 1024, so the list cannot starve the rest of the bottom screen.
+#
+# One bug this found that no test would have: AIR rendered GRASS art. Air's tex[] is all zero and
+# atlas tile 0 is grass, so an empty entry drew a plausible-looking picture rather than nothing.
+# It was caught by looking at the pixels, not by a check, and the fix tags plates as BL_OP_CELL
+# and skips air's icon quad. The check for it exists now; it did not find it.
+BHBLK="build-host/run-$$-blocklist"
+mkdir -p "$BHBLK"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/block.c \
+	source/world/registry.c \
+	source/debug/blocklist.c \
+	source/debug/blocklist_test.c \
+	-o "$BHBLK/blocklist_test"
+
+"./$BHBLK/blocklist_test"
+
+rm -rf "$BHBLK"
+
+# source/debug/biomeinfo_test.c -- the CURRENT BIOME readout on the bottom-screen debug display
+# (v1.8.8), the other thing steve asked for by name.
+#
+# The biome NAME table did not previously exist anywhere in this tree -- worldgen.c had BiomeId
+# values and no strings -- so this file is where the names live, and where a name added without
+# a row, or a row added without a name, fails.
+#
+# It links the generator because the readout's whole job is to answer "which biome am I standing
+# in", and answering it from anything other than the live WorldGen* would be the seed double-mix
+# trap the stanza above pins. debugBiomeSetWorldGen takes the pointer for that reason.
+#
+# The near-miss worth recording: debugBiomeName's guard was written `(int)b < 0`, which passed 56
+# checks on this host and was REJECTED by arm-none-eabi-gcc under -Werror=type-limits, because
+# the ARM EABI defaults to -fshort-enums and BiomeId is one unsigned byte there. The console build
+# would have failed. Host green is not console green on this project, and this is the second time
+# -fshort-enums has been the reason.
+#
+# The width check is a layout gate, not decoration: the widest row must fit the 320 px bottom
+# screen at the draw origin the HUD uses.
+BHBI="build-host/run-$$-biomeinfo"
+mkdir -p "$BHBI"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	tests/net_stub.c \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/budget.c \
+	source/world/world.c \
+	source/world/noise.c \
+	source/world/genversion.c \
+	source/world/crc32.c \
+	source/world/worldgen.c \
+	source/world/worldgen_density.c \
+	source/debug/biomeinfo.c \
+	source/debug/biomeinfo_test.c \
+	-lm \
+	-o "$BHBI/biomeinfo_test"
+
+"./$BHBI/biomeinfo_test"
+
+rm -rf "$BHBI"
+
+# ---------------------------------------------------------------------------------------
+# app/version_history_data.c freshness guard (v1.8.8) — the baked half of the version
+# history browser (scene/title.c's drawVersionHistory, app/version_history.h). Generated by
+# tools/make_version_history.sh from every whatsnew<version>.txt this repo ships, and
+# committed rather than gitignored (unlike build/atlas.t3x above) so a clean checkout builds
+# without a console pass first — but committed generated code can still go stale exactly the
+# way build/atlas.t3x can: someone adds or edits a whatsnew<version>.txt and forgets to
+# re-run the generator, and the browser ships baked text that disagrees with what
+# tools/make_whatsnew.sh and CHANGELOG.md say that release actually did.
+#
+# Same fix as the atlas guard above, for the same reason: regenerate into this run's own
+# scratch directory and cmp -s the two files. A content test, not a presence test and not an
+# mtime test. tools/make_version_history.sh is deterministic (plain byte globbing plus
+# od/tr/sed over files already on disk, no timestamps, no randomness anywhere in it), so two
+# runs over the same whatsnew*.txt files produce byte-identical output.
+#
+# tools/make_version_history.sh's OWN exit codes (5: a whatsnew file's version has no
+# "## [<version>]" heading in CHANGELOG.md; 6: an empty whatsnew file) are a second,
+# independent guard against the same drift this stanza checks for — that one runs every time
+# the generator itself runs, this one runs every time the test suite does.
+#
+# Own scratch directory rather than the shared $BH above: $BH is already rm -rf'd by the time
+# a stanza this far down the file runs (see its own comment - "removed at the end, but only
+# on success"), the same reason BHBLK and BHBI above have their own.
+BHVH="build-host/run-$$-verhist"
+mkdir -p "$BHVH"
+
+VH_DATA="source/app/version_history_data.c"
+VH_DATA_FRESH="$BHVH/version_history_data.expected.c"
+
+if ! sh tools/make_version_history.sh "$VH_DATA_FRESH" >"$BHVH/version_history_gen.log" 2>&1; then
+	echo "version history artefact guard: FAIL - tools/make_version_history.sh exited non-zero" >&2
+	cat "$BHVH/version_history_gen.log" >&2
+	echo "  see tools/make_version_history.sh's own comment for what each exit code means" >&2
+	echo "  (5: a whatsnew file's version is not in CHANGELOG.md, 6: an empty whatsnew file)." >&2
+	exit 1
+fi
+
+if [ ! -f "$VH_DATA" ]; then
+	echo "version history artefact guard: FAIL - $VH_DATA is MISSING" >&2
+	echo "  it is generated, COMMITTED source (see app/version_history.h's file comment), not" >&2
+	echo "  a gitignored build product - a clean checkout should always have it." >&2
+	echo "  Fix: sh tools/make_version_history.sh $VH_DATA" >&2
+	exit 1
+fi
+
+if ! cmp -s "$VH_DATA" "$VH_DATA_FRESH"; then
+	echo "version history artefact guard: FAIL - $VH_DATA is STALE" >&2
+	echo "  it is NOT what today's whatsnew<version>.txt files produce, so the version history" >&2
+	echo "  browser would ship text that disagrees with CHANGELOG.md and tools/make_whatsnew.sh." >&2
+	echo "  on disk : $(wc -c < "$VH_DATA") bytes" >&2
+	echo "  expected: $(wc -c < "$VH_DATA_FRESH") bytes" >&2
+	echo "  Fix: sh tools/make_version_history.sh $VH_DATA" >&2
+	exit 1
+fi
+
+echo "version history artefact guard: $VH_DATA matches a fresh tools/make_version_history.sh run"
+
+# app/version_history.c / app/version_history_test.c — the parse-on-demand half (index
+# bounds, ordering, out-of-range behaviour) that has no <3ds.h> in it. See
+# app/version_history_test.c's own file comment for why several checks hardcode a version
+# string at a fixed index rather than the total count.
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/app/whatsnew.c \
+	source/app/updater_version.c \
+	source/app/version_history.c \
+	source/app/version_history_data.c \
+	source/app/version_history_test.c \
+	-o "$BHVH/version_history_test"
+
+"./$BHVH/version_history_test"
+
+rm -rf "$BHVH"

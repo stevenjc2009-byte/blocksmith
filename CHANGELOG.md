@@ -4,6 +4,110 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.8.8] - 2026-09-02
+
+Biome identity. Biomes are now told apart by colour, Minecraft-style, and around that one
+feature grew twelve new blocks and plants, a debug-only border overlay for checking where those
+biomes actually meet, a browsable version history, and the first release where sound, the
+day/night cycle and entities are wired into the game and actually run, rather than sitting
+built and silent. A second world-generation thread also lands on the New 3DS as pure
+groundwork — present, correct, and not yet a speed claim.
+
+Most of this release is identical on both consoles. Where a console genuinely differs, it is
+said so explicitly below and nowhere else.
+
+### Added
+
+- **Biomes are told apart by colour**, the way Minecraft tints its grass. One grass block, one
+  set of tall-grass and fern art, is now coloured per biome rather than needing a separate
+  block for every biome. The half-grass/half-dirt block is untouched by this — checked pixel by
+  pixel, not just left alone — and the grass crust on its side is deliberately left untinted,
+  because this hardware has no way to tint half a block without also tinting the dirt half.
+
+  Worth knowing before it reads as a bug: the tinting can only darken or mute the underlying
+  art, never brighten or shift it past what the source texture already holds, so **desert
+  currently comes out a dry olive rather than the sandy tan you'd expect.**
+
+- **Twelve new blocks and plants**: birch and spruce logs, planks and leaves; a second cell for
+  tall grass; four flowers (poppy, daisy, bluebell, orchid); and apples, which are their own
+  breakable, carryable block. Each has its own break time — birch is the softest wood, spruce
+  the hardest, oak in between, and the same ordering holds for their leaves.
+
+- **Apples grow in oak and birch leaves**, never spruce, and drop about **1 in 200** breaks.
+  The odds are worked out from the leaf block's own position in the world rather than from when
+  or in what order it gets broken, so in a multiplayer game every player agrees on whether a
+  given leaf drops an apple, regardless of who broke it first.
+
+- **The debug menu's bottom screen now lists every registered block** in the game, with its
+  icon and name, paged with the D-pad.
+
+- **A "Version history" button, top left of the check-for-update screen.** D-pad driven across
+  both screens, it lists what every past version added, changed, fixed and removed — for
+  catching up after skipping a few updates. Its list is generated straight from this file, so
+  it can never say something the changelog doesn't.
+
+- **Debug-only neon biome borders.** A toggle in the debug menu — off by default, and not meant
+  to be a regular feature — draws a glowing fence standing on the ground exactly along every
+  biome boundary, for checking where biomes actually meet.
+
+- **The current biome is now shown on the bottom-screen debug readout.**
+
+- *New 3DS only:* **a second thread can now generate world terrain alongside the first**, using
+  the New 3DS's spare core. This is foundation work, not a promised loading-speed number — the
+  two threads are proven not to duplicate or drop a column under real concurrent load, but the
+  pairing has never run together on an actual console, so no in-game speed claim is made yet.
+  The Old 3DS has no spare core to give this and is unaffected: same one generator thread, same
+  byte-identical terrain either way.
+
+- **Sound effects, the day/night cycle and entities are wired into the game and now actually
+  run, for the first time.** All three existed and were tested in isolation earlier this cycle
+  but had never been switched on; this is the release where they are. Three sound effects ship
+  — block break, block place, footstep — sourced CC0 from Kenney's Impact Sounds pack; nothing
+  is taken from Minecraft or Nintendo. Entities are foundation only: storage, physics and
+  ticking exist and run, but there are no mobs yet and nothing new to see wandering around.
+
+### Changed
+
+- **Dead bushes redone.** What used to be a single thin diagonal twig is now a bushier clump.
+
+### Fixed
+
+- **Six items — cactus among them — could not be picked up, and the cactus specifically could
+  not be broken at all.** The inventory's "can this fit in the bag" check was a leftover
+  constant sized for the game's original eight blocks; tall grass, snow, ice, cactus, dead bush
+  and fern all fell past it and were silently refused. The check now asks the block registry
+  instead of a hardcoded number, so all six can be broken, carried and placed again. Cactus also
+  got its own break time for the first time, between snow's and ice's, rather than defaulting to
+  whatever the old ceiling implied.
+
+- **Standing grass strands were a jarring lime green against the block's own darker green.**
+  Traced to the source art itself, not to lighting or to the new biome tinting — the strand
+  tiles were simply painted a different green than the block they grow on. Repainted to share
+  the grass block's own colours.
+
+- **The debug overlay's "see" distance reading was wrong.** It was computed for the console's
+  built-in fog hardware, which has actually been switched off since v1.8.5 in favour of a
+  hand-drawn fade — so the on-screen number sat at roughly 14 blocks no matter what render
+  distance was actually selected. It now reports the real figure: roughly 28 blocks at render
+  distance 3, 38 at 4, and 47 at 5.
+
+### Notes
+
+**The chunk pop-in reported after v1.8.7 is not fixed, and still not explained.** This release
+investigated it: the console's built-in fog hardware was suspected and cleared — it has been
+off since v1.8.5 and was never the cause. A long walk through the real streaming code found
+nothing wrong, and a lengthy emulator walk at render distance 5 showed no holes. Neither of
+those proves it can't still happen on real hardware — an emulator runs on a PC far faster than
+the 3DS's own processor, and nobody has yet measured how fast the console itself generates a
+chunk of terrain. That measurement, not a fix, is the next step.
+
+Server-side groundwork so items like the cactus survive a multiplayer rejoin has shipped on the
+server, but the client half of that work did not land this version. For now, a cactus (or any
+of the other five newly-carryable items) picked up over multiplayer will not survive leaving
+and rejoining the server.
+
+Not run on real 3DS hardware.
+
 ## [1.8.7] - 2026-09-02
 
 Terrain — and, unexpectedly, the release where two bugs that had been quietly corrupting

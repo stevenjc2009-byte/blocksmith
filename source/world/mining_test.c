@@ -72,6 +72,54 @@ static void testCoreHardness(void)
 	CHECK(blockHardnessTicks(BLOCK_WATER)      ==  0, "water is 0 ticks (never targetable)");
 	CHECK(blockHardnessTicks(BLOCK_TALL_GRASS) ==  1, "tall grass is 1 tick (0.05 s)");
 
+	// v1.8.3 Phase 3's five rows, absent from this list until v1.8.8. Their absence was not
+	// an oversight in this file so much as a consequence of the item ceiling: none of these
+	// ids could be broken, so their hardness byte was a number nothing read, and a test of an
+	// unread number would have looked like diligence and proved nothing. With the ceiling
+	// widened they are live values, so they are pinned here the same way the ten above are —
+	// by name, one line each, typed from the intent rather than read back off the table.
+	CHECK(blockHardnessTicks(BLOCK_SNOW)      ==  8, "snow is 8 ticks (0.40 s)");
+	CHECK(blockHardnessTicks(BLOCK_ICE)       == 10, "ice is 10 ticks (0.50 s)");
+	CHECK(blockHardnessTicks(BLOCK_CACTUS)    ==  9, "cactus is 9 ticks (0.45 s)");
+	CHECK(blockHardnessTicks(BLOCK_DEAD_BUSH) ==  1, "dead bush is 1 tick (0.05 s)");
+	CHECK(blockHardnessTicks(BLOCK_FERN)      ==  1, "fern is 1 tick (0.05 s)");
+
+	// DISTINCTNESS, and this is the check the roadmap actually asked for: "every single new
+	// block breakable with its own durability". The three lines above could all read 9 and
+	// each `==` would still be a true statement about a table where the cactus had simply
+	// borrowed its neighbours' number. Stated as three inequalities, that cannot happen
+	// quietly. The cactus sits deliberately BETWEEN snow and ice rather than outside them —
+	// a value picked to be far away would satisfy this while telling the player nothing.
+	CHECK(blockHardnessTicks(BLOCK_CACTUS) != blockHardnessTicks(BLOCK_SNOW),
+	      "the cactus does not break in the same time as snow");
+	CHECK(blockHardnessTicks(BLOCK_CACTUS) != blockHardnessTicks(BLOCK_ICE),
+	      "nor in the same time as ice");
+	CHECK(blockHardnessTicks(BLOCK_SNOW) < blockHardnessTicks(BLOCK_CACTUS)
+	      && blockHardnessTicks(BLOCK_CACTUS) < blockHardnessTicks(BLOCK_ICE),
+	      "and it is ordered between them: snow < cactus < ice");
+
+	// THE RULE, not the values: every core row a player can aim at has a break time of its
+	// own. This is the check that catches the next block added without a .hardness, because
+	// world/registry.c's kCoreDefs is a designated-initialiser table — a row written without
+	// one gets 0 from the zero-fill, breakTicksRequired() returns 0, and the block shatters
+	// on the press edge with nothing said. A liquid is exempt and only a liquid, because
+	// blockIsTargetable() is false for it and no break timer can ever ask.
+	//
+	// world/registry_test.c's coreHardnessIsDeclared() states the identical rule over the
+	// registry directly. Two suites rather than one because they fail at different moments:
+	// that one goes red on the table, this one goes red on what mining reads out of it.
+	int targetable_rows = 0;
+	for (BlockId id = 1; id <= REG_ID_CORE_HI; id++) {
+		if (!registryIsDefined(id)) continue;
+		if (registryView(id)->liquid) continue;   // View, not Get: Get's liquid is a flags bit
+		targetable_rows++;
+		CHECK(blockHardnessTicks(id) != 0,
+		      "every defined, non-liquid core row declares a hardness of its own");
+	}
+	// The loop ran, and over the whole table rather than a prefix of it. Without this a
+	// `continue` that swallowed everything leaves the rule green having asserted nothing.
+	CHECK(targetable_rows == 25, "and there are 25: 27 core rows less air and less water");
+
 	// The view is derived from the def, so the two must agree. This is what goes red if
 	// refreshView() copies the wrong field, or copies it from the wrong row.
 	CHECK(registryGet(BLOCK_STONE)->hardness == blockHardnessTicks(BLOCK_STONE),
@@ -106,6 +154,14 @@ static void testBreakTicks(void)
 	CHECK(breakTicksRequired(BLOCK_SAND,       BARE_HANDS) == 10, "sand takes 10 ticks");
 	CHECK(breakTicksRequired(BLOCK_WOOD,       BARE_HANDS) == 40, "wood takes 40 ticks");
 	CHECK(breakTicksRequired(BLOCK_PLANKS,     BARE_HANDS) == 40, "planks take 40 ticks");
+
+	// v1.8.8. The three cubes whose hardness only started being read once the bag would take
+	// them. Three adjacent numbers on purpose, so a break time fetched from the wrong ROW —
+	// an off-by-one in a lookup, a view copied from the neighbour — lands on a value that is
+	// still plausible and is caught here rather than felt in play.
+	CHECK(breakTicksRequired(BLOCK_SNOW,   BARE_HANDS) ==  8, "snow takes 8 ticks");
+	CHECK(breakTicksRequired(BLOCK_CACTUS, BARE_HANDS) ==  9, "cactus takes 9 ticks: its own");
+	CHECK(breakTicksRequired(BLOCK_ICE,    BARE_HANDS) == 10, "ice takes 10 ticks");
 
 	// The blocks with no break time. Neither is targetable, so neither is ever asked in the
 	// game — but "never asked" is not "answers anything", and 0 is the answer that says

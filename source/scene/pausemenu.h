@@ -72,6 +72,18 @@ void pauseMenuClose(void);
 // and returns NONE.
 PauseAction pauseMenuInput(uint32_t down, int* out_dist_step, bool* out_stereo_toggle);
 
+// True once if the player moved the sound volume since the last call, and clears the
+// flag. The volume itself is NOT reported: unlike render distance and 3D there is
+// nothing for the caller to apply — audioSetMasterVolume() is the whole action and this
+// module already made it. What the caller still owns is the card, so this exists purely
+// so main.c knows to copy audioGetMasterVolume() into its Options and optionsSave().
+//
+// A separate poll rather than a third out-param on pauseMenuInput above, because that
+// signature is called from main.c and changing it would break a file this change does
+// not own. Ignoring this function entirely is a supported outcome: the volume still
+// works for the session, it just does not survive a reboot.
+bool pauseMenuTakeVolumeChanged(void);
+
 // Draws the menu over the bottom screen. Call inside the sprite batch, after the ordinary
 // bottom-screen UI, so it lands on top of it. A no-op when the menu is closed.
 void pauseMenuDraw(const PauseStats* st);

@@ -21,6 +21,11 @@
 #include "world/block.h"
 #include "world/crafting.h"
 #include "world/inventory.h"
+// v1.8.8: testTheBagTakesEveryDefinedBlock() walks the registry directly and registers a
+// dynamic row, so this is included by name rather than leant on through inventory.h (which
+// pulls it in since the ceiling became registry-driven). world/registry.c joined this binary's
+// link line in the same change.
+#include "world/registry.h"
 
 static int  s_checks;
 static int  s_fails;
@@ -52,7 +57,28 @@ static char s_first[160];
 //
 // Legitimately adding or removing a CHECK means editing this by hand. The suite going red
 // until you do is deliberate friction, not an accident.
-#define INVENTORY_TEST_EXPECTED_CHECKS 180
+//
+// 180 -> 212 on 2026-09-02 (v1.8.8), by DELTA rather than by pasting what the run printed.
+// testTheBagTakesEveryDefinedBlock() is the only addition and it makes 32 calls: 4 on the
+// cactus itself, 13 inside the per-row loop, 2 loop-ran counters, 3 on the defined/undefined
+// boundary, 2 on the surviving exclusions (air, liquid), 6 on the dynamic id before and after
+// registering plus the re-init, and 2 on the wire span. 180 + 32 = 212.
+//
+// The 13 is worth spelling out because the delta was first computed as 14 and the run said
+// 212, not 213. Fifteen core rows, LESS AIR (the loop starts at id 1) and LESS WATER (a
+// liquid). Two subtractions, not one — and the guard is what turned a miscount into a red
+// line rather than into a quietly wrong pin.
+//
+// 212 -> 224 on 2026-09-02, same v1.8.8, later the same day: registry.c grew twelve more core
+// rows (ids 15..26, the per-biome timber and flora) on top of the fifteen this file's previous
+// entry above was counting against. Nothing in testTheBagTakesEveryDefinedBlock() changed
+// shape — the per-row loop at line 217 is still one CHECK() per accepted id, it just now runs
+// over twenty-five accepted ids (twenty-seven core rows less air, less water) instead of
+// thirteen. Every other tally in the 32-call breakdown above — the 4 on the cactus, the 2
+// loop-ran counters, the 3 boundary checks, the 2 exclusions, the 6 dynamic-id calls, the 2
+// wire-span calls — is a fixed count untouched by how many rows the registry defines, so the
+// whole delta is the loop body: +12. 212 + 12 = 224.
+#define INVENTORY_TEST_EXPECTED_CHECKS 224
 
 // Deliberately NOT routed through CHECK(): this must not perturb the number it is testing,
 // so it bumps s_fails only. It fills s_first (with both numbers, so the one-line summary is
@@ -165,6 +191,84 @@ static void testAddToEmpty(void)
 		CHECK(inv.slots[i].item  == ITEM_NONE);
 		CHECK(inv.slots[i].count == 0);
 	}
+}
+
+// v1.8.8 — the item ceiling, through the API a pickup actually uses.
+//
+// Every other case in this file adds an id below 8, so the whole suite was green on a build
+// where inventoryAdd() refused everything else. That is not hypothetical: it WAS that build,
+// for five releases, and the way it surfaced was steve reporting that a cactus could not be
+// broken.
+//
+// The boundary is asserted from BOTH sides and against the registry rather than a constant,
+// because the id that must be refused is now "the one with no row", which moves whenever a row
+// is added — as v1.8.8's per-biome blocks will.
+static void testTheBagTakesEveryDefinedBlock(void)
+{
+	registryInitCore();
+
+	Inventory inv;
+	inventoryInit(&inv);
+
+	// The reported case, end to end: a cactus goes in, and comes back out of the slot as a
+	// cactus. Red on any pre-v1.8.8 build.
+	uint8_t leftover = 123;
+	CHECK(inventoryAdd(&inv, (ItemId)BLOCK_CACTUS, 5, &leftover) == INV_ADD_OK);
+	CHECK(leftover == 0);
+	CHECK(inv.slots[0].item  == (ItemId)BLOCK_CACTUS);
+	CHECK(inv.slots[0].count == 5);
+
+	// The rule, not the instance: every defined, non-liquid core row is accepted. A loop over
+	// the id space with a definedness skip, so a row added tomorrow is covered without anyone
+	// remembering to come back here.
+	Inventory all;
+	inventoryInit(&all);
+	int accepted = 0;
+	for (BlockId id = 1; id <= REG_ID_CORE_HI; id++) {
+		if (!registryIsDefined(id)) continue;
+		if (registryView(id)->liquid) continue;
+		CHECK(inventoryCanHold((ItemId)id));
+		accepted++;
+	}
+	// The loop ran, over the whole table rather than a prefix of it. Without this a
+	// definedness query answering false for everything leaves the rule green having asserted
+	// nothing at all.
+	CHECK(accepted == 25);            // 27 core rows less air and less water
+	CHECK(accepted > BLOCK_COUNT);    // and genuinely more than the old ceiling admitted
+
+	// THE BOUNDARY, both sides, derived rather than hard-coded: the last id with a row is
+	// accepted, the first id without one is refused.
+	CHECK(inventoryCanHold((ItemId)BLOCK_APPLE));                 // 26, the last defined row
+	CHECK(!inventoryCanHold((ItemId)(BLOCK_APPLE + 1)));          // 27, no row
+	CHECK(!registryIsDefined((BlockId)(BLOCK_APPLE + 1)));        // ...and that is why
+
+	// The two exclusions that survive the widening, each for its own reason. Neither of them
+	// is about where the id sits.
+	CHECK(!inventoryCanHold(ITEM_NONE));                         // air is not an item
+	CHECK(!inventoryCanHold((ItemId)BLOCK_WATER));               // a liquid is not carriable
+
+	// An id in the SERVER range is refused while undefined and accepted once it has a row —
+	// the whole change, stated as one before/after pair. Before v1.8.8 the second of these
+	// was false no matter what the server sent.
+	CHECK(!inventoryCanHold((ItemId)REG_ID_DYN_LO));
+	BlockDef def;
+	memset(&def, 0, sizeof def);
+	snprintf(def.name, sizeof def.name, "%s", "bag_probe");
+	def.flags = REG_FLAG_SOLID;
+	const BlockId dyn = registryRegister(&def);
+	CHECK(dyn >= REG_ID_DYN_LO);
+	CHECK(inventoryCanHold((ItemId)dyn));
+	CHECK(inventoryAdd(&all, (ItemId)dyn, 1, NULL) == INV_ADD_OK);
+	CHECK(all.slots[0].item == (ItemId)dyn);
+
+	// Put the table back, so nothing after this case inherits a row it never asked for.
+	registryInitCore();
+	CHECK(!inventoryCanHold((ItemId)dyn));
+
+	// The WIRE span is a separate and much smaller ceiling, and it did NOT move. Pinned here
+	// so the two are never conflated again: the bag holds a cactus, the wire cannot name one.
+	CHECK(inventoryItemOnWire((ItemId)BLOCK_PLANKS));
+	CHECK(!inventoryItemOnWire((ItemId)BLOCK_CACTUS));
 }
 
 static void testAddMergesIntoPartialStack(void)
@@ -573,6 +677,7 @@ int main(void)
 	testMkdir(TEST_DIR);
 
 	testAddToEmpty();
+	testTheBagTakesEveryDefinedBlock();   // v1.8.8 — the item ceiling
 	testAddMergesIntoPartialStack();
 	testAddFillsStackExactly();
 	testAddPartialMergeThenSpillsToSecondSlot();

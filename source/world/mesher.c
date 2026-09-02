@@ -347,6 +347,54 @@ static inline uint8_t cornerAO(int si, const CornerPlan* c)
 	return (s1 && s2) ? 0 : (uint8_t)(3 - s1 - s2 - (s_cell_flags[si + c->aoc] & CELL_FLAG_SOLID));
 }
 
+// ── v1.8.8 biome tint ────────────────────────────────────────────────────────
+//
+// Which faces the biome is allowed to colour. Everything else emits MESH_TINT_NONE and comes
+// out of this mesher byte-for-byte what it came out before.
+//
+// The grass block's TOP only, and the two cross-shaped plants whole. That is a deliberate
+// restriction and not an oversight: BTEX_GRASS_SIDE is ONE tile carrying a grass crust over
+// dirt (world/registry.c gives grass GRASS_SIDE on all four sides and DIRT on the bottom), and
+// this hardware has no fragment shader and no per-texel mask, so tinting that face tints the
+// dirt half of it with the grass half. Minecraft solves that with a separate masked overlay
+// sampled from a second texture unit; doing it here would need a new atlas tile and a second
+// texcoord varying, i.e. redrawing the block. The half-grass/half-dirt tile is to be kept
+// exactly as it is, so its sides stay untinted and only its lid takes the biome's colour.
+//
+// LEAVES ARE NOT IN THIS LIST even though Minecraft tints them. Nobody asked for it; adding
+// BLOCK_LEAVES here is a one-line change if it is ever wanted.
+static bool blockFaceTintable(BlockId id, int face)
+{
+	switch ((int)id) {
+	case BLOCK_GRASS:      return face == FACE_TOP;
+	case BLOCK_TALL_GRASS:
+	case BLOCK_FERN:       return true;
+	default:               return false;
+	}
+}
+
+// The tint band is indexed per column, so a cell index has to lose its y.
+//
+// si = sy*(18*18) + sz*18 + sx, so si modulo 18*18 is exactly sz*18 + sx — which is
+// scratchColumn(sx, sz) (world/scratch.h) with no division by 18 at all. One modulo by a
+// compile-time constant, and only on a face that is actually tintable.
+static inline int scratchColumnOf(int si)
+{
+	return si % (SCRATCH_DIM * SCRATCH_DIM);
+}
+
+// The palette index a face in cell `si` takes: the column's biome tint if this face is
+// tintable and anything filled the band, and MESH_TINT_NONE otherwise.
+//
+// The `tint_any` half is what makes this free for every caller that predates the feature —
+// scratchFill clears the band and leaves the flag false, so a host suite or a console build
+// with no biome source wired in never reads the band at all. See MeshScratch in scratch.h.
+static inline uint8_t faceTint(const MeshScratch* s, int si, bool tintable)
+{
+	if (!tintable || !s->tint_any) return MESH_TINT_NONE;
+	return (uint8_t)(s->tint[scratchColumnOf(si)] & MESH_TINT_MASK);
+}
+
 // Smooth per-corner light: average the four cells touching this corner from outside the
 // face — the neighbour cell plus the same two flanks and diagonal the AO rule already walks
 // — skipping occluding ones. The neighbour cell is never occluding (the face would not have
@@ -385,8 +433,13 @@ static inline uint8_t cornerLight(const MeshScratch* s, int si, const FacePlan* 
 // mesher emitted before v1.8.0 task 22b. It rides in the nrm byte (see mesher.h): the shader
 // already fetches a per-vertex table row from that byte for the face brightness, so the offset
 // comes along for one extra `add` and no extra fetch, and a row for face 0..5 carries 0.0.
+//
+// `tint` is the biome palette index this face draws with, MESH_TINT_NONE for everything that
+// is not tintable — see blockFaceTintable. It is resolved by the caller rather than here
+// because the caller is the one that knows the block id, and because mergeRun has to ask the
+// same question before it groups two faces into one quad.
 static void emitFace(MeshOut* o, const MeshScratch* s, int si, int lx, int ly, int lz,
-                     int face, const AtlasRect* r, bool lit, uint8_t drop)
+                     int face, const AtlasRect* r, bool lit, uint8_t drop, uint8_t tint)
 {
 	if (o->vert_count + 4 > o->vert_cap || o->index_count + 6 > o->index_cap) {
 		o->overflow = true;
@@ -417,7 +470,12 @@ static void emitFace(MeshOut* o, const MeshScratch* s, int si, int lx, int ly, i
 
 		// See cornerAO/cornerLight above — the rules live there because the greedy merge
 		// has to ask exactly the same questions before it groups two faces into one quad.
-		v->ao  = cornerAO(si, c);
+		//
+		// v1.8.8: the occlusion now shares its byte with the biome tint index, packed by
+		// meshAoPack (world/mesher.h). With tint 0 — every face that is not tintable, and
+		// every face at all until something fills the scratch's tint band — this is exactly
+		// the `cornerAO(si, c)` it replaced, which is why the pinned mesh hashes did not move.
+		v->ao  = meshAoPack(cornerAO(si, c), tint);
 		v->pad = lit ? cornerLight(s, si, p, c) : 0;
 	}
 
@@ -526,11 +584,44 @@ static inline bool mergeCandidate(const MeshScratch* s, int nb, int face, uint8_
 
 // The shading signature of one face, or 0 if it may not be merged at all.
 //
-// Non-zero means "all four corners carry the same AO, and the same light", and the value
-// identifies which. Two faces merge iff their keys are equal and non-zero. The bit above
-// the payload is what keeps a legitimate all-zero corner (AO 0, light 0 — a fully dark
-// crevice) from reading as "unmergeable".
-static uint32_t faceFlatKey(const MeshScratch* s, int si, int face, bool lit)
+// Non-zero means "all four corners carry the same AO, the same light, and the same biome
+// tint", and the value identifies which. Two faces merge iff their keys are equal and
+// non-zero. The bit above the payload is what keeps a legitimate all-zero corner (AO 0,
+// light 0, tint 0 — a fully dark untinted crevice) from reading as "unmergeable".
+//
+// Bit layout of the returned word:
+//   bits  0..7   the packed corner light, sky<<4 | block, 0 when the engine is off
+//   bits  8..15  the corner AO (only 0..3 ever occur, so 10..15 are always clear)
+//   bit   16     the "this is a real key" sentinel
+//   bits 17..19  v1.8.8, the biome tint palette index
+//   bits 20..31  free
+//
+// ── WHY THE TINT HAS TO BE IN HERE ───────────────────────────────────────────
+//
+// This is the bug the tint would otherwise have shipped with, and it is silent.
+//
+// mergeRun below merges coplanar faces of the same block id into a single quad up to
+// ATLAS_MAX_MERGE_BLOCKS (15) cells wide, and it merges them iff this key matches. The tint
+// is per COLUMN, so two grass tops either side of a biome border are the same block id, the
+// same shape, and — on flat open ground, which is where biome borders mostly are — the same
+// AO and the same light. Without the tint in this key they hash identically, merge into one
+// quad, and that quad takes the four vertices of the FIRST cell in the run. Every cell behind
+// it is then drawn in the first cell's biome colour: the border does not fade, it JUMPS, up to
+// fifteen blocks away from where the biome actually changes, in whichever direction the run
+// happened to be walked.
+//
+// Nothing else catches it. The face count is unchanged, the coverage is perfect, the AO and
+// the light are correct, and every existing test stays green — the geometry is right and only
+// the colour is wrong, which is precisely the class of defect this project has been bitten by
+// before. See world/biome_tint_test.c, which asserts the border is exact by walking the
+// emitted quads, and which was measured red with this line's `tint` term removed.
+//
+// `tintable` rather than the tint itself: a face that cannot be tinted emits MESH_TINT_NONE
+// whatever column it stands in, so folding the raw column value in for stone and dirt would
+// split their runs at every biome border for no visual difference at all — a pure meshing
+// regression. The tint that goes in the key is the tint that goes in the vertex, and
+// faceTint() is the one function that answers both.
+static uint32_t faceFlatKey(const MeshScratch* s, int si, int face, bool lit, bool tintable)
 {
 	const FacePlan* p  = &s_plan[face];
 	const uint8_t   ao = cornerAO(si, &p->corner[0]);
@@ -545,7 +636,7 @@ static uint32_t faceFlatKey(const MeshScratch* s, int si, int face, bool lit)
 			if (cornerLight(s, si, p, &p->corner[i]) != pad) return 0;
 	}
 
-	return 0x10000u | ((uint32_t)ao << 8) | pad;
+	return 0x10000u | ((uint32_t)faceTint(s, si, tintable) << 17) | ((uint32_t)ao << 8) | pad;
 }
 
 // How far a run starting at this cell may reach: the merge cap, the chunk edge, and then
@@ -553,7 +644,7 @@ static uint32_t faceFlatKey(const MeshScratch* s, int si, int face, bool lit)
 // only the single cheap mergeCandidate() probe — faceFlatKey is not computed at all unless
 // there is a geometrically eligible neighbour to merge with.
 static int mergeRun(const MeshScratch* s, int si, int uc, int face, uint8_t id,
-                    bool deferred, bool lit, uint8_t drop)
+                    bool deferred, bool lit, uint8_t drop, bool tintable)
 {
 	const FacePlan* p = &s_plan[face];
 	if (!p->u_merge) return 1;
@@ -566,7 +657,7 @@ static int mergeRun(const MeshScratch* s, int si, int uc, int face, uint8_t id,
 
 	if (!mergeCandidate(s, si + p->u_step, face, id, deferred, drop)) return 1;
 
-	const uint32_t key = faceFlatKey(s, si, face, lit);
+	const uint32_t key = faceFlatKey(s, si, face, lit, tintable);
 	if (!key) return 1;
 
 	int w  = 1;
@@ -574,7 +665,7 @@ static int mergeRun(const MeshScratch* s, int si, int uc, int face, uint8_t id,
 	while (w < max_w) {
 		nb += p->u_step;
 		if (!mergeCandidate(s, nb, face, id, deferred, drop)) break;
-		if (faceFlatKey(s, nb, face, lit) != key) break;
+		if (faceFlatKey(s, nb, face, lit, tintable) != key) break;
 		w++;
 	}
 	return w;
@@ -590,10 +681,11 @@ static int mergeRun(const MeshScratch* s, int si, int uc, int face, uint8_t id,
 // further along u. Which corners those are is read from the same CornerPlan emitFace used,
 // so the geometry and the UVs cannot disagree.
 static void emitFaceRun(MeshOut* o, const MeshScratch* s, int si, int lx, int ly, int lz,
-                        int face, const AtlasRect* r, bool lit, int width, uint8_t drop)
+                        int face, const AtlasRect* r, bool lit, int width, uint8_t drop,
+                        uint8_t tint)
 {
 	if (width <= 1) {
-		emitFace(o, s, si, lx, ly, lz, face, r, lit, drop);
+		emitFace(o, s, si, lx, ly, lz, face, r, lit, drop, tint);
 		return;
 	}
 
@@ -601,7 +693,11 @@ static void emitFaceRun(MeshOut* o, const MeshScratch* s, int si, int lx, int ly
 	wide.u1 = (uint8_t)(r->u0 + TILE_PX * width);
 
 	const uint32_t base = o->vert_count;
-	emitFace(o, s, si, lx, ly, lz, face, &wide, lit, drop);
+	// One tint for the whole run, taken from the run's FIRST cell. That is not an
+	// approximation: mergeRun only extended this run across cells whose faceFlatKey matched,
+	// and since v1.8.8 the tint is part of that key, so every cell under this quad carries
+	// this exact palette index. If it did not, this is where the colour would smear.
+	emitFace(o, s, si, lx, ly, lz, face, &wide, lit, drop, tint);
 	if (o->vert_count != base + 4) return;   // refused for want of room; nothing to widen
 
 	const FacePlan* p = &s_plan[face];
@@ -663,8 +759,12 @@ static const CrossCorner kCross[2][4] = {
 // a wall, so there are no crevices at its corners to darken. Light, when the engine is
 // on, is the cell's own — a cross never occludes, so its cell always carries the light
 // that reaches it.
+// v1.8.8: `tint` is the biome palette index, and for a cross it is the whole point — a grass
+// strand has to come out the same colour as the grass block it is standing on, or every plant
+// in a tinted biome reads as the wrong species. Both planes and both windings take it, so one
+// plant is one colour from every angle.
 static void emitCross(MeshOut* o, const MeshScratch* s, int si, int lx, int ly, int lz,
-                      const AtlasRect* r, bool lit)
+                      const AtlasRect* r, bool lit, uint8_t tint)
 {
 	if (o->vert_count + 4 * CROSS_QUADS > o->vert_cap ||
 	    o->index_count + 6 * CROSS_QUADS > o->index_cap) {
@@ -687,7 +787,7 @@ static void emitCross(MeshOut* o, const MeshScratch* s, int si, int lx, int ly, 
 				v->u   = c->u_hi ? r->u1 : r->u0;
 				v->v   = c->v_hi ? r->vslot1 : r->vslot0;
 				v->nrm = CROSS_NRM;
-				v->ao  = 3;
+				v->ao  = meshAoPack(3, tint);
 				v->pad = lit ? s->light[si] : 0;
 			}
 
@@ -960,7 +1060,8 @@ static void meshPass(MeshOut* out, const MeshScratch* s, const EmitCell* cells,
 				// cross block's def should set all six to it.
 				// Crosses are never water and never short, so they carry no drop and their
 				// nrm byte is the bare CROSS_NRM it always was.
-				emitCross(out, s, si, e->lx, e->ly, e->lz, &rects[FACE_EAST], lit);
+				emitCross(out, s, si, e->lx, e->ly, e->lz, &rects[FACE_EAST], lit,
+				          faceTint(s, si, blockFaceTintable(e->id, FACE_EAST)));
 			}
 			continue;
 		}
@@ -1015,9 +1116,16 @@ static void meshPass(MeshOut* out, const MeshScratch* s, const EmitCell* cells,
 			// pre-task mesher emitted, byte for byte.
 			const FacePlan* p  = &s_plan[face];
 			const int       uc = p->u_axis == 0 ? e->lx : (p->u_axis == 1 ? e->ly : e->lz);
-			const int       w  = mergeRun(s, si, uc, face, e->id, deferred, lit, drop);
 
-			emitFaceRun(out, s, si, e->lx, e->ly, e->lz, face, &rects[face], lit, w, drop);
+			// v1.8.8. Asked once and handed to BOTH the merge test and the emitter, so the
+			// tint that decides whether two faces may share a quad is the same tint that ends
+			// up in that quad's vertices. Two answers here is the whole smear bug — see
+			// faceFlatKey.
+			const bool      tintable = blockFaceTintable(e->id, face);
+			const int       w  = mergeRun(s, si, uc, face, e->id, deferred, lit, drop, tintable);
+
+			emitFaceRun(out, s, si, e->lx, e->ly, e->lz, face, &rects[face], lit, w, drop,
+			            faceTint(s, si, tintable));
 
 			// Claim the cells behind the first one. The first needs no mark: this walk is
 			// past it and will not return to it.

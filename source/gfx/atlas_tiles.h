@@ -50,8 +50,35 @@ enum {
 	TILE_DEAD_BUSH,  // 15 — BLOCK_SHAPE_CROSS
 	TILE_FERN,       // 16 — BLOCK_SHAPE_CROSS
 
+	// v1.8.8's per-biome flora and timber, slots 17..30, in the order
+	// tools/make_atlas.py's TILES list paints them. Append-only as always.
+	//
+	// The woods are here as separate TILES rather than as a tint of oak because the
+	// difference between them is DRAWING and not colour: birch's bark carries horizontal
+	// lenticel dashes and spruce's carries vertical scaly plates with fissures, and no
+	// per-vertex multiply of tile 6 can add a mark that is not in tile 6. The same is true
+	// of the planks (birch is a pale near-white board, spruce a dark red-brown one — a
+	// multiply can only darken, so oak cannot become birch at all) and of the two leaf
+	// canopies (birch is a broadleaf clump, spruce a needled speckle carved on the
+	// diagonal). Biome COLOUR is a separate concern and a separate agent's; these are
+	// separate MATERIALS.
+	TILE_BIRCH_LOG_SIDE,  // 17
+	TILE_BIRCH_LOG_TOP,   // 18
+	TILE_BIRCH_PLANKS,    // 19
+	TILE_BIRCH_LEAVES,    // 20
+	TILE_SPRUCE_LOG_SIDE, // 21
+	TILE_SPRUCE_LOG_TOP,  // 22
+	TILE_SPRUCE_PLANKS,   // 23
+	TILE_SPRUCE_LEAVES,   // 24
+	TILE_TALL_GRASS_TOP,  // 25 — BLOCK_SHAPE_CROSS, the upper half of the two-block clump
+	TILE_POPPY,           // 26 — BLOCK_SHAPE_CROSS
+	TILE_DAISY,           // 27 — BLOCK_SHAPE_CROSS
+	TILE_BLUEBELL,        // 28 — BLOCK_SHAPE_CROSS
+	TILE_ORCHID,          // 29 — BLOCK_SHAPE_CROSS
+	TILE_APPLE,           // 30
+
 	// How many slots the list above NAMES. Not the sheet's capacity — that is
-	// ATLAS_TILE_COUNT (64) in world/atlas_uv.h, and these seventeen are 0..16 of it.
+	// ATLAS_TILE_COUNT (64) in world/atlas_uv.h, and these thirty-one are 0..30 of it.
 	//
 	// It exists to be counted against, not to be used as a bound: world/block_tiles_check.c
 	// asserts that the number of BTEX/TILE assert lines equals this number, which is what
@@ -59,8 +86,10 @@ enum {
 	// as BLOCK_FACES in world/block.h, which terminates the face enum for the same reason.
 	TILE_USED_COUNT,
 
-	// Seventeen of ATLAS_TILE_COUNT (64) addressable slots used, 0..16 — twelve until
-	// v1.8.3 Phase 3 claimed 12..16 for snow, ice, cactus, dead bush and fern.
+	// Thirty-one of ATLAS_TILE_COUNT (64) addressable slots used, 0..30 — twelve until
+	// v1.8.3 Phase 3 claimed 12..16 for snow, ice, cactus, dead bush and fern, and
+	// seventeen until v1.8.8 claimed 17..30 for the birch and spruce materials, the tall
+	// grass top, the four flowers and the apple.
 	//
 	// It was twelve of FIFTEEN until v1.8.2's task 13b. The old ceiling was not the sheet
 	// height: MeshVertex.v held an atlas pixel row, so a uint8_t capped the sheet at 256 px
@@ -70,7 +99,7 @@ enum {
 	// dimension — for 64 slots, all addressable. The vertex is still 8 bytes. See the long
 	// note in world/atlas_uv.h.
 	//
-	// The 47 spares (17..62, and the reserved 63) are NOT blank. Since v1.6.0 F7
+	// The 33 spares (31..62, and the reserved 63) are NOT blank. Since v1.6.0 F7
 	// tools/make_atlas.py paints every slot this list does not name with the magenta/black
 	// missing-texture marker, and ATLAS_TILE_MISSING (slot 63, world/atlas_uv.h) is reserved
 	// as one permanently — it is where atlasRect() clamps an out-of-range tile id. Before

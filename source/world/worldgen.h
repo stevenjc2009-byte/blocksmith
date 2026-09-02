@@ -418,12 +418,96 @@ typedef enum {
 // silently clamped -- fewer plants, no error, and every placement assertion still green,
 // because they all check WHERE a plant stands and never HOW MANY there are. Add a branch,
 // add its chance here.
+// ── Flowers (v1.8.8) ──────────────────────────────────────────────────────────────────
+//
+// steve asked for "more grass variety — 2-block tall grass, normal grass, and flowers.
+// Flowers should be biome-specific." These are the biome-specific half.
+//
+// Same scale and the same idiom as everything above: out of 256 per eligible SURFACE cell,
+// drawn from worldgenFlora's ONE hash, and read as a BAND stacked on whatever that biome's
+// existing flora already claims. So taiga's fern keeps draws 0..19 exactly as it always had
+// and the bluebell takes 20..27; jungle's fern keeps 0..31 and the orchid takes 32..43. That
+// stacking is the whole reason no existing plant moves: every branch below leaves the band it
+// inherited alone and only claims draws above it, which the cheap reject used to throw away.
+//
+// Which flower goes where, and why these five bands and not others:
+//
+//   plains   poppy 10 + daisy 14   the open meadow biome; the widest flower band in the
+//                                  world, and the daisy is the commoner of the two so that a
+//                                  plains field reads white-speckled with red accents.
+//   forest   bluebell 12 + poppy 8 a shaded floor. Bluebells lead, poppies are the leftover
+//                                  sunlight; the two together (20) stay under plains' 24 so
+//                                  the meadow is still the flowery biome.
+//   taiga    bluebell 8            sparse and cold, and the same species as the forest's so
+//                                  the two shaded biomes share a palette rather than each
+//                                  inventing one.
+//   jungle   orchid 12             the only biome that grows it. Under the jungle fern's 32,
+//                                  so the undergrowth stays fern-first.
+//   tundra   none                  nothing flowers on a snow cap; it grows no tall grass
+//                                  either (GEN_GRASS_TUNDRA is 0).
+//   desert   none                  it has the dead bush, which is what a desert has instead.
+//
+// Placed by eye against the one measured ruler on this rung — tall grass at 24/256 reads as
+// "a meadow with gaps you can see the ground through" — and **NOT independently measured**,
+// exactly as the four Phase 3 chances above are not.
+#define GEN_POPPY_PLAINS     10
+#define GEN_DAISY_PLAINS     14
+#define GEN_BLUEBELL_FOREST  12
+#define GEN_POPPY_FOREST      8
+#define GEN_BLUEBELL_TAIGA    8
+#define GEN_ORCHID_JUNGLE    12
+
+// The five per-biome band tops, and the MAX over them. v1.8.8 widened this from three
+// expressions to five: every branch of worldgenFlora's switch now has a total, and the bound
+// is still a max over the very expressions those branches test against, so it still holds BY
+// CONSTRUCTION and still has no assertion for the reason stated above.
+//
+// It moves from 32 to 44, and that is safe in one direction only, which is the direction it
+// moves: raising the bound lets MORE draws reach the switch and can never reject one that used
+// to get through. Every draw in the newly admitted 32..43 band falls outside every pre-v1.8.8
+// branch — desert stops at 11, taiga's fern at 20, jungle's fern at 32 — so no cactus, dead
+// bush or fern changes position. Measured, not argued: see the A/B cell diff in
+// world_test.c's testWorldgenWaterAndGrass.
+#define GEN_FLORA_MAX2(a, b) ((a) > (b) ? (a) : (b))
 #define GEN_FLORA_DESERT_TOTAL (GEN_CACTUS_CHANCE + GEN_DEAD_BUSH_CHANCE)
-#define GEN_FLORA_FERN_MAX \
-	(GEN_FERN_TAIGA > GEN_FERN_JUNGLE ? GEN_FERN_TAIGA : GEN_FERN_JUNGLE)
-#define GEN_FLORA_CHANCE_MAX                       \
-	(GEN_FLORA_DESERT_TOTAL > GEN_FLORA_FERN_MAX ? \
-	 GEN_FLORA_DESERT_TOTAL : GEN_FLORA_FERN_MAX)
+#define GEN_FLORA_TAIGA_TOTAL  (GEN_FERN_TAIGA + GEN_BLUEBELL_TAIGA)
+#define GEN_FLORA_JUNGLE_TOTAL (GEN_FERN_JUNGLE + GEN_ORCHID_JUNGLE)
+#define GEN_FLORA_PLAINS_TOTAL (GEN_POPPY_PLAINS + GEN_DAISY_PLAINS)
+#define GEN_FLORA_FOREST_TOTAL (GEN_BLUEBELL_FOREST + GEN_POPPY_FOREST)
+#define GEN_FLORA_CHANCE_MAX                                                      \
+	GEN_FLORA_MAX2(GEN_FLORA_MAX2(GEN_FLORA_DESERT_TOTAL, GEN_FLORA_TAIGA_TOTAL), \
+	               GEN_FLORA_MAX2(GEN_FLORA_JUNGLE_TOTAL,                          \
+	                              GEN_FLORA_MAX2(GEN_FLORA_PLAINS_TOTAL,           \
+	                                             GEN_FLORA_FOREST_TOTAL)))
+
+// ── Two-block tall grass (v1.8.8) ─────────────────────────────────────────────────────
+//
+// Out of 256, per tall-grass clump worldgenScatter has ALREADY decided to place. Not a share
+// of the surface: it is a second question asked of a cell that is getting grass either way, so
+// raising it takes nothing away from anything.
+//
+// Drawn from bits 8..15 of the SAME hash the placement draw uses, and the placement draw is
+// still the low byte and is untouched. That is what keeps every existing clump exactly where
+// it was — this constant can only turn a one-block clump into a two-block one, never move one
+// or delete one. A clump with no room above it (a canopy, a cliff, the world ceiling) falls
+// back to one block rather than being skipped.
+//
+// 96/256, a bit over a third. Chosen so a meadow is visibly mixed-height: steve asked for
+// "2-block tall grass, normal grass", so both have to be present. A number near 128 would read
+// as "the grass got taller" and a number near 32 as an occasional glitch.
+#define GEN_TALL_GRASS_TWO   96
+
+// ── Apples (v1.8.8) ───────────────────────────────────────────────────────────────────
+//
+// Out of 256, per cell of the ring immediately BELOW a fruiting tree's lowest canopy layer.
+// Only oak and birch fruit — BiomeParams.fruit is BLOCK_AIR for every other species — which
+// is what keeps the taiga's conifers bare.
+//
+// 16/256 over a lowest layer of roughly thirteen cells is about 0.8 apples per fruiting tree,
+// so most trees carry one and a good many carry none. Deliberately under one: an apple is a
+// FULL_CUBE of solid red at 16x16, and a tree wearing six of them reads as a decoration
+// rather than as fruit.
+#define GEN_APPLE_CHANCE     16
 
 // Silhouette, from trunk length, canopy radius and layer pattern ONLY — no new block ids, no
 // new tiles. Canopy shape reads at distances where colour does not, which is what matters on a
@@ -465,6 +549,30 @@ typedef struct {
 	uint8_t canopy_max;
 	uint8_t shape;           // a TreeShape
 	uint8_t big_chance;      // out of 256 trees: a 2 x 2 trunk instead of a single column
+
+	// ── v1.8.8: the tree's SPECIES, as three block ids ────────────────────────────────
+	//
+	// steve asked for "per-biome wood colours, blocks, textures, types, leaves, logs,
+	// planks". Silhouette alone could not deliver that — the note above says outright that
+	// task 52 gave the biomes three shapes and NO new block ids — so this is the other axis:
+	// a taiga tree is a spruce made of spruce, and a forest tree is a birch made of birch.
+	//
+	// Ids and not a tint. The three barks differ by the MARKS on them (birch's horizontal
+	// lenticels, spruce's vertical scaly plates) and the three canopies by their cutout
+	// silhouette against the sky; a per-vertex multiply cannot add a mark that is not in the
+	// tile, and cannot lighten oak into birch at all. See source/gfx/atlas_tiles.h.
+	//
+	// `fruit` is BLOCK_AIR for a species that does not bear — which is every conifer. It is
+	// hung under the lowest canopy layer at GEN_APPLE_CHANCE, not woven into it, so it is
+	// visible from the ground rather than buried in leaves.
+	//
+	// ⚠ These are read ONLY on the `bp != NULL` path in treeInCell(), i.e. only for a world
+	// stamped GEN_VERSION_BIOME. A legacy or density world still gets BLOCK_WOOD and
+	// BLOCK_LEAVES from the defaults in the Tree struct, which is what keeps every world made
+	// before v1.8.8 byte-for-byte what it was.
+	uint8_t log;             // BLOCK_* written for the trunk
+	uint8_t leaf;            // BLOCK_* written for the canopy
+	uint8_t fruit;           // BLOCK_* hung under the canopy, or BLOCK_AIR for a bare species
 } BiomeParams;
 
 typedef struct {

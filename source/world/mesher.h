@@ -5,10 +5,18 @@
 // of which 1,536 are visible. Everything inside is never built, never uploaded and
 // never drawn.
 //
-// Deliberately *not* greedy meshing. Merging coplanar faces into big quads is a
-// measured decision deferred to Phase 7 — it complicates AO and per-face textures,
-// and this hardware may well be bound by something else first. See
-// code-vault/wiki/blocksmith/blocksmith-plan.md.
+// It IS greedy along one axis, and has been since v1.6.0 task 11. This comment used to say
+// "deliberately *not* greedy meshing ... deferred to Phase 7", which stopped being true the
+// moment mergeRun() landed in mesher.c and stayed on the page for three minor versions. It is
+// corrected here rather than deleted because the stale version was actively dangerous: it told
+// anyone packing a new field into a vertex that no two faces are ever combined, and the whole
+// hazard of doing that is that they ARE.
+//
+// What actually happens: mergeRun() walks coplanar faces of the same block id along the face's
+// u axis and emits ONE quad covering up to ATLAS_MAX_MERGE_BLOCKS (15) cells, with the art
+// tiled across it by GPU_REPEAT. Two faces merge only when faceFlatKey() gives them the same
+// non-zero signature, so ANY per-face value that must not be shared across a run has to be part
+// of that key. AO, light and now the biome tint are; see faceFlatKey in mesher.c.
 //
 // No <3ds.h> here: the mesher is the piece most likely to be wrong in a way a
 // screenshot cannot show, so it runs under the PC test suite too.
@@ -143,6 +151,122 @@ static inline float meshNrmAlpha(uint8_t nrm)
 {
 	return meshNrmDrop(nrm) >= WATER_SURFACE_DROP ? WATER_ALPHA : 1.0f;
 }
+
+// ── v1.8.8: what MeshVertex.ao carries now, and why the tint rides there ──────
+//
+//   bits 0..1   the ambient occlusion 0..3, 3 unoccluded — exactly what the whole byte was
+//   bits 2..4   a TINT PALETTE INDEX, 0..7, resolved to an RGB multiplier by the shader
+//   bits 5..7   still free
+//
+// Biome identity is carried by COLOUR, not by a block id per biome: there is one grass block
+// and one tall-grass strand in the registry (world/registry.c) and the biome multiplies what
+// they draw. That is Minecraft's model and it is the only one this hardware can afford — a
+// grass id per biome would need a tile per biome on a 64-slot atlas with 47 slots left, and it
+// would make every biome border a block-id boundary in the save format.
+//
+// WHY THE ao BYTE AND NOT A NEW ONE. MeshVertex is exactly 8 bytes and every byte is spoken for
+// (world/mesh_vertex.h). Widening it to 9 would break the offsetof static-assert that documents
+// the v1.1.0-v1.2.4 console freeze, and 10 (the next size that keeps both attributes 4-byte
+// aligned) would multiply the chunk mesh pool by 1.25 — 46,948,352 bytes to 58,685,440 at the
+// radius-5 ceiling, 11.7 MB of linear heap that cannot be defragmented, to carry three bits.
+// cornerAO() has only ever returned 0..3 (mesher.c) and emitCross() only ever writes 3, so six
+// bits of that byte have been zero in every vertex the mesher has ever emitted. Three of them
+// are now the tint. Cost: ZERO bytes per vertex, ZERO bytes of mesh pool.
+//
+// THREE BITS, NOT SIX. The shader resolves the index through a uniform array, and the PICA200
+// vertex stage has 96 float uniform registers TOTAL of which world_dynamic already spends 78 —
+// so the palette is what caps this, not the byte. Eight rows costs 8 registers (86 of 96) and
+// covers BIOME_COUNT (6, world/worldgen.h) with a spare and an untinted row. Bits 5..7 are left
+// free rather than claimed for a wider index that could not be looked up anyway.
+//
+// ROW 0 IS THE IDENTITY, (1,1,1). Every face that is not tintable writes tint 0, the scratch's
+// tint band is zero unless a caller fills it, and the palette's row 0 is white — so a vertex
+// with no tint is byte-for-byte the vertex this mesher emitted before v1.8.8 and multiplies its
+// colour by exactly 1. That is what keeps the four pinned mesh hashes in world/world_test.c and
+// the two in world/water_mesh_test.c from moving, and it is checked, not assumed.
+//
+// Anything reading a vertex's occlusion must mask. Reading the raw byte where 0..3 is meant is
+// the bug this encoding invites, and it is the one the SHADER hit first: both .pica files
+// multiply the attribute by 1/3 with no mask at all, so an unmasked tint index would not be
+// ignored, it would read as an ambient occlusion of up to 31 and blow the face to flat white.
+#define MESH_AO_BITS    2
+#define MESH_AO_MASK    ((uint8_t)((1u << MESH_AO_BITS) - 1))
+#define MESH_TINT_BITS  3
+#define MESH_TINT_MASK  ((uint8_t)((1u << MESH_TINT_BITS) - 1))
+#define MESH_TINT_ROWS  (1u << MESH_TINT_BITS)   // 8 palette rows
+
+// The untinted row. Must be 0 and must be (1,1,1) in the palette — see above.
+#define MESH_TINT_NONE  ((uint8_t)0)
+
+static inline uint8_t meshAoValue(uint8_t ao) { return (uint8_t)(ao & MESH_AO_MASK); }
+static inline uint8_t meshAoTint(uint8_t ao)  { return (uint8_t)((ao >> MESH_AO_BITS) & MESH_TINT_MASK); }
+static inline uint8_t meshAoPack(uint8_t ao, uint8_t tint)
+{
+	return (uint8_t)((ao & MESH_AO_MASK) | ((tint & MESH_TINT_MASK) << MESH_AO_BITS));
+}
+
+// An AO value has to fit under the tint, or the two overlap in the byte.
+_Static_assert(MESH_AO_MASK == 3, "cornerAO returns 0..3; the tint starts at bit 2");
+_Static_assert(MESH_AO_BITS + MESH_TINT_BITS <= 8, "tint index no longer fits the ao byte");
+
+// ── The palette itself ───────────────────────────────────────────────────────
+//
+// The eight RGB multipliers the shader's tintPalette bank is filled with, one per tint index.
+// Row `1 + biome` is that biome's colour and row 0 is the identity, so the mapping a future
+// filler needs is MESH_TINT_ROW_FOR_BIOME below and nothing more.
+//
+// It lives HERE, in a header with no <3ds.h> in it, for exactly the reason WATER_ALPHA does:
+// scene/chunk_render.c includes <3ds.h> and no host test can link it, so this is the one place
+// the renderer and the host suite can read the same numbers. world/biome_tint_test.c links this
+// function for real and then checks BY TEXT that the renderer calls it rather than carrying its
+// own copy of the table — without that second half the suite would be proving things about dead
+// code, which is a defect this tree has recorded eleven times.
+//
+// ── EVERY COMPONENT IS <= 1.0, AND THAT IS A HARDWARE LIMIT, NOT A TASTE ─────
+//
+// outclr is clamped to [0,1] by the rasterizer before it ever reaches the TexEnv, so a
+// component above 1.0 does not brighten anything — it is silently clipped and the biome comes
+// out looking like whichever channels did fit. A tint on this hardware can therefore only
+// DARKEN or shift hue downward, never lift.
+//
+// That interacts badly with the art, and the interaction is worth writing down because it caps
+// how different two biomes can look. tools/make_atlas.py paints grass_top from four saturated
+// greens around (58,112,74) — it is finished art, not a greyscale multiply target the way
+// Minecraft's grass texture is. Multiplying an already-saturated green can pull it toward
+// black, toward olive, or toward blue-green, but it cannot make it straw-yellow or make it
+// brighter than it started. The desert row below is the one that suffers: 0.94/0.82/0.42 is a
+// dry olive, not the pale sand-grass a wider range would give.
+//
+// The fix, if the range is ever wanted, is to repaint grass_top / grass_side / tall_grass /
+// fern toward a light desaturated base so the multipliers have somewhere to go. That is a
+// change to the ART and nobody asked for it, so it has not been made.
+//
+// PLAINS IS EXACTLY (1,1,1) ON PURPOSE. It is the biome the art was drawn for and the one most
+// of the world is, so a plains grass block renders bit-identically to every build before this
+// one and the tint is only ever visible where the world actually stops being plains.
+typedef struct { float r, g, b; } MeshTint;
+
+static inline MeshTint meshTintRow(uint8_t row)
+{
+	switch (row & MESH_TINT_MASK) {
+	case 0:  return (MeshTint){ 1.00f, 1.00f, 1.00f };   // untinted — the identity
+	case 1:  return (MeshTint){ 0.78f, 0.90f, 0.86f };   // tundra — pale and cold
+	case 2:  return (MeshTint){ 0.62f, 0.80f, 0.70f };   // taiga  — dark cold green
+	case 3:  return (MeshTint){ 1.00f, 1.00f, 1.00f };   // plains — the art as painted
+	case 4:  return (MeshTint){ 0.80f, 0.94f, 0.72f };   // forest — deeper green
+	case 5:  return (MeshTint){ 0.94f, 0.82f, 0.42f };   // desert — dry olive
+	case 6:  return (MeshTint){ 0.62f, 1.00f, 0.44f };   // jungle — vivid green
+	default: return (MeshTint){ 1.00f, 1.00f, 1.00f };   // row 7, spare — identity
+	}
+}
+
+// Which palette row a biome takes. Row 0 is reserved for "not tinted", so the biomes start at
+// 1 and BIOME_COUNT (6, world/worldgen.h) lands on row 6 with row 7 spare.
+//
+// Spelled as a macro rather than a function taking a BiomeId so this header does not have to
+// include world/worldgen.h — the mesher has no business knowing what a biome IS, only what
+// index it was handed.
+#define MESH_TINT_ROW_FOR_BIOME(b)  ((uint8_t)(((unsigned)(b) + 1u) & MESH_TINT_MASK))
 
 // Meshes the chunk sitting in the middle of `s`. Positions come out chunk-local,
 // 0..16 in block units, so the caller places the chunk with a model matrix.

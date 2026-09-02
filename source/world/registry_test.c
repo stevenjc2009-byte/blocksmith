@@ -57,7 +57,7 @@
 #define REGISTRY_DYN_LO_PIN     0x80  // first dynamic block id
 #define REGISTRY_DYN_HI_PIN     0xFD  // last one; 0xFE/0xFF stay reserved
 #define REGISTRY_DYN_ROWS_PIN   126   // 0xFD - 0x80 + 1, WRITTEN OUT, never computed
-#define REGISTRY_FULL_COUNT_PIN 141   // 15 core rows (air + fourteen) + 126 dyn rows
+#define REGISTRY_FULL_COUNT_PIN 153   // 27 core rows (air + twenty-six) + 126 dyn rows
 
 // Compile-time layer. These fire when the host suite builds, which is every
 // tools/run_host_tests.sh run; the 3DS build never compiles this file (see the __3DS__
@@ -147,7 +147,36 @@ static void checkPin(bool cond, long got, long want, const char *what, const cha
 // the other direction. Nothing else in this suite changed count: the crc golden moved VALUE
 // (0x4066 -> 0x189B, see testRegistryCrcStability) but it is still exactly one check, and
 // REGISTRY_FULL_COUNT_PIN moved value too without adding a call.
-#define REGISTRY_TEST_EXPECTED_CHECKS 89
+//
+// 89 -> 106 on 2026-09-02 (v1.8.8), and the arithmetic is written out for the same reason the
+// paragraphs above are — so the next person can tell an intended change from a shrunk loop.
+// coreHardnessIsDeclared() adds 16 calls: 13 inside its per-row loop, plus 3 fixed ones — the
+// loop-ran counter, the cactus-is-distinct check and the undefined-id control. 89 + 16 = 105.
+//
+// The 13 is worth spelling out because the first attempt at this number was 14 and the run
+// said 13. Fifteen core rows, LESS AIR (the loop starts at id 1, since air has no hardness to
+// declare) and LESS WATER (a liquid, the one exemption). Two subtractions, not one. The check
+// count guard is what caught it, which is the job it was put there to do.
+//
+// The crc golden moved VALUE again (0x189B -> 0xBDC5) and, as before, that is still exactly
+// one check.
+//
+// 105 -> 117 on 2026-09-02, v1.8.8's per-biome blocks and plants. Twelve core rows are added
+// — birch log/planks/leaves, spruce log/planks/leaves, the tall-grass top, four flowers and
+// the apple — and the arithmetic is ALL of it, from one loop:
+//
+//   +12   coreHardnessIsDeclared()'s per-row loop, one check() per targetable core row. It
+//         ran over 13 rows and now runs over 25, and 25 - 13 = 12.
+//
+// Nothing else in this suite gained a call. In particular the two places that look like they
+// should have did not: testRegistryCoreIdsStable's name loop and its kPhase3 table are both
+// written against a FIXED list of ids, so twelve new registry rows do not enter either one.
+// That is why 117 and not something larger, and it was predicted before the run rather than
+// pasted off it — the run printed "expected 105, ran 117", the same 12 from the other side.
+//
+// The crc golden moved VALUE a third time (0xBDC5 -> 0xD236) and, as every time before, that
+// is still exactly one check.
+#define REGISTRY_TEST_EXPECTED_CHECKS 117
 
 // Deliberately NOT routed through check(): this must not perturb the number it is testing,
 // so it bumps g_fails only. Reporting shape is check()'s, so a failure here reads the same
@@ -194,12 +223,15 @@ static void testRegistryRoundTrip(void)
 	puts("registry: register / find / duplicate / full range / unknown id");
 
 	registryInitCore();
-	// Fourteen core rows since v1.8.3 Phase 3: grass..planks are the seven that also carry
-	// ITEM ids, plus water (0x08) and tall grass (0x09) from roadmap tasks 17 and 19, plus
-	// snow (0x0A), ice (0x0B), cactus (0x0C), dead bush (0x0D) and fern (0x0E). Every one
-	// of the last seven is a core block and deliberately NOT an item — world/block.h
-	// records why BLOCK_COUNT stayed at 8 while the registry's row count moved to 15.
-	check(registryCount() == 15, "a fresh table defines exactly air + the fourteen core blocks");
+	// Twenty-six core rows since v1.8.8: grass..planks are the seven that also carry ITEM
+	// ids, plus water (0x08) and tall grass (0x09) from roadmap tasks 17 and 19, plus
+	// snow (0x0A), ice (0x0B), cactus (0x0C), dead bush (0x0D) and fern (0x0E), plus the
+	// twelve v1.8.8 adds — birch log/planks/leaves (0x0F..0x11), spruce log/planks/leaves
+	// (0x12..0x14), the tall-grass top (0x15), poppy/daisy/bluebell/orchid (0x16..0x19) and
+	// the apple (0x1A). Every one of the last nineteen is a core block and deliberately NOT
+	// an item — world/block.h records why BLOCK_COUNT stayed at 8 while the registry's row
+	// count moved to 27.
+	check(registryCount() == 27, "a fresh table defines exactly air + the twenty-six core blocks");
 	check(registryFind("grass") == BLOCK_GRASS, "core rows are findable by name");
 
 	// The runtime half of the dyn-range pin. The two _Static_asserts at the top of this
@@ -270,7 +302,7 @@ static void testRegistryRoundTrip(void)
 	         kDynRangeWhy);
 	checkPin(registryCount() == REGISTRY_FULL_COUNT_PIN,
 	         (long)registryCount(), (long)REGISTRY_FULL_COUNT_PIN,
-	         "count reflects every defined row once the range is full: 15 core + 126 dyn",
+	         "count reflects every defined row once the range is full: 27 core + 126 dyn",
 	         kDynRangeWhy);
 }
 
@@ -462,8 +494,57 @@ static void testRegistryCrcStability(void)
 	// because deps/blocksmith-server/game/bsgame.c accepts the join anyway and every id 10..14
 	// in the world resolves through registryGet()'s never-NULL contract to the AIR row: an
 	// invisible hole indistinguishable from a cave.
-	check(base == 0x189Bu,
-	      "core-only crc matches the pinned golden 0x189B");
+	//
+	// Moved 0x189B -> 0xBDC5 on 2026-09-02 by v1.8.8, and this move is a THIRD shape, unlike
+	// either above: no record was added (registryCount() stays 15) and no row was renamed or
+	// reflagged. Exactly one byte inside one existing record changed value — the cactus row's
+	// .hardness, 8 -> 9 — which makes it task 50's shape, not Phase 3's, so registryCount()
+	// still agrees with an older server and only the crc half of registryMatchesInfo()
+	// disagrees.
+	//
+	// **How this was told apart from breakage.** Measured by ABLATION, not by subtracting one
+	// total from another (scratchpad blockceil_crc_ablate.sh, which builds two arms of the
+	// real world/registry.c and asserts they differ on exactly one line):
+	//
+	//     arm A  ceiling widened + cactus hardness 9  ->  0xBDC5
+	//     arm B  ceiling widened + cactus hardness 8  ->  0x189B   (the golden above, exactly)
+	//
+	// Arm B reproducing the shipped golden byte-for-byte is the finding that matters: v1.8.8's
+	// item-ceiling change is entirely CRC-NEUTRAL. It moved inventoryCanHold() from a
+	// `< BLOCK_COUNT` comparison to a registry query, and a predicate stores nothing, so it
+	// cannot touch the packed table the hash runs over. The WHOLE of this crc move — and
+	// therefore the whole of its cross-repo cost — belongs to the cactus durability retune.
+	//
+	// The cost, stated plainly because it is not free: registryMatchesInfo() failing is a hard
+	// join refusal ("Server is a different Blocksmith version - update"), so cactus hardness 9
+	// must ship as a LOCKSTEP client+server release, the same procedure this repo ran for
+	// 0x72A8 -> 0x4066 and 0x4066 -> 0x189B. BS_PROTO_VERSION stays 1 through it, as it did
+	// both previous times; it gates transport packet types and none of those changed.
+	// deps/blocksmith-server/game/bsgame_test.c's BS_REGISTRY_CORE_CRC16_GOLDEN must move
+	// with this literal or that repo's suite goes red.
+	// Moved 0xBDC5 -> 0xD236 on 2026-09-02 by v1.8.8's per-biome blocks and plants, and this
+	// move is Phase 3's shape rather than the cactus retune's directly above: TWELVE records
+	// were APPENDED and no existing record was touched. registryCount() moves 15 -> 27 with
+	// it, so the count half of registryMatchesInfo() disagrees too, not only the crc half.
+	//
+	// Measured on the live table rather than reasoned about, by a probe linking the real
+	// world/registry.c (scratchpad biomeblocks_crc.c): count=27, crc=0xD236, and — the check
+	// that matters for "every new block is breakable with its own durability" — 25 targetable
+	// core rows with ZERO of them at hardness 0.
+	//
+	// **Same cost, same order, and it is bigger than the cactus one.** A client carrying these
+	// twelve rows against a server without them fails registryMatchesInfo() and refuses the
+	// join outright. The reverse is the dangerous direction and is worse here than it was for
+	// Phase 3: a client WITHOUT these rows joining a server that HAS them resolves every id
+	// 0x0F..0x1A through registryGet()'s never-NULL contract to the AIR row, so every birch
+	// tree, every spruce tree and every flower in the world becomes an invisible hole. So the
+	// SERVER SHIPS FIRST, exactly as it did for 0x72A8 -> 0x4066, 0x4066 -> 0x189B and
+	// 0x189B -> 0xBDC5. BS_PROTO_VERSION stays 1: it gates transport packet types and none of
+	// those changed. deps/blocksmith-server/game/bsgame_test.c's BS_REGISTRY_CORE_CRC16_GOLDEN
+	// and BS_REGISTRY_CORE_COUNT_GOLDEN must both move with these literals or that repo's
+	// suite goes red.
+	check(base == 0xD236u,
+	      "core-only crc matches the pinned golden 0xD236");
 
 	// Content sensitivity: one extra def must move the crc, and re-init must
 	// put it back - proving the crc covers table content, not process state.
@@ -529,6 +610,73 @@ static void testRegistrySidecar(void)
 	remove(path);
 }
 
+// v1.8.8. THE rule the roadmap asked for in steve's words — "make sure every single new block
+// you add is breakable with its own durability" — written as a check rather than as a note, so
+// forgetting it fails the build instead of shipping.
+//
+// Why it can fail silently without this. world/registry.c's kCoreDefs is a designated-
+// initialiser table: a row that simply omits `.hardness` compiles clean and gets 0 from the
+// zero-fill. There is no "unset" to detect and no default worth having, because 0 already
+// MEANS something — world/mining.c's breakTicksRequired() returns 0 for it, and 0 ticks is an
+// instant break on the press edge. So the missing field does not produce an error, or a slow
+// block, or a hard block. It produces a block that shatters the moment the button goes down,
+// which reads as a gameplay decision rather than as a mistake.
+//
+// The exemption is narrow on purpose: a LIQUID, and nothing else. blockIsTargetable() is
+// `drawn && !liquid`, so no crosshair ever lands on one and no break timer can ever ask it
+// for a number. Any other row with hardness 0 is a bug, and this is where it stops.
+//
+// This lives in the registry suite because it is a fact about the TABLE. world/mining_test.c
+// states the identical rule over blockHardnessTicks(), which is the same fact read through
+// the consumer. Two suites because they go red at different moments and a table can be wrong
+// in ways mining never asks about.
+static void coreHardnessIsDeclared(void)
+{
+	puts("registry: every targetable core row declares a break time of its own");
+
+	registryInitCore();
+
+	int rows = 0;
+	for (BlockId id = 1; id <= REG_ID_CORE_HI; id++) {
+		if (!registryIsDefined(id)) continue;
+
+		// registryView(), not registryGet(): Get hands back the packed BlockDef whose
+		// liquid-ness lives in a flags BIT, View hands back the unpacked BlockInfo with the
+		// bool already broken out. Reading the wrong one does not compile, which is the
+		// cheapest possible way for this distinction to be enforced.
+		const BlockInfo *v = registryView(id);
+		if (v->liquid) continue;   // the only exemption, and it is earned: never targetable
+
+		rows++;
+		check(v->hardness != 0, v->name);
+	}
+
+	// The loop ran, and over the whole core id space rather than a prefix of it. Without this
+	// the rule is green in a build where registryIsDefined() answers false for everything —
+	// a check that cannot go red proves nothing, and a `continue` is the easiest way to
+	// neutralise one by accident.
+	check(rows == 25, "and it ran over 25 rows: 27 core rows less air and less water");
+
+	// A row must have its OWN number, not a neighbour's. The loop above is satisfied by a
+	// table where every hardness is 9, which is exactly the failure mode "make sure every
+	// block is breakable with its own durability" is guarding against. The cactus is the case
+	// that matters here — it is the block v1.8.8 was reported for, and it was given a value
+	// deliberately WEDGED between snow's and ice's rather than parked somewhere distant,
+	// because a value far from its neighbours would satisfy a distinctness check while
+	// telling the player nothing.
+	check(registryGet(BLOCK_CACTUS)->hardness == 9
+	      && registryGet(BLOCK_SNOW)->hardness == 8
+	      && registryGet(BLOCK_ICE)->hardness == 10,
+	      "snow 8 < cactus 9 < ice 10: three neighbours, three break times");
+
+	// CONTROL. An id with no row still reads back as air, hardness 0, and that must NOT trip
+	// the rule above — the rule is about rows that exist. Green in every arm, including one
+	// with every hardness in the table zeroed, which is what makes the red checks above
+	// evidence rather than "the registry stopped answering".
+	check(registryGet((BlockId)(REG_ID_CORE_HI))->hardness == 0,
+	      "control: an undefined core id still reads back as air, so hardness 0");
+}
+
 int main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
@@ -539,6 +687,7 @@ int main(void)
 	testRegistryCoreIdsStable();
 	testRegistryCrcStability();
 	testRegistrySidecar();
+	coreHardnessIsDeclared();
 
 	checkCountPin();
 

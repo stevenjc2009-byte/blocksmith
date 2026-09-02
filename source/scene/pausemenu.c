@@ -2,6 +2,8 @@
 
 #include <3ds.h>
 
+#include "app/options.h"      // OPTIONS_AUDIO_VOL_* — one definition of the range
+#include "audio/audio.h"
 #include "gfx/font.h"
 #include "gfx/sprite.h"
 #include "scene/ui_layout.h"
@@ -15,13 +17,22 @@ typedef enum { PAGE_MAIN = 0, PAGE_OPTIONS } Page;
 // order on screen and MAIN_ROW_COUNT is what the cursor wraps against.
 enum { ROW_RESUME = 0, ROW_OPTIONS, ROW_QUIT, MAIN_ROW_COUNT };
 
-// Options-page rows. The first four are interactive; the memory figures below them are a
+// Options-page rows. All five are interactive; the memory figures below them are a
 // readout, so the cursor stops at OPT_ROW_COUNT rather than at the end of the list.
-enum { OPT_ROW_DIST = 0, OPT_ROW_3D, OPT_ROW_REMAP, OPT_ROW_DEBUG, OPT_ROW_COUNT };
+//
+// Sound sits next to 3D because they are the two output settings, with the two rows that
+// open another screen kept together at the bottom.
+enum { OPT_ROW_DIST = 0, OPT_ROW_3D, OPT_ROW_VOLUME, OPT_ROW_REMAP, OPT_ROW_DEBUG,
+       OPT_ROW_COUNT };
 
 static bool s_open;
 static Page s_page;
 static int  s_cursor;
+
+// Set when the volume row moves, cleared by pauseMenuTakeVolumeChanged. A flag rather
+// than an immediate save because a held left/right would otherwise rewrite options.ini
+// once per frame, and every one of those writes is a remove()+rename() on the SD card.
+static bool s_volume_changed;
 
 // Colours are 0xAABBGGRR, matching gfx/sprite.h's spriteRect and gfx/font.h's fontDraw.
 #define COL_SCRIM   0xC0100C08u   // darkens the world UI behind the panel without hiding it
@@ -38,11 +49,26 @@ static int  s_cursor;
 #define PANEL_H (SCR_H - PANEL_Y * 2)
 
 #define ROW_H     22
+
+// The options page uses a tighter pitch than the main page's ROW_H. It has to: five rows
+// at 22 px push the memory readout's last line to y=212, past the footer at y=200 and out
+// through the bottom of the panel at y=216. At 20 the last readout line lands at 190,
+// exactly where it sits today with four rows. Measured against PANEL_Y 24 + PANEL_H 192
+// and gfx/font.h's FONT_GLYPH_H of 7, not eyeballed — but nobody has LOOKED at it on a
+// screen, and this project has no way to.
+#define OPT_ROW_H 20
 #define ROW_X     (PANEL_X + 12)
 #define ROW_W     (PANEL_W - 24)
 #define TEXT_PAD  6
 
 bool pauseMenuOpen(void) { return s_open; }
+
+bool pauseMenuTakeVolumeChanged(void)
+{
+	const bool changed = s_volume_changed;
+	s_volume_changed = false;
+	return changed;
+}
 
 void pauseMenuClose(void)
 {
@@ -88,6 +114,24 @@ PauseAction pauseMenuInput(uint32_t down, int* out_dist_step, bool* out_stereo_t
 		if (s_cursor == OPT_ROW_3D && out_stereo_toggle &&
 		    (down & (KEY_DLEFT | KEY_DRIGHT | KEY_A)))
 			*out_stereo_toggle = true;
+		// Sound volume is APPLIED here rather than reported like the two rows above it,
+		// because there is nothing for the caller to do with it: audioSetMasterVolume() is
+		// the entire action, main.c holds no audio state that could fall out of step, and
+		// the call is a no-op on a console with no DSP firmware. Only persistence is still
+		// the caller's, and that is what s_volume_changed is for.
+		if (s_cursor == OPT_ROW_VOLUME && (down & (KEY_DLEFT | KEY_DRIGHT))) {
+			float v = audioGetMasterVolume();
+			v += (down & KEY_DRIGHT) ? OPTIONS_AUDIO_VOL_STEP : -OPTIONS_AUDIO_VOL_STEP;
+			// Snapped back onto the step grid every time. Without this, accumulating 0.1f
+			// ten times lands on 0.99999994 rather than 1.0 and the row reads 100% while the
+			// maximum is never actually reached — a bug that is invisible on screen.
+			v = (float)((int)(v / OPTIONS_AUDIO_VOL_STEP + (v < 0.0f ? -0.5f : 0.5f)))
+			    * OPTIONS_AUDIO_VOL_STEP;
+			if (v < OPTIONS_AUDIO_VOL_MIN) v = OPTIONS_AUDIO_VOL_MIN;
+			if (v > OPTIONS_AUDIO_VOL_MAX) v = OPTIONS_AUDIO_VOL_MAX;
+			audioSetMasterVolume(v);
+			s_volume_changed = true;
+		}
 		// The remap and debug rows are plain A-activations, reported to the caller the same
 		// way RESUME and QUIT are: this module cannot open those screens itself without
 		// owning their state, which is main.c's job.
@@ -181,7 +225,7 @@ void pauseMenuDraw(const PauseStats* st)
 	// as a glitch.
 	float y = (float)(PANEL_Y + 34);
 	if (s_cursor == OPT_ROW_DIST)
-		spriteRect((float)ROW_X, y - 3.0f, (float)ROW_W, (float)(ROW_H - 2), COL_SEL);
+		spriteRect((float)ROW_X, y - 3.0f, (float)ROW_W, (float)(OPT_ROW_H - 2), COL_SEL);
 	fontDraw((float)(ROW_X + TEXT_PAD), y, 1, COL_TEXT, "Render dist");
 	fontDrawf((float)(ROW_X + ROW_W - 58), y, 1,
 	          st->render_dist > st->dist_min ? COL_TEXT : COL_DIM, "<");
@@ -192,22 +236,48 @@ void pauseMenuDraw(const PauseStats* st)
 	// 3D. This lived on SELECT until SELECT became the button that opens this menu; it is a
 	// setting, so a settings page is where it belongs, but it is here mainly so the feature
 	// did not simply vanish when its button was reused.
-	y += (float)ROW_H;
+	y += (float)OPT_ROW_H;
 	if (s_cursor == OPT_ROW_3D)
-		spriteRect((float)ROW_X, y - 3.0f, (float)ROW_W, (float)(ROW_H - 2), COL_SEL);
+		spriteRect((float)ROW_X, y - 3.0f, (float)ROW_W, (float)(OPT_ROW_H - 2), COL_SEL);
 	fontDraw((float)(ROW_X + TEXT_PAD), y, 1, COL_TEXT, "3D");
 	fontDraw((float)(ROW_X + ROW_W - 44), y, 1,
 	         st->stereo ? COL_HEAD : COL_DIM, st->stereo ? "On" : "Off");
 
-	y += (float)ROW_H;
+	// Sound. The value is read live out of the audio system rather than passed in through
+	// PauseStats, so there is exactly one copy of the current volume in the process and no
+	// way for the row to disagree with what the DSP was told.
+	//
+	// The label greys out when there is no audio at all — a console whose DSP firmware was
+	// never dumped. The row still works and still saves, because the setting is a
+	// preference about the game and not a property of this console; greying it is the
+	// only honest signal that moving it will not change anything the player can hear.
+	//
+	// %3d%% rather than %d%%: a fixed four-character field means the number does not shift
+	// left and right under the cursor as it crosses 9% and 100%.
+	y += (float)OPT_ROW_H;
+	if (s_cursor == OPT_ROW_VOLUME)
+		spriteRect((float)ROW_X, y - 3.0f, (float)ROW_W, (float)(OPT_ROW_H - 2), COL_SEL);
+	{
+		const float vol = audioGetMasterVolume();
+		const int   pct = (int)(vol * 100.0f + 0.5f);
+		fontDraw((float)(ROW_X + TEXT_PAD), y, 1,
+		         audioAvailable() ? COL_TEXT : COL_DIM, "Sound");
+		fontDraw((float)(ROW_X + ROW_W - 66), y, 1,
+		         pct > 0 ? COL_TEXT : COL_DIM, "<");
+		fontDrawf((float)(ROW_X + ROW_W - 52), y, 1, COL_TEXT, "%3d%%", pct);
+		fontDraw((float)(ROW_X + ROW_W - 24), y, 1,
+		         pct < 100 ? COL_TEXT : COL_DIM, ">");
+	}
+
+	y += (float)OPT_ROW_H;
 	if (s_cursor == OPT_ROW_REMAP)
-		spriteRect((float)ROW_X, y - 3.0f, (float)ROW_W, (float)(ROW_H - 2), COL_SEL);
+		spriteRect((float)ROW_X, y - 3.0f, (float)ROW_W, (float)(OPT_ROW_H - 2), COL_SEL);
 	fontDraw((float)(ROW_X + TEXT_PAD), y, 1, COL_TEXT, "Controls");
 	fontDraw((float)(ROW_X + ROW_W - 44), y, 1, COL_DIM, ">");
 
-	y += (float)ROW_H;
+	y += (float)OPT_ROW_H;
 	if (s_cursor == OPT_ROW_DEBUG)
-		spriteRect((float)ROW_X, y - 3.0f, (float)ROW_W, (float)(ROW_H - 2), COL_SEL);
+		spriteRect((float)ROW_X, y - 3.0f, (float)ROW_W, (float)(OPT_ROW_H - 2), COL_SEL);
 	fontDraw((float)(ROW_X + TEXT_PAD), y, 1, COL_TEXT, "Debug");
 	fontDraw((float)(ROW_X + ROW_W - 44), y, 1, COL_DIM, ">");
 
@@ -216,15 +286,15 @@ void pauseMenuDraw(const PauseStats* st)
 	// console. World is the one the player's own building moves; linear is what the mesh
 	// pool came out of and therefore what render distance actually spends; VRAM holds the
 	// atlas and the framebuffers and barely moves at all.
-	float ly = y + (float)ROW_H + 6.0f;
+	float ly = y + (float)OPT_ROW_H - 2.0f;
 	fontDrawf((float)(ROW_X + TEXT_PAD), ly, 1, COL_HEAD, "MEMORY");
-	ly += 14.0f;
+	ly += 12.0f;
 	fontDrawf((float)(ROW_X + TEXT_PAD), ly, 1, COL_TEXT, "World  %lu / %lu KB",
 	          (unsigned long)kb(st->world_used), (unsigned long)kb(st->world_budget));
-	ly += 12.0f;
+	ly += 11.0f;
 	fontDrawf((float)(ROW_X + TEXT_PAD), ly, 1, COL_TEXT, "Linear %lu KB free",
 	          (unsigned long)kb(st->linear_free));
-	ly += 12.0f;
+	ly += 11.0f;
 	fontDrawf((float)(ROW_X + TEXT_PAD), ly, 1, COL_TEXT, "VRAM   %lu KB free",
 	          (unsigned long)kb(st->vram_free));
 

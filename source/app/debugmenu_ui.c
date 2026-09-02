@@ -4,6 +4,13 @@
 
 #include "scene/ui_layout.h"
 
+// v1.8.8. The BLOCK LIST sub-screen. Pure — no <3ds.h> — so this include is safe in the
+// host build that app/debugmenu_test.c makes of this file. Only DECLARATIONS come in here;
+// every CALL into it is inside the `#ifdef __3DS__` half below, which is what keeps
+// tools/run_host_tests.sh's debugmenu_test stanza linking exactly what it linked before.
+// See debug/blocklist.h's "screen's own state machine" note.
+#include "debug/blocklist.h"
+
 // <3ds.h> and the sprite/font batch are console-only; everything above the draw
 // block is plain integer work on a button word. Split the same way app/battery.c
 // splits its bar arithmetic from its PTM:U and drawing half, and for the same reason: the input
@@ -13,6 +20,7 @@
 #ifdef __3DS__
 #include <3ds.h>
 
+#include "gfx/atlas.h"
 #include "gfx/font.h"
 #include "gfx/sprite.h"
 #else
@@ -61,12 +69,71 @@ static int  s_scroll;
 // screen's state because "am I on my opening frame" is screen state, not input state.
 static bool s_swallow_frame;
 
+#ifdef __3DS__
+// Submits one page of the BLOCK LIST. It decides nothing: debug/blocklist.c emits the whole
+// page as a BlockListOp program and this is the loop that turns each op into exactly one
+// draw call. That is the point of the split — the host test and the scratchpad rasteriser
+// consume this same op list, so what they check is what this submits, not a re-derivation
+// of it.
+//
+// Two passes over the ops rather than one, because they need two different textures and the
+// sprite batch flushes on every texture change (gfx/sprite.h:80). Interleaved, a 16-row page
+// would flush ~32 times; split, it flushes once. scene/ui.c splits its hotbar the same way
+// and for the same reason.
+static void drawBlockList(void)
+{
+	BlockListOp ops[BL_MAX_OPS];
+	const int n = blockListBuild(blockListUiPage(), ops, BL_MAX_OPS);
+	if (n <= 0) return;   // build refuses rather than half-drawing; see blocklist.h
+
+	spriteBegin(SCR_W, SCR_H);
+
+	// Pass 1 — the font sheet. It carries the solid white texel that spriteRect samples
+	// (gfx/sprite.h:19), so the background, the row plates and every string are one batch.
+	spriteTexture(fontTexture());
+	for (int i = 0; i < n; i++) {
+		switch (ops[i].kind) {
+		case BL_OP_RECT:
+		case BL_OP_CELL:   // same draw as BL_OP_RECT; the tag is only for the tests
+			spriteRect(ops[i].x, ops[i].y, ops[i].w, ops[i].h, ops[i].colour);
+			break;
+		case BL_OP_TEXT:
+			fontDraw(ops[i].x, ops[i].y, 1, ops[i].colour, ops[i].text);
+			break;
+		default:
+			break;
+		}
+	}
+
+	// Pass 2 — the block atlas, for the icons. atlasTexture() rather than atlasBind(): the
+	// batch tracks texture changes itself, and binding behind its back would leave it certain
+	// it had not switched. gfx/atlas.h spells that out at the accessor.
+	C3D_Tex* atlas = atlasTexture();
+	if (atlas) {
+		spriteTexture(atlas);
+		for (int i = 0; i < n; i++)
+			if (ops[i].kind == BL_OP_ICON)
+				spriteQuad(ops[i].x, ops[i].y, ops[i].w, ops[i].h,
+				           ops[i].u0, ops[i].v0, ops[i].u1, ops[i].v1,
+				           ops[i].colour);
+	}
+
+	spriteEnd();
+}
+#endif  // __3DS__
+
 void debugMenuUiInit(void)
 {
 	s_open          = false;
 	s_cursor        = 0;
 	s_scroll        = 0;
 	s_swallow_frame = false;
+#ifdef __3DS__
+	// Inside the guard so the host build of this file needs no debug/blocklist.c on its link
+	// line — see the seam note in debug/blocklist.h. The block list's own host test drives
+	// blockListUiReset() directly, so this call being console-only costs no coverage.
+	blockListUiReset();
+#endif
 }
 
 void debugMenuUiOpen(void)
@@ -108,6 +175,43 @@ bool debugMenuUiUpdate(const DebugContext* ctx, bool* enabled,
 		down            = 0;
 		touch_down      = false;
 	}
+
+#ifdef __3DS__
+	// ── The BLOCK LIST sub-screen ────────────────────────────────────────────────────
+	//
+	// Handled here, ABOVE the menu's own KEY_B close, because both screens use B to go
+	// back and the innermost one has to win. Below this point B would close the whole
+	// debug menu and the block list would be unreachable-but-still-open underneath it.
+	//
+	// Console-only for the reason debug/blocklist.h documents at its state machine:
+	// app/debugmenu_test.c compiles THIS FILE as source and links only options.c + hw.c +
+	// render_dist.c + debugmenu.c, so a host-visible call to blockListUiInput() would put
+	// the registry and the block table on that link line — a stanza in
+	// tools/run_host_tests.sh that this change does not own. The logic behind the seam is
+	// host-tested in source/debug/blocklist_test.c instead; what is unguarded here is only
+	// the key mapping and the draw.
+	if (s_open && blockListUiIsOpen()) {
+		uint32_t bl = 0;
+		if (down & KEY_B)                          bl |= BL_KEY_CLOSE;
+		if (down & (KEY_R | KEY_DRIGHT | KEY_DDOWN)) bl |= BL_KEY_NEXT;
+		if (down & (KEY_L | KEY_DLEFT  | KEY_DUP))   bl |= BL_KEY_PREV;
+
+		if (blockListUiInput(bl)) drawBlockList();
+		// Either way the frame is spent: on close, returning true keeps the debug menu
+		// open and the very next frame draws it, so B steps back one screen instead of
+		// dropping the player two.
+		return true;
+	}
+
+	// X opens it. Not a debug-menu ROW: debugMenuUiInit() is called four times across
+	// app/debugmenu_test.c's cases, so registering a row from here would duplicate it and
+	// shift every index that file pins. A button costs that file nothing.
+	if (s_open && (down & KEY_X)) {
+		blockListUiOpen();
+		drawBlockList();
+		return true;
+	}
+#endif  // __3DS__
 
 	if (s_open && (down & KEY_B)) {
 		s_open = false;
@@ -256,7 +360,7 @@ bool debugMenuUiUpdate(const DebugContext* ctx, bool* enabled,
 	}
 
 	fontDraw((float)ROW_X, (float)(PANEL_Y + PANEL_H - 16), 1, COL_DIM,
-	         "A/Touch toggle   B close");
+	         "A/Touch toggle  B close  X block list");
 
 	spriteEnd();
 #endif  // __3DS__

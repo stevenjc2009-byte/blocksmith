@@ -114,6 +114,11 @@ static void testDefaultsInRange(void)
 	CHECK(o.slider_3d >= OPTIONS_SLIDER_MIN && o.slider_3d <= OPTIONS_SLIDER_MAX);
 	CHECK(o.invert_look == false);
 	CHECK(o.look_sensitivity >= OPTIONS_SENS_MIN && o.look_sensitivity <= OPTIONS_SENS_MAX);
+	CHECK(o.audio_volume >= OPTIONS_AUDIO_VOL_MIN && o.audio_volume <= OPTIONS_AUDIO_VOL_MAX);
+	// Specifically FULL, not merely in range — see options.h on why a quieter software
+	// default would be indistinguishable from a bug to the player holding the hardware
+	// volume slider.
+	CHECK(o.audio_volume == OPTIONS_AUDIO_VOL_DEFAULT);
 
 	// Every default binding must be a real, known key, and the defaults must reproduce the
 	// controls the game shipped with before this step existed — see options.c's
@@ -147,6 +152,9 @@ static void testRoundTrip(void)
 	out.slider_3d          = 0.75f;
 	out.invert_look        = true;
 	out.look_sensitivity   = 2.25f;
+	// 0.4 is exactly representable in binary32, so == below is a real equality test and
+	// not a tolerance dressed up as one.
+	out.audio_volume       = 0.4f;
 	for (int i = 0; i < ACTION_COUNT; i++)
 		out.bindings[i] = OPTIONS_VALID_KEYS[(i + 3) % OPTIONS_VALID_KEY_COUNT];
 
@@ -161,6 +169,7 @@ static void testRoundTrip(void)
 	CHECK(in.slider_3d == out.slider_3d);
 	CHECK(in.invert_look == out.invert_look);
 	CHECK(in.look_sensitivity == out.look_sensitivity);
+	CHECK(in.audio_volume == out.audio_volume);
 	for (int i = 0; i < ACTION_COUNT; i++)
 		CHECK(in.bindings[i] == out.bindings[i]);
 
@@ -217,6 +226,7 @@ static void testOutOfRangeClamps(void)
 	CHECK(writeText(path,
 		"render_dist=9999\n"
 		"slider_3d=5.0\n"
+		"audio_volume=9.5\n"
 		"look_sensitivity=-10\n"));
 
 	Options o;
@@ -228,11 +238,13 @@ static void testOutOfRangeClamps(void)
 	CHECK(o.render_dist == ceilingNow());
 	CHECK(o.slider_3d == OPTIONS_SLIDER_MAX);
 	CHECK(o.look_sensitivity == OPTIONS_SENS_MIN);
+	CHECK(o.audio_volume == OPTIONS_AUDIO_VOL_MAX);
 
-	CHECK(writeText(path, "render_dist=-1\n"));
+	CHECK(writeText(path, "render_dist=-1\naudio_volume=-3\n"));
 	CHECK(optionsLoad(&o, path, &bad));
 	CHECK(bad == 0);
 	CHECK(o.render_dist == RENDER_DIST_MIN);
+	CHECK(o.audio_volume == OPTIONS_AUDIO_VOL_MIN);
 }
 
 static void testMissingFileGivesDefaults(void)
@@ -256,6 +268,7 @@ static void testMissingFileGivesDefaults(void)
 	CHECK(o.slider_3d == def.slider_3d);
 	CHECK(o.invert_look == def.invert_look);
 	CHECK(o.look_sensitivity == def.look_sensitivity);
+	CHECK(o.audio_volume == def.audio_volume);
 	for (int i = 0; i < ACTION_COUNT; i++)
 		CHECK(o.bindings[i] == def.bindings[i]);
 }

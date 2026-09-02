@@ -23,7 +23,7 @@ include $(DEVKITARM)/3ds_rules
 #---------------------------------------------------------------------------------
 TARGET		:=	blocksmith
 BUILD		:=	build
-SOURCES		:=	source source/app source/gfx source/debug source/net source/scene source/shaders source/world deps/libhydrogen
+SOURCES		:=	source source/app source/audio source/entity source/gfx source/debug source/net source/scene source/shaders source/world deps/libhydrogen
 DATA		:=	data
 INCLUDES	:=	source deps/libhydrogen deps/blocksmith-server
 GRAPHICS	:=	gfx
@@ -212,7 +212,31 @@ PROTO_REPO	:=	https://github.com/stevenjc2009-byte/blocksmith-server.git
 # ONLY. And none of this licenses WIDENING an existing message -- networld.c's
 # `if (len != BS_WORLD_INFO_BYTES) return;` is strict equality, so BS_APP_WORLD_INFO
 # still cannot grow.
-PROTO_COMMIT	:=	533aee1424b5e6cada86112bd40b8808d00f7601
+#
+# 2026-09-02, 533aee14 -> bce14b65 (blocksmith-server v1.9.1, a PUSHED tag). Bumped for a
+# COMMENT-ONLY change, and that was checked before bumping rather than after:
+#
+#     git -C deps/blocksmith-server diff 533aee14 bce14b65 -- proto/bs_proto.h
+#     proto/bs_proto.h | 11 +++++++----   (7 insertions, 4 deletions)
+#
+# Every one of those lines is inside the block comments on BS_INV_OP_PICKUP and
+# BS_INV_OP_CONSUME. The values did NOT move -- PICKUP is still 0x05, CONSUME still 0x06,
+# BS_INV_OP_COUNT unchanged -- and no struct, field, size or id changed anywhere in the
+# file. The prose now says the server validates `a` through its block registry
+# (inventoryCanHold) instead of `a < BS_BLOCK_COUNT`, which is v1.9.1's actual change and
+# lives in game/bsgame.c and game/validate.h, not in the wire format.
+#
+# So this bump is a no-op for the built client: the header it compiles against is
+# byte-equivalent in every declaration. It is recorded anyway because the guard hashes the
+# whole file on purpose. A guard that ignored comments would have to parse C to know which
+# hunks were "only" comments, and a guard that can be argued with is not a guard -- the
+# same strictness that makes this bump feel like paperwork is what makes it catch the real
+# thing. Noise here is the price of the alarm working.
+#
+# NOTE for whoever widens the client's wire span: v1.9.1's server-side half is what makes
+# that safe, but the client half is NOT done. world/inventory.h's inventoryItemOnWire()
+# still reads `item < BLOCK_COUNT`. See the dated block above that function.
+PROTO_COMMIT	:=	bce14b658edc1c4a5be648e154dd7169e0427a6d
 PROTO		:=	deps/blocksmith-server
 
 .PHONY: deps

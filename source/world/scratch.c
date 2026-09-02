@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "world/light.h"
+#include "world/mesher.h"   // MESH_TINT_MASK / MESH_TINT_NONE only -- no link edge added
 
 // Where one neighbour offset lands in the scratch, per axis.
 //
@@ -44,6 +45,14 @@ void scratchFill(MeshScratch* s, const World* w, int cx, int cy, int cz)
 	// waterless chunk pays 972 memchr calls over 5,832 bytes and a water chunk usually pays
 	// far fewer.
 	s->has_water = false;
+
+	// v1.8.8 biome tint. Unlike the water band this one IS cleared here, and the difference is
+	// size: 324 bytes against water's 5,832, so the memset costs less than the bookkeeping
+	// needed to avoid it. Clearing it makes "nobody filled the tint" and "everything is
+	// untinted" the same state, which is what keeps every caller that predates this task
+	// emitting exactly the vertices it emitted before.
+	memset(s->tint, 0, sizeof s->tint);
+	s->tint_any = false;
 
 	for (int dy = -1; dy <= 1; dy++) {
 		const AxisSpan ay = axisSpan(dy);
@@ -119,6 +128,46 @@ void scratchFill(MeshScratch* s, const World* w, int cx, int cy, int cz)
 // This became live on an Old 3DS in v1.8.0 task 24, when the lighting gate went on
 // for both models (see world/light.h) — so it is new cost on the streaming drain,
 // on the hardware that has the least to spend.
+// v1.8.8 biome tint. See world/scratch.h for why this takes a function pointer instead of the
+// WorldGen it obviously wants -- short version: 10 of the 15 host binaries that link this file
+// do not link world/worldgen.c, and this file's whole job is to stay linkable by all of them.
+void scratchFillTint(MeshScratch* s, int cx, int cz, ScratchTintFn fn, const void* ctx)
+{
+	// A caller with no generator (every host suite that predates this, and the console before
+	// main.c hands one over) leaves the band exactly as scratchFill cleared it: all zeros,
+	// tint_any false, and the mesher never looks at it.
+	if (!fn) return;
+
+	bool any = false;
+
+	// sz outer and sx inner because sx is the CONTIGUOUS axis of the band -- scratchColumn puts
+	// it in the low term -- so one row is 18 sequential bytes. Same direction of travel as
+	// scratchFill and scratchFillLight, for the same reason.
+	for (int sz = 0; sz < SCRATCH_DIM; sz++) {
+		const int32_t wz = (int32_t)cz * CHUNK_DIM + sz - 1;
+		uint8_t* row = &s->tint[scratchColumn(0, sz)];
+
+		for (int sx = 0; sx < SCRATCH_DIM; sx++) {
+			// The -1 is the whole correctness question in this function. Scratch column 0 is
+			// the BORDER -- one block before the chunk begins -- and 1..16 is the chunk. An
+			// off-by-one here does not crash, drop a face or move a vertex: it draws every
+			// chunk in the world one block of COLOUR out of step with its own terrain, which
+			// is invisible to every hash and every face count in the tree.
+			const int32_t wx = (int32_t)cx * CHUNK_DIM + sx - 1;
+
+			// Masked at the boundary rather than trusted: the ao byte's low two bits are the
+			// ambient occlusion, and both .pica files read that byte with no mask of their own.
+			const uint8_t t = (uint8_t)(fn(ctx, wx, wz) & MESH_TINT_MASK);
+			row[sx] = t;
+			if (t != MESH_TINT_NONE) any = true;
+		}
+	}
+
+	// Set from what was actually written, never from "a generator exists". A world sitting
+	// entirely inside one untinted region must still report false here.
+	s->tint_any = any;
+}
+
 void scratchFillLight(MeshScratch* s, const World* w, int cx, int cy, int cz)
 {
 	// One resolve per neighbour column, not one per cell. Indexed [dz+1][dx+1],

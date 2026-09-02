@@ -105,6 +105,24 @@ extern const uint32_t OPTIONS_VALID_KEYS[OPTIONS_VALID_KEY_COUNT];
 #define OPTIONS_SENS_MAX      3.0f
 #define OPTIONS_SENS_DEFAULT  1.0f
 
+// Sound effect volume: a plain 0..1 multiplier handed straight to
+// audioSetMasterVolume() (audio/audio.h), which is safe to call on a console whose DSP
+// firmware was never dumped and therefore cannot make a noise at all.
+//
+// The default is FULL, not something quieter, because the 3DS already has a hardware
+// volume slider under the player's thumb. A software default below 1.0 would mean that
+// slider no longer reaches the level the sounds were mixed at, and the only symptom
+// would be "the game is quiet" with nothing on screen to explain it. Turning it down is
+// the player's call; this setting exists so they can reach zero without silencing the
+// console's other sounds along with it.
+//
+// STEP is what one press of left/right moves it by, so ten presses cross the range and
+// every reachable value is a round percentage.
+#define OPTIONS_AUDIO_VOL_MIN     0.0f
+#define OPTIONS_AUDIO_VOL_MAX     1.0f
+#define OPTIONS_AUDIO_VOL_DEFAULT 1.0f
+#define OPTIONS_AUDIO_VOL_STEP    0.1f
+
 typedef struct {
 	int      render_dist;                 // columns radius; RENDER_DIST_MIN..RENDER_DIST_MAX
 	float    slider_3d;                   // OPTIONS_SLIDER_MIN..OPTIONS_SLIDER_MAX
@@ -112,6 +130,7 @@ typedef struct {
 	float    look_sensitivity;            // OPTIONS_SENS_MIN..OPTIONS_SENS_MAX
 	uint32_t bindings[ACTION_COUNT];      // action -> raw key bit, one of OPTIONS_VALID_KEYS
 	bool     debug_menu;                  // debug menu on/off
+	float    audio_volume;                // OPTIONS_AUDIO_VOL_MIN..OPTIONS_AUDIO_VOL_MAX
 } Options;
 
 // Fills `o` with the shipped defaults. Every field is already inside its legal range —

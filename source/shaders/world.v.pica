@@ -58,6 +58,28 @@
 ; the header, which is the only reason the duplication is safe. Update all four together.
 .constf uvScale(0.0625, 0.015625, 0.0, 0.0)       ; 1/ATLAS_W_PX = 1/16, TILE_PX/ATLAS_H_PX = 16/1024
 
+; v1.8.8 biome tint. Eight RGB multipliers, indexed by bits 2..4 of the vertex's ao byte
+; (MESH_TINT_BITS in source/world/mesher.h). Row 0 is (1,1,1) — the identity — and is what
+; every untintable face and every vertex meshed without a biome source carries, so this
+; multiply is exactly 1.0 for all of them and the frame is unchanged.
+;
+; EIGHT ROWS IS THE CAP, and it is this bank that sets it, not the vertex byte: the PICA200
+; vertex stage has 96 float uniform registers in total and faceShade alone is 64 of them.
+; Three bits is therefore what the mesher packs, and BIOME_COUNT (world/worldgen.h) is 6.
+;
+; Must match world_dynamic.v.pica exactly. That file is the one actually BOUND on both console
+; models since the v1.8.0 shader split and this one is compiled and never bound, so an edit to
+; only one of them is invisible either on the hardware or to the next person reading the file —
+; the same drift world/atlas_uv_shader_test.c guards uvScale against.
+; source/world/biome_tint_test.c parses the declaration and the decode instructions out of both.
+.fvec tintPalette[8]
+
+; v1.8.8. Splitting the ao byte: 1/4 shifts the tint index down out of bits 2..4, -4 undoes
+; that shift inside the byte so what is left is the ambient occlusion 0..3.
+.constf tintConsts(0.25, -4.0, 0.0, 0.0)
+.alias  inv4 tintConsts.xxxx
+.alias  neg4 tintConsts.yyyy
+
 .constf consts(0.0, 1.0, 0.0, 0.33333333)         ; 0, 1, spare (was uvScale), 1/3
 .alias  zeros consts.xxxx
 .alias  ones  consts.yyyy
@@ -120,6 +142,21 @@
 	mova a0.x, inpack.zzzz
 	mov r3, faceShade[a0.x]
 
+	; --- v1.8.8 biome tint: split the ao byte and fetch the palette row ----
+	; inpack.w is ao | tint<<2 (world/mesher.h). The whole byte used to BE the occlusion and
+	; the ao curve below multiplied it by 1/3 with no mask, so leaving the tint in it would
+	; not be ignored — it would read as an occlusion of up to 31 and blow the face to white.
+	; That is why this split is not optional and why it happens before anything reads .w.
+	;
+	; a0.x is re-loaded here rather than kept: r3 is already fetched above, so the faceShade
+	; row this would clobber has been read and the register is free.
+	mul r8.x, inv4, inpack.wwww          ; ao byte / 4
+	flr r8.x, r8.xxxx                    ; tint index 0..7
+	mul r9.x, neg4, r8.xxxx              ; -4 * tint
+	add r9.x, r9.xxxx, inpack.wwww       ; ao 0..3, the value this shader always read
+	mova a0.x, r8.xxxx
+	mov r10, tintPalette[a0.x]
+
 	; --- position ---------------------------------------------------------
 	mov r0.xyz, inpos
 
@@ -179,12 +216,22 @@
 	; measurement that cleared the relative addressing itself of the hardware freeze.
 
 	; ao factor = aoFloor + aoRange * (ao / 3)
-	mul r4.x, aoScale, inpack.wwww
+	; v1.8.8: r9.x, not inpack.wwww — the MASKED occlusion, with the tint index taken back out
+	; of bits 2..4. See the split at the top of main.
+	mul r4.x, aoScale, r9.xxxx
 	mul r4.x, aoRange, r4.xxxx
 	add r4.x, aoFloor, r4.xxxx
 
+	; colour = faceShade x aoCurve x tint
+	;
+	; v1.8.8. The line above produces ONE brightness and all three colour channels were written
+	; from it — `mov outclr.xyz, r5.xxx`, a grey. The tint is therefore free at every stage
+	; after this one: no extra varying (outclr was already there and already interpolated) and
+	; no extra TexEnv stage (scene/chunk_render.c stage 0 is already GPU_MODULATE of
+	; GPU_TEXTURE0 against GPU_PRIMARY_COLOR). One instruction here, and nothing anywhere else.
 	mul r5, r3.xxxx, r4.xxxx
-	mov outclr.xyz, r5.xxx
+	mul r11.xyz, r5.xxxx, r10
+	mov outclr.xyz, r11.xyz
 
 	; v1.8.2: the vertex alpha, straight out of the same table row. .w used to be written 1.0
 	; and never read; scene/chunk_render.c now fills it with 0.70 for every row whose drop is

@@ -6,6 +6,7 @@
 #include "app/hw.h"           // v1.8.5: the render-distance stepper's ceiling is per-console
 #include "app/updater.h"
 #include "app/updater_retry.h"
+#include "app/version_history.h"
 #include "gfx/font.h"
 #include "gfx/sprite.h"
 #include "net/bsnet.h"
@@ -105,6 +106,19 @@
 #define OPT_BTN1_Y  (LIST_TOP_Y + 4 * LIST_ROW_H + 6)
 #define OPT_BTN2_Y  (OPT_BTN1_Y + OPT_BTN_H + 4)
 #define OPT_BTN3_Y  (OPT_BTN2_Y + OPT_BTN_H + 4)
+
+// The update screen's "VERSION HISTORY" button (v1.8.8) - steve's brief in his own words:
+// "a small little button ... in the top left". It sits in the same 20 px title-bar strip the
+// "UPDATE" label already occupies (y=4..11), to its left, and the label moves right to make
+// room rather than being dropped - see drawUpdate. 108 px fits "VERSION HISTORY" (16 chars *
+// FONT_ADVANCE(6) = 96 px) at scale 1 with 6 px of padding either side; 16 px tall is the
+// smallest this file gives any tappable target (below LIST_ROW_H's 32 and even BIND_ROW_H's
+// 24), which is the deliberate reading of "small little button" - it is reached once, to open
+// a screen with its own full-size rows, not a target a thumb has to land on repeatedly.
+#define VH_ENTRY_BTN_X  6
+#define VH_ENTRY_BTN_Y  3
+#define VH_ENTRY_BTN_W  108
+#define VH_ENTRY_BTN_H  16
 
 // ── Top screen: the release notes (v1.6.0 task 14b) ────────────────────────────────────
 //
@@ -1023,7 +1037,25 @@ static TitleResult drawUpdate(TitleState* ts, const TitleInput* in, bool tap)
 		ts->notes_scroll               = 0;
 	}
 
-	fontDraw(8, 4, 1, COL_TEXT_DIM, "UPDATE");
+	// Version history browser's entry point. Deliberately tap-only: it does not join
+	// ts->cursor's item_count cycle above (Left/Right when notes_visible, Up/Down otherwise -
+	// see "who owns the D-pad on this screen" just above), so adding it cannot disturb either
+	// of those two already-balanced mappings. steve's brief asked for the BROWSER itself to be
+	// D-pad driven ("using both the top screen and the bottom screen ... with the d pad"),
+	// which is what drawVersionHistory below does once this button is tapped - not that every
+	// path to reach it also has to be a D-pad path.
+	const TRect vh_btn_r = {VH_ENTRY_BTN_X, VH_ENTRY_BTN_Y, VH_ENTRY_BTN_W, VH_ENTRY_BTN_H};
+	if (uiButton(vh_btn_r, "VERSION HISTORY", false, tap, in->touch_x, in->touch_y, false)) {
+		ts->screen    = TITLE_SCR_VERSION_HISTORY;
+		ts->cursor    = 0;
+		ts->vh_cursor = 0;
+		ts->vh_scroll = 0;
+		ts->notes_scroll               = 0;
+		ts->notes_rep_up.held_frames   = 0;
+		ts->notes_rep_down.held_frames = 0;
+	}
+
+	fontDraw(VH_ENTRY_BTN_X + VH_ENTRY_BTN_W + 6, 4, 1, COL_TEXT_DIM, "UPDATE");
 
 	float y = LIST_TOP_Y;
 	char line[64];
@@ -1109,6 +1141,157 @@ static TitleResult drawUpdate(TitleState* ts, const TitleInput* in, bool tap)
 	return r;
 }
 
+// ── Version history browser (v1.8.8) ───────────────────────────────────────────────────
+//
+// steve's brief, in his own words: "it should be displaying all the past versions up to the
+// current latest version. What it added, what it changed, what it fixed, what it removed ...
+// So that way players can see ... what they've missed out on." app/version_history.h carries
+// the full design writeup (why the data is baked, why whatsnew<version>.txt rather than
+// CHANGELOG.md, why nothing before v1.6.0 is here); this half is just the screen.
+//
+// The list is newest-first, which is the order a player skimming "what did I miss" wants -
+// the same order CHANGELOG.md itself is written in. Row 0 is a release the update screen's own
+// check has already found but the player has not installed (updaterReleaseNotes() -
+// zero extra network requests), when there is one; every row after that is a baked
+// app/version_history.c entry, which is stored oldest-first, so the mapping below reads it
+// back to front.
+
+// True only once a check has actually found something newer than this build - never for a
+// baked version, by construction (app/version_history_data.c can only ever contain versions
+// that existed when THIS build was compiled, all of which are <= BLOCKSMITH_VERSION), but
+// checked with strcmp anyway rather than assumed, so a rebuilt-but-not-reinstalled dev binary
+// can never show the same version as both row 0 and the newest baked row.
+static bool vhHasExtraRow(void)
+{
+	if (!updaterAvailable() || updaterState() != UPDATE_AVAILABLE) return false;
+
+	const char* latest = updaterLatestVersion();
+	if (latest[0] == '\0') return false;
+
+	const int n = versionHistoryCount();
+	if (n > 0 && strcmp(versionHistoryVersionAt(n - 1), latest) == 0) return false;
+
+	return true;
+}
+
+static int vhRowCount(void)
+{
+	return versionHistoryCount() + (vhHasExtraRow() ? 1 : 0);
+}
+
+// Row 0..count-1, newest first. Returns -1 for the not-yet-installed row (row 0, only when
+// vhHasExtraRow()), or the app/version_history.c index otherwise.
+static int vhBakedIndexFor(int row)
+{
+	const int extra = vhHasExtraRow() ? 1 : 0;
+	if (row < extra) return -1;
+	return versionHistoryCount() - 1 - (row - extra);
+}
+
+static const char* vhRowVersion(int row)
+{
+	const int idx = vhBakedIndexFor(row);
+	return (idx < 0) ? updaterLatestVersion() : versionHistoryVersionAt(idx);
+}
+
+// One WhatsNew's worth of scratch, reused for whichever row is on screen - the same "parse on
+// demand into one shared buffer" tradeoff app/version_history.h's file comment already makes
+// for versionHistoryNotesAt, so this browser never holds more than ~3 KB of parsed notes live
+// no matter how many versions are baked in.
+static WhatsNew s_vh_notes;
+
+static const WhatsNew* vhRowNotes(int row)
+{
+	const int idx = vhBakedIndexFor(row);
+	if (idx < 0) return updaterReleaseNotes();
+	versionHistoryNotesAt(idx, &s_vh_notes);
+	return &s_vh_notes;
+}
+
+static TitleResult drawVersionHistory(TitleState* ts, const TitleInput* in, bool tap)
+{
+	TitleResult r = {TITLE_STAY, {0}};
+	const int rows = vhRowCount();
+
+	fontDraw(8, 4, 1, COL_TEXT_DIM, "VERSION HISTORY");
+
+	if (rows <= 0) {
+		fontDraw(10, LIST_TOP_Y + 10, 1, COL_TEXT_DIM, "No version history in this build.");
+	} else {
+		ts->vh_cursor = clampInt(ts->vh_cursor, 0, rows - 1);
+		const int prev_cursor = ts->vh_cursor;
+
+		// ── Who owns the D-pad on this screen ─────────────────────────────────────────
+		//
+		// LEFT/RIGHT step through the timeline one release at a time, the same physical
+		// gesture source/debug/blocklist.c's L/R page-through-the-list idiom uses, mapped to
+		// the D-pad because TitleInput carries no shoulder buttons (see title.h's own
+		// comment on keys_down). UP/DOWN scrolls the selected release's notes on the TOP
+		// screen - exactly what UP/DOWN already means on the update screen this was reached
+		// from (see drawUpdate's "who owns the D-pad" comment), so a player who has already
+		// used that screen needs nothing new here. Each direction owns exactly one thing, so
+		// there is nothing here for this project's twice-shipped "one keys_down word read by
+		// two UI layers" bug class to land on.
+		if (in->keys_down & KEY_DRIGHT) ts->vh_cursor = (ts->vh_cursor + 1) % rows;
+		if (in->keys_down & KEY_DLEFT)  ts->vh_cursor = (ts->vh_cursor + rows - 1) % rows;
+
+		if (ts->vh_cursor < ts->vh_scroll) ts->vh_scroll = ts->vh_cursor;
+		if (ts->vh_cursor >= ts->vh_scroll + LIST_VISIBLE_ROWS)
+			ts->vh_scroll = ts->vh_cursor - LIST_VISIBLE_ROWS + 1;
+
+		for (int row = 0; row < LIST_VISIBLE_ROWS; row++) {
+			const int i = ts->vh_scroll + row;
+			if (i >= rows) break;
+
+			const int   baked_idx = vhBakedIndexFor(i);
+			const char* version   = vhRowVersion(i);
+
+			char label[40];
+			if (baked_idx < 0) {
+				snprintf(label, sizeof(label), "v%s - AVAILABLE, NOT INSTALLED", version);
+			} else if (BLOCKSMITH_VERSION_SET && strcmp(version, BLOCKSMITH_VERSION) == 0) {
+				snprintf(label, sizeof(label), "v%s - THIS BUILD", version);
+			} else {
+				snprintf(label, sizeof(label), "v%s", version);
+			}
+
+			const TRect rr = {10, (float)(LIST_TOP_Y + row * LIST_ROW_H), SCR_W - 20,
+			                  LIST_ROW_H - 2};
+			// A is never read on this screen - only LEFT/RIGHT above move the cursor - so
+			// a_down is always false here; a tap still jumps straight to the row (uiButton's
+			// own tapped_here || (focused && a_down) contract).
+			if (uiButton(rr, label, ts->vh_cursor == i, tap, in->touch_x, in->touch_y, false))
+				ts->vh_cursor = i;
+		}
+
+		// Moving to a different row starts its notes scrolled to the top, same as entering
+		// the update screen already does for its own single version's notes.
+		if (ts->vh_cursor != prev_cursor) {
+			ts->notes_scroll               = 0;
+			ts->notes_rep_up.held_frames   = 0;
+			ts->notes_rep_down.held_frames = 0;
+		}
+
+		ts->notes_scroll += whatsnewRepeatStep(&ts->notes_rep_down,
+		                                        (in->keys_held & KEY_DDOWN) != 0);
+		ts->notes_scroll -= whatsnewRepeatStep(&ts->notes_rep_up,
+		                                        (in->keys_held & KEY_DUP) != 0);
+		if (ts->notes_scroll < 0) ts->notes_scroll = 0;
+	}
+
+	const TRect back_r = {10, (float)LIST_BTN1_Y, SCR_W - 20, LIST_BTN_H};
+	if (uiButton(back_r, "BACK", false, tap, in->touch_x, in->touch_y, false)
+	    || (in->keys_down & KEY_B)) {
+		ts->screen = TITLE_SCR_UPDATE;
+		ts->cursor = 0;
+		ts->notes_scroll               = 0;
+		ts->notes_rep_up.held_frames   = 0;
+		ts->notes_rep_down.held_frames = 0;
+	}
+
+	return r;
+}
+
 // ── Top screen: the release notes ──────────────────────────────────────────────────────
 
 // Re-laid out every frame rather than cached. The wrap is a few kilobytes of memcpy over at
@@ -1117,28 +1300,27 @@ static TitleResult drawUpdate(TitleState* ts, const TitleInput* in, bool tap)
 // fetch — a staleness bug in exchange for time nobody is short of.
 static WhatsNewLayout s_notes_layout;
 
-static void drawUpdateTop(TitleState* ts)
+// Shared by the update screen's single-version panel (drawUpdateTop, the only caller before
+// v1.8.8) and the version history browser's per-row panel (drawVersionHistoryTop) — same
+// layout, same scrollbar, same wrap; the only difference between the two screens is which
+// WhatsNew* and which heading text they hand in. Pulled out under its own name in v1.8.8
+// rather than duplicated, so drawUpdateTop's quad cost — already shipping, already proven to
+// fit — is provably unchanged: it is the same code, just called through one more frame.
+static void drawNotesTop(const char* heading, const WhatsNew* notes, int* scroll)
 {
-	const char* latest = updaterLatestVersion();
-
-	char heading[64];
-	if (latest[0] != '\0')
-		snprintf(heading, sizeof(heading), "WHAT'S NEW IN %s", latest);
-	else
-		snprintf(heading, sizeof(heading), "WHAT'S NEW");
 	fontDraw(NOTES_PANEL_X + 2, 6, 1, COL_ACCENT, heading);
 
 	// Real pixels and the real font advance, not a guessed character count — see
 	// app/whatsnew.h. FONT_ADVANCE is per font pixel, so at scale 1 it is the advance.
-	whatsnewBuildLayout(updaterReleaseNotes(), NOTES_TEXT_W, FONT_ADVANCE, &s_notes_layout);
+	whatsnewBuildLayout(notes, NOTES_TEXT_W, FONT_ADVANCE, &s_notes_layout);
 
 	const int lines = s_notes_layout.count;
-	ts->notes_scroll = whatsnewClampScroll(ts->notes_scroll, lines, NOTES_VISIBLE);
+	*scroll = whatsnewClampScroll(*scroll, lines, NOTES_VISIBLE);
 
 	spriteRect(NOTES_PANEL_X, NOTES_PANEL_Y, NOTES_PANEL_W, NOTES_PANEL_H, COL_PANEL_LO);
 
 	for (int row = 0; row < NOTES_VISIBLE; row++) {
-		const int i = ts->notes_scroll + row;
+		const int i = *scroll + row;
 		if (i >= lines) break;
 
 		const float ly = (float)(NOTES_TEXT_Y + row * FONT_LINE);
@@ -1161,8 +1343,7 @@ static void drawUpdateTop(TitleState* ts)
 	const bool more = whatsnewScrollable(lines, NOTES_VISIBLE);
 
 	WhatsNewThumb thumb;
-	whatsnewThumb(lines, NOTES_VISIBLE, ts->notes_scroll, NOTES_TRACK_H, NOTES_THUMB_MIN,
-	              &thumb);
+	whatsnewThumb(lines, NOTES_VISIBLE, *scroll, NOTES_TRACK_H, NOTES_THUMB_MIN, &thumb);
 
 	spriteRect(NOTES_BAR_X, NOTES_TRACK_Y, NOTES_BAR_W, NOTES_TRACK_H, COL_PANEL);
 	spriteRect(NOTES_BAR_X, (float)(NOTES_TRACK_Y + thumb.y), NOTES_BAR_W, (float)thumb.h,
@@ -1172,6 +1353,36 @@ static void drawUpdateTop(TitleState* ts)
 	                          : "THAT IS THE WHOLE CHANGELOG";
 	fontDraw(NOTES_PANEL_X + 2, (float)(NOTES_PANEL_Y + NOTES_PANEL_H + 5), 1,
 	         COL_TEXT_DIM, footer);
+}
+
+static void drawUpdateTop(TitleState* ts)
+{
+	const char* latest = updaterLatestVersion();
+
+	char heading[64];
+	if (latest[0] != '\0')
+		snprintf(heading, sizeof(heading), "WHAT'S NEW IN %s", latest);
+	else
+		snprintf(heading, sizeof(heading), "WHAT'S NEW");
+
+	drawNotesTop(heading, updaterReleaseNotes(), &ts->notes_scroll);
+}
+
+static void drawVersionHistoryTop(TitleState* ts)
+{
+	const int rows = vhRowCount();
+	if (rows <= 0) {
+		spriteRect(NOTES_PANEL_X, NOTES_PANEL_Y, NOTES_PANEL_W, NOTES_PANEL_H, COL_PANEL_LO);
+		fontDraw(NOTES_PANEL_X + 2, 6, 1, COL_ACCENT, "VERSION HISTORY");
+		return;
+	}
+
+	const int row = clampInt(ts->vh_cursor, 0, rows - 1);
+
+	char heading[64];
+	snprintf(heading, sizeof(heading), "WHAT'S NEW IN %s", vhRowVersion(row));
+
+	drawNotesTop(heading, vhRowNotes(row), &ts->notes_scroll);
 }
 
 void titleDrawTop(TitleState* ts)
@@ -1188,6 +1399,8 @@ void titleDrawTop(TitleState* ts)
 	if (ts->screen == TITLE_SCR_UPDATE && updaterAvailable() &&
 	    updaterState() == UPDATE_AVAILABLE)
 		drawUpdateTop(ts);
+	else if (ts->screen == TITLE_SCR_VERSION_HISTORY)
+		drawVersionHistoryTop(ts);
 
 	spriteEnd();
 }
@@ -1224,6 +1437,7 @@ TitleResult titleUpdateDraw(TitleState* ts, Options* opts, const TitleInput* in)
 	case TITLE_SCR_OPTIONS_BINDINGS: drawOptionsBindings(ts, opts, in, tap); break;
 	case TITLE_SCR_MULTIPLAYER:      r = drawMultiplayer(ts, in, tap);      break;
 	case TITLE_SCR_UPDATE:           r = drawUpdate(ts, in, tap);           break;
+	case TITLE_SCR_VERSION_HISTORY:  r = drawVersionHistory(ts, in, tap);   break;
 	}
 
 	spriteEnd();

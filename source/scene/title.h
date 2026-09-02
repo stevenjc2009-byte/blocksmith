@@ -28,6 +28,7 @@
 #include <3ds.h>
 
 #include "app/options.h"
+#include "app/version_history.h"
 #include "app/whatsnew.h"
 #include "scene/worldlist.h"
 
@@ -68,6 +69,9 @@ typedef enum {
 	TITLE_SCR_OPTIONS_BINDINGS,
 	TITLE_SCR_MULTIPLAYER,
 	TITLE_SCR_UPDATE,          // Options' "CHECK FOR UPDATE" button - see title.c's drawUpdate
+	// The update screen's top-left "VERSION HISTORY" button - see title.c's
+	// drawVersionHistory/drawVersionHistoryTop and app/version_history.h.
+	TITLE_SCR_VERSION_HISTORY,
 } TitleScreenId;
 
 typedef struct {
@@ -99,6 +103,17 @@ typedef struct {
 	int            notes_scroll;
 	WhatsNewRepeat notes_rep_up;
 	WhatsNewRepeat notes_rep_down;
+
+	// Version history browser (v1.8.8): which row is selected in the combined list, newest
+	// first - row 0 is an update the check already found but the player has not installed
+	// yet, when there is one (see app/version_history.h's file comment), then every baked
+	// app/version_history.c entry. `vh_scroll` is the first visible row of that list on the
+	// bottom screen, same auto-follow idea drawWorldSelect's world_scroll already uses above.
+	// The notes body the selected row shows on the TOP screen reuses notes_scroll/
+	// notes_rep_up/notes_rep_down above rather than duplicating them, because this screen and
+	// the update screen are never open at the same time.
+	int vh_cursor;
+	int vh_scroll;
 } TitleState;
 
 // Zeroes `ts` and puts it on the main screen. Call once, before the first titleUpdateDraw.

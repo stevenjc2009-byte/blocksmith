@@ -7783,7 +7783,59 @@ static bool genTestNotGround(BlockId b)
 	       b == BLOCK_WOOD      || b == BLOCK_LEAVES  ||
 	       /* v1.8.3 Phase 3 */
 	       b == BLOCK_ICE       || b == BLOCK_CACTUS  ||
-	       b == BLOCK_DEAD_BUSH || b == BLOCK_FERN;
+	       b == BLOCK_DEAD_BUSH || b == BLOCK_FERN    ||
+	       /* v1.8.8: the ten ids worldgen can now write that are not ground either.
+	        *
+	        * The two species pairs are here for exactly the reason BLOCK_WOOD and
+	        * BLOCK_LEAVES already were — a birch trunk standing on grass is not the grass —
+	        * and leaving them out is the failure this list was consolidated to prevent:
+	        * genTestTerrainTop() would have answered "the canopy" for every tree in a forest
+	        * or a taiga, and testWorldgenPhase3Flora's `y != top + 1` checks would then be
+	        * comparing a fern against a leaf. Nothing would have said so; the numbers would
+	        * just have been about something else.
+	        *
+	        * BLOCK_APPLE is here for a different reason worth stating separately: it is a
+	        * SOLID full cube, so it is the one id in this list that a naive "is it see
+	        * through" reading would have called ground. It hangs in the air under a canopy
+	        * and never touches the surface, so it is no more the ground than the leaf above
+	        * it. The four flowers and the tall-grass top are the ordinary case. */
+	       b == BLOCK_BIRCH_LOG  || b == BLOCK_BIRCH_LEAVES  ||
+	       b == BLOCK_SPRUCE_LOG || b == BLOCK_SPRUCE_LEAVES ||
+	       b == BLOCK_TALL_GRASS_TOP || b == BLOCK_APPLE ||
+	       b == BLOCK_POPPY    || b == BLOCK_DAISY ||
+	       b == BLOCK_BLUEBELL || b == BLOCK_ORCHID;
+}
+
+// Is this block a TRUNK / a CANOPY, of any species?
+//
+// v1.8.8 split one wood and one leaf into three of each, and these two exist so the split has
+// exactly one place to be spelled out. Every test below that reads a BIOME-generated world and
+// asks "is there a tree here" must ask through these, because after this version `== BLOCK_WOOD`
+// is not that question — it is "is there an OAK here", which in a forest or a taiga is now
+// always false.
+//
+// **This was found by the suite going red, not by reading the diff, and the shape of the red
+// is the point.** Twelve checks failed at once and every one of them was a `> 0` or a rate
+// comparison: trunks[BIOME_TAIGA] > 0, trunks[BIOME_FOREST] > 0, usable_by_biome[FOREST] > 0,
+// conifer_seen > 0, round_seen > 0, trunk_bases > 0, s_tv_n > 40. They were not asserting
+// anything false about the world — forests and taigas are full of trees. They were counting
+// oaks in the two biomes that no longer have any, and reporting the count as the tree count.
+// A change that had quietly stopped generating trees in half the world would have produced the
+// identical twelve failures, which is why the fix had to be paired with the three conservation
+// identities recorded above testWorldgenPhase188Flora: those say the tree COUNT did not move.
+//
+// LEGACY tests deliberately do NOT use these. testWorldgenTrees and testWorldgenTerrain run on
+// GEN_VERSION_LEGACY and their `== BLOCK_WOOD` comparisons are load-bearing exactly as written:
+// a legacy world must contain oak and nothing else, and widening them to accept birch would
+// delete that guarantee rather than maintain it. Both stayed green through this change.
+static bool genTestIsLog(BlockId b)
+{
+	return b == BLOCK_WOOD || b == BLOCK_BIRCH_LOG || b == BLOCK_SPRUCE_LOG;
+}
+
+static bool genTestIsLeaf(BlockId b)
+{
+	return b == BLOCK_LEAVES || b == BLOCK_BIRCH_LEAVES || b == BLOCK_SPRUCE_LEAVES;
 }
 
 // **The single most important check in the v1.7.0 terrain rework.**
@@ -8089,6 +8141,55 @@ static void testWorldgenBiomes(void)
 		CHECK(worldgenBiomeParams(BIOME_PLAINS)->trunk_min == GEN_TREE_MIN_H);
 		CHECK(worldgenBiomeParams(BIOME_PLAINS)->canopy_min == GEN_TREE_RADIUS);
 		CHECK(worldgenBiomeParams(BIOME_PLAINS)->canopy_max == GEN_TREE_RADIUS);
+
+		// ── v1.8.8: the species each row grows ────────────────────────────────────────
+		//
+		// Three new fields, named per row for the reason the block above already gives: a
+		// check written as `p->log == p->log` or as a loop over the table would agree with
+		// whatever the table says and could never report the table itself being wrong.
+		//
+		// **TUNDRA and DESERT carry oak and an apple they will never grow**, and that is
+		// deliberate rather than an oversight to be tidied. Both have tree_chance 0 (asserted
+		// twelve lines up), so treeInCell never reaches them. Leaving the fields at the
+		// baseline species means the rows say "no opinion" instead of encoding a second,
+		// unreachable design that nobody would ever see be wrong. If either row's tree_chance
+		// is ever raised, it grows an ordinary oak — the safe answer — rather than reading
+		// whatever a zeroed field happened to alias.
+		//
+		// **TAIGA is the one row with no fruit, and it is the only asymmetry here.** A
+		// conifer bearing apples is the specific thing the fruit pass must not do, and
+		// BLOCK_AIR in this field is how it is switched off — not a special case inside the
+		// pass. testWorldgenPhase188Flora's `apple_on_conifer` counter is the measurement of
+		// the same claim on generated ground; this is the claim about the data.
+		CHECK(worldgenBiomeParams(BIOME_TUNDRA)->log   == BLOCK_WOOD);
+		CHECK(worldgenBiomeParams(BIOME_TUNDRA)->leaf  == BLOCK_LEAVES);
+		CHECK(worldgenBiomeParams(BIOME_TUNDRA)->fruit == BLOCK_APPLE);
+		CHECK(worldgenBiomeParams(BIOME_TAIGA)->log    == BLOCK_SPRUCE_LOG);
+		CHECK(worldgenBiomeParams(BIOME_TAIGA)->leaf   == BLOCK_SPRUCE_LEAVES);
+		CHECK(worldgenBiomeParams(BIOME_TAIGA)->fruit  == BLOCK_AIR);
+		CHECK(worldgenBiomeParams(BIOME_PLAINS)->log   == BLOCK_WOOD);
+		CHECK(worldgenBiomeParams(BIOME_PLAINS)->leaf  == BLOCK_LEAVES);
+		CHECK(worldgenBiomeParams(BIOME_PLAINS)->fruit == BLOCK_APPLE);
+		CHECK(worldgenBiomeParams(BIOME_FOREST)->log   == BLOCK_BIRCH_LOG);
+		CHECK(worldgenBiomeParams(BIOME_FOREST)->leaf  == BLOCK_BIRCH_LEAVES);
+		CHECK(worldgenBiomeParams(BIOME_FOREST)->fruit == BLOCK_APPLE);
+		CHECK(worldgenBiomeParams(BIOME_DESERT)->log   == BLOCK_WOOD);
+		CHECK(worldgenBiomeParams(BIOME_DESERT)->leaf  == BLOCK_LEAVES);
+		CHECK(worldgenBiomeParams(BIOME_DESERT)->fruit == BLOCK_APPLE);
+		CHECK(worldgenBiomeParams(BIOME_JUNGLE)->log   == BLOCK_WOOD);
+		CHECK(worldgenBiomeParams(BIOME_JUNGLE)->leaf  == BLOCK_LEAVES);
+		CHECK(worldgenBiomeParams(BIOME_JUNGLE)->fruit == BLOCK_APPLE);
+
+		// A log is never a leaf and a leaf is never a log, over the whole table. This is the
+		// check that catches the two fields being swapped in a row — which the eighteen
+		// literals above would also catch, but only for as long as someone keeps them in step
+		// with the table. This one keeps working when a seventh biome is added.
+		for (int b = 0; b < BIOME_COUNT; b++) {
+			const BiomeParams* p = worldgenBiomeParams((BiomeId)b);
+			CHECK_QUIET(p->log != p->leaf);
+			CHECK_QUIET(p->log != BLOCK_AIR && p->leaf != BLOCK_AIR);
+			CHECK_QUIET(p->fruit == BLOCK_AIR || p->fruit == BLOCK_APPLE);
+		}
 
 		// Two biomes draw a width per tree rather than one fixed width, and this is the
 		// check that the RANGE exists at all. Without it every canopy_min == canopy_max row
@@ -8752,7 +8853,28 @@ static uint32_t genTestHashColumnTerrain(const World* w, int32_t cx, int32_t cz)
 			for (int lx = 0; lx < CHUNK_DIM; lx++) {
 				uint8_t b = (uint8_t)worldGet(w, cx * CHUNK_DIM + lx, y,
 				                             cz * CHUNK_DIM + lz);
-				if (b == BLOCK_WATER || b == BLOCK_TALL_GRASS) b = BLOCK_AIR;
+				// v1.8.8 extends the strip list, and the six additions are chosen by the
+				// rule the paragraph above states rather than by which ones are new: strip
+				// what a later pass writes INTO AN AIR CELL, keep what terrain is made of.
+				//
+				// The tall-grass top, the four flowers and the apple are all placed by
+				// worldgenScatter/worldgenFlora and by the tree's fruit pass into cells that
+				// were air. Stripping them is what preserves this fingerprint's actual job:
+				// if one of them ever ate a leaf or a stone block, the stripped column has
+				// an AIR where that block was and the hash MOVES. Leaving them visible would
+				// have destroyed exactly that — a flower that overwrote a leaf and a flower
+				// that was placed correctly would both simply be "a different hash", and
+				// this check would have stopped being able to tell them apart.
+				//
+				// The four species ids (birch/spruce log and leaves) are deliberately NOT
+				// stripped. They are not decoration written into air; they are the tree
+				// itself, and per-biome species selection genuinely moves the terrain. That
+				// movement is what the re-pinned literals below record.
+				if (b == BLOCK_WATER || b == BLOCK_TALL_GRASS ||
+				    b == BLOCK_TALL_GRASS_TOP || b == BLOCK_APPLE ||
+				    b == BLOCK_POPPY || b == BLOCK_DAISY ||
+				    b == BLOCK_BLUEBELL || b == BLOCK_ORCHID)
+					b = BLOCK_AIR;
 				h ^= b;
 				h *= 16777619u;
 			}
@@ -8814,7 +8936,7 @@ static void testWorldgenBiomeSurface(void)
 		for (int32_t x = (ox - r) * CHUNK_DIM; x < (ox + r + 1) * CHUNK_DIM; x++) {
 			const BiomeId b = worldgenBiomeAt(&g, x, z);
 			for (int y = 0; y < WORLD_HEIGHT; y++)
-				if (worldGet(&s_world, x, y, z) == BLOCK_LEAVES) leaves[b]++;
+				if (genTestIsLeaf(worldGet(&s_world, x, y, z))) leaves[b]++;
 
 			const int top = genTestTerrainTop(&s_world, x, z);
 			if (top < 0 || top + 1 >= WORLD_HEIGHT)
@@ -8848,11 +8970,11 @@ static void testWorldgenBiomeSurface(void)
 				if (over == BLOCK_TALL_GRASS)
 					plants[b]++;
 			}
-			if (over == BLOCK_WOOD) {
+			if (genTestIsLog(over)) {
 				trunks[b]++;
 				int n = 0;
 				for (int y = top + 1;
-				     y < WORLD_HEIGHT && worldGet(&s_world, x, y, z) == BLOCK_WOOD; y++)
+				     y < WORLD_HEIGHT && genTestIsLog(worldGet(&s_world, x, y, z)); y++)
 					n++;
 				if (n < tmin[b]) tmin[b] = n;
 				if (n > tmax[b]) tmax[b] = n;
@@ -9004,7 +9126,7 @@ static int tvLayerReach(int self, int y)
 	for (int dz = -TV_REACH; dz <= TV_REACH + ext; dz++) {
 		for (int dx = -TV_REACH; dx <= TV_REACH + ext; dx++) {
 			const int32_t bx = t->x + dx, bz = t->z + dz;
-			if (worldGet(&s_world, bx, y, bz) != BLOCK_LEAVES)
+			if (!genTestIsLeaf(worldGet(&s_world, bx, y, bz)))
 				continue;
 			const int f = tvFootprintDist(t, bx, bz);
 			bool mine = true;
@@ -9054,22 +9176,22 @@ static void testWorldgenTreeVariants(void)
 	for (int32_t z = bz0; z < bz1; z++) {
 		for (int32_t x = bx0; x < bx1; x++) {
 			for (int y = 1; y < WORLD_HEIGHT - 1; y++) {
-				if (worldGet(&s_world, x, y, z) != BLOCK_WOOD)
+				if (!genTestIsLog(worldGet(&s_world, x, y, z)))
 					continue;
-				if (worldGet(&s_world, x, y - 1, z) == BLOCK_WOOD)
+				if (genTestIsLog(worldGet(&s_world, x, y - 1, z)))
 					break;                       // not the base of this column
-				if (worldGet(&s_world, x - 1, y, z) == BLOCK_WOOD
-				    || worldGet(&s_world, x, y, z - 1) == BLOCK_WOOD)
+				if (genTestIsLog(worldGet(&s_world, x - 1, y, z))
+				    || genTestIsLog(worldGet(&s_world, x, y, z - 1)))
 					break;                       // not the anchor of a wide trunk
 				if (s_tv_n >= TV_TREES_MAX)
 					break;
 				TvTree* t = &s_tv[s_tv_n++];
 				t->x = x; t->z = z; t->base = y;
-				t->wide = worldGet(&s_world, x + 1, y, z)     == BLOCK_WOOD
-				       && worldGet(&s_world, x,     y, z + 1) == BLOCK_WOOD
-				       && worldGet(&s_world, x + 1, y, z + 1) == BLOCK_WOOD;
+				t->wide = genTestIsLog(worldGet(&s_world, x + 1, y, z))
+				       && genTestIsLog(worldGet(&s_world, x,     y, z + 1))
+				       && genTestIsLog(worldGet(&s_world, x + 1, y, z + 1));
 				t->ht = 0;
-				while (worldGet(&s_world, x, y + t->ht, z) == BLOCK_WOOD)
+				while (genTestIsLog(worldGet(&s_world, x, y + t->ht, z)))
 					t->ht++;
 				t->biome  = (int)worldgenBiomeAt(&g, x, z);
 				t->usable = true;
@@ -9396,8 +9518,20 @@ static void testWorldgenPhase3Flora(void)
 					for (int y = 0; y < WORLD_HEIGHT; y++) {
 						const BlockId lb = worldGet(&s_world, x, y, z);
 						cells++;
+						// v1.8.8 adds ten more ids to the same list and for the same reason
+						// the paragraph above gives. The species pair matters most here:
+						// every new behaviour this version adds is gated either on
+						// `version >= GEN_VERSION_BIOME` or on the `bp != NULL` arm, so a
+						// legacy world must still grow OAK and only oak. A birch trunk in a
+						// pre-v1.8.8 save would be that gate having been dropped, and it
+						// would change every world on every SD card.
 						if (lb == BLOCK_SNOW || lb == BLOCK_ICE || lb == BLOCK_CACTUS ||
-						    lb == BLOCK_DEAD_BUSH || lb == BLOCK_FERN)
+						    lb == BLOCK_DEAD_BUSH || lb == BLOCK_FERN ||
+						    lb == BLOCK_BIRCH_LOG  || lb == BLOCK_BIRCH_LEAVES ||
+						    lb == BLOCK_SPRUCE_LOG || lb == BLOCK_SPRUCE_LEAVES ||
+						    lb == BLOCK_TALL_GRASS_TOP || lb == BLOCK_APPLE ||
+						    lb == BLOCK_POPPY    || lb == BLOCK_DAISY ||
+						    lb == BLOCK_BLUEBELL || lb == BLOCK_ORCHID)
 							intruders++;
 					}
 			CHECK(intruders == 0);
@@ -9406,6 +9540,228 @@ static void testWorldgenPhase3Flora(void)
 			worldExit(&s_world);
 		}
 	}
+}
+
+// ── v1.8.8: where the ten new generated ids land ──────────────────────────────────────
+//
+// Same shape and same area as testWorldgenPhase3Flora above — seed 90210 around (10, -20) at
+// r5 — and deliberately so. That area was chosen by measurement to contain all six biomes,
+// and every claim this version makes is a per-biome claim, so it needs exactly the ground
+// that test already established. The biome census recorded there still holds: TUNDRA 4596,
+// TAIGA 2297, PLAINS 1458, FOREST 6546, DESERT 6989, JUNGLE 9090.
+//
+// Surveyed on this tree by a probe linking the real worldgen.c, over that area:
+//
+//     birch_log 300  birch_leaves 2778   spruce_log 55  spruce_leaves 356
+//     oak_log   753  oak_leaves   3851
+//     tall_grass 1628, of which 611 carry a top and 1017 do not
+//     poppy 225  daisy 66  bluebell 310  orchid 123  apple 129
+//
+// **The thinnest is spruce_log at 55 and daisy at 66.** Both are an order of magnitude clear
+// of zero, unlike the cactus count that forced Phase 3's area from r3 to r5, so no "> 0"
+// below is a claim about luck.
+//
+// ── Three conservation identities, measured against the pre-change generator ──────────
+//
+// The same probe was built twice — once with world/worldgen.c and world/worldgen.h from HEAD
+// and everything else from this tree — and run over this identical area:
+//
+//     logs        base oak 1108  ->  oak 753 + birch 300 + spruce  55  = 1108   EXACT
+//     leaves      base oak 6985  ->  oak 3851 + birch 2778 + spruce 356 = 6985  EXACT
+//     tall grass  base 1628, 0 tops -> 1628, of which 611 + 1017        = 1628  EXACT
+//
+// These are the two strongest facts about this change and neither is arguable:
+//
+//   * Per-biome species is a pure RELABEL. Not one tree was gained, lost, moved or resized.
+//     Had the species branch also perturbed the tree draw — the obvious way to get this
+//     wrong, since it reads the same BiomeParams the trunk and canopy come from — the two
+//     sums would not have balanced, and no "> 0" or "== 0" check in this file would have
+//     noticed.
+//   * The two-block grass is purely ADDITIVE. The same 1628 base cells exist in both arms;
+//     611 of them gained a second block above. worldgenScatter takes the two-tall decision
+//     from bits 8..15 of a hash whose low byte it was already drawing on, so the existing
+//     `draw = gh & 0xFF` comparison is untouched — and this is the measurement of that,
+//     rather than the argument for it.
+//
+// Neither identity is checkable from inside this suite, which has only the one arm. They are
+// recorded here because they are the reason the checks below are allowed to be as loose as
+// "> 0": what the numbers cannot move is already established.
+static void testWorldgenPhase188Flora(void)
+{
+	const uint32_t seed = 90210u;
+	const int32_t  ox = 10, oz = -20;
+	const int      r  = 5;
+
+	WorldGen g;
+	CHECK(worldgenInit(&g, seed, GEN_VERSION_BIOME));
+	worldInit(&s_world);
+	for (int32_t cz = oz - r; cz <= oz + r; cz++)
+		for (int32_t cx = ox - r; cx <= ox + r; cx++)
+			CHECK_QUIET(worldgenColumn(&g, &s_wgs, &s_world, cx, cz));
+
+	long birch_log = 0, birch_leaf = 0, spruce_log = 0, spruce_leaf = 0, oak_log = 0;
+	long tall_grass = 0, tops = 0, two_tall = 0, one_tall = 0, orphan_top = 0;
+	long poppy = 0, daisy = 0, bluebell = 0, orchid = 0, apple = 0;
+	long spruce_not_taiga = 0, birch_not_forest = 0, oak_in_taiga_forest = 0;
+	long flower_wrong_biome = 0, flower_not_on_grass = 0, flower_at_or_below_sea = 0;
+	long apple_no_leaf = 0, apple_on_conifer = 0, apple_grounded = 0;
+	long poppy_plains = 0, poppy_forest = 0, bluebell_forest = 0, bluebell_taiga = 0;
+	long apple_oak = 0, apple_birch = 0;
+
+	for (int32_t z = (oz - r) * CHUNK_DIM; z < (oz + r + 1) * CHUNK_DIM; z++) {
+		for (int32_t x = (ox - r) * CHUNK_DIM; x < (ox + r + 1) * CHUNK_DIM; x++) {
+			const BiomeId b = worldgenBiomeAt(&g, x, z);
+			for (int y = 0; y < WORLD_HEIGHT; y++) {
+				const BlockId here  = worldGet(&s_world, x, y, z);
+				const BlockId under = (y > 0) ? worldGet(&s_world, x, y - 1, z) : BLOCK_AIR;
+
+				switch (here) {
+					// ── The two species. ──────────────────────────────────────────
+					// Only the TRUNK's biome is checked. A canopy may legitimately
+					// overhang into a neighbouring biome — species is resolved once,
+					// at the tree's cell, exactly as trunk height and canopy radius
+					// already are — so asserting on a leaf's own cell would be
+					// asserting that no tree ever grows near a border.
+					case BLOCK_SPRUCE_LOG:
+						spruce_log++;
+						if (b != BIOME_TAIGA) spruce_not_taiga++;
+						break;
+					case BLOCK_SPRUCE_LEAVES: spruce_leaf++; break;
+					case BLOCK_BIRCH_LOG:
+						birch_log++;
+						if (b != BIOME_FOREST) birch_not_forest++;
+						break;
+					case BLOCK_BIRCH_LEAVES: birch_leaf++; break;
+
+					// The other half of "per-biome species", and the half a set of
+					// "> 0" checks alone would miss entirely: the new species must
+					// REPLACE the oak, not stand beside it. A branch that added birch
+					// without removing oak passes every other check in this function.
+					case BLOCK_WOOD:
+						oak_log++;
+						if (b == BIOME_TAIGA || b == BIOME_FOREST) oak_in_taiga_forest++;
+						break;
+
+					// ── Two-block grass. ──────────────────────────────────────────
+					case BLOCK_TALL_GRASS:
+						tall_grass++;
+						if (y + 1 >= WORLD_HEIGHT ||
+						    worldGet(&s_world, x, y + 1, z) != BLOCK_TALL_GRASS_TOP)
+							one_tall++;
+						break;
+					case BLOCK_TALL_GRASS_TOP:
+						tops++;
+						// A top with nothing under it is a floating half-plant, and it
+						// is what a cellsClear() check that stopped working looks like.
+						if (under == BLOCK_TALL_GRASS) two_tall++; else orphan_top++;
+						break;
+
+					// ── The four flowers. ─────────────────────────────────────────
+					case BLOCK_POPPY: case BLOCK_DAISY:
+					case BLOCK_BLUEBELL: case BLOCK_ORCHID: {
+						const bool right_biome =
+						    (here == BLOCK_POPPY    && (b == BIOME_PLAINS || b == BIOME_FOREST)) ||
+						    (here == BLOCK_DAISY    &&  b == BIOME_PLAINS) ||
+						    (here == BLOCK_BLUEBELL && (b == BIOME_FOREST || b == BIOME_TAIGA)) ||
+						    (here == BLOCK_ORCHID   &&  b == BIOME_JUNGLE);
+						if (!right_biome)         flower_wrong_biome++;
+						if (under != BLOCK_GRASS) flower_not_on_grass++;
+						if (y <= GEN_SEA_LEVEL)   flower_at_or_below_sea++;
+						if (here == BLOCK_POPPY)    poppy++;
+						if (here == BLOCK_DAISY)    daisy++;
+						if (here == BLOCK_BLUEBELL) bluebell++;
+						if (here == BLOCK_ORCHID)   orchid++;
+						if (here == BLOCK_POPPY    && b == BIOME_PLAINS) poppy_plains++;
+						if (here == BLOCK_POPPY    && b == BIOME_FOREST) poppy_forest++;
+						if (here == BLOCK_BLUEBELL && b == BIOME_FOREST) bluebell_forest++;
+						if (here == BLOCK_BLUEBELL && b == BIOME_TAIGA)  bluebell_taiga++;
+						break;
+					}
+
+					// ── Apples. ───────────────────────────────────────────────────
+					case BLOCK_APPLE: {
+						apple++;
+						// An apple hangs. Anything directly under it means the fruit
+						// pass wrote at the wrong height and it is sitting on the
+						// ground or buried in the trunk.
+						if (under != BLOCK_AIR) apple_grounded++;
+						// Leaves within three cells above, and NOT directly above:
+						// the lowest canopy layer has clipped corners, so an apple on
+						// the ring's edge legitimately has air over it and leaves one
+						// cell in.
+						bool oak_above = false, birch_above = false, conifer_above = false;
+						for (int dy = 1; dy <= 3; dy++)
+							for (int dz = -1; dz <= 1; dz++)
+								for (int dx = -1; dx <= 1; dx++) {
+									const BlockId o =
+									    worldGet(&s_world, x + dx, y + dy, z + dz);
+									if (o == BLOCK_LEAVES)        oak_above     = true;
+									if (o == BLOCK_BIRCH_LEAVES)  birch_above   = true;
+									if (o == BLOCK_SPRUCE_LEAVES) conifer_above = true;
+								}
+						if (!oak_above && !birch_above) apple_no_leaf++;
+						if (oak_above)     apple_oak++;
+						if (birch_above)   apple_birch++;
+						if (conifer_above) apple_on_conifer++;
+						break;
+					}
+
+					default: break;
+				}
+			}
+		}
+	}
+	worldExit(&s_world);
+
+	// ── Each of the ten is where it belongs, and nowhere else. ────────────────────────
+	CHECK(spruce_not_taiga    == 0);
+	CHECK(birch_not_forest    == 0);
+	CHECK(oak_in_taiga_forest == 0);
+	CHECK(flower_wrong_biome  == 0);
+	CHECK(flower_not_on_grass == 0);
+	CHECK(flower_at_or_below_sea == 0);
+	CHECK(orphan_top       == 0);
+	CHECK(apple_no_leaf    == 0);
+	CHECK(apple_on_conifer == 0);
+	CHECK(apple_grounded   == 0);
+
+	// ── And every one of them exists, so none of the above is vacuous. ────────────────
+	CHECK(birch_log   > 0);
+	CHECK(birch_leaf  > 0);
+	CHECK(spruce_log  > 0);
+	CHECK(spruce_leaf > 0);
+	CHECK(oak_log     > 0);   // the relabel did not delete the baseline species
+	CHECK(poppy    > 0);
+	CHECK(daisy    > 0);
+	CHECK(bluebell > 0);
+	CHECK(orchid   > 0);
+	CHECK(apple    > 0);
+	CHECK(two_tall > 0);
+	CHECK(one_tall > 0);      // the meadow is MIXED, not uniformly two blocks tall
+
+	// Every top is accounted for, and every base is either topped or bare. Stronger than
+	// `orphan_top == 0` on its own: that one says no top lacks a base, this says the two
+	// counts close, so a top the sweep never visited cannot hide in the difference.
+	CHECK(tops == two_tall);
+	CHECK(two_tall + one_tall == tall_grass);
+
+	// ── The multi-biome bands actually fire in every biome they name. ─────────────────
+	//
+	// This is the check the six-way-rule trap demands, and it is not covered by anything
+	// above: poppy is drawn from a band shared by PLAINS and FOREST, and bluebell from one
+	// shared by FOREST and TAIGA. A `poppy > 0` with the forest arm dead would pass, and so
+	// would `flower_wrong_biome == 0` — a flower that never generates is in no wrong biome.
+	// Measured here: poppy 61 plains / 164 forest, bluebell 243 forest / 67 taiga.
+	CHECK(poppy_plains    > 0);
+	CHECK(poppy_forest    > 0);
+	CHECK(bluebell_forest > 0);
+	CHECK(bluebell_taiga  > 0);
+
+	// Both fruiting species really bear fruit. `apple > 0` alone would pass with the birch
+	// arm dead, since oak covers plains, desert, tundra and jungle between them.
+	// Measured: 56 apples under oak, 73 under birch.
+	CHECK(apple_oak   > 0);
+	CHECK(apple_birch > 0);
 }
 
 static void testWorldgenWaterAndGrass(void)
@@ -9480,9 +9836,54 @@ static void testWorldgenWaterAndGrass(void)
 	// over ground that did not, which is what a change to canopy shape and trunk width is
 	// allowed to be. The eight columns of seeds 4242 and 90210 did not move at all, and their
 	// hashes below are the same literals they were before task 52.
+	// **Four of the twelve moved again on 2026-09-02, and only four: v1.8.8's per-biome
+	// species.** Measured the same way — one dump program built twice, once with
+	// world/worldgen.c and world/worldgen.h taken from HEAD and everything else from this
+	// tree, and diffed cell by cell — over 90 columns (the 81-column ring of seed 1337 plus
+	// all twelve pinned columns). 5,338 differing cells of 2,949,120 (0.1810 %), every one of
+	// them between y 67 and y 99, in exactly nine transitions:
+	//
+	//     leaves -> spruce_leaves 2905     air -> bluebell        522
+	//     leaves -> birch_leaves   688     air -> tall_grass_top  461
+	//     wood   -> spruce_log     448     air -> poppy           128
+	//     wood   -> birch_log       63     air -> daisy           102
+	//                                      air -> apple            21
+	//
+	// **GROUND_TO_GROUND is 0 in every one of the 90 columns.** Same probe and same definition
+	// as task 52's entry above: stone/dirt/grass/sand/water, any pair of them. No height, no
+	// density, no cave, no surface cap moved. Nothing a player has built on can be left
+	// floating or buried by this.
+	//
+	// The nine transitions divide cleanly in two, and the division is the reason only four
+	// hashes below move. The four `air -> plant` rows are decoration written into empty space,
+	// and genTestHashColumnTerrain() now strips all of them (see the note there) — so they
+	// cannot move a fingerprint, by construction. The four species rows are the tree itself
+	// and are NOT stripped, so they do and must.
+	//
+	// That split was CHECKED rather than asserted, on the columns themselves:
+	//
+	//     seed 4242  ( 1,  0)  40 cells differ  daisy 18, tall_grass_top 12, poppy 8, apple 2
+	//                          hash 0xa038a451 -> 0xa038a451   UNCHANGED
+	//     seed 90210 ( 7, -3)  22 cells differ  tall_grass_top 8, daisy 7, ...
+	//                          hash 0x30e49729 -> 0x30e49729   UNCHANGED
+	//     seed 1337  ( 0,  0)  79 cells differ  spruce_leaves 59, spruce_log 6, + decoration
+	//                          hash 0x84080715 -> 0x13a7520f   MOVED
+	//
+	// So this fingerprint is demonstrably blind to the new decoration and demonstrably
+	// sensitive to the new species, which is exactly the pair of properties its comment
+	// claims. Eight of twelve unchanged is again not luck: seeds 4242 and 90210 have no taiga
+	// and no forest tree in any of their eight sampled columns, only meadow.
+	//
+	// **The four new numbers were taken from a probe whose hash was first proved equal to this
+	// function's on the OLD tree.** That control is not a formality — the first version of the
+	// probe omitted the water/tall-grass strip and printed 0x1796e884 for {1337, 0, 0} where
+	// this table pins 0x84080715. Pasting that run's twelve numbers in would have produced a
+	// green suite pinned to twelve values no build had ever computed. Run against the baseline
+	// with the strip corrected, the probe reproduced all twelve literals below exactly, and
+	// only then was the new arm read.
 	static const struct { uint32_t seed; int32_t cx, cz; uint32_t hash; } pinned[] = {
-		{1337u,   0,  0, 0x84080715u}, {1337u,   1,  0, 0xc3709efbu},
-		{1337u,  -1, -1, 0xfe5fc66eu}, {1337u,   7, -3, 0x34522ed6u},
+		{1337u,   0,  0, 0x13a7520fu}, {1337u,   1,  0, 0x57b0f340u},
+		{1337u,  -1, -1, 0x0d0971d6u}, {1337u,   7, -3, 0x608e4cb2u},
 		{4242u,   0,  0, 0x40c702cbu}, {4242u,   1,  0, 0xa038a451u},
 		{4242u,  -1, -1, 0xe4b4d7c1u}, {4242u,   7, -3, 0x7fb8f23fu},
 		{90210u,  0,  0, 0x8bb38a6eu}, {90210u,  1,  0, 0xea29565au},
@@ -9668,7 +10069,7 @@ static void testWorldgenWaterAndGrass(void)
 				    worldGet(&s_world, x, top, z) == BLOCK_GRASS) {
 					const BlockId over = worldGet(&s_world, x, top + 1, z);
 					if (over == BLOCK_AIR || over == BLOCK_TALL_GRASS) eligible++;
-					if (over == BLOCK_WOOD) trunk_bases++;
+					if (genTestIsLog(over)) trunk_bases++;
 				}
 			}
 		}
@@ -11706,6 +12107,7 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testWorldgenBiomeSurface();
 	testWorldgenTreeVariants();
 	testWorldgenPhase3Flora();
+	testWorldgenPhase188Flora();
 	testRaycast();
 	testBodyBlocked();
 	testCeilingCollision();
@@ -11938,21 +12340,38 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 // old 10/18/34/58) the same tree printed "FAILED - 75 of 6135 checks", because a failing
 // CHECK_QUIET DOES count. A red arm's total is not a measurement of anything, which is why
 // only the green one is pinned. What went red there is recorded above testDensitySeedSweep.
+//
+// v1.8.8, per-biome blocks and plants: 6064 + 49 = 6113, counted off the source first in the
+// order this comment demands, and countable because all 49 are loud CHECKs with no loop
+// around any of them:
+//
+//   +18  the per-biome table block gains three fields (log, leaf, fruit) named as naked
+//        literals for all six rows. The three-assertion sweep added under them is CHECK_QUIET
+//        inside a loop over BIOME_COUNT and contributes nothing while it passes.
+//   +31  testWorldgenPhase188Flora, new: 1 worldgenInit + 10 "== 0" placement invariants
+//        + 12 non-vacuity counters + 2 tall-grass conservation + 4 for the two multi-biome
+//        flower bands firing in both their biomes + 2 for both fruiting species bearing.
+//        Its 121-column generation loop is CHECK_QUIET, so it costs nothing while green.
+//
+// **This change also moves worldgen output, so the warning three paragraphs up applies to it
+// directly: the count could have moved on its own.** It did not, and that was checked rather
+// than assumed — the whole delta is accounted for by the 49 above. If a future edit here lands
+// a number other than 6113, read WHICH checks went red before touching the pin.
 #ifndef __3DS__
 	{
 		const int ran = s_checks;
-		if (ran != 6064)
+		if (ran != 6113)
 			printf("\nCHECK-COUNT GUARD: %d checks ran, %d expected.\n"
 			       "  %s\n"
 			       "  This is NOT an ordinary assertion failure.\n"
 			       "  Read the comment above this guard in world/world_test.c before"
 			       " touching the pinned number.\n",
-			       ran, 6064,
-			       ran < 6064
+			       ran, 6113,
+			       ran < 6113
 			           ? "Checks went MISSING: checks that should have run never ran at all."
 			           : "Extra checks appeared: either you added checks and did not update"
 			             " the pin, or something is emitting checks it should not.");
-		CHECK(ran == 6064);
+		CHECK(ran == 6113);
 	}
 #endif
 

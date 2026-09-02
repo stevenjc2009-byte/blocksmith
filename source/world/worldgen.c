@@ -97,6 +97,17 @@ static inline fx caveCoordY(int32_t block)
 // the same canopy, and a forest would repeat on the cell lattice.
 #define SALT_TSHAPE 0x54534850U   // 'TSHP'
 
+// v1.8.8. The apple draw's salt. Same house convention, checked against all twelve existing
+// salts — BIOM TREE PLNT CAVE CAV2 HUMD FLOR TSHP DLOW DHIG DSEL and the BLKS seed mix — and
+// it collides with none.
+//
+// Its own salt rather than spare bits of SALT_TSHAPE, and for a reason of GRANULARITY rather
+// than of bit budget: SALT_TSHAPE is hashed over the tree's CELL, so every cell of one tree's
+// canopy reads the same value from it. An apple has to be decided per (x, z) or a tree wears
+// either a full skirt of fruit or none at all. This salt is hashed over the apple's own block
+// coordinate, which is the granularity SALT_GRASS and SALT_FLORA already use.
+#define SALT_APPLE  0x4150504CU   // 'APPL'
+
 bool worldgenInit(WorldGen* g, uint32_t seed, uint32_t version)
 {
 	// Refused rather than coerced. A WorldGen carrying a version this build cannot generate
@@ -164,20 +175,51 @@ fx worldgenHumidity(const WorldGen* g, int32_t x, int32_t z)
 // leaving it at the baseline shape is what makes "trees were switched on for this biome" a
 // one-number change rather than a table edit that has to invent a silhouette under time
 // pressure.
+//
+// **v1.8.8 adds the SPECIES columns — log, leaf and fruit.** Until now the six rows named a
+// silhouette and nothing else, and the comment above says as much: task 52's whole design was
+// "no new block ids, no new tiles". steve asked for the other axis ("per-biome wood colours,
+// blocks, textures, types, leaves, logs"), so each row now also names what its trees are MADE
+// of. Three species over six biomes rather than six species:
+//
+//   taiga    SPRUCE   the conifer. Its shape column already said conifer and its trunk was
+//                     already the tallest-and-narrowest in the table; it was an oak wearing a
+//                     spruce's outline. Bare — a conifer bears no apples.
+//   forest   BIRCH    the dense broadleaf biome, and the one place a pale trunk reads at
+//                     400x240 against a dark forest floor. Bears apples.
+//   plains,
+//   jungle,
+//   tundra,
+//   desert   OAK      unchanged, byte for byte, from what they have always grown. Plains and
+//                     jungle keep the oak they were drawn with; tundra and desert have
+//                     tree_chance 0 and grow nothing at all, so their species column is
+//                     reachable only if somebody switches their trees on — and it is filled
+//                     in for the same reason their silhouette column is (see above).
+//
+// Only TWO rows change what they produce. That is deliberate: a change that re-textured every
+// tree in the world would move every one of world_test.c's biome fingerprints and make the
+// A/B cell diff impossible to read.
 static const BiomeParams s_biome_params[BIOME_COUNT] = {
-	// grass, tree, trunk_min, trunk_max, canopy_min, canopy_max, shape, big_chance
+	// grass, tree, trunk_min, trunk_max, canopy_min, canopy_max, shape, big_chance,
+	// log, leaf, fruit
 	{GEN_GRASS_TUNDRA, GEN_TREE_TUNDRA, GEN_TREE_MIN_H, GEN_TREE_MAX_H,
-	 GEN_TREE_RADIUS, GEN_TREE_RADIUS, TREE_SHAPE_ROUND, 0},
+	 GEN_TREE_RADIUS, GEN_TREE_RADIUS, TREE_SHAPE_ROUND, 0,
+	 BLOCK_WOOD, BLOCK_LEAVES, BLOCK_APPLE},
 	{GEN_GRASS_TAIGA,  GEN_TREE_TAIGA,  6,              9,
-	 1,               2,               TREE_SHAPE_CONIFER, 0},
+	 1,               2,               TREE_SHAPE_CONIFER, 0,
+	 BLOCK_SPRUCE_LOG, BLOCK_SPRUCE_LEAVES, BLOCK_AIR},
 	{GEN_GRASS_PLAINS, GEN_TREE_PLAINS, GEN_TREE_MIN_H, GEN_TREE_MAX_H,
-	 GEN_TREE_RADIUS, GEN_TREE_RADIUS, TREE_SHAPE_ROUND, 0},
+	 GEN_TREE_RADIUS, GEN_TREE_RADIUS, TREE_SHAPE_ROUND, 0,
+	 BLOCK_WOOD, BLOCK_LEAVES, BLOCK_APPLE},
 	{GEN_GRASS_FOREST, GEN_TREE_FOREST, GEN_TREE_MIN_H, 8,
-	 GEN_TREE_RADIUS, GEN_TREE_RADIUS_MAX, TREE_SHAPE_ROUND, 0},
+	 GEN_TREE_RADIUS, GEN_TREE_RADIUS_MAX, TREE_SHAPE_ROUND, 0,
+	 BLOCK_BIRCH_LOG, BLOCK_BIRCH_LEAVES, BLOCK_APPLE},
 	{GEN_GRASS_DESERT, GEN_TREE_DESERT, GEN_TREE_MIN_H, GEN_TREE_MAX_H,
-	 GEN_TREE_RADIUS, GEN_TREE_RADIUS, TREE_SHAPE_ROUND, 0},
+	 GEN_TREE_RADIUS, GEN_TREE_RADIUS, TREE_SHAPE_ROUND, 0,
+	 BLOCK_WOOD, BLOCK_LEAVES, BLOCK_APPLE},
 	{GEN_GRASS_JUNGLE, GEN_TREE_JUNGLE, 8,              GEN_TREE_TRUNK_MAX,
-	 GEN_TREE_RADIUS, GEN_TREE_RADIUS_MAX, TREE_SHAPE_BROAD, 64},
+	 GEN_TREE_RADIUS, GEN_TREE_RADIUS_MAX, TREE_SHAPE_BROAD, 64,
+	 BLOCK_WOOD, BLOCK_LEAVES, BLOCK_APPLE},
 };
 
 const BiomeParams* worldgenBiomeParams(BiomeId b)
@@ -509,6 +551,14 @@ typedef struct {
 	int     shape;   // a TreeShape
 	int     tiers;   // TREE_SHAPE_CONIFER only: how many narrow/wide tier pairs
 	bool    wide;    // 2 x 2 trunk rather than one column
+
+	// v1.8.8. What this tree is MADE of, resolved once here so that neither the trunk loop
+	// nor the canopy loop nor the fruit pass has to ask the biome again. Defaulted to oak by
+	// the initialiser below, which is what a legacy or density world keeps: those worlds never
+	// reach the `bp != NULL` branch that overwrites them.
+	BlockId log;
+	BlockId leaf;
+	BlockId fruit;   // BLOCK_AIR for a species that bears nothing
 } Tree;
 
 static Tree treeInCell(const WorldGen* g, int32_t tcx, int32_t tcz,
@@ -518,6 +568,14 @@ static Tree treeInCell(const WorldGen* g, int32_t tcx, int32_t tcz,
 	t.radius = GEN_TREE_RADIUS;
 	t.shape  = TREE_SHAPE_ROUND;
 	t.tiers  = 2;
+	// v1.8.8. Oak, and no fruit, unless the biome branch below says otherwise. These are the
+	// defaults a LEGACY or DENSITY world keeps — it never reaches that branch — so every world
+	// made before v1.8.8 still grows exactly the trees it grew, out of exactly the two block
+	// ids it grew them from. t.fruit stays BLOCK_AIR here rather than BLOCK_APPLE for the same
+	// reason: an apple in an old world is a new block in a world that has never had one.
+	t.log   = BLOCK_WOOD;
+	t.leaf  = BLOCK_LEAVES;
+	t.fruit = BLOCK_AIR;
 
 	const uint32_t h = rngHash2(rngMix(g->seed ^ SALT_TREE), tcx, tcz);
 
@@ -579,6 +637,13 @@ static Tree treeInCell(const WorldGen* g, int32_t tcx, int32_t tcz,
 		trunk_max = bp->trunk_max;
 		t.shape   = bp->shape;
 		t.radius  = bp->canopy_min;
+		// v1.8.8. The species, resolved at the trunk's own coordinate — the same coordinate
+		// the density and the silhouette are resolved at, so a tree is one species all the way
+		// up even when its canopy overhangs a neighbouring biome. Anything else would give a
+		// spruce birch leaves at a taiga/forest border depending on where each leaf landed.
+		t.log   = bp->log;
+		t.leaf  = bp->leaf;
+		t.fruit = bp->fruit;
 	}
 
 	// The draw uses the same low 8 bits it always has, compared against the biome's chance
@@ -771,7 +836,7 @@ bool worldgenDecorate(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 				for (int dz = 0; dz < span; dz++)
 					for (int dx = 0; dx < span; dx++)
 						ok &= treePut(w, cx, cz, t.x + dx, t.ground + i, t.z + dz,
-						              BLOCK_WOOD, false);
+						              t.log, false);
 
 			// Canopy. v1.8.3 task 52 replaced one loop with three silhouettes, and the
 			// layer pattern is chosen per shape rather than shared:
@@ -805,7 +870,57 @@ bool worldgenDecorate(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 						if (r >= 2 && fx * fx + fz * fz > r * r)
 							continue;                        // clipped corners
 						ok &= treePut(w, cx, cz, t.x + dx, top + dy, t.z + dz,
-						              BLOCK_LEAVES, true);
+						              t.leaf, true);
+					}
+				}
+			}
+
+			// ── v1.8.8: the fruit ─────────────────────────────────────────────────────
+			//
+			// steve asked for "apples dropping from leaves, pickable and functional". An
+			// apple is a real block hanging one cell BELOW the lowest canopy layer, on the
+			// ring that layer covers.
+			//
+			// Below rather than inside, and that is the whole design decision: an apple woven
+			// into the canopy is surrounded by leaves on all six faces, so the mesher culls
+			// nothing but nobody can see it either. One cell down it hangs in open air under
+			// the crown, which is where fruit is looked at from — the ground.
+			//
+			// Its own salt, and a hash of the apple's OWN (x, z) rather than of the tree's
+			// cell. That is what makes the pattern per-apple instead of per-tree: a hash of
+			// the cell would give every cell of the ring the same answer and a tree would
+			// wear either a full skirt of apples or none.
+			//
+			// Order-independence is inherited unchanged. Every input is a hash of world
+			// coordinates plus this tree's own deterministic geometry, and treePut() clips to
+			// the column being generated, so a neighbouring column computes the identical
+			// answer for the identical cell no matter which of them runs first.
+			//
+			// `only_into_air` is true, so an apple is never written over a trunk, a leaf, a
+			// neighbouring tree or a block of water — it is silently not placed, the same
+			// direction every other loss in this file falls in.
+			if (t.fruit != BLOCK_AIR) {
+				const int low  = canopyLowest(&t);
+				const int r    = canopyRadiusAt(&t, low);
+				const int y    = top + low - 1;   // one below the lowest leaf layer
+				const uint32_t fsalt = rngMix(g->seed ^ SALT_APPLE);
+
+				// y can only be under the world if a tree stands on the floor with a very
+				// short trunk; checked rather than assumed, because trunk_min is a tuning
+				// constant and this loop writes without re-checking.
+				if (r >= 0 && y >= 0) {
+					for (int dz = -r; dz <= r + ext; dz++) {
+						for (int dx = -r; dx <= r + ext; dx++) {
+							const int fx = footprintDist(dx, ext);
+							const int fz = footprintDist(dz, ext);
+							if (r >= 2 && fx * fx + fz * fz > r * r)
+								continue;               // the same clipped corners
+							const int32_t ax = t.x + dx, az = t.z + dz;
+							if ((rngHash2(fsalt, ax, az) & 0xFFu) >=
+							    (uint32_t)GEN_APPLE_CHANCE)
+								continue;
+							ok &= treePut(w, cx, cz, ax, y, az, t.fruit, true);
+						}
 					}
 				}
 			}
@@ -822,6 +937,12 @@ bool worldgenDecorate(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 // than re-fetched: it is per-column state that the caller has already validated.
 static bool worldgenFlora(const WorldGen* g, World* w, int32_t cx, int32_t cz,
                           const int16_t* tops);
+
+// v1.8.3 Phase 3's "are these n cells free" helper, forward-declared for the same reason
+// worldgenFlora is: v1.8.8's two-block tall grass needs it and it is defined below, next to
+// the flora pass it was written for. Declared rather than moved so that the diff of this
+// change is the grass rule and not a block of code sliding up the file.
+static bool cellsClear(World* w, int32_t x, int y, int32_t z, int n);
 
 // v1.7.0 task 19. Tall grass on the exposed surface.
 //
@@ -881,7 +1002,12 @@ bool worldgenScatter(const WorldGen* g, WorldGenScratch* s, World* w, int32_t cx
 			// with — this pass is reachable from the density path, so leaving the per-biome
 			// table ungated changed the tall grass in every v1.7.0-v1.8.2 world. See
 			// genversion.h on GEN_VERSION_BIOME.
-			const uint32_t draw = rngHash2(salt, x, z) & 0xFFu;
+			// v1.8.8: the hash is KEPT rather than discarded after the draw, because the
+			// two-block decision below reads bits 8..15 of it. The draw itself is still the
+			// low byte and is bit-for-bit what it was, which is what guarantees this change
+			// cannot move a single clump — it can only make one taller.
+			const uint32_t gh   = rngHash2(salt, x, z);
+			const uint32_t draw = gh & 0xFFu;
 			if (g->version >= GEN_VERSION_BIOME) {
 				if (draw >= (uint32_t)GEN_GRASS_CHANCE_MAX)
 					continue;
@@ -902,6 +1028,34 @@ bool worldgenScatter(const WorldGen* g, WorldGenScratch* s, World* w, int32_t cx
 			// direction for the loss to fall in.
 			if (worldGet(w, x, y, z) != BLOCK_AIR)
 				continue;
+
+			// ── v1.8.8: the two-block clump ───────────────────────────────────────────
+			//
+			// steve asked for "2-block tall grass, normal grass". A clump that wins the
+			// second draw AND has a clear cell above it becomes two blocks: the ordinary
+			// tall grass at the bottom and BLOCK_TALL_GRASS_TOP above it, which is a
+			// separate row purely so the two halves can carry different art (blade bases
+			// below, tips above).
+			//
+			// Three things this is careful about, in the order they can bite:
+			//
+			//   * the DRAW is bits 8..15, not the low byte. The low byte still decides
+			//     whether a clump exists at all and is untouched, so no clump moves.
+			//   * BOTH cells are tested before EITHER is written — cellsClear(), the same
+			//     helper the cactus uses and for the same reason. A clump under a canopy
+			//     falls back to one block; it is never placed half-height and never
+			//     skipped, because the ground cell was already earned above.
+			//   * BIOME worlds only. A world stamped GEN_VERSION_DENSITY was made before
+			//     BLOCK_TALL_GRASS_TOP existed, and putting a new id into a world its
+			//     player has already walked through is exactly what genversion.h exists to
+			//     prevent.
+			if (g->version >= GEN_VERSION_BIOME &&
+			    ((gh >> 8) & 0xFFu) < (uint32_t)GEN_TALL_GRASS_TWO &&
+			    cellsClear(w, x, y, z, 2)) {
+				ok &= worldSet(w, x, y,     z, BLOCK_TALL_GRASS);
+				ok &= worldSet(w, x, y + 1, z, BLOCK_TALL_GRASS_TOP);
+				continue;
+			}
 
 			ok &= worldSet(w, x, y, z, BLOCK_TALL_GRASS);
 		}
@@ -934,6 +1088,12 @@ static bool cellsClear(World* w, int32_t x, int y, int32_t z, int n)
 
 // v1.8.3 Phase 3. The per-biome flora pass: cactus and dead bush on desert sand, fern on
 // taiga and jungle grass.
+//
+// **v1.8.8 adds the flowers** — poppy and daisy on plains, bluebell and poppy in forest,
+// bluebell in taiga, orchid in jungle — each as a BAND stacked above whatever that biome
+// already grew, off the same single hash. Nothing that was here before moves; see
+// GEN_FLORA_CHANCE_MAX in worldgen.h for why widening the bound is safe in this direction and
+// only in this direction.
 //
 // **Why it is a second loop and not a second draw inside worldgenScatter's.** That loop's
 // very first test is `draw >= GEN_GRASS_CHANCE_MAX`, and GEN_GRASS_TUNDRA and
@@ -1011,11 +1171,20 @@ static bool worldgenFlora(const WorldGen* g, World* w, int32_t cx, int32_t cz,
 				}
 				break;
 
+			// Taiga and jungle: the fern band, then v1.8.8's flower band stacked on top
+			// of it. The fern's own test is UNCHANGED — `draw < GEN_FERN_*` — so every fern
+			// in every existing biome world stands exactly where it stood; the flower takes
+			// only draws the cheap reject used to throw away entirely (it bounded at 32 and
+			// now bounds at 44). Same species in taiga as in the forest below, so the two
+			// shaded biomes share a palette.
 			case BIOME_TAIGA:
 			case BIOME_JUNGLE: {
-				const uint32_t chance = (b == BIOME_TAIGA) ? (uint32_t)GEN_FERN_TAIGA
+				const uint32_t fern   = (b == BIOME_TAIGA) ? (uint32_t)GEN_FERN_TAIGA
 				                                           : (uint32_t)GEN_FERN_JUNGLE;
-				if (draw >= chance)
+				const uint32_t total  = (b == BIOME_TAIGA) ? (uint32_t)GEN_FLORA_TAIGA_TOTAL
+				                                           : (uint32_t)GEN_FLORA_JUNGLE_TOTAL;
+				const BlockId  flower = (b == BIOME_TAIGA) ? BLOCK_BLUEBELL : BLOCK_ORCHID;
+				if (draw >= total)
 					continue;
 				// Grass only — not the bare stone of a cliff face, not a dirt scar, and
 				// not the snow or sand of a neighbouring cap that reached in.
@@ -1023,16 +1192,45 @@ static bool worldgenFlora(const WorldGen* g, World* w, int32_t cx, int32_t cz,
 					continue;
 				if (!cellsClear(w, x, y, z, 1))
 					continue;
-				ok &= worldSet(w, x, y, z, BLOCK_FERN);
+				ok &= worldSet(w, x, y, z, draw < fern ? BLOCK_FERN : flower);
 				break;
 			}
 
-			// Tundra, plains and forest grow none of these three. Written out rather than
-			// left to a default so that adding a biome is a compile warning here under
-			// -Wswitch rather than a silent nothing.
-			case BIOME_TUNDRA:
+			// ── v1.8.8: the two biomes that grew nothing at all ───────────────────────
+			//
+			// Plains and forest had no branch here before this change, which is why every
+			// draw they made fell straight through to the empty default below. Both grow
+			// flowers now and nothing else: a poppy/daisy band in the open meadow, a
+			// bluebell/poppy band on the shaded forest floor.
+			//
+			// Same three gates as every branch above, and in the same order — the band
+			// test first because it is free, then grass-only so a flower cannot stand on a
+			// cliff face or a dirt scar, then cellsClear so it cannot be written into a
+			// trunk, a leaf, water or a tall grass that the earlier pass already placed.
 			case BIOME_PLAINS:
-			case BIOME_FOREST:
+			case BIOME_FOREST: {
+				const uint32_t lead = (b == BIOME_PLAINS) ? (uint32_t)GEN_POPPY_PLAINS
+				                                          : (uint32_t)GEN_BLUEBELL_FOREST;
+				const uint32_t total = (b == BIOME_PLAINS)
+				                           ? (uint32_t)GEN_FLORA_PLAINS_TOTAL
+				                           : (uint32_t)GEN_FLORA_FOREST_TOTAL;
+				const BlockId a = (b == BIOME_PLAINS) ? BLOCK_POPPY : BLOCK_BLUEBELL;
+				const BlockId c = (b == BIOME_PLAINS) ? BLOCK_DAISY : BLOCK_POPPY;
+				if (draw >= total)
+					continue;
+				if (worldGet(w, x, y - 1, z) != BLOCK_GRASS)
+					continue;
+				if (!cellsClear(w, x, y, z, 1))
+					continue;
+				ok &= worldSet(w, x, y, z, draw < lead ? a : c);
+				break;
+			}
+
+			// Tundra grows none of them: it is a snow cap, and it grows no tall grass
+			// either (GEN_GRASS_TUNDRA is 0). Written out rather than left to a default so
+			// that adding a biome is a compile warning here under -Wswitch rather than a
+			// silent nothing.
+			case BIOME_TUNDRA:
 			case BIOME_COUNT:
 				break;
 			}

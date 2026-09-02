@@ -57,7 +57,21 @@
 	X(BTEX_ICE,        TILE_ICE)        \
 	X(BTEX_CACTUS,     TILE_CACTUS)     \
 	X(BTEX_DEAD_BUSH,  TILE_DEAD_BUSH)  \
-	X(BTEX_FERN,       TILE_FERN)
+	X(BTEX_FERN,       TILE_FERN)       \
+	X(BTEX_BIRCH_LOG_SIDE,  TILE_BIRCH_LOG_SIDE)  \
+	X(BTEX_BIRCH_LOG_TOP,   TILE_BIRCH_LOG_TOP)   \
+	X(BTEX_BIRCH_PLANKS,    TILE_BIRCH_PLANKS)    \
+	X(BTEX_BIRCH_LEAVES,    TILE_BIRCH_LEAVES)    \
+	X(BTEX_SPRUCE_LOG_SIDE, TILE_SPRUCE_LOG_SIDE) \
+	X(BTEX_SPRUCE_LOG_TOP,  TILE_SPRUCE_LOG_TOP)  \
+	X(BTEX_SPRUCE_PLANKS,   TILE_SPRUCE_PLANKS)   \
+	X(BTEX_SPRUCE_LEAVES,   TILE_SPRUCE_LEAVES)   \
+	X(BTEX_TALL_GRASS_TOP,  TILE_TALL_GRASS_TOP)  \
+	X(BTEX_POPPY,           TILE_POPPY)           \
+	X(BTEX_DAISY,           TILE_DAISY)           \
+	X(BTEX_BLUEBELL,        TILE_BLUEBELL)        \
+	X(BTEX_ORCHID,          TILE_ORCHID)          \
+	X(BTEX_APPLE,           TILE_APPLE)
 
 // One _Static_assert per pair, exactly as before. The names are stringified into the message
 // because every one of these expands from the same source line, so the message is the only

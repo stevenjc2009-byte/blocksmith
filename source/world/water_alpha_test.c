@@ -179,6 +179,24 @@ static const char* lineText(int line1)
 	return s_lines[line1 - 1];
 }
 
+// The LAST line strictly before `before` (1-based) containing `needle`, or -1.
+//
+// This exists because a0.x is one register with one value at a time. What a relative fetch
+// actually indexes by is whatever the most recent `mova` put there — so "which mova governs
+// this fetch" is a last-before question, and never a count. Until v1.8.8 the file asked it as
+// a count (`exactly one mova, so a0.x has exactly one source`), which was true of the shader
+// as it stood and stopped being true the moment the biome tint added a second indexed fetch
+// of its own. Counting was the weaker question anyway: two movas and two fetches are correct,
+// while one mova inserted between the right one and its fetch is a wrong picture that a
+// count of two would have accepted just as readily.
+static int lastLineBefore(const char* needle, int before)
+{
+	int found = -1;
+	for (int i = 0; i < s_nlines && i + 1 < before; i++)
+		if (strstr(s_lines[i], needle)) found = i + 1;
+	return found;
+}
+
 // ── The table ────────────────────────────────────────────────────────────────
 
 // The claim: the faceShade row index IS the whole nrm byte, so rows 0..7 are the eight face
@@ -291,6 +309,39 @@ static void testAlphaTestSurvives(void)
 #define ALPHA_PIN_NEEDLE  "mov outclr.w, ones"
 #define MOVA_NEEDLE       "mova a0.x, inpack.zzzz"
 #define FETCH_NEEDLE      "mov r3, faceShade[a0.x]"
+#define TINT_MOVA_NEEDLE  "mova a0.x, r8.xxxx"
+#define TINT_FETCH_NEEDLE "mov r10, tintPalette[a0.x]"
+
+// One relative fetch, and the `mova` that decides what it reads.
+//
+// Split out because v1.8.8 gave these shaders a SECOND indexed fetch — the biome tint palette
+// — and the question this asks is per-fetch, not per-file. `fetch_line_out` is the fetch's
+// line number so the caller can keep using it for the ordering checks it already does.
+static void checkIndexedFetch(const char* path, const char* fetch_needle,
+                              const char* mova_needle, const char* indexed_by,
+                              int* fetch_line_out)
+{
+	int fetch = -1;
+	const int fetches = countLines(fetch_needle, &fetch);
+	if (fetch_line_out) *fetch_line_out = fetch;
+
+	CHECK(fetches == 1, "%s fetches `%s` exactly once (found %d)", path, fetch_needle, fetches);
+	if (fetches != 1) return;
+
+	// WHICH ROW — the only part of the expression the CPU never sees, and the part no needle
+	// in this file described before the operand sabotage below was measured.
+	const int gov = lastLineBefore("mova ", fetch);
+
+	CHECK(gov > 0,
+	      "%s sets a0.x at all before `%s` on L%d — with no mova above it the fetch reads "
+	      "whatever the previous vertex left in the address register",
+	      path, fetch_needle, fetch);
+	if (gov <= 0) return;
+
+	CHECK(lineHas(gov, mova_needle),
+	      "%s indexes `%s` (L%d) by %s: the last mova above it is L%d `%s`, wanted `%s`",
+	      path, fetch_needle, fetch, indexed_by, gov, lineText(gov), mova_needle);
+}
 
 // `bound` says whether this is the program the console actually runs. Both models have run
 // world_dynamic.v.pica since v1.8.0 task 24 (scene/chunk_render.c's chunkRenderInit parses
@@ -335,20 +386,15 @@ static void checkOneShader(const char* path, bool bound)
 	// "PASS 34 checks, 0 failed", the same 34 as a healthy tree, with not one check moved.
 	// Both instructions were still present and still in the right order; only the operand
 	// changed, and no needle in this file described an operand.
-	const int movas = countLines("mova ", NULL);
-	int mova_line = -1;
-	const int nrm_movas = countLines(MOVA_NEEDLE, &mova_line);
+	// .xxxx or .yyyy on that mova's operand indexes the table by a texture coordinate instead,
+	// which draws a lit world with every face at another face's brightness and alpha.
+	checkIndexedFetch(path, FETCH_NEEDLE, MOVA_NEEDLE, "the nrm byte", NULL);
 
-	CHECK(movas == 1, "%s has exactly one mova, so a0.x has exactly one source (found %d)",
-	      path, movas);
-	CHECK(nrm_movas == 1,
-	      "%s loads a0.x from the nrm byte with `%s` (found %d) — .xxxx or .yyyy there indexes "
-	      "the table by a texture coordinate instead, which draws a lit world with every face "
-	      "at another face's brightness and alpha", path, MOVA_NEEDLE, nrm_movas);
-	CHECK(mova_line > 0 && fetch > 0 && mova_line < fetch,
-	      "%s sets a0.x BEFORE `%s` reads it (mova L%d, fetch L%d) — after it, the fetch uses "
-	      "whatever the previous vertex left in the address register",
-	      path, FETCH_NEEDLE, mova_line, fetch);
+	// v1.8.8's second indexed fetch. r8.x is the tint index the shader derives from the top
+	// bits of the ao byte just above; indexing the palette by anything else paints the world
+	// in another biome's colours, which is a picture, not an error — the same silent class of
+	// wrongness as the face-row sabotage measured above, one register along.
+	checkIndexedFetch(path, TINT_FETCH_NEEDLE, TINT_MOVA_NEEDLE, "the derived tint index", NULL);
 
 	// Task 13b's atlas layout must not have been disturbed on the way past.
 	CHECK(countLines(".constf uvScale(0.0625, 0.015625, 0.0, 0.0)", NULL) == 1,

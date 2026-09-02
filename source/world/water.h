@@ -33,8 +33,14 @@
 //     encoding and the wire format are all untouched. A v1.7.0 or v1.7.1 world opens as the
 //     world it was, with an empty flow map, which reads as "all of its water is source
 //     water" — which is exactly true, because worldgen is the only thing that has ever
-//     placed water and water cannot be placed by a player (world/block.h: it is past
-//     BLOCK_COUNT, so inventoryCanHold refuses it).
+//     placed water and water cannot be placed by a player (world/inventory.h:
+//     inventoryCanHold refuses it because registryView(item)->liquid is true). That REASON
+//     changed in v1.8.8 and the note is kept current deliberately: the old reason was "it is
+//     past BLOCK_COUNT", and v1.8.8's ceiling fix deleted the BLOCK_COUNT term from
+//     inventoryCanHold entirely. Six blocks that had been unpickable — tall grass, snow, ice,
+//     cactus, dead bush, fern — became carryable by that change. Water did NOT, because the
+//     !liquid term is what actually holds it out, and that term is unconditional. The
+//     conclusion this paragraph rests on is therefore unchanged; only its justification is.
 //   * The mesher is untouched. Every level is BLOCK_WATER, so the same-material self-cull at
 //     mesher.c's deferred pass still matches on a bare id compare and a lake still meshes to
 //     its shell. A design with eight water ids would have had to relax that test.

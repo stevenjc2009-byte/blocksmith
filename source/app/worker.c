@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "app/hw.h"
+#include "app/lanes.h"
 #include "debug/loadprof.h"
 #include "world/jobq.h"
 #include "world/light.h"
@@ -16,11 +17,17 @@
 // 32 KB. worldgenColumn's frame is about 1.3 KB (the 16x16 height and sandy tables) and
 // nothing below it recurses, so this is mostly margin: a stack overflow on this console
 // corrupts whatever is underneath instead of faulting, and the saving from a tight stack
-// would be one page of heap.
+// would be one page of heap. Charged once per lane — libctru takes a thread stack off the
+// application heap — so a second lane costs another 32 KB of heap on a New 3DS and nothing
+// at all on an Old one.
 #define WORKER_STACK_BYTES (32 * 1024)
 
 // Step 6.3, and the answer is a measurement rather than the one the plan expected. Set to 1
 // to ask for the system core; see the table in worker.h for why the default is 0.
+//
+// v1.8.8: read worker.h's note on cia/blocksmith.rsf's AffinityMask before setting this to 1
+// on an installed CIA. The exheader permits core 0 only (AffinityMask : 1), so the request
+// below can succeed and the threadCreate that follows it still be refused.
 #ifndef BS_WORKER_CORE
 #define BS_WORKER_CORE 0
 #endif
@@ -32,35 +39,102 @@
 // that share from the OS services sharing the core, which cannot be tested on an emulator.
 #define WORKER_CPU_TIME_LIMIT 80
 
-static Thread     s_thread;
-static bool       s_started;
-static int        s_core = -1;   // where the worker actually ended up; see workerCore()
+// v1.8.8. Where the SECOND lane goes, and why it is a constant rather than a ladder.
+//
+// app/hw.c's hwPreferredWorkerCore() is a ladder because every core it offers is a request
+// that can be refused for a different reason. Lane 1 has no such choice to make: core 2 has
+// already been taken by lane 0 (the second lane is not started at all unless it was — see
+// workerStart), core 1 is the system core this game does not take, and core 3 is not offered
+// to applications. That leaves core 0, which is always available and is the core the main
+// thread is blocked on the GPU for ~15.7 ms of every 16.71 ms frame.
+#define WORKER_LANE1_CORE 0
 
-// Everything below is shared between the two threads and only ever touched under s_lock.
-// s_work is the worker's wake-up: signalled when a job is submitted, when the staging
-// world has been emptied, and when the worker is asked to quit.
+// ── One lane ──────────────────────────────────────────────────────────────────────────
+//
+// Everything a generator lane owns exclusively. Lane 0 is a static (its cost is unchanged
+// from v1.8.7 and an Old 3DS must not pay a byte for a lane it will never start); lane 1 is
+// malloc'd by workerStart and only on a New 3DS that actually got core 2.
+typedef struct {
+	int        index;      // 0 or 1; the index into s_claims and the tag in the ready ring
+	Thread     thread;
+	int        core;       // where this lane actually ended up, not what it asked for
+	LightEvent work;       // this lane's wake-up; see the note on the event scheme below
+
+	// Worker-owned. The main thread only touches this while this lane's claim is held and
+	// the lane is parked, which is the whole handshake — see worker.h.
+	World      staging;
+
+	// v1.8.7. THIS LANE's generator scratch, 16,256 B — the buffers world/worldgen.c and
+	// world/worldgen_density.c used to keep in file statics. It is exactly one lane's worth,
+	// which is the point of that move and is what makes v1.8.8's second lane possible at all.
+	WorldGenScratch wgs;
+
+	// v1.5.0 adaptive lighting: the BFS worklist lightPropagateColumn fills, allocated only
+	// when the engine is enabled — which, since v1.8.0 task 24, is BOTH console models: this
+	// stopped being New-3DS-only when chunk_render.c's chunkRenderInit started calling
+	// lightEngineInit(true) unconditionally (source/scene/chunk_render.c:844), so an Old 3DS
+	// pays for this too now. Owned by its lane for that lane's whole life — the main thread's
+	// edit path uses the CAS-claimed shared queue in world/light.c and never this one.
+	// ~64 KB of heap per lane against the worker's measured ~94% idle capacity; propagation
+	// is what that headroom is for.
+	LightQueue* lightq;
+
+	// Per-lane so the two do not have to contend for one counter on the hot path. Read by
+	// workerBusyMs(), which sums them.
+	u64        busy_ticks;
+} Lane;
+
+static Lane   s_lane0;                       // always; .bss, unchanged cost on both consoles
+static Lane*  s_lane[WORKER_LANES_MAX];      // [0] = &s_lane0, [1] = malloc'd on a New 3DS
+static int    s_lanes;                       // how many are actually running: 1 or 2
+static bool   s_started;
+
+// ── The event scheme, and why it is one event PER LANE ────────────────────────────────
+//
+// A single sticky LightEvent with two waiters is a lost-wakeup waiting to happen: each waiter
+// has to clear the event before it inspects the queue (clearing afterwards is the classic
+// bug), and with two of them one lane's clear can swallow the signal the other lane needed.
+// Per-lane events remove the question entirely. The main thread signals every lane on submit;
+// each lane clears only its own event and then looks at the shared queue; at most one of them
+// gets the job and the other goes back to sleep having lost nothing.
 static LightLock  s_lock;
-static LightEvent s_work;
+
+// v1.8.8. The SD card, which is emphatically not per-lane. worker.h's step 8.1 note is the
+// reason: libctru reaches the card through one FS service session shared by the whole process,
+// and two threads inside it at once is not a race this project wants to reason about. That
+// argument was satisfied for free while there was one worker thread; with two it needs a lock.
+//
+// It covers regionReadColumnCached, regionDecodeColumn, regionWriteColumn and regionMaintain —
+// i.e. every entry into world/region.c from this file — because region.c's directory cache
+// (s_cache, s_cache_clock), its write hint (s_write_hint) and regionCompact's static repack
+// buffer are all file statics shared by whoever calls in. It also lets the two lanes share one
+// s_load_buf below instead of paying 32,816 B twice.
+//
+// It does NOT serialise generation, which is the expensive half and the whole point of the
+// second lane: the lock is dropped before worldgenColumn runs. On a fresh world a load is a
+// cache hit and a miss return; on a saved world the decodes serialise, which is what the one
+// FS session requires anyway.
+static LightLock  s_fs_lock;
 
 static JobQueue   s_queue;
 static bool       s_quit;
-static bool       s_in_flight;      // a job has been popped and is being generated
-static bool       s_ready;          // staging holds a finished column waiting to be installed
-static bool       s_ready_ok;       // ...and every chunk of it was generated
-static int32_t    s_ready_cx, s_ready_cz;
 
-// Worker-owned. The main thread only touches these while s_ready is set and the worker is
-// parked, which is the whole handshake — see worker.h.
-static World      s_staging;
+// v1.8.8. Which column each lane is working on, and the finished columns waiting to be
+// installed. Both are plain bookkeeping with no locking of their own — see app/lanes.h — and
+// every call to them in this file is made under s_lock.
+static LaneClaims    s_claims;
+static LaneReadyRing s_ready;
+
+// Jobs thrown away because the other lane was already generating that column. Not an error:
+// main.c can legitimately submit one column twice (genUnloadColumn clears its `asked` mark
+// when it leaves the ring and genRequestArea re-asks if the player walks back), and the copy
+// already in flight is the one that will arrive. Counted so that "the world has a hole in it"
+// can be told apart from "a duplicate was dropped".
+static int        s_dup_dropped;
+
 static const WorldGen* s_gen;
 
-// v1.8.7. THIS LANE's generator scratch, 16,253 B — the buffers world/worldgen.c and
-// world/worldgen_density.c used to keep in file statics. It is exactly one lane's worth: a
-// second worker thread would need a second one of these, which is the point of the move but
-// not part of it.
-static WorldGenScratch s_wgs;
-
-static u64 s_busy_ticks, s_install_ticks;
+static u64 s_install_ticks;
 
 // ── Step 8.1: the save ring ───────────────────────────────────────────────────────────
 //
@@ -70,6 +144,11 @@ static u64 s_busy_ticks, s_install_ticks;
 // empty almost all of the time. A third slot would buy the case where three edited columns
 // unload in the same frame, which needs the player to have built in three columns and then
 // crossed a boundary diagonally — rare enough to pay one SD write of latency for.
+//
+// v1.8.8: drained by LANE 0 ONLY, whatever the lane count. Nothing about a save is
+// parallelisable — it is one FS session and one card — so handing it to whichever lane
+// happened to be idle would buy no throughput and would put a second thread in the write
+// path for the sake of symmetry.
 #define SAVE_SLOTS 2
 
 typedef struct {
@@ -80,7 +159,7 @@ typedef struct {
 
 static SaveSlot s_save[SAVE_SLOTS];
 static int      s_save_head;        // next slot the main thread fills
-static int      s_save_tail;        // next slot the worker writes
+static int      s_save_tail;        // next slot lane 0 writes
 static int      s_save_count;       // slots full; guarded by s_lock
 static int      s_saved, s_save_failed, s_loaded;
 
@@ -96,44 +175,38 @@ static u64      s_save_wait_max_ticks;  // worst single wait
 // path under REGION_ROOT plus a world name.
 static char s_world_dir[128];
 
-// Read buffer for the load-before-generate path. Worker-owned, never touched by the main
-// thread, and static rather than on the worker's 32 KB stack — which it would not merely
-// fill but overflow by itself: REGION_COL_MAX is 32,816 bytes (region.h: COLUMN_CHUNKS(8) *
-// (CHUNK_CODEC_MAX(4098) + 2) + 16) against WORKER_STACK_BYTES's 32,768 above — 48 bytes over
-// before any call frame, return address, or other local is counted.
+// Read buffer for the load-before-generate path. Static rather than on a lane's 32 KB stack —
+// which it would not merely fill but overflow by itself: REGION_COL_MAX is 32,816 bytes
+// (region.h: COLUMN_CHUNKS(8) * (CHUNK_CODEC_MAX(4098) + 2) + 16) against WORKER_STACK_BYTES's
+// 32,768 above — 48 bytes over before any call frame, return address, or other local is
+// counted.
+//
+// v1.8.8: SHARED by both lanes and only ever touched inside s_fs_lock, which is where the
+// bytes are read and where they are decoded. Per-lane would cost a second 32,816 B for a
+// buffer that can only be in use by one lane at a time anyway.
 static uint8_t s_load_buf[REGION_COL_MAX];
 
 // Unpack buffer for workerInstall's staging → world copy. Since step 9.2a a Chunk is opaque
 // and there is no flat blocks[] to memcpy between the two worlds, so a chunk is unpacked
 // here and handed on whole. Main-thread-owned and safe as a static for the same reason the
-// rest of workerInstall is: it only runs while s_ready is set and the worker is parked. 4 KB
-// in .bss rather than on the stack because workerInstall runs on the *main* thread, whose
-// frame is already carrying the render path — this is not worth spending stack on when it is
-// live for a few microseconds per installed column.
+// rest of workerInstall is: it only runs while the source lane's claim is held and that lane
+// is parked. 4 KB in .bss rather than on the stack because workerInstall runs on the *main*
+// thread, whose frame is already carrying the render path — this is not worth spending stack
+// on when it is live for a few microseconds per installed column.
 static BlockId s_install_blocks[CHUNK_BLOCKS];
 
-// v1.5.0 adaptive lighting: the BFS worklist lightPropagateColumn fills, allocated only
-// when the engine is enabled — which, since v1.8.0 task 24, is BOTH console models: this
-// stopped being New-3DS-only when chunk_render.c's chunkRenderInit started calling
-// lightEngineInit(true) unconditionally (source/scene/chunk_render.c:844), so an Old 3DS
-// pays for this too now. Owned by this thread for its whole life — the main thread's edit
-// path uses the queue-free sweep engine precisely so the two never share one. ~64 KB of
-// heap against the worker's measured ~94% idle capacity; propagation is what that headroom
-// is for.
-static LightQueue* s_lightq;
-
-static bool workerLightQueue(void)
+static bool workerLightQueue(Lane* ln)
 {
-	if (!s_lightq) {
-		s_lightq = (LightQueue*)malloc(sizeof(LightQueue));
-		if (!s_lightq) return false;
-		lightQueueInit(s_lightq);
+	if (!ln->lightq) {
+		ln->lightq = (LightQueue*)malloc(sizeof(LightQueue));
+		if (!ln->lightq) return false;
+		lightQueueInit(ln->lightq);
 	}
 	return true;
 }
 
-// Step 8.1. Fills the staging column from the region file, and says whether it managed it.
-// False is the ordinary answer, not an error: it means the card has never heard of this
+// Step 8.1. Fills the lane's staging column from the region file, and says whether it managed
+// it. False is the ordinary answer, not an error: it means the card has never heard of this
 // column, which is true of all of them the first time a world is played.
 //
 // A failed decode leaves the chunks it had already allocated behind — region.h documents
@@ -150,9 +223,14 @@ static bool workerLightQueue(void)
 // long to load as a fresh one. Correctness is unchanged: the cache is dropped by every writer
 // in region.c, including workerWriteSave's regionWriteColumn below, so a column saved a
 // moment ago is never answered from a directory that predates it.
-static bool workerLoadColumn(int32_t cx, int32_t cz)
+//
+// v1.8.8. Everything that touches world/region.c or s_load_buf happens inside s_fs_lock; the
+// bookkeeping that follows touches only this lane's own staging world and is outside it.
+static bool workerLoadColumn(Lane* ln, int32_t cx, int32_t cz)
 {
 	if (!s_world_dir[0]) return false;
+
+	LightLock_Lock(&s_fs_lock);
 
 	// v1.7.1 task 48b. The two halves of a load are timed apart because they answer different
 	// questions: region_io is the card (an open, a directory parse, a payload read) and decode
@@ -162,13 +240,19 @@ static bool workerLoadColumn(int32_t cx, int32_t cz)
 	const uint64_t t_io = loadprofMark();
 	const uint32_t n = regionReadColumnCached(s_world_dir, cx, cz, s_load_buf, sizeof(s_load_buf));
 	loadprofSince(LOAD_STAGE_REGION_IO, t_io);
-	if (n == 0) return false;
 
-	const uint64_t t_dec = loadprofMark();
-	const bool decoded = regionDecodeColumn(&s_staging, cx, cz, s_load_buf, n);
-	loadprofSince(LOAD_STAGE_DECODE, t_dec);
+	bool decoded = false;
+	if (n != 0) {
+		const uint64_t t_dec = loadprofMark();
+		decoded = regionDecodeColumn(&ln->staging, cx, cz, s_load_buf, n);
+		loadprofSince(LOAD_STAGE_DECODE, t_dec);
+	}
+
+	LightLock_Unlock(&s_fs_lock);
+
+	if (n == 0) return false;
 	if (!decoded) {
-		worldColumnRemove(&s_staging, cx, cz);
+		worldColumnRemove(&ln->staging, cx, cz);
 		return false;
 	}
 
@@ -177,20 +261,22 @@ static bool workerLoadColumn(int32_t cx, int32_t cz)
 	// today — a column only becomes dirty by an edit, and an edit always leaves a chunk
 	// allocated — but the install path assumes the column exists, so make it so rather than
 	// leave a one-line assumption between two files.
-	if (!worldColumnCreate(&s_staging, cx, cz)) return false;
+	if (!worldColumnCreate(&ln->staging, cx, cz)) return false;
 
-	s_loaded++;
+	__atomic_fetch_add(&s_loaded, 1, __ATOMIC_RELAXED);
 	return true;
 }
 
-// Writes one full save slot. Worker thread only; the slot's bytes are not touched by the
-// main thread while it is counted full, so this needs no lock of its own.
+// Writes one full save slot. Lane 0 only; the slot's bytes are not touched by the main thread
+// while it is counted full, so this needs no lock of its own — but the card does, because
+// lane 1 may be inside a region read at the same moment.
 static void workerWriteSave(int slot)
 {
 	const SaveSlot* s = &s_save[slot];
-	if (regionWriteColumn(s_world_dir, s->cx, s->cz, s->bytes, s->len)) {
-		s_saved++;
 
+	LightLock_Lock(&s_fs_lock);
+	const bool written = regionWriteColumn(s_world_dir, s->cx, s->cz, s->bytes, s->len);
+	if (written) {
 		// v1.8.2. The region file's payload arena is append-only, so this save just orphaned
 		// the previous copy of this column and nothing used to give that space back:
 		// regionCompact() existed and had no caller in any shipped build, and a region file
@@ -209,11 +295,15 @@ static void workerWriteSave(int slot)
 		//
 		// Not verified on hardware: if an SD rewrite of a big region is slow enough, three
 		// column saves landing inside one would fill the two-slot ring above and make the main
-		// thread wait in workerSubmitSave. workerSaveWaits() is where that would show.
+		// thread wait in workerSubmitSave. workerSaveWaits() is where that would show. v1.8.8
+		// adds a second way for it to show: lane 1 blocking on s_fs_lock behind this rewrite,
+		// which costs generation throughput rather than a frame.
 		regionMaintain(s_world_dir, regionOf(s->cx), regionOf(s->cz));
-	} else {
-		s_save_failed++;
 	}
+	LightLock_Unlock(&s_fs_lock);
+
+	if (written) __atomic_fetch_add(&s_saved, 1, __ATOMIC_RELAXED);
+	else         __atomic_fetch_add(&s_save_failed, 1, __ATOMIC_RELAXED);
 
 	LightLock_Lock(&s_lock);
 	s_save_tail = (s_save_tail + 1) % SAVE_SLOTS;
@@ -223,13 +313,14 @@ static void workerWriteSave(int slot)
 
 static void workerMain(void* arg)
 {
-	(void)arg;
+	Lane* const ln = (Lane*)arg;
 
 	for (;;) {
 		// Cleared *before* the queue is inspected, so a job submitted between the
 		// inspection and the wait leaves the event signalled and the wait returns
-		// immediately. Clearing after the check is the classic lost-wakeup bug.
-		LightEvent_Clear(&s_work);
+		// immediately. Clearing after the check is the classic lost-wakeup bug. Per-lane,
+		// so one lane's clear cannot swallow the other lane's wake-up — see s_lock above.
+		LightEvent_Clear(&ln->work);
 
 		Job job = {JOB_NONE, 0, 0, 0};
 		bool got = false, quit = false;
@@ -239,14 +330,24 @@ static void workerMain(void* arg)
 		// Saves come first and are drained even while quitting, so workerStop cannot strand
 		// a column the player edited on the way out. workerFlushSaves is still the right
 		// thing for the caller to do — it waits for the card — but the ordering here means
-		// forgetting it costs nothing.
-		if (s_save_count > 0) save_slot = s_save_tail;
+		// forgetting it costs nothing. Lane 0's job alone: see SAVE_SLOTS above.
+		if (ln->index == 0 && s_save_count > 0) save_slot = s_save_tail;
 		quit = s_quit && save_slot < 0;
-		// Nothing is taken while a finished column is still waiting: there is one staging
-		// world, so the previous result would be overwritten before it was installed.
-		if (!quit && save_slot < 0 && !s_ready)
-			got = jobqPop(&s_queue, &job);
-		if (got) s_in_flight = true;
+
+		// Nothing is taken while this lane's own finished column is still waiting: a lane has
+		// one staging world, so the previous result would be overwritten before it was
+		// installed. That is what its claim means — it is held from here until workerInstall
+		// has copied the column out and emptied the staging world.
+		if (!quit && save_slot < 0 && !laneClaimBusy(&s_claims, ln->index)) {
+			while (jobqPop(&s_queue, &job)) {
+				if (laneClaimTake(&s_claims, ln->index, job.cx, job.cz)) { got = true; break; }
+				// The other lane is already generating this exact column. Dropping the
+				// duplicate is right and it is not a hole: the copy in flight will be
+				// installed, and anything that genuinely never arrives is re-asked by
+				// main.c's genRequestArea. See app/lanes.h.
+				s_dup_dropped++;
+			}
+		}
 		LightLock_Unlock(&s_lock);
 
 		if (quit) break;
@@ -254,12 +355,12 @@ static void workerMain(void* arg)
 		if (save_slot >= 0) {
 			const u64 ts = svcGetSystemTick();
 			workerWriteSave(save_slot);
-			s_busy_ticks += svcGetSystemTick() - ts;
+			ln->busy_ticks += svcGetSystemTick() - ts;
 			continue;
 		}
 
 		if (!got) {
-			LightEvent_Wait(&s_work);
+			LightEvent_Wait(&ln->work);
 			continue;
 		}
 
@@ -271,13 +372,13 @@ static void workerMain(void* arg)
 			// and regenerating it from the seed would quietly undo their work. Generation is
 			// the fallback for everything the card does not have, which on a fresh world is
 			// every column.
-			ok = workerLoadColumn(job.cx, job.cz);
+			ok = workerLoadColumn(ln, job.cx, job.cz);
 			if (!ok) {
 				// v1.7.1 task 48b. Timed only when it actually runs, so `generate`'s call
 				// count IS the number of columns the card did not have — the other half of
 				// the fresh-versus-reloaded question region_io/decode opens above.
 				const uint64_t t_gen = loadprofMark();
-				ok = worldgenColumn(s_gen, &s_wgs, &s_staging, job.cx, job.cz);
+				ok = worldgenColumn(s_gen, &ln->wgs, &ln->staging, job.cx, job.cz);
 				loadprofSince(LOAD_STAGE_GENERATE, t_gen);
 			}
 
@@ -287,11 +388,13 @@ static void workerMain(void* arg)
 			// queue overflow) leaves the column unlit, which degrades to today's look via
 			// scratchFillLight's full-sky default rather than to darkness; a false return
 			// from the BFS falls back to the sweep engine so a dropped entry can never
-			// ship half-lit terrain.
-			if (ok && lightEnabled() && workerLightQueue()) {
+			// ship half-lit terrain. The BFS worklist is this lane's own; the sweep-engine
+			// fallback is the one world/light.c CAS-claims (its s_edit_queue_busy), which is
+			// what keeps two lanes out of one queue.
+			if (ok && lightEnabled() && workerLightQueue(ln)) {
 				const uint64_t t_light = loadprofMark();
-				if (!lightPropagateColumn(&s_staging, job.cx, job.cz, s_lightq))
-					lightRelightColumn(&s_staging, job.cx, job.cz);
+				if (!lightPropagateColumn(&ln->staging, job.cx, job.cz, ln->lightq))
+					lightRelightColumn(&ln->staging, job.cx, job.cz);
 				loadprofSince(LOAD_STAGE_LIGHT, t_light);
 			}
 			break;
@@ -307,14 +410,17 @@ static void workerMain(void* arg)
 		case JOB_NONE:
 			break;
 		}
-		s_busy_ticks += svcGetSystemTick() - t0;
+		ln->busy_ticks += svcGetSystemTick() - t0;
 
 		LightLock_Lock(&s_lock);
-		s_ready    = true;
-		s_ready_ok = ok;
-		s_ready_cx = job.cx;
-		s_ready_cz = job.cz;
-		s_in_flight = false;
+		// Cannot fail: the ring has one slot per lane and a lane holds its claim until its
+		// previous result was installed, so this lane cannot already have one in there. It is
+		// checked anyway, and the failure releases the claim rather than keeping it — a lost
+		// column is re-asked by main.c's genRequestArea, whereas a lane still holding a claim
+		// for a result nobody will ever install never takes another job for the rest of the
+		// session. The cheap wrong answer beats the expensive one.
+		if (!laneReadyPush(&s_ready, ln->index, job.cx, job.cz, ok))
+			laneClaimDrop(&s_claims, ln->index);
 		LightLock_Unlock(&s_lock);
 	}
 
@@ -340,18 +446,47 @@ void workerSetWorldDir(const char* dir)
 	if (strlen(dir) >= sizeof(s_world_dir)) s_world_dir[0] = '\0';
 }
 
+// Brings one lane up: its staging world, its scratch, its event, and its thread on `core`.
+// False leaves nothing behind for the caller to unwind but the World, which it frees itself.
+static bool workerLaneStart(Lane* ln, int index, int core, s32 prio)
+{
+	ln->index      = index;
+	ln->core       = -1;
+	ln->thread     = NULL;
+	ln->lightq     = NULL;
+	ln->busy_ticks = 0;
+
+	worldgenScratchInit(&ln->wgs);
+	worldInit(&ln->staging);
+
+	// Sticky rather than one-shot: the lane clears it itself before each check, so a
+	// signal that arrives with nobody waiting must persist until the next wait.
+	LightEvent_Init(&ln->work, RESET_STICKY);
+
+	ln->thread = threadCreate(workerMain, ln, WORKER_STACK_BYTES, prio, core, false);
+	if (!ln->thread) {
+		worldExit(&ln->staging);
+		return false;
+	}
+	ln->core = core;
+	return true;
+}
+
 bool workerStart(const WorldGen* g)
 {
 	if (s_started) return true;
 
 	s_gen = g;
 	jobqInit(&s_queue);
-	worldgenScratchInit(&s_wgs);
-	worldInit(&s_staging);
-	s_quit = s_in_flight = s_ready = s_ready_ok = false;
-	s_busy_ticks = s_install_ticks = 0;
+	laneClaimsInit(&s_claims);
+	laneReadyInit(&s_ready);
+	s_quit = false;
+	s_dup_dropped = 0;
+	s_install_ticks = 0;
 	s_save_head = s_save_tail = s_save_count = 0;
 	s_saved = s_save_failed = s_loaded = 0;
+	s_lanes = 0;
+	s_lane[0] = s_lane[1] = NULL;
 
 	// Cleared with the rest, so the counters describe THIS world rather than every world
 	// entered since the app launched. Without this a second world would inherit the first
@@ -360,12 +495,10 @@ bool workerStart(const WorldGen* g)
 	s_save_wait_ticks = s_save_wait_max_ticks = 0;
 
 	LightLock_Init(&s_lock);
-	// Sticky rather than one-shot: the worker clears it itself before each check, so a
-	// signal that arrives with nobody waiting must persist until the next wait.
-	LightEvent_Init(&s_work, RESET_STICKY);
+	LightLock_Init(&s_fs_lock);
 
 	// One step below the main thread. Higher numbers are lower priority on this console,
-	// so this thread only runs when the main thread is blocked — which it is for most of
+	// so these threads only run when the main thread is blocked — which it is for most of
 	// every frame, waiting on the GPU. Clamped to the 0x18..0x3F userland range.
 	s32 prio = 0x30;
 	svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
@@ -417,21 +550,55 @@ bool workerStart(const WorldGen* g)
 		BS_WORKER_CORE && R_SUCCEEDED(APT_SetAppCpuTimeLimit(WORKER_CPU_TIME_LIMIT));
 	const int ncores = hwPreferredWorkerCore(hwIsNew3ds(), cpu_time_limit_ok, cores);
 
-	s_thread = NULL;
-	for (int i = 0; i < ncores && !s_thread; i++) {
-		s_thread = threadCreate(workerMain, NULL, WORKER_STACK_BYTES, prio, cores[i], false);
-		if (s_thread) s_core = cores[i];
-	}
-	if (!s_thread) {
-		worldExit(&s_staging);
-		return false;
+	bool up = false;
+	for (int i = 0; i < ncores && !up; i++)
+		up = workerLaneStart(&s_lane0, 0, cores[i], prio);
+	if (!up) return false;
+
+	s_lane[0] = &s_lane0;
+	s_lanes   = 1;
+
+	// ── v1.8.8: the second lane ───────────────────────────────────────────────────────
+	//
+	// Started only when there is a SECOND CORE for it to run on, which means both of:
+	//
+	//   * this is a New 3DS (laneCountFor, app/lanes.c), and
+	//   * lane 0 actually landed on core 2 rather than falling back.
+	//
+	// The second condition is the one worth stating. If core 2 was refused — the expected
+	// answer under the Homebrew Launcher, where the .3dsx inherits the launcher's exheader
+	// instead of ours — then lane 0 is on core 0, and a second lane there would share one
+	// core's idle time with it, buy no throughput at all, and cost ~114 KB of heap plus a
+	// scheduler's worth of context switching. So in that case the game runs exactly as
+	// v1.8.7 did, with one lane, and workerLanes() says 1 rather than implying otherwise.
+	//
+	// A refused second lane is not a failure of workerStart. The world still generates; it
+	// generates at v1.8.7's speed.
+	if (laneCountFor(hwIsNew3ds()) > 1 && s_lane0.core == 2) {
+		Lane* const ln = (Lane*)malloc(sizeof(Lane));
+		if (ln) {
+			memset(ln, 0, sizeof(*ln));
+			if (workerLaneStart(ln, 1, WORKER_LANE1_CORE, prio)) {
+				s_lane[1] = ln;
+				s_lanes   = 2;
+			} else {
+				free(ln);
+			}
+		}
 	}
 
 	s_started = true;
 	return true;
 }
 
-int workerCore(void) { return s_core; }
+int workerCore(void)  { return s_lane[0] ? s_lane[0]->core : -1; }
+int workerLanes(void) { return s_started ? s_lanes : 0; }
+
+int workerLaneCore(int lane)
+{
+	if (lane < 0 || lane >= WORKER_LANES_MAX || !s_lane[lane]) return -1;
+	return s_lane[lane]->core;
+}
 
 void workerStop(void)
 {
@@ -440,11 +607,13 @@ void workerStop(void)
 	LightLock_Lock(&s_lock);
 	s_quit = true;
 	LightLock_Unlock(&s_lock);
-	LightEvent_Signal(&s_work);
+	for (int i = 0; i < s_lanes; i++) LightEvent_Signal(&s_lane[i]->work);
 
-	threadJoin(s_thread, U64_MAX);
-	threadFree(s_thread);
-	s_thread = NULL;
+	for (int i = 0; i < s_lanes; i++) {
+		threadJoin(s_lane[i]->thread, U64_MAX);
+		threadFree(s_lane[i]->thread);
+		s_lane[i]->thread = NULL;
+	}
 	s_started = false;
 
 	// v1.7.1 task 48. After the join, never before it: the region cache is worker-thread
@@ -457,10 +626,17 @@ void workerStop(void)
 	// Whatever was staged is dropped, not installed: stopping happens on the way out of
 	// the game, and a half-installed column in a world about to be freed is worse than no
 	// column at all.
-	worldExit(&s_staging);
+	for (int i = 0; i < s_lanes; i++) {
+		worldExit(&s_lane[i]->staging);
+		free(s_lane[i]->lightq);
+		s_lane[i]->lightq = NULL;
+	}
 
-	free(s_lightq);
-	s_lightq = NULL;
+	// Lane 0 is a static and stays; every lane above it was malloc'd by workerStart and goes
+	// back, so an Old 3DS session that never had one is byte-for-byte what it was in v1.8.7.
+	for (int i = 1; i < s_lanes; i++) free(s_lane[i]);
+	for (int i = 1; i < WORKER_LANES_MAX; i++) s_lane[i] = NULL;
+	s_lanes = 0;
 }
 
 bool workerSubmitColumn(int32_t cx, int32_t cz)
@@ -478,7 +654,9 @@ bool workerSubmitColumn(int32_t cx, int32_t cz)
 	const bool ok = jobqPush(&s_queue, job);
 	LightLock_Unlock(&s_lock);
 
-	if (ok) LightEvent_Signal(&s_work);
+	// Every lane, because any of them may be the idle one. A lane that is busy clears and
+	// re-waits having lost nothing — see the event scheme note above s_lock.
+	if (ok) for (int i = 0; i < s_lanes; i++) LightEvent_Signal(&s_lane[i]->work);
 	return ok;
 }
 
@@ -539,17 +717,17 @@ bool workerSubmitSave(const Column* col)
 	s->cz  = col->cz;
 	s->len = regionEncodeColumn(col, s->bytes, sizeof(s->bytes));
 	if (s->len == 0) {
-		s_save_failed++;
+		__atomic_fetch_add(&s_save_failed, 1, __ATOMIC_RELAXED);
 		return false;
 	}
 
-	// Published only once the bytes are in: the worker takes any slot the count says is
-	// full, so incrementing first would hand it a half-written buffer.
+	// Published only once the bytes are in: lane 0 takes any slot the count says is full,
+	// so incrementing first would hand it a half-written buffer.
 	LightLock_Lock(&s_lock);
 	s_save_head = (s_save_head + 1) % SAVE_SLOTS;
 	s_save_count++;
 	LightLock_Unlock(&s_lock);
-	LightEvent_Signal(&s_work);
+	LightEvent_Signal(&s_lane[0]->work);
 	return true;
 }
 
@@ -562,14 +740,14 @@ void workerFlushSaves(void)
 		const int n = s_save_count;
 		LightLock_Unlock(&s_lock);
 		if (n == 0) return;
-		LightEvent_Signal(&s_work);
+		LightEvent_Signal(&s_lane[0]->work);
 		svcSleepThread(1000000ULL);
 	}
 }
 
-int workerLoaded(void)     { return s_loaded; }
-int workerSaved(void)      { return s_saved; }
-int workerSaveFailed(void) { return s_save_failed; }
+int workerLoaded(void)     { return __atomic_load_n(&s_loaded, __ATOMIC_RELAXED); }
+int workerSaved(void)      { return __atomic_load_n(&s_saved, __ATOMIC_RELAXED); }
+int workerSaveFailed(void) { return __atomic_load_n(&s_save_failed, __ATOMIC_RELAXED); }
 
 bool workerInstall(World* w, int32_t* cx, int32_t* cz, bool* ok)
 {
@@ -579,16 +757,22 @@ bool workerInstall(World* w, int32_t* cx, int32_t* cz, bool* ok)
 	// world (BS_WORLD_GEN=0) never starts the worker, so this path is real.
 	if (!s_started) return false;
 
+	int     lane = -1;
+	int32_t rx = 0, rz = 0;
+	bool    gen_ok = false;
+
 	LightLock_Lock(&s_lock);
-	const bool ready = s_ready;
-	const int32_t rx = s_ready_cx, rz = s_ready_cz;
-	const bool gen_ok = s_ready_ok;
+	const bool ready = laneReadyPop(&s_ready, &lane, &rx, &rz, &gen_ok);
 	LightLock_Unlock(&s_lock);
 
-	if (!ready) return false;
+	if (!ready || lane < 0 || lane >= WORKER_LANES_MAX || !s_lane[lane]) return false;
 
-	// The worker is parked until s_ready is cleared below, so the staging world is ours
-	// for the duration of this function and needs no lock of its own.
+	Lane* const ln = s_lane[lane];
+
+	// That lane is parked until its claim is dropped below — it may not take another job
+	// while it holds one — so its staging world is ours for the duration of this function
+	// and needs no lock of its own. This is the v1.8.7 handshake unchanged; all that moved
+	// is which of the two staging worlds it applies to on any given call.
 	const u64 t0 = svcGetSystemTick();
 	// v1.7.1 task 48b. The same bracket s_install_ticks already keeps, reported per world load
 	// instead of per session: workerInstallMs() is a since-launch total and cannot say what one
@@ -597,7 +781,7 @@ bool workerInstall(World* w, int32_t* cx, int32_t* cz, bool* ok)
 	const uint64_t t_inst = loadprofMark();
 
 	bool all = gen_ok;
-	const Column* src = worldColumn(&s_staging, rx, rz);
+	const Column* src = worldColumn(&ln->staging, rx, rz);
 	if (!src) {
 		all = false;
 	} else {
@@ -617,24 +801,26 @@ bool workerInstall(World* w, int32_t* cx, int32_t* cz, bool* ok)
 		}
 
 		// v1.5.0 adaptive lighting: the staged column's channels ride across with its
-		// blocks, under the same parked-worker handshake that makes the chunk copy
+		// blocks, under the same parked-lane handshake that makes the chunk copy
 		// lock-free. A refusal leaves the live column unlit — scratchFillLight's
 		// full-sky default covers it — and the staging copy is freed with the rest of
 		// the staging world below either way.
 		if (all) lightColumnCopy(src, worldColumn(w, rx, rz));
 	}
 
-	// Frees the staged column and resets the staging world to empty, which is the state
-	// the worker expects to find when it takes the next job.
-	worldExit(&s_staging);
+	// Frees the staged column and resets that lane's staging world to empty, which is the
+	// state it expects to find when it takes the next job.
+	worldExit(&ln->staging);
 
 	s_install_ticks += svcGetSystemTick() - t0;
 	loadprofSince(LOAD_STAGE_INSTALL, t_inst);
 
+	// Only now is the lane let go: the drop is what allows it to pop another job, and it
+	// must not be able to do that until the staging world above has been emptied.
 	LightLock_Lock(&s_lock);
-	s_ready = false;
+	laneClaimDrop(&s_claims, lane);
 	LightLock_Unlock(&s_lock);
-	LightEvent_Signal(&s_work);
+	LightEvent_Signal(&ln->work);
 
 	if (cx) *cx = rx;
 	if (cz) *cz = rz;
@@ -647,7 +833,13 @@ bool workerBusy(void)
 	if (!s_started) return false;
 
 	LightLock_Lock(&s_lock);
-	const bool busy = s_ready || s_in_flight || jobqCount(&s_queue) > 0;
+	// A held claim covers both "generating" and "finished, waiting to be installed", so the
+	// ready ring does not need testing separately — but it is tested anyway, because the two
+	// are only equal while the code above is correct and this is the predicate main.c waits
+	// on before deciding the world is complete.
+	const bool busy = laneClaimCount(&s_claims) > 0 ||
+	                  laneReadyCount(&s_ready) > 0 ||
+	                  jobqCount(&s_queue) > 0;
 	LightLock_Unlock(&s_lock);
 	return busy;
 }
@@ -672,7 +864,33 @@ int workerDropped(void)
 	return n;
 }
 
-float workerBusyMs(void)    { return (float)((double)s_busy_ticks / CPU_TICKS_PER_MSEC); }
+int workerDupDropped(void)
+{
+	if (!s_started) return 0;
+
+	LightLock_Lock(&s_lock);
+	const int n = s_dup_dropped;
+	LightLock_Unlock(&s_lock);
+	return n;
+}
+
+int workerReadyPeak(void)
+{
+	if (!s_started) return 0;
+
+	LightLock_Lock(&s_lock);
+	const int n = laneReadyPeak(&s_ready);
+	LightLock_Unlock(&s_lock);
+	return n;
+}
+
+float workerBusyMs(void)
+{
+	u64 t = 0;
+	for (int i = 0; i < s_lanes; i++) t += s_lane[i]->busy_ticks;
+	return (float)((double)t / CPU_TICKS_PER_MSEC);
+}
+
 float workerInstallMs(void) { return (float)((double)s_install_ticks / CPU_TICKS_PER_MSEC); }
 
 int   workerSaveSubmits(void) { return s_save_submits; }

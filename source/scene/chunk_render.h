@@ -13,6 +13,7 @@
 #include "scene/mesh_pool_sizing.h"
 #include "scene/render_dist.h"
 #include "world/water.h"
+#include "world/worldgen.h"
 #include "world/world.h"
 
 // Per-slot capacity. A pathological 16³ checkerboard would need 12,288 faces, which
@@ -111,6 +112,38 @@ const RenderDist* chunkRenderDistance(void);
 // dependency on water.c: mesher.c is in six host binaries and water.c in one. The levels travel
 // as plain bytes in MeshScratch, so meshChunk never learns that a WaterSim exists.
 void chunkRenderSetWater(const WaterSim* sim);
+
+// v1.8.8 biome tint. Points the renderer at the world's generator so chunkRenderBuild can ask
+// it which biome each column of the chunk it is about to mesh sits in, and write the matching
+// palette row into the scratch's tint band.
+//
+// NULL -- the state before main.c calls this, and the state of every host binary -- means the
+// band is never filled, every vertex carries tint row 0 (the identity), and the frame is
+// byte-for-byte what it was before v1.8.8.
+//
+// A pointer set from outside, for the same layering reason chunkRenderSetWater gives just
+// above: the renderer must not know which module owns the world's generator, only that
+// something does. The tint travels to the mesher as plain bytes in MeshScratch, so meshChunk
+// still never learns that a WorldGen -- or a biome -- exists.
+void chunkRenderSetGen(const WorldGen* gen);
+
+// v1.8.9 day/night. Points the renderer at the world clock's current time of day, so
+// pipelineBind's dayLevel upload and the fog/clear colour can track the cycle instead of
+// staying pinned to full day. Call once a frame, before the eyes are drawn — main.c owns the
+// DayNight clock itself; this file does no arithmetic on the tick at all, only forwards it to
+// world/daynight.h's pure functions.
+void chunkRenderSetTimeOfDay(uint32_t tod);
+
+// v1.9.1. The debug overlay's "see" field used to read RenderDist.half_vis, which comes
+// from the retired PICA200 fixed-function fog LUT (renderDistVisibility/renderDistFogTable
+// in render_dist.c) and has had no GPU path since the v1.9.0 shader-driven fog-ramp redesign
+// -- it barely moves across render distances (~14.3-14.4 regardless of radius) while the
+// player's actual visibility scales hugely with it. This reads the LIVE half-visibility out
+// of the FogShape this file genuinely uploaded to the GPU (s_fog), combined with fogRampTexel(),
+// the same reference ramp-texel generator tests/fogramp_test.c already cross-checks against the
+// compiled build/fogramp.t3x -- so there is exactly one texel table in play, not a second copy
+// that can drift from what the console actually renders.
+float chunkRenderFogHalfVis(void);
 
 // Meshes one chunk out of the world into its slot, reusing the slot it already owns
 // if it has one. A chunk that meshes to nothing KEEPS its slot: releasing it made that

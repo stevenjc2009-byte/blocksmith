@@ -6,7 +6,9 @@
 #include "gfx/atlas.h"
 #include "gfx/font.h"
 #include "gfx/sprite.h"
+#include "debug/biomeinfo.h"
 #include "net/inv_bridge.h"
+#include "scene/chunk_render.h"   // chunkRenderCamera, for the biome row's position
 #include "scene/ui_layout.h"
 #include "world/block.h"
 #include "world/crafting.h"
@@ -268,6 +270,38 @@ static void drawHudFont(const UiStats* stats)
 	if (stats->status) fontDrawf(6, y, 1, COL_TEXT_DIM, "%s", stats->status);
 	y += 12;
 	if (stats->net) fontDrawf(6, y, 1, COL_TEXT_DIM, "%s", stats->net);
+	y += 12;
+
+	// v1.8.8. The biome the player is standing in.
+	//
+	// Appended after the existing rows rather than inserted among them so the readout above
+	// is byte-for-byte the one that was already there — this is an addition to the panel, not
+	// a re-layout of it. Same x, same colour, same 12-px step and the same terse
+	// label-then-value shape as "cols 81  chunks 435".
+	//
+	// The position comes from chunkRenderCamera and not from UiStats, because UiStats is
+	// built in source/main.c and that file belongs to another lane right now. It is the
+	// camera's column, so it is where the player is LOOKING FROM, which for a first-person
+	// camera is where they are standing.
+	//
+	// **This row reads "biome ?  unwired" in the build as it stands.** debugBiomeRow has no
+	// WorldGen until main.c hands it one; see the routed one-liner spelled out at the top of
+	// source/debug/biomeinfo.h. Everything else about the row — wording, colour, width,
+	// position, and the lookup itself — is finished and covered by
+	// source/debug/biomeinfo_test.c.
+	{
+		float cx = 0.0f, cy = 0.0f, cz = 0.0f;
+		chunkRenderCamera(&cx, &cy, &cz);
+		char biome[48];
+		// Floored, not truncated: (int) rounds toward zero, so the 128-block biome cell
+		// straddling the origin would be reported one column off for every negative
+		// coordinate — the classic half-of-the-world-is-wrong bug that only shows up west or
+		// north of spawn.
+		const int32_t bx = (int32_t)((cx < 0.0f) ? (cx - 1.0f) : cx);
+		const int32_t bz = (int32_t)((cz < 0.0f) ? (cz - 1.0f) : cz);
+		fontDrawf(6, y, 1, COL_TEXT_DIM, "%s",
+		          debugBiomeRow(bx, bz, biome, sizeof(biome)));
+	}
 	y += 14;
 	fontDraw(6, y, 1, COL_TEXT_DIM, "tap a hotbar slot to select it");
 }

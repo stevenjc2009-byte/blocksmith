@@ -647,8 +647,43 @@ int main(void)
 	// GEN_VERSION_LEGACY and GEN_VERSION_DENSITY worlds are unaffected: the new tree
 	// table is only consulted at genv >= GEN_VERSION_BIOME, so no existing save
 	// re-generates.
-	CHECK(hash_fresh  == 0xe959bfae490df573ULL);
-	CHECK(hash_reload == 0xf4bc0b9d80bb2f8eULL);
+	// ── WHY THEY MOVED A FOURTH TIME (2026-09-02) ────────────────────────────────────
+	//
+	// They were 0xe959bfae490df573 / 0xf4bc0b9d80bb2f8e. v1.8.8, "per-biome blocks and
+	// plants": taiga now grows spruce and forest grows birch instead of both growing oak,
+	// tall grass can be two blocks tall, four flowers are scattered per biome, and oak and
+	// birch hang apples under their canopies. Biome worlds therefore contain block ids this
+	// ring has never seen. That is precisely the change this pin exists to notice, and it
+	// went red as it is supposed to.
+	//
+	// Taken the same way as the third move — transcribed from the line the suite prints on
+	// its own ring, not from a standalone probe:
+	//
+	//   identity  fresh=ba19cb5b038483fc  reload=c3ebcc973d6b3675
+	//
+	// What makes them safe to take at face value is the A/B cell census against the
+	// pre-change generator (world/worldgen.{c,h} from HEAD, everything else from this tree)
+	// over 90 columns — the same 81-column ring of seed 1337 plus world_test.c's twelve
+	// pinned columns — 2,949,120 cells:
+	//
+	//   * 5,338 cells differ, 0.1810%, every one of them in y 67..99.
+	//   * LEAVES -> SPRUCE_LEAVES 2,905, LEAVES -> BIRCH_LEAVES 688, WOOD -> SPRUCE_LOG 448,
+	//     WOOD -> BIRCH_LOG 63, and AIR -> {BLUEBELL 522, TALL_GRASS_TOP 461, POPPY 128,
+	//     DAISY 102, APPLE 21}. Nine transitions, and no others at all.
+	//   * ZERO ground-to-ground transitions in all 90 columns. No height, no density, no
+	//     cave, no biome surface and no water moved.
+	//   * Counted over world_test.c's six-biome area, the two species sums BALANCE EXACTLY:
+	//     1,108 oak logs became 753 oak + 300 birch + 55 spruce, and 6,985 oak leaves became
+	//     3,851 + 2,778 + 356. Not one tree was gained, lost, moved or resized — the species
+	//     change is a pure relabel. Tall grass is the same 1,628 base cells in both arms,
+	//     1,017 bare and 611 now carrying a top, so no grass cell moved either.
+	//
+	// GEN_VERSION_LEGACY and GEN_VERSION_DENSITY worlds are unaffected: every one of these
+	// behaviours is gated on genv >= GEN_VERSION_BIOME or on the biome-params branch, so no
+	// existing save re-generates. world_test.c's legacy byte-identity hashes and its legacy
+	// intruder sweep (widened to reject all ten new ids) are the checks that say so.
+	CHECK(hash_fresh  == 0xba19cb5b038483fcULL);
+	CHECK(hash_reload == 0xc3ebcc973d6b3675ULL);
 
 	regionCacheClose();
 	testRmTree(testDir());

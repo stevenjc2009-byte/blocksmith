@@ -71,12 +71,40 @@ typedef struct {
 	// early return — would pay a 5,508-cell scan on every chunk in the world, and about 95%
 	// of them hold no water whatever.
 	bool    has_water;
+
+	// v1.8.8 biome tint. One palette index (0..7, 0 meaning untinted — MESH_TINT_NONE in
+	// world/mesher.h) per COLUMN of the scratch, indexed by scratchColumn(sx, sz).
+	//
+	// Per column and not per cell because a biome is a function of x and z and of nothing
+	// else — worldgenBiomeAt(g, x, z) in world/worldgen.h takes no y and never has. A
+	// per-cell band would be 5,832 bytes to hold 324 distinct values; this is 324.
+	//
+	// The band is 18x18, so it covers the one-block border as well as the chunk. That is
+	// load-bearing rather than incidental: a merge run can start on the last column of a
+	// chunk, and the mesher tints a face from the column the FACE sits in, so a border left
+	// at zero would draw an untinted line down every chunk seam inside a biome.
+	uint8_t tint[SCRATCH_DIM * SCRATCH_DIM];
+
+	// Whether `tint` holds anything but zeros. Same shape and same purpose as water_any: the
+	// band is cleared by scratchFill, and a caller that never fills it (every host suite but
+	// the biome-tint one, and the console until a WorldGen reaches the render path) leaves
+	// this false, so the mesher skips the lookup entirely and its vertices come out
+	// byte-for-byte what they were before v1.8.8.
+	bool    tint_any;
 } MeshScratch;
 
 // sx/sy/sz are 0..17 — scratch space, where 0 is the border and 1..16 is the chunk.
 static inline int scratchIndex(int sx, int sy, int sz)
 {
 	return (sy * SCRATCH_DIM + sz) * SCRATCH_DIM + sx;
+}
+
+// Where column (sx, sz) lands in the tint band. sx/sz are 0..17, the same scratch space
+// scratchIndex takes, and the order is the same (z, x) row-major one scratchIndex uses for its
+// inner two axes so the two walk memory the same way.
+static inline int scratchColumn(int sx, int sz)
+{
+	return sz * SCRATCH_DIM + sx;
 }
 
 // Copies chunk (cx,cy,cz) and its 26 neighbours into the scratch. Absent or
@@ -95,6 +123,33 @@ void scratchFillLight(MeshScratch* s, const World* w, int cx, int cy, int cz);
 // simulation because the flow levels do. It is declared there and not here so that scratch.c
 // keeps its current link footprint: every host suite links this file, only one links
 // world/water.c, and a call from here would drag the simulation into all of them.
+
+// v1.8.8 biome tint. Fills the 18x18 tint band for the chunk column at (cx, cz), asking `fn`
+// for the palette row of every column the band covers -- the one-block border included.
+//
+// **A CALLBACK and not a `const WorldGen*`, and that signature is the whole design decision.**
+// The biome lives in world/worldgen.c, and 10 of the 15 host binaries that link THIS file do
+// not link that one (measured, not assumed: networld, inv_bridge, interop, scratch_light,
+// water_mesh, mesher_hashcheck, light_luminance, relight_drain, light_race, biome_tint).
+// Calling worldgenBiomeAt() from here would pull worldgen.c -- and noise.c, and rng.c -- into
+// every one of them, which is precisely what the water band's note above refuses to do for
+// precisely the same reason. A function pointer keeps this file's link footprint EXACTLY what
+// it was, while keeping the part that is actually easy to get wrong -- the scratch-space to
+// world-space walk, where sx runs 0..17 and only 1..16 is the chunk -- inside a file that all
+// 15 of those binaries already compile, and can therefore test.
+//
+// `fn` is handed WORLD block coordinates and returns a palette row. Whatever it returns is
+// masked to MESH_TINT_MASK here, so a miscounting callback can never spill into the ao byte's
+// low two bits and read as an occlusion of up to 31 (see world/mesher.h).
+//
+// tint_any is set iff at least one column came back non-zero, so a callback that tints nothing
+// leaves the mesher on exactly its pre-v1.8.8 path and every pinned hash where it was.
+//
+// A NULL `fn` is a no-op. Call this AFTER scratchFill, which clears the band -- calling it
+// before would have the clear silently undo the fill.
+typedef uint8_t (*ScratchTintFn)(const void* ctx, int32_t wx, int32_t wz);
+
+void scratchFillTint(MeshScratch* s, int cx, int cz, ScratchTintFn fn, const void* ctx);
 
 // Reads in *chunk-local* coordinates, which run -1..16: the mesher works in the
 // chunk's own frame and stepping off the edge is normal, not an error.

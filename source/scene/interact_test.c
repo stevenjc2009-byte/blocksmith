@@ -28,6 +28,11 @@
 #include "world/block.h"
 #include "world/inventory.h"
 #include "world/light.h"
+// v1.8.8: the cactus case asserts the break landed on the tick breakTicksRequired() says it
+// should, rather than on "some tick > 0". world/mining.c is already in this binary's link
+// line — scene/interact.c calls it — so this is a header the suite was missing, not a new
+// dependency.
+#include "world/mining.h"
 #include "world/registry.h"
 
 static int  s_checks;
@@ -226,17 +231,95 @@ static int holdBreakUntilDone(Interact* it, const Body* body, int max_ticks)
 // world/inventory.h's inventoryCanHold() is the single home of the rule; if it ever says
 // something different from what the cases below assume, they would all still pass while
 // meaning something else. So it is pinned first.
+//
+// v1.8.8 REWROTE this rule and this test with it. It used to read
+//
+//     CHECK(inventoryCanHold(BLOCK_PLANKS));            // the last core id
+//     CHECK(!inventoryCanHold((ItemId)BLOCK_COUNT));    // one past it
+//     CHECK(!inventoryCanHold((ItemId)REG_ID_DYN_LO));  // the first server id
+//     CHECK(!inventoryCanHold((ItemId)REG_ID_DYN_HI));
+//
+// and every one of those four was a statement about the CONSTANT 8, not about the game. Note
+// what the old comments called things: planks "the last core id" when it was the last core id
+// BELOW THE CEILING — there were fifteen core rows by then and the bag admitted seven of them.
+// That is the bug steve reported as "the cactus cannot be broken".
+//
+// Two of those four lines would still pass verbatim today, which is why they are gone rather
+// than left in place: BLOCK_COUNT is 8 and id 8 is water, refused now for being a LIQUID, and
+// REG_ID_DYN_HI is refused now for being UNDEFINED. A check that passes for a reason unrelated
+// to what it claims is worse than no check.
 static void testTheCarryCeilingIsWhereItSays(void)
 {
+	// Air is not an item, and that has never moved.
 	CHECK(!inventoryCanHold(ITEM_NONE));
+	CHECK(!inventoryCanHold((ItemId)BLOCK_AIR));      // ITEM_NONE spelled the other way
+
+	// An ordinary block, below the old ceiling. The control: this was true before and must
+	// stay true, so a broken predicate that refuses everything cannot pass this suite.
 	CHECK(inventoryCanHold(BLOCK_STONE));
-	CHECK(inventoryCanHold(BLOCK_PLANKS));            // the last core id
-	CHECK(!inventoryCanHold((ItemId)BLOCK_COUNT));    // one past it
-	CHECK(!inventoryCanHold((ItemId)REG_ID_DYN_LO));  // the first server id
-	CHECK(!inventoryCanHold((ItemId)REG_ID_DYN_HI));
+	CHECK(inventoryCanHold(BLOCK_PLANKS));
+
+	// THE regression. Every one of these is an id the old `< BLOCK_COUNT` test refused, and
+	// every one of them is a real block a player meets in a real world.
+	CHECK(inventoryCanHold((ItemId)BLOCK_TALL_GRASS));   // 9
+	CHECK(inventoryCanHold((ItemId)BLOCK_SNOW));         // 10
+	CHECK(inventoryCanHold((ItemId)BLOCK_ICE));          // 11
+	CHECK(inventoryCanHold((ItemId)BLOCK_CACTUS));       // 12 — the reported defect
+	CHECK(inventoryCanHold((ItemId)BLOCK_DEAD_BUSH));    // 13
+	CHECK(inventoryCanHold((ItemId)BLOCK_FERN));         // 14
+
+	// The BOUNDARY, both sides of it, and it is now the edge of the DEFINED core table
+	// rather than a compile-time constant: id 26 is the last defined core row and id 27 is
+	// the first undefined one, now that v1.8.8's twelve per-biome rows (ids 15..26) have
+	// landed. registryCount() is read here rather than hard-coded so this pair keeps
+	// straddling the real edge if another biome rung ever lands on top of this one.
+	const ItemId last_defined  = (ItemId)(registryCount() - 1);
+	const ItemId first_beyond  = (ItemId)registryCount();
+	CHECK(last_defined == (ItemId)BLOCK_APPLE);          // premise: the table is 27 rows
+	CHECK(inventoryCanHold(last_defined));
+	CHECK(!inventoryCanHold(first_beyond));
+
+	// Liquids stay out, and this is the ONE core row the widened rule still refuses. Not
+	// because of where it sits in the id space — it is id 8, right where the old ceiling was,
+	// and that coincidence is exactly why the old `!inventoryCanHold(BLOCK_COUNT)` line had
+	// to be deleted rather than kept.
+	CHECK(!inventoryCanHold((ItemId)BLOCK_WATER));
+
+	// The dynamic range. UNDEFINED ids are refused, defined ones are not — so the answer
+	// tracks the registry rather than the address, which is the whole change. Registering
+	// here is safe for the cases below: they use ids this never touches.
+	CHECK(!inventoryCanHold((ItemId)REG_ID_DYN_HI));     // never registered by this suite
+	const BlockId dyn = registerDynBlock("ceiling_probe");
+	CHECK(dyn >= REG_ID_DYN_LO);
+	CHECK(inventoryCanHold((ItemId)dyn));                // was FALSE before v1.8.8
+	CHECK(!inventoryCanHold((ItemId)0xFF));              // reserved, never a row
+
+	// The WIRE span is a SEPARATE and much smaller ceiling, and it did NOT move. This is the
+	// gap the report has to name: the bag holds every defined row, but only ids below
+	// BLOCK_COUNT can be named in a BS_INV_OP_PICKUP that an unpatched server will accept.
+	CHECK(inventoryItemOnWire((ItemId)BLOCK_PLANKS));    // 7, the last id on the wire
+	CHECK(!inventoryItemOnWire((ItemId)BLOCK_WATER));    // 8, one past it
+	CHECK(!inventoryItemOnWire((ItemId)BLOCK_CACTUS));   // carryable, NOT sendable
+	CHECK(!inventoryItemOnWire(ITEM_NONE));
 }
 
 // ── the defect ──────────────────────────────────────────────────────────────────────────
+
+// An id the bag genuinely cannot hold, for the cases below that need one. It is an id in the
+// server range that this suite NEVER registers, so registryIsDefined() is false for it and
+// inventoryCanHold() refuses it.
+//
+// v1.8.8 had to invent this. Until now these cases used registerDynBlock(), because before
+// the fix EVERY dynamic id was over the ceiling by definition — being at 0x80 was the whole
+// reason the bag refused it. Now the bag refuses ids it has no ROW for, so a registered
+// dynamic block is perfectly carryable and using one here would have quietly turned the two
+// refusal cases below into tests that a block breaks. They went red, which is how this was
+// found rather than reasoned.
+//
+// REG_ID_DYN_HI is the choice because registryRegister() hands ids out counting UP from
+// REG_ID_DYN_LO, so the top of the range is the last thing this suite could ever collide
+// with; the ceiling test above pins that it is undefined before anything else runs.
+#define UNCARRYABLE_ID ((BlockId)REG_ID_DYN_HI)
 
 // THE case this file exists for. Before the fix, interactEdit wrote BLOCK_AIR first and the
 // carry check happened afterwards in main.c, so the block was deleted from the world and
@@ -244,9 +327,9 @@ static void testTheCarryCeilingIsWhereItSays(void)
 // against that code.
 static void testABreakOnACarryUnholdableBlockChangesNothing(void)
 {
-	const BlockId dyn = registerDynBlock("test_dyn");
-	CHECK(dyn >= REG_ID_DYN_LO);
-	if (dyn < REG_ID_DYN_LO) return;
+	const BlockId dyn = UNCARRYABLE_ID;
+	CHECK(!inventoryCanHold((ItemId)dyn));      // the premise, not an assumption
+	CHECK(!blockDropsNothing(dyn));             // and it is not a plant taking the other path
 
 	Interact it;
 	freshAimedAt(&it, dyn);
@@ -289,9 +372,17 @@ static void testABreakOnACarryUnholdableBlockChangesNothing(void)
 // this guard never touched the one block a player actually meets.
 static void testTallGrassBreaksAndDropsNothing(void)
 {
-	// The premise, pinned first: this really is an id the bag cannot hold. If tall grass ever
-	// moves below the ceiling this goes red, and the rest stops proving what it claims.
-	CHECK(!inventoryCanHold((ItemId)BLOCK_TALL_GRASS));
+	// The premise, pinned first, and v1.8.8 INVERTED it. This line used to read
+	//
+	//     CHECK(!inventoryCanHold((ItemId)BLOCK_TALL_GRASS));
+	//
+	// and the comment under it said "if tall grass ever moves below the ceiling this goes red".
+	// It did go red, and correctly: tall grass is id 9 and the bag now holds it. What must not
+	// change is the OTHER half — the plant still yields nothing when broken, and it yields
+	// nothing because of its SHAPE, never because of its id. Keeping both lines here is what
+	// makes that separation visible: carryable and drops-nothing are now plainly independent,
+	// where the old pair could be read as one fact stated twice.
+	CHECK(inventoryCanHold((ItemId)BLOCK_TALL_GRASS));   // was !, before v1.8.8
 	CHECK(blockDropsNothing(BLOCK_TALL_GRASS));
 	CHECK(!blockDropsNothing(BLOCK_STONE));          // control: an ordinary block still drops
 
@@ -343,9 +434,8 @@ static void testAnOrdinaryBlockStillDropsItself(void)
 // block on the second press.
 static void testRepeatedBreakAttemptsStillChangeNothing(void)
 {
-	const BlockId dyn = registerDynBlock("test_dyn2");
-	CHECK(dyn >= REG_ID_DYN_LO);
-	if (dyn < REG_ID_DYN_LO) return;
+	const BlockId dyn = UNCARRYABLE_ID;   // see the note on UNCARRYABLE_ID: v1.8.8 changed this
+	CHECK(!inventoryCanHold((ItemId)dyn));
 
 	Interact it;
 	freshAimedAt(&it, dyn);
@@ -384,19 +474,148 @@ static void testACoreBlockStillBreaks(void)
 
 // Every core id, not just stone: the guard is a predicate over ids, so a version of it that
 // happened to admit stone and reject something else would pass the case above.
+//
+// v1.8.8 WIDENED the loop, and the old bound is the bug. It read
+//
+//     for (BlockId id = BLOCK_GRASS; id < BLOCK_COUNT; id++)
+//
+// which walks ids 1..7 and stops — seven of the fifteen rows the game actually ships. Snow,
+// ice, cactus, dead bush and fern were all outside it, so "every core block still breaks" was
+// a green check that had never once looked at the block steve reported as unbreakable. That is
+// the whole defect in one line: a bound written as a constant walks the constant, not the game.
+//
+// It now walks the whole CORE id space and skips what has no row, so the row a future biome
+// adds is covered the moment it is registered and nobody has to remember to widen anything.
+// The bound is REG_ID_CORE_HI rather than registryCount() on purpose: freshAimedAt() calls
+// registryInitCore() on every iteration, and a count taken across that would be a bound that
+// moves underneath its own loop.
 static void testEveryCoreBlockStillBreaks(void)
 {
-	for (BlockId id = BLOCK_GRASS; id < BLOCK_COUNT; id++) {
+	// Premise: the loop really is looking at more than the old seven. Without this a table
+	// that had somehow shrunk back to eight rows would leave the loop exactly as narrow as it
+	// was while reading as if it had been fixed.
+	CHECK(registryCount() > BLOCK_COUNT);
+
+	int targetable_seen = 0;
+	int cross_seen      = 0;
+
+	for (BlockId id = BLOCK_GRASS; id <= REG_ID_CORE_HI; id++) {
+		if (!registryIsDefined(id)) continue;
+		// Water is the one core row a crosshair cannot land on, so it is skipped rather than
+		// asserted about here — testTheCarryCeilingIsWhereItSays owns the liquid rule, and a
+		// break case that "passed" on a block no ray can hit would prove nothing.
+		if (!blockIsTargetable(id)) continue;
+		targetable_seen++;
+
 		Interact it;
 		freshAimedAt(&it, id);
 		const Body body = farAwayBody();
 		CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) > 0);
 
 		CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_AIR);
-		CHECK(it.broke_id == id);
 		CHECK(it.refused == 0);
 		CHECK(s_edits_sent == 1);
+
+		// What reaches the bag splits by SHAPE, not by id: a cross-quad plant is removed and
+		// yields nothing (breakComplete hands main.c BLOCK_AIR), everything else drops itself.
+		if (blockDropsNothing(id)) {
+			cross_seen++;
+			CHECK(it.broke_id == BLOCK_AIR);
+		} else {
+			CHECK(it.broke_id == id);
+		}
 	}
+
+	// The loop ran, and ran over both kinds. A `continue` that swallowed everything would
+	// otherwise leave this function green having made no assertion at all — the vault's
+	// "a check that could not fail proves nothing", written as two counters.
+	CHECK(targetable_seen == 25);   // 26 rows past air, less water
+	CHECK(cross_seen == 8);         // tall grass, dead bush, fern, tall grass top,
+	                                 // poppy, daisy, bluebell, orchid
+}
+
+// ── v1.8.8: the reported defect, end to end ─────────────────────────────────────────────
+
+// steve's report, in his words: the cactus cannot be broken. This is that exact sequence —
+// aim at a cactus, hold break, and assert all four halves of what "breakable" means.
+//
+// It is a separate case from the loop above on purpose. The loop proves the RULE; this proves
+// the INSTANCE that was reported, so the report has an answer that does not depend on reading
+// a bound. Against the pre-v1.8.8 client every check below is red at the first one.
+static void testTheCactusBreaksAndDropsItself(void)
+{
+	// 1. The bag will take it. This is the line that was false, and the only thing that was
+	//    ever wrong with the cactus.
+	CHECK(inventoryCanHold((ItemId)BLOCK_CACTUS));
+	// 2. It is a full cube, so it drops ITSELF rather than taking the plant path.
+	CHECK(!blockDropsNothing(BLOCK_CACTUS));
+	CHECK(blockIsTargetable(BLOCK_CACTUS));
+
+	Interact it;
+	freshAimedAt(&it, BLOCK_CACTUS);
+	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_CACTUS);
+
+	const Body body = farAwayBody();
+	const int landed = holdBreakUntilDone(&it, &body, NEVER_TICKS);
+
+	// 3. It breaks, and it breaks on ITS OWN clock. 9 ticks is the cactus row's hardness and
+	//    nothing else's — snow is 8 and ice is 10, so a break time borrowed from a neighbour
+	//    lands on the wrong tick and this goes red. An `== 9` rather than a `> 0` is the
+	//    difference between "it broke" and "it broke with its own durability".
+	CHECK(landed == 9);
+	CHECK(landed == (int)breakTicksRequired(BLOCK_CACTUS, ITEM_NONE));
+	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_AIR);
+	CHECK(it.broke == 1);
+	CHECK(it.refused == 0);
+
+	// 4. And the cactus itself is what main.c is handed for the bag — not air, not the id of
+	//    something else.
+	CHECK(it.broke_id == BLOCK_CACTUS);
+	CHECK(inventoryCanHold((ItemId)it.broke_id));
+
+	CHECK(s_edits_sent == 1);
+	CHECK(s_last_block == BLOCK_AIR);
+}
+
+// The guard in scene/interact.c that refuses a break on an id the bag cannot hold. Named in
+// that file's comment, because v1.8.8 makes it far easier to delete than to keep.
+//
+// The honest position, and the reason this test says what it says: through the PRODUCTION
+// raycast the branch can no longer fire. world/raycast.c stops on blockIsTargetable(), which
+// is now "drawn && !liquid", and inventoryCanHold() is "defined && !air && !liquid" — the same
+// set. So no ray can hand breakProgress() an id the bag refuses.
+//
+// It is kept, and tested, because "no ray can produce it" is not "it cannot happen" and
+// certainly not "it will never happen again". A server whose registry sync failed leaves ids
+// in the world this client has no row for, and the first ItemId that is not a BlockId — a
+// tool, the apple v1.8.8 is being built for — separates the two predicates again on purpose.
+// This case reaches the branch the only way anything can: by handing interactEdit a hit on an
+// undefined id directly, which is exactly the state a failed registry sync leaves behind.
+static void testTheBreakGuardStillRefusesTheUncarryable(void)
+{
+	// The two predicates agree across every id a raycast can produce. This is the fact that
+	// makes the branch unreachable in play, stated as a check so it cannot rot silently: the
+	// day it stops being true, this goes red and the branch has a live case again.
+	registryInitCore();
+	int agreed = 0;
+	for (BlockId id = 0; id <= REG_ID_CORE_HI; id++) {
+		CHECK(blockIsTargetable(id) == inventoryCanHold((ItemId)id));
+		agreed++;
+	}
+	CHECK(agreed == REG_ID_CORE_HI + 1);   // the loop ran over the whole core id space
+
+	// And the branch still does its job when reached. Same shape as the v1.6.0 defect case:
+	// the block stays, nothing is offered to the bag, nothing goes on the wire.
+	Interact it;
+	freshAimedAt(&it, UNCARRYABLE_ID);
+	const Body body = farAwayBody();
+
+	CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) == -1);
+	CHECK(worldGet(&s_world, TX, TY, TZ) == UNCARRYABLE_ID);
+	CHECK(it.broke == 0);
+	CHECK(it.broke_id == BLOCK_AIR);
+	CHECK(it.refused == 1);
+	CHECK(s_edits_sent == 0);
 }
 
 static void testACoreBlockStillPlaces(void)
@@ -1158,6 +1377,156 @@ static void testAFullQueueStillRelightsInline(void)
 	interactSetRelightQueue(NULL);
 }
 
+// ── apples (v1.8.8: "apples dropping from leaves, pickable and functional") ─────────────
+//
+// interact.c's breakComplete() rolls a POSITIONAL hash (world/rng.h's rngHash3) rather than
+// exposing the roll itself — appleDropRoll and blockIsAppleBearingLeaves are static to that
+// file, the same way this file has never reached into any of interact.c's other static
+// helpers. What is tested here is the OBSERVABLE behaviour: what it->broke_id reads after a
+// real break, driven through the real interactEdit()/breakComplete() path, at coordinates a
+// hand-written Python replica of rngHash3 (byte-for-byte, matching the salt 0xA9D1E0 in
+// interact.c) already evaluated before this test was written. This file does not reimplement
+// the hash; it checks the real one against numbers worked out independently of it.
+//
+// Deliberately NOT at (TX,TY,TZ) — the fixture every other case in this file shares. Both
+// BLOCK_LEAVES and BLOCK_BIRCH_LEAVES were checked against that exact coordinate by the same
+// replica before this feature was written, and neither rolls a hit there, which is what keeps
+// testEachBlockTakesItsOwnHardness() and testEveryCoreBlockStillBreaks() (both of which
+// assert broke_id == the leaf's own id at that fixture) green without touching either case.
+
+// A fresh world and registry, with `target_block` placed at an arbitrary (x,y,z) rather than
+// the shared (TX,TY,TZ) fixture. Mirrors freshAimedAt()'s body; kept separate rather than
+// parameterising that function, because every other case in this file depends on the fixture
+// staying fixed at TX/TY/TZ and a silent extra parameter is how that would stop being true.
+static void freshAimedAtCoord(Interact* it, BlockId target_block, int x, int y, int z)
+{
+	registryInitCore();
+	worldExit(&s_world);
+	worldInit(&s_world);
+	s_edits_sent   = 0;
+	s_last_block   = 0xFF;
+	s_send_ok      = true;
+	s_session_live = false;
+	interactSetRelightQueue(NULL);
+
+	worldSet(&s_world, x, y, z, target_block);
+
+	interactInit(it);
+	it->target.hit  = true;
+	it->target.x    = x;
+	it->target.y    = y;
+	it->target.z    = z;
+	it->target.face = FACE_TOP;
+	it->target.px   = x;
+	it->target.py   = y + 1;
+	it->target.pz   = z;
+}
+
+// One break at (x,y,z) in the world the caller already has, re-aiming and re-placing the
+// block fresh each call. Used by the grid sweep below, where paying freshAimedAtCoord's full
+// registry/world reset for each of 5000 cells would redo the same init work five thousand
+// times for no reason: only the one cell being broken needs to start fresh, and this sets
+// that itself.
+static BlockId breakOneAndReadDrop(Interact* it, int x, int y, int z, BlockId block)
+{
+	worldSet(&s_world, x, y, z, block);
+	interactInit(it);
+	it->target.hit  = true;
+	it->target.x    = x;
+	it->target.y    = y;
+	it->target.z    = z;
+	it->target.face = FACE_TOP;
+	it->target.px   = x;
+	it->target.py   = y + 1;
+	it->target.pz   = z;
+
+	const Body body = farAwayBody();
+	// One oversized-tick frame lands the break in a single call: breakProgress starts the
+	// hold and completes it in the same call once break_ticks (now `ticks`) reaches
+	// break_need, and nothing between here and there is being timed.
+	holdBreakFrame(it, &body, 1000);
+	return it->broke_id;
+}
+
+#define APPLE_HIT_X   9
+#define APPLE_HIT_Y  40
+#define APPLE_HIT_Z  36
+#define APPLE_MISS_X  0
+#define APPLE_MISS_Y 40
+#define APPLE_MISS_Z  0
+
+// THE feature. A known hit and a known miss, worked out independently before this test was
+// written — this is the real hash being checked against numbers it did not produce.
+static void testALeafSometimesDropsAnApple(void)
+{
+	Interact it;
+	const Body body = farAwayBody();
+
+	freshAimedAtCoord(&it, BLOCK_LEAVES, APPLE_HIT_X, APPLE_HIT_Y, APPLE_HIT_Z);
+	CHECK(holdBreakUntilDone(&it, &body, 20) > 0);
+	CHECK(it.broke_id == (ItemId)BLOCK_APPLE);
+	CHECK(worldGet(&s_world, APPLE_HIT_X, APPLE_HIT_Y, APPLE_HIT_Z) == BLOCK_AIR);
+
+	freshAimedAtCoord(&it, BLOCK_LEAVES, APPLE_MISS_X, APPLE_MISS_Y, APPLE_MISS_Z);
+	CHECK(holdBreakUntilDone(&it, &body, 20) > 0);
+	CHECK(it.broke_id == (ItemId)BLOCK_LEAVES);   // the ordinary case: the leaf drops itself
+}
+
+// Spruce is explicitly excluded — registry.c's own row comment says apples "grow in oak and
+// birch canopies", never spruce — checked at the SAME coordinate an oak/birch leaf rolls a
+// hit at, so this is a real exclusion and not just "spruce was never tried at a hitting cell".
+static void testSpruceLeavesNeverDropAnApple(void)
+{
+	Interact it;
+	const Body body = farAwayBody();
+
+	freshAimedAtCoord(&it, BLOCK_SPRUCE_LEAVES, APPLE_HIT_X, APPLE_HIT_Y, APPLE_HIT_Z);
+	CHECK(holdBreakUntilDone(&it, &body, 20) > 0);
+	CHECK(it.broke_id == (ItemId)BLOCK_SPRUCE_LEAVES);
+}
+
+// ── the statistical rate ─────────────────────────────────────────────────────────────────
+//
+// A 50x50 grid (2500 cells, y fixed at 40) is exactly the sweep the Python replica ran before
+// any of this was written, and the two counts pinned below are what it printed. Reproducing
+// them here through the REAL interactEdit()/breakComplete() path — not by calling rngHash3
+// directly, which this file cannot do; appleDropRoll is static to interact.c — is what proves
+// the production code matches the independently-worked-out numbers rather than merely
+// matching itself.
+static void testAppleDropRateOverAGrid(void)
+{
+	Interact it;
+	int leaves_hits = 0, birch_hits = 0, spruce_hits = 0;
+
+	for (int z = 0; z < 50; z++) {
+		for (int x = 0; x < 50; x++) {
+			if (breakOneAndReadDrop(&it, x, 40, z, BLOCK_LEAVES) == (ItemId)BLOCK_APPLE)
+				leaves_hits++;
+			if (breakOneAndReadDrop(&it, x, 40, z, BLOCK_BIRCH_LEAVES) == (ItemId)BLOCK_APPLE)
+				birch_hits++;
+			// Spruce swept over the SAME 2500 cells as leaves and birch, not just checked at
+			// one coordinate. A single-coordinate spruce check was tried first and sabotaging
+			// blockIsAppleBearingLeaves() to also accept BLOCK_SPRUCE_LEAVES slipped past it
+			// clean — the one coordinate that test used happens not to roll a hit for spruce's
+			// id (the id feeds the hash, so leaves and spruce roll independently at the same
+			// cell), so a check that could not tell the sabotaged build from the real one was
+			// proving nothing. Sweeping the grid and pinning the count at zero is what a
+			// leaves-rate-sized sabotage (in this arm, effectively another ~7-in-2500) cannot
+			// pass through unnoticed.
+			if (breakOneAndReadDrop(&it, x, 40, z, BLOCK_SPRUCE_LEAVES) == (ItemId)BLOCK_APPLE)
+				spruce_hits++;
+		}
+	}
+
+	// Roughly 2500/200 = 12.5 expected of a true 1-in-200 draw; a deterministic positional
+	// hash over a finite grid is not required to land near its own expectation, and these two
+	// numbers are pinned because they are what the hash actually produces, not because they
+	// are close to 12.5.
+	CHECK(leaves_hits == 7);
+	CHECK(birch_hits  == 9);
+	CHECK(spruce_hits == 0);
+}
+
 int main(void)
 {
 	// v1.8.6: see the section comment above testABreakRelightsTheColumnItLeftBehind for why
@@ -1173,6 +1542,13 @@ int main(void)
 	testRepeatedBreakAttemptsStillChangeNothing();
 	testACoreBlockStillBreaks();
 	testEveryCoreBlockStillBreaks();
+
+	// v1.8.8 — the item ceiling. The cactus case is the reported defect; the guard case is
+	// the branch that used to enforce the old ceiling and now has almost nothing left to
+	// refuse.
+	testTheCactusBreaksAndDropsItself();
+	testTheBreakGuardStillRefusesTheUncarryable();
+
 	testACoreBlockStillPlaces();
 	testADynamicBlockStillPlaces();
 	testAimingAtNothingIsStillARefusal();
@@ -1203,6 +1579,11 @@ int main(void)
 	testQueuedAndInlineRelightsAgreeByteForByte();
 	testAPlacedBlocksQueuedRelightMatchesTheInlineOne();
 	testAFullQueueStillRelightsInline();
+
+	// v1.8.8 — apples from leaves.
+	testALeafSometimesDropsAnApple();
+	testSpruceLeavesNeverDropAnApple();
+	testAppleDropRateOverAGrid();
 
 	if (s_fails == 0)
 		printf("interact self-test: PASS  %d checks\n", s_checks);

@@ -6,7 +6,7 @@
 // heaps: the mesh pool is linearAlloc and the world store is calloc/malloc, and app/heapsplit.h
 // is the file that had to work that out before the New 3DS could be given a wider ring at all.
 // A New 3DS at radius 5 spends 46,948,352 bytes of its 64 MB linear heap on the pool; the
-// world store's 11,160,160 comes out of the 59,715,584 bytes of application heap left beside
+// world store's 11,225,808 comes out of the 59,715,584 bytes of application heap left beside
 // it. They do not compete, and this binary is where that stops being a claim.
 //
 // ── Why the numbers are carried rather than computed ──────────────────────────────────────
@@ -44,6 +44,7 @@
 #include <stdio.h>
 
 #include "app/heapsplit.h"
+#include "app/lanes.h"
 #include "scene/render_dist.h"
 #include "world/budget.h"
 #include "world/chunk.h"
@@ -94,6 +95,19 @@ int main(void)
 	CHECK(chunkFormBytes(CHUNK_FORM_RAW) >= chunkFormBytes(CHUNK_FORM_UNIFORM));
 	CHECK(2u * LIGHT_COL_BYTES == TARGET_LIGHT_COLUMN_BYTES);
 	CHECK(COLUMN_CHUNKS == 8);
+
+	// The staging charge must equal the number of generator lanes that can exist, because every
+	// lane owns its own staging world (app/worker.c's Lane.staging) and can hold a staged column
+	// at the same time as every other. world/budget.h cannot #include this constant — it owes no
+	// include to anything, which is what lets thirteen host link lines carry it — so the two are
+	// pinned HERE instead, where app/lanes.h is free to be read.
+	//
+	// This check exists because the pair was already wrong once. BUDGET_STAGING_COLUMNS stayed 1
+	// through the whole of the second lane's v1.8.8 work and understated the radius-5 worst case
+	// by one column, 65,648 B. It was recorded in app/worker.h rather than fixed, because that
+	// change did not own this file. A third lane would do exactly the same thing silently; now
+	// it fails here first.
+	CHECK(BUDGET_STAGING_COLUMNS == WORKER_LANES_MAX);
 
 	// Every target term is at or below its host term, because the only difference is pointer
 	// width. Stated as a check rather than as a sentence: it is what makes the host arithmetic

@@ -88,8 +88,16 @@ InvAddResult invBridgeAdd(Inventory* inv, ItemId item, uint8_t count, uint8_t* o
 	// count is what was offered, leftover what would not fit; the difference is what the
 	// inventory is now actually holding, and that is the only number the server should be told
 	// about. INV_ADD_REFUSED means leftover == count, so `landed` is 0 and nothing goes out.
+	//
+	// inventoryItemOnWire, not inventoryCanHold (v1.8.8). The two were the same predicate until
+	// v1.8.8 widened the BAG to the whole registry; the WIRE item span is still BS_BLOCK_COUNT
+	// == 8, in deps/blocksmith-server, a repo this client does not own. The bag really is
+	// holding the cactus — this only decides whether the server is told, and an old server's
+	// `if (a < BS_BLOCK_COUNT && ...)` has no else, so telling it would be a datagram it
+	// discards. See world/inventory.h's inventoryItemOnWire() for what the gap costs a player on
+	// a server and for the one change across both repos that closes it.
 	const uint8_t landed = (uint8_t)(count - leftover);
-	if (landed > 0 && inventoryCanHold(item))
+	if (landed > 0 && inventoryItemOnWire(item))
 		(void)networldSendInvAction(BS_INV_OP_PICKUP, (uint8_t)item, landed, 0);
 
 	return r;
@@ -99,7 +107,9 @@ uint8_t invBridgeRemove(Inventory* inv, ItemId item, uint8_t count)
 {
 	const uint8_t removed = inventoryRemove(inv, item, count);
 
-	if (removed > 0 && inventoryCanHold(item))
+	// inventoryItemOnWire for the same reason as invBridgeAdd above: the bag's ceiling and the
+	// wire's parted company in v1.8.8, and this is the wire.
+	if (removed > 0 && inventoryItemOnWire(item))
 		(void)networldSendInvAction(BS_INV_OP_CONSUME, (uint8_t)item, removed, 0);
 
 	return removed;

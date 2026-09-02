@@ -181,6 +181,40 @@ TILES = [
     "cactus",
     "dead_bush",
     "fern",
+    # v1.8.8's fourteen, claiming slots 17..30 — the lowest free ones. Appended for the
+    # reason everything since the sentinel has been: this order IS the contract with
+    # gfx/atlas_tiles.h's TILE_* enum and world/block.h's BTEX_* mirror of it, so
+    # inserting would silently re-texture every tile after the insertion point.
+    #
+    # The two WOOD SETS come first and are grouped by species rather than by face, so
+    # that a set is a contiguous run of four and adding a third species later is an
+    # append rather than four insertions in four places.
+    #
+    # Each set is here rather than being a TINT of the oak set because a tint is a
+    # per-channel multiply: it can change hue, but it cannot move a groove, re-space a
+    # plate, or change which texels are alpha 0. Each painter's docstring says which of
+    # those it is relying on. Where the difference WOULD have been only hue — the jungle
+    # — no set was added and the biome keeps oak.
+    "birch_log_side",   # 17
+    "birch_log_top",    # 18
+    "birch_planks",     # 19
+    "birch_leaves",     # 20
+    "spruce_log_side",  # 21
+    "spruce_log_top",   # 22
+    "spruce_planks",    # 23
+    "spruce_leaves",    # 24
+    # The plants. tall_grass_top is the upper half of the two-block clump and must join
+    # tile_tall_grass (slot 11) at the seam; the four flowers are BLOCK_SHAPE_CROSS like
+    # tall_grass, dead_bush and fern.
+    "tall_grass_top",   # 25
+    "poppy",            # 26
+    "daisy",            # 27
+    "bluebell",         # 28
+    "orchid",           # 29
+    # A FULL_CUBE, unlike every other plant-ish tile above it. tile_apple says why: a
+    # cross block is handed BLOCK_AIR by breakComplete(), and an apple that yields
+    # nothing when broken is not an apple.
+    "apple",            # 30
 ]
 
 
@@ -494,8 +528,20 @@ def tile_tall_grass(rng):
     slot, and slot_png_y() is what applies the sheet-wide V flip), so the blades are
     rooted on the last row and grow upwards.
     """
-    blades = [(72, 132, 68), (86, 150, 78), (58, 112, 58)]
-    tip    = (126, 184, 100)
+    # Colour-mismatch fix (steve, testing v1.8.7): "the grass block color is sort of like a
+    # dark green, whereas the actual grass grass, like, that stands up, is like a lime
+    # green, and it's really weird." Measured (offline rasterizer replay of world_dynamic.v.pica,
+    # plains/identity tint): block top face averaged (63,120,79), the old blade/tip palette here
+    # averaged (81,141,74) — a real base-texture mismatch, not a lighting difference (both
+    # surfaces measured ao=3, face=TOP, faceShade=1.00, identical pad byte). tile_grass_top and
+    # tile_grass_side are NOT touched by this fix — the block's own art stays exactly as painted
+    # (see world/mesher.h's "PLAINS IS EXACTLY (1,1,1) ON PURPOSE" note) — instead the blades and
+    # tip are repainted using tile_grass_top's own colours (three of its four greens, and its own
+    # highlight colour as the tip) so the standing grass reads as grown from the same block it
+    # stands on, in every biome the tint system can produce. Re-measured average after this
+    # change: (63,120,79) vs (63,120,79) — see grasscol_render.c / -log.md for the full table.
+    blades = [(58, 112, 74), (50, 100, 66), (74, 138, 90)]
+    tip    = (88, 152, 100)
 
     img = Image.new("RGBA", (TILE_PX, TILE_PX), (0, 0, 0, 0))
     px = img.load()
@@ -666,8 +712,26 @@ def tile_cactus(rng):
     return img
 
 
-def tile_dead_bush(rng):
-    """Dead bush — v1.8.3 phase 3, and a BLOCK_SHAPE_CROSS tile like tall_grass.
+def _dead_bush_v1(rng):
+    """v1.8.3 phase 3's dead bush. NOT painted any more — v1.8.8 redrew it (see
+    tile_dead_bush below). It is kept, and still CALLED, for one reason: it is what
+    advances the shared seeded stream by exactly the number of draws it always did.
+
+    Every painted tile comes out of ONE random.Random in TILES order, so the art of
+    slot N depends on how many values every painter before it consumed. Deleting this
+    body and drawing the new bush in its place would have changed the stream position
+    that tile_fern (slot 16) starts from, and fern's art would have silently changed —
+    a tile nobody asked to touch, whose pinned fingerprint in
+    source/world/atlas_uv_shader_test.c would then have had to be re-pinned to hide it.
+
+    Calling it and throwing the image away costs one tile's worth of drawing at build
+    time and keeps slot 16 bit-identical. That is the proof, not the claim: fern's
+    existing fingerprint 0x003F0B7EA35C1195 is left UNCHANGED in that test, so if this
+    alignment were wrong the suite goes red.
+
+    Original docstring follows.
+
+    Dead bush — v1.8.3 phase 3, and a BLOCK_SHAPE_CROSS tile like tall_grass.
 
     Returns RGBA and is mostly alpha 0, with alpha only ever 0 or 255, for the reason
     spelled out in tile_tall_grass and tile_leaves: the draw is an alpha test, so a
@@ -780,6 +844,659 @@ def tile_fern(rng):
     return img
 
 
+# ── v1.8.8: the redrawn dead bush, the per-biome woods, and the plants ────────────────
+#
+# Everything below this line is v1.8.8. The woods come in matched SETS (log side, log top,
+# planks, leaves) because a tree is not one tile, and each set is here rather than being a
+# TINT of the oak set for a reason stated on each painter: a tint is a per-channel multiply,
+# so it can change a tile's HUE but it can never move a groove, re-space a plate, or change
+# which texels are alpha 0. Where the only difference would have been hue, no set was added
+# and the biome keeps oak — see the note on the jungle in source/world/worldgen.c.
+
+
+def tile_dead_bush(rng):
+    """Dead bush, REDRAWN for v1.8.8 at steve's request ("dead bushes redone").
+
+    Draws from its OWN seeded stream, not the shared one. `rng` is still taken and is
+    still spent — on _dead_bush_v1 above — so that slot 16's fern is untouched by this
+    redraw; see that function for the whole argument. The art below therefore cannot
+    shift any other tile however much it is edited, which is exactly what a tile that
+    has now been redrawn once is likely to want again.
+
+    What was wrong with v1: it was three twigs on a 3/8/12 grid, all rooted on the
+    bottom row, all forking upward. At 16x16 that read as three separate sticks rather
+    than as one dead shrub — the eye grouped them by their even spacing, and there was
+    nothing connecting them near the ground where a real bush is densest.
+
+    Three changes, all shape rather than colour, because on a 5-bit sheet next to sand
+    and dirt colour is not what carries this tile:
+      * a low SPRAWL — two near-horizontal runners across the bottom third, which is
+        what ties the uprights into one plant instead of three,
+      * uneven roots (jittered off 2/7/13) so the spacing stops reading as a comb, and
+      * a sun-bleached top: twigs pick a paler shade the higher they get, so the bush
+        has a light direction instead of being one flat brown.
+
+    Alpha stays 0 or 255 and never between, and there is still no opaque border, for
+    the reasons tile_tall_grass and tile_leaves give at length.
+    """
+    _dead_bush_v1(rng)   # stream alignment only — see _dead_bush_v1's docstring
+
+    # Its own stream. The seed is arbitrary and fixed; what matters is that it is not
+    # the shared one.
+    r = random.Random(0x1E4D8175)
+
+    low  = [(112, 80, 44), (126, 92, 52)]              # shaded, near the ground
+    high = [(150, 114, 68), (166, 130, 80)]            # sun-bleached, up top
+
+    img = Image.new("RGBA", (TILE_PX, TILE_PX), (0, 0, 0, 0))
+    px = img.load()
+
+    def shade_for(y):
+        """Paler the higher up the tile — y 0 is the TOP row (see tile_tall_grass)."""
+        return r.choice(high if y < TILE_PX // 2 else low)
+
+    def walk(x, y, dx, dy, steps):
+        """One twig. Returns every (x, y) it covered so a fork can leave from the
+        middle of it rather than only from the tip — v1's tip-only forking is what
+        drew a stick figure."""
+        path = []
+        for _ in range(steps):
+            if not (0 <= y < TILE_PX):
+                break
+            x = max(0, min(TILE_PX - 1, x))
+            px[x, y] = shade_for(y) + (255,)
+            path.append((x, y))
+            x += dx
+            y += dy
+            if r.random() < 0.34:
+                dx = r.choice((-1, 0, 1))
+        return path
+
+    # The sprawl first, so uprights drawn afterwards sit ON it rather than under it.
+    # Near-horizontal (dy 0 most steps), low in the cell, and this is the whole reason
+    # the redraw reads as one shrub.
+    for base_y, dirn in ((TILE_PX - 1, 1), (TILE_PX - 2, -1)):
+        x = 7 + r.choice((-2, -1, 0, 1))
+        y = base_y
+        for _ in range(4 + r.randrange(4)):
+            x = max(0, min(TILE_PX - 1, x + dirn))
+            if r.random() < 0.3:
+                y = max(0, min(TILE_PX - 1, y - 1))
+            px[x, y] = shade_for(y) + (255,)
+
+    # Uprights, jittered off an uneven set of roots.
+    for root in (2, 7, 13):
+        x = max(0, min(TILE_PX - 1, root + r.choice((-1, 0, 1, 2))))
+        stem = walk(x, TILE_PX - 1, r.choice((-1, 0, 1)), -1, 6 + r.randrange(6))
+        for _ in range(2 + r.randrange(3)):
+            if len(stem) < 3:
+                break
+            # Never the root (a fork there floats free of the ground) and never the
+            # tip (that was v1's defect).
+            bx, by = stem[r.randrange(1, len(stem) - 1)]
+            walk(bx, by, r.choice((-1, 1)), -1, 3 + r.randrange(4))
+    return img
+
+
+def tile_birch_log_side(rng):
+    """Birch bark — v1.8.8, and the clearest case in the sheet for a real tile rather
+    than a tint of wood_side.
+
+    A tint multiplies each channel, so it can lighten oak's bark but it cannot do
+    either of the two things that actually make birch birch: the field is PALE and the
+    marks on it are HORIZONTAL. Oak (tile_wood_side) is a dark field with vertical
+    grain and two full-height grooves; this is a near-white field with short dark
+    lenticel dashes lying across it. Rotating a groove is not a colour operation.
+
+    They are also far apart in value — oak's palest bark is (104,76,52) against this
+    tile's darkest field shade (194,188,170), a gap of 90 in red, i.e. eleven 5-bit
+    steps — so the two never read as two lightnesses of one wood.
+
+    Dashes are kept fully inside the tile and never touch column 0 or 15. u is the
+    axis greedy meshing merges along and GPU_REPEAT wraps this art onto itself, so a
+    dash running off one edge would join the one wrapping in from the other and draw a
+    continuous ruled line across a merged run — the defect tile_water's glints and
+    tile_planks' seams are both broken up to avoid.
+    """
+    bark = [(206, 200, 182), (218, 212, 196), (194, 188, 170), (228, 222, 208)]
+    mark = (72, 64, 56)
+    soft = (150, 142, 128)
+
+    img = speckle(rng, TILE_PX, bark, weights=[4, 3, 3, 2])
+    px = img.load()
+
+    # Lenticels: short horizontal dashes, 2..4 px, with a soft pixel on one end so they
+    # sit in the bark rather than on top of it.
+    for _ in range(9):
+        w = 2 + rng.randrange(3)
+        x = 1 + rng.randrange(TILE_PX - w - 2)
+        y = rng.randrange(TILE_PX)
+        for dx in range(w):
+            px[x + dx, y] = mark
+        if x + w < TILE_PX - 1:
+            px[x + w, y] = soft
+
+    # A couple of wider scars — two rows tall — so the tile has something at a second
+    # scale. A field of identical dashes reads as a pattern at 240p.
+    for _ in range(2):
+        w = 3 + rng.randrange(3)
+        x = 1 + rng.randrange(TILE_PX - w - 2)
+        y = rng.randrange(TILE_PX - 1)
+        for dy in range(2):
+            for dx in range(w):
+                px[x + dx, y + dy] = mark if dy == 0 else soft
+    return img
+
+
+def tile_birch_log_top(rng):
+    """Birch cut end — pale rings, same construction as tile_wood_top and deliberately
+    so: a cut log is a cut log, and what separates the two species here is the palette,
+    which on THIS tile is legitimate because the top face carries no directional
+    structure for a tint to falsify. It is the SIDE that could not be a tint.
+
+    The bark ring framing the cut is pale too, which is what stops it reading as an oak
+    log with a bleached middle.
+    """
+    pale = (226, 220, 204)
+    ring = (198, 190, 172)
+    edge = (128, 118, 102)
+    img = Image.new("RGB", (TILE_PX, TILE_PX))
+    px = img.load()
+    cx = 7.5 + rng.uniform(-1.2, 1.2)
+    cy = 7.5 + rng.uniform(-1.2, 1.2)
+    for y in range(TILE_PX):
+        for x in range(TILE_PX):
+            d = ((x - cx) ** 2 + (y - cy) ** 2) ** 0.5
+            band = int(d + rng.uniform(-0.35, 0.35)) // 2
+            px[x, y] = ring if band % 2 else pale
+            if d > 7.4:
+                px[x, y] = edge
+    return img
+
+
+def tile_birch_planks(rng):
+    """Birch boards. Same 4px board pitch as tile_planks — that pitch is a tiling
+    property, not a species one: 16 is a whole number of boards, so two stacked blocks
+    read as a continuous wall, and breaking that would be a regression for no gain.
+
+    Paler and far less yellow than oak planks: oak's base is (168,132,88), a 80-wide
+    red-to-blue spread; this is (198,186,158), a 40-wide one. So the two differ in
+    SATURATION as well as lightness, which is what keeps them apart in a hotbar where
+    they sit side by side — the test tile_planks itself sets against wood_side.
+    """
+    base = (198, 186, 158)
+    warm = (212, 200, 172)
+    cool = (182, 170, 144)
+    seam = (132, 118, 96)
+
+    img = Image.new("RGB", (TILE_PX, TILE_PX))
+    px = img.load()
+    board_h = 4
+    for y in range(TILE_PX):
+        board = y // board_h
+        tint = blend(cool, warm, (board * 0.31 + 0.15) % 1.0)
+        for x in range(TILE_PX):
+            px[x, y] = tint if rng.random() < 0.55 else blend(tint, base, 0.5)
+
+    for _ in range(22):
+        board = rng.randrange(TILE_PX // board_h)
+        y = board * board_h + rng.randrange(1, board_h)
+        x = rng.randrange(TILE_PX - 3)
+        shade = blend(px[x, y], seam, rng.uniform(0.18, 0.34))
+        for dx in range(rng.randint(2, 4)):
+            if x + dx < TILE_PX:
+                px[x + dx, y] = shade
+
+    for board in range(TILE_PX // board_h):
+        y = board * board_h
+        for x in range(TILE_PX):
+            t = 0.62 if rng.random() < 0.88 else 0.40
+            px[x, y] = blend(px[x, y], seam, t)
+
+    for board in (1, 3):
+        x = 4 if board == 1 else 11
+        for y in range(board * board_h + 1, (board + 1) * board_h):
+            px[x, y] = blend(px[x, y], seam, 0.45)
+    return img
+
+
+def tile_birch_leaves(rng):
+    """Birch canopy. Brighter and yellower than oak leaves — (74..110 red against
+    oak's 30..54) — and, more usefully at 16 px, a DIFFERENT CUTOUT: the holes are
+    bigger and fewer, so the canopy reads as broad separated leaves rather than oak's
+    fine dense mat. Which texels are alpha 0 is not something a tint can change, which
+    is why this is a tile and not a colour on the oak one.
+
+    Same alpha contract as tile_leaves — 0 or 255, never between — and the same opaque
+    border, for the same reason: this is a full cube whose silhouette is the cell, so
+    a transparent edge row would sit one texel from the next slot's art.
+    """
+    leaf = [(86, 132, 62), (98, 148, 72), (74, 116, 54), (110, 162, 84)]
+    img = speckle(rng, TILE_PX, leaf, weights=[4, 3, 3, 2]).convert("RGBA")
+    px = img.load()
+
+    # Broad clumps: 3x2 rather than tile_leaves' 2x2.
+    for _ in range(10):
+        x = rng.randrange(TILE_PX - 2)
+        y = rng.randrange(TILE_PX - 1)
+        shade = rng.choice(leaf) + (255,)
+        for dy in range(2):
+            for dx in range(3):
+                px[x + dx, y + dy] = shade
+
+    # Fewer, larger gaps: 2x2 tears instead of a scatter of singles.
+    hole = (0, 0, 0, 0)
+    for _ in range(9):
+        x = rng.randrange(TILE_PX - 1)
+        y = rng.randrange(TILE_PX - 1)
+        for dy in range(2):
+            for dx in range(2):
+                px[x + dx, y + dy] = hole
+    for _ in range(10):
+        px[rng.randrange(TILE_PX), rng.randrange(TILE_PX)] = hole
+
+    for i in range(TILE_PX):
+        for x, y in ((i, 0), (i, TILE_PX - 1), (0, i), (TILE_PX - 1, i)):
+            r, g, b, a = px[x, y]
+            px[x, y] = (rng.choice(leaf) + (255,)) if a == 0 else (r, g, b, 255)
+    return img
+
+
+def tile_spruce_log_side(rng):
+    """Spruce bark — scaly PLATES, where oak is vertical grain.
+
+    This is the tint argument again and it is the structure that carries it, not the
+    colour: spruce bark breaks into irregular overlapping scales with a dark fissure
+    around each one. Oak's tile is columns of grain with two full-height grooves down
+    it. A per-channel multiply cannot turn a column into a plate, so darkening oak
+    would have produced a dark oak, not a spruce.
+
+    The palette is redder and darker than oak as well — oak's green channel runs 50..76
+    against 30..56 here, and its blue 34..52 against 24..44 — but that gap is only two
+    to three 5-bit steps and is explicitly NOT what this tile is relying on. Shape is.
+
+    Plate boundaries are kept off columns 0 and 15 so a merged run does not join one
+    plate's fissure to the next tile's and draw a full-width line.
+    """
+    flesh  = [(88, 46, 36), (72, 38, 30), (102, 56, 42), (58, 30, 24)]
+    fissure = (40, 20, 16)
+    lip     = (122, 72, 52)
+
+    img = speckle(rng, TILE_PX, flesh, weights=[4, 3, 2, 3])
+    px = img.load()
+
+    # Scales: irregular blocks 3..5 wide and 2..4 tall, each outlined on its lower and
+    # right edges so it reads as lifted off the trunk. Laid down row-band by row-band
+    # so they interlock rather than overlapping into mush.
+    y = 0
+    while y < TILE_PX:
+        h = 2 + rng.randrange(3)
+        x = 1 + rng.randrange(3)
+        while x < TILE_PX - 1:
+            w = 3 + rng.randrange(3)
+            w = min(w, TILE_PX - 1 - x)
+            if w < 2:
+                break
+            for dy in range(h):
+                if y + dy >= TILE_PX:
+                    break
+                # right edge of the scale
+                px[min(TILE_PX - 2, x + w - 1), y + dy] = fissure
+            if y + h - 1 < TILE_PX:
+                for dx in range(w):
+                    if x + dx < TILE_PX - 1:
+                        px[x + dx, y + h - 1] = fissure
+            # a lit lip along the scale's top edge, so it has relief
+            if y > 0:
+                for dx in range(w):
+                    if x + dx < TILE_PX - 1 and rng.random() < 0.6:
+                        px[x + dx, y] = lip
+            x += w
+        y += h
+    return img
+
+
+def tile_spruce_log_top(rng):
+    """Spruce cut end: TIGHT rings — bands one pixel apart rather than tile_wood_top's
+    two — which is what a fast-grown conifer's end grain actually looks like next to an
+    oak's, and the one thing on a top face that is structure rather than hue.
+    """
+    pale = (128, 92, 66)
+    ring = (96, 66, 48)
+    dark = (56, 34, 26)
+    img = Image.new("RGB", (TILE_PX, TILE_PX))
+    px = img.load()
+    cx = 7.5 + rng.uniform(-1.0, 1.0)
+    cy = 7.5 + rng.uniform(-1.0, 1.0)
+    for y in range(TILE_PX):
+        for x in range(TILE_PX):
+            d = ((x - cx) ** 2 + (y - cy) ** 2) ** 0.5
+            band = int(d + rng.uniform(-0.3, 0.3))     # //1: tight rings
+            px[x, y] = ring if band % 2 else pale
+            if d > 7.4:
+                px[x, y] = dark
+    return img
+
+
+def tile_spruce_planks(rng):
+    """Spruce boards — dark, and the darkest planks on the sheet. Base (118,84,58)
+    against oak's (168,132,88) is a 50 gap in red, six 5-bit steps, so the three plank
+    tiles (oak, birch, spruce) sit at three clearly separated lightnesses and can be
+    told apart in a hotbar row without reading the label.
+
+    Same 4px board pitch and the same seam and butt-joint construction as the other
+    two, for the tiling reason given in tile_birch_planks.
+    """
+    base = (118, 84, 58)
+    warm = (132, 96, 66)
+    cool = (102, 72, 50)
+    seam = (66, 44, 30)
+
+    img = Image.new("RGB", (TILE_PX, TILE_PX))
+    px = img.load()
+    board_h = 4
+    for y in range(TILE_PX):
+        board = y // board_h
+        tint = blend(cool, warm, (board * 0.31 + 0.15) % 1.0)
+        for x in range(TILE_PX):
+            px[x, y] = tint if rng.random() < 0.55 else blend(tint, base, 0.5)
+
+    for _ in range(22):
+        board = rng.randrange(TILE_PX // board_h)
+        y = board * board_h + rng.randrange(1, board_h)
+        x = rng.randrange(TILE_PX - 3)
+        shade = blend(px[x, y], seam, rng.uniform(0.18, 0.34))
+        for dx in range(rng.randint(2, 4)):
+            if x + dx < TILE_PX:
+                px[x + dx, y] = shade
+
+    for board in range(TILE_PX // board_h):
+        y = board * board_h
+        for x in range(TILE_PX):
+            t = 0.62 if rng.random() < 0.88 else 0.40
+            px[x, y] = blend(px[x, y], seam, t)
+
+    for board in (1, 3):
+        x = 4 if board == 1 else 11
+        for y in range(board * board_h + 1, (board + 1) * board_h):
+            px[x, y] = blend(px[x, y], seam, 0.45)
+    return img
+
+
+def tile_spruce_leaves(rng):
+    """Spruce canopy — NEEDLES, and the cutout is the whole argument for it being a
+    tile rather than a dark tint of oak leaves.
+
+    Oak's holes are a scatter of isolated singles and 2x1 HORIZONTAL tears. This tile's
+    are short DIAGONAL runs, because that is the shape of the gap between two needle
+    sprays coming off a branch; and the needles themselves are drawn as diagonal dark
+    strokes over the field, on the same axis. Which texels are alpha 0 is not something
+    a per-channel multiply can change, so a tinted oak canopy would still be an oak
+    canopy — that is why this is a tile.
+
+    Built from a DENSE speckled base and then carved, not drawn onto an empty tile. The
+    first version of this painter did the latter — sprigs on transparency — and it came
+    out roughly half cutout, which on a FULL CUBE is not a conifer, it is a block you
+    can see the sky through. Looked at, at 9x, before it was changed: the gap count is
+    the whole difference and it is kept in line with tile_leaves' deliberately.
+
+    Darker and bluer than both other leaf tiles, but as with the log, hue is not being
+    asked to carry this on a 5-bit sheet.
+
+    Keeps an opaque border like tile_leaves and tile_birch_leaves — it is a full cube.
+    """
+    needle = [(24, 58, 52), (32, 70, 60), (18, 46, 42), (40, 84, 68)]
+    dark   = (14, 38, 34)
+
+    img = speckle(rng, TILE_PX, needle, weights=[4, 3, 3, 2]).convert("RGBA")
+    px = img.load()
+
+    # The needles: short diagonal strokes in the darkest shade, so the mat has visible
+    # direction rather than being a flat field of noise.
+    for _ in range(16):
+        x = rng.randrange(TILE_PX)
+        y = rng.randrange(TILE_PX)
+        step_x = rng.choice((-1, 1))
+        for step in range(2 + rng.randrange(3)):
+            xx, yy = x + step * step_x, y + step
+            if 0 <= xx < TILE_PX and 0 <= yy < TILE_PX:
+                px[xx, yy] = dark + (255,)
+
+    # The gaps, on the same diagonal axis. Kept to roughly tile_leaves' hole count so
+    # the canopy stays a canopy.
+    hole = (0, 0, 0, 0)
+    for _ in range(11):
+        x = rng.randrange(TILE_PX)
+        y = rng.randrange(TILE_PX)
+        step_x = rng.choice((-1, 1))
+        for step in range(2 + rng.randrange(2)):
+            xx, yy = x + step * step_x, y + step
+            if 0 <= xx < TILE_PX and 0 <= yy < TILE_PX:
+                px[xx, yy] = hole
+    for _ in range(8):
+        px[rng.randrange(TILE_PX), rng.randrange(TILE_PX)] = hole
+
+    for i in range(TILE_PX):
+        for x, y in ((i, 0), (i, TILE_PX - 1), (0, i), (TILE_PX - 1, i)):
+            r, g, b, a = px[x, y]
+            px[x, y] = (rng.choice(needle) + (255,)) if a == 0 else (r, g, b, 255)
+    return img
+
+
+def tile_tall_grass_top(rng):
+    """The UPPER half of the two-block tall grass — v1.8.8, and the first tile in the
+    sheet that is half of a plant rather than all of one.
+
+    It has to join tile_tall_grass at the seam, so the blades are rooted on the BOTTOM
+    row (image row 15, which is the row that touches the lower block's top row) and
+    grow upward from there, at the same odd-column pitch tile_tall_grass roots on —
+    `range(1, TILE_PX, 2)`. Anything else and the plant would visibly step sideways
+    where the two cells meet.
+
+    Slightly sparser and shorter than the lower half — about seven roots in eight carry
+    a blade, and those that do run 6..13 rows rather than 7..14. A real clump thins as
+    it rises and that thinning is what tells the player which half they are looking at,
+    but it is a LIGHT thinning on purpose: the first version skipped a third of the
+    roots and capped them at 10 rows, and at 9x it came out as three lonely squiggles
+    rather than the top of a clump of grass. Looked at before it was changed.
+
+    Same alpha contract and the same no-opaque-border rule as tile_tall_grass: this is
+    a BLOCK_SHAPE_CROSS tile, and an opaque border would draw a rectangle in the air
+    above every clump.
+    """
+    # Same colour-mismatch fix as tile_tall_grass above (grass-block-colour palette instead of
+    # the old brighter lime green) — this tile is the top half of the SAME plant, joined at the
+    # seam, so it has to move with tile_tall_grass or the clump would visibly change colour at
+    # the boundary between the two cells.
+    blades = [(58, 112, 74), (50, 100, 66), (74, 138, 90)]
+    tip    = (88, 152, 100)
+
+    img = Image.new("RGBA", (TILE_PX, TILE_PX), (0, 0, 0, 0))
+    px = img.load()
+
+    for root in range(1, TILE_PX, 2):
+        if rng.random() < 0.12:
+            continue                                # the thinning
+        x      = root
+        height = 6 + rng.randrange(8)               # 6..13 of the 16 rows
+        shade  = rng.choice(blades)
+        top_y  = TILE_PX - 1
+        for step in range(height):
+            y = TILE_PX - 1 - step
+            top_y = y
+            px[x, y] = shade + (255,)
+            # Two px wide for the first two rows, matching the weight tile_tall_grass
+            # gives its blades at the same rows, so the two halves meet without a step.
+            if step < 2 and x + 1 < TILE_PX:
+                px[x + 1, y] = shade + (255,)
+            if step >= 2 and rng.random() < 0.34:
+                x = max(0, min(TILE_PX - 1, x + rng.choice((-1, 1))))
+        px[x, top_y] = tip + (255,)
+    return img
+
+
+def _flower(rng, petal, centre, stems):
+    """The shared skeleton for v1.8.8's four biome flowers.
+
+    One painter rather than four copies because what differs between a poppy and a
+    bluebell at 16x16 is the BLOOM — its colour, its size and where it sits — and not
+    the stem, the leaves or the rooting rule, all of which are the same plant anatomy
+    every time. `stems` is the per-flower part: a list of (x, height, bloom_kind).
+
+    Two stems minimum, never one centred. A BLOCK_SHAPE_CROSS block is seen from every
+    horizontal angle, and tile_fern's docstring records what a single central stem
+    costs — it presents as a bare stick from the two directions where it is edge-on.
+
+    Alpha 0 or 255, no opaque border: same contract as every other cross tile here.
+    """
+    stem_shades = [(56, 104, 56), (68, 122, 64), (46, 88, 48)]
+
+    img = Image.new("RGBA", (TILE_PX, TILE_PX), (0, 0, 0, 0))
+    px = img.load()
+
+    def put(x, y, rgb):
+        if 0 <= x < TILE_PX and 0 <= y < TILE_PX:
+            px[x, y] = rgb + (255,)
+
+    for stem_x, height, kind in stems:
+        x = stem_x
+        shade = rng.choice(stem_shades)
+        top_y = TILE_PX - 1
+        for step in range(height):
+            y = TILE_PX - 1 - step
+            top_y = y
+            put(x, y, shade)
+            # A leaf pair low down, which is what stops the stem being a wire.
+            if step in (2, 4) and rng.random() < 0.7:
+                put(x - 1, y, rng.choice(stem_shades))
+                put(x + 1, y, rng.choice(stem_shades))
+            if step >= 3 and rng.random() < 0.28:
+                x = max(1, min(TILE_PX - 2, x + rng.choice((-1, 1))))
+
+        by = top_y - 1
+        if kind == "cup":
+            # Poppy / orchid: a four-petal bloom around a dark eye.
+            for dx, dy in ((0, -1), (-1, 0), (1, 0), (0, 1), (-1, -1), (1, -1)):
+                put(x + dx, by + dy, petal)
+            put(x, by, centre)
+        elif kind == "disc":
+            # Daisy: a ring of petals with a bright eye, one pixel wider than the cup.
+            for dx, dy in ((0, -1), (-1, -1), (1, -1), (-2, 0), (-1, 0),
+                           (1, 0), (2, 0), (-1, 1), (0, 1), (1, 1)):
+                put(x + dx, by + dy, petal)
+            put(x, by, centre)
+        elif kind == "bell":
+            # Bluebell: bells HANG, so they are drawn below the stem tip and to one
+            # side of it, two or three of them down the stalk. This is the shape that
+            # separates it from the poppy at 16px — colour alone would not, because
+            # both are one saturated blob on a green stick.
+            side = rng.choice((-1, 1))
+            for i in range(2 + rng.randrange(2)):
+                cy = by + i * 3
+                cx = x + side
+                put(cx, cy, petal)
+                put(cx, cy + 1, petal)
+                put(cx + side, cy, petal)
+                put(cx, cy + 2, centre)
+    return img
+
+
+def tile_poppy(rng):
+    """Poppy — plains and forest. A red four-petal cup with a near-black eye.
+
+    Red is the one hue on this sheet with no neighbour at all: nothing else painted
+    here is above 200 red with both other channels under 80, so a poppy never reads as
+    a bright version of anything. That is why it is the flower the mild biomes get.
+    """
+    return _flower(rng, (204, 48, 44), (48, 20, 24),
+                   [(4, 9 + rng.randrange(3), "cup"),
+                    (11, 6 + rng.randrange(3), "cup")])
+
+
+def tile_daisy(rng):
+    """Daisy — plains. White petals, yellow eye, and the widest bloom of the four so
+    that "white flower" is not confusable with the pale end of the snow tile in a
+    hotbar icon: snow is a full 16x16 field, this is ten opaque texels on transparency.
+
+    Petals sit at (238,238,230) rather than pure white: 248 and 255 both quantise to
+    the same 5-bit value, so there is no headroom above 248 to be brighter than, and
+    the eye needs somewhere to sit.
+    """
+    return _flower(rng, (238, 238, 230), (232, 196, 72),
+                   [(5, 8 + rng.randrange(3), "disc"),
+                    (11, 11 + rng.randrange(3), "disc")])
+
+
+def tile_bluebell(rng):
+    """Bluebell — forest and taiga. Hanging bells rather than a face-on bloom, which
+    is what tells it from the poppy in silhouette; see the "bell" branch of _flower.
+
+    Blue at (72,88,196): well clear of water's crest (56,112,172) in green — 24, three
+    5-bit steps — so a bluebell against a shoreline does not read as a splash.
+    """
+    return _flower(rng, (72, 88, 196), (44, 52, 132),
+                   [(4, 10 + rng.randrange(3), "bell"),
+                    (11, 7 + rng.randrange(3), "bell")])
+
+
+def tile_orchid(rng):
+    """Orchid — jungle only, and the one flower with no green in its bloom, because
+    the jungle is where a flower has the most competing green around it: jungle grass,
+    oak leaves and ferns all sit in the same band. Magenta (196,72,168) shares no
+    channel ordering with any of them.
+
+    Deliberately NOT the sentinel's (255,0,255). That colour is a bleed alarm and must
+    keep meaning "something is wrong"; a real block wearing it would spend that alarm.
+    This is two 5-bit steps down in red and nine up in green, which is a different
+    colour on the sheet and not a near-miss.
+    """
+    return _flower(rng, (196, 72, 168), (108, 36, 96),
+                   [(5, 8 + rng.randrange(3), "cup"),
+                    (11, 11 + rng.randrange(3), "cup")])
+
+
+def tile_apple(rng):
+    """Apple — v1.8.8. A FULL_CUBE tile, not a cross, because the apple has to be
+    pickable: scene/interact.c banks a break through world/block.h's
+    blockDropsNothing(), which answers from the SHAPE and hands the bag BLOCK_AIR for
+    anything BLOCK_SHAPE_CROSS. A cross apple would break and yield nothing, which is
+    the one thing it must not do.
+
+    So it is drawn as a face of fruit rather than as a hanging apple on a stem: a red
+    body with a lit shoulder top-left (the same light direction tile_dirt's pebbles and
+    tile_snow's hollows agree on), a darker underside, a short brown stalk and one leaf.
+
+    Reds are chosen to stay clear of the poppy's (204,48,44) — the body sits at
+    (176,32,40) and below, a 28 gap, so an apple block and a poppy are not the same red
+    at a distance.
+    """
+    body   = [(176, 32, 40), (160, 24, 34), (192, 44, 48)]
+    lit    = (214, 76, 68)
+    shadow = (112, 16, 26)
+    stalk  = (94, 66, 42)
+    leaf   = (70, 132, 62)
+
+    img = speckle(rng, TILE_PX, body, weights=[4, 3, 2])
+    px = img.load()
+
+    # Shoulder highlight, top-left, as a soft blob rather than a hard disc.
+    for y in range(TILE_PX):
+        for x in range(TILE_PX):
+            d = ((x - 5.0) ** 2 + (y - 5.0) ** 2) ** 0.5
+            if d < 3.2 and rng.random() < 0.8:
+                px[x, y] = lit
+            elif d > 10.5 and rng.random() < 0.7:
+                px[x, y] = shadow
+
+    # Stalk and one leaf, top centre. Two px of stalk so it survives at 240p.
+    px[8, 0] = stalk
+    px[8, 1] = stalk
+    px[7, 1] = stalk
+    for dx, dy in ((9, 1), (10, 1), (10, 2), (11, 2)):
+        px[dx, dy] = leaf
+    return img
+
+
 def tile_sentinel(_rng):
     """Not art — a bleed alarm.
 
@@ -842,6 +1559,20 @@ PAINTERS = {
     "cactus": tile_cactus,
     "dead_bush": tile_dead_bush,
     "fern": tile_fern,
+    "birch_log_side": tile_birch_log_side,
+    "birch_log_top": tile_birch_log_top,
+    "birch_planks": tile_birch_planks,
+    "birch_leaves": tile_birch_leaves,
+    "spruce_log_side": tile_spruce_log_side,
+    "spruce_log_top": tile_spruce_log_top,
+    "spruce_planks": tile_spruce_planks,
+    "spruce_leaves": tile_spruce_leaves,
+    "tall_grass_top": tile_tall_grass_top,
+    "poppy": tile_poppy,
+    "daisy": tile_daisy,
+    "bluebell": tile_bluebell,
+    "orchid": tile_orchid,
+    "apple": tile_apple,
 }
 
 

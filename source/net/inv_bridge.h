@@ -93,7 +93,10 @@ uint8_t invBridgeRemove(Inventory* inv, ItemId item, uint8_t count);
 // optimistic path above got wrong is corrected the next time a snapshot lands.
 //
 // Returns false and leaves `inv` COMPLETELY untouched if any slot names an item this build
-// does not have (item >= BLOCK_COUNT). networld.c cannot make that check — it must not
+// does not have. That test is inventoryCanHold(), which since v1.8.8 asks the registry ("is
+// there a row for this id") instead of comparing against BLOCK_COUNT — a more direct answer to
+// the question this paragraph was always asking, and a strictly MORE permissive one, so no
+// snapshot that used to be accepted is rejected now. networld.c cannot make that check — it must not
 // include world/block.h, by the same boundary rule described at the top of this file — so it
 // validates only what bs_proto.h promises about the wire (the count-iff-item pairing, the
 // stack cap) and this is where the id space is checked. All-or-nothing rather than
