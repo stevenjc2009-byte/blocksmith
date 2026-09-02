@@ -96,9 +96,21 @@
 // written as `== GEN_VERSION_DENSITY` from here on is a bug waiting for version 4.
 #define GEN_VERSION_BIOME    3u
 
+// v1.8.11: the column-independent worm-cave carver (docs/plan-1.8.11-caves.md), replacing the
+// per-block noise-field cave test with a neighbourhood-scanned, walked tunnel/room system for
+// this version and above. **Why this is a separate version rather than a change gated on
+// `>= GEN_VERSION_BIOME`**: the same v1.8.3 measurement this file already narrates for
+// GEN_VERSION_BIOME applies unchanged here — a new cave *shape* landing on an existing BIOME
+// world would silently reshape every cave under every player's existing buildings on their next
+// load, which is exactly the failure this file's whole mechanism exists to prevent (plan 2.6).
+// Every world stamped LEGACY, DENSITY or BIOME keeps exactly the noise-field cave test it has
+// today, unconditionally; only a GEN_VERSION_CAVES-and-above world reaches the new carver
+// (world/cave_carve.h, called from world/worldgen_density.c's wgdColumn()).
+#define GEN_VERSION_CAVES    4u
+
 // The newest generator this build can produce. A stamp above this is a world from the
 // future and is refused — see genVersionResolve.
-#define GEN_VERSION_NEWEST   GEN_VERSION_BIOME
+#define GEN_VERSION_NEWEST   GEN_VERSION_CAVES
 
 // What a new world made by this build gets stamped with.
 #define GEN_VERSION_FOR_NEW_WORLDS GEN_VERSION_NEWEST

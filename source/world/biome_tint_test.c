@@ -82,6 +82,7 @@
 // edit shape that cannot drop another session's work, and that file is shared.
 #ifndef __3DS__
 
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -615,6 +616,69 @@ static void testPaletteIsSane(void)
 	      "taiga and desert are actually different colours");
 }
 
+// v1.8.11: the desert row read as "dry olive" instead of sandy tan. The tint LITERAL alone
+// (0.94, 0.82, 0.42 — R already bigger than G) looked fine in isolation; the bug only showed up
+// in the PRODUCT against grass_top's actual base art, which tools/make_atlas.py's
+// tile_grass_top() paints from these four texels (a weighted speckle, plus a highlight this
+// test does not need). Base green sits at roughly 1.9x base red, which swallows a tint ratio of
+// only 1.15x and comes out green-dominant (measured hue ~96 degrees) regardless of what the
+// tint literal alone suggests. That is why this checks the PRODUCT and not just the row.
+static float rgbHueDeg(float r, float g, float b)
+{
+	const float mx = (r > g) ? ((r > b) ? r : b) : ((g > b) ? g : b);
+	const float mn = (r < g) ? ((r < b) ? r : b) : ((g < b) ? g : b);
+	const float delta = mx - mn;
+	if (delta <= 0.00001f) return 0.0f;   // grey: no hue to be wrong about
+
+	float h;
+	if (mx == r)      h = fmodf((g - b) / delta, 6.0f);
+	else if (mx == g) h = (b - r) / delta + 2.0f;
+	else              h = (r - g) / delta + 4.0f;
+
+	h *= 60.0f;
+	if (h < 0.0f) h += 360.0f;
+	return h;
+}
+
+static void testDesertReadsTanNotOlive(void)
+{
+	puts("\n-- desert: the PRODUCT against grass_top's real base art reads tan, not olive --");
+
+	// tools/make_atlas.py tile_grass_top(): greens = [(58,112,74),(66,126,82),(74,138,90),(50,100,66)]
+	const float grass_top_shades[4][3] = {
+		{  58.0f / 255.0f, 112.0f / 255.0f,  74.0f / 255.0f },
+		{  66.0f / 255.0f, 126.0f / 255.0f,  82.0f / 255.0f },
+		{  74.0f / 255.0f, 138.0f / 255.0f,  90.0f / 255.0f },
+		{  50.0f / 255.0f, 100.0f / 255.0f,  66.0f / 255.0f },
+	};
+
+	const MeshTint desert = meshTintRow(5);   // BIOME_DESERT's row, same lookup the mesher uses
+
+	// 90 degrees is dead-centre green on the hue wheel and the pre-fix product measured ~96;
+	// 65 leaves a wide margin into the yellow/orange band a "sandy tan" needs to sit in, on
+	// EVERY base shade the real art actually paints, not just their average.
+	int bad = 0;
+	for (int i = 0; i < 4; i++) {
+		const float pr = grass_top_shades[i][0] * desert.r;
+		const float pg = grass_top_shades[i][1] * desert.g;
+		const float pb = grass_top_shades[i][2] * desert.b;
+		const float hue = rgbHueDeg(pr, pg, pb);
+		const bool  ok  = hue <= 65.0f;
+		if (!ok) bad++;
+		CHECK(ok, "grass_top shade %d (%.0f,%.0f,%.0f) tints to hue %.1f (<=65, yellow/tan)",
+		      i, (double)(grass_top_shades[i][0] * 255.0f), (double)(grass_top_shades[i][1] * 255.0f),
+		      (double)(grass_top_shades[i][2] * 255.0f), (double)hue);
+	}
+	CHECK(bad == 0, "no grass_top base shade crosses into the green band under the desert tint");
+
+	// The ratio invariant the fix actually rests on: the tint's R:G must overcome grass_top's
+	// own G:R bias (~1.9x average), not merely exceed 1 — 0.94/0.82 (ratio 1.15) was already
+	// R > G and still produced olive.
+	CHECK(desert.r / desert.g >= 1.8f,
+	      "desert tint R:G ratio (%.3f) is wide enough to overcome the base art's G:R bias",
+	      (double)(desert.r / desert.g));
+}
+
 // ── 6. The renderer, by text ─────────────────────────────────────────────────
 
 static void testRendererUploadsPalette(void)
@@ -740,6 +804,7 @@ int main(void)
 	testMergingActuallyHappens();
 	testUntintableRunsStillMerge();
 	testPaletteIsSane();
+	testDesertReadsTanNotOlive();
 	testRendererUploadsPalette();
 	testShadersDecodeTint();
 	testMesherHeaderTellsTheTruth();

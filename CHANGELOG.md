@@ -4,6 +4,69 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.8.11] - 2026-09-02
+
+The holes in the world. This release is mostly one fix: chunks that never loaded until you
+walked almost on top of them, leaving gaps you could see straight through while chunks further
+away sat there loaded perfectly. It also rebuilds caves into actual tunnels, and makes desert
+grass look like desert grass.
+
+Everything here is identical on both consoles. Nothing in this release is Old-3DS-only or
+New-3DS-only.
+
+### Fixed
+- **Chunks stopped loading and never tried again.** This is the one that made the world look
+  broken: three chunks loaded in front of you, then a gap, then more loaded chunks past the gap
+  — and the gap only filled in when you walked right up to it. The world is built in two steps,
+  generated and then turned into something drawable, and *both* steps could quietly give up.
+
+  When the drawable step ran out of room to put a chunk's geometry, it threw the request away
+  and marked the chunk as already handled. Nothing ever asked again. The chunk stayed invisible
+  for as long as you stayed near it, and only came back if you walked far enough away for the
+  game to forget it and start over. The generation step had the same fault and was fixed in
+  1.8.10 — that half also explains why the gaps came in clusters rather than one at a time,
+  because a chunk cannot be drawn until the eight around it exist, so one missing chunk took its
+  neighbours down with it.
+
+  Both steps now keep a list of what they had to refuse and ask again a few frames later. The
+  one case that is *not* retried is a chunk too complex to fit at all, because retrying that
+  would fail identically forever and starve everything queued behind it; those are counted
+  instead, and across roughly 135,000 test chunks there were none.
+
+  Why it looked so strange is worth saying, because it is what identified the bug: the world
+  loads nearest-first, so a slow queue can only ever leave the *furthest* chunks missing. A
+  loaded chunk sitting beyond an empty one is not slowness. It can only mean a request was
+  thrown away.
+- **Desert grass was the wrong colour.** It was meant to be pale and sandy and came out a dull
+  olive-green, closer to a sickly field than a desert. Each biome tints the same grass artwork
+  rather than shipping its own, and the desert's tint was not far enough from the others to
+  overcome the green already in the artwork — so the result stayed green no matter what. The
+  tint is now weighted strongly enough toward red and away from green that every shade in the
+  texture lands in the yellow-tan range. It is a darker khaki than true sand, because tinting
+  can only ever darken; making it genuinely bright would mean repainting the grass artwork, and
+  that has not been done.
+
+### Changed
+- **Caves are tunnels now, not sponge.** The old caves were made by testing every single block
+  against a noise field, which riddles the ground with small disconnected pockets — it looks
+  like swiss cheese and it is expensive, because every block underground has to be asked. The
+  new caves are carved by tracing winding paths through the rock, so you get fewer, larger,
+  connected tunnels that go somewhere. Measured against the old generator, the change turns far
+  more rock back into solid stone than it opens up.
+
+  **This only affects newly created worlds.** A world you have already made keeps the caves it
+  was made with, exactly as they are, and will not regenerate. Worlds made before 1.8.11 are
+  also the ones under the most memory pressure — the old cave style produces more geometry to
+  draw than the new one does.
+
+### Notes
+- The chunk fix is verified by an automated test that drives the real loading code, holds a
+  chunk unbuildable for a set number of frames, and requires it to appear anyway. The same test
+  run against 1.8.10's code fails, which is what says the test is actually testing something.
+- The new cave generator has its own test suite of 494 checks, the important one being that a
+  chunk's caves come out identical whether it is generated on its own or in the middle of a
+  large area — so caves cannot change shape depending on which direction you approached from.
+
 ## [1.8.10] - 2026-09-02
 
 Light. Torches, and a lighting model that finally behaves the way Minecraft's does — light

@@ -573,6 +573,19 @@ typedef struct {
 	int  meshed;           // chunks that got a mesh slot
 	int  mesh_refused;
 
+	// v1.8.11. mesh_refused above is the TOTAL, and it conflates a job-ring shortage
+	// (world/meshq.c bumps it directly, and that path already retries itself) with a
+	// chunkRenderBuild refusal (which until now retried nothing at all). These two split the
+	// build refusals by cause, because the response to each is opposite — see
+	// scene/chunk_render.h's ChunkRefuseReason.
+	//
+	// A single conflated counter is exactly why this bug survived: a nonzero mesh_refused
+	// could not tell anyone whether the pool was momentarily full (recoverable, retry it) or
+	// a chunk was too complex to mesh at all (unrecoverable, retrying spins forever), so it
+	// read as noise and nothing acted on it.
+	int  mesh_refused_pool;      // acquireSlot found nothing — transient, retried
+	int  mesh_refused_overflow;  // chunk exceeds the per-chunk cap — permanent, NOT retried
+
 	// Step 6.2's measurement. The frame is 16.71 ms and the streaming path is the only
 	// thing on it whose cost is not bounded by a constant, so these are what say whether a
 	// budget is needed and, afterwards, whether it worked. Worst rather than average: a
@@ -769,6 +782,30 @@ static ColSlot s_col_asked[GEN_AREA_SPAN][GEN_AREA_SPAN];   // submitted to the 
 // fresh world.
 static GenRetryLedger s_gen_retry;
 
+// v1.8.11. The same ledger again, one layer up, for the bug world/genretry.h's own header
+// describes but only half fixed.
+//
+// genretry.h fixed the GENERATION half: a column that installed with a hole was in s_col_in
+// forever, so genRequestArea would never ask for it again. The MESH half was left with exactly
+// the same shape and nobody noticed, because the two failures look identical from the player's
+// seat. genQueueReadyColumns sets s_col_queued the moment meshqPushColumn accepts a column, and
+// then skips any column carrying that mark. But acceptance into the job ring is not the same
+// event as a successful mesh: genDrainMesh pops the job, calls chunkRenderBuild, and if that
+// refuses, the job is already gone and the mark is still set. Nothing re-pushes it. The column
+// stays a hole until it leaves the mesh ring entirely (genRecenter/genSetRadius are the only
+// places that clear s_col_queued) and the player walks back into it.
+//
+// That is the reported symptom word for word: chunks loaded beyond a gap, and the gap filling
+// only once you are almost on top of it. Nearest-first ordering (scene/ringorder.c) rules out a
+// merely slow queue as the cause — a throttled queue fills inward-out and can never leave a
+// loaded column BEHIND an unloaded one — so a dropped request was the only shape left.
+//
+// Keyed by column, not by chunk, because that is what the ledger stores and what the re-push
+// operates on. Re-meshing a column's other chunks alongside the one that failed is a few
+// hundred microseconds of duplicated work on a path that runs at most once per column per
+// backoff period, which is a straight trade against a permanent hole.
+static GenRetryLedger s_mesh_retry;
+
 // The column the ring is centred on, and the streaming counters the overlay reports.
 static int32_t s_center_cx, s_center_cz;
 static int s_col_unloaded;      // columns freed because they left the ring
@@ -912,6 +949,16 @@ _Static_assert(GEN_AREA_SPAN * GEN_AREA_SPAN <= GEN_RETRY_SLOTS,
                "genRetryInit would refuse to start and every budget-refused column would go "
                "back to being a silent permanent hole. Raise GEN_RETRY_SLOTS to at least "
                "GEN_AREA_SPAN * GEN_AREA_SPAN.");
+
+// v1.8.11, and the same argument for s_mesh_retry. GEN_MESH_SPAN is the narrower of the two, so
+// this cannot fail while the assert above passes — it is here anyway, because "it is implied by
+// the other one" is a property of today's spans, not a rule, and if the mesh ring ever grows
+// past the area ring this is the assert that says so instead of genRetryInit quietly returning
+// false and every refused column going back to being a permanent hole.
+_Static_assert(GEN_MESH_SPAN * GEN_MESH_SPAN <= GEN_RETRY_SLOTS,
+               "world/genretry.h's GEN_RETRY_SLOTS is smaller than one full mesh ring, so "
+               "genRetryInit(&s_mesh_retry, GEN_MESH_SPAN) would refuse to start and every "
+               "mesh-refused column would be a silent permanent hole again.");
 static void genQueueReadyColumns(void)
 {
 	bool still_short = false;
@@ -988,6 +1035,54 @@ static bool genRetrySubmit(void* ud, int32_t cx, int32_t cz)
 	if (!workerSubmitColumn(cx, cz)) return false;
 	genSlotSet(&s_col_asked[0][0], GEN_AREA_SPAN, cx, cz);
 	return true;
+}
+
+// world/genretry.h's submit callback for s_mesh_retry — the mesh-side twin of genRetrySubmit
+// above. v1.8.11.
+//
+// The single load-bearing line is the genSlotClear. s_col_queued is what makes the hole
+// permanent: genQueueReadyColumns will not look at a column that carries it, and nothing on the
+// mesh path ever takes it off. Dropping it here is what lets the column be pushed again at all.
+//
+// RETURN VALUE. This deliberately returns false on the success path, which reads backwards and
+// is not a mistake. genRetryTick marks an entry `inflight` when submit returns true, meaning
+// "resubmitted, now waiting to hear back" — and for the generation ledger something genuinely
+// does report back later (genInstallOne calls genRetryClear or genRetryMark). On the mesh side
+// there is no such callback: the re-push either lands in the job ring now or it does not, and
+// whether the resulting build succeeds is reported by genDrainMesh marking the column afresh.
+// So the entry is retired here, the moment the re-push is accepted, and returning false keeps
+// genRetryTick from setting inflight on a slot that no longer holds anything. A column that
+// fails again is simply marked again, at attempts 0.
+//
+// That flat retry cadence (a fixed GEN_RETRY_BASE_FRAMES rather than a doubling backoff) is
+// only safe because the caller never marks the unrecoverable class: genDrainMesh retries
+// CHUNK_REFUSE_POOL and never CHUNK_REFUSE_OVERFLOW. Pool pressure is transient and clears as
+// columns unload, so this loop terminates on its own. An overflowing chunk would not, which is
+// exactly why it is kept out of this ledger rather than given a longer backoff.
+static bool meshRetrySubmit(void* ud, int32_t cx, int32_t cz)
+{
+	GenRetryLedger* h = (GenRetryLedger*)ud;
+
+	// The ring moved past it, or a neighbour it needs has gone away again. genRetryTick's own
+	// radius check catches the first; the second is this function's to catch, because a column
+	// whose 3x3 is no longer complete cannot be meshed and re-pushing it would put a job in the
+	// ring that genDrainMesh would only refuse again.
+	if (!genInMesh(cx, cz) || !genColumnRingComplete(cx, cz)) {
+		genRetryClear(h, cx, cz);
+		return false;
+	}
+
+	genSlotClear(&s_col_queued[0][0], GEN_MESH_SPAN, cx, cz);
+
+	// Job ring full this frame. The mark is left standing and the s_col_queued bit stays
+	// cleared, so either this callback gets another go next frame or genQueueReadyColumns
+	// picks the column up first — both of which end with it meshed, which is the only thing
+	// that matters here.
+	if (!meshqPushColumn(&s_meshq, &s_world, cx, cz, &s_genr.mesh_refused)) return false;
+
+	genSlotSet(&s_col_queued[0][0], GEN_MESH_SPAN, cx, cz);
+	genRetryClear(h, cx, cz);
+	return false;
 }
 
 // Frees a column and everything drawn from it. Safe to call for a column that was only
@@ -1557,6 +1652,9 @@ static bool genStart(int32_t cx, int32_t cz)
 	// cannot fail for any configuration that compiled — same reasoning the JOBQ_CAP asserts
 	// rely on elsewhere in this file instead of a runtime check here.
 	genRetryInit(&s_gen_retry, GEN_AREA_SPAN);
+	// v1.8.11. Keyed on the mesh ring, which is the ring s_col_queued is indexed by — using
+	// GEN_AREA_SPAN here would wrap mesh columns onto the wrong slots.
+	genRetryInit(&s_mesh_retry, GEN_MESH_SPAN);
 	s_genr = (GenResult){0};
 	s_genr.ran = true;
 	s_center_cx = cx;
@@ -1720,8 +1818,41 @@ static int genDrainMesh(float budget_ms, int max_chunks)
 		// loading screen actually built and mesh/us-per-call is directly comparable with the
 		// DRAIN_BUDGET_MS the drain is trying to stay inside.
 		const uint64_t t_mesh = loadprofMark();
-		if (chunkRenderBuild(&s_world, j.cx, j.cy, j.cz)) s_genr.meshed++;
-		else                                              s_genr.mesh_refused++;
+		if (chunkRenderBuild(&s_world, j.cx, j.cy, j.cz)) {
+			s_genr.meshed++;
+		} else {
+			s_genr.mesh_refused++;
+
+			// v1.8.11. THE FIX. Until now this line was the whole of the failure handling,
+			// and the job had already been popped — so a refused chunk was simply forgotten,
+			// with s_col_queued still set against its column so genQueueReadyColumns would
+			// never offer it again. That is the permanent hole. See s_mesh_retry's comment.
+			//
+			// Only the pool class is retried. An overflowing chunk meshed again overflows
+			// again by definition, so putting it in the ledger would resubmit it every
+			// backoff period forever, burning drain budget that the chunks which CAN be
+			// meshed are queued behind — turning a one-chunk hole into a world-wide stall.
+			// It is counted and surfaced instead, because a nonzero overflow count is a
+			// capacity fact that wants fixing at the tier sizing, not at the retry.
+			switch (chunkRenderLastRefusal()) {
+			case CHUNK_REFUSE_POOL:
+				s_genr.mesh_refused_pool++;
+				genRetryMark(&s_mesh_retry, j.cx, j.cz);
+				break;
+			case CHUNK_REFUSE_OVERFLOW:
+				s_genr.mesh_refused_overflow++;
+				break;
+			case CHUNK_REFUSE_NONE:
+				// chunkRenderBuild returned false without naming a reason. Not reachable
+				// today — every `return false` in it sets one — and deliberately not
+				// silently swallowed: treat it as the recoverable class, because retrying
+				// something that did not need it costs one remesh, while dropping
+				// something that did need it costs a permanent hole.
+				s_genr.mesh_refused_pool++;
+				genRetryMark(&s_mesh_retry, j.cx, j.cz);
+				break;
+			}
+		}
 		loadprofSince(LOAD_STAGE_MESH, t_mesh);
 		built++;
 
@@ -1829,6 +1960,10 @@ static bool runLoadingScreen(bool draw, const char* heading, const char* world_n
 		// call, never a loop that can spin.
 		genRetryTick(&s_gen_retry, s_center_cx, s_center_cz, s_area_radius, genRetrySubmit, NULL);
 		watchdogPhase(WD_PHASE_LOAD_MESH);
+		// v1.8.11. Before the drain, not after: a column re-pushed by this tick should get its
+		// chance in the very same frame's drain rather than waiting a frame for the next one.
+		genRetryTick(&s_mesh_retry, s_center_cx, s_center_cz, s_mesh_radius, meshRetrySubmit,
+		             &s_mesh_retry);
 		genDrainMesh(LOADING_DRAIN_BUDGET_MS, LOADING_DRAIN_MAX_CHUNKS);
 
 		const LoadingSample sample = genLoadingSample();
@@ -2755,6 +2890,23 @@ static void worldReportDraw(int refused, bool built,
 		// number that climbs and never comes back down is the one this line exists to catch.
 		printf("ring at %+3ld %+3ld unl %3d stale %d hole %d\n", (long)s_center_cx,
 		       (long)s_center_cz, s_col_unloaded, s_col_dropped, genRetryOutstanding(&s_gen_retry));
+
+		// v1.8.11. The mesh-side twin of `hole`, and the pair of numbers that says which of the
+		// two mesh refusal classes is actually firing — the thing a single conflated
+		// mesh_refused count could never say.
+		//
+		//   mhole — columns whose mesh build was refused and which s_mesh_retry has not yet got
+		//           back in. Behaves like `hole`: brief spikes are fine, a number that climbs
+		//           and never returns to 0 is a real leak.
+		//   pool  — cumulative build refusals from an exhausted slot pool. RECOVERABLE; each one
+		//           is retried. A large and growing count means the tier sizing in
+		//           scene/chunk_render.c is short for this render distance.
+		//   ovfl  — cumulative refusals from a chunk too complex to fit the per-chunk cap.
+		//           NOT recoverable and NOT retried. This one must be zero. Any nonzero value
+		//           is a permanent hole that no amount of walking will fix, and it means
+		//           MESH_SLOT_VERTS/MESH_SLOT_INDICES need raising.
+		printf("mhole %d pool %3d ovfl %3d     \n", genRetryOutstanding(&s_mesh_retry),
+		       gen->mesh_refused_pool, gen->mesh_refused_overflow);
 
 		// Step 6.2's line, and the only per-frame costs the streaming path adds. `strm` is
 		// install + mesh drain on the worst frame, `rc` the recentre on the frame that
@@ -4809,6 +4961,12 @@ session_start:
 		// resubmission per pending column per call, same as the loading loop's call to this.
 		if (!paused) genRetryTick(&s_gen_retry, s_center_cx, s_center_cz, s_area_radius,
 		                           genRetrySubmit, NULL);
+		// v1.8.11. The mesh-side ledger, ticked on the same schedule and under the same pause
+		// gate. s_mesh_radius, not s_area_radius: this ledger tracks columns that failed to
+		// MESH, and the mesh ring is the narrower of the two — ticking it at the area radius
+		// would keep re-pushing columns that genQueueReadyColumns is not even walking.
+		if (!paused) genRetryTick(&s_mesh_retry, s_center_cx, s_center_cz, s_mesh_radius,
+		                           meshRetrySubmit, &s_mesh_retry);
 		const float install_ms =
 			(float)((double)(svcGetSystemTick() - t_install) / CPU_TICKS_PER_MSEC);
 #endif

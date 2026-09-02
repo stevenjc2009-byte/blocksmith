@@ -234,12 +234,23 @@ _Static_assert(MESH_AO_BITS + MESH_TINT_BITS <= 8, "tint index no longer fits th
 // greens around (58,112,74) — it is finished art, not a greyscale multiply target the way
 // Minecraft's grass texture is. Multiplying an already-saturated green can pull it toward
 // black, toward olive, or toward blue-green, but it cannot make it straw-yellow or make it
-// brighter than it started. The desert row below is the one that suffers: 0.94/0.82/0.42 is a
-// dry olive, not the pale sand-grass a wider range would give.
+// brighter than it started.
 //
-// The fix, if the range is ever wanted, is to repaint grass_top / grass_side / tall_grass /
-// fern toward a light desaturated base so the multipliers have somewhere to go. That is a
-// change to the ART and nobody asked for it, so it has not been made.
+// v1.8.11: the desert row was 0.94/0.82/0.42, which reasoning about the PRODUCT (not the tint
+// literal alone) shows was the bug. grass_top's four texels average to roughly (0.245, 0.468,
+// 0.307) — green is already ~1.9x red in the base art — so even a tint with R > G (0.94 vs
+// 0.82, ratio 1.15) still comes out green-dominant: measured product (0.231, 0.384, 0.129),
+// hue ~96 degrees, squarely in the green/olive band. That is the "dry olive" the biome read as.
+//
+// The fix that fits inside a multiply is to widen the R:G ratio in the TINT far enough to
+// overcome the base art's own G:R bias (~1.9x), not to nudge it. 1.00/0.50/0.40 does that:
+// tint R:G is 2.0x, which drives every one of grass_top's four base shades (and its highlight
+// speckle) to a product hue of 45-60 degrees — the yellow/tan band, never green — measured
+// per-shade, not just on the average. The residual limit tools/make_atlas.py's comment already
+// named still applies: a multiply cannot lift brightness past the base texel (value tops out
+// at ~0.245, i.e. a dark khaki, not a bright sand tan), and closing that gap for real needs the
+// ART repainted lighter — grass_top / grass_side / tall_grass / fern — which is out of scope
+// here and has not been touched.
 //
 // PLAINS IS EXACTLY (1,1,1) ON PURPOSE. It is the biome the art was drawn for and the one most
 // of the world is, so a plains grass block renders bit-identically to every build before this
@@ -254,7 +265,7 @@ static inline MeshTint meshTintRow(uint8_t row)
 	case 2:  return (MeshTint){ 0.62f, 0.80f, 0.70f };   // taiga  — dark cold green
 	case 3:  return (MeshTint){ 1.00f, 1.00f, 1.00f };   // plains — the art as painted
 	case 4:  return (MeshTint){ 0.80f, 0.94f, 0.72f };   // forest — deeper green
-	case 5:  return (MeshTint){ 0.94f, 0.82f, 0.42f };   // desert — dry olive
+	case 5:  return (MeshTint){ 1.00f, 0.50f, 0.40f };   // desert — sandy tan (v1.8.11, was 0.94/0.82/0.42 "dry olive")
 	case 6:  return (MeshTint){ 0.62f, 1.00f, 0.44f };   // jungle — vivid green
 	default: return (MeshTint){ 1.00f, 1.00f, 1.00f };   // row 7, spare — identity
 	}

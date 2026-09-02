@@ -1,5 +1,6 @@
 #include "world/worldgen_density.h"
 
+#include "world/cave_carve.h"
 #include "world/chunk.h"
 #include "world/genversion.h"
 #include "world/noise.h"
@@ -626,6 +627,15 @@ bool wgdColumn(const WorldGen* g, WorldGenScratch* s, World* w, int32_t cx, int3
 	s->top_valid = true;
 	buildSlope(s);
 
+	// v1.8.11. The worm-carver's pre-pass (world/cave_carve.h, plan 3.1): run once per column,
+	// before the fill loop below reads it, and ONLY for GEN_VERSION_CAVES-and-above worlds — a
+	// version gate at the one call site that produces it, matching genversion.h's own rule that
+	// nothing new reaches an old world (plan 2.6). Every world below this version never calls
+	// caveCarveBuildMask() and s->carve is never read for it either (see the fill loop below),
+	// so this line changes nothing for LEGACY, DENSITY or BIOME worlds.
+	if (g->version >= GEN_VERSION_CAVES)
+		caveCarveBuildMask(g, s, cx, cz);
+
 	// v1.8.3 Phase 2. The biome per (x, z), resolved once for the column and consumed by the
 	// surface pass below.
 	//
@@ -755,8 +765,20 @@ bool wgdColumn(const WorldGen* g, WorldGenScratch* s, World* w, int32_t cx, int3
 					// system into a scatter of isolated pockets. Measured: run-depth gave
 					// 10,360 air cells under the surface against 27,312 in legacy.
 					const int d_surf = s->top[z][x] - 1 - y;
+					// v1.8.11. GEN_VERSION_CAVES-and-above worlds test the worm-carver's own
+					// pre-pass mask, built once above, in place of the per-block noise test —
+					// a replacement, not an addition (plan 3.1: running both would double-carve
+					// two visually incompatible shapes). The GEN_CAVE_MIN_DEPTH gate itself is
+					// untouched either way, so a carved cell still cannot float a grass block
+					// or open under a spawn point on either generator. The ternary sits INSIDE
+					// the && rather than being hoisted above this if, so the short-circuit on
+					// d_surf is preserved exactly as it was — a LEGACY/DENSITY/BIOME world still
+					// calls worldgenIsCaveCached() only for cells that already passed the depth
+					// gate, not for every solid cell in the column.
 					if (d_surf >= GEN_CAVE_MIN_DEPTH &&
-					    worldgenIsCaveCached(g, s, wx0 + x, y, wz0 + z)) {
+					    (g->version >= GEN_VERSION_CAVES
+					         ? caveCarveMaskGet(s, x, y, z)
+					         : worldgenIsCaveCached(g, s, wx0 + x, y, wz0 + z))) {
 						exposed[z][x] = false;
 						run[z][x] = -1;
 						// A carved cell is air, so the fill treats it as air. It is almost

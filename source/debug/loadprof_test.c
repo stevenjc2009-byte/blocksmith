@@ -682,8 +682,31 @@ int main(void)
 	// behaviours is gated on genv >= GEN_VERSION_BIOME or on the biome-params branch, so no
 	// existing save re-generates. world_test.c's legacy byte-identity hashes and its legacy
 	// intruder sweep (widened to reject all ten new ids) are the checks that say so.
-	CHECK(hash_fresh  == 0xba19cb5b038483fcULL);
-	CHECK(hash_reload == 0xc3ebcc973d6b3675ULL);
+	// ── WHY THEY MOVED A FIFTH TIME (2026-09-02) ─────────────────────────────────────
+	//
+	// They were 0xba19cb5b038483fc / 0xc3ebcc973d6b3675. v1.8.11 adds GEN_VERSION_CAVES: a
+	// sparse worm carver (world/cave_carve.c) replaces the old per-block noise-field cave
+	// test for genv >= GEN_VERSION_CAVES. This ring generates at GEN_VERSION_NEWEST, which
+	// is now CAVES, so it re-carves. That is exactly what this pin exists to notice.
+	//
+	// Unlike the four moves above, this one DOES move ground-to-ground cells, and that is
+	// intended — a cave carver's entire job is turning STONE into AIR. So the census below
+	// is what makes the new numbers safe to take, rather than the "zero ground transitions"
+	// argument the previous four leaned on:
+	//
+	//   * 122,295 of 2,654,208 cells differ, 4.6%.
+	//   * The dominant transition is AIR -> STONE, 118,083 — i.e. the OLD dense noise caves
+	//     are being FILLED BACK IN, and the new carver opens far fewer, larger tunnels.
+	//     That direction is the point of the change: the old field made swiss cheese.
+	//
+	// GEN_VERSION_LEGACY, _DENSITY and _BIOME worlds are unaffected — worldgen_density.c
+	// reaches the new carver only at genv >= GEN_VERSION_CAVES, so no existing save
+	// re-generates. Every world on a card today predates this and keeps its old caves.
+	//
+	// Transcribed from the line the suite prints on its own ring, not from a standalone
+	// probe:  identity fresh=67c24ddd7a91454b reload=f03ef44657a3596d
+	CHECK(hash_fresh  == 0x67c24ddd7a91454bULL);
+	CHECK(hash_reload == 0xf03ef44657a3596dULL);
 
 	regionCacheClose();
 	testRmTree(testDir());

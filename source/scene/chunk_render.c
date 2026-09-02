@@ -773,6 +773,9 @@ static int      s_alpha_draws;
 #define ALPHA_CUTOFF  127   // step 7.3: chunks no sight line reached
 static bool     s_cave_ran;      // ...and whether the walk ran at all this frame
 static int      s_refusals;
+// v1.8.11. Which of the two refusal classes the last chunkRenderBuild hit — see
+// chunkRenderLastRefusal() in the header for why the caller cannot infer this and must be told.
+static ChunkRefuseReason s_last_refuse;
 static size_t   s_bytes;
 
 // Step 7.3's working memory, ~37 KB and ~18 KB. Static for the same reason MeshScratch is:
@@ -1686,6 +1689,10 @@ bool chunkRenderBuild(const World* w, int cx, int cy, int cz)
 	// move to a different tier. NULL just means "this chunk has never been drawn before".
 	MeshSlot* existing = findSlot(cx, cy, cz);
 
+	// v1.8.11. Cleared on entry rather than on each success path, so every one of this
+	// function's several `return true`s leaves it NONE without having to remember to.
+	s_last_refuse = CHUNK_REFUSE_NONE;
+
 	// Deliberately does not touch the dirty queue. Clearing the flag here looks like
 	// tidiness and is how this shipped a bug for about three hours: the drain already
 	// clears it, so a clear here decremented the count twice per drained chunk until it
@@ -1707,6 +1714,7 @@ bool chunkRenderBuild(const World* w, int cx, int cy, int cz)
 		MeshSlot* s = existing ? existing : acquireSlot(0, NULL);
 		if (!s) {
 			s_refusals++;
+			s_last_refuse = CHUNK_REFUSE_POOL;
 			return false;
 		}
 		s->cx = cx; s->cy = cy; s->cz = cz;
@@ -1782,6 +1790,7 @@ bool chunkRenderBuild(const World* w, int cx, int cy, int cz)
 
 	if (out.overflow) {
 		s_refusals++;
+		s_last_refuse = CHUNK_REFUSE_OVERFLOW;
 		// Matches what the flat pool always did here: an overflowing remesh must not go on
 		// showing a chunk that no longer matches its own blocks, so a slot this chunk
 		// already owned is blanked rather than left showing stale geometry. A chunk that
@@ -1811,6 +1820,7 @@ bool chunkRenderBuild(const World* w, int cx, int cy, int cz)
 			// showing its last successfully built mesh instead of a hole, the same
 			// principle the overflow branch above uses for the same reason.
 			s_refusals++;
+			s_last_refuse = CHUNK_REFUSE_POOL;
 			return false;
 		}
 		if (existing) {
@@ -2924,6 +2934,7 @@ float chunkRenderVisUs(void)
 	return (float)s_vis_ticks / per_us / (float)n;
 }
 int    chunkRenderRefusals(void) { return s_refusals; }
+ChunkRefuseReason chunkRenderLastRefusal(void) { return s_last_refuse; }
 size_t chunkRenderBytes(void)    { return s_bytes; }
 
 // Step 7.5. Triangles and draw calls the alpha-tested pass actually submitted on the last

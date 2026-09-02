@@ -111,4 +111,14 @@ struct WorldGenScratch {
 	// column coordinate, so validity is its own flag rather than a sentinel pair.      9 B
 	int32_t top_cx, top_cz;
 	bool    top_valid;
+
+	// ── world/cave_carve.c (v1.8.11) ────────────────────────────────────────────────────
+	//
+	// The worm-carver's pre-pass output: which cells of THIS column are carved, one bit per
+	// block, same shape and size as `solid` above. Built once per column by
+	// caveCarveBuildMask(), for GEN_VERSION_CAVES-and-above worlds only (world/genversion.h);
+	// consumed by wgdColumn()'s existing downward fill loop in place of
+	// worldgenIsCaveCached() for those worlds. Untouched, and never read, on any older
+	// version — see world/cave_carve.h's own file comment.                       4,096 B
+	uint16_t carve[WORLD_HEIGHT][CHUNK_DIM];
 };

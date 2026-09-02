@@ -392,8 +392,39 @@ folded into the same per-cell write the mask already makes), no new pass and no 
 A new `BLOCK_LAVA` id is required — `block.h` currently defines no lava block at all
 (`caves-legacy-console.md` §7 confirms this by repository search) — and per that same
 file's own append discipline (`block.h:104-167`, the `BLOCK_COUNT`/id-numbering comments
-and their `_Static_assert`s), it must be appended past the current highest id, never
-inserted or renumbered.
+and their `_Static_assert`s), it must be appended past the current highest id (`BLOCK_TORCH
+= 27`, `block.h:170`), never inserted or renumbered. `BLOCK_COUNT` itself does not move —
+it stays 8, the frozen wire span (`block.h:172-173`'s `_Static_assert`) — the same way
+`BLOCK_TORCH` sits outside it today.
+
+**This is the one piece of this plan that forces a server release, and nothing else in it
+does — that split is worth stating precisely rather than by the blanket rule "any worldgen
+change is a server release."** The mirror is a named file list, not the whole directory:
+`deps/blocksmith-server/tools/sync-world-sources.sh:46` reads
+`FILES=(block.h inventory.h inventory.c crafting.h crafting.c crc32.h crc32.c registry.h
+registry.c tick.h tick.c)`, and `check-world-drift` (`Makefile:402-403`, comparing
+`WORLD_SRC` against `WORLD_VENDOR`) reads that exact line rather than walking the
+directory. `worldgen.c`, `worldgen.h`, `worldgen_density.c`, `worldgen_scratch.h`,
+`genversion.h`, and `water.c`/`water.h` are **not** in that list — every carving,
+neighbourhood-scan, versioning, and water change this plan proposes (§2, §3.1, §3.3) can
+land, build, and ship on the client alone, with `check-world-drift` never even looking at
+those files. `block.h` and `registry.c`/`registry.h` **are** in the list. Appending
+`BLOCK_LAVA` to `block.h` and giving it a registry row therefore does exactly what
+`BLOCK_TORCH` did for v1.8.10: it moves the vendored copy out of sync the moment it lands,
+`check-world-drift` fails the very next `make` or `make test` until
+`tools/sync-world-sources.sh` is run and the result committed to
+`deps/blocksmith-server`, and it moves the registry CRC golden again, the same shape as
+the torch's own move from 0xD236 (27 rows) to 0x165E (28 rows), pinned at
+`registry_test.c:554-580`. **Sequencing**: the lava block-registry change and its server
+sync must land together — the client commit that adds `BLOCK_LAVA` should carry the synced
+`deps/blocksmith-server/game/world/{block.h,registry.h,registry.c}` in the same change or
+the immediately following one, and the server's own release (whatever process ships
+`deps/blocksmith-server`, git-tagged the same way `BS_BLOCK_COUNT`'s `_Static_assert` in
+`validate.c:146` is checked) has to go out no later than the client CIA that starts writing
+`BLOCK_LAVA` cells into carved caves, or a server built from the stale vendored copy will
+disagree with a client already placing a block id it has never heard of. The carving code
+itself carries no such requirement and can be developed, tested, and iterated on entirely
+client-side, in any order, with no server coordination at all.
 
 Standalone rarer lava "lakes" above the fixed floor (§4 of the research document) are a
 separate, rarer per-region draw of the same shape as ravines (§2.5) — explicitly proposed
@@ -563,7 +594,12 @@ Ordered so each step is independently host-testable before the next depends on i
    by the existing downward fill loop in place of `worldgenIsCaveCached()`, gated on
    `GEN_VERSION_CAVES` (§3.1). The legacy fill loop is untouched.
 8. **Lava** (§3.2) — the fixed-Y branch inside the carve-stamp write, plus the new
-   `BLOCK_LAVA` id appended per `block.h`'s own discipline.
+   `BLOCK_LAVA` id appended per `block.h`'s own discipline. **This is the only step in this
+   build order that touches a mirrored file** (`block.h`, `registry.c`/`registry.h` — §3.2's
+   file-list citation); land it as its own commit, run
+   `deps/blocksmith-server/tools/sync-world-sources.sh` in the same change, and confirm
+   `make check-world-drift` passes before this step is considered done — not deferred to a
+   later cleanup pass.
 9. **Water, column-local only** (§3.3) — extending the existing `sea[]` overhang case to
    also see carved cells from the new mask, no cross-column work.
 10. **Ravines** (§2.5) — the second per-region draw and preset, folded into the existing
@@ -633,6 +669,13 @@ Named here so they are decisions, not omissions:
    rarity (~1-in-50) rejects nearly all of that wider neighbourhood for one hash call each.
 7. **Cave entrances are a design fork, not an engineering detail, and this document does
    not decide it** — see §8.
+8. **`BLOCK_LAVA` ships client-side without its server sync landing first or alongside**,
+   leaving a client that places a block id the deployed server has never heard of (§3.2).
+   Cheapest mitigation: treat the lava id and its registry row as their own commit gated on
+   `make check-world-drift` passing (build-order step 8), never bundled silently inside the
+   larger carving change where a missed sync would be easy to overlook — the rest of this
+   plan's changes (§2, §3.1, §3.3) are confirmed, by the mirror's own file list
+   (`sync-world-sources.sh:46`), not to need this at all.
 
 ---
 

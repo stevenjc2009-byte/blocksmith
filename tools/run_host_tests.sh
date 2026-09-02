@@ -268,6 +268,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/world/visgraph.c \
 	source/world/worldgen.c \
 	source/world/worldgen_density.c \
+	source/world/cave_carve.c \
 	source/world/genversion.c \
 	source/scene/render_dist.c \
 	source/world/world_test.c \
@@ -1708,6 +1709,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/world/budget.c \
 	source/world/worldgen.c \
 	source/world/worldgen_density.c \
+	source/world/cave_carve.c \
 	source/world/genversion.c \
 	tests/net_stub.c \
 	-lm \
@@ -3868,6 +3870,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/world/budget.c \
 	source/world/worldgen.c \
 	source/world/worldgen_density.c \
+	source/world/cave_carve.c \
 	source/world/genversion.c \
 	tests/net_stub.c \
 	tests/worldgen_density_opt_test.c \
@@ -3975,6 +3978,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/world/budget.c \
 	source/world/worldgen.c \
 	source/world/worldgen_density.c \
+	source/world/cave_carve.c \
 	source/world/genversion.c \
 	tests/net_stub.c \
 	tests/worldgen_mt_test.c \
@@ -4063,6 +4067,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/world/jobq.c \
 	source/world/worldgen.c \
 	source/world/worldgen_density.c \
+	source/world/cave_carve.c \
 	source/world/genversion.c \
 	source/app/lanes.c \
 	tests/net_stub.c \
@@ -4248,6 +4253,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/world/crc32.c \
 	source/world/worldgen.c \
 	source/world/worldgen_density.c \
+	source/world/cave_carve.c \
 	tests/scratch_tint_fill_test.c \
 	-lm \
 	-o "$BHTF/scratch_tint_fill_test"
@@ -4326,6 +4332,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/world/crc32.c \
 	source/world/worldgen.c \
 	source/world/worldgen_density.c \
+	source/world/cave_carve.c \
 	source/debug/biomeinfo.c \
 	source/debug/biomeinfo_test.c \
 	-lm \
@@ -4584,3 +4591,155 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 "./$BHGR/genretry_test"
 
 rm -rf "$BHGR"
+
+# meshdrop_test: proves the v1.8.11 chunk-hole fix in source/main.c's genDrainMesh.
+#
+# THE BUG (v1.8.10 and earlier): genDrainMesh pops a JOB_MESH, calls chunkRenderBuild, and on
+# failure only bumped a diagnostics counter -- the job was already popped, and s_col_queued's
+# bit for that column had been set the moment the job was PUSHED. genQueueReadyColumns skips
+# any column whose bit is set, and the bit is cleared only when the column LEAVES the mesh
+# ring. So one transient refusal became a permanent hole in the world that healed only by
+# walking far enough away and back. That is exactly the reported symptom: three chunks loaded,
+# one missing, and another loaded BEYOND the gap -- which a merely slow queue cannot produce,
+# because both streaming walks use ringOrder() and fill nearest-first.
+#
+# THE FIX: chunkRenderBuild now reports WHY it refused (scene/chunk_render.h, ChunkRefuseReason).
+# CHUNK_REFUSE_POOL is transient -- slots come back as columns unload -- so it goes into a
+# world/genretry.h ledger and is resubmitted. CHUNK_REFUSE_OVERFLOW is permanent (the chunk's
+# own geometry exceeds the per-chunk cap; meshing it again overflows again by definition), so
+# it is counted and NEVER retried: a retry there would spin forever and starve the drain budget
+# every meshable chunk is queued behind, turning a one-chunk hole into a world-wide stall.
+#
+# Both halves are asserted, because a fix that simply retried EVERY failure would pass the
+# first fixture and fail testOverflowIsNotRetried.
+#
+# Extracted (not hand-copied) out of source/main.c, exactly like cavewalk_extract.inc extracts
+# out of scene/chunk_render.c: main.c includes <3ds.h> and carries main(), so nothing in it can
+# be linked directly. world/meshq.c, world/jobq.c, world/genretry.c and scene/ringorder.c are
+# linked FOR REAL -- the queue, the retry ledger and the ring visit order these checks observe
+# are the ones the console runs.
+#
+# Red arm, measured against commit 28e01e9 (v1.8.10) with this same fixture:
+#   "FAIL 20 checks, 3 failed", first "L318 THE BUG: the column is re-queued and meshed within
+#   MAX_FRAMES frames", with "DIAGNOSTIC: after 1000 frames standing still -- s_genr.meshed=0
+#   s_genr.mesh_refused=1 jobqCount=0 s_col_queued(0,0)=still set".
+# Green arm, the fixed tree: "PASS 17 checks, 0 failed".
+BHMD="build-host/run-$$-meshdrop"
+mkdir -p "$BHMD"
+
+# ChunkRefuseReason out of scene/chunk_render.h. Buffered, so only the enum whose closing line
+# names ChunkRefuseReason is emitted and any other typedef enum in that header is discarded.
+awk '
+/^typedef enum \{$/       { buf = $0 "\n"; inb = 1; next }
+inb && /^\} [A-Za-z_]+;$/ { if ($0 == "} ChunkRefuseReason;") { print buf $0; sawEnum = 1 } inb = 0; next }
+inb                       { buf = buf $0 "\n" }
+END {
+	if (sawEnum) print "#define BS_MESHDROP_REFUSE_OK 1"
+	else print "#error \"meshdrop_refuse.inc did not carry ChunkRefuseReason out of source/scene/chunk_render.h\""
+}
+' source/scene/chunk_render.h > "$BHMD/meshdrop_refuse.inc"
+
+awk '
+/^static int genWrap\(int32_t c, int span\)$/                                   { inf=1; sawWrap=1 }
+/^static ColSlot\* genSlot\(ColSlot\* grid, int span, int32_t cx, int32_t cz\)$/ { inf=1; sawSlot=1 }
+/^static bool genSlotHas\(ColSlot\* grid, int span, int32_t cx, int32_t cz\)$/   { inf=1; sawHas=1 }
+/^static void genSlotSet\(ColSlot\* grid, int span, int32_t cx, int32_t cz\)$/   { inf=1; sawSet=1 }
+/^static void genSlotClear\(ColSlot\* grid, int span, int32_t cx, int32_t cz\)$/ { inf=1; sawClear=1 }
+/^static bool genInArea\(int32_t cx, int32_t cz\)$/                              { inf=1; sawInArea=1 }
+/^static bool genInMesh\(int32_t cx, int32_t cz\)$/                              { inf=1; sawInMesh=1 }
+/^static bool genColumnInstalled\(int32_t cx, int32_t cz\)$/                     { inf=1; sawInstalled=1 }
+/^static bool genColumnRingComplete\(int32_t cx, int32_t cz\)$/                  { inf=1; sawRingComplete=1 }
+/^static bool meshRetrySubmit\(void\* ud, int32_t cx, int32_t cz\)$/             { inf=1; sawMeshRetry=1 }
+/^static void genQueueReadyColumns\(void\)$/                                     { inf=1; sawQueue=1 }
+/^static int genDrainMesh\(float budget_ms, int max_chunks\)$/                   { inf=1; sawDrain=1 }
+inf { print; if ($0 == "}") inf=0 }
+END {
+	if (sawWrap && sawSlot && sawHas && sawSet && sawClear && sawInArea && sawInMesh &&
+	    sawInstalled && sawRingComplete && sawQueue && sawDrain && sawMeshRetry)
+		print "#define BS_MESHDROP_EXTRACT_OK 1"
+	else
+		print "#error \"meshdrop_extract.inc did not carry the functions under test out of source/main.c\""
+}
+' source/main.c > "$BHMD/meshdrop_extract.inc"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source -I "$BHMD" \
+	source/world/meshq.c \
+	source/world/jobq.c \
+	source/world/genretry.c \
+	source/scene/ringorder.c \
+	source/world/world.c \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/budget.c \
+	source/world/scratch.c \
+	tests/net_stub.c \
+	source/world/meshdrop_test.c \
+	-lm \
+	-o "$BHMD/meshdrop_test"
+
+"./$BHMD/meshdrop_test"
+
+rm -rf "$BHMD"
+
+# ── tests/cave_carve_test.c — the v1.8.11 worm cave carver ────────────────────────────────
+#
+# world/cave_carve.c is the generator half of v1.8.11: a sparse worm carver that replaces the
+# old per-block noise-field cave test for genv >= GEN_VERSION_CAVES. It shipped into
+# worldgen_density.c:637 with NO behaviour test in this suite — loadprof_test.c reaches it
+# transitively (its 81-column pass generates at GEN_VERSION_NEWEST) but only as an opaque
+# FNV-hash black box, and world_test.c's GEN_VERSION references are version arithmetic, not
+# generation. A hash pin notices that caves CHANGED; it cannot say they are CORRECT.
+#
+# The property that matters, and the one a cave carver gets wrong first: a column's mask must
+# not depend on what was generated before it. The carver writes through a SHARED WorldGenScratch
+# that is reused column after column, so a missed clear makes a column inherit its neighbour's
+# tunnels — which on the console looks like caves that change shape depending on which way the
+# player walked in. testCrossColumnAgreement generates a column on a fresh scratch and again
+# after many other columns on a reused one, and requires the two masks to be identical;
+# testOrderIndependence does the same for forward, reverse and shuffled build orders.
+#
+# RED ARM, MEASURED HERE on 2026-09-02 rather than taken on the authoring lane's report.
+# Sabotage: the scratch clear at the top of caveCarveBuildMaskR (world/cave_carve.c:267-269,
+# the three-line "s->carve[y][z] = 0" loop) replaced by a comment, so every column inherits
+# whatever the previous column carved. Restored afterwards and the file's md5 confirmed
+# identical to before (3bd9e26aa23527e174969f34f48bc527).
+#
+#   GREEN:  "PASS (494/494 checks)"
+#   RED:    "FAILED (447/494 checks)" — 47 red. 19 of them
+#           "FAIL tests/cave_carve_test.c:233  digestMask(&a) == digestMask(&b)" (the
+#           isolation-vs-larger-area property), plus
+#           "FAIL tests/cave_carve_test.c:287  below_floor == 0", and the summary lines
+#           degrade exactly as the bug predicts: "radius sufficiency R vs R+2: 0/108 columns
+#           agreed" (was 108/108) and "588 columns carved something out of 588; 2352 cells
+#           below GEN_CAVE_FLOOR" (was 176/588 and 0).
+#
+# The binary returns `g_failed ? 1 : 0` (tests/cave_carve_test.c:302), so under this script's
+# `set -e` (line 224) a red cave test aborts the suite rather than scrolling past.
+BHCC="build-host/run-$$-cavecarve"
+mkdir -p "$BHCC"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/chunk_codec.c \
+	source/world/crc32.c \
+	source/world/world.c \
+	source/world/scratch.c \
+	source/world/noise.c \
+	source/world/budget.c \
+	source/world/worldgen.c \
+	source/world/worldgen_density.c \
+	source/world/cave_carve.c \
+	source/world/genversion.c \
+	tests/net_stub.c \
+	tests/cave_carve_test.c \
+	-lm \
+	-o "$BHCC/cave_carve_test"
+
+"./$BHCC/cave_carve_test"
+
+rm -rf "$BHCC"

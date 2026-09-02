@@ -1,0 +1,19 @@
+# Release notes shown on the 3DS top screen before the update downloads.
+#
+# Two sections, both optional, one item per line. Plain English, no markdown: this is read
+# by a player on a 400 px screen, not by a developer. A leading "- " is optional.
+#
+# Long lines wrap on their own, so write a sentence rather than fighting the width.
+#
+# The two lines below are placeholders. This script REFUSES the file while either of them is
+# still here, so replace each with a real sentence about this release, or delete it if that
+# section has nothing in it.
+
+[features]
+Caves are proper winding tunnels now instead of small disconnected pockets.
+New caves only appear in new worlds. A world you already have keeps the caves it has.
+
+[fixes]
+Chunks that never loaded until you walked up to them, leaving gaps in the world. Fixed.
+A chunk the game could not draw was thrown away and never asked for again. It retries now.
+Desert grass was a dull olive green. It is a sandy tan now.

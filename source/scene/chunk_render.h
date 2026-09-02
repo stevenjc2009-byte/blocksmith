@@ -182,6 +182,32 @@ float chunkRenderFogHalfVis(void);
 // pool is otherwise full. False means the pool was full or the mesh did not fit.
 bool chunkRenderBuild(const World* w, int cx, int cy, int cz);
 
+// Why the most recent chunkRenderBuild returned false. v1.8.11.
+//
+// The caller has to be able to tell these two apart, because the right response to each is the
+// OPPOSITE of the right response to the other:
+//
+//   POOL     — acquireSlot found no free slot in any tier. Transient: slots come back as
+//              columns unload, so asking again later genuinely can succeed, and asking again
+//              is the only thing that repairs the hole.
+//   OVERFLOW — this one chunk's own geometry exceeds MESH_SLOT_VERTS/MESH_SLOT_INDICES, the
+//              absolute per-chunk cap. Permanent for as long as those blocks are those blocks.
+//              Retrying it is provably useless: the same chunk meshed again produces the same
+//              overflow, so a retry loop here would spin forever and starve the drain budget
+//              that every other chunk is waiting on.
+//
+// A single conflated "it failed" counter cannot support that decision, which is why this exists
+// rather than the caller inferring a reason. Valid only immediately after a false return, on the
+// same thread; chunkRenderBuild is main-thread only and its two callers both test it straight
+// away. A true return leaves this CHUNK_REFUSE_NONE.
+typedef enum {
+	CHUNK_REFUSE_NONE = 0,
+	CHUNK_REFUSE_POOL,
+	CHUNK_REFUSE_OVERFLOW,
+} ChunkRefuseReason;
+
+ChunkRefuseReason chunkRenderLastRefusal(void);
+
 // Hands back every slot belonging to a column that has just been unloaded, and returns how
 // many. Call it *after* the column is gone from the World: a slot whose chunk no longer
 // exists would otherwise keep drawing terrain that is not there, and — worse — would still
