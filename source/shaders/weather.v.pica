@@ -1,0 +1,81 @@
+; Blocksmith — the rain/snow billboard-strip vertex shader (v1.8.9 weather rendering).
+;
+; source/shaders/crack.v.pica with everything the crack overlay does not have taken out and
+; exactly one thing added. No baked face shade, no ambient occlusion, no relative-addressed
+; table, no water height offset — same as crack.v.pica for the same reason. The one addition
+; is `params`, a single vec4 uniform whose x component is the current fall-scroll offset:
+; source/gfx/weatherdraw.c rebuilds the static billboard grid exactly once (see its own
+; header for why a per-frame CPU rebuild is not needed), so the ONLY thing that makes the
+; texture look like it is falling is this one float, added to the scroll axis here and
+; re-uploaded once a frame. That is the entire per-frame GPU-side cost of the "falling"
+; effect: one uniform upload, not a vertex buffer touch.
+;
+; Attributes (see WeatherVertex in source/gfx/weatherdraw.c):
+;   v0 = position, 3x float, local to the billboard grid's own snapped origin — the model
+;        matrix uploaded at draw time carries that origin (and, for snow, the drift offset)
+;        into world space, exactly as crack.v.pica's v0 is local to a block's own corner.
+;   v1 = texture coordinate, 2x float, ALREADY NORMALISED to 0..1 (before the scroll add
+;        below). x is the TILE-SELECT axis (rain vs snow — fixed per vertex, never
+;        animated); y is the FALL-SCROLL axis (animated by `params`). See
+;        source/gfx/weatherdraw.h's vertex-format comment for the full reasoning on why the
+;        axes are this way around and not the other.
+;
+; No uvScale constant here for the same reason crack.v.pica has none: source/gfx/weatherdraw.c
+; bakes already-normalised floats on the CPU from constants it alone owns
+; (WEATHERDRAW_TILE_RAIN/SNOW, WEATHERDRAW_TEX_WORLD_PER_TILE), so the texture layout lives in
+; exactly two places — tools/make_weathertex.py and weatherdraw.c/h — and this shader never
+; sees a sheet dimension to disagree with.
+
+.fvec projection[4], modelView[4]
+.fvec params[1]
+
+.constf consts(0.0, 1.0, 0.0, 0.0)
+.alias  ones consts.yyyy
+
+.out outpos position
+.out outtc0 texcoord0
+.out outclr color
+
+.alias inpos v0
+.alias inuv  v1
+
+.proc main
+	mov r0.xyz, inpos
+	mov r0.w,   ones
+
+	dp4 r1.x, modelView[0], r0
+	dp4 r1.y, modelView[1], r0
+	dp4 r1.z, modelView[2], r0
+	dp4 r1.w, modelView[3], r0
+
+	dp4 outpos.x, projection[0], r1
+	dp4 outpos.y, projection[1], r1
+	dp4 outpos.z, projection[2], r1
+	dp4 outpos.w, projection[3], r1
+
+	; Tile-select (x) passes straight through, unanimated. Fall-scroll (y) gets the current
+	; offset added before it reaches the sampler; GPU_REPEAT (weatherdraw.c's wrap mode on
+	; this axis — see its own header on why that is safe here and was NOT safe on the axis
+	; an earlier draft of this feature put it on) wraps whatever magnitude this reaches, so
+	; nothing here needs to keep the sum bounded. weatherdraw.c's own CPU-side accumulator
+	; still wraps it into [0, 1) before upload, for float-precision reasons stated there —
+	; not because the GPU needs it to.
+	;
+	; Operand order matters here: picasso rejected `add outtc0.y, inuv.y, params[0].x`
+	; with "invalid source2 register: params" (caught by a real picasso run, not by
+	; reasoning about the ISA) — every other uniform-plus-register add in this codebase
+	; (e.g. world.v.pica's `add r7.x, fogParams.yyyy, r7.xxxx`) puts the uniform in the
+	; source1 slot and the non-uniform operand in source2, matching the PICA200 vertex
+	; shader restriction that source2 cannot address the constant/uniform bank. Swapped
+	; below to match that pattern.
+	mov outtc0.x, inuv.x
+	add outtc0.y, params[0].x, inuv.y
+
+	; Unused by TEV — weatherDrawDraw's stage 0 is GPU_REPLACE from GPU_TEXTURE2, so the
+	; primary colour is never read — but left defined rather than omitted, exactly as
+	; crack.v.pica and highlight.v.pica both leave it, so every output the fixed-function
+	; pipeline expects has a value.
+	mov outclr, ones
+
+	end
+.end

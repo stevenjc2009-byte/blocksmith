@@ -1,0 +1,9 @@
+[features]
+It rains, and it snows. Which one you get depends on the biome and how cold it is.
+Snow settles on the ground as it falls, one layer deep, and melts away when it warms up.
+Jump into water and it splashes.
+Weather is finally running. It was built and tested a while back, but nothing ever ran it.
+
+[fixes]
+Night was far too bright indoors. A torchless room now reads as dark, the way it should.
+Rain and snow no longer fall through cave ceilings or through a roof you have built.

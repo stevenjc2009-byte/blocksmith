@@ -1,0 +1,54 @@
+; Blocksmith — the particle vertex shader (v1.8.9, source/gfx/particles.c).
+;
+; Deliberately the same shape as source/shaders/sprite.v.pica, with one swap: sprite.v.pica
+; has no model-view matrix because the UI is already in screen pixels, so its one uniform is
+; a pure ortho projection; particles live in world space and are billboarded on the CPU
+; (particles.c's buildVertices), so the vertices this shader receives are already final
+; world-space positions and the one uniform it needs is projection*view combined — computed
+; once per draw call on the CPU (Mtx_Multiply in particles.c) rather than as two uniforms and
+; a second dp4 block per vertex, the same "one matrix, not two" reasoning
+; source/shaders/sprite.v.pica's own header comment gives for its single ortho uniform.
+;
+; Attributes:
+;   v0 = position, 3x float, world-space block coordinates (see ParticleVertex, particles.c).
+;   v1 = texcoord, 2x float — written by particles.c for every vertex but NOT sampled by any
+;        TEV stage today (particlesDraw's TEV stage 0 sources GPU_PRIMARY_COLOR, not
+;        GPU_TEXTURE0 — see plan-particles.md section 3a: a splash needs no texture). Passed
+;        through anyway so a later, genuinely textured particle type costs zero shader
+;        changes, only a TEV change in particles.c.
+;   v2 = colour, 4x unsigned byte, 0..255 — scaled to 0..1 below exactly the way
+;        sprite.v.pica's own header comment explains (the PICA200 has no normalised unsigned
+;        byte attribute format, so the /255 has to happen somewhere, and here is the
+;        cheapest somewhere). This is what carries a particle's fade: particles.c writes a
+;        lower alpha every frame as life runs out, and this shader just passes it through.
+
+.fvec viewProj[4]
+
+.constf consts(0.0, 1.0, 0.00392156862, 0.0)   ; z = 1/255
+.alias  ones    consts.yyyy
+.alias  inv255  consts.zzzz
+
+.out outpos position
+.out outtex texcoord0
+.out outclr color
+
+.alias inpos v0
+.alias intex v1
+.alias inclr v2
+
+.proc main
+	mov r0.xyz, inpos
+	mov r0.w,   ones
+
+	dp4 outpos.x, viewProj[0], r0
+	dp4 outpos.y, viewProj[1], r0
+	dp4 outpos.z, viewProj[2], r0
+	dp4 outpos.w, viewProj[3], r0
+
+	mov outtex.xy, intex
+	mov outtex.zw, consts.xxxx
+
+	mul outclr, inv255, inclr
+
+	end
+.end

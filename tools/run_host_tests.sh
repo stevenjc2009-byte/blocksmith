@@ -4272,3 +4272,111 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 "./$BHVH/version_history_test"
 
 rm -rf "$BHVH"
+
+# world/daynight_test.c -- the day/night clock (v1.8.9). Own binary, own main(), appended for
+# the same reason every stanza in this file is appended: an append cannot drop another
+# session's work, and this file is shared. See world/daynight_test.c's own file comment for
+# what it checks and why the oracle is a hand-transcribed wiki table rather than a copy of
+# daynight.c's own kDarkenRows.
+#
+# The link is world/crc32.c (the sidecar's CRC-32) and world/daynight.c itself; daynight.c also
+# includes world/tick.h for TICK_HZ and DAY_TICKS' _Static_assert against it, but tick.h is a
+# header of macros only, so world/tick.c does not need to be on this link line. -lm is required:
+# unlike every other host stanza in this file, daynight.c calls cosf/floorf directly (the sky
+# angle and sky-darken formulas), and without it the link fails with "undefined reference to
+# `cosf'" rather than a test failure -- MEASURED, not assumed, the first time this stanza was
+# written.
+#
+# daynight_test.c takes a writable directory as argv[1] for its sidecar round-trip checks
+# (testSidecarRoundTrip et al.), the same shape world/worldseed_test.c already uses for its own
+# sidecar -- so this stanza passes its own scratch directory rather than "." the way the
+# no-argument binaries above it are invoked.
+#
+# THE CHECK COUNT. daynight_test.c prints "PASS 235 checks" against its own
+# `#define EXPECTED_CHECKS 234`, which reads like the same off-by-one this file's other stanzas
+# warn about -- and it is NOT one, checked here rather than assumed: checkCountPin() reads
+# `ran = g_checks` BEFORE incrementing g_checks for its own check, so EXPECTED_CHECKS pins the
+# count of SUBSTANTIVE checks and the pin's own check is what carries the total to 235. Run
+# healthy: "PASS 235 checks, 0 failed" -- the pin passed (234 substantive checks matched
+# EXPECTED_CHECKS), so there was never a real mismatch to fix. Confirmed the other way too: with
+# EXPECTED_CHECKS hand-edited to 235 (i.e. "fixing" the apparent off-by-one), the pin itself goes
+# red -- "FAIL CHECK COUNT: expected 235, ran 234 -- 1 check(s) WENT MISSING" -- which is exactly
+# the false alarm this comment exists to head off for the next person reading this stanza.
+BHDN="build-host/run-$$-daynight"
+mkdir -p "$BHDN"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/crc32.c \
+	source/world/daynight.c \
+	source/world/daynight_test.c \
+	-lm \
+	-o "$BHDN/daynight_test"
+
+"./$BHDN/daynight_test" "$BHDN"
+
+rm -rf "$BHDN"
+
+# particles_test.c -- source/gfx/particles.c's pool/spawn/tick/fade logic, host-only.
+#
+# particles.c has no <3ds.h> or citro3d anywhere except inside its own #ifdef __3DS__ block
+# (particlesDraw, and the console halves of particlesInit/particlesExit) -- see
+# source/gfx/particles.h's own header comment for why. Compiling it here with no -D__3DS__
+# builds only the host-visible half: the static pool, particlesTick's fall/fade arithmetic,
+# particlesSpawn's ring-recycle, and particlesSpawnSplash's deterministic hash-based scatter.
+# particlesDraw and the GPU resource claims in particlesInit/particlesExit's __3DS__ half are
+# never reached from this binary -- this stanza proves the simulation logic, nothing about
+# whether the shader compiles or the console half links. See
+# docs/plan-1.8.9-particles-integration.md for what that gap means for whoever wires this in.
+#
+# -lm: particlesSpawnSplash calls fabsf/cosf/sinf directly (particleHash-derived scatter
+# angle) -- same reason daynight_test.c above needs it.
+BHPART="build-host/run-$$-particles"
+mkdir -p "$BHPART"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/gfx/particles.c \
+	tests/particles_test.c \
+	-lm \
+	-o "$BHPART/particles_test"
+
+"./$BHPART/particles_test"
+
+rm -rf "$BHPART"
+
+# weatherdraw_test.c -- source/gfx/weatherdraw.c's grid-placement and scroll/drift logic,
+# host-only (v1.8.9 weather RENDERING — not world/weather.c, which decides what is falling
+# and is tested separately; this is only the billboard-strip geometry that draws it).
+#
+# weatherdraw.c has no <3ds.h> or citro3d anywhere except inside its own #ifdef __3DS__
+# block (weatherDrawInit/Exit/Draw) -- see source/gfx/weatherdraw.h's own header comment for
+# why. Compiling it here with no -D__3DS__ builds only the host-visible half:
+# weatherDrawStateInit/SetState/ShouldDraw/FallSpeed/TileForKind/KindVertexOffset and the
+# grid-building/scroll/drift arithmetic in weatherDrawBuildVertices and weatherDrawUpdate.
+# weatherDrawDraw and the GPU resource claims in weatherDrawInit/Exit's __3DS__ half are
+# never reached from this binary -- this stanza proves the geometry and animation state
+# machine, nothing about whether the shader compiles, the texture loads, or the console half
+# links. See docs/plan-1.8.9-weather-integration.md for what that gap means for whoever
+# wires this in, and for why weatherAt() itself is never called from this file at all.
+#
+# weatherdraw.c's pure half includes world/weather.h for the WeatherKind enum alone (a
+# header-only need — nothing here calls weatherAt() or any other weather.c function), so no
+# source/world/*.c file needs to be on this compile line for the binary to link.
+#
+# -lm: weatherDrawUpdate calls fmodf/sinf directly (the scroll and drift accumulators) and
+# weatherDrawBuildVertices' own snap helper calls floorf -- same reason particles_test.c
+# above and daynight_test.c both need it.
+BHWXD="build-host/run-$$-weatherdraw"
+mkdir -p "$BHWXD"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/gfx/weatherdraw.c \
+	tests/weatherdraw_test.c \
+	-lm \
+	-o "$BHWXD/weatherdraw_test"
+
+"./$BHWXD/weatherdraw_test"
+
+rm -rf "$BHWXD"

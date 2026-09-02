@@ -46,8 +46,10 @@
 #include "entity/entity.h"
 #include "gfx/atlas.h"
 #include "gfx/font.h"
+#include "gfx/particles.h"
 #include "gfx/screen.h"
 #include "gfx/sprite.h"
+#include "gfx/weatherdraw.h"
 #include "net/bsnet.h"
 #include "net/inv_bridge.h"
 #include "net/networld.h"
@@ -81,6 +83,7 @@
 #include "world/relightq.h"
 #include "world/tick.h"
 #include "world/water.h"
+#include "world/weather.h"
 #include "world/world.h"
 #include "world/world_test.h"
 #include "world/worldgen.h"
@@ -128,6 +131,13 @@ static TickClock s_tickclock;
 // entities, and read back every frame in drawEye() to drive the sky colour and the chunk shader's
 // dayLevel uniform.
 static DayNight s_daynight;
+
+// v1.8.9 weather rendering. The camera-following rain/snow strip's animation state (kind,
+// scroll/drift phase, snapped grid position) -- see gfx/weatherdraw.h. Reset once per
+// new/loaded world in genStart(), beside dayNightInit(), because it needs a real world to
+// poll weatherAt() against; the GPU resources it draws through (shader/texture/vertex
+// buffer) are claimed once for the process by weatherDrawInit(), beside chunkRenderInit().
+static WeatherDrawState s_weatherdraw;
 
 // v1.8.0 task 22. The water simulation: sources, flow levels, spread and drainage. Its state is
 // the flow-level side map and the candidate queue — see world/water.h for why the level is not a
@@ -1456,6 +1466,14 @@ static bool genStart(int32_t cx, int32_t cz)
 	(void)dayNightRead(world_dir, &day_ticks);
 	dayNightInit(&s_daynight, day_ticks);
 
+	// v1.8.9 weather rendering. Reset here, alongside the day/night clock it shares wx_tick
+	// with (see the per-tick weather loop below), and not at process boot: weatherDrawUpdate
+	// needs a real world's camera position to snap its grid against, and a state left over
+	// from a previous world would show that world's scroll/drift phase and grid snap in the
+	// first frame of this one. The GPU resources it draws through are process-level and were
+	// already claimed by weatherDrawInit() at boot -- only the animation state resets here.
+	weatherDrawStateInit(&s_weatherdraw);
+
 	if (!worldgenInit(&s_gen, seed, gen_version)) {
 		// Unreachable while genVersionResolve only ever returns OK for a known version — this
 		// is the same predicate asked twice, on purpose, at the one other place a WorldGen can
@@ -2391,6 +2409,24 @@ static void drawEye(C3D_RenderTarget* target, const C3D_Mtx* view, const RayHit*
 	// chunkRenderDraw and this file draws the whole frame again in every arm.
 	chunkRenderDraw(view);
 	for (int i = 0; i < BS_GPU_STRESS; i++) chunkRenderDraw(view);
+
+	// v1.8.9 weather rendering. Immediately after the terrain (and its BS_GPU_STRESS
+	// repeats), not before: weatherDrawDraw blends against whatever is already in the colour
+	// buffer, and an opaque chunkRenderDraw running after it would overwrite the blended
+	// rain/snow rather than composite with it. Passed chunkRenderProjection() (this eye's
+	// matrix, already skewed by chunkRenderSetEye(iod) above) so stereo separation matches
+	// the terrain exactly -- see docs/plan-1.8.9-weather-integration.md §4. Restores its own
+	// GPU state (depth test, alpha blend, cull face) back to chunk_render.c's own defaults
+	// before returning, so nothing below needs to know it ran.
+	weatherDrawDraw(chunkRenderProjection(), view, &s_weatherdraw);
+
+	// v1.8.9 particle system. Same placement rule as weatherDrawDraw immediately above and
+	// for the same reason (blends against the colour buffer, must run after every opaque
+	// draw that could cover the same pixels) -- see
+	// docs/plan-1.8.9-particles-integration.md §3. particlesDraw depth-TESTS against the
+	// world's buffer without writing to it, so it needs chunkRenderDraw's terrain already
+	// resolved, which it is by this point. Also restores its own GPU state before returning.
+	particlesDraw(view);
 
 	// v1.8.8 NEON BIOME BORDERS — the debug overlay, and the ONLY line of the world pass it
 	// costs. There is no render hook in this file and none was invented for it: every stage
@@ -3456,6 +3492,16 @@ int main(void)
 	memProbeBootMark("chunkRenderInit");
 	memProbeBootFlush();
 
+	// v1.8.9 weather rendering. Same phase as chunkRenderInit above -- a one-time GPU-object
+	// claim (shader/texture/vertex buffer) made once for the process, before session_start,
+	// and freed once at app_shutdown by weatherDrawExit() beside chunkRenderExit() -- but NOT
+	// the same failure-handling shape: chunkRenderInit's failure above is fatal because the
+	// world literally cannot be drawn without it, whereas rain/snow is not load-bearing, the
+	// same not-fatal footing as crackOverlayInit/highlightInit/playerModelInit below. A
+	// failed weatherDrawInit leaves weatherDrawShouldDraw() false forever (nothing was armed
+	// to draw), so weatherDrawDraw() degrades to a no-op rather than crashing.
+	(void)weatherDrawInit();
+
 	// Step 8.3. The GUI's batch and its font, brought up together because they are one
 	// thing in practice: spriteRect() samples the solid white texel that lives *inside*
 	// the font texture, so a batch without a font can draw nothing at all. A failure here
@@ -3981,6 +4027,13 @@ session_start:
 	// fails, so nothing downstream needs the answer. It loads its own texture — do not call
 	// crackAtlasInit here as well, crackOverlayInit already has.
 	(void)crackOverlayInit();
+
+	// v1.8.9 particle system. Same not-load-bearing footing as the crack overlay right above,
+	// and paired with it directly: both are per-session GPU claims made every time control
+	// reaches here (including a loop back to session_start after quitting to title), and
+	// particlesInit() also resets the pool so a fresh world join never inherits a previous
+	// session's leftover splashes -- see gfx/particles.h's own comment on particlesInit.
+	(void)particlesInit();
 
 	// Remote player bodies, on the same not-load-bearing footing as the highlight above: a
 	// failure here costs the ability to see other players, which is worse in a session and
@@ -4768,7 +4821,58 @@ session_start:
 			// reads s_entities yet -- see the s_entities declaration above.
 			(void)entityTick(&s_entities, &s_world, tickClockCount(&s_tickclock),
 			                  player.body.x, player.body.z, NULL, NULL);
+
+			// v1.8.9 weather. docs/plan-1.8.9-weather.md §7 asked for exactly this and named
+			// the shape: once per loaded column, decimated through world/tick.h rather than
+			// with a second scheduler invented here.
+			//
+			// The tick comes from dayNightTicks() and NOT from tickClockCount() beside it,
+			// which is the one thing §2 of that plan is emphatic about. Both count the same
+			// simulation ticks today, so this looks like a distinction without a difference —
+			// but the day/night counter is the one persisted to the time.bin sidecar and the
+			// one BS_APP_TIME_SYNC agrees across a server. A weather model keyed to a counter
+			// that resets on load would have every client seeing different rain, and would
+			// have the rain jump on rejoin. Keyed to this one, it does not.
+			//
+			// Sweeping all WORLD_MAP_SLOTS costs 1024 pointer tests; the real work is behind
+			// tickDue, which staggers by column so the far-field 2 Hz saving is a smooth load
+			// and not a 2 Hz spike. weatherTickColumn itself is capped at
+			// WEATHER_CELLS_PER_VISIT cells, so a due column is bounded work, not a scan.
+			const uint64_t wx_tick = dayNightTicks(&s_daynight);
+			for (int i = 0; i < WORLD_MAP_SLOTS; i++) {
+				const Column* col = s_world.slots[i];
+				if (!col) continue;
+				// Column centre against the player, in blocks, to pick near or far rate.
+				const int32_t ddx = (col->cx * CHUNK_DIM + CHUNK_DIM / 2) - (int32_t)player.body.x;
+				const int32_t ddz = (col->cz * CHUNK_DIM + CHUNK_DIM / 2) - (int32_t)player.body.z;
+				const int period = tickPeriodForDistSq(ddx * ddx + ddz * ddz);
+				if (!tickDue(wx_tick, period, (uint32_t)i)) continue;
+				(void)weatherTickColumn(&s_gen, &s_world, wx_tick, col->cx, col->cz);
+			}
 		}
+
+		// v1.8.9 weather rendering: the render-side poll, per
+		// docs/plan-1.8.9-weather-integration.md §3. Deliberately NOT reusing the `wx_tick`
+		// declared above -- that one lives inside `for (int t = 0; t < ticks_now; t++)` and
+		// does not exist when ticks_now == 0, which is exactly the paused case. Calling
+		// dayNightTicks(&s_daynight) fresh here instead is always safe (a live world is
+		// guaranteed by this point in the frame, so s_daynight is long since initialised) and
+		// gives the right paused-game answer for free: dayNightAdvance was skipped above when
+		// paused, so this reads the same tick every frame the game sits paused, which holds
+		// the weather classification and grid still rather than reading stale/uninitialised
+		// data -- exactly the behaviour a paused world should have. The animation update
+		// below still runs every frame regardless of pause, so scroll/drift keep advancing
+		// (the visible "is it still raining" motion), matching every other purely-visual,
+		// non-simulation update in drawEye's neighbourhood.
+		const uint64_t wx_tick_draw = dayNightTicks(&s_daynight);
+		if (tickDue(wx_tick_draw, TICK_HZ / 4, 0)) {
+			WeatherKind wk = weatherAt(&s_gen, wx_tick_draw,
+			                           (int32_t)floorf(player.cam.x),
+			                           (int32_t)floorf(player.cam.z));
+			weatherDrawSetState(&s_weatherdraw, wk);
+		}
+		weatherDrawUpdate(&s_weatherdraw, metricsFrameMs() / 1000.0f,
+		                   player.cam.x, player.cam.y, player.cam.z);
 
 		// Aim first, then edit, so the highlight and the edit in the same frame cannot
 		// disagree about which block was being pointed at.
@@ -5535,6 +5639,12 @@ session_start:
 	worldExit(&s_world);
 	highlightExit();
 	crackOverlayExit();
+
+	// v1.8.9 particle system. Paired with particlesInit() above (both re-run on a loop back
+	// to session_start), on the same footing as crackOverlayExit() right above -- see that
+	// call's own comment.
+	particlesExit();
+
 	playerModelExit();
 
 	// v1.8.8 NEON BIOME BORDERS. Frees the vertex buffer and drops the world pointer, so a
@@ -5566,6 +5676,13 @@ session_start:
 
 app_shutdown:
 	chunkRenderExit();
+
+	// v1.8.9 weather rendering. Paired with weatherDrawInit() at boot, beside chunkRenderInit
+	// -- both are true process-level, once-only GPU claims (unlike particlesInit/Exit and
+	// crackOverlayInit/Exit above, which re-run every loop back to session_start), so this is
+	// the one and only place their exit belongs, beside the other process-level exit here.
+	weatherDrawExit();
+
 	metricsExit();
 	screenExit();
 	// Before netExit, which is what closes the SOC session the updater was told to share: the

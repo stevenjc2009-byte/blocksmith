@@ -3,6 +3,7 @@
 #include <math.h>
 
 #include "app/input_map.h"
+#include "gfx/particles.h"
 
 // The largest tick the physics is ever handed, in seconds. Nothing in a steady frame
 // comes close to this — 16.71 ms is 0.0167 s — but the first frame after startup follows
@@ -59,8 +60,19 @@ void playerUpdate(Player* p, const World* w, float dt_ms)
 	// bodyWetUpdate, not bodyWetState: the submerged boundary is hysteretic and the band
 	// is carried on the body, so the driven answer is the one the vertical input must see.
 	// bodyStep calls it again below and gets the same answer at the same position.
+	const BodyWet prev_wet = p->body.wet;   // bodyWetUpdate has not overwritten it yet -- see physics.c:412-417
 	const BodyWet wet = bodyWetUpdate(w, &p->body);
 	const bool submerged = (wet != BODY_DRY);
+
+	// v1.8.9 particle system. docs/plan-1.8.9-particles-integration.md §5 -- the one splash
+	// case the parent plan calls REQUIRED. prev_wet is safely last frame's answer (see the
+	// comment on the line above and physics.c's own bodyWetUpdate comment: it reads b->wet
+	// for its own hysteresis bias before overwriting it), so this fires exactly once, on the
+	// frame the body's eye crosses from dry into either the surface or fully submerged --
+	// not on a later surface<->submerged transition while already wet. p->body.vy is the
+	// fall speed at the moment of entry, read before bodyStep (below) changes it.
+	if (prev_wet == BODY_DRY && wet != BODY_DRY)
+		particlesSpawnSplash(p->body.x, p->body.y, p->body.z, p->body.vy);
 
 	// Step 8.4. The four directions come from the player's bindings rather than from KEY_DUP
 	// and friends directly. app/input_map.c answers with exactly those defaults until an
@@ -94,6 +106,13 @@ void playerUpdate(Player* p, const World* w, float dt_ms)
 	bodyJump(&p->body, wet, (held & jump_bit) != 0, (hidKeysDown() & jump_bit) != 0, dt);
 
 	bodyStep(&p->body, w, dt);
+
+	// v1.8.9 particle system. playerUpdate's own already-clamped dt, not a second
+	// metricsFrameMs()-derived one -- see docs/plan-1.8.9-particles-integration.md §4. Ticks
+	// while !paused and not under BS_FLY (main.c only calls playerUpdate in that case); under
+	// BS_FLY's spectator camera particles simply hold still rather than animate, a debug-only
+	// gap disclosed by that doc rather than silently accepted here.
+	particlesTick(dt);
 
 	// v1.8.3 — the surface swell. Added to the eye AFTER the step, and read back by
 	// nothing: the body is where the physics left it, and this is the only line in the

@@ -4,6 +4,51 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.8.9] - 2026-09-02
+
+Sky and weather. Rain and snow now actually fall, the sun's light is finally shaped the way
+Minecraft shapes it, and water splashes when you drop into it. The weather model itself has
+existed and been under test since earlier in the 1.8 line, but nothing in the game had ever
+called it — so despite the tests being green, no weather had ever happened. This release wires
+it in and gives it something to draw.
+
+Everything here is identical on both consoles. Nothing in this release is Old-3DS-only or
+New-3DS-only.
+
+### Added
+- **Rain and snow.** Which one falls depends on the biome and on how cold the column is, so
+  snow lands in the cold biomes and rain everywhere else. Drawn as camera-centred billboard
+  strips — the same approach Minecraft itself uses, and on this hardware the cheap one rather
+  than a compromise. Weather is depth-tested against the terrain that was already drawn, so it
+  does not fall through a cave ceiling or through a roof you have built.
+- **Snow settles.** Where snow falls it accumulates on the ground, in layers, capped at one
+  block deep so it can never bury the world.
+- **Water splashes.** Dropping into water throws up a scatter of splash particles. The scatter
+  is a fixed function of where and when you hit the water rather than a running random
+  sequence, so two players in the same world see the same splash.
+- **The weather simulation is running for the first time.** Loaded columns are ticked on the
+  same clock the day/night cycle uses — the one saved with your world and the one a server
+  agrees on — rather than a counter that restarts when you load. That is what stops rain from
+  jumping the moment you rejoin. Near columns tick often, far columns rarely.
+
+### Changed
+- **Night is dark again.** Brightness is now shaped by Minecraft's own curve rather than used
+  raw, which is what makes a torchless interior read as gloom instead of dusk. Measured against
+  the reference: a midnight interior was rendering 3.2 times brighter than it should have been.
+  Daylight is almost unaffected; the difference is nearly all at the dark end.
+
+### Fixed
+- A comment in the world shader claimed it was used on a New 3DS only. It has been used on both
+  consoles since 1.8.0. Nothing behaved wrongly because of it, but anyone reading the render
+  path — including future work on it — was being told the wrong thing.
+
+### Notes
+- Sky light and block light are still combined by taking the brighter of the two, where
+  Minecraft adds them. That difference only starts to matter once there is a torch to emit
+  block light, which is 1.8.10.
+- The chunk pop-in reported against 1.8.7 is **not** fixed here and is still not diagnosed.
+- Not run on real 3DS hardware.
+
 ## [1.8.8] - 2026-09-02
 
 Biome identity. Biomes are now told apart by colour, Minecraft-style, and around that one

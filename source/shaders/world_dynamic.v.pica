@@ -1,21 +1,24 @@
 ; Blocksmith — the world vertex shader, adaptive-lighting variant (v1.5.0).
 ;
-; Compiled alongside world.v.pica and bound INSTEAD of it on a New 3DS only
-; (scene/chunk_render.c asks APT_CheckNew3DS once at init). An Old 3DS never
-; sees this program: same TEV setup, same attribute layout, same vertices with
-; pad written zero, so its frames stay byte-identical to the baked path.
+; Compiled alongside world.v.pica. STALE AS OF v1.8.0 (corrected here, not restated at the
+; other copy): this header used to say "bound INSTEAD of it on a New 3DS only", which was true
+; through v1.7.0. Since the v1.8.0 shader split, THIS program is bound on BOTH console models
+; and world.v.pica is compiled and never bound — see world.v.pica's own tintPalette comment and
+; scene/chunk_render.c's chunkRenderInit, which parses world_dynamic_shbin.h unconditionally.
 ;
 ; The one difference from world.v.pica is what the mesher puts in MeshVertex.pad.
 ; There it is alignment filler the shader overwrites; here it carries the corner's
 ; smooth light packed by world/mesher.c as sky<<4 | block, both 0..15, averaged
 ; over the four cells touching the corner (the same taps the AO rule walks).
 ;
-;   brightness = faceShade[nrm] x aoCurve(ao) x max(sky x dayLevel, block) / 15
+;   brightness = faceShade[nrm] x aoCurve(ao) x curve(max(sky x dayLevel, block) / 15)
 ;
-; With dayLevel 1.0 and full sky light the multiplier is exactly 1, so a fully
-; sunlit face matches the baked shader's output; underground, max() falls and
-; caves go dark without any remeshing. dayLevel is a uniform so a future day/
-; night cycle becomes one register write per frame, not a re-mesh.
+;   curve(l) = l / (4 - 3l)     -- v1.8.9, see curveConsts below for the citation
+;
+; With dayLevel 1.0 and full sky light the pre-curve multiplier is exactly 1, and curve(1) is
+; also exactly 1, so a fully sunlit face still matches the baked shader's output; underground,
+; max() falls and caves go dark without any remeshing. dayLevel is a uniform so the day/night
+; cycle is one register write per frame, not a re-mesh.
 ;
 ; Attributes (see MeshVertex in source/world/mesh_vertex.h — the format is locked):
 ;   v0 = position, 4x s8 — xyz read, w is the pad byte this shader exists to read
@@ -103,6 +106,24 @@
 .alias  inv16   lightConsts.xxxx
 .alias  neg16   lightConsts.yyyy
 .alias  inv15   lightConsts.zzzz
+
+; v1.8.9. The vanilla light-to-brightness curve, b = l / (4 - 3l), read off the decompiled
+; client (MCP-919 EntityRenderer.updateLightmap, cited in full in
+; docs/research/sky-and-weather.md E3) and restated in docs/VERSION-LIST.md's v1.8.9 entry:
+; "A linear light-to-brightness ramp would render full night 3.2x too bright." l here is the
+; ALREADY-COMBINED r5.w below (max(daySky, block)), not the raw sky or block nibble alone —
+; vanilla's own table is applied to each of sky and block before they combine, but Blocksmith
+; combines first and this curve is concave (b'(l) is largest near l=0), so applying it once to
+; the max() of the two is the same shape the two-separate-curves version would give at every l
+; this project's max() can output, and it is one curve instead of two.
+;
+; Concretely: dayLevel's own floor already holds a fully sky-lit face at l=4/15=0.2667 at
+; midnight (world/daynight.h). Uncurved, that renders at 26.67% brightness — visibly not
+; night. Curved: 0.2667/(4-0.8) = 0.2667/3.2 = 0.0833, an eighth of full brightness, which is
+; the "3.2x too bright" VERSION-LIST.md names (0.2667/0.0833 = 3.2 exactly).
+.constf curveConsts(4.0, -3.0, 0.0, 0.0)
+.alias  curveFour     curveConsts.xxxx
+.alias  curveNegThree curveConsts.yyyy
 
 .out outpos position
 .out outtc0 texcoord0
@@ -214,6 +235,16 @@
 	mul r5.y, inv15, r5.yyyy             ; block 0..1
 	mul r5.z, dayLevel.xxxx, r5.xxxx     ; day-scaled sky
 	max r5.w, r5.zzzz, r5.yyyy           ; lum = max(daySky, block)
+
+	; v1.8.9. b = l / (4 - 3l) — see curveConsts above for the citation and the arithmetic
+	; that names this "3.2x too bright" uncurved. Curves the LINEAR lum in r5.w into vanilla's
+	; own light-to-brightness shape before anything below multiplies it into the final colour.
+	; r6.x/r6.y are free here: r6.x's only earlier use (line 229 above) was fully consumed
+	; before r5.y was written, and r6.y is not read by anything until this block writes it.
+	mul r6.x, curveNegThree, r5.wwww     ; -3 * l
+	add r6.x, curveFour, r6.xxxx         ; 4 - 3l
+	rcp r6.y, r6.xxxx                    ; 1 / (4 - 3l)
+	mul r5.w, r5.wwww, r6.yyyy           ; r5.w = l / (4 - 3l), replacing the linear value
 
 	; colour = faceShade x aoCurve x lum x tint
 	;
