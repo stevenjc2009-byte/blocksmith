@@ -57,7 +57,7 @@
 #define REGISTRY_DYN_LO_PIN     0x80  // first dynamic block id
 #define REGISTRY_DYN_HI_PIN     0xFD  // last one; 0xFE/0xFF stay reserved
 #define REGISTRY_DYN_ROWS_PIN   126   // 0xFD - 0x80 + 1, WRITTEN OUT, never computed
-#define REGISTRY_FULL_COUNT_PIN 153   // 27 core rows (air + twenty-six) + 126 dyn rows
+#define REGISTRY_FULL_COUNT_PIN 154   // 28 core rows (air + twenty-seven) + 126 dyn rows
 
 // Compile-time layer. These fire when the host suite builds, which is every
 // tools/run_host_tests.sh run; the 3DS build never compiles this file (see the __3DS__
@@ -176,7 +176,14 @@ static void checkPin(bool cond, long got, long want, const char *what, const cha
 //
 // The crc golden moved VALUE a third time (0xBDC5 -> 0xD236) and, as every time before, that
 // is still exactly one check.
-#define REGISTRY_TEST_EXPECTED_CHECKS 117
+//
+// 117 -> 118 on 2026-09-02, v1.8.10 "Light"'s torch. One core row is appended (id 27), and
+// coreHardnessIsDeclared()'s per-row loop runs one more iteration, so its
+// check(v->hardness != 0, v->name) call fires once more: 117 + 1 = 118. Nothing else in this
+// suite gained a call, for the same reason nothing else did in the twelve-row move above —
+// testRegistryCoreIdsStable and its kPhase3 table are both written against fixed id lists, and
+// the crc golden is still exactly one check regardless of what value it holds.
+#define REGISTRY_TEST_EXPECTED_CHECKS 118
 
 // Deliberately NOT routed through check(): this must not perturb the number it is testing,
 // so it bumps g_fails only. Reporting shape is check()'s, so a failure here reads the same
@@ -223,15 +230,15 @@ static void testRegistryRoundTrip(void)
 	puts("registry: register / find / duplicate / full range / unknown id");
 
 	registryInitCore();
-	// Twenty-six core rows since v1.8.8: grass..planks are the seven that also carry ITEM
+	// Twenty-seven core rows since v1.8.10: grass..planks are the seven that also carry ITEM
 	// ids, plus water (0x08) and tall grass (0x09) from roadmap tasks 17 and 19, plus
 	// snow (0x0A), ice (0x0B), cactus (0x0C), dead bush (0x0D) and fern (0x0E), plus the
 	// twelve v1.8.8 adds — birch log/planks/leaves (0x0F..0x11), spruce log/planks/leaves
 	// (0x12..0x14), the tall-grass top (0x15), poppy/daisy/bluebell/orchid (0x16..0x19) and
-	// the apple (0x1A). Every one of the last nineteen is a core block and deliberately NOT
-	// an item — world/block.h records why BLOCK_COUNT stayed at 8 while the registry's row
-	// count moved to 27.
-	check(registryCount() == 27, "a fresh table defines exactly air + the twenty-six core blocks");
+	// the apple (0x1A) — plus v1.8.10's torch (0x1B), the first light source. Every one of
+	// the last twenty is a core block and deliberately NOT an item — world/block.h records
+	// why BLOCK_COUNT stayed at 8 while the registry's row count moved to 28.
+	check(registryCount() == 28, "a fresh table defines exactly air + the twenty-seven core blocks");
 	check(registryFind("grass") == BLOCK_GRASS, "core rows are findable by name");
 
 	// The runtime half of the dyn-range pin. The two _Static_asserts at the top of this
@@ -302,7 +309,7 @@ static void testRegistryRoundTrip(void)
 	         kDynRangeWhy);
 	checkPin(registryCount() == REGISTRY_FULL_COUNT_PIN,
 	         (long)registryCount(), (long)REGISTRY_FULL_COUNT_PIN,
-	         "count reflects every defined row once the range is full: 27 core + 126 dyn",
+	         "count reflects every defined row once the range is full: 28 core + 126 dyn",
 	         kDynRangeWhy);
 }
 
@@ -543,8 +550,34 @@ static void testRegistryCrcStability(void)
 	// those changed. deps/blocksmith-server/game/bsgame_test.c's BS_REGISTRY_CORE_CRC16_GOLDEN
 	// and BS_REGISTRY_CORE_COUNT_GOLDEN must both move with these literals or that repo's
 	// suite goes red.
-	check(base == 0xD236u,
-	      "core-only crc matches the pinned golden 0xD236");
+	//
+	// MOVED A FOURTH TIME 2026-09-02, 0xD236 -> 0x165E, by v1.8.10 "Light"'s torch (id 27, the
+	// first light source). One record appended, Phase 3's shape again: registryCount() moves
+	// 27 -> 28. torch is BLOCK_SHAPE_CROSS, non-solid, luminance 14, and .hardness 1 — the
+	// smallest nonzero value the byte allows, since 0 means "no break time at all" and is
+	// reserved for water; every other targetable core row, torch included, is nonzero for the
+	// same reason coreHardnessIsDeclared() below exists to enforce.
+	//
+	// Measured the same way as every move above: a scratchpad probe (torchreg_crc.c) linking
+	// this tree's real world/registry.c and world/block.c, no test file linked so the golden
+	// is unreachable from the binary being measured. Printed
+	//
+	//     count=28 crc=0x165E
+	//     targetable-rows-checked, zero-hardness-count=0
+	//     torch: name=torch hardness=1 luminance=14 flags=0x2A tex0=31
+	//
+	// and cross-checked by compiling the identical probe against
+	// deps/blocksmith-server/game/world/registry.c after tools/sync-world-sources.sh ran (it
+	// reported block.h and registry.c synced, the other nine files unchanged, diff -q
+	// confirming both trees byte-identical): count=28 crc16=0x165E rev=1, the same number from
+	// the other side.
+	//
+	// SERVER SHIPS FIRST, same reason as every move above: a v1.8.9 client on a v1.8.10 server
+	// cannot name id 27 and would render every torch as an unlit hole.
+	// deps/blocksmith-server/game/bsgame_test.c's BS_REGISTRY_CORE_CRC16_GOLDEN and
+	// BS_REGISTRY_CORE_COUNT_GOLDEN move with this literal.
+	check(base == 0x165Eu,
+	      "core-only crc matches the pinned golden 0x165E");
 
 	// Content sensitivity: one extra def must move the crc, and re-init must
 	// put it back - proving the crc covers table content, not process state.
@@ -655,7 +688,7 @@ static void coreHardnessIsDeclared(void)
 	// the rule is green in a build where registryIsDefined() answers false for everything —
 	// a check that cannot go red proves nothing, and a `continue` is the easiest way to
 	// neutralise one by accident.
-	check(rows == 25, "and it ran over 25 rows: 27 core rows less air and less water");
+	check(rows == 26, "and it ran over 26 rows: 28 core rows less air and less water");
 
 	// A row must have its OWN number, not a neighbour's. The loop above is satisfied by a
 	// table where every hardness is 9, which is exactly the failure mode "make sure every

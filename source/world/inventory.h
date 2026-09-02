@@ -155,7 +155,7 @@ static inline bool inventoryCanHold(ItemId item)
 // would be satisfied by a `return true;`.
 //
 // Two compatibility corners were checked in the code, not assumed, and both are clear:
-//   NEW client / OLD server — registryCrc16() (0xD236, count 27) is a join-time lockstep, so an
+//   NEW client / OLD server — registryCrc16() (0x165E, count 28) is a join-time lockstep, so an
 //     old server is refused outright and never sees a widened send.
 //   OLD client / NEW server — net/inv_bridge.c's invBridgeApplyState() validates every slot
 //     against inventoryCanHold() before writing ANY of them, all-or-nothing, so an old client

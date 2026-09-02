@@ -82,7 +82,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "gfx/watershimmer.h"
 #include "world/block.h"
+#include "world/chunk.h"
 #include "world/mesher.h"
 #include "world/scratch.h"
 
@@ -518,6 +520,126 @@ static void testUiStillArmsItsOwnBlend(void)
 	      "to contain '%s'", ui_on + 1, lineText(ui_on + 1), BLEND_ON_TAIL);
 }
 
+// ── v1.8.10: the shimmer scroll ──────────────────────────────────────────────
+
+// gfx/watershimmer.h is the arithmetic behind the water glint's movement, and it is the same
+// class of thing as everything else in this file: it cannot fail loudly. A scroll that does not
+// advance compiles, links, binds, samples a real texture and renders a perfectly plausible
+// picture — water with a static highlight pattern painted on it. That is the difference between
+// this feature working and not working, and no test anywhere else in the tree can see it,
+// because scene/chunk_render.c includes <3ds.h> and cannot be linked here. The header exists so
+// this suite can link the REAL rule; if the renderer is ever changed to compute its own offsets
+// inline, these checks go on passing about dead code — which is why the last check below pins
+// scene/chunk_render.c to calling the functions rather than restating them.
+//
+// Appended to this file rather than given its own binary because tools/run_host_tests.sh was
+// being edited by two other sessions while this landed and could not be touched. Water's suite
+// is the right home for it anyway.
+static void testWaterShimmerScroll(void)
+{
+	puts("water shimmer: the scroll offset advances with time and wraps");
+
+	// The premise the sheet's seamlessness rests on. The shader builds the shimmer coordinate
+	// from a CHUNK-LOCAL position (the vertex format is 8 bytes and locked, so there is nowhere
+	// to put a world coordinate), which means the sheet restarts at every chunk boundary. That
+	// is invisible only while a chunk spans a WHOLE number of repeats. At 0.125 per block and
+	// CHUNK_DIM 16 that is exactly 2. Any other scale draws a 16-block grid on the ocean.
+	const float per_chunk = (float)CHUNK_DIM * WATER_SHIMMER_UV_PER_BLOCK;
+	CHECK(per_chunk == (float)(int)per_chunk,
+	      "premise: a chunk spans %.3f whole repeats of the sheet (CHUNK_DIM %d x %.4f per "
+	      "block), so the pattern is continuous across a chunk boundary",
+	      (double)per_chunk, CHUNK_DIM, (double)WATER_SHIMMER_UV_PER_BLOCK);
+
+	CHECK(WATER_SHIMMER_PERIOD_U_MS != WATER_SHIMMER_PERIOD_V_MS,
+	      "premise: the two axes wrap at different rates (%u ms, %u ms), so the pair of phases "
+	      "does not repeat on the shorter of the two",
+	      WATER_SHIMMER_PERIOD_U_MS, WATER_SHIMMER_PERIOD_V_MS);
+
+	// ADVANCING. Eight samples a second apart, each strictly greater than the last, all inside
+	// one period so no wrap can be mistaken for progress. This is the check the whole feature
+	// lives or dies by: a shimmer that does not move is the documented wrong answer.
+	int rising = 0;
+	float prev = waterShimmerOffsetU(0);
+	for (uint64_t t = 1000; t < WATER_SHIMMER_PERIOD_U_MS; t += 1000) {
+		const float now = waterShimmerOffsetU(t);
+		if (now > prev) rising++;
+		prev = now;
+	}
+	CHECK(rising == 8, "u advances at every one of 8 one-second steps inside its %u ms period "
+	      "(got %d)", WATER_SHIMMER_PERIOD_U_MS, rising);
+
+	// ...and by a real amount, not by a rounding error. One second is one ninth of a wrap.
+	const float step = waterShimmerOffsetU(1000) - waterShimmerOffsetU(0);
+	CHECK(step > 0.10f && step < 0.12f,
+	      "and by 1/9 of the sheet per second (measured %.5f)", (double)step);
+
+	// WRAPPING. Exactly at the period it is back to the start, and just before it, it is nearly
+	// a whole sheet along. A phase that saturated at 1.0 instead of wrapping would pass every
+	// "advancing" check above and then freeze after nine seconds.
+	CHECK(waterShimmerOffsetU(0) == 0.0f, "u starts at 0.0");
+	CHECK(waterShimmerOffsetU(WATER_SHIMMER_PERIOD_U_MS) == 0.0f,
+	      "u is back to 0.0 after exactly one period (%u ms)", WATER_SHIMMER_PERIOD_U_MS);
+	CHECK(waterShimmerOffsetU(WATER_SHIMMER_PERIOD_U_MS - 1) > 0.999f,
+	      "and was still just short of a whole sheet one millisecond earlier (%.5f)",
+	      (double)waterShimmerOffsetU(WATER_SHIMMER_PERIOD_U_MS - 1));
+	CHECK(waterShimmerOffsetV(WATER_SHIMMER_PERIOD_V_MS) == 0.0f,
+	      "v wraps on its own period (%u ms) and not on u's", WATER_SHIMMER_PERIOD_V_MS);
+	CHECK(waterShimmerOffsetV(WATER_SHIMMER_PERIOD_U_MS) != 0.0f,
+	      "control: v has NOT wrapped at u's period, so the two are genuinely independent");
+
+	// IN RANGE, everywhere. Sampled across three full periods at an interval that is coprime
+	// with neither, so the samples land all over both cycles rather than on the same few phases.
+	int out_of_range = 0;
+	for (uint64_t t = 0; t < 3u * WATER_SHIMMER_PERIOD_V_MS; t += 37) {
+		const float u = waterShimmerOffsetU(t);
+		const float v = waterShimmerOffsetV(t);
+		if (!(u >= 0.0f && u < 1.0f)) out_of_range++;
+		if (!(v >= 0.0f && v < 1.0f)) out_of_range++;
+	}
+	CHECK(out_of_range == 0,
+	      "every offset over three periods is in [0, 1) — the texture wrap is GPU_REPEAT, so an "
+	      "out-of-range value is not an error, it is a differently-wrong picture");
+
+	// A LARGE CLOCK. The console's tick counter is milliseconds since the SYSTEM booted, not
+	// since the game did, so a 3DS left in sleep for a week hands this a number in the hundreds
+	// of millions. That is the case the modulo-then-divide shape exists for: the equivalent
+	// small time must give the SAME phase, bit for bit. `seconds * speed` in float32 would not.
+	const uint64_t week = 7ull * 24ull * 60ull * 60ull * 1000ull;
+	CHECK(waterShimmerOffsetU(week + 4000u) == waterShimmerOffsetU((week + 4000u) % WATER_SHIMMER_PERIOD_U_MS),
+	      "a week-old clock (%llu ms) gives the same phase as its remainder does",
+	      (unsigned long long)week);
+	CHECK(waterShimmerOffsetU(week + 4000u) != waterShimmerOffsetU(week + 5000u),
+	      "and is still MOVING a week in — the float has not run out of resolution");
+
+	// ...and that the renderer uses this rule rather than a copy of it. Everything above is
+	// about dead code if scene/chunk_render.c computes its own offsets inline.
+	const int n = loadLines(RENDERER_PATH);
+	CHECK(n >= 0, "%s opens and reads", RENDERER_PATH);
+	if (n < 0) return;
+
+	CHECK(countLines("waterShimmerOffsetU(s_shimmer_ms)", NULL) == 1 &&
+	      countLines("waterShimmerOffsetV(s_shimmer_ms)", NULL) == 1,
+	      "the renderer's uniform upload calls both of these functions, so the checks above are "
+	      "about live code");
+
+	// THE GATE. The whole design of this feature is that with the shaders option off, no new GPU
+	// state is issued at all — v1.8.10 also ships the fix for the freeze that locked up steve's
+	// console, and a hardware result has to be attributable to that fix and not to an untested
+	// TEV stage. Both calls that touch the GPU must therefore be inside the one `if`.
+	int gate = -1, bind_line = -1, tev_line = -1;
+	CHECK(countLines("const bool shimmer_on = s_fake_shading && s_shimmer_ready;", &gate) == 1,
+	      "the shimmer gate is derived exactly once, from the option AND the texture import");
+	CHECK(countLines("waterShimmerBind();", &bind_line) == 1, "unit 2 is bound in exactly one place");
+	CHECK(countLines("waterShimmerTevSet();", &tev_line) == 1, "TEV stage 2 is set in exactly one place");
+	CHECK(gate > 0 && bind_line == gate + 2 && tev_line == gate + 3,
+	      "and both sit immediately inside `if (shimmer_on)` on L%d (bind L%d, tev L%d) — if "
+	      "either escapes the gate, a default install starts issuing GPU state it has never "
+	      "been tested with",
+	      gate, bind_line, tev_line);
+	CHECK(countLines("waterShimmerTevReset();", NULL) == 1,
+	      "and the stage is put back to passthrough afterwards, so it cannot leak into the HUD");
+}
+
 int main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
@@ -529,6 +651,7 @@ int main(void)
 	testShadersReadAlpha();
 	testRendererOwnsBlendState();
 	testUiStillArmsItsOwnBlend();
+	testWaterShimmerScroll();
 
 	printf("\n%s %d checks, %d failed\n", s_fails == 0 ? "PASS" : "FAIL", s_checks, s_fails);
 	if (s_fails) printf("FAILED - %d of %d checks\n", s_fails, s_checks);

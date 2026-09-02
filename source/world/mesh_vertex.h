@@ -27,8 +27,9 @@ typedef struct {
 } MeshVertex;
 
 // The name `pad` is historical and is now actively wrong: this field is READ by the GPU.
-// shaders/world_dynamic.v.pica:99-106 takes it as inpos.wwww and unpacks it as sky * 16 +
-// block, scales the sky half by the dayLevel uniform, and takes max(daySky, block) as the
+// shaders/world_dynamic.v.pica takes it as inpos.wwww and unpacks it as sky * 16 + block,
+// scales the sky half by the dayLevel uniform, curves each half through vanilla's own
+// l / (4 - 3l), and ADDS them (v1.8.10; it was a max() of the two until then) to get the
 // luminance every fragment's colour is multiplied by. Since v1.8.0 that shader is bound on
 // Old 3DS as well as New (scene/chunk_render.c:750 calls lightEngineInit(true)
 // unconditionally), so there is no build in which this byte is dead. Until v1.7.1 the line

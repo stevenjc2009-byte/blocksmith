@@ -269,13 +269,14 @@ static void testTheCarryCeilingIsWhereItSays(void)
 	CHECK(inventoryCanHold((ItemId)BLOCK_FERN));         // 14
 
 	// The BOUNDARY, both sides of it, and it is now the edge of the DEFINED core table
-	// rather than a compile-time constant: id 26 is the last defined core row and id 27 is
-	// the first undefined one, now that v1.8.8's twelve per-biome rows (ids 15..26) have
-	// landed. registryCount() is read here rather than hard-coded so this pair keeps
-	// straddling the real edge if another biome rung ever lands on top of this one.
+	// rather than a compile-time constant: id 27 is the last defined core row and id 28 is
+	// the first undefined one, now that v1.8.10's torch (id 27) has landed on top of v1.8.8's
+	// twelve per-biome rows (ids 15..26). registryCount() is read here rather than hard-coded
+	// so this pair keeps straddling the real edge if another core row ever lands on top of
+	// this one.
 	const ItemId last_defined  = (ItemId)(registryCount() - 1);
 	const ItemId first_beyond  = (ItemId)registryCount();
-	CHECK(last_defined == (ItemId)BLOCK_APPLE);          // premise: the table is 27 rows
+	CHECK(last_defined == (ItemId)BLOCK_TORCH);          // premise: the table is 28 rows
 	CHECK(inventoryCanHold(last_defined));
 	CHECK(!inventoryCanHold(first_beyond));
 
@@ -545,9 +546,9 @@ static void testEveryCoreBlockStillBreaks(void)
 	// The loop ran, and ran over both kinds. A `continue` that swallowed everything would
 	// otherwise leave this function green having made no assertion at all — the vault's
 	// "a check that could not fail proves nothing", written as two counters.
-	CHECK(targetable_seen == 25);   // 26 rows past air, less water
-	CHECK(cross_seen == 8);         // tall grass, dead bush, fern, tall grass top,
-	                                 // poppy, daisy, bluebell, orchid
+	CHECK(targetable_seen == 26);   // 27 rows past air, less water
+	CHECK(cross_seen == 9);         // tall grass, dead bush, fern, tall grass top,
+	                                 // poppy, daisy, bluebell, orchid, torch
 }
 
 // ── v1.8.8: the reported defect, end to end ─────────────────────────────────────────────
@@ -1543,6 +1544,116 @@ static void testAppleDropRateOverAGrid(void)
 	CHECK(spruce_hits == 0);
 }
 
+// ── v1.8.10 "Light": the torch, end to end through the real edit path ──────────────────
+//
+// world/registry.c's [27] row gave BLOCK_TORCH the first non-zero luminance in the game
+// (14), and light_luminance_test.c pins that row and light_seam_test.c pins the engine's
+// falloff and cross-column handoff — but nothing before this file placed a torch through
+// interactEdit() itself, which is the only path a player's press actually takes. The claim
+// under test is the player-visible one: put a torch down and the world gets brighter, take
+// it back out and the world gets exactly as dark as it was, not just darker than it was
+// with the torch there.
+//
+// Same fixture as the two v1.8.6 relight cases above (TX,TY,TZ stone, place cell one cell
+// above it, "otherwise-empty column" — see the comment on testABreakRelightsTheColumnItLeftBehind
+// for why open air on every side of the place cell is a premise this file has already
+// established rather than a new assumption). Reused rather than a fresh coordinate, so
+// nothing here has to re-derive that premise.
+static void testPlacingATorchLightsUpTheWorldAndBreakingItDarkensItAgain(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_STONE);
+	it.holding = BLOCK_TORCH;
+
+	// Read from the registry, not hardcoded: a change that silently dropped the torch's
+	// brightness must make THIS check wrong, not slip past an assertion that already agreed
+	// with the regression.
+	const uint8_t lum = registryGet(BLOCK_TORCH)->luminance;
+	CHECK(lum > 0);   // premise — nothing below means anything if this block does not emit
+
+	LightQueue* q = (LightQueue*)malloc(sizeof(LightQueue));
+	CHECK(q != NULL);
+	if (!q) return;
+	lightQueueInit(q);
+	CHECK(lightPropagateColumn(&s_world, TX >> 4, TZ >> 4, q));
+	free(q);
+
+	Column* col = worldColumn(&s_world, TX >> 4, TZ >> 4);
+	CHECK(col != NULL);
+
+	// Step 1: the baseline. Nothing in this fixture emits yet, so block light reads dark at
+	// every point the sample cells below will look — pinned rather than assumed, so "brighter
+	// after placing" has something real measured to be brighter than.
+	const uint8_t base_h1 = lightGetBlock(col, TX + 1, TY + 1, TZ);
+	const uint8_t base_h3 = lightGetBlock(col, TX + 3, TY + 1, TZ);
+	const uint8_t base_v1 = lightGetBlock(col, TX,     TY + 2, TZ);
+	const uint8_t base_v3 = lightGetBlock(col, TX,     TY + 4, TZ);
+	CHECK(base_h1 == 0 && base_h3 == 0 && base_v1 == 0 && base_v3 == 0);
+
+	// Step 2: place it, through the real edit path — placeKey(), interactEdit(), the same
+	// call testACoreBlockStillPlaces() above drives, so this is the actual press a player
+	// makes and not a reimplementation of what the press is supposed to do.
+	const Body body = farAwayBody();
+	interactEdit(&it, &s_world, &body, placeKey(), 0, 0);
+	CHECK(it.placed == 1);
+	CHECK(worldGet(&s_world, TX, TY + 1, TZ) == BLOCK_TORCH);
+
+	// Step 3: brighter, at the torch's own declared luminance, and falling off with distance
+	// in both directions sampled — horizontally and vertically — so a fix that only got one
+	// axis of the engine right cannot pass this.
+	col = worldColumn(&s_world, TX >> 4, TZ >> 4);
+	CHECK(col != NULL);
+	const uint8_t torch_v = lightGetBlock(col, TX, TY + 1, TZ);
+	CHECK(torch_v == lum);
+
+	const uint8_t h1 = lightGetBlock(col, TX + 1, TY + 1, TZ);
+	const uint8_t h3 = lightGetBlock(col, TX + 3, TY + 1, TZ);
+	const uint8_t v1 = lightGetBlock(col, TX,     TY + 2, TZ);
+	const uint8_t v3 = lightGetBlock(col, TX,     TY + 4, TZ);
+
+	CHECK(h1 > base_h1 && h3 > base_h3);   // brighter than step 1 in both...
+	CHECK(v1 > base_v1 && v3 > base_v3);   // ...directions sampled
+	CHECK(h1 > h3);                        // ...and falls off with distance, horizontally
+	CHECK(v1 > v3);                        // ...and vertically
+
+	// Pinned exactly, not just "> 0": -1 falloff per cell is the engine's stated rule
+	// (light.c's spread(), and the crossed-value checks in tests/light_seam_test.c), and
+	// open air on every side of this fixture (the v1.8.6 comment above) means nothing here
+	// should fall short of that straight line.
+	CHECK(h1 == (uint8_t)(lum - 1));
+	CHECK(h3 == (uint8_t)(lum - 3));
+	CHECK(v1 == (uint8_t)(lum - 1));
+	CHECK(v3 == (uint8_t)(lum - 3));
+
+	// Step 4: break it, through the same real path. Only the crosshair's y needs to move —
+	// freshAimedAt() already aimed x/z at the torch's column, and target.px/py/pz already
+	// name this exact cell (they were the place cell) — the same minimal-retarget style
+	// testLookingAtAnotherBlockThrowsAwayProgress() uses above rather than building a second
+	// fixture from scratch.
+	it.target.y = TY + 1;
+
+	CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) == 1);   // hardness 1: gone on tick 1,
+	                                                            // same as every other CROSS row
+	CHECK(worldGet(&s_world, TX, TY + 1, TZ) == BLOCK_AIR);
+	CHECK(it.broke_id == BLOCK_AIR);   // BLOCK_SHAPE_CROSS drops nothing — same family as tall
+	                                    // grass; testEveryCoreBlockStillBreaks() already counts
+	                                    // the torch into its cross_seen == 9
+
+	// Step 4, the important half: every sampled cell is back to EXACTLY what it read in step
+	// 1 — not merely dimmer than it was with the torch there. lightRelightColumn() fully
+	// recomputes the column from its seeds rather than patching a delta, so a broken
+	// retraction shows up here as a wrong number, not a crash, and asserting with == rather
+	// than < is what makes that visible instead of passing on "darker than lit".
+	col = worldColumn(&s_world, TX >> 4, TZ >> 4);
+	CHECK(col != NULL);
+	CHECK(lightGetBlock(col, TX,     TY + 1, TZ) == 0);   // the torch cell itself
+	CHECK(lightGetBlock(col, TX + 1, TY + 1, TZ) == base_h1);
+	CHECK(lightGetBlock(col, TX + 3, TY + 1, TZ) == base_h3);
+	CHECK(lightGetBlock(col, TX,     TY + 2, TZ) == base_v1);
+	CHECK(lightGetBlock(col, TX,     TY + 4, TZ) == base_v3);
+	CHECK(lightColumnsAttached() == 1);   // still one column — the v1.8.6 leak fix, not a leak
+}
+
 int main(void)
 {
 	// v1.8.6: see the section comment above testABreakRelightsTheColumnItLeftBehind for why
@@ -1600,6 +1711,9 @@ int main(void)
 	testALeafSometimesDropsAnApple();
 	testSpruceLeavesNeverDropAnApple();
 	testAppleDropRateOverAGrid();
+
+	// v1.8.10 "Light" — the torch, end to end through interactEdit().
+	testPlacingATorchLightsUpTheWorldAndBreakingItDarkensItAgain();
 
 	if (s_fails == 0)
 		printf("interact self-test: PASS  %d checks\n", s_checks);

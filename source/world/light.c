@@ -424,6 +424,105 @@ static void spread(uint8_t* chan, const Chunk* const chunks[COLUMN_CHUNKS],
 	}
 }
 
+// ── cross-column block-light handoff (v1.8.10) ──────────────────────────────
+//
+// The torch is the first block in the game that emits, and propagation above is
+// deliberately column-local (light.h's "known gap"): a column-local flood fill
+// truncates a torch's light dead at the column edge instead of letting it decay
+// one more step into the neighbour, which is wrong -- a torch one cell from an
+// edge reads 14 on its own side and 0 one cell across a boundary that should read
+// 13. MEASURED (tests/light_seam_test.c, and the scratchpad probe this was first
+// caught with): a torch at local x=15 reads col0 lx=15 = 14, col1 lx=0 = 0, a
+// 14-level drop across one cell instead of the expected 1. scratchFillLight
+// (world/scratch.c) reads the neighbour's REAL stored channel at that border with
+// no clamping at all, so the mesher's corner taps show exactly that drop -- this
+// is a light-DATA bug, not a mesher bug.
+//
+// Sky light is NOT extended this way, on purpose: it is near-uniform, so the same
+// column-local truncation is invisible there, and touching it would be scope this
+// fix was not asked for. See the report this shipped with.
+//
+// crossBorderCandidate is shared by BOTH engines below (the BFS seeding call and
+// the border check inside lightRelightColumnSweeps' cell loop) so the two cannot
+// compute two different answers for the same input cell -- the whole reason the
+// host suite can diff them byte for byte. It answers "what would this column's
+// border cell (lx,y,lz) read if block light crossed the seam", i.e. an already-
+// loaded neighbour's own stored value at the mirrored cell, minus one more
+// falloff step -- exactly how a real emitter one cell further out would decay
+// into this cell. -1 means no loaded neighbour reaches this cell at all (not on
+// a border, or that side's column/light is absent), so callers can tell "nothing
+// to offer" apart from "offers 0".
+static int crossBorderCandidate(const World* w, int cx, int cz, int lx, int y, int lz)
+{
+	if (lx != 0 && lx != CHUNK_DIM - 1 && lz != 0 && lz != CHUNK_DIM - 1) return -1;
+
+	static const int8_t dcx[4] = { 1, -1, 0, 0 };
+	static const int8_t dcz[4] = { 0, 0, 1, -1 };
+
+	int best = -1;
+	for (int d = 0; d < 4; d++) {
+		const bool along_x = (dcz[d] == 0);
+		if (along_x) {
+			if (dcx[d] > 0 && lx != CHUNK_DIM - 1) continue;
+			if (dcx[d] < 0 && lx != 0)             continue;
+		} else {
+			if (dcz[d] > 0 && lz != CHUNK_DIM - 1) continue;
+			if (dcz[d] < 0 && lz != 0)             continue;
+		}
+
+		const Column* ncol = worldColumn(w, cx + dcx[d], cz + dcz[d]);
+		const uint8_t* nblk = lightChannelBlock(ncol);
+		if (!nblk) continue;   // neighbour not loaded, or has no light: nothing to offer
+
+		const int their_lx = along_x ? (dcx[d] > 0 ? 0 : CHUNK_DIM - 1) : lx;
+		const int their_lz = along_x ? lz : (dcz[d] > 0 ? 0 : CHUNK_DIM - 1);
+		const int cand = lightNibble(nblk, lightIndex(their_lx, y, their_lz)) - 1;
+		if (cand > best) best = cand;
+	}
+	return best;
+}
+
+// One face of the column's border shell (2048 cells: 128 y-levels x 16 across),
+// seeding blk from crossBorderCandidate exactly like a local emitter -- set only
+// when it strictly improves the cell, queued only then, same rule spread() itself
+// applies. opaqueAt is checked because a solid cell at the seam holds no light of
+// its own to offer inward, matching every other opaque cell in this file.
+static void seedCrossColumnSide(uint8_t* blk, const World* w,
+                                const Chunk* const chunks[COLUMN_CHUNKS],
+                                int cx, int cz, bool along_x, int edge,
+                                LightQueue* q, int* dropped)
+{
+	for (int y = 0; y < WORLD_HEIGHT; y++) {
+		for (int p = 0; p < CHUNK_DIM; p++) {
+			const int lx = along_x ? edge : p;
+			const int lz = along_x ? p    : edge;
+			if (opaqueAt(chunks, lx, y, lz)) continue;
+
+			const int cand = crossBorderCandidate(w, cx, cz, lx, y, lz);
+			if (cand <= 0) continue;
+
+			const int ci = lightIndex(lx, y, lz);
+			if (cand <= lightNibble(blk, ci)) continue;
+
+			setNibble(blk, ci, (uint8_t)cand);
+			queuePush(q, (uint16_t)ci, dropped);
+		}
+	}
+}
+
+// All four sides. Corners are visited twice (once from each adjoining side),
+// which is harmless -- the "only write if it strictly improves" rule in
+// seedCrossColumnSide makes a repeat visit a no-op.
+static void seedCrossColumnBorder(uint8_t* blk, const World* w,
+                                  const Chunk* const chunks[COLUMN_CHUNKS],
+                                  int cx, int cz, LightQueue* q, int* dropped)
+{
+	seedCrossColumnSide(blk, w, chunks, cx, cz, true,  0,             q, dropped);
+	seedCrossColumnSide(blk, w, chunks, cx, cz, true,  CHUNK_DIM - 1, q, dropped);
+	seedCrossColumnSide(blk, w, chunks, cx, cz, false, 0,             q, dropped);
+	seedCrossColumnSide(blk, w, chunks, cx, cz, false, CHUNK_DIM - 1, q, dropped);
+}
+
 bool lightPropagateColumn(World* w, int cx, int cz, LightQueue* q)
 {
 	if (!s_enabled || !q) return false;
@@ -481,11 +580,27 @@ bool lightPropagateColumn(World* w, int cx, int cz, LightQueue* q)
 	spread(lc->sky, chunks, q, &dropped);
 
 	// Block seeds: luminous cells. syncLuminance() refreshes the table from the
-	// registry and answers whether anything in it emits at all; no core row declares
-	// a luminance today, so on a single-player world the scan is skipped entirely.
+	// registry and answers whether anything in it emits at all; before v1.8.10 no
+	// core row declared a luminance, so this whole branch was skipped outright on
+	// every single-player world. The torch changes that forever: syncLuminance()
+	// now answers true on every call regardless of whether a torch is placed
+	// anywhere NEAR this column, so the cell loop below runs on every propagate.
+	//
+	// v1.8.10: a chunk in CHUNK_FORM_UNIFORM form (chunk.h) is one id repeated
+	// 4096 times -- "half of every generated column is sky, and every sky chunk
+	// is this" per chunk.h's own header -- and chunkGet on one is already O(1)
+	// (chunk.c:207, a struct field read). Reading it ONCE and skipping the whole
+	// chunk when that one id does not emit turns the common case (an all-air or
+	// all-stone chunk, neither of which is ever luminous) from 4096 chunkGet
+	// calls into 1. MEASURED, tests/light_seam_test.c: see its cost-comparison
+	// arm for the before/after numbers this comment does not want to go stale.
 	if (syncLuminance()) {
 		for (int cy = 0; cy < COLUMN_CHUNKS; cy++) {
 			if (!chunks[cy]) continue;
+			if (chunkGetForm(chunks[cy]) == CHUNK_FORM_UNIFORM &&
+			    !s_luminance[chunkGet(chunks[cy], 0)])
+				continue;
+
 			for (int i = 0; i < CHUNK_BLOCKS; i++) {
 				const BlockId id = chunkGet(chunks[cy], i);
 				const uint8_t lum = s_luminance[id];
@@ -499,6 +614,8 @@ bool lightPropagateColumn(World* w, int cx, int cz, LightQueue* q)
 				queuePush(q, (uint16_t)ci, &dropped);
 			}
 		}
+		// v1.8.10 cross-column handoff -- see the comment above crossBorderCandidate.
+		seedCrossColumnBorder(lc->blk, w, chunks, cx, cz, q, &dropped);
 		spread(lc->blk, chunks, q, &dropped);
 	}
 
@@ -518,7 +635,12 @@ bool lightPropagateColumn(World* w, int cx, int cz, LightQueue* q)
 // s_edit_queue above for the measurement). lightRelightColumnSweeps is what it used to call and
 // is still the independent second implementation the host suite diffs this one against; the two
 // are proven to agree byte-for-byte, which is the only reason this swap is behaviour-preserving.
-bool lightRelightColumn(World* w, int cx, int cz)
+//
+// v1.8.10: split into relightColumnCore (this function's old body, unchanged) plus the
+// cross-column PUSH below. Everything the old body did — the CAS claim, the fast/sweep
+// choice, the fallback counter — is exactly as it was; lightRelightColumn now does that
+// and then hands off any border light this column can offer a neighbour.
+static bool relightColumnCore(World* w, int cx, int cz)
 {
 	if (!s_enabled) return false;
 
@@ -545,6 +667,219 @@ bool lightRelightColumn(World* w, int cx, int cz)
 	const bool ok = lightPropagateColumn(w, cx, cz, s_edit_queue);
 	__atomic_store_n(&s_edit_queue_busy, 0, __ATOMIC_RELEASE);
 	return ok;
+}
+
+// ── cross-column block-light handoff, the PUSH half (v1.8.10) ───────────────────
+//
+// crossBorderCandidate / seedCrossColumnBorder above are the PULL half: a column
+// reads its neighbours' CURRENT block light whenever it is (re)computed, which is
+// enough for a column that is edited or loaded NEXT TO an already-lit one. It is
+// not enough the other way — an already-loaded, already-lit neighbour does not
+// spontaneously notice that ITS neighbour just grew a torch near the shared edge,
+// because nothing ever asks it to recompute. This is what makes that happen:
+// called once, from lightRelightColumn below, after a column's own light is
+// current, so the edit path (a torch placed or broken) ends with every affected
+// neighbour correct rather than just the edited column.
+//
+// v1.8.10, second pass: the first version of this triggered a neighbour only when
+// this column's border STRICTLY IMPROVED on what the neighbour already held
+// (candidate > neighbour's current value). That is correct for growth — a torch
+// placed near an edge — and provably wrong for retraction. Measured on the host
+// probe: place a torch one cell from a column edge, relight the edited column
+// only (exactly what scene/interact.c's relightEdited does), the neighbour
+// correctly reads the crossed light (14 -> 13). Now delete the torch and relight
+// the SAME single column again, exactly as the removal path does: the edited
+// column reads 12 at the torch cell and 11 one step further, not 0/0. The
+// increase-only trigger never told the neighbour anything when it was first lit,
+// so the neighbour still holds its old value (13); when the edited column recomputes
+// after the removal, crossBorderCandidate PULLS that stale 13 straight back in,
+// producing a "ghost" value that has no real emitter behind it anywhere. This is
+// exactly the failure mode chunked flood-fill engines solve with a separate
+// unset/retract pass (0FPS's "smooth lighting" article and Minecraft's own light
+// engine both document it) — a value that is self-consistent with its neighbour
+// ("I am one less than what you show me") is not the same thing as a value that
+// traces back to a real source, and PUSHING ONLY ON INCREASE can never detect the
+// difference once the real source is gone.
+//
+// The fix does not need separate unset/reflood logic, because relightColumnCore
+// already recomputes a column's ENTIRE channel from scratch every time (memset +
+// reseed — see the "good news" this file's header banks on) rather than patching
+// in place. That means "is this column's light still correct" reduces to "would
+// relighting it again change anything" — so relightColumnCoreDiff below relights
+// a column and reports whether ANYTHING in its 16 KiB block channel moved, in
+// EITHER direction, and lightHandoffBorders chases that report outward instead of
+// a one-directional candidate comparison. Growth and retraction fall out of the
+// same code path: a grown border changes its neighbour's recompute (now pulls a
+// higher candidate) and a retracted one does too (the neighbour's own recompute
+// no longer finds the old high value locally-justified once ITS OWN relight also
+// stops finding it, and the pair decays together — see the bound below).
+//
+// BOUNDED — three independent arguments, not one:
+//   1. Per-hop, per-direction decay. Consider the worst case this fix exists for:
+//      a torch at the max level (14) is removed right at a border, so its
+//      neighbour is left holding a stale 13 with the edited column now offering
+//      0 locally. Relighting the edited column pulls the stale 13 back (-1 = 12,
+//      a "ghost" one step decayed) — a real, if temporary, contamination, exactly
+//      what the probe measured. Relighting the NEIGHBOUR next pulls 12 back
+//      (-1 = 11). Each hop strictly decreases by exactly 1 relative to two hops
+//      before it (the pair is alternately re-deriving from each other's last
+//      value, with nothing else feeding either side), so it cannot cycle and
+//      cannot fail to reach 0 — it just takes as many hops as the peak level, at
+//      most 15 per side, 30 for the pair to both bottom out. Growth converges
+//      far faster (a column's OWN local recompute already includes any local
+//      emitter, so pulling a neighbour's value only ever raises it to the same
+//      fixpoint the old increase-only version reached, typically 1-2 hops).
+//      LIGHT_HANDOFF_MAX_DEPTH=32 covers the proven worst case with a small
+//      margin, not the depth this is expected to reach in play.
+//   2. Column geometry. A column is 16 cells wide and 15 is the brightest level,
+//      so a SINGLE emitter's cross-column reach cannot even cross one whole
+//      neighbour column (14 - 16 < 0) — only a deliberately built CHAIN of
+//      several torches, each within reach of the next column's edge, can push
+//      more than one hop of GROWTH. Retraction of one such torch is bounded by
+//      argument 1 regardless of chain length, because it only ever involves the
+//      one pair straddling the removed emitter's own border.
+//   3. The loaded ring. worldColumn(w, ...) reads NULL for anything not currently
+//      loaded, so a push never reaches past however many columns are actually
+//      loaded (RENDER_DIST_MAX_COLUMNS = 49, scene/render_dist.h, today) no
+//      matter how deep a hand-built chain goes.
+//   The cap firing is counted in s_handoff_capped (same idiom as s_sweep_fallbacks
+//   above) rather than silently truncating, so a fixture that deliberately builds
+//   a chain long enough to exceed it (tests/light_seam_test.c's
+//   testHandoffDepthCap) can prove the backstop is reachable and not dead code.
+//
+// COST. relightColumnCoreDiff always pays one relightColumnCore (the file's own
+// measured 0.156 ms median) plus one 16 KiB memcmp (negligible next to that) for
+// every column it touches. lightRelightColumn only enters the handoff at all when
+// the EDITED column's own channel changed — an edit with no light relevance
+// (breaking a block far from every emitter and every border) costs exactly the
+// one relight it always cost, zero neighbour touches. An edit that does move
+// light near a border costs up to 4 neighbour relights per hop it actually
+// propagates, which is the real, bounded price of correctness here, not a
+// pre-existing cost this pays for edits that were never near a light source.
+//
+// THREAD SAFETY. This walks live neighbour columns via worldColumn(w, ...), and
+// is safe for the same reason crossBorderCandidate's comment gives: every real
+// caller that hands this file a MULTI-column world does so from the main thread
+// only — scene/interact.c's edit path, main.c's remote-edit path, and
+// world/relight_drain.c's drain, which is exactly the set light.c:26-156's
+// threading note already names as "the main thread". The worker thread
+// (app/worker.c JOB_GENERATE) never reaches this function with a live world: it
+// calls lightPropagateColumn/lightRelightColumn directly against its OWN staging
+// world (worker.c:396-397), and lightRelightColumn is the only caller of this
+// function — so the one time a worker thread's call could reach it, the world in
+// hand is a staging world that holds exactly one column for its whole life
+// (worker.c:264 creates it, :811-813 empties it), and every worldColumn lookup
+// on a neighbour coordinate there reads NULL. This function is a genuine no-op
+// on that thread, not a race that happens not to have been hit yet.
+//
+// tests/light_race_test.c's two concurrently-relit fixture columns were moved
+// apart in this version for exactly this reason: that test drives two threads
+// against ONE live-style World with adjacent columns, which no real caller does
+// (see the paragraph above), and adjacency would make it exercise a cross-column
+// read racing a cross-column write — a scenario this file's design does not
+// claim to make safe, because nothing in the real game ever produces it.
+#define LIGHT_HANDOFF_MAX_DEPTH  32
+
+static int s_handoff_capped;
+
+// v1.8.10: the cap itself is read out of this variable, not the macro directly, so a test
+// can prove it is reachable without building the 30-column chain the real bound needs —
+// the same idiom lightFailEditQueueForTest above uses to prove the CAS/malloc-refusal
+// fallback is reachable without actually exhausting memory. Real callers never touch this;
+// it starts at, and non-test code always sees, LIGHT_HANDOFF_MAX_DEPTH.
+static int s_handoff_max_depth = LIGHT_HANDOFF_MAX_DEPTH;
+
+int  lightHandoffCapped(void)             { return __atomic_load_n(&s_handoff_capped, __ATOMIC_RELAXED); }
+void lightResetHandoffCappedForTest(void) { __atomic_store_n(&s_handoff_capped, 0, __ATOMIC_RELAXED); }
+
+void lightSetHandoffMaxDepthForTest(int depth) { s_handoff_max_depth = depth; }
+void lightResetHandoffMaxDepthForTest(void)    { s_handoff_max_depth = LIGHT_HANDOFF_MAX_DEPTH; }
+
+// Relights (cx,cz) and reports, via the return value, whether its stored block
+// channel is now different from what it was immediately before this call — in
+// EITHER direction. *out_ok, if non-NULL, carries relightColumnCore's own result
+// (false only when the engine is off, the column is absent, or light could not
+// be attached — the same cases it always returned false for).
+//
+// v1.8.10, third pass — the first-relight case. The second pass counted a column
+// with no light attached yet as "changed" unconditionally, reasoning that it has
+// never been through a relight so there is nothing for it to have been consistent
+// with. True as far as it goes, and wrong as a HANDOFF trigger, because it makes
+// the very first relight of any column fan out to all four of its loaded
+// neighbours — each of which has also never been relit, so each also reports
+// "changed", and the fan-out walks the entire loaded ring. Every one of those
+// columns pays a full relightColumnCore (this file's own measured 0.156 ms
+// median). With RENDER_DIST_MAX_COLUMNS = 49 loaded that is up to ~7.6 ms of a
+// 16.71 ms frame spent handing off light that does not exist. It is not a
+// correctness bug — the result is right — it is a large amount of provably
+// pointless work, and world/relight_drain_test.c caught it as one: its control
+// ("relighting column 0 did not light column 1") went red in a torch-free world
+// of flat stone, where there is no block light anywhere to cross any border.
+//
+// So the first-relight case now asks the question the handoff actually cares
+// about: does this column have any block light AT ALL to tell a neighbour about?
+// An all-zero block channel cannot raise a neighbour (it offers 0) and cannot
+// lower one either, because a neighbour can only be holding a value pulled from
+// this column if this column once had light to be pulled — and this branch is
+// reached only when it has never had a channel at all. Both directions of the
+// second pass's argument are therefore preserved exactly:
+//   GROWTH     — a first relight that DOES find local block light (a column
+//                streamed in with a torch already in it) still returns true and
+//                still hands off.
+//   RETRACTION — removing the last torch happens in a column that WAS lit, so
+//                had_before is true, the memcmp below fires, and the ghost-value
+//                decay chain the second pass exists for is untouched.
+static bool relightColumnCoreDiff(World* w, int cx, int cz, bool* out_ok)
+{
+	Column* col = worldColumn(w, cx, cz);
+	const uint8_t* before = lightChannelBlock(col);
+	const bool had_before = (before != NULL);
+	uint8_t snapshot[LIGHT_COL_BYTES];
+	if (had_before) memcpy(snapshot, before, sizeof(snapshot));
+
+	const bool ok = relightColumnCore(w, cx, cz);
+	if (out_ok) *out_ok = ok;
+	if (!ok) return false;
+
+	col = worldColumn(w, cx, cz);
+	const uint8_t* after = lightChannelBlock(col);
+	if (!after) return false;   // engine on, but this column still has no light
+	if (!had_before) {
+		// Never been lit: hand off only if there is actually block light here to
+		// hand over. See the third-pass note above.
+		for (size_t i = 0; i < sizeof(snapshot); i++)
+			if (after[i]) return true;
+		return false;
+	}
+	return memcmp(snapshot, after, sizeof(snapshot)) != 0;
+}
+
+static void lightHandoffBorders(World* w, int cx, int cz, int depth)
+{
+	if (depth >= s_handoff_max_depth) {
+		__atomic_fetch_add(&s_handoff_capped, 1, __ATOMIC_RELAXED);
+		return;
+	}
+
+	static const int8_t dcx[4] = { 1, -1, 0, 0 };
+	static const int8_t dcz[4] = { 0, 0, 1, -1 };
+
+	for (int d = 0; d < 4; d++) {
+		const int ncx = cx + dcx[d], ncz = cz + dcz[d];
+		if (!worldColumn(w, ncx, ncz)) continue;   // that neighbour is not loaded at all
+
+		if (relightColumnCoreDiff(w, ncx, ncz, NULL))
+			lightHandoffBorders(w, ncx, ncz, depth + 1);
+	}
+}
+
+bool lightRelightColumn(World* w, int cx, int cz)
+{
+	bool ok = false;
+	const bool changed = relightColumnCoreDiff(w, cx, cz, &ok);
+	if (!ok) return false;
+	if (changed) lightHandoffBorders(w, cx, cz, 0);
+	return true;
 }
 
 bool lightRelightColumnSweeps(World* w, int cx, int cz)
@@ -622,6 +957,21 @@ bool lightRelightColumnSweeps(World* w, int cx, int cz)
 						const int nb = lightNibble(lc->blk, nci);
 						if (ns > best_s) best_s = (uint8_t)(ns - 1);
 						if (nb > best_b) best_b = (uint8_t)(nb - 1);
+					}
+
+					// v1.8.10 cross-column handoff, the sweep engine's half.
+					// crossBorderCandidate is the SAME function the BFS engine
+					// seeds from (see its comment above lightPropagateColumn) —
+					// called with the same inputs it must produce the same
+					// answer, which is what keeps the two engines agreeing byte
+					// for byte on a column next to a lit neighbour. Gated on
+					// x/z first, cheaply, so the function call itself only
+					// happens for the border cells, on every one of this loop's
+					// (possibly several) passes.
+					if (lum_any &&
+					    (x == 0 || x == CHUNK_DIM - 1 || z == 0 || z == CHUNK_DIM - 1)) {
+						const int cand = crossBorderCandidate(w, cx, cz, x, y, z);
+						if (cand > best_b) best_b = (uint8_t)cand;
 					}
 
 					if (best_s != lightNibble(lc->sky, ci)) {

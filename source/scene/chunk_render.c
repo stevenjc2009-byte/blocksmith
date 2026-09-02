@@ -3,12 +3,15 @@
 #include <math.h>
 #include <string.h>
 
+#include <tex3ds.h>
+
 #include "app/drawprobe.h"
 #include "app/watchdog.h"
 #include "debug/metrics.h"
 #include "gfx/atlas.h"
 #include "gfx/fogramp.h"
 #include "gfx/fogtex.h"
+#include "gfx/watershimmer.h"
 #include "world/daynight.h"
 #include "world/dirtyq.h"
 #include "world/light.h"
@@ -29,6 +32,7 @@
 // as long as two copies of the constant exist.
 #include "world_shbin.h"
 #include "world_dynamic_shbin.h"   // picasso, source/shaders/world_dynamic.v.pica
+#include "watershimmer_t3x.h"      // tex3ds, gfx/watershimmer.t3s -> gfx/watershimmer.png
 
 // Step 7.1, overridable so the check can go red: -DBS_FRUSTUM=0 draws every live slot, and
 // the two builds must produce a pixel-identical frame or the cull is eating visible geometry.
@@ -137,9 +141,63 @@ void chunkRenderSetGen(const WorldGen* gen)
 // what it drew before this file existed.
 static uint32_t s_tod = DAY_START_TICKS;
 
+// v1.8.10. faceShadeTableBuild and s_fake_shading are defined further down, next to
+// kFaceShade and s_faceshade_rows (see faceShadeTableBuild's own comment for why they sit
+// there), but chunkRenderSetTimeOfDay and chunkRenderSetFakeShading below need to reach them
+// from here. A plain forward declaration for the function; a tentative definition (no
+// initializer, same as the real one at its definition site) for the static bool, which C
+// merges into the one definition further down rather than treating as a conflict.
+static void faceShadeTableBuild(void);
+static bool s_fake_shading;
+
 void chunkRenderSetTimeOfDay(uint32_t tod)
 {
 	s_tod = tod;
+	// v1.8.10. Only while fake shading is on: rebuilding all 64 rows every frame is a ~64-
+	// iteration loop of a handful of float multiplies (see faceShadeTableBuild), which is
+	// noise next to a remesh or even next to the identical loop pipelineBind already runs
+	// every bind to UPLOAD the same rows — so there is nothing to gate this behind beyond the
+	// option itself. With the option off this is exactly the one extra branch it was before
+	// v1.8.10, and s_faceshade_rows keeps whatever faceShadeTableBuild wrote at init.
+	if (s_fake_shading) faceShadeTableBuild();
+}
+
+// v1.8.10 fake directional lighting option. main.c calls this once a frame from the live
+// Options struct, unconditionally — same shape as chunkRenderSetTimeOfDay just above, and
+// deliberately not gated on "did the option change": a plain bool compare against the last
+// value would save one branch and one 64-row rebuild on the (overwhelmingly common) frame
+// where nothing changed, but the option can only change from the pause menu, which pauses the
+// world and therefore does not draw a frame while it is being toggled — so that saving is not
+// reachable in practice and is not worth the extra state. On a genuine toggle this rebuilds
+// immediately, so the very next frame already shows the new setting instead of waiting for the
+// next time-of-day tick.
+void chunkRenderSetFakeShading(bool on)
+{
+	if (s_fake_shading == on) return;
+	s_fake_shading = on;
+	faceShadeTableBuild();
+}
+
+// v1.8.10 water shimmer. The clock the scrolling glint reads, in milliseconds; main.c sets it
+// once a frame from svcGetSystemTick, in the same place and the same shape as the two setters
+// above. gfx/watershimmer.h turns it into the UV offset and owns all the arithmetic.
+//
+// SAMPLED ONCE A FRAME BY THE CALLER, and that is the whole reason this is a setter rather than
+// a svcGetSystemTick() call inside pipelineBind. pipelineBind runs TWICE in a 3D frame — once
+// per eye — so reading the clock there would give the left and right eyes offsets a few
+// milliseconds apart. The shimmer is a high-contrast pattern on a flat surface, which is
+// precisely the kind of image where a small horizontal disagreement between the eyes is what
+// the 3D slider fuses into depth; the glints would sit at a different depth from the water they
+// are on. One value, held here, is read by both eyes.
+//
+// Stored unconditionally, like s_tod. It is one 64-bit store on a frame that is about to issue
+// hundreds of draw calls, and gating it on the option would mean the first frame after the
+// option is switched on scrolls from a stale timestamp.
+static uint64_t s_shimmer_ms;
+
+void chunkRenderSetShimmerTimeMs(uint64_t ms)
+{
+	s_shimmer_ms = ms;
 }
 
 // One column's palette row, in the shape world/scratch.h's ScratchTintFn asks for.
@@ -182,9 +240,28 @@ static const float kFaceShade[BLOCK_FACES] = {
 // the fill sits at the top rather than beside the other GPU setup.
 static float s_faceshade_rows[MESH_NRM_STATES][4];
 
+// v1.8.10 fake directional lighting option (Options.fake_shading, off by default). Whether
+// faceShadeTableBuild below should swing the EAST/WEST rows with the sun instead of holding
+// them at kFaceShade's fixed constants. Set by chunkRenderSetFakeShading, which main.c calls
+// once a frame from the live Options struct — see the setter for why "once a frame,
+// unconditionally" is safe and cheap here.
+static bool s_fake_shading;
+
+// How far the EAST/WEST brightness is allowed to swing off its kFaceShade baseline, in either
+// direction. Small enough that a face never reads as a different material, big enough to be
+// seen: 0.20 takes EAST's 0.78 to 0.58..0.98 and WEST's 0.66 to 0.46..0.86 over a full day.
+#define FAKE_SHADE_AMPLITUDE 0.20f
+
+static float fakeShadeClamp(float v)
+{
+	return v < 0.05f ? 0.05f : (v > 1.0f ? 1.0f : v);
+}
+
 // The row derivation, moved verbatim out of pipelineBind's loop. Kept as its own function so
 // the numbers and the upload can be read apart: this is what the values ARE, pipelineBind is
-// when they reach the GPU. Idempotent — running it twice writes the same 64 rows.
+// when they reach the GPU. Idempotent — running it twice writes the same 64 rows (and, with
+// fake shading on, running it a third time with the same s_tod writes the same 64 rows again;
+// nothing here has memory of a previous call).
 //
 // All four components are stored even though pipelineBind reads three: [2] is the uniform's
 // third component, which has always been the same number as [0] (the upload passes `s` twice),
@@ -192,12 +269,42 @@ static float s_faceshade_rows[MESH_NRM_STATES][4];
 // so a check comparing it against the old per-bind loop compares all four values, not three.
 static void faceShadeTableBuild(void)
 {
+	// v1.8.10. Fake directional lighting: zero shader instructions and zero new vertex data,
+	// because this table already feeds the same 64-row uniform bank pipelineBind re-uploads
+	// every bind regardless (see the comment on s_faceshade_rows) — only the CPU-side numbers
+	// that land in it change. EAST and WEST are the only rows this swings; see
+	// FAKE_SHADE_AMPLITUDE's comment and chunkRenderSetTimeOfDay for the rest of the reasoning.
+	float east = kFaceShade[FACE_EAST];
+	float west = kFaceShade[FACE_WEST];
+	if (s_fake_shading) {
+		// theta=0 is noon (dayNightCelestialAngle's own zero point) and theta=pi is midnight;
+		// both put swing at exactly 0, so a fully sunlit or fully midnight frame reproduces
+		// kFaceShade's baked constants exactly, byte for byte, same as every build before this
+		// option existed. The extremes sit at dawn/dusk (theta=+-pi/2), which is where a real
+		// low sun would light one vertical face and leave its opposite in shadow. Only EAST/
+		// WEST move: this game's sun (world/daynight.h) tracks a single plane, exactly as
+		// Minecraft's own does, so there is no real azimuth signal to drive SOUTH/NORTH from
+		// without inventing a second axis the day/night clock does not have. TOP/BOTTOM are
+		// also left untouched on purpose — they already carry the day/night cycle's own,
+		// independent dimming through the dayLevel/sky-light system in the vertex shader
+		// (curve(dayLevel*sky)); swinging kFaceShade's TOP row as well would multiply two
+		// independent day/night effects together and make night far too dark.
+		const float theta = dayNightCelestialAngle(s_tod) * 6.283185307f; // rotations -> radians
+		const float swing = FAKE_SHADE_AMPLITUDE * sinf(theta);
+		east = fakeShadeClamp(kFaceShade[FACE_EAST] + swing);
+		west = fakeShadeClamp(kFaceShade[FACE_WEST] - swing);
+	}
+
 	for (unsigned i = 0; i < MESH_NRM_STATES; i++) {
 		const unsigned face = meshNrmFace((uint8_t)i);
 		const unsigned drop = meshNrmDrop((uint8_t)i);
-		s_faceshade_rows[i][0] = (face < BLOCK_FACES) ? kFaceShade[face] : 1.0f;
+		float s;
+		if (face == FACE_EAST)      s = east;
+		else if (face == FACE_WEST) s = west;
+		else                        s = (face < BLOCK_FACES) ? kFaceShade[face] : 1.0f;
+		s_faceshade_rows[i][0] = s;
 		s_faceshade_rows[i][1] = -(float)drop / (float)SCRATCH_WATER_STEPS;
-		s_faceshade_rows[i][2] = s_faceshade_rows[i][0];
+		s_faceshade_rows[i][2] = s;
 		s_faceshade_rows[i][3] = meshNrmAlpha((uint8_t)i);
 	}
 }
@@ -269,6 +376,27 @@ static int             s_uloc_fogparams;
 // consecutive rows, filled from meshTintRow() in pipelineBind. See world/mesher.h for the
 // encoding, the palette itself, and why the numbers live in that header and not here.
 static int             s_uloc_tintpalette;
+
+// v1.8.10 water shimmer. The scroll uniform (waterShimmer, world_dynamic.v.pica ONLY — see that
+// file's declaration for why it is not in world.v.pica). Filled every bind in pipelineBind.
+static int             s_uloc_watershimmer;
+
+// The glint sheet itself, on texture unit 2. Imported once in chunkRenderInit and BOUND only
+// while the option is on, which is the difference this whole feature is designed around: with
+// the shaders option off nothing binds unit 2 and no TEV stage sources it, so the default
+// install issues exactly the GPU state it issued in v1.8.9. That matters more than usual for
+// this release, whose headline is the fix for the freeze that locked up steve's console — a
+// hardware result has to be attributable, and untested GPU state on the default path would make
+// it not be.
+//
+// s_shimmer_ready is separate from s_fake_shading because the import can fail and the option
+// can still be on. A failure here is NOT fatal: fogTexInit's failure refuses the boot because
+// the world cannot be drawn without the fog ramp, and this is a cosmetic add — refusing to
+// start the game over a 4 KB decoration would be the wrong trade. The consequence of a failure
+// is that the option silently draws v1.8.9's water, which is stated plainly rather than logged
+// because there is no log on the console path to write it to.
+static C3D_Tex         s_shimmer_tex;
+static bool            s_shimmer_ready;
 
 static FogShape        s_fog;
 
@@ -836,6 +964,132 @@ static MeshSlot* acquireSlot(uint32_t need_verts, const MeshSlot* exclude)
 	return NULL;
 }
 
+// ── v1.8.10 water shimmer: the texture and the TEV stage ─────────────────────
+//
+// The three functions below are the ENTIRE GPU footprint of the feature, and all three of them
+// are called from inside `if (s_fake_shading)`. That placement is the design, not a detail: the
+// gate is at the point where the state is SET, so with the shaders option off (the default —
+// Options.fake_shading, app/options.h) unit 2 is never bound, TEV stage 2 is never configured,
+// and the command list this build sends the GPU is byte-for-byte the one v1.8.9 sent.
+//
+// The one exception is the waterShimmer UNIFORM, which pipelineBind uploads unconditionally
+// with zeroed offsets. It has to: the vertex shader writes outtc2 on every vertex whether the
+// option is on or not (the PICA200 has no cheap branch and a vertex program cannot be
+// part-compiled), so leaving the register unwritten would mean reading whatever scene/
+// highlight.c's program last left in that shared bank. One extra C3D_FVUnifSet per bind, and
+// the value it uploads is discarded because nothing samples texcoord2 unless the gate is open.
+//
+// Lives in this file rather than beside gfx/fogtex.c, which is the obvious sibling, because the
+// v1.8.10 scope owns scene/chunk_render.c and does not own a new gfx/*.c. The arithmetic that
+// would want host testing is in gfx/watershimmer.h, which is <3ds.h>-free and IS linked by
+// world/water_alpha_test.c; what is left here is four citro3d calls and a TEV stage.
+
+// Imports build/watershimmer.t3x. False means the glint is unavailable and the option quietly
+// draws v1.8.9's water; see s_shimmer_ready for why that is not a boot failure.
+static bool waterShimmerTexInit(void)
+{
+	// vram = false, which is the opposite of the atlas and of the fog ramp, and the reason is
+	// the gate: this texture is sampled by NOTHING in a default install, so it must not take
+	// VRAM away from the atlas on the machines that will never look at it. 64x64 at A8 is 4,096
+	// bytes either way. NOT MEASURED on a console — nothing since v1.2.5 has run on hardware —
+	// but the size is arithmetic from the sheet, not an estimate.
+	Tex3DS_Texture t3x =
+		Tex3DS_TextureImport(watershimmer_t3x, watershimmer_t3x_size, &s_shimmer_tex, NULL, false);
+	if (!t3x)
+		return false;
+	Tex3DS_TextureFree(t3x);
+
+	// GPU_LINEAR, same reasoning as the fog ramp and the opposite of the atlas: this is a
+	// continuous function sampled at 64 points per 8 blocks, not pixel art. GPU_NEAREST would
+	// quantise the glints into visible squares that jump a whole texel at a time as the sheet
+	// scrolls, which reads as the water flickering rather than flowing.
+	C3D_TexSetFilter(&s_shimmer_tex, GPU_LINEAR, GPU_LINEAR);
+
+	// GPU_REPEAT on BOTH axes, and this is the one texture in the tree that needs it on both.
+	// The coordinate is chunk-local XZ scaled by WATER_SHIMMER_UV_PER_BLOCK plus a scrolling
+	// offset, so it runs 0..2 across a chunk and then keeps going as the offset advances; it is
+	// never in 0..1 and is not meant to be. GPU_CLAMP_TO_EDGE here would smear one row and one
+	// column of the sheet across the entire ocean. tools/make_atlas.py draws the sheet from
+	// integer-frequency sinusoids specifically so that this repeat has no seam in it.
+	C3D_TexSetWrap(&s_shimmer_tex, GPU_REPEAT, GPU_REPEAT);
+	return true;
+}
+
+// Unit 2, the only unit this project has never used (gfx/fogtex.c owns unit 1, gfx/atlas.c and
+// gfx/font.c share unit 0). Rebound per bind for the same reason atlasBind() and fogTexBind()
+// are: a texture binding is global GPU state.
+//
+// citro3d has no unbind, so once this runs the unit stays ENABLED for the rest of the frame,
+// the UI batch included — the same standing cost gfx/fogtex.c's own comment describes for unit
+// 1, and it cannot go wrong for the same two reasons: GPU_REPEAT means no coordinate can
+// address outside these 4 KB, and no TEV stage in those passes sources GPU_TEXTURE2. It is a
+// discarded fetch on the fragments of the frame drawn after the world, and it is only paid at
+// all when the option is on.
+static void waterShimmerBind(void)
+{
+	C3D_TexBind(2, &s_shimmer_tex);
+}
+
+// TEV stage 2: add the glint, to water and to nothing else.
+//
+//   rgb   = texture2.a * (1 - primary.a) + previous.rgb
+//   alpha = REPLACE(previous)
+//
+// WHY (1 - primary.a) AND NOT A SEPARATE DRAW CALL. The plan (docs/plan-1.8.10-light.md 5.3)
+// speaks of "the water draw", and there is no such thing in this renderer: the transparent pass
+// draws leaves and water together out of one index run per chunk, and splitting them would mean
+// a third offset in MeshOut and a third draw call per chunk — a mesher change, on the release
+// that must not move the mesher.
+//
+// The discriminator is already there and costs nothing. Vertex alpha is WATER_ALPHA = 0.70 on
+// water and 1.0 on every other surface in the world (world/mesher.h, meshNrmAlpha), so
+// GPU_TEVOP_RGB_ONE_MINUS_SRC_ALPHA on GPU_PRIMARY_COLOR is EXACTLY 0.30 on a water fragment
+// and EXACTLY 0.0 on a leaf. Multiplied into the glint and added, that makes this stage an
+// arithmetic no-op on every non-water fragment — not "nearly invisible", zero — while giving
+// water a highlight that peaks at 0.875 * 0.30 = 0.26 and averages 0.088 * 0.30 = 0.026 (the
+// sheet's measured min/max/mean are in tools/make_atlas.py, printed by the generator itself).
+// It also scales itself: if WATER_ALPHA ever moves, the glint strength moves with it in the
+// same direction, because a more transparent surface is one that reflects less.
+//
+// GPU_PREVIOUS is in source2 and the uniform-ish operands are not, which is not stylistic — the
+// PICA200 forbids a constant or uniform in the third source slot and NOTHING in the host suite
+// can catch that. Only picasso and the hardware can. This stage sources GPU_TEXTURE2,
+// GPU_PRIMARY_COLOR and GPU_PREVIOUS, none of which is GPU_CONSTANT.
+//
+// The alpha half is REPLACE(previous), exactly as the fog stage above it is and for the same
+// reason: stage 0's alpha is what the alpha TEST at GPU_GREATER 127 and the SRC_ALPHA blend
+// both read. A stage that touched alpha here would turn water opaque or leaves solid, and
+// neither would look like a shimmer bug.
+//
+// ACCEPTED LIMITATION, stated because it is visible rather than theoretical: this stage runs
+// AFTER stage 1's fog interpolation, so the glint is added on top of the fog rather than faded
+// into it, and distant water keeps a faint sparkle the fog should have removed. Fixing it means
+// moving the fog to a later stage — restructuring load-bearing code that the freeze fix's
+// hardware result has to be read against — so it is left, and the sheet's low mean (a 7/255
+// average lift) is what keeps it faint rather than obvious.
+static void waterShimmerTevSet(void)
+{
+	C3D_TexEnv* sh = C3D_GetTexEnv(2);
+	C3D_TexEnvInit(sh);
+	C3D_TexEnvSrc(sh, C3D_RGB, GPU_TEXTURE2, GPU_PRIMARY_COLOR, GPU_PREVIOUS);
+	C3D_TexEnvOpRgb(sh, GPU_TEVOP_RGB_SRC_ALPHA, GPU_TEVOP_RGB_ONE_MINUS_SRC_ALPHA,
+	                GPU_TEVOP_RGB_SRC_COLOR);
+	C3D_TexEnvFunc(sh, C3D_RGB, GPU_MULTIPLY_ADD);
+	C3D_TexEnvSrc(sh, C3D_Alpha, GPU_PREVIOUS, 0, 0);
+	C3D_TexEnvFunc(sh, C3D_Alpha, GPU_REPLACE);
+}
+
+// And back to citro3d's REPLACE(previous) passthrough, which is what stages 2..5 have held
+// since C3D_Init and what every other pass in the tree assumes. Without this the stage would
+// leak into scene/highlight.c, scene/crackoverlay.c, scene/playermodel.c and the HUD, whose
+// vertex alpha VARIES — the HUD's especially — so (1 - primary.a) would stop being 0 there and
+// the glint would be added to menus and text. That is the same class of leak gfx/fogtex.c
+// describes for TEV stage 1, which those four passes each reset explicitly for the same reason.
+static void waterShimmerTevReset(void)
+{
+	C3D_TexEnvInit(C3D_GetTexEnv(2));
+}
+
 // Everything the world draw needs the GPU to be set to. Called once at init and then
 // again at the top of every chunkRenderDraw, deliberately, rather than being left
 // standing from init: step 4.2's highlight binds its own shader program and its own
@@ -962,7 +1216,10 @@ static void pipelineBind(void)
 	// alpha half of this stage does not source the constant) and is set for the sake of not
 	// leaving a component undefined.
 	//
-	// Stages 2..5 stay at citro3d's REPLACE(previous) passthrough, as they always have been.
+	// Stages 3..5 stay at citro3d's REPLACE(previous) passthrough, as they always have been, and
+	// so does stage 2 unless v1.8.10's shaders option is on — in which case the transparent pass
+	// (and only the transparent pass) configures it for the water shimmer and puts it straight
+	// back. See waterShimmerTevSet above pipelineBind.
 	C3D_TexEnv* fog = C3D_GetTexEnv(1);
 	C3D_TexEnvInit(fog);
 	C3D_TexEnvSrc(fog, C3D_RGB, GPU_CONSTANT, GPU_PREVIOUS, GPU_TEXTURE1);
@@ -1043,6 +1300,25 @@ static void pipelineBind(void)
 		const MeshTint t = meshTintRow((uint8_t)i);
 		C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uloc_tintpalette + (int)i, t.r, t.g, t.b, 1.0f);
 	}
+
+	// v1.8.10 water shimmer: the scroll offset and the sheet's scale, re-uploaded here for the
+	// same reason every uniform above it is — scene/highlight.c's program lands its own uniforms
+	// in this shared bank.
+	//
+	// UNCONDITIONAL, unlike every other part of this feature. world_dynamic.v.pica writes outtc2
+	// on every vertex whether the option is on or not, so this register is read on every vertex
+	// and an unwritten one holds another program's leftovers; the full argument is at the
+	// waterShimmer declaration in that file and at waterShimmerTexInit above. With the option off
+	// the offsets are zeros and the varying goes nowhere, because no texture is bound to unit 2
+	// and no TEV stage sources it.
+	//
+	// The offsets come from gfx/watershimmer.h rather than being computed here, so that
+	// world/water_alpha_test.c can test the real scroll instead of a copy of it; .z is the sheet's
+	// scale in texture repeats per block and is a compile-time constant from the same header.
+	const float shim_u = s_fake_shading ? waterShimmerOffsetU(s_shimmer_ms) : 0.0f;
+	const float shim_v = s_fake_shading ? waterShimmerOffsetV(s_shimmer_ms) : 0.0f;
+	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uloc_watershimmer,
+	              shim_u, shim_v, WATER_SHIMMER_UV_PER_BLOCK, 0.0f);
 }
 
 bool chunkRenderInit(int max_radius)
@@ -1135,6 +1411,11 @@ bool chunkRenderInit(int max_radius)
 	// rows 0..MESH_TINT_ROWS-1 from meshTintRow() at s_uloc_tintpalette + i, exactly as it
 	// does for faceShade.
 	s_uloc_tintpalette = shaderInstanceGetUniformLocation(s_program.vertexShader, "tintPalette");
+
+	// v1.8.10 water shimmer. Looked up unconditionally, because pipelineBind uploads it
+	// unconditionally — see the note there and at the uniform's declaration in
+	// source/shaders/world_dynamic.v.pica.
+	s_uloc_watershimmer = shaderInstanceGetUniformLocation(s_program.vertexShader, "waterShimmer");
 
 	// Step 9.2b. The one shared index buffer every slot draws from, built once and never
 	// written again — see the comment on s_shared_indices. Every quad's pattern is
@@ -1237,6 +1518,13 @@ bool chunkRenderInit(int max_radius)
 	// error. Failing the same way the atlas does means main.c already reports it.
 	if (!fogTexInit())
 		return false;
+
+	// v1.8.10 water shimmer, on unit 2. Deliberately NOT `return false` on failure, which is the
+	// one place this differs from the two inits above it: the atlas and the fog ramp are the
+	// world, and this is a decoration on one block type behind an option that is off by default.
+	// A game that refuses to boot because a 4 KB glint sheet would not import is a worse outcome
+	// than a game whose water looks like v1.8.9's. s_shimmer_ready gates every later use.
+	s_shimmer_ready = waterShimmerTexInit();
 
 	// Step 7.7. The fog LUT and the projection both come from here, and both have to exist
 	// before the first frame. Radius 1 rather than the console's default: main.c owns the
@@ -1373,6 +1661,13 @@ void chunkRenderExit(void)
 {
 	atlasExit();
 	fogTexExit();
+	// v1.8.10. Guarded, because unlike the two above it this import is allowed to have failed:
+	// C3D_TexDelete on a C3D_Tex that Tex3DS_TextureImport never filled would free whatever the
+	// zero-initialised struct's data pointer happens to be.
+	if (s_shimmer_ready) {
+		C3D_TexDelete(&s_shimmer_tex);
+		s_shimmer_ready = false;
+	}
 	// Step 9.2c. Three arenas now, not MESH_SLOTS individual allocations — every slot's
 	// `verts` pointer is an offset into one of these, so freeing per-slot would free the
 	// same block up to kTierSlots[t] times.
@@ -2465,6 +2760,22 @@ void chunkRenderDraw(const C3D_Mtx* view)
 	// water — a deep sea is exactly as blue as a puddle — which is a fidelity limit, not a bug.
 	C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA,
 	               GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA);
+
+	// v1.8.10 water shimmer. THE GATE, and the only place in the file that opens it: both calls
+	// are the whole GPU footprint of the feature (bind unit 2, configure TEV stage 2), and both
+	// sit inside this one `if`. With the shaders option off — the default — neither runs, so a
+	// default install's command list is v1.8.9's.
+	//
+	// Here rather than in pipelineBind, which is where the rest of the world's state is set,
+	// because the stage is only wanted for THIS pass. In pipelineBind it would be configured for
+	// the opaque pass too, where every fragment has vertex alpha 1.0 and the stage is an exact
+	// no-op — but an exact no-op that still costs a texture fetch on every fragment of the whole
+	// world. Confined to the transparent run it is paid by leaves and water only.
+	const bool shimmer_on = s_fake_shading && s_shimmer_ready;
+	if (shimmer_on) {
+		waterShimmerBind();
+		waterShimmerTevSet();
+	}
 #if BS_DRAW_PROBE
 	// arms 3 and 5 have no transparent pass. Only the loop is cut, not the alpha-test pair
 	// around it: those two calls are render state rather than draws, and leaving them in
@@ -2484,6 +2795,13 @@ void chunkRenderDraw(const C3D_Mtx* view)
 		s_alpha_tris += count / 3;
 		s_alpha_draws++;
 	}
+
+	// v1.8.10. And the shimmer stage back to passthrough, in the same breath as the alpha test
+	// and the blend unit below and for exactly the same reason: this is global GPU state and the
+	// four passes that draw after the world do not configure stage 2. Their vertex alpha varies
+	// — the HUD's most of all — so a stage left standing would add the glint to menus and text.
+	if (shimmer_on)
+		waterShimmerTevReset();
 
 	// Left off for whatever draws next. This is global GPU state, not per-program state,
 	// and the highlight pass in scene/highlight.c never sets it.

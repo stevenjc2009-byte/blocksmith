@@ -71,7 +71,8 @@
 	X(BTEX_DAISY,           TILE_DAISY)           \
 	X(BTEX_BLUEBELL,        TILE_BLUEBELL)        \
 	X(BTEX_ORCHID,          TILE_ORCHID)          \
-	X(BTEX_APPLE,           TILE_APPLE)
+	X(BTEX_APPLE,           TILE_APPLE)           \
+	X(BTEX_TORCH,           TILE_TORCH)
 
 // One _Static_assert per pair, exactly as before. The names are stringified into the message
 // because every one of these expands from the same source line, so the message is the only

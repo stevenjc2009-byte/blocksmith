@@ -93,17 +93,37 @@
 // made once, for the title screen, when Multiplayer became a fourth item there: recompute
 // the shared height instead of shrinking anything already on screen.
 //
-//   240 = LIST_TOP_Y(24) + 4*LIST_ROW_H(32) + gap(6) + 3*OPT_BTN_H + 2*gap(4) + margin(6)
+//   240 = LIST_TOP_Y(24) + 5*OPT_ROW_H(26) + gap(6) + 3*OPT_BTN_H(22) + 2*gap(4) + margin(6)
 //
-// The "4" is drawOptionsGeneral's own four setting rows (render dist, 3D depth, invert
-// look, look sensitivity) — unchanged by this, so LIST_TOP_Y and LIST_ROW_H are reused
-// rather than re-derived. That leaves 240 = 172 + 3*OPT_BTN_H, so OPT_BTN_H = 22 (3.6 mm)
-// with 2 px left over — under BIND_ROW_H's 24 px (4.0 mm) above, the previous low point in
-// this file, but the same mitigation applies: a full-width tap target reached this rarely
-// costs a D-pad user nothing extra over a taller one, and nothing on this screen requires
-// the smaller target to land first try the way the setting rows above it do.
-#define OPT_BTN_H   ((SCR_H - LIST_TOP_Y - 4 * LIST_ROW_H - 6 - 2 * 4 - 6) / 3)
-#define OPT_BTN1_Y  (LIST_TOP_Y + 4 * LIST_ROW_H + 6)
+// The "5" is drawOptionsGeneral's own five setting rows (render dist, 3D depth, invert
+// look, look sensitivity, and — v1.8.10 — SHADING). A genuinely new setting row grows the
+// "4" rather than being squeezed into it, which is the same move MAIN_ITEM_COUNT's comment
+// made for the title screen. What is new here is WHERE the 26 px the fifth row costs is
+// taken from.
+//
+// v1.8.10: this page no longer reuses LIST_ROW_H for its setting rows. It cannot. Holding
+// the rows at 32 px leaves 240 = 204 + 3*OPT_BTN_H, i.e. OPT_BTN_H = 12 px (2.0 mm) — below
+// BIND_ROW_H's 24 px, and below VH_ENTRY_BTN_H's 16 px, which this file calls "the smallest
+// this file gives any tappable target". Adding one toggle would have shrunk three buttons
+// that were already here past the floor the file sets for itself, which is the wrong way
+// round: the cost of a new row should not land on what is already shipping.
+//
+// So OPT_ROW_H is 26 rather than LIST_ROW_H's 32, and the three pinned buttons keep the
+// 22 px they had. That trade is the right way round on this file's own Fitts's-law
+// reasoning (see LIST_ROW_H's comment: "area, not height, is what a touch target is scored
+// on"). A setting row is a full 300 px wide and 26 px tall — 7,800 px^2, comfortably the
+// largest class of target on the screen — while a 12 px button would have been the smallest
+// this file has ever shipped. Five rows lose 6 px each; nothing drops below any floor.
+//
+//   24 + 5*26 + 6 + 3*22 + 2*4 + 6 = 24 + 130 + 6 + 66 + 8 + 6 = 240, exactly, 0 px spare.
+//
+// The redesign that would remove the trade-off entirely — CONTROLS/UPDATE/BACK on their own
+// screen, or a scrolling list — is still the right answer if a SIXTH setting row ever
+// arrives, because 6*26 = 156 leaves only 14 px a button and the same problem returns one
+// row later. It was not done here: it is a layout redesign, not part of adding a toggle.
+#define OPT_ROW_H   26
+#define OPT_BTN_H   ((SCR_H - LIST_TOP_Y - 5 * OPT_ROW_H - 6 - 2 * 4 - 6) / 3)
+#define OPT_BTN1_Y  (LIST_TOP_Y + 5 * OPT_ROW_H + 6)
 #define OPT_BTN2_Y  (OPT_BTN1_Y + OPT_BTN_H + 4)
 #define OPT_BTN3_Y  (OPT_BTN2_Y + OPT_BTN_H + 4)
 
@@ -531,11 +551,11 @@ static TitleResult drawMain(TitleState* ts, const TitleInput* in, bool tap)
 
 // ── Options: general settings ─────────────────────────────────────────────────────────
 
-#define GEN_ITEM_COUNT 7   // 4 settings + "Controls >" + "Check for Update" + Back
+#define GEN_ITEM_COUNT 8   // 5 settings + "Controls >" + "Check for Update" + Back
 
 static TRect optRowRect(int i)
 {
-	TRect r = {10, (float)(LIST_TOP_Y + i * LIST_ROW_H), SCR_W - 20, LIST_ROW_H - 2};
+	TRect r = {10, (float)(LIST_TOP_Y + i * OPT_ROW_H), SCR_W - 20, OPT_ROW_H - 2};
 	return r;
 }
 
@@ -577,14 +597,22 @@ static void drawOptionsGeneral(TitleState* ts, Options* opts, const TitleInput* 
 	if (step) opts->look_sensitivity = clampF(opts->look_sensitivity + (float)step * 0.25f,
 	                                           OPTIONS_SENS_MIN, OPTIONS_SENS_MAX);
 
+	// v1.8.10 shaders option: fake directional lighting, off by default (see
+	// chunk_render.c's chunkRenderSetFakeShading for what this actually turns on). Placed as
+	// a 5th settings row rather than on the pause menu's options subset — see OPT_BTN_H's
+	// comment just above for the pixel-budget trade-off that entailed.
+	const bool shading_toggled = settingRowToggle(optRowRect(4), "SHADING", opts->fake_shading,
+	                                               ts->cursor == 4, tap, in->touch_x, in->touch_y);
+	if (shading_toggled || (ts->cursor == 4 && a)) opts->fake_shading = !opts->fake_shading;
+
 	const TRect controls_r = {10, (float)OPT_BTN1_Y, SCR_W - 20, OPT_BTN_H};
-	if (uiButton(controls_r, "CONTROLS >", ts->cursor == 4, tap, in->touch_x, in->touch_y, a)) {
+	if (uiButton(controls_r, "CONTROLS >", ts->cursor == 5, tap, in->touch_x, in->touch_y, a)) {
 		ts->screen = TITLE_SCR_OPTIONS_BINDINGS;
 		ts->cursor = 0;
 	}
 
 	const TRect update_r = {10, (float)OPT_BTN2_Y, SCR_W - 20, OPT_BTN_H};
-	if (uiButton(update_r, "CHECK FOR UPDATE", ts->cursor == 5, tap, in->touch_x, in->touch_y, a)) {
+	if (uiButton(update_r, "CHECK FOR UPDATE", ts->cursor == 6, tap, in->touch_x, in->touch_y, a)) {
 		ts->screen = TITLE_SCR_UPDATE;
 		ts->cursor = 0;
 		// The updater's state survives a trip out of this screen and back, so notes from a
@@ -596,7 +624,7 @@ static void drawOptionsGeneral(TitleState* ts, Options* opts, const TitleInput* 
 	}
 
 	const TRect back_r = {10, (float)OPT_BTN3_Y, SCR_W - 20, OPT_BTN_H};
-	if (uiButton(back_r, "BACK", ts->cursor == 6, tap, in->touch_x, in->touch_y, a)
+	if (uiButton(back_r, "BACK", ts->cursor == 7, tap, in->touch_x, in->touch_y, a)
 	    || (in->keys_down & KEY_B)) {
 		// The one point either options screen ever writes to disk — see title.h's file
 		// comment for why this is the whole of this file's crash exposure: at worst a

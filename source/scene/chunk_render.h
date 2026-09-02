@@ -134,6 +134,35 @@ void chunkRenderSetGen(const WorldGen* gen);
 // world/daynight.h's pure functions.
 void chunkRenderSetTimeOfDay(uint32_t tod);
 
+// v1.8.10 fake directional lighting option (Options.fake_shading in app/options.h, off by
+// default). Swings the EAST/WEST rows of the faceShade uniform table with the sun's current
+// celestial angle instead of holding them at their fixed baked constants — see
+// faceShadeTableBuild in chunk_render.c for the shape of the swing and why only those two
+// faces move. Costs no new shader instructions and no new vertex data: the table this rebuilds
+// is the same one pipelineBind already re-uploads to the GPU every bind.
+//
+// Call once a frame from the live Options struct, unconditionally, the same as
+// chunkRenderSetTimeOfDay just above and right next to it — see this function's own comment in
+// chunk_render.c for why "every frame, no change-detection" is deliberate and still cheap.
+void chunkRenderSetFakeShading(bool on);
+
+// v1.8.10 water shimmer, the second half of that same shaders option. Milliseconds — any
+// monotonic clock; main.c passes svcGetSystemTick divided down, which is what every other
+// millisecond figure in this project is (app/sleep.c, app/battery.c).
+//
+// The scrolling glint on water is gated on chunkRenderSetFakeShading's flag, not on a second
+// option: steve asked for ONE "shaders" switch covering both the fake directional lighting and
+// the fake water reflections, so Options.fake_shading owns both and there is no new field.
+//
+// Call once a frame, unconditionally, next to the two setters above. ONCE is the operative
+// word: pipelineBind runs per eye, and reading the clock there instead would give the two eyes
+// different scroll offsets on a high-contrast pattern, which the 3D slider fuses as depth. See
+// this function's own comment in chunk_render.c.
+//
+// With the option off this value is stored and never read — every piece of GPU state the
+// shimmer needs is behind the gate in chunkRenderDraw.
+void chunkRenderSetShimmerTimeMs(uint64_t ms);
+
 // v1.9.1. The debug overlay's "see" field used to read RenderDist.half_vis, which comes
 // from the retired PICA200 fixed-function fog LUT (renderDistVisibility/renderDistFogTable
 // in render_dist.c) and has had no GPU path since the v1.9.0 shader-driven fog-ramp redesign

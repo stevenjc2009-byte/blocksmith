@@ -104,6 +104,7 @@ Re-run after editing:
 
 from __future__ import annotations
 
+import math
 import random
 from pathlib import Path
 
@@ -215,6 +216,10 @@ TILES = [
     # cross block is handed BLOCK_AIR by breakComplete(), and an apple that yields
     # nothing when broken is not an apple.
     "apple",            # 30
+    # v1.8.10 "Light" — the torch, and the first tile in the sheet that is a light
+    # source rather than terrain or flora. BLOCK_SHAPE_CROSS like tall_grass, dead_bush,
+    # fern and the four flowers above it; docs/plan-1.8.10-light.md §2.3 is the design.
+    "torch",            # 31
 ]
 
 
@@ -1497,6 +1502,79 @@ def tile_apple(rng):
     return img
 
 
+# ── v1.8.10 "Light" ─────────────────────────────────────────────────────────────────────
+
+
+def tile_torch(rng):
+    """Torch — v1.8.10 "Light", docs/plan-1.8.10-light.md §2.3. The first
+    BLOCK_SHAPE_CROSS tile that is a light SOURCE rather than a plant, and the first
+    tile in the sheet with nothing behind its luminance but this art — see
+    world/registry.c's row [27] for the luminance itself.
+
+    Same shape and the same alpha contract as tall_grass, dead_bush, fern and the four
+    flowers: RGBA, alpha 0 or 255 and never between (the draw is an alpha TEST, not a
+    blend, so a middling value lands on one side of the threshold and looks like a
+    mistake), no opaque border (a cross has no silhouette but its own art — an opaque
+    edge would draw a rectangle around every torch in the world, exactly the argument
+    tile_tall_grass's docstring makes at length).
+
+    Two parts, the same two parts every torch anywhere has: a narrow charred stick,
+    rooted on the bottom row like every other cross plant in this sheet (tall_grass,
+    dead_bush and fern all root there so a clump's base sits on the cell floor, not
+    floating), and a flame riding its top. The stick stops well short of the top of the
+    tile rather than running the full sixteen rows — a torch is a short object standing
+    off the ground, not a fence post — the same call tile_tall_grass's own blades make
+    (7..14 of 16 rows) for the same reason.
+
+    The flame is the one thing on this sheet that is warm-BRIGHT rather than body-lit:
+    every other tile picks one light direction (top-left, matching tile_dirt's pebbles
+    and tile_snow's hollows) and shades away from it; a flame has no such direction, it
+    IS the light, so it is drawn as concentric warm rings brightening toward the centre
+    instead of a shaded blob. Colours are kept clear of the sheet's other warm tiles on
+    purpose: the poppy's red (204,48,44) and the apple's body (176,32,40 and below) are
+    both saturated and dark, where this flame's core (252,224,128) and outer ring
+    (232,130,40) sit lighter and far more yellow — the difference that makes it read as
+    fire next to a poppy and an apple in the same hotbar row, not as a third red block.
+    """
+    stick = [(96, 72, 48), (110, 84, 56), (82, 60, 40)]
+    charred = (54, 40, 28)
+    core = (252, 224, 128)
+    mid  = (244, 176, 72)
+    edge = (232, 130, 40)
+
+    img = Image.new("RGBA", (TILE_PX, TILE_PX), (0, 0, 0, 0))
+    px = img.load()
+
+    # The stick: two columns wide so it survives at 240p (tile_dead_bush's docstring
+    # makes the same call for its own uprights), rooted on the bottom row and running
+    # up to row 6 — ten rows, well short of the tile's full sixteen. A little per-row
+    # jitter keeps a two-pixel-wide post from reading as a ruled line.
+    stem_x = TILE_PX // 2
+    for y in range(TILE_PX - 1, 5, -1):
+        x = stem_x + rng.choice((-1, 0, 0, 0, 1))
+        shade = rng.choice(stick) + (255,)
+        px[x, y] = shade
+        px[min(TILE_PX - 1, x + 1), y] = shade
+    # A charred tip where the flame meets the wood.
+    px[stem_x, 6] = charred + (255,)
+    px[stem_x + 1, 6] = charred + (255,)
+
+    # The flame: concentric warm rings around a centre a few rows above the stick's
+    # top, brightening INWARD rather than shading away from a fixed light — see the
+    # docstring above for why this tile alone breaks that rule.
+    fx, fy = stem_x + 0.5, 3.0
+    for y in range(TILE_PX):
+        for x in range(TILE_PX):
+            d = ((x - fx) ** 2 + (y - fy) ** 2) ** 0.5
+            if d < 1.6:
+                px[x, y] = core + (255,)
+            elif d < 2.5:
+                px[x, y] = mid + (255,)
+            elif d < 3.4 and rng.random() < 0.6:
+                px[x, y] = edge + (255,)
+    return img
+
+
 def tile_sentinel(_rng):
     """Not art — a bleed alarm.
 
@@ -1573,6 +1651,7 @@ PAINTERS = {
     "bluebell": tile_bluebell,
     "orchid": tile_orchid,
     "apple": tile_apple,
+    "torch": tile_torch,
 }
 
 
@@ -1618,6 +1697,90 @@ def place(atlas: Image.Image, tile: Image.Image, index: int) -> None:
             f"whatever was underneath, which renders as art rather than as an error."
         )
     atlas.paste(tile, (0, slot_png_y(index)))
+
+
+# ── v1.8.10 water shimmer ─────────────────────────────────────────────────────
+#
+# A second, tiny sheet that is NOT part of the block atlas and never enters it. It is the
+# scrolling glint texture source/scene/chunk_render.c binds to texture unit 2 for the
+# transparent pass when the shaders option (Options.fake_shading, source/app/options.h) is on.
+# It is drawn here rather than downloaded or traced for the same reason every other image in
+# this project is: see the module docstring. Minecraft is visual reference only.
+#
+# WHY IT IS NOT A SLOT IN atlas.png. The atlas is one tile wide so GPU_REPEAT's period in U is
+# exactly one tile, and V is GPU_CLAMP_TO_EDGE (module docstring). The shimmer has to repeat in
+# BOTH axes, because its texcoord is scrolled freely by a uniform: in a 1024px-tall strip any
+# v scroll walks straight into the neighbouring tile. It is its own power-of-two sheet, sampled
+# with GPU_REPEAT on both axes.
+#
+# WHY EVERY TERM IS A SINUSOID WITH INTEGER FREQUENCIES, and nothing here is random. The sheet
+# tiles across a whole sea, so a seam would draw a visible grid on the water. Each term below
+# is sin(2*pi*(a*u + b*v) + phase) with INTEGER a and b, which has period 1 in both u and v by
+# construction — the sheet tiles exactly, as a property of the formula rather than something
+# checked after the fact. Value noise would have to be wrapped by hand and would not survive an
+# edit, so there is deliberately no rng parameter here and this function touches no shared
+# random stream. That also keeps gfx/atlas.png byte-identical: it is generated, and saved,
+# before any of this runs.
+#
+# WHAT IT SHOULD LOOK LIKE: broken diagonal glints of varying brightness lying along wave
+# crests, over a mostly black field — light catching a rippled surface, not a mirror and not an
+# even sheen. MEASURED over the sheet as written, reading back the 8-bit alpha this actually
+# saves (not the float before quantisation): min 0.000, max 0.875, mean 0.088.
+# The mean is the number that matters, because the TEV stage adds this at up to
+# (1 - WATER_ALPHA) = 0.30 strength: 0.088 * 0.30 = 0.026, so the AVERAGE water fragment is
+# lifted by about 7/255 while a crest peaks at 0.874 * 0.30 = 0.26. Sparse and bright rather
+# than flat and grey is the point — "the whole water surface strobing" is the documented wrong
+# answer (docs/plan-1.8.10-light.md 5.4).
+#
+# WHY THE VALUE IS IN THE ALPHA CHANNEL with the colour left white: gfx/watershimmer.t3s asks
+# tex3ds for "-f a8", one byte per texel taken from alpha, and gfx/fogramp.png is written the
+# same way for the same reason. The TEV stage reads it through GPU_TEVOP_RGB_SRC_ALPHA, so the
+# glint is white and lifts all three channels equally.
+WATER_SHIMMER_PX = 64
+
+
+def water_shimmer_value(u: float, v: float) -> float:
+    """One texel of the shimmer sheet, 0..1, for u,v in [0,1). Tiles seamlessly."""
+    tau = math.pi * 2.0
+
+    # Two NEARLY-parallel crest waves, not orthogonal ones. Their beat stretches the bright
+    # region into long thin ridges; two crossed waves give round blobs instead, which read as
+    # fireflies sitting on the water rather than light along a ripple.
+    crest = (0.60 * math.sin(tau * (3 * u + 1 * v))
+             + 0.40 * math.sin(tau * (4 * u + 2 * v) + 1.10))
+
+    # Raised to a high power so only the very top of a crest is bright. Two terms rather than
+    # one so a ridge has a soft shoulder (t**3) under a hard core (t**8) instead of a hard edge.
+    t = (crest + 1.0) * 0.5
+    streak = 0.28 * t ** 3 + 0.72 * t ** 8
+
+    # A faint finer ripple so a ridge is not a clean gradient close up.
+    fine = 0.06 * (0.5 + 0.5 * math.sin(tau * (7 * u + 3 * v) + 0.90))
+
+    # A slow product mask fading the ridges in and out ALONG their length, which is what turns
+    # three long stripes into a field of separate glints. Clamped at zero rather than allowed
+    # to go negative: a negative mask would flip part of a ridge into a dark line, and a dark
+    # line on water reads as a crack in it.
+    mask = (0.55 + 0.45 * math.sin(tau * (1 * u + 2 * v) + 2.20)
+                        * math.sin(tau * (2 * u - 1 * v) + 0.70))
+
+    return (streak + fine) * max(0.0, mask)
+
+
+def make_water_shimmer() -> Image.Image:
+    """The shimmer sheet: white RGB, glint in alpha. See the block comment above."""
+    n = WATER_SHIMMER_PX
+    img = Image.new("RGBA", (n, n), (255, 255, 255, 0))
+    px = img.load()
+    for y in range(n):
+        for x in range(n):
+            # Texel CENTRES, not corners. Sampling at x/n puts the first column exactly on the
+            # seam of the periodic function and the last column one texel short of it, biasing
+            # the sheet by half a texel — the classic way a "seamless" tile still shows a
+            # one-pixel line down one edge.
+            a = water_shimmer_value((x + 0.5) / n, (y + 0.5) / n)
+            px[x, y] = (255, 255, 255, int(round(max(0.0, min(1.0, a)) * 255.0)))
+    return img
 
 
 def main() -> None:
@@ -1669,6 +1832,18 @@ def main() -> None:
                "missing-texture marker" if index < ADDRESSABLE_SLOTS else \
                "missing-texture marker (unaddressable)"
         print(f"  {index:3d}  {'-':<11} png row {y:3d}..{y + TILE_PX - 1:3d}   {note}")
+
+    # The water shimmer sheet, written LAST and entirely after atlas.save() above, so that
+    # adding it cannot perturb a single byte of gfx/atlas.png. It draws from no shared state:
+    # not `rng`, not `atlas`. (gfx/atlas.png md5 be20b196c4323e795b2236b101adc2f8, measured
+    # identical before and after this section was added.)
+    shimmer_png = root / "gfx" / "watershimmer.png"
+    shimmer = make_water_shimmer()
+    shimmer.save(shimmer_png)
+    alphas = [a / 255.0 for a in shimmer.getchannel("A").getdata()]
+    print(f"{shimmer_png}  {WATER_SHIMMER_PX}x{WATER_SHIMMER_PX}  a8 (value in alpha)  "
+          f"min {min(alphas):.3f}  max {max(alphas):.3f}  "
+          f"mean {sum(alphas) / len(alphas):.3f}")
 
 
 if __name__ == "__main__":

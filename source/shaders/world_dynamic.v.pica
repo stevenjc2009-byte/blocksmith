@@ -11,18 +11,31 @@
 ; smooth light packed by world/mesher.c as sky<<4 | block, both 0..15, averaged
 ; over the four cells touching the corner (the same taps the AO rule walks).
 ;
-;   brightness = faceShade[nrm] x aoCurve(ao) x curve(max(sky x dayLevel, block) / 15)
+;   lum        = min(1, curve(sky x dayLevel) + 1.5 x curve(block))   -- v1.8.10
+;   brightness = faceShade[nrm] x aoCurve(ao) x lum
 ;
 ;   curve(l) = l / (4 - 3l)     -- v1.8.9, see curveConsts below for the citation
 ;
-; With dayLevel 1.0 and full sky light the pre-curve multiplier is exactly 1, and curve(1) is
-; also exactly 1, so a fully sunlit face still matches the baked shader's output; underground,
-; max() falls and caves go dark without any remeshing. dayLevel is a uniform so the day/night
-; cycle is one register write per frame, not a re-mesh.
+; v1.8.10 replaced a max() of the two channels with the sum vanilla actually uses. See the long
+; note at the combine itself; the short version is that under max() an emitter could never
+; brighten a spot past whatever the sky was already giving it, so a torch in daylight did
+; nothing at all.
+;
+; With dayLevel 1.0 and full sky light the sky term alone is curve(1) = 1 and the clamp holds
+; it there, so a fully sunlit face still matches the baked shader's output exactly; underground
+; the sky term falls to nothing and only the emitters light the place, without any remeshing.
+; dayLevel is a uniform so the day/night cycle is one register write per frame, not a re-mesh.
 ;
 ; Attributes (see MeshVertex in source/world/mesh_vertex.h — the format is locked):
-;   v0 = position, 4x s8 — xyz read, w is the pad byte this shader exists to read
+;   v0 = position, 4x u8 — xyz read, w is the pad byte this shader exists to read
 ;   v1 = (u, v, normal index, ao), 4x u8
+;
+; v0 is fetched UNSIGNED even though MeshVertex declares x, y, z as int8_t: positions are
+; chunk-local 0..16 so the wider type costs nothing, and pad reaches 255, which a signed
+; fetch would hand this shader as -16 — every sunlit surface unlit. The header said "4x s8"
+; until v1.8.10; scene/chunk_render.c:958 has always been GPU_UNSIGNED_BYTE since v1.8.0.
+; It matters because the whole light unpack below assumes a non-negative w, and so does the
+; rcp: curve(l) = l / (4 - 3l) only stays away from a zero denominator while l is in 0..1.
 
 .fvec projection[4], modelView[4]
 
@@ -30,8 +43,10 @@
 ; brightness, .y a height offset added to the vertex's y. 64 rows, filled by
 ; scene/chunk_render.c, row face + 8*d holding brightness(face) and -d/8. Same layout
 ; and same reasoning as world.v.pica — see the long note there and MESH_NRM_FACE_BITS in
-; source/world/mesher.h. It must move with it: a New 3DS binds THIS program instead, so a
-; drift here would leave flowing water full-height on exactly the hardware nobody tests on.
+; source/world/mesher.h. It must move with it — and since v1.8.0 that is true on BOTH console
+; models, not just a New 3DS: this is the only world program that is ever bound, so a drift
+; here leaves flowing water full-height everywhere, not on one machine. (This paragraph said
+; "a New 3DS binds THIS program instead" until v1.8.10, contradicting the header six lines up.)
 .fvec faceShade[64]
 
 ; Day-night multiplier for the sky channel. Held per-channel-scaled so caves lit
@@ -75,6 +90,27 @@
 ; atlas_uv_shader_test.c does for uvScale.
 .fvec tintPalette[8]
 
+; v1.8.10 water shimmer. .x and .y are the scrolling UV offset, .z is texture repeats per block,
+; .w unused. Filled by scene/chunk_render.c's pipelineBind from gfx/watershimmer.h, which is
+; also where the arithmetic and its reasoning live and is what world/water_alpha_test.c links.
+;
+; It is uploaded on EVERY bind, including when the shaders option is off — and that is the one
+; deliberate exception to this feature's "no new GPU state by default" rule, so it is written
+; down here rather than left to be rediscovered. The instructions below are unconditional: the
+; PICA200 has no branch worth spending here and a vertex shader cannot be part-compiled, so
+; outtc2 is always written and the uniform is always read. Leaving it unwritten would mean the
+; shader reading whatever the previous program left in that register bank, which on this
+; hardware is shared with the highlight program's uniforms. With the option off the offsets are
+; uploaded as zeros; nothing samples texcoord2, because no texture is bound to unit 2 and no
+; TEV stage sources it, so the varying is computed and discarded.
+;
+; This is the 87th of the vertex stage's 96 float uniform registers — see the tintPalette note
+; above for the count and for why 8 palette rows was the cap.
+;
+; NOT in world.v.pica. That program is compiled and never bound (see this file's header), and
+; the v1.8.10 scope owns this file only. Nothing parses this declaration out of both.
+.fvec waterShimmer[1]
+
 ; v1.8.8. Splitting the ao byte: 1/4 shifts the tint index down out of bits 2..4, -4 undoes
 ; that shift inside the byte so what is left is the ambient occlusion 0..3. Exactly the shape
 ; of the light unpack below, which splits inpos.w the same way with 1/16 and -16.
@@ -110,20 +146,29 @@
 ; v1.8.9. The vanilla light-to-brightness curve, b = l / (4 - 3l), read off the decompiled
 ; client (MCP-919 EntityRenderer.updateLightmap, cited in full in
 ; docs/research/sky-and-weather.md E3) and restated in docs/VERSION-LIST.md's v1.8.9 entry:
-; "A linear light-to-brightness ramp would render full night 3.2x too bright." l here is the
-; ALREADY-COMBINED r5.w below (max(daySky, block)), not the raw sky or block nibble alone —
-; vanilla's own table is applied to each of sky and block before they combine, but Blocksmith
-; combines first and this curve is concave (b'(l) is largest near l=0), so applying it once to
-; the max() of the two is the same shape the two-separate-curves version would give at every l
-; this project's max() can output, and it is one curve instead of two.
+; "A linear light-to-brightness ramp would render full night 3.2x too bright."
+;
+; v1.8.10 correction. This note used to argue that one curve over the combined max() was the
+; same shape as vanilla's two, and that argument only held because the combine was a max().
+; It is a sum now, and curve(a + b) is NOT curve(a) + curve(b) for a concave curve, so the
+; shader applies the curve to each channel separately exactly as vanilla does. l below is
+; therefore the raw sky or block nibble, never the combined value.
 ;
 ; Concretely: dayLevel's own floor already holds a fully sky-lit face at l=4/15=0.2667 at
 ; midnight (world/daynight.h). Uncurved, that renders at 26.67% brightness — visibly not
 ; night. Curved: 0.2667/(4-0.8) = 0.2667/3.2 = 0.0833, an eighth of full brightness, which is
 ; the "3.2x too bright" VERSION-LIST.md names (0.2667/0.0833 = 3.2 exactly).
-.constf curveConsts(4.0, -3.0, 0.0, 0.0)
+.constf curveConsts(4.0, -3.0, 1.5, 0.0)
 .alias  curveFour     curveConsts.xxxx
 .alias  curveNegThree curveConsts.yyyy
+
+; v1.8.10. Vanilla multiplies the CURVED block term by (torchFlickerX * 0.1F + 1.5F) before
+; adding it to the sky term. torchFlickerX is a small wander around zero, so with flicker at
+; rest the multiplier is exactly 1.5, and that is what this constant is. It is what makes a
+; torch read as a torch rather than as a slightly-less-dark patch: without it a block light of
+; 14 would peak at curve(14/15) = 0.918, below a fully sky-lit face, and a lit room would look
+; dimmer than daylight outdoors instead of blowing out to white the way it should.
+.alias  curveBlockMul curveConsts.zzzz
 
 .out outpos position
 .out outtc0 texcoord0
@@ -138,6 +183,27 @@
 ; which feeds texture unit 0's third coordinate and cannot be sampled by unit 1 at all.
 ; texcoord1 is unwritten everywhere else in the tree, so this costs nothing that was in use.
 .out outtc1 texcoord1
+
+; v1.8.10. The water shimmer coordinate, on the third and last texcoord varying.
+;
+; It could not share outtc1 for the same reason the fog coordinate could not share outtc0:
+; texcoord1 is a two-component semantic and the fog already uses both (the shader writes the
+; same value into .x and .y, but the rasterizer only ever carries two lanes). It has to be its
+; own semantic, and texcoord2 is the one texture unit 2 reads.
+;
+; WHICH TEXCOORD UNIT 2 SAMPLES WITH is the one thing the plan (docs/plan-1.8.10-light.md 7)
+; left unresolved, so the evidence is recorded here. GPUREG_TEXUNIT_CONFIG bit 13 selects it:
+; set, unit 2 reads texcoord1; clear, it reads texcoord2. Azahar names that bit
+; `texture2_use_coord1` in src/video_core/pica/regs_texturing.h, and citro3d's C3D_Init
+; (source/base.c) initialises ctx->texConfig to BIT(12) alone and writes the register with a
+; mask that covers bit 13 — so bit 13 is written ZERO and nothing in this tree ever sets it.
+; Unit 2 therefore samples texcoord2. If that is ever wrong the symptom is specific and worth
+; knowing: the shimmer would be sampled with the FOG coordinate, i.e. a function of camera
+; distance, so the glints would sit still relative to the screen and sweep when the player
+; walks toward the water rather than drifting on it.
+;
+; This output is written unconditionally — see the waterShimmer uniform's note above.
+.out outtc2 texcoord2
 
 .alias inpos v0
 .alias inpack v1
@@ -214,6 +280,24 @@
 	add r7.x, fogParams.yyyy, r7.xxxx
 	mov outtc1, r7.xxxx
 
+	; --- v1.8.10 water shimmer coordinate ----------------------------------
+	; uv = inpos.xz * waterShimmer.z + waterShimmer.xy, on r0 — which still holds the
+	; CHUNK-LOCAL position (only .y was touched, by the water drop, and .y is not read here).
+	; Chunk-local is correct and not a compromise: 16 blocks * 0.125 repeats per block is
+	; exactly 2 whole repeats, so the sheet is continuous across every chunk boundary. See
+	; WATER_SHIMMER_UV_PER_BLOCK in source/gfx/watershimmer.h for why that number and no other.
+	;
+	; r12 rather than one of the scratch registers above it: r0..r11 are all live somewhere in
+	; this program and r12 is used by nothing, so this block cannot be broken by, and cannot
+	; break, a later edit to the lighting.
+	;
+	; Uniforms sit in the first source, same constraint as the fog block above and the light
+	; unpack below. Two instructions and a move, on every vertex in the world — the cost of the
+	; option being compiled in rather than of it being switched on.
+	mul r12, waterShimmer.zzzz, r0.xzxz
+	add r12, waterShimmer.xyxy, r12
+	mov outtc2, r12.xyxy
+
 	; --- baked lighting ---------------------------------------------------
 	; r3 was fetched at the top of main, exactly as in world.v.pica.
 
@@ -234,17 +318,47 @@
 	mul r5.x, inv15, r5.xxxx             ; sky 0..1
 	mul r5.y, inv15, r5.yyyy             ; block 0..1
 	mul r5.z, dayLevel.xxxx, r5.xxxx     ; day-scaled sky
-	max r5.w, r5.zzzz, r5.yyyy           ; lum = max(daySky, block)
 
-	; v1.8.9. b = l / (4 - 3l) — see curveConsts above for the citation and the arithmetic
-	; that names this "3.2x too bright" uncurved. Curves the LINEAR lum in r5.w into vanilla's
-	; own light-to-brightness shape before anything below multiplies it into the final colour.
-	; r6.x/r6.y are free here: r6.x's only earlier use (line 229 above) was fully consumed
-	; before r5.y was written, and r6.y is not read by anything until this block writes it.
-	mul r6.x, curveNegThree, r5.wwww     ; -3 * l
-	add r6.x, curveFour, r6.xxxx         ; 4 - 3l
-	rcp r6.y, r6.xxxx                    ; 1 / (4 - 3l)
-	mul r5.w, r5.wwww, r6.yyyy           ; r5.w = l / (4 - 3l), replacing the linear value
+	; v1.8.10. The two light channels are CURVED SEPARATELY and then ADDED, replacing v1.8.9's
+	; single curve over max(daySky, block). Vanilla's lightmap is
+	;   table[sky] * sunBrightness  +  table[block] * (torchFlickerX * 0.1F + 1.5F)
+	; then * 0.96F + 0.03F, clamped to 1. It is a SUM. The `max(sky, block)` line the wiki is
+	; usually quoted for describes a different quantity — the "client light" the F3 readout and
+	; the mob-spawning checks use — and taking it for the lightmap is the trap this shader was
+	; in until now. See docs/research/light-and-torches.md.
+	;
+	; The difference only becomes visible with an emitter in the world, which is exactly what
+	; v1.8.10 adds. Under max(), a torch could never make a spot brighter than open daylight
+	; already was; standing in a lit doorway at noon, the torch contributed literally nothing.
+	; Under a sum it adds on top and saturates, which is what a fire looks like.
+	;
+	; b = l / (4 - 3l) — see curveConsts above for the citation and the arithmetic that names
+	; the uncurved version "3.2x too bright". r6.x/r6.y are scratch: r6.x's only earlier use
+	; (the -16*sky above) was fully consumed before r5.y was written, and r6.y is not read by
+	; anything until this block writes it. Both are rewritten between the two curves, so the
+	; second curve cannot see the first one's leftovers.
+
+	; sky term: curve(dayLevel * sky).
+	; With no emitter anywhere in the world every vertex carries block = 0, the second term is
+	; zero, and this reduces to EXACTLY the v1.8.9 expression. That is deliberate: 1.8.9's night
+	; was measured and has not been playtested yet, and this release must not silently move it.
+	mul r6.x, curveNegThree, r5.zzzz     ; -3 * skyLum
+	add r6.x, curveFour, r6.xxxx         ; 4 - 3*skyLum
+	rcp r6.y, r6.xxxx
+	mul r5.z, r5.zzzz, r6.yyyy           ; curved sky
+
+	; block term: curve(block) * 1.5.
+	mul r6.x, curveNegThree, r5.yyyy     ; -3 * blockLum
+	add r6.x, curveFour, r6.xxxx         ; 4 - 3*blockLum
+	rcp r6.y, r6.xxxx
+	mul r5.y, r5.yyyy, r6.yyyy           ; curved block
+	mul r5.y, curveBlockMul, r5.yyyy     ; x 1.5, vanilla's torch multiplier at rest
+
+	; the sum, and the clamp vanilla also applies. Without the clamp a torch at point-blank
+	; range in daylight overdrives r5.w past 1 and the face washes to pure white, and worse,
+	; the biome tint below is multiplied by it and stops being a tint.
+	add r5.w, r5.zzzz, r5.yyyy           ; ADDITIVE — not max()
+	min r5.w, ones, r5.wwww
 
 	; colour = faceShade x aoCurve x lum x tint
 	;

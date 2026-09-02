@@ -98,19 +98,35 @@ static void controls(Column* col, const char* arm)
 	      arm, lightGetSky(col, 2, 46, 2));
 }
 
-// Core blocks declare no luminance, and must keep declaring none: this is the check that
-// says the wiring did not accidentally light up an existing world. Runs against the
-// SHIPPED core table with no dynamic row registered at all.
+// Exactly one core block declares luminance, and it is the torch: this is the check that says
+// the wiring did not accidentally light up an existing world. Runs against the SHIPPED core
+// table with no dynamic row registered at all.
+//
+// Until v1.8.10 this asserted ZERO, and light.c:485 could say "no core row declares a luminance
+// today, so on a single-player world the scan is skipped entirely". The torch is the first row
+// to break that, which is the whole point of the version — so the pin moves from "none" to
+// "exactly this one", rather than being deleted. Deleting it would have been the easy fix and
+// the wrong one: a count of zero was never the property worth protecting, "nothing lights up
+// that was not meant to" is, and that survives the torch only if the identity is named here.
 static void testCoreRegistryEmitsNothing(void)
 {
 	registryInitCore();
 	printf("ARM 0 - shipped core registry, no dynamic rows\n");
 
 	int declared = 0;
-	for (int id = 0; id < REGISTRY_MAX; id++)
-		if (registryIsDefined((BlockId)id) && registryGet((BlockId)id)->luminance != 0)
-			declared++;
-	CHECK(declared == 0, "%d core rows declare a non-zero luminance, want 0", declared);
+	int torch_lum = -1;
+	for (int id = 0; id < REGISTRY_MAX; id++) {
+		if (!registryIsDefined((BlockId)id) || registryGet((BlockId)id)->luminance == 0)
+			continue;
+		declared++;
+		if ((BlockId)id == BLOCK_TORCH)
+			torch_lum = registryGet((BlockId)id)->luminance;
+		else
+			CHECK(0, "core row %d declares luminance %u and is not the torch",
+			      id, registryGet((BlockId)id)->luminance);
+	}
+	CHECK(declared == 1, "%d core rows declare a non-zero luminance, want exactly 1", declared);
+	CHECK(torch_lum == 14, "BLOCK_TORCH declares luminance %d, want 14", torch_lum);
 
 	lightEngineInit(true);
 	worldInit(&s_world);

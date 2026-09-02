@@ -57,6 +57,7 @@ void optionsDefaults(Options* o)
 	o->look_sensitivity = OPTIONS_SENS_DEFAULT;
 	o->debug_menu       = false;
 	o->audio_volume     = OPTIONS_AUDIO_VOL_DEFAULT;
+	o->fake_shading     = false;
 
 	for (int i = 0; i < ACTION_COUNT; i++)
 		o->bindings[i] = s_action_defaults[i];
@@ -187,6 +188,7 @@ bool optionsSave(const Options* o, const char* path)
 	n += fprintf(f, "look_sensitivity=%.9g\n",  (double)o->look_sensitivity);
 	n += fprintf(f, "debug_menu=%d\n",          o->debug_menu ? 1 : 0);
 	n += fprintf(f, "audio_volume=%.9g\n",      (double)o->audio_volume);
+	n += fprintf(f, "fake_shading=%d\n",        o->fake_shading ? 1 : 0);
 	for (int i = 0; i < ACTION_COUNT; i++)
 		// PRIX32 rather than a plain %08X: uint32_t is `unsigned int` on the host and
 		// `long unsigned int` on devkitARM, so either fixed conversion is wrong on one of
@@ -322,6 +324,13 @@ bool optionsLoad(Options* o, const char* path, int* bad_keys_out)
 			float v;
 			if (parseFloat(val, &v))
 				o->audio_volume = clampFloat(v, OPTIONS_AUDIO_VOL_MIN, OPTIONS_AUDIO_VOL_MAX);
+			else
+				bad++;
+		} else if (!strcmp(key, "fake_shading")) {
+			matched = true;
+			bool v;
+			if (parseBool(val, &v))
+				o->fake_shading = v;
 			else
 				bad++;
 		} else {

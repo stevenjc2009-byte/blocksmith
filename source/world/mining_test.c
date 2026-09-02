@@ -84,6 +84,13 @@ static void testCoreHardness(void)
 	CHECK(blockHardnessTicks(BLOCK_DEAD_BUSH) ==  1, "dead bush is 1 tick (0.05 s)");
 	CHECK(blockHardnessTicks(BLOCK_FERN)      ==  1, "fern is 1 tick (0.05 s)");
 
+	// v1.8.10 "Light". The torch is the first light source and, like every other new core
+	// block, must be breakable with its own durability — never instant (0), never unbreakable.
+	// 1 is the smallest nonzero value the byte allows, the same floor dead_bush and fern above
+	// already sit at: a torch is meant to come up as fast as a Minecraft one, not to be a
+	// durability sink.
+	CHECK(blockHardnessTicks(BLOCK_TORCH) == 1, "torch is 1 tick (0.05 s)");
+
 	// DISTINCTNESS, and this is the check the roadmap actually asked for: "every single new
 	// block breakable with its own durability". The three lines above could all read 9 and
 	// each `==` would still be a true statement about a table where the cactus had simply
@@ -118,7 +125,7 @@ static void testCoreHardness(void)
 	}
 	// The loop ran, and over the whole table rather than a prefix of it. Without this a
 	// `continue` that swallowed everything leaves the rule green having asserted nothing.
-	CHECK(targetable_rows == 25, "and there are 25: 27 core rows less air and less water");
+	CHECK(targetable_rows == 26, "and there are 26: 28 core rows less air and less water");
 
 	// The view is derived from the def, so the two must agree. This is what goes red if
 	// refreshView() copies the wrong field, or copies it from the wrong row.
@@ -162,6 +169,12 @@ static void testBreakTicks(void)
 	CHECK(breakTicksRequired(BLOCK_SNOW,   BARE_HANDS) ==  8, "snow takes 8 ticks");
 	CHECK(breakTicksRequired(BLOCK_CACTUS, BARE_HANDS) ==  9, "cactus takes 9 ticks: its own");
 	CHECK(breakTicksRequired(BLOCK_ICE,    BARE_HANDS) == 10, "ice takes 10 ticks");
+
+	// v1.8.10. hardness 1 at the 1x multiplier this game has today (testSpeedMultiplier below)
+	// is ceil(1 * 256 / 256) == 1, not a placeholder copied from dead_bush/fern's line above —
+	// measured through the real breakTicksRequired(), the same call every other line here goes
+	// through.
+	CHECK(breakTicksRequired(BLOCK_TORCH, BARE_HANDS) == 1, "torch takes 1 tick: its own");
 
 	// The blocks with no break time. Neither is targetable, so neither is ever asked in the
 	// game — but "never asked" is not "answers anything", and 0 is the answer that says

@@ -2468,6 +2468,52 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 rm -rf "$BHWA"
 
+# world/light_combine_test.c -- v1.8.10's additive lightmap combine in
+# source/shaders/world_dynamic.v.pica. Own binary, own main(), appended for the same reason
+# every stanza in this file is appended: an append cannot drop another session's work, and this
+# file is shared.
+#
+# v1.8.9 combined sky and block light with `max r5.w, r5.zzzz, r5.yyyy` and curved the winner
+# once. v1.8.10 replaced that with vanilla's real rule -- curve each channel separately, add,
+# clamp -- because under max() a torch could never brighten a spot past whatever the sky already
+# gave it. Neither half of that change can fail loudly: picasso assembles `add` and `max`
+# equally happily, and a host test that only checked the shader's TEXT would say nothing about
+# whether the formula it now contains produces the right numbers. So this pins both:
+#
+#   * the shader text -- an `add` combine, no leftover `max` in the block, a `min` clamp,
+#     exactly two `rcp` (one curve per channel, not one collapsed over the sum), and the
+#     constant bank (4.0, -3.0, 1.5). Comments are stripped before matching, the same technique
+#     world/atlas_uv_shader_test.c uses on this file, because this shader's own header explains
+#     the change in prose that says "max()" eight times.
+#   * the arithmetic -- the same formula reproduced in plain C, pinned against v1.8.9's measured
+#     midnight value (sky=15 block=0 dayLevel=4/15 -> 0.0833333, which must NOT move), a torch in
+#     the dark clamping to 1.0 with the pre-clamp sum proven to actually exceed it, and an
+#     additive-vs-max control (sky=8 block=8) chosen so the two formulas disagree by a wide
+#     margin.
+#
+# Own binary rather than folded into water_alpha_test.c above it: the link sets differ (this one
+# links nothing but libm) and a failure in one must not be able to hide behind the other's total.
+#
+# Its own build directory, not $BH. $BH is removed at the `rm -rf "$BH"` around line
+# 1286, roughly twelve hundred lines above this stanza, so linking into it here fails
+# with `cannot open output file build-host/run-<pid>/light_combine_test`. That is what
+# happened the first time the suite ever got this far: every earlier run died at the
+# atlas artefact guard near line 768, and under `set -e` nothing past it executes, so
+# this stanza had never once been reached. Every other late stanza in this file already
+# carries its own run-$$-<name> directory for exactly this reason.
+BHLC="build-host/run-$$-lightcombine"
+mkdir -p "$BHLC"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/light_combine_test.c \
+	-lm \
+	-o "$BHLC/light_combine_test"
+
+"./$BHLC/light_combine_test"
+
+rm -rf "$BHLC"
+
 # world/region_growth_test.c -- region files grew without bound, and now do not (v1.8.2). Own
 # binary, own main(), appended rather than merged into any stanza above it for the reason every
 # stanza in this file is appended: an append is the one edit shape that cannot drop another
@@ -2786,6 +2832,86 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 "./$BHLL/light_luminance_test"
 
 rm -rf "$BHLL"
+
+# tests/light_seam_test.c -- the cross-column block-light handoff (v1.8.10). Own binary, own
+# main(), appended for the same reason every stanza here is: an append is the one edit shape
+# that cannot drop another session's work, and this file is shared.
+#
+# Block light was column-local by design until this version (light.h's header banner called it
+# "the known gap"): lightPropagateColumn/lightRelightColumnSweeps only ever read and wrote the
+# column they were called for. Measured on an ad hoc host probe before this file existed: a
+# torch (luminance 14) one cell inside a column's +x edge, relit exactly as scene/interact.c's
+# relightEdited does (the edited column only), read 14 at the column's own border and 0 one cell
+# further into the untouched neighbour -- a vertical seam of 14, not the physically correct
+# 1-level falloff. Fixed by light.c's crossBorderCandidate (read by both engines, seeds a
+# column's own recompute from its neighbours' current border) and lightHandoffBorders (called
+# once from lightRelightColumn, tells a neighbour to recompute when this column's own channel
+# just changed).
+#
+# ARM 1 proves the seam closes (14 / 13, not 14 / 0), that the mesher's own light source
+# (scratch.c's scratchFillLight, what mesher.c's cornerLight actually reads -- confirmed
+# read-only for this fix) shows the same falloff rather than a clamp, and that the independent
+# sweep engine agrees with the BFS engine on the crossed value.
+#
+# ARM 2 is the one the first version of this fix got wrong. A push that only fires on a value
+# that STRICTLY IMPROVES a neighbour's current light closes ARM 1 and cannot detect a neighbour
+# holding a now-stale value with no real source left behind it: deleting the torch and relighting
+# the edited column ALONE (exactly what a real "break torch" edit does) pulled the neighbour's
+# stale border back in and read 12 / 11 instead of 0 / 0 -- a ghost glow with no emitter behind
+# it anywhere. See light.c's comment above relightColumnCoreDiff for the fix (relight-and-diff,
+# chasing a change in EITHER direction instead of only growth) and its convergence bound.
+#
+# ARM 3 proves light.c's LIGHT_HANDOFF_MAX_DEPTH backstop (32, sized off a worst-case pairwise
+# retraction decay -- see light.c's comment above the #define) is reachable and not dead code,
+# via lightSetHandoffMaxDepthForTest -- the same test-hook idiom light_luminance_test.c and
+# lightFailEditQueueForTest use elsewhere in this suite to prove a fallback path is reachable
+# without actually building the pathological input the real bound needs.
+#
+# RED, sabotaged by temporarily replacing lightRelightColumn's `if (changed)
+# lightHandoffBorders(...)` with `if (0 && changed) ...` in the real source/world/light.c (this
+# session owned that file for its entire life; restored immediately after, verified by re-diffing
+# against the session's own prior edits, never left uncommitted):
+#   col0 lx=15 (own border) = 14   col1 lx=0 (crossed) = 0
+#   FAIL  L103  light crossing into column 1 = 0, want 13 (the reported bug read 0)
+#   FAIL  L116  scratchFillLight inside blk = 0, want 13
+#   FAIL  L147  setup: neighbour did not receive crossed light before removal (got 0)
+#   handoff capped 0 time(s) with max depth forced to 1
+#   FAIL  L182  forcing max depth to 1 never hit the cap; this arm is not exercising it
+#   light seam self-test: FAILED - 4 of 16 checks
+# That RED capture predates ARM 4 (added after, see below) -- it covers 16 of the current 18
+# checks; ARMs 1-3 are unchanged since, so the same sabotage still fails the same three lines.
+#
+# ARM 4 measures the CHUNK_FORM_UNIFORM short-circuit in lightPropagateColumn's block-seed loop
+# (the comment beside that short-circuit in light.c promised this number): an all-air column
+# (single UNIFORM chunk per level, no luminance) against an all-checkerboard column (forces
+# PALETTE4/RAW, defeats the short-circuit) is only ever a direction check (checker must not be
+# FASTER, never a ratio threshold -- see the file banner), because clock() on this host has no
+# verified ns-level precision to defend a specific number, and there is no verified
+# host-to-268MHz-ARM11 scaling factor anywhere in this codebase (relightq.h says so explicitly)
+# to turn a host ratio into a console one. Measured (host, gcc -O1, 20000-iters, WSL clock()):
+# all-UNIFORM column totalled 0.133 ms over 20000 calls (0.0000066 ms/call), all-checkerboard
+# totalled 2026.224 ms over 20000 calls (0.1013 ms/call) -- ratio ~15235x. Total time, not just
+# the divided average, is what is printed: at this per-call cost the average alone rounds to
+# 0.0000 ms at 4 decimal places even at 20000 iterations, which is why the total is reported too.
+# Green after restore, with ARM 4 included: PASS 18 checks.
+BHLS="build-host/run-$$-lightseam"
+mkdir -p "$BHLS"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/world.c \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/budget.c \
+	source/world/scratch.c \
+	tests/net_stub.c \
+	tests/light_seam_test.c \
+	-o "$BHLS/light_seam_test"
+
+"./$BHLS/light_seam_test"
+
+rm -rf "$BHLS"
 
 # world/tick_test.c -- the 20 TPS simulation clock (v1.8.3). Own binary, own main(), appended
 # rather than merged into the world stanza for the reason every stanza in this file is appended:
@@ -3618,6 +3744,17 @@ rm -rf "$BHRD"
 # synchronisation, which is what says the fix moved not one nibble. Anything that changes what
 # light.c computes will move them, and that is the point -- re-baseline them deliberately or not
 # at all.
+#
+# v1.8.10: the second fixture column moved from cx=1 to cx=10 (light_race_test.c's
+# ARM2_COLUMN_B_CX) so the two threads' columns are never neighbours of each other -- see that
+# file's comment above the constant for why the new cross-column block-light handoff
+# (light.c's lightHandoffBorders) makes adjacency here unsafe in a way column 0 vs column 1
+# never was before this version. buildColumn's height formula folds cx into its own output, so
+# moving the coordinate moves the terrain and therefore the digest: re-measured on the host,
+# f130485b UNCHANGED (column 0's own cx did not move) against 9e6f033a for column B (was
+# fa839901 at cx=1) -- a digest move from the FIXTURE'S OWN coordinate, not from light.c
+# computing anything differently. 0/60 wrong digests on both columns, PASS 15 checks, same
+# check count as before.
 BHLR="build-host/run-$$-lightrace"
 mkdir -p "$BHLR"
 
@@ -4380,3 +4517,70 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 "./$BHWXD/weatherdraw_test"
 
 rm -rf "$BHWXD"
+
+# framesync_guard_test.c -- pins main.c's gpuWaitPrevFrame(), THE fix for the hardware freeze
+# steve's New 3DS hit at render distance 5. Parses source/main.c as text (like
+# world/water_alpha_test.c parses scene/chunk_render.c) rather than linking it -- main.c
+# includes <3ds.h> and carries main(), so no host binary can link it -- and asserts: (1) the
+# shipped (BS_GPU_TESTS=0) branch calls C3D_FrameBegin(C3D_FRAME_SYNCDRAW), the call that
+# actually reaches gxCmdQueueWait(-1), and makes no bare C3D_FrameSync() call, which only
+# waits for a vblank tick and proves nothing about the GPU; (2) the gpuWaitPrevFrame(); call
+# site precedes both the genFollow( and genDrainMesh( calls in the main loop, which reassign
+# mesh slots and memcpy new geometry into them; (3) nothing between that call and the draw
+# block (anchored on watchdogPhase(WD_PHASE_DRAW);) issues a C3D_*/GX_*/gsp* call, which is
+# the invariant that makes calling FrameBegin this early safe. No project headers or sources
+# needed on this compile line -- the whole test is string parsing over plain-text lines.
+BHFSG="build-host/run-$$-framesync-guard"
+mkdir -p "$BHFSG"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/framesync_guard_test.c \
+	-o "$BHFSG/framesync_guard_test"
+
+"./$BHFSG/framesync_guard_test"
+
+rm -rf "$BHFSG"
+
+# source/world/genretry_test.c -- the ledger that turns a budget-refused column into a
+# recoverable hole instead of a permanent one (world/genretry.c). The file existed, with its own
+# main() and the __3DS__ guard every source/*_test.c needs to avoid a duplicate main() in the
+# console build, but nothing in this suite ever compiled or ran it -- a test that never runs is
+# worth nothing. This stanza wires it in. See genretry_test.c's own top-of-file comment for what
+# it reproduces (main.c's genInstallOne() marking a partial column installed permanently) and why
+# it cannot call genInstallOne() itself (main.c includes <3ds.h> and carries main()).
+#
+# Same base file set as the relight_drain_test.c stanza above (world.c, block.c, registry.c,
+# chunk.c, budget.c, scratch.c, tests/net_stub.c for world.c's net/networld.h #include) plus
+# genretry.c itself -- no worldgen.c/noise.c/genversion.c needed because genColumnAttempt() (in
+# genretry_test.c) models worldgenColumn's allocation contract directly, through the real
+# worldColumnCreate()/worldChunkCreate()/budgetClaim(), rather than calling real terrain
+# generation. world/light.c must NOT be listed below -- world.c #includes it (world.c line 16),
+# same arrangement the relight-drain and luminance stanzas depend on; listing it is a double
+# definition.
+#
+# Green: "gen retry self-test: PASS", 48 checks, exit 0.
+#
+# RED, proven: reverting genRetryMark's `h->outstanding++;` (the new-hole counter, genretry.c) in
+# a scratchpad copy and linking that copy instead of the repo file -- never mutating genretry.c
+# itself -- fails 15 of 48 checks starting at L246 `genRetryOutstanding(&g_fix_ledger) == 1`,
+# "gen retry self-test: FAILED", exit 1.
+BHGR="build-host/run-$$-genretry"
+mkdir -p "$BHGR"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/world.c \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/budget.c \
+	source/world/scratch.c \
+	source/world/genretry.c \
+	tests/net_stub.c \
+	source/world/genretry_test.c \
+	-o "$BHGR/genretry_test"
+
+"./$BHGR/genretry_test"
+
+rm -rf "$BHGR"

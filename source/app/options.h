@@ -131,6 +131,9 @@ typedef struct {
 	uint32_t bindings[ACTION_COUNT];      // action -> raw key bit, one of OPTIONS_VALID_KEYS
 	bool     debug_menu;                  // debug menu on/off
 	float    audio_volume;                // OPTIONS_AUDIO_VOL_MIN..OPTIONS_AUDIO_VOL_MAX
+	bool     fake_shading;                // v1.8.10 shaders option: fake directional lighting,
+	                                       // off by default — see chunk_render.c's
+	                                       // chunkRenderSetFakeShading for the effect itself.
 } Options;
 
 // Fills `o` with the shipped defaults. Every field is already inside its legal range —

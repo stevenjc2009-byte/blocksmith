@@ -70,6 +70,7 @@
 #include "world/budget.h"
 #include "world/daynight.h"
 #include "world/genrefuse.h"
+#include "world/genretry.h"
 #include "world/handbuilt.h"
 #include "world/inventory.h"
 #include "world/jobq.h"
@@ -759,6 +760,15 @@ static ColSlot s_col_in[GEN_AREA_SPAN][GEN_AREA_SPAN];      // generated and ins
 static ColSlot s_col_queued[GEN_MESH_SPAN][GEN_MESH_SPAN];  // chunks pushed to the mesh queue
 static ColSlot s_col_asked[GEN_AREA_SPAN][GEN_AREA_SPAN];   // submitted to the worker
 
+// v1.8.10. Columns that installed with ok == false above (world/genretry.h) — a budget or
+// column-table refusal, not a hole s_col_in's "generated and installed" flag can tell apart
+// from a genuinely complete column. Recovering them without ever touching s_col_in is the
+// point: unmarking a partial column here would re-open the exact neighbour-stall problem the
+// "marked before the ring is tested" comment on genInstallOne exists to avoid. Initialised by
+// genStart() below, alongside the memsets that clear s_col_in/s_col_asked/s_col_queued for a
+// fresh world.
+static GenRetryLedger s_gen_retry;
+
 // The column the ring is centred on, and the streaming counters the overlay reports.
 static int32_t s_center_cx, s_center_cz;
 static int s_col_unloaded;      // columns freed because they left the ring
@@ -891,6 +901,17 @@ _Static_assert(RING_ORDER_MAX_RADIUS >= GEN_AREA_RADIUS_MAX,
                "columns would never be requested and the far edge of the world would stop "
                "loading — with a completely clean build. RING_ORDER_MAX_RADIUS is derived from "
                "RENDER_DIST_MAX; GEN_AREA_RADIUS_MAX is GEN_MESH_RADIUS_MAX + 1.");
+
+// v1.8.10. Same failure shape as the two JOBQ_CAP asserts above: world/genretry.h's
+// GEN_RETRY_SLOTS is a hand-maintained bound, sized for today's GEN_AREA_SPAN. A render-distance
+// change that grows GEN_AREA_SPAN past it would not fail to compile and would not crash —
+// genRetryInit(&s_gen_retry, GEN_AREA_SPAN) below would just return false, silently leaving
+// s_gen_retry zeroed and every future budget refusal an unrecovered hole again.
+_Static_assert(GEN_AREA_SPAN * GEN_AREA_SPAN <= GEN_RETRY_SLOTS,
+               "world/genretry.h's GEN_RETRY_SLOTS is smaller than one full area ring, so "
+               "genRetryInit would refuse to start and every budget-refused column would go "
+               "back to being a silent permanent hole. Raise GEN_RETRY_SLOTS to at least "
+               "GEN_AREA_SPAN * GEN_AREA_SPAN.");
 static void genQueueReadyColumns(void)
 {
 	bool still_short = false;
@@ -951,6 +972,22 @@ static void genRequestArea(void)
 		if (workerSubmitColumn(cx, cz)) genSlotSet(&s_col_asked[0][0], GEN_AREA_SPAN, cx, cz);
 		else                            s_genr.submit_failed++;
 	}
+}
+
+// world/genretry.h's submit callback for s_gen_retry. A retried column is not a different kind
+// of request — it is asked for exactly the way genRequestArea above asks the first time
+// (workerSubmitColumn, then genSlotSet(s_col_asked) on success) — the only thing different about
+// it is WHY it is being asked again, which genRequestArea's own "not already in s_col_in" gate
+// would otherwise never allow (s_col_in already has it, from genInstallOne marking it installed
+// with a hole). Returning false here means the job ring was full this frame, not a generation
+// failure, so genRetryTick leaves the backoff alone and offers it again next frame instead of
+// waiting out a whole cooldown for what is a one-frame condition.
+static bool genRetrySubmit(void* ud, int32_t cx, int32_t cz)
+{
+	(void)ud;
+	if (!workerSubmitColumn(cx, cz)) return false;
+	genSlotSet(&s_col_asked[0][0], GEN_AREA_SPAN, cx, cz);
+	return true;
 }
 
 // Frees a column and everything drawn from it. Safe to call for a column that was only
@@ -1515,6 +1552,11 @@ static bool genStart(int32_t cx, int32_t cz)
 	// flag that survives the thing it describes is how the queued-before-pushed bug happened
 	// in the first place.
 	s_mesh_queue_short = false;
+	// v1.8.10. GEN_AREA_SPAN is the same compile-time constant s_col_in/s_col_asked are sized
+	// for, and the _Static_assert next to GEN_RETRY_SLOTS above guarantees it fits, so this
+	// cannot fail for any configuration that compiled — same reasoning the JOBQ_CAP asserts
+	// rely on elsewhere in this file instead of a runtime check here.
+	genRetryInit(&s_gen_retry, GEN_AREA_SPAN);
 	s_genr = (GenResult){0};
 	s_genr.ran = true;
 	s_center_cx = cx;
@@ -1597,6 +1639,13 @@ static bool genInstallOne(void)
 		worldColumnRemove(&s_world, cx, cz);
 		genSlotClear(&s_col_asked[0][0], GEN_AREA_SPAN, cx, cz);
 		s_col_dropped++;
+		// v1.8.10. If this was a retry landing after the ring had already moved past it,
+		// s_gen_retry must hear about it here — genRetryTick's own out-of-radius drop (see
+		// world/genretry.h) never runs for an INFLIGHT entry, which this one is the moment it
+		// was submitted, so nothing else would ever clear it. genretry.h documents exactly this
+		// case: "the caller no longer wants it (the ring moved past it)". A no-op if this
+		// column was never a retry.
+		genRetryClear(&s_gen_retry, cx, cz);
 		return true;
 	}
 
@@ -1606,6 +1655,16 @@ static bool genInstallOne(void)
 	// neighbours forever instead of meshing what did arrive.
 	genSlotSet(&s_col_in[0][0], GEN_AREA_SPAN, cx, cz);
 	genSlotClear(&s_col_asked[0][0], GEN_AREA_SPAN, cx, cz);
+
+	// v1.8.10. This is the actual fix (world/genretry.h): ok == false no longer leaves a
+	// silent, permanent hole. s_col_in above still marks the column installed — that half is
+	// unchanged, and still has to stay unconditional or a partial column would stall its four
+	// neighbours' ring-complete check forever — but now s_gen_retry also remembers it, and
+	// genRetryTick (called once per frame, below and in the loading loop) resubmits it with
+	// backoff once budget allows. ok == true clears any pending retry for this column, which is
+	// a documented no-op if it was never one.
+	if (ok) genRetryClear(&s_gen_retry, cx, cz);
+	else    genRetryMark(&s_gen_retry, cx, cz);
 
 	// This column is now genuinely part of the live world, every chunk workerInstall() had
 	// already copied in above — the moment net/blockdiff.h's pending diffs for it (a remote
@@ -1764,6 +1823,11 @@ static bool runLoadingScreen(bool draw, const char* heading, const char* world_n
 		// what it is for, and it is not bounded by the lane count.
 		watchdogPhase(WD_PHASE_LOAD_GEN);
 		for (int i = 0; i < 8 && genInstallOne(); i++) { }
+		// v1.8.10. Once per frame, same as the play loop below — ages every outstanding hole by
+		// one frame and resubmits whichever ones have backed off long enough. Bounded the same
+		// way genInstallOne's own drain is: at most one resubmission per still-pending column per
+		// call, never a loop that can spin.
+		genRetryTick(&s_gen_retry, s_center_cx, s_center_cz, s_area_radius, genRetrySubmit, NULL);
 		watchdogPhase(WD_PHASE_LOAD_MESH);
 		genDrainMesh(LOADING_DRAIN_BUDGET_MS, LOADING_DRAIN_MAX_CHUNKS);
 
@@ -2683,8 +2747,14 @@ static void worldReportDraw(int refused, bool built,
 		// freed because they left it, and `stale` the columns that finished generating for
 		// a ring position the player had already walked out of — those are thrown away on
 		// arrival, and a large number there means the ring is moving faster than the worker.
-		printf("ring at %+3ld %+3ld unl %3d stale %d\n", (long)s_center_cx, (long)s_center_cz,
-		       s_col_unloaded, s_col_dropped);
+		//
+		// v1.8.10 `hole`: columns installed with a real gap in them (world/genretry.h) that
+		// s_gen_retry is still waiting to resubmit — the "one chunk away and it never loads in"
+		// bug's own counter. 0 almost always; briefly non-zero under budget pressure and always
+		// falling back to 0 within GEN_RETRY_MAX_FRAMES (300, ~5 s) of the budget freeing up. A
+		// number that climbs and never comes back down is the one this line exists to catch.
+		printf("ring at %+3ld %+3ld unl %3d stale %d hole %d\n", (long)s_center_cx,
+		       (long)s_center_cz, s_col_unloaded, s_col_dropped, genRetryOutstanding(&s_gen_retry));
 
 		// Step 6.2's line, and the only per-frame costs the streaming path adds. `strm` is
 		// install + mesh drain on the worst frame, `rc` the recentre on the frame that
@@ -3126,9 +3196,49 @@ static void gpuWaitPrevFrame(void)
 	wait_frame++;
 	if (!gpuTestFrameWait()) gpuTestPostMortem(wait_frame);
 #else
-	// c3d/renderqueue.h: "Waits for the GPU to finish rendering." Unbounded, which is fine
-	// in a build that has deliberately compiled the safety net out.
-	C3D_FrameSync();
+	// CORRECTED v1.8.10. This was C3D_FrameSync(), on the strength of c3d/renderqueue.h's
+	// one-line doc comment "Waits for the GPU to finish rendering." That comment is misleading
+	// and this function was measurably not doing its job.
+	//
+	// Disassembling the actually-linked libcitro3d.a (1.7.1-2) shows C3D_FrameSync is:
+	//
+	//     r6 = frameCounter[0]; r5 = frameCounter[1];
+	//     do { gspWaitForAnyEvent(); } while (frameCounter[0]==r6 || frameCounter[1]==r5);
+	//
+	// It waits for a VBLANK TICK ON BOTH SCREENS. There is no bl to gxCmdQueueWait, and no
+	// GX/GPU-busy check of any kind anywhere in it — confirmed by the absence of the call, and
+	// matching upstream renderqueue.c at tag v1.7.1 instruction for instruction. A vblank
+	// arrives every ~16.7 ms whether or not the GPU has finished. The two are unrelated events.
+	//
+	// So the wait that actually blocks until the queue drains, gxCmdQueueWait(-1), was only ever
+	// reached later, inside C3D_FrameBegin(C3D_FRAME_SYNCDRAW) at the draw — AFTER genFollow and
+	// both mesh drains had already reassigned and memcpy'd over slots the GPU was still reading.
+	// This function narrowed the race window from "the rest of the frame" to "until the next
+	// vblank" and was then described at its call site as "THE fix for the hardware freeze". It
+	// was not. It is harmless only while a frame finishes inside one vblank, and radius 5 does
+	// not: steve's New 3DS froze at render distance 5 with a visibly low frame rate, which is
+	// precisely the condition in which the remaining window is wide open.
+	//
+	// C3D_FrameBegin(C3D_FRAME_SYNCDRAW) is that same vblank wait FOLLOWED by the real
+	// gxCmdQueueWait(-1) — also measured, from the same disassembly: bit 0 of the flags gates an
+	// inlined copy of the C3D_FrameSync loop, and both paths then fall through to an
+	// unconditional gxCmdQueueWait. It is public API in c3d/renderqueue.h, unlike the queue
+	// pointer itself, which app/gputest.c can only reach through a documented __C3D_Context hack
+	// that its own comment calls fragile and confines to the diagnostic build.
+	//
+	// Calling FrameBegin here rather than at the draw is safe, for one checked reason: there is
+	// not a single citro3d or GX call anywhere between this line and the draw block. Everything
+	// in that span — the sim, genFollow, both mesh drains — is CPU work and memcpy into linear
+	// memory. So setting citro3d's inFrame flag early cannot capture commands into the wrong
+	// frame, because no commands are emitted. The later C3D_FrameBegin(C3D_FRAME_SYNCDRAW) then
+	// finds inFrame already set and early-returns 0 without waiting or clearing anything, which
+	// the disassembly confirms is its entire behaviour on that path. If a citro3d call is ever
+	// added between the two, this stops being true — that is the invariant to protect.
+	//
+	// Unbounded, like the call it replaces. That is deliberate in a build with the safety net
+	// compiled out: BS_GPU_TESTS above is where the bounded version lives, and it has always
+	// used the real queue wait, which is why the diagnostic build never carried this bug.
+	C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
 #endif
 }
 
@@ -4694,6 +4804,11 @@ session_start:
 		watchdogPhase(WD_PHASE_INSTALL);
 		const u64 t_install = svcGetSystemTick();
 		if (!paused) for (int i = 0; i < workerLanes() && genInstallOne(); i++) { }
+		// v1.8.10. Once per frame — ages every outstanding hole (world/genretry.h) by one frame
+		// and resubmits whichever have backed off long enough, bounded to at most one
+		// resubmission per pending column per call, same as the loading loop's call to this.
+		if (!paused) genRetryTick(&s_gen_retry, s_center_cx, s_center_cz, s_area_radius,
+		                           genRetrySubmit, NULL);
 		const float install_ms =
 			(float)((double)(svcGetSystemTick() - t_install) / CPU_TICKS_PER_MSEC);
 #endif
@@ -4758,7 +4873,16 @@ session_start:
 		//
 		// This must sit ahead of genFollow, not merely ahead of the drains: genFollow
 		// reaches chunkRenderReleaseColumn, which hands a live slot to a different chunk.
+		//
+		// v1.8.10: the sync metric moved here with the wait it measures. It used to wrap the
+		// C3D_FrameBegin at the draw, which is where the queue wait used to happen; now that
+		// gpuWaitPrevFrame performs it, that call early-returns and wrapping it would have
+		// printed a permanent ~0.00 ms on the debug overlay while the real wait went unmeasured.
+		// A live readout wired to something that no longer measures the thing is worse than no
+		// readout, because it reads as evidence.
+		metricsSyncBegin();
 		gpuWaitPrevFrame();
+		metricsSyncEnd();
 
 #if BS_WORLD_GEN
 		// After the move, so the ring is centred on where the player is now rather than
@@ -5206,9 +5330,24 @@ session_start:
 		// whole frame and then blocks in C3D_FrameBegin(C3D_FRAME_SYNCDRAW), so the GPU took
 		// the world's commands and never signalled. One thing that does exactly that, and
 		// grows with the number of chunks on screen, is the command buffer overrunning: it is
-		// 0x40000 bytes (C3D_DEFAULT_CMDBUF_SIZE, passed in gfx/screen.c) and citro3d does not
-		// bounds-check the writes into it, so a frame that needs more silently walks off the
-		// end and the GPU is handed whatever follows it in the linear heap.
+		// 0x40000 bytes (C3D_DEFAULT_CMDBUF_SIZE, passed in gfx/screen.c).
+		//
+		// CORRECTED v1.8.10, and the correction is the point of keeping this paragraph. It used
+		// to end "and citro3d does not bounds-check the writes into it, so a frame that needs
+		// more silently walks off the end and the GPU is handed whatever follows it in the
+		// linear heap." That is FALSE, and it was reasoning that never got checked against the
+		// SDK. Disassembling the actually-linked /c/devkitPro/libctru/lib/libctru.a (2.7.0-1)
+		// shows GPUCMD_Add ends with `cmp r1, ip / bls / mov r0,#0 / bl svcBreak` — it compares
+		// gpuCmdBufOffset + paramlength + 1 against gpuCmdBufSize and calls
+		// svcBreak(USERBREAK_PANIC) rather than writing past the end. Every citro3d emission
+		// path (AddWrite, AddMaskedWrite, AddWrites, AddIncrementalWrites) funnels through it.
+		//
+		// So an overrun is a deterministic supervisor panic, NOT a silent wedge — a DIFFERENT
+		// signature from the unresponsive hang this probe was built to explain. The 2026-09-02
+		// hardware freeze was chased down this paragraph for two hours on the strength of the
+		// sentence above. Arithmetic since put radius 5 at ~59% of the ceiling (radius 3 ~24%),
+		// so the instrument is still worth having — but it can only ever exonerate, and a low
+		// reading here does not narrow anything, because a high one would have panicked instead.
 		//
 		// Measurable here rather than on his console: Azahar runs the same citro3d and builds
 		// the same command list, and the usage figure does not depend on the GPU ever
@@ -5252,7 +5391,8 @@ session_start:
 		}
 #endif
 		watchdogPhase(WD_PHASE_DRAW);
-		metricsSyncBegin();
+		// v1.8.10: metricsSyncBegin/End no longer wrap this block. The queue wait they existed
+		// to time now happens in gpuWaitPrevFrame(), far above, and the metric moved with it.
 #if BS_DRAW_PROBE
 		// The same two waits C3D_FrameBegin(C3D_FRAME_SYNCDRAW) performs internally, called
 		// separately so the hang report can name which of them the console stopped in. See the
@@ -5325,7 +5465,6 @@ session_start:
 		C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
 #endif
 		spriteFrameBegin();
-		metricsSyncEnd();
 			// Step 7.6. In 2D this is one call with iod 0, which is exactly the frame this
 			// loop drew before the step existed. In 3D it is the same work twice, and that
 			// is the cost the plan warned about rather than an implementation to be
@@ -5344,6 +5483,18 @@ session_start:
 			// two eye calls, so a stereo frame's left and right eye cannot land on opposite
 			// sides of a tick boundary and disagree about the sky.
 			chunkRenderSetTimeOfDay(dayNightTimeOfDay(&s_daynight));
+			// v1.8.10 shaders option: fake directional lighting. Same shape as the call just
+			// above — once a frame, unconditionally, from the live Options struct — see
+			// chunkRenderSetFakeShading's own comment in chunk_render.c for why an
+			// unconditional call every frame is safe and cheap here.
+			chunkRenderSetFakeShading(opts.fake_shading);
+			// v1.8.10 shaders option: the water shimmer's clock. Same reasoning as
+			// crack_stage and the time of day above — sampled ONCE, outside the two eye
+			// calls, so a stereo frame cannot scroll the glints to two different places
+			// and have the 3D slider fuse the difference as depth. The tick-to-ms divisor
+			// is the same one app/sleep.c and app/battery.c use, and it stays correct at
+			// 804 MHz (see app/hw.h).
+			chunkRenderSetShimmerTimeMs(svcGetSystemTick() / (SYSCLOCK_ARM11 / 1000));
 			drawEye(screenTop(), &view, &it.target, crack_stage, s_stereo ? -iod : 0.0f, 0);
 			if (s_stereo)
 				drawEye(screenTopRight(), &view, &it.target, crack_stage, iod, 1);

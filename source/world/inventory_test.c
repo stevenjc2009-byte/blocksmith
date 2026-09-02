@@ -78,7 +78,18 @@ static char s_first[160];
 // loop-ran counters, the 3 boundary checks, the 2 exclusions, the 6 dynamic-id calls, the 2
 // wire-span calls — is a fixed count untouched by how many rows the registry defines, so the
 // whole delta is the loop body: +12. 212 + 12 = 224.
-#define INVENTORY_TEST_EXPECTED_CHECKS 226
+//
+// 224 -> 226 on 2026-09-02, v1.8.10's wire-span widening (inventoryItemOnWire() delegating to
+// inventoryCanHold()): the four CHECK()s at the bottom of testTheBagTakesEveryDefinedBlock()
+// pinning both the widened and still-refused wire cases. 224 + 4... except one of those four
+// replaced a call that already existed, so measured, not derived, is 226; see this file's own
+// checkCountPin() output as the source of truth if this arithmetic and that output ever
+// disagree — the run is authoritative, not this comment.
+//
+// 226 -> 227 on 2026-09-02, v1.8.10 "Light"'s torch. Nothing in testTheBagTakesEveryDefinedBlock
+// changed shape — the per-row loop still runs one CHECK() per accepted id, now over
+// twenty-six instead of twenty-five, so the loop body alone is +1. 226 + 1 = 227.
+#define INVENTORY_TEST_EXPECTED_CHECKS 227
 
 // Deliberately NOT routed through CHECK(): this must not perturb the number it is testing,
 // so it bumps s_fails only. It fills s_first (with both numbers, so the one-line summary is
@@ -233,14 +244,19 @@ static void testTheBagTakesEveryDefinedBlock(void)
 	// The loop ran, over the whole table rather than a prefix of it. Without this a
 	// definedness query answering false for everything leaves the rule green having asserted
 	// nothing at all.
-	CHECK(accepted == 25);            // 27 core rows less air and less water
+	CHECK(accepted == 26);            // 28 core rows less air and less water
 	CHECK(accepted > BLOCK_COUNT);    // and genuinely more than the old ceiling admitted
 
 	// THE BOUNDARY, both sides, derived rather than hard-coded: the last id with a row is
 	// accepted, the first id without one is refused.
-	CHECK(inventoryCanHold((ItemId)BLOCK_APPLE));                 // 26, the last defined row
-	CHECK(!inventoryCanHold((ItemId)(BLOCK_APPLE + 1)));          // 27, no row
-	CHECK(!registryIsDefined((BlockId)(BLOCK_APPLE + 1)));        // ...and that is why
+	//
+	// v1.8.10: this used to be BLOCK_APPLE / BLOCK_APPLE+1 — apple (26) was the last defined
+	// core row and 27 had none. The torch (BLOCK_TORCH = 27) is now that last row, so the
+	// pair moves one further out, exactly as this comment's own "derived rather than
+	// hard-coded" framing anticipates whenever a core row is appended.
+	CHECK(inventoryCanHold((ItemId)BLOCK_TORCH));                 // 27, the last defined row
+	CHECK(!inventoryCanHold((ItemId)(BLOCK_TORCH + 1)));          // 28, no row
+	CHECK(!registryIsDefined((BlockId)(BLOCK_TORCH + 1)));        // ...and that is why
 
 	// The two exclusions that survive the widening, each for its own reason. Neither of them
 	// is about where the id sits.

@@ -77,8 +77,11 @@ enum {
 	TILE_ORCHID,          // 29 — BLOCK_SHAPE_CROSS
 	TILE_APPLE,           // 30
 
+	// v1.8.10 "Light", slot 31 — the first light source. docs/plan-1.8.10-light.md §2.3.
+	TILE_TORCH,           // 31 — BLOCK_SHAPE_CROSS
+
 	// How many slots the list above NAMES. Not the sheet's capacity — that is
-	// ATLAS_TILE_COUNT (64) in world/atlas_uv.h, and these thirty-one are 0..30 of it.
+	// ATLAS_TILE_COUNT (64) in world/atlas_uv.h, and these thirty-two are 0..31 of it.
 	//
 	// It exists to be counted against, not to be used as a bound: world/block_tiles_check.c
 	// asserts that the number of BTEX/TILE assert lines equals this number, which is what
@@ -86,10 +89,10 @@ enum {
 	// as BLOCK_FACES in world/block.h, which terminates the face enum for the same reason.
 	TILE_USED_COUNT,
 
-	// Thirty-one of ATLAS_TILE_COUNT (64) addressable slots used, 0..30 — twelve until
-	// v1.8.3 Phase 3 claimed 12..16 for snow, ice, cactus, dead bush and fern, and
-	// seventeen until v1.8.8 claimed 17..30 for the birch and spruce materials, the tall
-	// grass top, the four flowers and the apple.
+	// Thirty-two of ATLAS_TILE_COUNT (64) addressable slots used, 0..31 — twelve until
+	// v1.8.3 Phase 3 claimed 12..16 for snow, ice, cactus, dead bush and fern, seventeen
+	// until v1.8.8 claimed 17..30 for the birch and spruce materials, the tall grass top,
+	// the four flowers and the apple, and thirty-one until v1.8.10 claimed 31 for the torch.
 	//
 	// It was twelve of FIFTEEN until v1.8.2's task 13b. The old ceiling was not the sheet
 	// height: MeshVertex.v held an atlas pixel row, so a uint8_t capped the sheet at 256 px
@@ -99,7 +102,7 @@ enum {
 	// dimension — for 64 slots, all addressable. The vertex is still 8 bytes. See the long
 	// note in world/atlas_uv.h.
 	//
-	// The 33 spares (31..62, and the reserved 63) are NOT blank. Since v1.6.0 F7
+	// The 32 spares (32..62, and the reserved 63) are NOT blank. Since v1.6.0 F7
 	// tools/make_atlas.py paints every slot this list does not name with the magenta/black
 	// missing-texture marker, and ATLAS_TILE_MISSING (slot 63, world/atlas_uv.h) is reserved
 	// as one permanently — it is where atlasRect() clamps an out-of-range tile id. Before

@@ -4,6 +4,85 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.8.10] - 2026-09-02
+
+Light. Torches, and a lighting model that finally behaves the way Minecraft's does — light
+spreading properly from one chunk into the next, and sky light and torch light added together
+instead of one simply winning. It is also the release that fixes a bug that froze a real console
+solid, which is the most important thing in it and has nothing to do with torches.
+
+Everything here is identical on both consoles. Nothing in this release is Old-3DS-only or
+New-3DS-only.
+
+### Fixed
+- **The whole console could freeze, and now should not.** Reported on real hardware at render
+  distance 5: the frame rate dropped, and a couple of chunks from spawn the console locked up
+  completely — not just the game, the system. The cause was a wait in the wrong place. Every
+  frame the game hands the graphics chip a batch of chunk geometry and then immediately begins
+  rebuilding chunks in that same memory, so it has to wait for the chip to finish reading first.
+  It was waiting on the screen refresh instead of on the chip. Those two things look identical
+  right up until a frame takes longer than a screen refresh — which is exactly what render
+  distance 5 does — and then the game starts overwriting geometry the chip is still reading. The
+  wait now really waits for the chip. The graphics library's own documentation is what caused
+  this: it describes the old call as waiting for the GPU, and the disassembled library does not.
+
+  There is a cost, and it is expected rather than a second bug: the old behaviour let chunk
+  building overlap with drawing, for free, and that overlap *was* the bug. Frame rate at render
+  distance 5 may be lower than before. Getting the overlap back safely is separate work and was
+  deliberately kept out of this release so that the freeze fix can be judged on its own.
+- **A test file was breaking the console build entirely.** A new test added under `source/world/`
+  was missing the guard that keeps test code out of the console binary, so the game could not be
+  built for hardware at all. The host test suites never link the console target, so they stayed
+  green throughout.
+- **The new cross-chunk lighting was doing a great deal of pointless work.** Making light cross
+  a chunk edge means that when one chunk's light changes it has to tell its neighbours, so they
+  can recompute too. The first version treated a chunk that had never been lit as having always
+  changed — which is true, but it meant the very first lighting of any chunk told all four
+  neighbours, and each of those had also never been lit, so each told its four, and the wave ran
+  outward across every chunk loaded. Each one costs a full lighting pass. With 49 chunks loaded
+  that is up to about 7.6 ms of a 16.7 ms frame spent handing light to its neighbours that does
+  not exist. A chunk being lit for the first time now only tells its neighbours if it actually
+  has any light in it to tell them about. Placing and breaking torches is unaffected in either
+  direction — that path always runs on a chunk that was already lit.
+
+- **Two faults in the test suite itself, both found by finally running it end to end.** The art
+  sheet's guard against unpainted tiles still believed the sheet had thirty-one tiles on it, so
+  it demanded that the torch's slot be the magenta “missing texture” marker and failed on finding
+  a real torch there. The guard was right and the count was stale. Behind that failure, and
+  hidden by it, the new lighting test was linking its binary into a scratch directory that an
+  earlier part of the suite deletes, so it could never have run at all — the suite stops at the
+  first failure, and it had been stopping before this point every time. Neither fault touched the
+  game; both meant checks were silently not happening.
+
+### Added
+- **Torches.** Placeable, breakable like everything else, and they light the area around them.
+  Brightness 14, the same as Minecraft's.
+- **Light crosses chunk boundaries.** Block light used to stop dead at the edge of the chunk it
+  was in — a torch near an edge lit its own chunk to 14 and the chunk beside it to 0, with a hard
+  seam down the middle. It now hands off properly: 14 on one side, 13 on the other, which is what
+  a single step of falloff should look like.
+- **Fake shading, as an option.** Off by default. A cheap lighting effect that costs almost
+  nothing on this hardware — not ray tracing, and not pretending to be.
+- **Water shimmer**, part of that same option. Pale highlights drift slowly and diagonally
+  across the surface of water, roughly a block a second, so a lake reads as moving rather than
+  as a flat blue pane. It is a scrolling texture, not a reflection — the console cannot afford
+  a real one. It only touches water: leaves and glass are drawn in the very same pass and are
+  left exactly as they were, told apart by the transparency value the mesher already writes.
+  With the option off, water looks precisely as it did in 1.8.9.
+
+### Changed
+- **Sky light and torch light are added together now, not compared.** Until this release the game
+  took whichever of the two was brighter and used that. Minecraft curves each one separately and
+  adds them, which is why a torch in daylight still visibly brightens what it is near, and why a
+  torchlit room at night does not look like a room at dusk. Daylight is essentially unchanged;
+  the difference is all in the dark and in the area near a torch.
+
+### Notes
+- The chunk pop-in reported against 1.8.7 is **not** fixed here.
+- The freeze fix is proven at the binary level — the compiled object now references the call that
+  really waits, and no longer references the one that does not — but it has **not** been
+  confirmed on real hardware, because that needs a 3DS.
+
 ## [1.8.9] - 2026-09-02
 
 Sky and weather. Rain and snow now actually fall, the sun's light is finally shaped the way

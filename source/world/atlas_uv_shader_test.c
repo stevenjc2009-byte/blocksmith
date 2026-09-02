@@ -189,7 +189,7 @@ static char s_first[512];
 // the enum. What the enum's count governs is TILE_USED_COUNT in gfx/atlas_tiles.h, which
 // world/block_tiles_check.c asserts against the BTEX_* mirror - a separate guard over a
 // separate pair of lists, untouched by this and still reading 12 on both sides.
-#define ATLAS_PAINTED_SLOTS 31
+#define ATLAS_PAINTED_SLOTS 32
 
 // Slots 10 and 11 within that: water and tall grass (roadmap tasks 17 and 19). Named here
 // because the two texel-content checks further down are about what these two tiles ARE, not
@@ -1342,6 +1342,7 @@ int main(void)
 				0xB3DEE21405C3F1B3ull,   // 28 bluebell
 				0xEF709703CD95BB3Eull,   // 29 orchid
 				0xAC89049AACB76209ull,   // 30 apple
+				0xF0CDA838E1746BCDull,   // 31 torch (NEW pin, v1.8.10 -- see below)
 			};
 			for (int slot = 0; slot < ATLAS_PAINTED_SLOTS; slot++) {
 				const uint64_t got = slotFingerprint(SLOT_PNG_TOP(slot));
@@ -1353,6 +1354,26 @@ int main(void)
 				      "addressing is wrong and re-pinning would ship it",
 				      slot, got, kPaintedFingerprint[slot]);
 			}
+
+			// ── 2026-09-02: slot 31 is a NEW pin, which is a different thing ──
+			//
+			// v1.8.10 "Light" added the torch and gave it slot 31, taking the sheet from
+			// thirty-one painted tiles to thirty-two. ATLAS_PAINTED_SLOTS was not moved with
+			// it, so slot 31 stayed inside the H9 marker sweep below, and that sweep failed
+			// exactly as designed: it found real torch art sitting where it demanded the
+			// magenta/black missing-texture checker. The sweep was right and the constant was
+			// stale. The fix is the constant; the new tile then needs a pin like every other
+			// painted tile has.
+			//
+			// This is NOT the move the block above forbids. That warning is about RE-pinning
+			// a tile whose fingerprint MOVED, which means the generator started painting
+			// different art into a slot that already had art, and re-pinning would bless it.
+			// Slot 31 had no pin at all, because until this version it had no art.
+			// 0xF0CDA838E1746BCD was measured by compiling a scratchpad copy of this file
+			// with the pin set to zero and reading the fingerprint the failure printed. It
+			// was not chosen. Every pin 0..30 is byte-identical to what it was before the
+			// torch, which is the evidence that adding a thirty-second tile did not disturb
+			// the seeded stream the other thirty-one are drawn from.
 
 			// ── 2026-09-02: slots 11 and 25 re-pinned, and why that was allowed ─────────
 			//

@@ -7,11 +7,14 @@ is in `CHANGELOG.md`; full reasoning on everything not yet built is in `docs/ROA
 and, for the three versions that have a dedicated plan document, in
 `docs/plan-1.8.7-terrain.md` and `docs/plan-1.8.8-biome-identity.md`.
 
-**Current version: 1.8.6** (see `source/version.h`). Everything up to and including it
-has shipped. `v1.8.4`, `v1.8.5` and `v1.8.6` are tagged and pushed but do not yet have a
-published GitHub Release — the newest published Release is still `v1.8.3` (confirmed via
-`gh release list`). Everything after `v1.8.6` is a plan, not a build; order, scope, and
-whether a given version ships at all can still change before it does.
+**Newest published version: 1.8.9** (confirmed via `gh release list` — `v1.8.9` is tagged
+`Latest`, released 2026-09-02). Everything from `v0.1.0` up to and including `v1.8.9` is
+released and published on GitHub. `source/version.h` in the working tree currently reads
+`1.8.10`, and `CHANGELOG.md` already carries a full, dated `## [1.8.10]` entry — but that
+version has not been committed, tagged, or published as a GitHub Release yet, so it is
+mid-release, not "planned" the way everything after it is. See its own entry below for
+exactly what that status means. Everything after `v1.8.10` is a plan, not a build; order,
+scope, and whether a given version ships at all can still change before it does.
 
 A console note appears below **only** where an Old 3DS and a New 3DS genuinely differ —
 a different render-distance ceiling, extra RAM, a higher clock, an extra core, anything
@@ -237,7 +240,7 @@ ground, plants and tree shape. Worlds get their own terrain seed instead of shar
 **Fixed.** A client that joins a server running a different generator is now refused
 rather than silently desyncing.
 
-### v1.8.4 — New 3DS treated as a New 3DS — released, not yet published
+### v1.8.4 — New 3DS treated as a New 3DS — released and published
 
 *A genuine Old/New 3DS split.* **Added.** The 804 MHz clock, the L2 cache, the larger
 memory mode and the third CPU core are actually requested and used now — they were
@@ -253,7 +256,7 @@ a second and buys exactly one climb.
 **Fixed.** The core request was written but gated behind a flag that defaults to off, so
 a New 3DS previously got exactly what an Old 3DS got. The two questions are now separate.
 
-### v1.8.5 — render distance — released, not yet published
+### v1.8.5 — render distance — released and published
 
 *A genuine Old/New 3DS split.* **Added.** A New 3DS can now be set to render distance 5;
 an Old 3DS stays at 3, which is what its memory holds. A settings file written on a New
@@ -274,7 +277,7 @@ network-edit store, which took a flat 1.02 MB whether or not Multiplayer was eve
 now allocates only on the first server packet that needs it (measured off the built ELF:
 `.bss` 1,725,944 → 660,968 bytes).
 
-### v1.8.6 — Speed — released, not yet published
+### v1.8.6 — Speed — released and published
 
 No new features and nothing that looks different on screen. **Every change in this
 release is byte-for-byte invisible**: the world generates the same terrain (484 columns
@@ -308,131 +311,228 @@ changed on evidence that cannot support the change.
 **Not verified.** Nothing in this release has run on real 3DS hardware; every timing
 figure above is a host x86-64 ratio, not a console frame cost.
 
+### v1.8.7 — Terrain — released and published
+
+**Despite the name, this did not add "the Beta 1.7.3 world" — that already shipped, across
+v1.7.0 and v1.8.3 (see the closing section below).** What this version actually did:
+validated and refined the generator v1.7.0 already shipped, and — unexpectedly — turned up
+two bugs that had been quietly corrupting worlds since earlier releases. What grew around
+that is a large speed pass and the groundwork for a second world-generation thread on the
+New 3DS.
+
+**Fixed.** Lighting could be relit wrong, on both consoles, since v1.8.0: the main thread
+and the world worker were both running flood fills over one shared queue, despite a comment
+in `worker.c` that had asserted otherwise since before it became false. Measured under
+contention, 116 of 120 columns relit wrong. The queue is now claimed atomically, with the
+losing thread falling back to the sweep engine the file already keeps; lighting output stays
+byte-identical. *Console difference:* on a New 3DS the worker genuinely runs at the same
+time as the main thread (the third core), so the window was permanently open; on an Old 3DS
+the two share a core but a relight holds the queue for many scheduler slices, so it was wide
+open there too — both consoles were affected, the New 3DS more often. Also fixed: a block
+you broke or placed could silently fail to reach other players, because a failed send was
+discarded rather than checked — the edit (and the inventory change riding on it) is now
+rolled back if the packet never left, with single-player left untouched since it reports the
+same "no session" condition for an unrelated reason. A client joining a server running a
+different block-id mapping used to be let in anyway after a two-second wait, with every
+disagreed block silently resolving to air; it now refuses the join with an explicit message
+instead. And the pause menu no longer leaves break/place and water flow live in the
+background — X and Y kept working, and water kept moving, while the world looked paused.
+
+**Changed.** Cave generation is 3.09× faster and a whole column is 2.20× faster (1.190 →
+0.542 ms/column on host), by caching the noise-lattice corners a column's roughly 20,900
+cave tests were re-deriving on every call, once per column instead of once per test. The
+terrain interpolator now short-circuits the 92.2% of lattice cells that are uniform (43.2%
+air, 49.0% solid) exactly rather than running all 224 interpolations to arrive at a constant
+— worth 7.6–9.7% off generation on host. Chunk culling does less work per candidate (a
+square root moved from per-pair to per-blocker; the view matrix is built directly, proved
+bit-identical across 341,280 cases including the signed-zero edge cases). Chunks now load
+nearest-first, dropping columns queued ahead of your own immediate surroundings from 98 to
+8. (All ratios are host x86-64, not console frame cost.)
+
+**Added.** The world generator no longer keeps its working memory in globals — the
+prerequisite for a second generator thread on the New 3DS. Two threads generating separate
+columns previously produced 25 of 32 columns wrong and refused 145 of 192 generations
+outright (a refused generation is a permanent hole, not a slow frame); now proved 0 wrong
+and 0 refused by a permanent two-real-thread test. *Console difference:* this is groundwork
+only — there is still just one generator thread running on either console — and it exists
+for the New 3DS specifically, since an Old 3DS has no spare core to give it. Also added: a
+50-seed audit of the terrain amplitude table (29,491,200 lattice steps), confirming the
+overhang preconditions the Beta-1.7.3-style terrain depends on hold across every seed
+tested, not just the handful it was originally tuned against.
+
+**Notes.** Terrain is byte-identical to v1.8.6 — same seed, same world, and a 1.8.7 client
+and a 1.8.6 client can still play together. Binary size: text +9,064 bytes, static memory
++5,056 bytes. Not run on real 3DS hardware.
+
+*Background this version settled but did not itself change:* `docs/ROADMAP.md` had floated
+raising world height as part of "Terrain"; that was decided against, on the numbers rather
+than by feel. 128 already matches Beta's own world height, and the amplitude table — not
+height — is the measured overhang lever. It is also not affordable: one loaded column costs
+65,648 bytes at 128 blocks tall, and at 192 blocks the worst-case 17×17 case would reach
+roughly 28,554,560 bytes against a 12 MB budget, about 2.27× over. World height stays at
+128. Full research, with sources and file:line evidence: `docs/plan-1.8.7-terrain.md` and
+`docs/research/terrain-beta-1.7.3.md`.
+
+### v1.8.8 — Biome identity — released and published
+
+Biomes are now told apart by colour, Minecraft-style, and around that one feature grew
+twelve new blocks and plants, a debug-only border overlay for checking where biomes actually
+meet, a browsable version history, and the first release where sound, the day/night cycle
+and entities are wired into the game and actually run, rather than sitting built and silent.
+
+**Added.** Biomes are told apart by colour: one grass block, and one set of tall-grass and
+fern art, tinted per biome rather than needing a separate block per biome. The half-grass/
+half-dirt block is untouched by this (checked pixel by pixel), and the grass crust on its
+side is deliberately left untinted, because this hardware has no way to tint half a block
+without also tinting the dirt half. **The tint can only darken or mute the source art, never
+brighten or shift it past what the texture already holds — desert currently comes out a dry
+olive rather than the sandy tan you'd expect.** Twelve new blocks and plants: birch and
+spruce logs, planks and leaves; a second tall-grass cell; four flowers (poppy, daisy,
+bluebell, orchid); and apples, their own breakable, carryable block, with birch the softest
+wood and spruce the hardest (and the same ordering for their leaves). Apples grow in oak and
+birch leaves only, never spruce, and drop about 1 in 200 breaks — the odds come from the
+leaf block's own position rather than break order, so every player in a multiplayer game
+agrees on whether a given leaf drops one. The debug menu's bottom screen now lists every
+registered block with its icon and name, paged with the D-pad, and now also shows the
+current biome. A "Version history" button on the check-for-update screen lists what every
+past version added, changed, fixed and removed, generated straight from `CHANGELOG.md` so it
+cannot say something the changelog doesn't. A debug-only neon biome-border toggle (off by
+default) draws a glowing fence along every biome boundary. *New 3DS only:* a second thread
+can now generate world terrain alongside the first, using the spare core — proved not to
+duplicate or drop a column under real concurrent load, but never run together on an actual
+console, so this is foundation work with no in-game speed claim yet; an Old 3DS has no spare
+core to give this and is unaffected. Sound effects, the day/night cycle, and entities are
+wired into the game and actually run for the first time — all three existed and were tested
+in isolation earlier in the 1.8 line but had never been switched on. Three sounds ship
+(block break, block place, footstep), CC0 from Kenney's Impact Sounds pack. Entities are
+foundation only: storage, physics and ticking exist and run, but there are no mobs yet.
+
+**Changed.** Dead bushes redone — a bushier clump instead of a single thin diagonal twig.
+
+**Fixed.** Six items, cactus among them, could not be picked up, and cactus specifically
+could not be broken at all — this is the same bug `docs/ROADMAP.md` had misnamed as a
+`BlockId` ceiling problem. `BlockId` (`source/world/block.h`) is a `uint8_t` with roughly
+112 free ids below its real 0xFD/253 ceiling; the actual bug was `inventoryCanHold()` gating
+on `item < BLOCK_COUNT`, where `BLOCK_COUNT` was a leftover 8 sized for the game's original
+blocks. It now asks the block registry instead, so tall grass, snow, ice, cactus, dead bush
+and fern can all be broken, carried and placed, and cactus got its own break time (between
+snow's and ice's). Standing grass strands were a jarring lime green against the block's own
+darker green — traced to the source art itself, not lighting or the new tinting, and
+repainted to match. The debug overlay's "see" distance reading was still computed for the
+console's built-in fog hardware, which has been off since v1.8.5 in favour of a hand-drawn
+fade, so it read roughly 14 blocks regardless of the setting; it now reports the real
+figures — roughly 28 blocks at render distance 3, 38 at 4, 47 at 5.
+
+**Notes.** The chunk pop-in reported after v1.8.7 is not fixed, and still not explained:
+this release cleared the built-in fog hardware as a suspect (off since v1.8.5), a long walk
+through the streaming code found nothing wrong, and an emulator walk at render distance 5
+showed no holes — but none of that proves it can't happen on real hardware, since nobody has
+yet measured how fast the console itself generates a chunk. That measurement, not a fix, is
+the next step. Server-side groundwork so items like the cactus survive a multiplayer rejoin
+shipped on the server, but the client half did not land this version — a cactus or any of
+the other five newly-carryable items picked up over multiplayer will not survive leaving and
+rejoining yet. Not run on real 3DS hardware.
+
+Full research, with sources and file:line evidence: `docs/plan-1.8.8-biome-identity.md` and
+`docs/research/biome-identity.md`.
+
+### v1.8.9 — Sky and weather — released and published
+
+Rain and snow now actually fall, the sun's light is finally shaped the way Minecraft shapes
+it, and water splashes when you drop into it. The weather model itself has existed and been
+under test since earlier in the 1.8 line, but nothing in the game had ever called it — so
+despite the tests being green, no weather had ever happened until this release wired it in.
+
+**Added.** Rain and snow, decided per biome and by how cold the column is — snow in cold
+biomes, rain everywhere else — drawn as camera-centred billboard strips, the same cheap
+approach Minecraft itself uses on this class of hardware, and depth-tested against already-
+drawn terrain so it does not fall through a cave ceiling or a roof you built. Snow settles on
+the ground in layers, capped at one block deep. Dropping into water throws up a scatter of
+splash particles, fixed by where and when you hit the water rather than a running random
+sequence, so two players in the same world see the same splash. The weather simulation is
+running for the first time: loaded columns are ticked on the same clock the day/night cycle
+uses — saved with your world, agreed with a server — instead of a counter that restarted on
+load, which is what stops rain jumping the moment you rejoin; near columns tick often, far
+columns rarely.
+
+**Changed.** Night is dark again: brightness is now shaped by Minecraft's own curve instead
+of used raw, which is what makes a torchless interior read as gloom instead of dusk.
+Measured against the reference, a midnight interior had been rendering 3.2× brighter than it
+should have been; daylight is almost unaffected.
+
+**Fixed.** A comment in the world shader claimed it was New-3DS-only; it has run on both
+consoles since v1.8.0. Nothing behaved wrongly because of it, but anyone reading the render
+path was being told the wrong thing.
+
+**Notes.** Sky light and block light are still combined by taking whichever is brighter,
+where Minecraft adds them — that difference only starts to matter once there is a torch to
+emit block light, which is v1.8.10. The chunk pop-in reported against v1.8.7 is still not
+fixed and still not diagnosed. Not run on real 3DS hardware.
+
 ---
 
 ## Planned
 
-Everything from here down has not shipped. These are plans, not built features, and
-their scope, order, and even whether a given version ships at all can still change.
-Where a version has a dedicated research brief or plan document beyond `ROADMAP.md`'s own
-entry, that is named so the deeper detail can be found.
+Everything from here down has not been published as a GitHub Release. v1.8.10 is the one
+exception to "not shipped" in this section — it is real, built, tested code sitting
+uncommitted in the working tree with a matching `CHANGELOG.md` entry, just not yet
+committed, tagged, or published; see its own entry for exactly what that means. Everything
+from v1.8.11 onward genuinely is a plan, not a build, and their scope, order, and even
+whether a given version ships at all can still change. Where a version has a dedicated
+research brief or plan document beyond `ROADMAP.md`'s own entry, that is named so the
+deeper detail can be found.
 
-### v1.8.7 — Terrain — in progress
+### v1.8.10 — Light — built in the tree, not yet committed, tagged, or published
 
-**Despite the name, this is not "the version that adds the Beta 1.7.3 world" — that
-already shipped, across v1.7.0 and v1.8.3 (see the closing section below).** This entry
-in `docs/ROADMAP.md` was rewritten on 2026-09-01 to correct that framing; what follows is
-the corrected scope, plus work reported as already landed in-tree ahead of a matching
-`CHANGELOG.md` entry.
+**What this status means, plainly: this is not a plan.** `source/version.h` already reads
+`1.8.10`, `CHANGELOG.md` already carries a full dated `## [1.8.10]` entry, and
+`whatsnew1.8.10.txt` exists and passes its checker — but there is no `v1.8.10` git tag, no
+commit carrying this work yet (the working tree currently shows it as uncommitted changes),
+and no GitHub Release, so there is nothing on record yet that could be reverted to and
+nothing installable exists outside this machine. Treat everything below as real but not yet
+durable.
 
-**What this version actually is: making the shipped terrain good on every seed, not on
-two.** The per-biome amplitude table (`worldgen_density.c:70-151`) was tuned by eye
-against terrain from exactly two seeds; the overhang measurement backing v1.8.7's premise
-(a mountainous seed reaching +16.76 blocks of rise, 9.99% of lattice steps rising) rests
-on those same two seeds. Planned: a real seed sweep wide enough to state an overhang rate
-per biome from a distribution, not one lucky seed; and a real ARM11 timing reading for
-column generation, which does not exist anywhere in the tree today — every cost figure on
-record is a host x86-64 ratio (1.055–1.310 ms/column against legacy's 0.757–0.804, a
-1.37–1.64× multiplier).
+Torches, and a lighting model that finally behaves the way Minecraft's does — light
+spreading properly from one chunk into the next, sky light and torch light added together
+instead of one simply winning. It is also the release that fixes a bug that froze a real
+console solid, which has nothing to do with torches and is the most important thing in it.
 
-**Not planned: raising world height.** 128 already matches Beta's own height, and the
-code's own measurement says amplitude, not height, is the overhang lever. A taller world
-is also not close to affordable: one loaded column costs 65,648 bytes at 128 blocks tall
-(48 B `Column` struct, 32,832 B of chunks, a 32,768 B `LightColumn`), and at 192 blocks the
-17×17 worst case reaches roughly 28,554,560 bytes against a 12 MB cap — about 2.27× over,
-not fitting by any plausible trimming. (An earlier draft of this reasoning used a stale,
-2× — understated per-column figure and got 1.16×; the corrected arithmetic, above, is
-compiled-for-ARM and read from the emitted constants, not derived on paper.)
+**Added.** Torches: placeable, breakable like everything else, light the area around them
+at brightness 14, the same as Minecraft's. Light now crosses chunk boundaries — block light
+used to stop dead at the edge of the chunk it was in, so a torch near an edge lit its own
+chunk to 14 and the chunk beside it to 0 with a hard seam; it now hands off properly, 14 on
+one side and 13 on the other. A fake-shading option, off by default, costing almost nothing
+on this hardware.
 
-**Reported as landed in-tree, not yet reflected in `CHANGELOG.md`** — the tree carries
-extensive uncommitted work from parallel sessions as this document is written, so these
-are stated as reported rather than independently re-verified against a stable commit:
-a per-column cave-noise corner-interpolation cache (`CaveCache`, `caveCacheBuild()`,
-`caveFieldAt()` in `world/worldgen.c`) that exploits the noise lattice's constant x/z
-index across a whole column, reported at 2.20× faster over 484 columns while still
-hashing identically to before (`820dd26ab8db0d7a` — the same hash and column count
-CHANGELOG's v1.8.6 entry uses for its own terrain-identity check, consistent with a pure
-caching change that must not alter output); a data race in `light.c` reported to relight
-116 of 120 columns incorrectly under contention, on both consoles; a block-edit desync
-bug; and the 50-seed terrain amplitude validation sweep called for above.
+**Changed.** Sky light and torch light are added together now instead of the game taking
+whichever was brighter — which is why a torch in daylight now visibly brightens what it is
+near, and a torchlit room at night no longer looks like a room at dusk. Daylight is
+essentially unchanged.
 
-Full research, with sources and file:line evidence: `docs/plan-1.8.7-terrain.md` and
-`docs/research/terrain-beta-1.7.3.md`.
+**Fixed.** The whole console could freeze — reported on real hardware at render distance 5,
+frame rate dropping and then the system locking up completely a couple of chunks from spawn.
+The cause was a wait in the wrong place: every frame the game hands chunk geometry to the
+graphics chip and immediately starts rebuilding chunks in that same memory, so it has to wait
+for the chip to finish reading first — and it was waiting on the screen refresh instead of on
+the chip. Those look identical until a frame runs longer than a screen refresh, which is
+exactly what render distance 5 does. There is an expected cost, not a second bug: the old
+behaviour let chunk building overlap with drawing for free, and that overlap *was* the bug,
+so frame rate at render distance 5 may be lower than before — getting the overlap back safely
+is separate work, deliberately left out of this release. Also fixed: a new test file under
+`source/world/` was missing the guard that keeps test code out of the console binary, so the
+game could not be built for hardware at all; the host suites never caught it because they
+never link the console target.
 
-### v1.8.8 — Biome identity — planned
+**Not delivered in this version, despite earlier plans for it.** Water bobbing returning
+(calmer than before) and a broader "shaders option" (fake directional lighting and fake
+water reflection beyond the fake-shading toggle above) do not appear in the actual
+`CHANGELOG.md` entry for 1.8.10 and were not found in the tree; both have slipped rather
+than shipped.
 
-**Changed.** Colour comes from tint, not from separate blocks, wherever the material does
-not genuinely differ — one grass block, tinted per biome from a climate colormap read by
-temperature and rainfall, rather than a distinct block (and a distinct ID, atlas slot,
-and server-lockstep change) per biome's ground cover.
-
-**Added.** Real per-biome blocks only where the block genuinely differs — wood, leaves,
-planks, and ground cover that is a different material, not just a different colour. Plant
-variety: short grass, two-block tall grass, ferns, and biome-specific flowers, placed on
-purpose rather than scattered everywhere. Apples drop from leaves and can be picked up
-and eaten. A debug-menu-only biome readout, a debug-menu-only neon biome-border toggle,
-and a debug-menu-only block list (every block in the game with its icon and name, on the
-bottom screen).
-
-**Changed.** Dead bushes redone.
-
-**Fixed.** Cactus, snow, and ice cannot currently be broken.
-
-**Groundwork, and a correction to how `docs/ROADMAP.md` currently states it.** ROADMAP's
-own text ("lift the block ID ceiling") names the wrong ceiling. `BlockId`
-(`source/world/block.h`) is a `uint8_t` — its real ceiling is 0xFD/253, and the core
-registry has roughly 112 free ids below that; it is nowhere close to being the bottleneck.
-The actual bug is the **item** ceiling: `inventoryCanHold()` gates on `item < BLOCK_COUNT`,
-and `BLOCK_COUNT` is 8 — which is exactly why cactus, snow and ice (block ids past 8)
-cannot currently be broken or held. This version's groundwork is lifting *that* ceiling,
-client and server in lockstep; nearly everything later on this list depends on it.
-
-Full research, with sources and file:line evidence: `docs/plan-1.8.8-biome-identity.md`
-and `docs/research/biome-identity.md`.
-
-### v1.8.9 — Sky and weather — planned
-
-**Changed.** A day/night cycle matched to Minecraft's own timings: a 24,000-tick,
-20-minute day at Blocksmith's existing 20 Hz tick rate needs no rescaling at all. The
-sun's angle does not move linearly — it blends one third of a cosine ease into a linear
-motion, which is what makes dawn and dusk read as unhurried. Sky light itself follows a
-sharper, clamped curve of its own: it holds flat across all of midday and all of night,
-with the whole fall from 15 to 4 (night never goes below 4) packed into about 81.5 real
-seconds out of the 20-minute day. **A linear light-to-brightness ramp would render full
-night 3.2× too bright** — vanilla's own curve, `l/(4-3l)`, is what has to ship instead,
-and it costs three vertex-shader instructions on the PICA200.
-
-**Added — weather that knows where it is.** Rain or snow is decided by two independent
-things per biome, not one: whether the biome has precipitation at all (desert and savanna
-do not, by declaration, not because they are hot), and if it does, whether its effective
-temperature is above or below 0.15. Altitude cooling is planned but needs its own tuning:
-vanilla's own altitude-cooling coefficients are calibrated for 256- and 384-tall worlds
-and are measurably inert in Blocksmith's 128-tall one (under vanilla's modern rule,
-nothing at all snows from altitude at this height; under the older rule, exactly one
-biome does, in its top four blocks) — they cannot be copied unchanged.
-
-**Added — snow that settles in layers**, up to exactly one block deep and no further,
-which is vanilla's own default `max_snow_accumulation_height` game rule, not a
-compromise. A single layer already has no collision and no light-blocking in modern
-vanilla, which is convenient: Blocksmith's mesher already has an 8-step partial-height
-block (used today for water's surface drop) that a one-layer snow block can reuse
-directly, and the existing `dayLevel` shader uniform (declared since v1.5.0, currently
-pinned to 1.0 specifically to wait for this version) means the entire day/night dimming
-behaviour is one float written per frame, with no remesh required.
-
-Full research, with sources and citations: `docs/research/sky-and-weather.md`.
-
-### v1.8.10 — Light — planned
-
-**Added.** Torches, with smooth lighting — gradients across a face, not a flat value per
-block. Particles where they are missing, starting with water splashing.
-
-**Changed.** Water bobbing returns, much calmer.
-
-**Added — a shaders option**, in the cheap sense: fake directional lighting, fake water
-reflection, not ray tracing or anything close to it. *A possible, not yet decided,
-console difference:* if it cannot hold a frame rate on an Old 3DS it is dropped rather
-than shipped badly, and if it ships at all it may end up a New 3DS-only option.
+**Notes.** The chunk pop-in reported against v1.8.7 is still not fixed here. The freeze fix
+is proven at the binary level — the compiled object now references the call that really
+waits, no longer the one that doesn't — but it has not been confirmed on real hardware,
+because that needs a 3DS.
 
 ### v1.8.11 — Caves — planned
 

@@ -178,6 +178,24 @@ size_t lightBytesUsed(void);   // budget bytes currently held by attached column
 bool lightFastEngineReady(void);
 int  lightSweepFallbacks(void);
 
+// v1.8.10. How many times the cross-column block-light handoff hit its recursion
+// depth cap (light.c's LIGHT_HANDOFF_MAX_DEPTH) rather than stopping on its own
+// because a pushed value no longer improved the next column. Expected to stay 0 in
+// every real fixture -- see light.c's lightHandoffBorders for the two independent
+// arguments that bound it well under the cap -- and exists so a deliberately built
+// long chain (tests/light_seam_test.c's testHandoffDepthCap) can prove the cap is
+// reachable rather than dead code, the same way lightSweepFallbacks proves the CAS
+// fallback above is reachable.
+int  lightHandoffCapped(void);
+void lightResetHandoffCappedForTest(void);
+
+// Overrides light.c's s_handoff_max_depth so a test can drive the handoff into its cap
+// with a small fixture instead of the 30-column chain the real 32-deep bound needs — the
+// same idiom lightFailEditQueueForTest below uses for the CAS/malloc-refusal fallback.
+// Call lightResetHandoffMaxDepthForTest() when done; nothing else restores it.
+void lightSetHandoffMaxDepthForTest(int depth);
+void lightResetHandoffMaxDepthForTest(void);
+
 // Test hooks. No block in the CORE registry declares a luminance — nothing emits in a
 // single-player world — and these exist so the suite can prove the block channel
 // end-to-end without inventing a gameplay feature.

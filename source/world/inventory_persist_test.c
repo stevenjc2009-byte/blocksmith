@@ -288,21 +288,27 @@ static void testEmptyInventoryRoundTrips(void)
  * the old build could store and one it could not. The first-invalid side is covered separately
  * below, since inventoryAdd() can never put one on disk in the first place — only a hand-built
  * file can, and only the loader's defence in depth stands between that file and a slot nothing
- * has validated. */
+ * has validated.
+ *
+ * Moved a second time, apple (26) -> torch (27), on 2026-09-02 by v1.8.10 "Light": exactly the
+ * predicted case fired — `!inventoryCanHold(BLOCK_APPLE + 1)` went red because id 27 is now
+ * BLOCK_TORCH, not an undefined row (inventoryCanHold() only checks defined-and-not-liquid, and
+ * the torch is neither undefined nor a liquid). Re-pointed again rather than patched, same
+ * reasoning as the first move. */
 static void testMaxValidItemIdRoundTrips(void)
 {
 	freshDir();
 
 	/* The premise, checked rather than assumed: these really are the two sides of the edge.
-	 * If a future row lands at 27 this goes red and the case gets re-pointed, instead of
+	 * If a future row lands at 28 this goes red and the case gets re-pointed, instead of
 	 * quietly testing the middle of the table while calling it the boundary. */
-	CHECK(inventoryCanHold((ItemId)BLOCK_APPLE));
-	CHECK(!inventoryCanHold((ItemId)(BLOCK_APPLE + 1)));
+	CHECK(inventoryCanHold((ItemId)BLOCK_TORCH));
+	CHECK(!inventoryCanHold((ItemId)(BLOCK_TORCH + 1)));
 
 	Inventory in;
 	inventoryInit(&in);
 	in.slots[0] = (InvSlot){ .item = BLOCK_LEAVES, .count = INV_STACK_MAX };  /* 6: the old top */
-	in.slots[1] = (InvSlot){ .item = BLOCK_APPLE,  .count = INV_STACK_MAX };  /* 26: the real one */
+	in.slots[1] = (InvSlot){ .item = BLOCK_TORCH,  .count = INV_STACK_MAX };  /* 27: the real one */
 
 	CHECK(inventorySave(&in, INV_DIR));
 	Inventory out;
@@ -311,7 +317,7 @@ static void testMaxValidItemIdRoundTrips(void)
 	CHECK(invEqual(&out, &in));
 	/* Spelled out as well as compared, so a failure says WHICH id was lost rather than only
 	 * that two structs differ. invEqual is the check; this is the error message. */
-	CHECK(out.slots[1].item == BLOCK_APPLE && out.slots[1].count == INV_STACK_MAX);
+	CHECK(out.slots[1].item == BLOCK_TORCH && out.slots[1].count == INV_STACK_MAX);
 }
 
 /* ── v1.8.8: the widened capacity, on disk ──────────────────────────────────────────────

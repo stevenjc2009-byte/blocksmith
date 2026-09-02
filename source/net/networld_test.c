@@ -2276,7 +2276,7 @@ static void test_registry_defs_converge(void)
 
     check(registryFind("wire_a") == REG_ID_DYN_LO && registryFind("wire_b") == REG_ID_DYN_LO + 1,
           "both defs landed under their consecutive ids");
-    check(registryCount() == 29, "count moved from 27 to 29 defined rows");
+    check(registryCount() == 30, "count moved from 28 to 30 defined rows");
     check(blockIsSolid(REG_ID_DYN_LO), "after sync the same id resolves to the real def");
     check(worldGet(&w, 5, 10, 7) == REG_ID_DYN_LO,
           "the stored raw byte needed no rewrite — tables agree around it");
@@ -2302,8 +2302,20 @@ static void test_registry_defs_converge(void)
      * 0xBDC5 this `!=` would still have passed — the converged table (core + 2 dynamic rows)
      * was never going to collide with either golden by chance — but it would have been proving
      * inequality against a fingerprint that is nobody's core-only table any more, which is
-     * exactly the silently-disarmed case this comment exists to name. */
-    check(registryCrc16() != 0xD236u,
+     * exactly the silently-disarmed case this comment exists to name.
+     *
+     * 0xD236 -> 0x165E on 2026-09-02 by v1.8.10's floor-standing torch (id 27, hardness 1,
+     * luminance 14, BLOCK_SHAPE_CROSS, REG_FLAG_TRANSPARENT|REG_FLAG_LUMINOUS, tex0=TILE_TORCH):
+     * one more 28-byte record appended (registryCount() moves 27 -> 28), same shape of move as
+     * the two above it. Measured, not guessed: a scratchpad probe linking the real
+     * world/registry.c + world/block.c calls registryInitCore() and prints registryCrc16(),
+     * printing `count=28 crc=0x165E`; a second probe linking only the vendored
+     * deps/blocksmith-server/game/world/registry.c printed the identical `count=28 crc16=0x165E
+     * rev=1`. Left at 0xD236 this `!=` would still have passed for the same reason as every prior
+     * move — the converged table was never going to collide with either golden by chance — but it
+     * would again be proving inequality against a fingerprint that is nobody's core-only table
+     * any more. */
+    check(registryCrc16() != 0x165Eu,
           "the converged table no longer hashes like the core-only one");
 }
 
@@ -2321,7 +2333,7 @@ static void test_registry_defs_malformed_dropped_whole(void)
 
     /* Short by one record byte: length-exact posture, drop without parsing. */
     networldApplyPayload(batch, len - 1);
-    check(registryCount() == 27 && registryFind("bad_a") == 0,
+    check(registryCount() == 28 && registryFind("bad_a") == 0,
           "a truncated DEFS applies nothing");
 
     /* Claiming more records than the sender's own cap can carry. */
@@ -2329,14 +2341,14 @@ static void test_registry_defs_malformed_dropped_whole(void)
     memcpy(greedy, batch, sizeof greedy);
     greedy[2] = BS_APP_REGISTRY_DEFS_MAX_N + 1u;
     networldApplyPayload(greedy, sizeof greedy);
-    check(registryCount() == 27, "an over-cap count is refused outright");
+    check(registryCount() == 28, "an over-cap count is refused outright");
 
     /* first below the dyn range would overwrite compiled-in core rows. */
     uint8_t hostile[BS_APP_REGISTRY_DEFS_BYTES(2)];
     memcpy(hostile, batch, sizeof hostile);
     hostile[1] = BLOCK_STONE;
     networldApplyPayload(hostile, sizeof hostile);
-    check(registryCount() == 27 && strcmp(blockInfo(BLOCK_STONE)->name, "stone") == 0,
+    check(registryCount() == 28 && strcmp(blockInfo(BLOCK_STONE)->name, "stone") == 0,
           "a batch aimed at the core range changes nothing");
 
     /* A record whose embedded id disagrees with its slot position: all-or-nothing. */
@@ -2344,7 +2356,7 @@ static void test_registry_defs_malformed_dropped_whole(void)
     memcpy(shuffled, batch, sizeof shuffled);
     shuffled[4] = REG_ID_DYN_LO + 1u;   /* record 0 claims id 0x81 */
     networldApplyPayload(shuffled, sizeof shuffled);
-    check(registryCount() == 27 && registryFind("bad_a") == 0 && registryFind("bad_b") == 0,
+    check(registryCount() == 28 && registryFind("bad_a") == 0 && registryFind("bad_b") == 0,
           "one inconsistent record refuses the WHOLE batch, not just itself");
 }
 
@@ -2403,51 +2415,57 @@ static void buildRegistryInfoFor(uint8_t *out /* BS_APP_REGISTRY_INFO_BYTES */,
     registryInitCore();
 }
 
-/* The twenty-seven core rows as world/block.h's own constants spell them, written out here so
+/* The twenty-eight core rows as world/block.h's own constants spell them, written out here so
  * the core-only fingerprint below can be DERIVED rather than recorded. This is deliberately not
  * read out of world/registry.c's kCoreDefs (it is static there anyway): a reference built from
  * the table under test would move whenever that table moved, and a pasted hash literal — which
  * is what this replaced — would pin whatever the table happened to hash to on the day it was
- * recorded, wrong answer included. Two independent spellings of the same twenty-seven rows can
+ * recorded, wrong answer included. Two independent spellings of the same twenty-eight rows can
  * disagree;
  * a number copied out of a run cannot.
  *
- * The fields the rows never vary are not listed: luminance is 0 on every core row, fluid_class
- * is REG_FLUID_NONE on every core row (water included — REG_FLAG_LIQUID is what makes it a
- * liquid, and Phase B is what will make fluid_class mean anything), and variant_of is the row's
- * own id, because a core row is its own variant base. registryInitCore() sets the last two
- * itself rather than taking them from the definition; coreOnlyCrc16() below says so in bytes. */
+ * The fields the rows never vary are not listed: fluid_class is REG_FLUID_NONE on every core row
+ * (water included — REG_FLAG_LIQUID is what makes it a liquid, and Phase B is what will make
+ * fluid_class mean anything), and variant_of is the row's own id, because a core row is its own
+ * variant base. registryInitCore() sets both itself rather than taking them from the definition;
+ * coreOnlyCrc16() below says so in bytes.
+ *
+ * luminance is 0 on every core row EXCEPT the torch (id 27, luminance 14 — its own dedicated
+ * block below, added 2026-09-02 by v1.8.10 "Light"). Before the torch this field never varied
+ * either and CoreRowSpec had no member for it; the struct grew a luminance field the day the
+ * first row needed one, rather than reserving it speculatively ahead of time. */
 typedef struct {
     uint8_t     id;
     const char *name;
     uint8_t     tex[BLOCK_FACES];
     uint8_t     flags;
     uint8_t     hardness;
+    uint8_t     luminance;   /* 0 for every row here except the torch's own entry below */
 } CoreRowSpec;
 
 static const CoreRowSpec kCoreRowSpecs[] = {
-    { 0, "air",   { 0, 0, 0, 0, 0, 0 }, REG_FLAG_TRANSPARENT, 0 },
+    { 0, "air",   { 0, 0, 0, 0, 0, 0 }, REG_FLAG_TRANSPARENT, 0, 0 },
     { 1, "grass", { BTEX_GRASS_SIDE, BTEX_GRASS_SIDE, BTEX_GRASS_TOP,
-                    BTEX_DIRT,       BTEX_GRASS_SIDE, BTEX_GRASS_SIDE }, REG_FLAG_SOLID, 12 },
+                    BTEX_DIRT,       BTEX_GRASS_SIDE, BTEX_GRASS_SIDE }, REG_FLAG_SOLID, 12, 0 },
     { 2, "dirt",  { BTEX_DIRT, BTEX_DIRT, BTEX_DIRT,
-                    BTEX_DIRT, BTEX_DIRT, BTEX_DIRT }, REG_FLAG_SOLID, 12 },
+                    BTEX_DIRT, BTEX_DIRT, BTEX_DIRT }, REG_FLAG_SOLID, 12, 0 },
     { 3, "stone", { BTEX_STONE, BTEX_STONE, BTEX_STONE,
-                    BTEX_STONE, BTEX_STONE, BTEX_STONE }, REG_FLAG_SOLID, 45 },
+                    BTEX_STONE, BTEX_STONE, BTEX_STONE }, REG_FLAG_SOLID, 45, 0 },
     { 4, "sand",  { BTEX_SAND, BTEX_SAND, BTEX_SAND,
-                    BTEX_SAND, BTEX_SAND, BTEX_SAND }, REG_FLAG_SOLID, 10 },
+                    BTEX_SAND, BTEX_SAND, BTEX_SAND }, REG_FLAG_SOLID, 10, 0 },
     { 5, "wood",  { BTEX_WOOD_SIDE, BTEX_WOOD_SIDE, BTEX_WOOD_TOP,
-                    BTEX_WOOD_TOP,  BTEX_WOOD_SIDE, BTEX_WOOD_SIDE }, REG_FLAG_SOLID, 40 },
+                    BTEX_WOOD_TOP,  BTEX_WOOD_SIDE, BTEX_WOOD_SIDE }, REG_FLAG_SOLID, 40, 0 },
     { 6, "leaves", { BTEX_LEAVES, BTEX_LEAVES, BTEX_LEAVES,
                      BTEX_LEAVES, BTEX_LEAVES, BTEX_LEAVES },
-      REG_FLAG_SOLID | REG_FLAG_TRANSPARENT, 4 },
+      REG_FLAG_SOLID | REG_FLAG_TRANSPARENT, 4, 0 },
     { 7, "planks", { BTEX_PLANKS, BTEX_PLANKS, BTEX_PLANKS,
-                     BTEX_PLANKS, BTEX_PLANKS, BTEX_PLANKS }, REG_FLAG_SOLID, 40 },
+                     BTEX_PLANKS, BTEX_PLANKS, BTEX_PLANKS }, REG_FLAG_SOLID, 40, 0 },
     { 8, "water",  { BTEX_WATER, BTEX_WATER, BTEX_WATER,
                      BTEX_WATER, BTEX_WATER, BTEX_WATER },
-      REG_FLAG_TRANSPARENT | REG_FLAG_LIQUID, 0 },
+      REG_FLAG_TRANSPARENT | REG_FLAG_LIQUID, 0, 0 },
     { 9, "tall_grass", { BTEX_TALL_GRASS, BTEX_TALL_GRASS, BTEX_TALL_GRASS,
                          BTEX_TALL_GRASS, BTEX_TALL_GRASS, BTEX_TALL_GRASS },
-      REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS), 1 },
+      REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS), 1, 0 },
 
     /* v1.8.3 Phase 3's five, ids 10..14. Transcribed from world/block.h's constants the
      * same way every row above was — deliberately NOT copied out of world/registry.c's
@@ -2466,17 +2484,17 @@ static const CoreRowSpec kCoreRowSpecs[] = {
      * Transcribed here from that intent, NOT read back out of world/registry.c — which is the
      * whole point of this list. */
     { 10, "snow",   { BTEX_SNOW, BTEX_SNOW, BTEX_SNOW,
-                      BTEX_SNOW, BTEX_SNOW, BTEX_SNOW }, REG_FLAG_SOLID, 8 },
+                      BTEX_SNOW, BTEX_SNOW, BTEX_SNOW }, REG_FLAG_SOLID, 8, 0 },
     { 11, "ice",    { BTEX_ICE, BTEX_ICE, BTEX_ICE,
-                      BTEX_ICE, BTEX_ICE, BTEX_ICE }, REG_FLAG_SOLID, 10 },
+                      BTEX_ICE, BTEX_ICE, BTEX_ICE }, REG_FLAG_SOLID, 10, 0 },
     { 12, "cactus", { BTEX_CACTUS, BTEX_CACTUS, BTEX_CACTUS,
-                      BTEX_CACTUS, BTEX_CACTUS, BTEX_CACTUS }, REG_FLAG_SOLID, 9 },
+                      BTEX_CACTUS, BTEX_CACTUS, BTEX_CACTUS }, REG_FLAG_SOLID, 9, 0 },
     { 13, "dead_bush", { BTEX_DEAD_BUSH, BTEX_DEAD_BUSH, BTEX_DEAD_BUSH,
                          BTEX_DEAD_BUSH, BTEX_DEAD_BUSH, BTEX_DEAD_BUSH },
-      REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS), 1 },
+      REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS), 1, 0 },
     { 14, "fern",   { BTEX_FERN, BTEX_FERN, BTEX_FERN,
                       BTEX_FERN, BTEX_FERN, BTEX_FERN },
-      REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS), 1 },
+      REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS), 1, 0 },
 
     /* v1.8.8's twelve, ids 15..26: per-biome timber and flora. Transcribed from
      * world/registry.c's kCoreDefs the same way every row above was — independently, from the
@@ -2486,40 +2504,53 @@ static const CoreRowSpec kCoreRowSpecs[] = {
      * the four flowers) — the floor mining.c holds every CROSS plant to already. */
     { 15, "birch_log", { BTEX_BIRCH_LOG_SIDE, BTEX_BIRCH_LOG_SIDE, BTEX_BIRCH_LOG_TOP,
                          BTEX_BIRCH_LOG_TOP,  BTEX_BIRCH_LOG_SIDE, BTEX_BIRCH_LOG_SIDE },
-      REG_FLAG_SOLID, 36 },
+      REG_FLAG_SOLID, 36, 0 },
     { 16, "birch_planks", { BTEX_BIRCH_PLANKS, BTEX_BIRCH_PLANKS, BTEX_BIRCH_PLANKS,
                             BTEX_BIRCH_PLANKS, BTEX_BIRCH_PLANKS, BTEX_BIRCH_PLANKS },
-      REG_FLAG_SOLID, 36 },
+      REG_FLAG_SOLID, 36, 0 },
     { 17, "birch_leaves", { BTEX_BIRCH_LEAVES, BTEX_BIRCH_LEAVES, BTEX_BIRCH_LEAVES,
                             BTEX_BIRCH_LEAVES, BTEX_BIRCH_LEAVES, BTEX_BIRCH_LEAVES },
-      REG_FLAG_SOLID | REG_FLAG_TRANSPARENT, 3 },
+      REG_FLAG_SOLID | REG_FLAG_TRANSPARENT, 3, 0 },
     { 18, "spruce_log", { BTEX_SPRUCE_LOG_SIDE, BTEX_SPRUCE_LOG_SIDE, BTEX_SPRUCE_LOG_TOP,
                           BTEX_SPRUCE_LOG_TOP,  BTEX_SPRUCE_LOG_SIDE, BTEX_SPRUCE_LOG_SIDE },
-      REG_FLAG_SOLID, 44 },
+      REG_FLAG_SOLID, 44, 0 },
     { 19, "spruce_planks", { BTEX_SPRUCE_PLANKS, BTEX_SPRUCE_PLANKS, BTEX_SPRUCE_PLANKS,
                              BTEX_SPRUCE_PLANKS, BTEX_SPRUCE_PLANKS, BTEX_SPRUCE_PLANKS },
-      REG_FLAG_SOLID, 44 },
+      REG_FLAG_SOLID, 44, 0 },
     { 20, "spruce_leaves", { BTEX_SPRUCE_LEAVES, BTEX_SPRUCE_LEAVES, BTEX_SPRUCE_LEAVES,
                              BTEX_SPRUCE_LEAVES, BTEX_SPRUCE_LEAVES, BTEX_SPRUCE_LEAVES },
-      REG_FLAG_SOLID | REG_FLAG_TRANSPARENT, 5 },
+      REG_FLAG_SOLID | REG_FLAG_TRANSPARENT, 5, 0 },
     { 21, "tall_grass_top", { BTEX_TALL_GRASS_TOP, BTEX_TALL_GRASS_TOP, BTEX_TALL_GRASS_TOP,
                               BTEX_TALL_GRASS_TOP, BTEX_TALL_GRASS_TOP, BTEX_TALL_GRASS_TOP },
-      REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS), 1 },
+      REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS), 1, 0 },
     { 22, "poppy", { BTEX_POPPY, BTEX_POPPY, BTEX_POPPY,
                     BTEX_POPPY, BTEX_POPPY, BTEX_POPPY },
-      REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS), 1 },
+      REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS), 1, 0 },
     { 23, "daisy", { BTEX_DAISY, BTEX_DAISY, BTEX_DAISY,
                     BTEX_DAISY, BTEX_DAISY, BTEX_DAISY },
-      REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS), 1 },
+      REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS), 1, 0 },
     { 24, "bluebell", { BTEX_BLUEBELL, BTEX_BLUEBELL, BTEX_BLUEBELL,
                         BTEX_BLUEBELL, BTEX_BLUEBELL, BTEX_BLUEBELL },
-      REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS), 1 },
+      REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS), 1, 0 },
     { 25, "orchid", { BTEX_ORCHID, BTEX_ORCHID, BTEX_ORCHID,
                      BTEX_ORCHID, BTEX_ORCHID, BTEX_ORCHID },
-      REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS), 1 },
+      REG_FLAG_TRANSPARENT | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS), 1, 0 },
     { 26, "apple", { BTEX_APPLE, BTEX_APPLE, BTEX_APPLE,
                     BTEX_APPLE, BTEX_APPLE, BTEX_APPLE },
-      REG_FLAG_SOLID, 2 },
+      REG_FLAG_SOLID, 2, 0 },
+
+    /* v1.8.10 "Light"'s torch, id 27: the first light source, and the first core row this list
+     * has ever needed a nonzero luminance field for — see the struct comment above. Transcribed
+     * from world/registry.c's own row comment (registry.c:517-543), not copied from its
+     * .luminance/.hardness fields: TRANSPARENT|LUMINOUS|SHAPE(CROSS), same as every other
+     * transparent CROSS plant above plus LUMINOUS; hardness 1, the shared floor every CROSS row
+     * in this table already carries (tall grass, dead bush, fern, tall_grass_top, the four
+     * flowers) so the torch reads as "instant, like every other plant" and not a block that was
+     * never given a break time; luminance 14, Minecraft's own torch light level and one step
+     * below this schema's 4-bit ceiling of 15. */
+    { 27, "torch", { BTEX_TORCH, BTEX_TORCH, BTEX_TORCH,
+                     BTEX_TORCH, BTEX_TORCH, BTEX_TORCH },
+      REG_FLAG_TRANSPARENT | REG_FLAG_LUMINOUS | REG_FLAG_SHAPE(BLOCK_SHAPE_CROSS), 1, 14 },
 };
 
 /* CRC-16/CCITT-FALSE, spelled out here rather than reached for in world/registry.c, so that the
@@ -2550,7 +2581,7 @@ static uint16_t coreOnlyCrc16(void)
         memcpy(&rec[1], row->name, strlen(row->name));
         memcpy(&rec[17], row->tex, BLOCK_FACES);
         rec[23] = row->flags;
-        rec[24] = 0;                                /* luminance: 0 on every core row */
+        rec[24] = row->luminance;                    /* 0 on every core row except the torch */
         rec[25] = row->hardness;
         rec[26] = row->id;                          /* variant_of: a base is its own root */
         rec[27] = REG_FLUID_NONE;
@@ -2649,7 +2680,7 @@ static void test_registry_fetch_retries_a_lost_reply(void)
     uint8_t partial[BS_APP_REGISTRY_DEFS_BYTES(2)];
     len = buildRegistryDefs(partial, REG_ID_DYN_LO, two, 2, false);   /* not the last */
     networldApplyPayload(partial, len);
-    check(registryCount() == 29, "the partial batch landed two rows");
+    check(registryCount() == 30, "the partial batch landed two rows");
     fake_sent_calls = 0;
     fakeNowAdvance(NETWORLD_REG_FETCH_RETRY_MS);
     networldUpdate();
@@ -2808,13 +2839,13 @@ static void test_registry_table_resets_between_sessions(void)
     uint8_t batch[BS_APP_REGISTRY_DEFS_BYTES(2)];
     size_t len = buildRegistryDefs(batch, REG_ID_DYN_LO, defs, 2, true);
     networldApplyPayload(batch, len);
-    check(registryCount() == 29 && registryFind("srv1_a") == REG_ID_DYN_LO,
+    check(registryCount() == 30 && registryFind("srv1_a") == REG_ID_DYN_LO,
           "the first server's two rows are in the table");
 
     /* netDisconnect() runs networldInit() (net/bsnet.c), which is the whole of leaving a
      * session as far as this module is concerned. */
     networldInit();
-    check(registryCount() == 27, "after leaving, only the twenty-seven core rows remain");
+    check(registryCount() == 28, "after leaving, only the twenty-eight core rows remain");
     check(registryFind("srv1_a") == 0 && registryFind("srv1_b") == 0,
           "the first server's names are gone, not merely hidden");
     check(registryCrc16() == coreOnlyCrc16(),
@@ -2840,7 +2871,7 @@ static void test_registry_table_resets_between_sessions(void)
     networldApplyPayload(batch2, len);
     check(registryFind("srv2_only") == REG_ID_DYN_LO,
           "the second server's row takes 0x80, which server one had been holding");
-    check(registryCount() == 28, "and it is the only dynamic row in the table");
+    check(registryCount() == 29, "and it is the only dynamic row in the table");
 }
 
 /* v1.6.0 F2, and the scenario the test directly above could not be: it calls networldInit()
@@ -2878,7 +2909,7 @@ static void test_registry_join_after_a_single_player_quit_to_title(void)
     check(registryRegister(&sp) == REG_ID_DYN_LO,
           "control: the single-player world's sidecar row is really in the table");
     registryFreeze();
-    check(registryFrozen() && registryCount() == 28,
+    check(registryFrozen() && registryCount() == 29,
           "control: and genStart() has frozen it, in single player exactly as in a session");
 
     /* Quit to title. This is the whole of it. */
@@ -2900,7 +2931,7 @@ static void test_registry_join_after_a_single_player_quit_to_title(void)
 
     check(registryFind("srv_blk") == REG_ID_DYN_LO,
           "the server's block is committed at 0x80 rather than refused by the stale freeze");
-    check(registryCount() == 28 && registryFind("sp_sidecar") == 0,
+    check(registryCount() == 29 && registryFind("sp_sidecar") == 0,
           "and it is the only dynamic row: the last world's is gone");
     /* The NAME is checked, not just "a defined solid row exists at 0x80". Against the stale
      * table the single-player world's own row was sitting in that slot, defined and solid, so
@@ -2944,7 +2975,7 @@ static void test_registry_terminator_alone_is_not_a_synced_table(void)
     const size_t tlen = buildRegistryDefs(term, REG_ID_DYN_LO, declared, 0, true);
     networldApplyPayload(term, tlen);
 
-    check(registryCount() == 27,
+    check(registryCount() == 28,
           "the terminator carried no records, so the table is still core-only");
     check(!networldRegistrySynced(),
           "and a table that cannot reproduce the server's crc16 is not a synced table");
@@ -3010,7 +3041,7 @@ static void test_registry_terminator_alone_is_not_a_synced_table(void)
     uint8_t batch[BS_APP_REGISTRY_DEFS_BYTES(2)];
     const size_t blen = buildRegistryDefs(batch, REG_ID_DYN_LO, declared, 2, true);
     networldApplyPayload(batch, blen);
-    check(registryCount() == 27, "the frozen table refused the batch, per registry.h's contract");
+    check(registryCount() == 28, "the frozen table refused the batch, per registry.h's contract");
     check(!networldRegistrySynced(),
           "and a refused batch's LAST flag does not turn the indicator healthy");
 
@@ -3029,7 +3060,7 @@ static void test_registry_terminator_alone_is_not_a_synced_table(void)
     networldApplyPayload(wi, sizeof wi);
 
     networldApplyPayload(batch, blen);
-    check(registryCount() == 29, "the unsolicited batch's rows did land in the table");
+    check(registryCount() == 30, "the unsolicited batch's rows did land in the table");
     check(!networldRegistrySynced(),
           "but with no INFO there is no fingerprint, so nothing is verified");
 
@@ -3053,7 +3084,7 @@ static void test_registry_sync_is_proved_by_the_fingerprint(void)
     uint8_t all[BS_APP_REGISTRY_DEFS_BYTES(3)];
     size_t alen = buildRegistryDefs(all, REG_ID_DYN_LO, declared, 3, true);
     networldApplyPayload(all, alen);
-    check(registryCount() == 30, "all three declared rows landed");
+    check(registryCount() == 31, "all three declared rows landed");
     check(networldRegistrySynced(), "and the table reproduces the server's whole fingerprint");
     check(!networldRegistryWaiting(), "which releases world entry immediately");
 
@@ -3063,7 +3094,7 @@ static void test_registry_sync_is_proved_by_the_fingerprint(void)
     uint8_t two[BS_APP_REGISTRY_DEFS_BYTES(2)];
     const size_t twolen = buildRegistryDefs(two, REG_ID_DYN_LO, declared, 2, true);
     networldApplyPayload(two, twolen);
-    check(registryCount() == 29, "two of the three rows landed");
+    check(registryCount() == 30, "two of the three rows landed");
     check(!networldRegistrySynced(),
           "a short delivery is not a synced table however the LAST flag is set");
     fake_sent_calls = 0;
@@ -3079,7 +3110,7 @@ static void test_registry_sync_is_proved_by_the_fingerprint(void)
     uint8_t wrong[BS_APP_REGISTRY_DEFS_BYTES(3)];
     const size_t wlen = buildRegistryDefs(wrong, REG_ID_DYN_LO, impostor, 3, true);
     networldApplyPayload(wrong, wlen);
-    check(registryCount() == 30, "three rows landed, so rev and count both agree");
+    check(registryCount() == 31, "three rows landed, so rev and count both agree");
     check(registryFind("fp_X") == REG_ID_DYN_LO + 2u, "with the third row under its own name");
     check(!networldRegistrySynced(),
           "but the crc16 disagrees, so this is not the server's table and not synced");
@@ -3111,7 +3142,7 @@ static void test_registry_sync_is_proved_by_the_fingerprint(void)
 
     alen = buildRegistryDefs(all, REG_ID_DYN_LO, declared, 3, true);
     networldApplyPayload(all, alen);
-    check(registryCount() == 30, "control: the rows landed exactly as in the passing case");
+    check(registryCount() == 31, "control: the rows landed exactly as in the passing case");
     check(!networldRegistrySynced(), "but a foreign table revision is never verifiable");
 }
 
@@ -3210,7 +3241,7 @@ static void test_registry_mismatch_refuses_instead_of_degrading(void)
     const size_t wlen = buildRegistryDefs(wrong, REG_ID_DYN_LO, impostor, 3, true);
     networldApplyPayload(wrong, wlen);
 
-    check(registryCount() == 30,
+    check(registryCount() == 31,
           "control: three rows landed, so the server's count is reproduced exactly");
     check(!networldRegistrySynced(),
           "control: and only the crc16 disagrees — this is the same-count, wrong-content case");

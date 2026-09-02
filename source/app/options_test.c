@@ -119,6 +119,9 @@ static void testDefaultsInRange(void)
 	// default would be indistinguishable from a bug to the player holding the hardware
 	// volume slider.
 	CHECK(o.audio_volume == OPTIONS_AUDIO_VOL_DEFAULT);
+	// v1.8.10 shaders option: off by default, same reasoning as debug_menu — a new visual
+	// effect must never turn on for a player who never opened the options page.
+	CHECK(o.fake_shading == false);
 
 	// Every default binding must be a real, known key, and the defaults must reproduce the
 	// controls the game shipped with before this step existed — see options.c's
@@ -155,6 +158,7 @@ static void testRoundTrip(void)
 	// 0.4 is exactly representable in binary32, so == below is a real equality test and
 	// not a tolerance dressed up as one.
 	out.audio_volume       = 0.4f;
+	out.fake_shading        = true;
 	for (int i = 0; i < ACTION_COUNT; i++)
 		out.bindings[i] = OPTIONS_VALID_KEYS[(i + 3) % OPTIONS_VALID_KEY_COUNT];
 
@@ -170,6 +174,7 @@ static void testRoundTrip(void)
 	CHECK(in.invert_look == out.invert_look);
 	CHECK(in.look_sensitivity == out.look_sensitivity);
 	CHECK(in.audio_volume == out.audio_volume);
+	CHECK(in.fake_shading == out.fake_shading);
 	for (int i = 0; i < ACTION_COUNT; i++)
 		CHECK(in.bindings[i] == out.bindings[i]);
 
@@ -204,12 +209,13 @@ static void testMalformedFallsBackAndCounted(void)
 		"render_dist=notanumber\n"
 		"invert_look=maybe\n"
 		"look_sensitivity=\n"
+		"fake_shading=maybe\n"
 		"bind.jump=0xDEADBEEF\n"));   // syntactically a number, but not a real key bit
 
 	Options o;
 	int bad = -1;
 	CHECK(optionsLoad(&o, path, &bad));
-	CHECK(bad == 4);
+	CHECK(bad == 5);
 
 	// Every malformed field falls back to its default rather than being left half-set.
 	Options def;
@@ -217,6 +223,7 @@ static void testMalformedFallsBackAndCounted(void)
 	CHECK(o.render_dist == def.render_dist);
 	CHECK(o.invert_look == def.invert_look);
 	CHECK(o.look_sensitivity == def.look_sensitivity);
+	CHECK(o.fake_shading == def.fake_shading);
 	CHECK(o.bindings[ACTION_JUMP] == def.bindings[ACTION_JUMP]);
 }
 
@@ -269,6 +276,7 @@ static void testMissingFileGivesDefaults(void)
 	CHECK(o.invert_look == def.invert_look);
 	CHECK(o.look_sensitivity == def.look_sensitivity);
 	CHECK(o.audio_volume == def.audio_volume);
+	CHECK(o.fake_shading == def.fake_shading);
 	for (int i = 0; i < ACTION_COUNT; i++)
 		CHECK(o.bindings[i] == def.bindings[i]);
 }
