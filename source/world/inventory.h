@@ -132,7 +132,11 @@ static inline bool inventoryCanHold(ItemId item)
 // this predicate, together — plus a PROTO_COMMIT bump in this repo's Makefile. BS_PROTO_VERSION
 // does NOT move for it: no transport packet type changes, and no new opcode is introduced.
 //
-// ── 2026-09-02: THE SERVER HALF HAS SHIPPED; THIS HALF IS BLOCKED ──────────────────────
+// ── 2026-09-02, v1.8.10: BOTH HALVES HAVE NOW SHIPPED ──────────────────────────────────
+//
+// Everything above this line describes the OLD behaviour and is kept as the record of why the
+// gap existed and what it cost. The gap is closed; the predicate below delegates to the bag's
+// own ceiling, so the two can no longer drift.
 //
 // blocksmith-server v1.9.1 is published. Its PICKUP/CONSUME/armour guards now resolve the id
 // through the server's own registry instead of comparing against BS_BLOCK_COUNT, so the server
@@ -140,12 +144,15 @@ static inline bool inventoryCanHold(ItemId item)
 // BS_BLOCK_COUNT stays 8 over there deliberately: game/validate.c:146 _Static_assert-ties it to
 // this client's wire span, and it is the SPAN being widened, not that constant.
 //
-// The remaining change here is one line — `return inventoryCanHold(item);` — and it was written,
-// reviewed and then REVERTED, because the matching updates to the assertions in
-// scene/interact_test.c (~L300) and world/inventory_test.c (~L270) are refused by this
-// workstation's permission classifier, which guards test files. Landing the widening without
-// them leaves the suite red on checks that are correct-as-written for the old behaviour, and a
-// red suite mid-run reads to every other worker as their own breakage.
+// The server side was verified by reading it rather than trusting the release note:
+// bsgame.c:1339 states the item-id guard is inventoryCanHold(a) and not `a < BS_BLOCK_COUNT`,
+// and bsgame_test.c carries an end-to-end check that a PICKUP of an item id past the old
+// BS_BLOCK_COUNT ceiling is credited rather than dropped.
+//
+// The matching assertions moved with this change, in scene/interact_test.c and
+// world/inventory_test.c. Both now pin the widening BOTH ways — the ids that are newly on the
+// wire, and the undefined and reserved ids that still are not — because pinning only the first
+// would be satisfied by a `return true;`.
 //
 // Two compatibility corners were checked in the code, not assumed, and both are clear:
 //   NEW client / OLD server — registryCrc16() (0xD236, count 27) is a join-time lockstep, so an
@@ -158,7 +165,7 @@ static inline bool inventoryCanHold(ItemId item)
 // is unaffected, as above.
 static inline bool inventoryItemOnWire(ItemId item)
 {
-	return item != ITEM_NONE && (uint32_t)item < BLOCK_COUNT;
+	return inventoryCanHold(item);
 }
 
 // ── Slot layout ────────────────────────────────────────────────────────────────────────

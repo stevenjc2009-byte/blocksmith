@@ -294,13 +294,29 @@ static void testTheCarryCeilingIsWhereItSays(void)
 	CHECK(inventoryCanHold((ItemId)dyn));                // was FALSE before v1.8.8
 	CHECK(!inventoryCanHold((ItemId)0xFF));              // reserved, never a row
 
-	// The WIRE span is a SEPARATE and much smaller ceiling, and it did NOT move. This is the
-	// gap the report has to name: the bag holds every defined row, but only ids below
-	// BLOCK_COUNT can be named in a BS_INV_OP_PICKUP that an unpatched server will accept.
-	CHECK(inventoryItemOnWire((ItemId)BLOCK_PLANKS));    // 7, the last id on the wire
-	CHECK(!inventoryItemOnWire((ItemId)BLOCK_WATER));    // 8, one past it
-	CHECK(!inventoryItemOnWire((ItemId)BLOCK_CACTUS));   // carryable, NOT sendable
+	// v1.8.10: the WIRE span now tracks the registry too, so it is the SAME ceiling as the
+	// bag's rather than a smaller one. Landing it needed the server half first, and that has
+	// shipped: deps/blocksmith-server is on v1.9.1, whose bsgame.c guards a PICKUP with
+	// inventoryCanHold(a) rather than `a < BS_BLOCK_COUNT`, and whose own suite carries an
+	// end-to-end check that "a PICKUP of an item id past the old BS_BLOCK_COUNT ceiling is
+	// credited, not dropped". Before that, a broken cactus vanished on a multiplayer rejoin.
+	//
+	// BLOCK_COUNT itself has NOT moved and must not: it is the frozen core-id span, tied by a
+	// _Static_assert in the server's game/validate.c. What moved is the predicate, not the
+	// constant.
+	CHECK(inventoryItemOnWire((ItemId)BLOCK_PLANKS));    // 7, the last CORE id
+	CHECK(inventoryItemOnWire((ItemId)BLOCK_CACTUS));    // past the core span, carryable AND
+	                                                     // now sendable — this is the widening
+	CHECK(!inventoryItemOnWire((ItemId)BLOCK_WATER));    // 8, past the span but a LIQUID: the
+	                                                     // bag will not hold it, so neither will
+	                                                     // the wire. Being one past BLOCK_COUNT
+	                                                     // is no longer what decides this.
 	CHECK(!inventoryItemOnWire(ITEM_NONE));
+	// Still refused, and these are the checks that keep the widening honest: the predicate
+	// tracks what the REGISTRY defines, so an undefined id and the reserved row stay off the
+	// wire. Without these two a `return true;` would pass everything above.
+	CHECK(!inventoryItemOnWire((ItemId)REG_ID_DYN_HI));  // never registered by this suite
+	CHECK(!inventoryItemOnWire((ItemId)0xFF));           // reserved, never a row
 }
 
 // ── the defect ──────────────────────────────────────────────────────────────────────────

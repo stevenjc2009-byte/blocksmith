@@ -78,7 +78,7 @@ static char s_first[160];
 // loop-ran counters, the 3 boundary checks, the 2 exclusions, the 6 dynamic-id calls, the 2
 // wire-span calls — is a fixed count untouched by how many rows the registry defines, so the
 // whole delta is the loop body: +12. 212 + 12 = 224.
-#define INVENTORY_TEST_EXPECTED_CHECKS 224
+#define INVENTORY_TEST_EXPECTED_CHECKS 226
 
 // Deliberately NOT routed through CHECK(): this must not perturb the number it is testing,
 // so it bumps s_fails only. It fills s_first (with both numbers, so the one-line summary is
@@ -265,10 +265,15 @@ static void testTheBagTakesEveryDefinedBlock(void)
 	registryInitCore();
 	CHECK(!inventoryCanHold((ItemId)dyn));
 
-	// The WIRE span is a separate and much smaller ceiling, and it did NOT move. Pinned here
-	// so the two are never conflated again: the bag holds a cactus, the wire cannot name one.
+	// v1.8.10: the wire span now tracks the registry, the same ceiling the bag uses, so the
+	// cactus the bag holds can also be named on the wire. Pinned here BOTH ways — the widened
+	// case and the still-refused case — because a `return true;` would satisfy the first alone.
+	// Note `dyn` was un-registered by the registryInitCore() above, so it is a genuinely
+	// undefined id at this point rather than merely a high one.
 	CHECK(inventoryItemOnWire((ItemId)BLOCK_PLANKS));
-	CHECK(!inventoryItemOnWire((ItemId)BLOCK_CACTUS));
+	CHECK(inventoryItemOnWire((ItemId)BLOCK_CACTUS));
+	CHECK(!inventoryItemOnWire((ItemId)dyn));
+	CHECK(!inventoryItemOnWire(ITEM_NONE));
 }
 
 static void testAddMergesIntoPartialStack(void)
