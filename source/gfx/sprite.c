@@ -19,13 +19,26 @@ typedef struct {
 // takes a fresh region (see spriteFrameBegin in the header for why they cannot share one),
 // so this has to cover all of them added together.
 //
-// 1024 is not a guess. The worst frame the game can draw is: the bottom screen's full
-// inventory grid — 9x5 slots, each a panel quad plus an icon quad plus up to two digits of
-// count, so 45 * 4 = 180 quads — plus its background, hotbar and a line or two of text,
-// call it 220; plus the top screen's name tags, which are one quad per character at
-// NETWORLD_MAX_REMOTE (15) players and 11 characters a label, so 165; and the top screen is
-// drawn TWICE when the 3D slider is up, so the tags count double. 220 + 330 = 550, and 1024
-// leaves not quite 2x headroom on a frame that has never actually occurred.
+// 1024 is not a guess. The inventory figure below was WRONG until v1.8.7 — it said "9x5 slots,
+// 45 slots, 180 quads", a grid this game has never had. The real one is world/inventory.h's
+// INV_SLOT_COUNT of 24: an 8-slot hotbar plus an INV_MAIN_COLS x INV_MAIN_ROWS main grid of
+// 8x2 = 16. Correcting it makes the budget LARGER, not smaller, which is why the error was
+// harmless and also why it survived — an over-estimate of the worst case never overflows.
+//
+// The worst frame the game can draw, recounted against the real layout: the bottom screen with
+// the inventory overlay open is 24 slot panels, at most one four-quad "picked" border, up to two
+// count digits a slot, 24 icon quads in the atlas pass and the crafting panel's four rows and
+// title — under 200 all together (gfx/font.c emits one quad per PRINTABLE NON-SPACE character,
+// so the text is cheaper than its length suggests). On top of that the pause menu, and over it
+// the remap or debug screen, are each their own pass on the same screen: call the bottom screen
+// 450. The top screen is the name tags — one quad per character at NETWORLD_MAX_REMOTE (15)
+// players and 11 characters a label, so 165 — plus a four-quad reticle, and it is drawn TWICE
+// when the 3D slider is up, so 338. That is roughly 790 of 1024 for a frame that has never
+// actually occurred, and it is arithmetic over the draw sites rather than a measurement.
+//
+// Deliberately NOT shrunk to fit that. A UI redesign is planned for v1.8.19 and shrinking a
+// constant now in order to grow it again later is churn against the one buffer in this file
+// whose overflow silently draws one batch's geometry in another's place.
 //
 // The cost is 1024 * 4 * 24 = 96 KB of linear memory, up from 48 KB. That is affordable
 // against a measured app heap of 0.26-0.49 MB in a 12.00 MB cap, and it is the cheap half
@@ -46,8 +59,6 @@ static bool          s_ready;
 static int      s_base;           // first quad slot this frame's pending batch owns
 static int      s_quads;          // pending, not yet submitted, counted from s_base
 static C3D_Tex* s_tex;            // currently bound
-static int      s_draws, s_total_quads;
-static int      s_overflows;
 
 static C3D_Mtx s_projection;
 
@@ -133,7 +144,6 @@ static void flush(void)
 	GSPGPU_FlushDataCache(&s_verts[s_base * 4], (size_t)s_quads * 4u * sizeof(SpriteVertex));
 
 	C3D_DrawElements(GPU_TRIANGLES, s_quads * 6, C3D_UNSIGNED_SHORT, &s_indices[s_base * 6]);
-	s_draws++;
 	s_base += s_quads;
 	s_quads = 0;
 }
@@ -141,7 +151,6 @@ static void flush(void)
 void spriteFrameBegin(void)
 {
 	s_base = 0;
-	s_overflows = 0;
 }
 
 void spriteBegin(int w, int h)
@@ -149,8 +158,6 @@ void spriteBegin(int w, int h)
 	if (!s_ready) return;
 
 	s_quads = 0;
-	s_draws = 0;
-	s_total_quads = 0;
 	s_tex = NULL;
 
 	C3D_BindProgram(&s_program);
@@ -225,20 +232,17 @@ void spriteQuad(float x, float y, float w, float h,
 	if (!s_ready) return;
 
 	// Flushing rather than dropping. A dropped quad is a hole in the UI that nothing
-	// reports; an extra draw call is a number that shows up in spriteDrawCount() and can
-	// be traced back to whoever is drawing a whole buffer's worth of quads.
+	// reports; an extra draw call is only an extra draw call.
 	//
 	// Wrapping past the end is the one case with no good answer: the frame has asked for
 	// more quads than exist, and every slot from here on is still claimed by a batch the
 	// GPU has not drawn yet. Wrapping keeps drawing (a wrong picture) where refusing would
-	// silently lose a screen of UI, and spriteOverflowCount() is what makes the difference
-	// visible instead of mysterious.
+	// silently lose a screen of UI. v1.8.7 removed the counter that used to record it — see
+	// gfx/sprite.h on why, and on what putting one back would have to involve.
 	if (s_base + s_quads >= SPRITE_MAX_QUADS) {
 		flush();
-		if (s_base >= SPRITE_MAX_QUADS) {
+		if (s_base >= SPRITE_MAX_QUADS)
 			s_base = 0;
-			s_overflows++;
-		}
 	}
 
 	SpriteVertex* v = &s_verts[(s_base + s_quads) * 4];
@@ -253,7 +257,6 @@ void spriteQuad(float x, float y, float w, float h,
 	v[3] = (SpriteVertex){x,  y1, 0.0f, u0, v1, colour};
 
 	s_quads++;
-	s_total_quads++;
 }
 
 void spriteRect(float x, float y, float w, float h, uint32_t colour)
@@ -283,7 +286,3 @@ void spriteEnd(void)
 {
 	flush();
 }
-
-int spriteDrawCount(void) { return s_draws; }
-int spriteQuadCount(void) { return s_total_quads; }
-int spriteOverflowCount(void) { return s_overflows; }

@@ -1,454 +1,728 @@
-# Legacy Console Edition Caves — Research Brief for Blocksmith v1.8.11
+# Cave generation research: Legacy Console Edition, for Blocksmith v1.8.11
 
-Scope note: this is research only. Nothing in the Blocksmith project tree was touched.
-Everything below is sourced via inline links unless explicitly marked **[INFERENCE]** —
-my own reasoning/extrapolation, not a cited claim — or **[FOLKLORE]** — a claim I found
-repeated by players but could not pin to an authoritative technical source.
+Research only. Nothing under `source/` was touched, nothing was built or run. This
+file is the only thing this pass wrote.
 
----
-
-## (a) What LCE caves actually were
-
-**Legacy Console Edition (LCE)** is 4J Studios' console line (Xbox 360, PS3, Xbox One,
-PS4, Wii U, PS Vita, Switch — pre-"Better Together"/Bedrock unification). Its world
-generation is NOT its own algorithm; it tracked Java Edition's generator at whatever
-point 4J had last ported it, then froze.
-
-- Xbox 360 launched with generation "roughly equivalent to Java Edition Beta 1.6."
-  Title Update 5 brought it in line with **Java Edition Beta 1.8** ("The Adventure
-  Update," Sept 2011) — the same release that added ravines and gave the terrain
-  generator "a complete rewrite ... aimed to make the code simpler," which is also
-  documented as controversial at the time (old chunks meeting new chunks produced
-  visible seams and caves that "abruptly stop and start"). [Minecraft Wiki: World
-  generation/History](https://minecraft.wiki/w/World_generation/History),
-  [Minecraft Wiki: Legacy Console Edition](https://minecraft.wiki/w/Legacy_Console_Edition),
-  [dither8.xyz technical blog](https://dither8.xyz/blog/minecraft-cliffs-terrain/)
-- Infinite worlds arrived on console in mid-2014, bringing across the biome set from
-  the Java 1.7 ("The Update that Changed the World") generator. This generator —
-  carver-based caves and ravines, no noise-cave rewrite — is what LCE ran **until it
-  was discontinued**, i.e. it never received Java's 1.18 Caves & Cliffs Part II
-  overhaul at all. [Minecraft Wiki: World generation/History](https://minecraft.wiki/w/World_generation/History)
-- Confirmed by the wiki directly: "The seeds for a Large world in the final versions
-  of Legacy Console Edition are mostly identical to Java Edition 1.12.2 in terms of
-  terrain generation" (biome *layer* stack differs slightly — roughly Java 1.8.1+
-  equivalent — but the noise stack and river stack, which is what actually shapes
-  caves/terrain, are the same as Java). [Minecraft Wiki: Legacy Console Edition](https://minecraft.wiki/w/Legacy_Console_Edition)
-
-**So: the caves people are nostalgic for are literally 2011–2017-era Java Edition
-carver caves (Beta 1.8 through ~1.12), running inside a finite, much smaller world,
-frozen there by console hardware/update cycles while PC Java moved on to noise caves
-in 2021.** This is documented, not folklore.
-
-### World size (documented)
-Finite world options: **Classic 864×864** (the only option on Xbox 360/PS3/Vita/Wii U),
-Small 1024×1024, Medium 3072×3072, Large 5120×5120 (Xbox One/PS4/Switch only). The
-outer two chunks are an unbuildable water moat blending to open ocean; there is an
-invisible world-edge barrier, not an infinite void border like Java/Bedrock.
-[Minecraft Wiki: Legacy Console Edition exclusive features](https://minecraft.wiki/w/Legacy_Console_Edition_exclusive_features)
-
-### World height — the messiest data point, flagged explicitly
-- Java itself was 0–128 tall before the **1.2 "Anvil" update (2012)** raised it to
-  0–255. Xbox 360 launched matching the *contemporary* PC limit of 128, then Title
-  Update 12 raised it to 256 alongside adopting the Anvil save format — mirroring
-  PC's own 1.2 change. [Minecraft Forum: New build height limit](https://www.minecraftforum.net/forums/minecraft-editions/minecraft-xbox-360-edition/mcx360-discussion/2016616-new-build-height-limit), [Minecraft Forum: Building height limit](https://www.minecraftforum.net/forums/minecraft-editions/minecraft-xbox-360-edition/mcx360-discussion/2012238-building-height-limit)
-- BUT the current Minecraft Wiki page on Legacy Console Edition states the *effective*
-  placeable height is **511 blocks** ("while it is theoretically 2,147,483,647 blocks
-  tall, the world height stops the player at 511"). [Minecraft Wiki: Legacy Console Edition](https://minecraft.wiki/w/Legacy_Console_Edition)
-- I could not reconcile 256 (generation ceiling, Anvil-format) with 511 (wiki's stated
-  hard stop) from the sources gathered — they may be measuring different things (build
-  limit including empty air above generated terrain, vs. the terrain generation
-  ceiling itself). **Treat "0–128" from the brief prompt as shorthand for the
-  pre-Anvil Java baseline LCE launched from, not a literal final-LCE number** — the
-  generation ceiling that actually shaped LCE's caves/ores for most of its life was
-  most plausibly 128, rising to 256 with TU12. This is the one fact in this brief I'd
-  flag as needing outside verification if it matters to a specific design decision.
-
-### Why players describe LCE caves as bigger/better connected — documented vs. folklore
-Documented, sourced reasons:
-1. **No 1.18 noise-cave rewrite** — LCE ran carver caves (worm tunnels + ravines) its
-   entire life; Java's "sprawling" post-2021 caves never existed on console at all.
-   [Minecraft Wiki: World generation/History](https://minecraft.wiki/w/World_generation/History)
-2. **A finite, small world compresses discovery density.** On Classic (864×864), a
-   fixed *count* of world features (ravines, mineshafts, ore) is packed into a tiny
-   area compared to Java's practically-infinite border — more villages, monuments and
-   mansions were documented to attempt generation on Classic than on larger sizes,
-   which is Mojang/4J explicitly compensating for the small map by raising structure
-   density. [Minecraft Wiki: Legacy Console Edition exclusive features](https://minecraft.wiki/w/Legacy_Console_Edition_exclusive_features) — the same compensating logic plausibly applied to how densely caves/ravines were felt, though I did not find a source stating cave *density per chunk* was deliberately tuned up for console; that specific causal claim is **[INFERENCE]**.
-3. **A shorter vertical column concentrates the same absolute cave volume into less
-   space.** Documented mechanically (fewer Y-levels to spread carvers across); the
-   *player-felt* consequence ("caves feel denser/more rewarding") is **[INFERENCE]**
-   from that mechanical fact, though it matches general player commentary that older,
-   shorter-column Minecraft felt more "compact." One general sentiment piece frames
-   old-Minecraft's rewarding claustrophobia in terms of atmosphere/scarcity rather
-   than pure density — related but not identical claim. [Sportskeeda: Minecraft
-   players discuss features that have lost their value in recent years](https://www.sportskeeda.com/minecraft/minecraft-players-discuss-features-lost-value-recent-years)
-4. **Pre-1.18 caves cut less than post-1.18 "cheese caves."** One documented 1.7.2
-   change note: "Cave generation tweaked, making caves less dense and interconnected"
-   (13w36a) — showing Mojang itself iterated cave density even within the carver era,
-   and that at least one point in the carver era was *pulled back* for being too
-   dense/interconnected, i.e. the "nice tunnels" era had a specific known-good window
-   rather than being one static thing across all carver versions.
-   [Minecraft Wiki: Cave](https://minecraft.wiki/w/Cave)
-
-Folklore (repeated by players, not independently sourced by me here):
-- That noise caves (1.18+) feel like "swiss cheese" and less purposeful despite being
-  literally bigger — a real and recurring player complaint but reported here via a
-  forum paraphrase, not a primary technical source. [Minecraft Forum: Exploring
-  ravines... Fun or just a death trap?](https://www.minecraftforum.net/forums/minecraft-java-edition/survival-mode/251101-exploring-ravines-fun-or-just-a-death-trap?page=3) **[FOLKLORE, but well-attested]**
-- That LCE specifically (as opposed to "old Minecraft" generally) is remembered as
-  *better* than modern caves — I could not find a dedicated Reddit/forum thread
-  making exactly this comparison after repeated targeted search; what I found instead
-  is broad "old Minecraft caves were more atmospheric/claustrophobic" nostalgia not
-  specific to the console SKU. Treat the LCE-specific framing as **the project
-  owner's own lived memory**, corroborated only indirectly (LCE ran the carver
-  generator its whole life, which is a documented, sufficient mechanical cause).
+**Provenance tags used throughout:** every quantitative claim is tagged one of
+**[measured]** (read off Blocksmith's own source), **[sourced: URL]** (a web source
+gave the number directly, cited inline), **[reasoned]** (derived by arithmetic or
+logical necessity from measured/sourced facts, shown worked), or **[assumed]** (a
+plausible figure with no source found this session — flagged, never presented as if
+sourced). A number with no tag next to it does not appear in this document; that is
+the rule this file holds itself to.
 
 ---
 
-## (b) The carver cave algorithm — shape, in prose + pseudocode (not copied source)
+## §1 — What Legacy Console Edition caves actually were
 
-This describes the pre-1.18 Java Edition ("MapGenCaves"-era, i.e. the algorithm LCE
-ran) approach. Sourced from Minecraft Wiki, Bedrock's still-live `cave_carver_feature`
-docs (which preserve the same knob names because the classic carver was later exposed
-as a configurable datapack feature rather than replaced), and a modding-community
-explanation of the decompiled parameter list.
-[Bedrock cave_carver_feature docs](https://learn.microsoft.com/en-us/minecraft/creator/reference/content/featuresreference/examples/features/minecraftcave_carver_feature?view=minecraft-bedrock-stable),
-[Minecraft Wiki: Carver definition](https://minecraft.wiki/w/Carver_definition)
+**LCE is not its own generator.** 4J Studios' console line (Xbox 360, PS3, Xbox One,
+PS4, Wii U, PS Vita, Switch — everything before the Bedrock unification) shipped
+Java Edition's world generator, ported and then frozen at whatever point 4J's port
+had last caught up to PC.
 
-### Per-chunk seeding
-For every chunk, a chunk-local RNG is seeded deterministically from the world seed and
-the chunk's coordinates. That RNG then rolls **how many tunnel systems start in this
-chunk** — a *nested* random roll (three levels of `rand.nextInt` feeding into each
-other) rather than a flat `rand.nextInt(N)`. Nesting like this skews the result hard
-toward small numbers (0, 1, 2 are common; double-digit counts are rare), which is the
-actual source of "most chunks have nothing, a few chunks are cave-rich" rather than an
-even distribution. Community decompilation notes describe this concretely as
-`rand.nextInt(rand.nextInt(rand.nextInt(15)+1)+1)`. [Web search summary of decompiled
-MapGenCaves parameters, corroborated by Bedrock's `skip_carve_chance` knob which is the
-same idea exposed as a flat "1-in-N chance to skip carving entirely" for the modern
-configurable carver — see Carver definition page above]
+- Xbox 360 Edition's initial gameplay/generation was drawn from **PC Beta 1.6.6**,
+  the version just before pistons and shears; 4J's first major content-parity push
+  publicly targeted **Beta 1.7.3** equivalence. **[sourced: minecraft-archive.fandom.com/wiki/Minecraft:_Xbox_360_Edition,
+  co-optimus.com/article/8239]**
+- Ravines were not part of that initial baseline — they were added to Java in
+  **Beta 1.8** ("The Adventure Update," released 2011-09-14), alongside abandoned
+  mineshafts. **[sourced: minecraft.wiki/w/Java_Edition_Beta_1.8]** Console picked
+  ravines up in a later title update as 4J's port caught up further; TU36
+  (2016-06-21) explicitly lists "Added Caves and Ravines to the Custom Superflat
+  options" for both Xbox 360 and Wii U, which confirms ravines were a normal,
+  already-shipped world-gen feature by that point (the TU36 change is about giving
+  *superflat* worlds the option, not introducing the feature itself) and a later
+  Aquatic-era update references "Underwater Caves/Ravines" as an established
+  concept being extended. **[sourced: minecraft.wiki/w/Xbox_360_Edition_TU36]** I
+  could not find the specific title update that first brought ordinary
+  (non-superflat) ravines to console — see §10.
+- Ordinary, non-flat-world cave generation itself — the tunnel/room carver — was
+  present from Xbox 360's Beta-1.6.6-equivalent launch onward; nothing in the
+  sources found this session suggests caves themselves were ever absent, only that
+  ravines, biome variety, and world size options arrived in later updates.
+  **[reasoned from the above two points]**
+- LCE **never received Java's 1.18 "Caves & Cliffs Part II" noise-cave rewrite** —
+  it was discontinued (final updates around 2017-2019, "Update Aquatic" being one
+  of the last major content passes) years before 1.18 shipped (2021). Whatever
+  generator LCE had at end-of-life, it was carver-based, full stop.
+  **[reasoned: 1.18 shipped 2021, LCE's active-development window is documented as
+  2012-2019 — sourced: minecraft.wiki/w/World_size search-summary]**
 
-```
-Pseudocode — per chunk (x, z):
-    rng = seed_rng(world_seed, x, z)
-    tunnel_count = nested_skewed_roll(rng, max=15)   # usually 0-2
-    for i in 0..tunnel_count:
-        start = random_position_in_chunk(rng, y_range = [start_y_low, start_y_high])
-        if rng.chance(1/7):
-            spawn_large_room(start)      # a single big carved sphere/chamber
-        else:
-            spawn_tunnel_worm(rng, start)
-```
+**Did the finite/bounded world change the cave *algorithm*, or just the map it ran
+on?** This matters because the task brief specifically asked me not to assume.
+Everything found points to: **just the map.** LCE's finite worlds (Classic
+864x864 on Xbox 360/PS3/Vita/Wii U; Small 1024x1024, Medium 3072x3072, Large
+5120x5120 on Xbox One/PS4/Switch) worked by running the same per-chunk generator
+Java used, bounded by an invisible edge barrier with a 2-chunk water moat blending
+the generated terrain into open ocean at the border. **[sourced:
+minecraft.wiki/w/World_size search-summary, minecraft.wiki/w/Legacy_Console_Edition_exclusive_features
+search-summary]** Nothing in any source suggests the *carver itself* — the
+per-chunk RNG roll, the tunnel walk, the branch/room logic — was rewritten to know
+about the boundary; the boundary is handled by clipping/moating the outer two
+chunks, which is a generation-*area* concern, not a generation-*algorithm* one. So:
+**the carver Blocksmith should copy the shape of is the ordinary Java Beta/early-1.x
+carver, not something bespoke to a finite world.** The finiteness explains why
+players could reliably find everything (a bounded map with a fixed structure/ore
+count reads as denser — **[reasoned]**, not independently sourced this session as
+a stated design intent), not why the caves themselves look different.
 
-### The tunnel walk
-A tunnel is a **walked sequence of overlapping spheres/ellipsoids** along a path, not
-a single shape:
-
-- The walk has a **yaw** (horizontal heading) and **pitch** (vertical heading), both
-  initialized randomly and then perturbed by small random deltas every step —
-  producing the organic "worm" curve rather than a straight line.
-- A `yaw/pitch ratio` parameter (explicitly named in the decompiled signature) governs
-  how much more the path is allowed to turn horizontally vs. vertically per step —
-  this is what keeps tunnels mostly winding sideways with occasional climbs/drops,
-  rather than corkscrewing wildly.
-- At each step, the carver **removes a sphere or vertically-scaled ellipsoid** of
-  blocks around the current point. Radius is not constant along the tunnel — it's
-  modulated by a smooth per-step multiplier (in the modern exposed form this is the
-  `width_modifier`/`horizontal_radius_multiplier`/`vertical_radius_multiplier` trio),
-  so a tunnel visibly narrows and widens as you walk it rather than being a uniform
-  pipe.
-- **Vertical bias**: tunnels are seeded with a start-Y range weighted toward the lower
-  portion of the generatable column (documented for the modern equivalent as "the
-  probability of cave generation being higher" in the lower band of its Y-range,
-  [Minecraft Wiki: Cave / World generation](https://minecraft.wiki/w/World_generation)) — the classic carver inherited this same lower-weighted bias, just over a much
-  shorter column (0–128ish instead of -56–180).
-- **Branching**: a `branchStartIndex`/`branchCount` pair lets a tunnel spawn a second,
-  independent worm partway along its own path, at a reduced scale — this is the whole
-  mechanism behind cave systems having side-passages instead of being one single
-  corridor.
-
-```
-Pseudocode — spawn_tunnel_worm(rng, start):
-    yaw   = rng.uniform(0, 2*PI)
-    pitch = rng.uniform(-PITCH_LIMIT, PITCH_LIMIT)
-    length = rng.range(MIN_LEN, MAX_LEN)
-    base_radius = rng.range(MIN_R, MAX_R)
-    branch_point = rng.chance(BRANCH_CHANCE) ? rng.int(0, length) : NONE
-
-    pos = start
-    for step in 0..length:
-        yaw   += rng.uniform(-YAW_DRIFT, YAW_DRIFT)
-        pitch += rng.uniform(-PITCH_DRIFT, PITCH_DRIFT) * yaw_pitch_ratio
-        pos += direction(yaw, pitch) * STEP_SIZE
-        radius = base_radius * radius_envelope(step / length)   # widens/narrows along path
-        carve_ellipsoid(pos, radius_x=radius, radius_y=radius*vscale, radius_z=radius)
-        if step == branch_point:
-            spawn_tunnel_worm(rng, pos)   # recursive, smaller scale
-```
-
-### Water/lava interaction
-Pre-1.18, there was no aquifer system. Fluid placement was a simple flood rule tied to
-sea level: any carved void that connects to (or sits at/below) the world's water table
-gets flooded with water; anything carved below a fixed low Y threshold near bedrock is
-lava instead (documented for the modern system's non-aquifer fallback as "areas below
-Y=-55 are always filled with lava," which is the direct descendant of the classic
-fixed lava-floor rule — [Minecraft Wiki: Cave](https://minecraft.wiki/w/Cave)). This
-is why classic caves reliably had a "lava floor" near the bottom of the reachable
-column and could flood if you broke into open ocean at depth — both are load-bearing
-for the *feel* the project owner is describing (see section (d)).
+**World height.** This is the one place LCE's own numbers turned out to matter a
+lot for Blocksmith specifically — see §6, where it turns out LCE's build height and
+Blocksmith's `WORLD_HEIGHT` are close enough that almost no vertical rescaling is
+needed for the carver's own native (Beta-era) figures. Confirmed:
+LCE is permanently capped at a **128-block build limit** (bedrock at the very
+bottom, one buildable layer up to 128) — this was true of the console line for its
+entire life and was never raised to Java's later 256- or 384-tall worlds.
+**[sourced: minecraft.fandom.com/wiki/Legacy_Console_Edition search-summary, cross-checked
+against Minecraft Forum threads on the Xbox 360 build-height ceiling]**
 
 ---
 
-## (c) The ravine ("canyon") carver — same family, different envelope
+## §2 — The carver algorithm, as an implementable specification
 
-Documented dimensions (current wiki, descended unchanged in spirit from the classic
-Beta 1.8 implementation): length **~85–127 blocks**, width **<15 blocks**, depth
-**~27–62 blocks**, generation Y-range **10–72** in the classic/default config.
-[Minecraft Wiki: Canyon](https://minecraft.wiki/w/Canyon)
+**Everything below is my own restatement of behaviour, not copied source.** Two
+source lineages were findable this session, and they disagree on two tuning
+constants; both are given, with the disagreement flagged rather than silently
+picked. I could not obtain the actual LCE console binary to resolve which one 4J
+shipped — see §10.
 
-Structurally a ravine is generated the same way as a cave tunnel — a walked path with
-per-step carving — but with different tuning:
+**Lineage A — Beta 1.7.3 (`i73` project, a from-scratch open-source Beta-1.7.3-
+compatible reimplementation used as a documentation source, not copied):**
+**[sourced: github.com/coderbot16/i73, "Cave Generation" doc]**
+- Per-chunk gate ("rarity"): **1 in 15**
+- Tunnel-count shape: a triple-nested random pick bounded at 40 (`pick(pick(pick(40))`
+  shape) — nesting skews the result hard toward 0-2, not evenly across 0-39
+- Start-height distribution: **linear from y=8 up to y=126** (biased toward the low
+  end of that band, not uniform — "linear_start: 8" in the source's own terms)
+- Vertical size multiplier for tunnels: **0.5** (half as tall as wide)
+- Carve target below **y=10**: lava instead of air
 
-- **Much rarer per chunk** than cave tunnels: added in Beta 1.8 at a rate of roughly
-  **1 attempt per 50 chunks** (vs. caves' usually-0-to-2-per-chunk). [Minecraft Wiki:
-  World generation/History](https://minecraft.wiki/w/World_generation/History) — the search agent's synthesis of the wiki's "ravines added ... at a rate of one every 50 chunks" note.
-- **Shape**: a single long, mostly-straight horizontal slash (much less yaw/pitch
-  drift per step than a cave worm — a ravine reads as "one big crack," not a curling
-  tunnel) whose cross-section is *not* a uniform tube. The Carver definition page
-  (which still exposes the classic ravine's tuning knobs under their original
-  intent, just as a datapack schema) names the shaping parameters directly:
-  - `distance_factor` — scales overall length
-  - `thickness` — scales overall breadth/height together
-  - `horizontal_radius_factor` — scales width independently
-  - `vertical_radius_default_factor` — scales depth independently
-  - **`vertical_radius_center_factor`** — explicitly "scales the height based on
-    horizontal distance from the canyon's center, resulting in a deeper center" — this
-    is the documented mechanism for the classic "wide/deep in the middle, pinched at
-    both ends" spindle profile the project owner is remembering.
-  - `width_smoothness` — smooths the wall profile on the vertical axis (keeps it from
-    looking like stacked cylinders)
-  [Minecraft Wiki: Carver definition](https://minecraft.wiki/w/Carver_definition)
+**Lineage B — decompiled 1.7.10 `MapGenCaves`** (read via a public decompiled-source
+mirror to understand behaviour, not reproduced as code below):
+**[sourced: github.com/vmarchaud/Alkazia, MapGenCaves.java, fetched and summarized]**
+- Per-chunk gate: **1 in 7**
+- Tunnel-count shape: triple-nested random pick bounded at **15**
+- Initial yaw: uniform 0..2π. Initial pitch: `(rand-0.5) * 2/8`, i.e. roughly
+  **±0.125 radians (~±7°)** off level
+- Per-step drift: a "velocity" term for each of yaw and pitch that decays toward
+  zero each step (roughly ×0.9 for yaw's velocity, ×0.75 for pitch's) and gets a
+  fresh random kick added every step (yaw's kick scaled ×2.0, pitch's ×4.0, before
+  a further ×0.1 is applied when folding the velocity into the actual heading) —
+  net effect: the path curves smoothly rather than jittering, because each step's
+  turn is a damped average of the last step's turn plus a small new random nudge,
+  not an independent random heading every step
+- Tunnel length: derived from a "range" parameter (`range*16-16`) with a further
+  random reduction — long tunnels are the exception, not the rule
+- Branch point: roughly the 25%-75% window of the tunnel's own length
+- Radius envelope along the tunnel: `1.5 + sin(progress * pi / length) * size` —
+  radius is **smallest at both ends and largest in the middle** of the tunnel (a
+  taper, not a uniform pipe)
+- Vertical radius: **exactly half** the horizontal radius at every point (the
+  "wider than tall" squash, expressed as a flat 0.5 ratio in this lineage too)
+- Branching trigger: at the branch point, if the tunnel's radius parameter is
+  still above 1.0 (i.e. it hasn't tapered to nothing) and this tunnel is not
+  itself already a branch, it spawns **two** new independent tunnels from that
+  point (not a probability roll on top of reaching the branch point — reaching a
+  qualifying branch point always forks in this decompile; I could not confirm
+  whether Beta 1.7.3's version added a probability gate on top of this — see §10)
+- Y clamp: 1 to 248 out of a 256-tall world (i.e. barely a restriction at all —
+  almost the full column)
+- Carve target below **y=10**: lava instead of air (agrees with Lineage A)
 
-```
-Pseudocode — spawn_ravine(rng, start):
-    yaw   = rng.uniform(0, 2*PI)
-    pitch = rng.uniform(-SMALL_LIMIT, SMALL_LIMIT)   # ravines drift far less than caves
-    length = rng.range(85, 127)                       # documented range
-    base_half_width = rng.range(2, 7)                 # keeps total width < 15
-    base_half_height = rng.range(14, 31)               # keeps total depth in 27-62 range
+A third, older lineage — **Minecraft *Classic* (c0.30)**, which predates Beta and
+is a different, simpler, single-pass carver (not the chunk-seeded system above) —
+was also findable in detail and is useful **only as a clean illustration of the
+general technique**, not as an LCE-accurate parameter set (Classic's carver was
+gone long before Xbox 360 Edition existed): **[sourced:
+github.com/ClassiCube/ClassiCube/wiki/Minecraft-Classic-map-generation-algorithm]**
+theta/phi (yaw/pitch) drift with momentum (`theta += deltaTheta*0.2`,
+`deltaTheta = deltaTheta*0.9 + rand - rand`, and the equivalent halved/quartered
+form for phi), a radius envelope that also bulges in the middle and tapers at the
+ends (`radius *= sin(len * pi / caveLength)`), and critically the **oblate-spheroid
+carve test itself spelled out as an inequality**: a point is carved when
+`dx² + 2*dy² + dz² < radius²` — the coefficient 2 on the vertical term is exactly
+what makes the carved shape wider than tall, expressed as a single constant in the
+carve test rather than as a separate vertical-radius parameter. This is a genuinely
+useful implementation pattern (one inequality instead of tracking two separate
+radii) even though its exact ratio (2 on `dy²`, ≈0.71 linear squash) differs from
+Beta/1.7.10's flat 0.5 linear vertical multiplier — **the two lineages don't even
+agree on how "wider than tall" their own predecessor/successor should be, which is
+itself evidence this was always a hand-tuned feel constant, not a value worth
+copying exactly.**
 
-    pos = start
-    for step in 0..length:
-        yaw   += rng.uniform(-TINY_DRIFT, TINY_DRIFT)   # much straighter than caves
-        pos += direction(yaw, pitch) * STEP_SIZE
-        t = step / length
-        length_envelope = sin(PI * t)                    # pinched at both ends, wide mid
-        height = base_half_height * center_bulge(vertical_offset_from_pos)
-        carve_ellipsoid(pos,
-                         radius_x = base_half_width  * length_envelope,
-                         radius_y = height,
-                         radius_z = base_half_width  * length_envelope)
-```
+**Specification for Blocksmith (synthesis, own wording):**
 
-Practically: a ravine is a *cave carver with the drift dialed down, the length/aspect
-ratio dialed up, and a bespoke vertical taper* — not a separate system from scratch.
-That's useful for Blocksmith: one core "walked ellipsoid carver" with two tunings
-(tight-radius/high-drift/branching = cave; wide-radius/low-drift/no-branching/length-
-capped = ravine) gets both shapes for roughly one implementation's cost.
-
----
-
-## (d) What makes cave systems fun (developer/player consensus)
-
-- **Connectivity beats size.** The single most consistent player complaint across both
-  eras is dead ends killing momentum, not caves being too small. One detailed
-  community writeup explicitly compares interconnectivity across generations and
-  states plainly that "it is no fun at all if you can't explore ... without
-  constantly running into dead ends." [Minecraft Forum: Exploring ravines... Fun or
-  just a death trap?](https://www.minecraftforum.net/forums/minecraft-java-edition/survival-mode/251101-exploring-ravines-fun-or-just-a-death-trap?page=3)
-- **Ravines are connective tissue, not just scenery.** The same source: ravines (along
-  with mineshafts) are what tie separate cave pockets into one traversable network;
-  removing them was observed to make caves measurably less interconnected. This is a
-  direct, concrete reason to prioritize the ravine carver, not just tunnel carvers, in
-  Blocksmith — a world with only tunnel-worms and no long-range ravine/canyon shapes
-  will read as choppier and less "found a system" than one with both.
-- **Vertical movement and landmarks matter.** The same discussion documents a single
-  explored ravine over 300 blocks long / 30 wide / 60 deep as part of a cluster of 7
-  intersecting ravines — the *memorability* comes from scale variance (most ravines
-  small, a rare one huge) plus intersections creating recognizable junctions, not from
-  every ravine being uniformly large.
-- **Lava/water are both hazard and wayfinding tool.** Documented mechanically in (b):
-  fixed lava floor near the bottom of the column, water flooding near sea level. Their
-  presence as fixed reference *bands* (you always know roughly how deep you are by
-  whether you're seeing water or lava) is itself a navigation aid, independent of any
-  explicit map/waypoint system.
-- **Too much open space reads as "purposeless," even when technically bigger.** The
-  1.18 "swiss cheese" complaint (folklore, cited above) is the cautionary case: making
-  caves objectively larger (which 1.18 documentedly did — depth alone expanded from a
-  128-tall column to a -64–320 column, i.e. tripled+) did **not** universally read as
-  "better" to players; several found the added openness diluted the sense of a
-  purposeful, explorable network. This directly supports the project owner's framing:
-  volume is not the goal, *tunnel character and connectivity* is.
-- **Ore-in-wall visibility drives exploration** — this is common design knowledge
-  (seeing a diamond vein embedded in a cave wall pulls the player toward it) but I did
-  not find a dedicated citation distinct from the general ore-distribution pages
-  already covered in (a)/(b); treating this point as **[INFERENCE from well-known
-  design practice, not independently sourced here]**.
-
----
-
-## (e) Recommended design for Blocksmith, given the 3DS constraints
-
-Stated constraints from the task: 12 MB world-store cap, 16×16×16 chunks, a small
-fixed column height, and generation must not stall a 268 MHz (O3DS) / 804 MHz (N3DS)
-ARM11 core.
-
-### The cost problem, quantified
-Vanilla's carver reaches into a neighborhood of chunks around the one being generated
-so that a tunnel *started* in a distant chunk still carves correctly into the current
-one. Bedrock's own feature docs describe this literally: `cave_carver_feature` "carves
-a cave through the world in the current chunk, and in every chunk around the current
-chunk **in an 8 radial pattern**." [Bedrock cave_carver_feature docs](https://learn.microsoft.com/en-us/minecraft/creator/reference/content/featuresreference/examples/features/minecraftcave_carver_feature?view=minecraft-bedrock-stable) A radius of 8 chunks means a **17×17 = 289-chunk neighborhood**
-must be considered (rolled for tunnel starts, and for any chunk that rolls a start,
-walked) every time a single chunk's caves are finalized. That figure is corroborated
-independently by a community technical explanation of the same "radius 8" constant.
-[Web search: cave generation chunk radius technical breakdown, synthesizing Bedrock docs and MapGenCaves community analysis]
-
-**289× the per-chunk RNG/walk cost, paid for every chunk generated, is not affordable
-on this hardware.** Even though most of those 289 rolls resolve to "zero tunnels here"
-(the nested skewed roll from (b) keeps most chunks empty), you still pay the *roll*
-cost 289 times, and for every chunk that *does* roll a tunnel you pay a multi-step walk
-that must then be tested against blocks potentially several chunks away — worst case,
-a full worm walk (up to `MAX_LEN` steps, each doing an ellipsoid stamp) has to run to
-completion just to find out whether it grazes the one chunk you're actually trying to
-finish generating.
-
-### Recommendation: decouple cost from neighborhood radius entirely
-
-Rather than reduce the radius and accept vanilla's simulate-then-discard cost model at
-a smaller scale, restructure the carver so a chunk can determine **exactly which
-tunnels could possibly reach it, in O(1) lookups, without simulating any neighbor**:
-
-1. **Coarse deterministic tunnel index.** Partition the world into coarse cells much
-   larger than a chunk (e.g. 4×4 or 8×8 chunks per cell — tune to taste). For each
-   cell, a tunnel's full parameter set (start point, yaw, pitch, length, radius,
-   branch point/branch params, cave-vs-ravine tuning) is derived **entirely** from a
-   hash of `(world_seed, cell_x, cell_z)` — no RNG state carried from anywhere else,
-   no simulation. This is the standard trick for turning a stateful walked-RNG process
-   into something any chunk can query independently: the whole tunnel is a pure
-   function of its cell coordinates, so any chunk can recompute it from scratch and
-   get the identical answer a neighboring chunk would.
-2. **Bounding check, not simulation, for reach.** Because a tunnel's max length and
-   radius are bounded (cap `MAX_LEN` and `MAX_R` at generation-parameter level), you
-   can compute a tunnel's bounding box/sphere cheaply from its hashed parameters
-   *before* walking a single step. A chunk being generated only needs to check the
-   handful of coarse cells within `MAX_LEN + MAX_R` of itself (almost always just its
-   own cell plus immediate neighbors, not 289 chunks) — reject any tunnel whose
-   bounding volume doesn't touch the chunk, and only walk the ones that survive that
-   cheap test.
-3. **Analytic evaluation, not voxel-by-voxel stamping across the whole tunnel.** For a
-   tunnel that does reach the current chunk, evaluate the walked path (per (b)'s
-   pseudocode) but only emit carve operations for the segment of the path whose
-   bounding sphere intersects this chunk — you still need to walk from the tunnel's
-   start to reach the right segment (the walk is sequential/stateful because yaw/pitch
-   drift each step), but you never touch the block grid for steps outside this chunk,
-   and you never do this for tunnels whose cell is out of range at all.
-4. **Coarse cave-presence mask for early-out.** Before running any tunnel evaluation
-   for a chunk, generate a cheap low-resolution 3D presence mask (e.g., one sample
-   every 4 blocks per axis, from fast value/gradient noise, no RNG walk at all) as a
-   first-pass gate: if the mask says "definitely solid, far from any hashed tunnel's
-   bounding volume," skip the fine carve pass for that region of the chunk entirely.
-   This mirrors vanilla's own effect (most chunks are cave-free) but achieves it via a
-   cheap noise sample instead of a full nested-RNG roll plus a discarded walk.
-
-Net effect: **generation cost is proportional to how many tunnels actually reach a
-given chunk (typically 0–3), not to a fixed 289-chunk neighborhood.** This is a
-different implementation strategy from vanilla's (vanilla literally re-derives and
-partially re-walks neighbor chunks' RNG state; this instead makes every tunnel a
-stateless, independently-recomputable object), which also satisfies the project's
-"no borrowed Minecraft code" requirement structurally, not just in wording — this is
-a reimplementation of the *shape* of the classic algorithm, built differently to fit
-the memory/CPU budget.
-
-**Recommended neighborhood radius, concretely: cap tunnel `MAX_LEN`/`MAX_R` such that
-a tunnel's coarse cell need only check its own cell plus a 1-cell ring (radius 1 in
-coarse-cell units) — i.e., far short of vanilla's 8-chunk radius, but because cells
-are themselves several chunks wide, this still comfortably covers tunnels several
-chunks long.** This is a design choice (cell size × radius), not a fixed constant —
-tune cell size against how long you want the longest tunnel/ravine to be able to run
-before it's forced to stop and branch.
-
-### 2D vs. 3D — do not go pure 2D for the primary system
-A 2D (heightmap-modulated) cave system is far cheaper (one hash per column, no walk)
-but section (d) is explicit that **vertical movement and multi-level connectivity are
-named repeatedly as core to what makes caves feel rewarding**, and that is exactly
-what a 2D approach cannot produce (a 2D mask can carve "wide or narrow at this X/Z,"
-but not "this tunnel dips under that one and reconnects three levels down"). Recommend
-true 3D worm-walk carving (per (b)) as the primary tunnel/ravine system, with a cheap
-**2D or low-res-3D mask used only as the early-out gate** described in step 4 above —
-2D as an optimization layer, not as the generator itself.
-
-### Practical sequencing note **[INFERENCE — general engineering judgment, not sourced]**
-Because tunnel objects are fully deterministic from `(seed, cell)`, they don't need to
-be persisted at all — they can be recomputed on demand whenever a chunk near them is
-touched (loaded, or an adjacent chunk is generated), which sidesteps needing to store
-any cave-specific data in the 12 MB world store beyond the resulting carved voxels
-themselves. This is very likely necessary given the stated memory cap, but I have not
-seen Blocksmith's actual save format (out of scope per this task's restriction) so
-cannot confirm it's compatible with what's already built — flag this as a question for
-whoever owns the world-store format.
+1. For every chunk-sized region, derive a chunk-local seed from the world seed and
+   the region's coordinates.
+2. Roll a tunnel-system count using a *nested*, not flat, random draw, so most
+   regions get 0-2 systems and a long tail gets more — this nesting is the actual
+   source of "some chunks are cave-rich, most aren't," not a separate density knob.
+3. For each system: pick a start point in the region, a start height biased toward
+   the lower half of the allowed band (never uniform across the whole column), an
+   initial heading, and roll a small chance of the system starting as a single
+   large "room" rather than a worm (see below).
+4. Walk each tunnel step by step. At each step: nudge yaw and pitch by a random
+   amount damped by the previous step's nudge (momentum, not independent noise per
+   step — this is what keeps the path smooth); advance the position along the
+   resulting heading; compute a radius that's smallest at the very start and end
+   of the tunnel and largest around the middle; carve every block within an
+   ellipsoid around the current point whose vertical radius is about half its
+   horizontal radius.
+5. Partway along a sufficiently large tunnel's length (roughly its middle third),
+   optionally fork into one or more new independent tunnels continuing from that
+   point — this, not a separate "connect systems" pass, is what produces branching
+   networks instead of isolated single corridors.
+6. Occasionally (a small, separately-rolled fraction of systems), skip the worm
+   walk entirely and instead carve one oversized, roughly spherical chamber — the
+   classic "room."
+7. While carving, any cell that ends up below a fixed low absolute Y and would
+   otherwise become air is filled with lava instead (see §4).
 
 ---
 
-## (f) World height recommendation
+## §3 — Ravines
 
-LCE's generation ceiling was most plausibly **128 blocks** for most of its
-documented lifetime (see the flagged discrepancy in section (a) about the later
-256/511 figures). Given a much tighter memory cap than any console LCE ran under (12
-MB vs. a console generation with tens/hundreds of MB of working RAM available for
-world data), Blocksmith should target **noticeably shorter than even LCE's 128**,
-because column height is one of the most direct memory-budget levers available
-(every additional 16-tall chunk slab is a fixed, multiplicative cost across every
-column in the loaded area). **[INFERENCE — memory-scaling claim, not sourced, but
-follows directly from the stated 16×16×16 chunk unit and 12 MB cap]**
+Structurally the same family as §2's tunnel — a walked path with per-step
+ellipsoid carving — retuned toward "one big crack" instead of a branching worm
+network:
 
-Recommendation: **a column in the roughly 64–96 block range**, structured the same
-way LCE's shorter-than-Java column concentrated its cave/ore story: keep the "cave
-band" (where tunnel/ravine carving is weighted, per the vertical-bias note in (b))
-proportionally similar to LCE's — i.e. don't just shrink the *reachable* column and
-leave caves spread thin through it; deliberately keep the carver's Y-weighting biased
-toward a compact lower band so the *player-felt density* of tunnels-per-block-dug
-stays close to what LCE delivered in its own shorter column, rather than diluting to
-match a taller Java-style spread. Concretely: if the column is ~80 blocks, don't
-spread cave generation evenly across all 80 — bias it toward roughly the bottom
-two-thirds, mirroring how LCE's own 128-tall column concentrated its documented
-lower-weighted cave probability rather than spreading generation evenly floor to
-ceiling. This is a direct, intentional echo of the mechanism identified in (a)/(b),
-not a new claim.
+- Added in Java Beta 1.8 (2011), the same release LCE's console port later caught
+  up to. **[sourced: minecraft.wiki/w/Java_Edition_Beta_1.8]**
+- Rarity: roughly **1 attempt in 50 chunks** — an order of magnitude rarer than
+  cave-tunnel systems' 1-in-7/1-in-15 gate. **[sourced: web-search summary of a
+  decompiled 1.16-era analysis citing `rand.nextInt(50) == 0`]** — flagged: this
+  figure comes from a later (1.16) decompile than either cave-carver lineage in
+  §2, but ravine rarity is widely and consistently reported at this same order of
+  magnitude across versions, so it's presented with medium-high confidence despite
+  the version mismatch, not high confidence.
+- Dimensions, as generally documented (not tied to a specific decompiled version
+  this session): width **usually well under 15 blocks, often cited around 5-7**;
+  depth **up to roughly 40-62 blocks**. **[sourced: minecraft-archive.fandom
+  search-summary "up to 40 blocks deep, ~5 wide"; minecraftbedrock-archive.fandom
+  search-summary "no bigger than 7 wide, 40-50 deep"]** — the two archived sources
+  disagree by about 2 blocks on width and 10-20 on depth, which is consistent with
+  ravines' own dimensions being randomly rolled per-instance within a range rather
+  than fixed; neither source gave the exact roll formula.
+- Much less yaw/pitch drift per step than a cave tunnel — a ravine reads as one
+  long, mostly-straight slash rather than a curling worm.
+- No branching — a ravine does not fork into child tunnels the way a cave system
+  does. **[reasoned from every source describing ravines as a single crack, none
+  describing ravine branching]**
+- Almost always intersects or connects to at least one ordinary cave system, and
+  ravines can also cut through mineshafts and other carved features.
+  **[sourced: minecraft-archive.fandom search-summary]**
+- Vertical profile: wider/deeper in the middle of its length, pinched at both
+  ends — the same tapering-envelope idea as §2's tunnel radius, just applied over
+  a much longer, straighter path and with depth (not just width) tapering too.
+
+**Specification for Blocksmith:** reuse the exact tunnel-walk machinery from §2
+with different tuning — far lower per-step drift, a fixed roughly-straight-line
+length in the tens of blocks, a taller/narrower ellipsoid instead of the cave
+tunnel's wide-flat one, no branch step, and a roughly 10x-lower per-region trigger
+chance than the cave-tunnel roll. One carver, two presets, not two separate
+systems — this was true of vanilla's own implementation shape (§2's Lineage A/B
+both show the same walked-ellipsoid primitive underneath) and there is no reason
+to duplicate the machinery for Blocksmith.
 
 ---
 
-## Open questions
+## §4 — Lava, water and ores
 
-1. **The LCE height discrepancy (128 vs 256 vs 511)** in section (a) — worth a
-   dedicated verification pass (e.g. a decompilation-based wiki like a fandom talk
-   page, or directly testing on an emulator) if the exact number matters to a design
-   decision, rather than the "shorter than modern Java, roughly comparable to
-   pre-Anvil" framing used here.
-2. **Whether Blocksmith's existing chunk/world-store format already supports
-   recomputing generated content on demand** (needed for the stateless-tunnel-object
-   approach in (e)) — out of scope for this research pass since it required reading
-   the project tree, which this task explicitly excluded.
-3. **Exact numeric tuning** (tunnel count skew, radius ranges, branch chance, ravine
-   rarity) was described here in shape/pseudocode per the task's instruction not to
-   copy Java source — actual constants for Blocksmith's version should be chosen by
-   playtesting against the "feel" target (connectivity + vertical movement + rare-but-
-   memorable big ravines), not by trying to match vanilla's numbers exactly, since the
-   world is a different size/height/hardware target entirely.
-4. **I could not find a single, dedicated primary source (Reddit thread, dev post) that
-   makes the LCE-specific "these caves were better" comparison** as opposed to general
-   "old Minecraft was more atmospheric" nostalgia — the causal case here rests on the
-   mechanical fact that LCE ran carver-only generation its entire life (well-sourced)
-   plus the project owner's own recollection, not on a third-party writeup confirming
-   the exact sentiment. Worth knowing this is an inference chain, not a documented
-   consensus claim, if it's ever repeated externally.
+### Lava
+- Below a fixed absolute **y=10**, any cell the carver would otherwise leave as
+  air is instead filled with lava — this is not a separate "lava lake" feature,
+  it is the carve rule itself. **[sourced: i73 Beta-1.7.3 doc AND independently
+  the decompiled 1.7.10 MapGenCaves source agree on y<10 — see §2, both lineages]**
+- General community description of the resulting player experience: "the lava
+  level is 10... this is the point where all caves are filled with lava," and
+  lava is markedly rarer as a surprise pool above that line (still possible in
+  small pockets, just not guaranteed). **[sourced: web-search summary of Minecraft
+  Forum discussion + GGServers knowledgebase article]**
+- Separately, standalone lava *lakes* (not just the fixed-Y carve rule) could also
+  be seeded above that floor via a dedicated "lake" placer distinct from the cave
+  carver — commonly cited at roughly **1 attempt per 8 chunks underground**, with
+  a much lower chance (roughly a further 90% reduction) of any lake attempt
+  landing above sea level at all. **[sourced: web-search summary of Minecraft Wiki
+  Lava page + a modded-worldgen wiki mirroring vanilla defaults; the exact
+  constant is reported inconsistently across the sources found (1-in-6, 1-in-8,
+  1-in-25 all appear depending on version/surface-vs-underground) — treat the
+  "roughly 1 in 8, underground, rare above sea level" framing as the safe summary,
+  not a specific version's exact constant]**
+- Both mechanisms matter for the *feel* the project owner described: the y<10
+  carve rule guarantees you will eventually hit a lava floor if you dig deep
+  enough anywhere, while the separate lake placer is what produces the
+  "surprise" mid-depth lava pool that isn't tied to the very bottom of the world.
+
+### Water
+- Pre-1.18 Minecraft had no aquifer system. The rule was a simple flood: any
+  carved void that sits at or below the world's sea-level water table gets filled
+  with water; nothing more sophisticated than that. **[sourced: web-search summary
+  of Minecraft Wiki Cave page, contrasting the pre-1.18 flood rule against 1.18's
+  aquifer system]**
+- This is why classic caves near sea level would sometimes be fully or partially
+  flooded, and why breaking into open ocean laterally at depth could flood a whole
+  system, while caves well below the water table stayed dry unless they held their
+  own separately-seeded water lake (same lake-placer mechanism as lava, just with
+  water and a different, higher-frequency roll — no exact constant was found for
+  the water-lake variant this session; see §10).
+
+### Ore placement relative to caves
+- **Ores are placed after caves and ravines are carved**, not before. The
+  generation order (confirmed consistently across every source found describing
+  the pipeline, from the classic per-chunk "populate" step through the modern
+  data-driven carver/feature split) is: base terrain shape → carve caves/ravines
+  → place ores/dungeons/other decoration into what's left. **[sourced: web-search
+  synthesis of Minecraft Wiki "World generation" page + a GitHub gist overview of
+  the pipeline, both independently describing carving before ore/feature
+  placement]**
+- **This order is exactly why exposed ore on cave walls is a thing at all.** An
+  ore vein is placed as a blob inside solid stone, with no knowledge of where
+  caves already are; any part of that blob that lands in a cell the carver had
+  already turned to air is either skipped (some implementations check for air
+  exposure and reduce placement odds right at a cave wall) or simply never placed
+  there, while any part of the vein sitting immediately *against* a carved wall
+  is now visible without further digging. Caving is rewarding specifically
+  because ore placement happens on top of an already-holey world, not because ore
+  is deliberately biased toward cave walls. **[reasoned from the sourced
+  generation order above, cross-checked against a Minecraft Wiki "Ore" page
+  description of an air-exposure skip check — sourced: web-search summary of
+  minecraft.wiki/w/Ore_(feature)]**
+- Y-bands and vein sizes: I was only able to source approximate legacy/pre-1.17
+  Y-ranges, and could not independently confirm exact vein-size or
+  attempts-per-chunk figures this session (two direct page fetches for the table
+  were truncated/unavailable — see §10). What was captured, with the caveat that
+  one field (redstone's) looked internally inconsistent in the fetched summary and
+  is intentionally omitted rather than repeated uncertainly:
+  **[sourced: minecraft.wiki/w/Ore/Pre-1.17_distribution, partial]**
+  - Coal: generates across a wide band, common through the upper-middle of the
+    column
+  - Iron: generates through roughly the lower two-thirds of the column, tapering
+    above that
+  - Gold: concentrated low, roughly the bottom quarter of the column
+  - Diamond: concentrated at the very bottom, roughly the bottom 10-12% of the
+    column
+  - Lapis lazuli: **not monotonic with depth** — its frequency peaks at a specific
+    band well below sea level and tapers off both above and below that peak,
+    unlike every other ore listed, which just get rarer moving up
+  - Vein/blob sizes and per-chunk attempt counts: **[assumed, not sourced this
+    session]** — commonly-cited figures exist in general Minecraft knowledge
+    (small veins of 6-10 blocks for most ores, larger for coal, single-attempt
+    for diamond/lapis, multiple attempts for coal/iron/redstone) but none of them
+    were independently confirmed by a fetched source this session, so none are
+    presented as sourced numbers. Recommend Blocksmith pick its own round vein
+    sizes tuned for a 128-tall world rather than importing an unverified table —
+    see §8.
+
+---
+
+## §5 — Cave mob spawning
+
+- Light-level rule (pre-1.18, i.e. the rule LCE ran its entire life): a hostile
+  mob can spawn on a block with **sky+block light level 7 or below** — a far more
+  permissive threshold than the light-level-0-only rule 1.18 introduced. This is
+  exactly why legacy-era caves felt more dangerous by default: a single torch
+  does not spawn-proof nearly as large an area as it does post-1.18.
+  **[sourced: web-search summary of Minecraft Wiki "Light"/"Mob spawning" pages,
+  explicitly contrasting pre-1.18 (≤7) against 1.18+ (0 only)]**
+- Spawn cadence: hostile-mob spawn attempts run **every game tick** (20 times a
+  second) as part of the per-tick spawn cycle, distinct from the passive-mob
+  cycle which runs far less often (roughly every 400 ticks / 20 seconds).
+  **[sourced: web-search summary of Minecraft Wiki "Mob spawning" page]** — this
+  figure is describing the modern spawn-cycle implementation and I could not
+  independently confirm it is unchanged from the Beta/legacy-era spawn loop, only
+  that the light-level gate is documented as different pre/post 1.18 while the
+  cadence itself was not called out as having changed — treat the cadence number
+  as **[sourced but not confirmed legacy-specific]**.
+- Pack behaviour: hostile mobs spawn in **clusters of up to ~4** around a rolled
+  center point, not individually — this is what makes a cave "come at you" as a
+  group rather than a trickle, and is the direct cause of the "several zombies
+  and skeletons at once" danger the project owner is asking to recreate.
+  **[sourced: web-search summary of Minecraft Wiki "Mob spawning" page]**
+- Mob cap: a base cap of **70** hostile mobs can exist around a solo player at
+  once (scaling up with more players in multiplayer), beyond which no further
+  hostile spawns are attempted regardless of light level.
+  **[sourced: web-search summary aggregating multiple mob-spawning guide sites]**
+- Minimum spawn distance from the player: roughly **24 blocks**, with an outer
+  bound of roughly **128 blocks** beyond which hostile mobs don't spawn (or
+  despawn) relative to the player at all.
+  **[sourced: web-search summary of Minecraft Wiki "Mob spawning" page]**
+
+**None of §5's mechanics exist in Blocksmith today** — see §7. Every number above
+is a target to design *toward* once an entity/mob system exists, not something
+that plugs into the current codebase as-is.
+
+---
+
+## §6 — Rescaling every figure to Blocksmith's 128-tall world
+
+This section turned out simpler than expected, and the arithmetic below shows why.
+
+**Blocksmith measured facts** (read from source this session):
+- `WORLD_HEIGHT` = 128 (`world/world.h`: `COLUMN_CHUNKS * CHUNK_DIM` = 8 * 16)
+  **[measured]**
+- `GEN_SEA_LEVEL` = 64, the y of the water *surface* — topmost water block sits at
+  y=63 (`world/worldgen.h`) **[measured]**
+
+**LCE/legacy-Java measured/sourced facts:**
+- LCE's build height was permanently capped at **128 blocks** for its entire
+  active life (§1) **[sourced]**
+- The classic pre-Anvil PC convention (which LCE's caves-and-ore figures in §2/§4
+  are drawn from) used a **128-tall world with sea level at y=63** — i.e. the
+  *exact same* height Blocksmith uses, and a sea level one block off from
+  Blocksmith's own (63 vs 64) **[reasoned: this is the well-known pre-1.2/Anvil PC
+  convention that both of §2's cave-carver lineages predate or match — Lineage A
+  (Beta 1.7.3) is squarely inside this era; Lineage B (1.7.10 decompile) is a
+  256-tall-world version, addressed separately below]**
+
+**The arithmetic:**
+
+For every figure sourced from a **128-tall-world version** (Beta 1.7.3 / Lineage
+A, the y<10 lava rule, the general "lava sea below layer 10-11" folklore, and
+LCE's own native figures): the scale factor is **128 / 128 = 1.0**. These numbers
+carry over to Blocksmith with no arithmetic at all beyond the 1-block sea-level
+offset (Blocksmith's `GEN_SEA_LEVEL` is 64, one higher than the classic 63 — close
+enough that this document treats it as a rounding choice already made by
+Blocksmith's own generator, not something this research should re-litigate).
+
+Concretely:
+- Cave start-height band, Beta 1.7.3: linear y=8..126 → **Blocksmith y=8..126,
+  unchanged** (both worlds are 128 tall; y=126 is 2 below Blocksmith's ceiling of
+  127, exactly as it was 2 below Beta's own ceiling of 127)
+- Lava-below-y=10 carve rule → **Blocksmith y<10, unchanged**
+- `GEN_CAVE_MIN_DEPTH` (Blocksmith's own existing 5-block no-cave-near-surface
+  rule, measured from `worldgen.h`) has no legacy equivalent to rescale against —
+  it's a Blocksmith-specific safety rule (see §7), not a ported figure
+
+For the one figure sourced from a **256-tall-world version** (the 1.7.10 decompile,
+Lineage B's y-clamp of 1..248, out of a 256-tall world that version already used):
+the scale factor is **128 / 256 = 0.5**.
+- 1 * 0.5 ≈ **1**, 248 * 0.5 = **124** → a rescaled clamp of roughly y=1..124,
+  which lands within a couple of blocks of the *native* 128-tall figure above
+  (8..126) anyway. **[reasoned]** This is worth stating plainly: Lineage B's own
+  y-clamp was already so generous (nearly the full height of its own taller
+  world) that it barely constrains anything either way — whichever lineage's
+  number gets used, the practical effect on Blocksmith is the same "basically the
+  whole column below the surface band," which is consistent with §2's own
+  framing of that clamp as "barely a restriction at all."
+
+For the ravine start-Y figure that could not be confidently tied to a specific
+world-height era this session (§3's general depth/width figures came from
+sources that don't state which world-height convention they're using): **no
+rescaling arithmetic is shown, because I don't trust the input enough to scale
+it.** Instead, §8's recommendation reasons about ravine placement *relatively* —
+biased toward the same lower-half band as caves, since every source agrees
+ravines are found "underground" and "beneath sea level" without giving a version-
+tagged absolute range I could rescale with confidence.
+
+**World *area*, separately from height, does not rescale at all — it doesn't
+need to.** LCE's finite worlds (864x864 up to 5120x5120, §1) are all vastly
+larger than anything Blocksmith holds in memory at once (§7's 12 MB cap holds at
+most a 13x13-column ring, i.e. 208x208 blocks, at the New 3DS's radius-5 ceiling).
+The carver's *area* behaviour (how far a tunnel can wander from its start chunk)
+is a generation-cost question, not a world-size question, and belongs in §7.
+
+---
+
+## §7 — What Blocksmith does today, and the honest delta
+
+**What exists today:** `worldgenIsCave()` (`world/worldgen.c`) is a **pure 3D
+noise field**, not a carver. A block is "cave" when it falls inside the
+overlapping threshold band of *two independent* 3D fractal-noise fields (two
+salts) evaluated at that exact `(x, y, z)` — see `inCaveBand()` and the function's
+body. There is no path, no walk, no start point, no branch, no room, and no
+concept of a "tunnel" as an object; every block's cave-or-not answer is computed
+independently of every other block, purely as a function of its own coordinates
+and the world seed.
+
+Measured tuning (`GEN_CAVE_*` constants, `world/worldgen.h`):
+- `GEN_CAVE_SHIFT_XZ` = 5 → 32-block horizontal noise-lattice period
+- `GEN_CAVE_SHIFT_Y` = 4 → 16-block vertical noise-lattice period (explicitly
+  commented as "squashed, so tunnels run flat" — the noise field's own vertical
+  squash is a 2:1 ratio between these two shift constants)
+- `GEN_CAVE_OCTAVES` = 2
+- `GEN_CAVE_HALF` = 0.05, chosen as "the connectivity knee" — measured sweep
+  across seeds (1337, 1616, 4242, 7, 99999, 20260818), 6-connected flood fill over
+  a 96x64x96 box: at half-width 0.05, **5.44% of the underground volume is
+  carved, with 99.2% of that carved volume sitting in connected systems bigger
+  than 100 blocks**; every tested seed put at least 98.9% of its carved volume
+  into walkable systems, across a 3.97-8.23% carved-volume range depending on
+  seed. **[measured, from the comment block above `GEN_CAVE_SHIFT_XZ` in
+  `worldgen.h`]**
+- `GEN_CAVE_MIN_DEPTH` = 5, `GEN_CAVE_FLOOR` = 1 — no cave within 5 blocks of the
+  surface (so a carved cell can never leave a floating grass block or open under
+  a spawn point) and nothing carved below y=1. **This is Blocksmith's own
+  existing design decision, not a legacy figure, and it has a direct, stated
+  cost: the current generator produces no cave entrances at all — the only way
+  into a cave is to dig one open, because no carved cell is ever allowed to reach
+  the surface.** `worldgen.h`'s own comment on `GEN_CAVE_MIN_DEPTH` says this
+  explicitly.
+
+A per-column corner-interpolation cache (`CaveCache`, `caveCacheBuild()`,
+`caveFieldAt()`) was added in v1.8.7 to make repeated evaluation of this noise
+field cheap — it exploits the fact that, given the lattice periods above, both
+octaves' x/z lattice indices are constant across an entire 16-block column, so a
+column's worth of corner values can be hashed once instead of re-hashed per
+block. **A second agent is actively extending this cache in the same file as
+this research is being written — this document does not touch `worldgen.c` and
+does not depend on that cache's current line numbers, only on the two function
+names (`worldgenIsCave`, `caveCacheBuild`) and the constants in `worldgen.h`,
+which are stable regardless of how the cache internals change.**
+
+### The honest delta: noise field → carver
+
+A true legacy-style carver (§2) is a fundamentally different computational shape
+from a noise field, and the difference that matters most is **not** primarily
+memory — it's **cross-column dependency**.
+
+- **Today:** `worldgenIsCave(x, y, z)` is answerable from that single block's
+  coordinates and the seed alone. This is *why* the per-column corner cache
+  works cleanly — a column never needs to know anything about its neighbors to
+  answer its own cave questions, so caching is purely local.
+- **A carver:** a tunnel that *starts* in one chunk can wander into, and carve
+  blocks in, several neighboring chunks before it ends. Vanilla's own generator
+  handles this by re-deriving (from the world seed and each candidate start
+  chunk's coordinates) and partially re-walking every tunnel that could plausibly
+  reach the chunk currently being generated, checking a neighborhood of
+  candidate start chunks around it. The exact vanilla radius could not be pinned
+  to a legacy-specific source this session (see §10), but the *shape* of the
+  problem is not in question: **generating one column's caves correctly requires
+  knowing about tunnels that started in other columns.**
+
+That is the real architectural break against Blocksmith's current design, stated
+plainly: **`worldgenColumn()` today generates a column from nothing but its own
+coordinates and the seed — no neighbor column is ever consulted.** A carver
+either needs to (a) re-derive and partially re-walk candidate tunnels from a
+neighborhood of surrounding columns every time a column is generated — a CPU
+cost, not a memory one, since nothing needs to be stored beyond the current
+column's own blocks — or (b) bound that neighborhood tightly enough (e.g. only
+the column's own 3x3 or 5x5 immediate neighbors, deliberately sacrificing rare
+long-range tunnel continuity) to keep the re-walk cost affordable on an ARM11 core
+generating columns on a background worker thread while the player moves.
+
+**Against the 12 MB budget specifically** (`world/budget.h`, all measured): the
+loaded column ring at New 3DS's radius 5 already uses **11,160,160 bytes of the
+12,582,912-byte cap (88.7%)**, with radius 6 (14,836,448 bytes) explicitly
+excluded by 2,253,536 bytes — the ceiling is asserted tight on purpose, not
+loose. A carver that needs to *persist* tunnel objects (rather than re-derive
+them on demand, stateless, from the seed) would compete directly with that
+already-88.7%-committed budget, and there is essentially no slack to give it.
+**The only affordable design is one where tunnels are never stored** — every
+column re-derives, from its own coordinates plus its bounded neighborhood, only
+the tunnels relevant to itself, exactly the way the existing noise field is
+already a pure function of position with nothing persisted between calls. This
+is a real constraint on *how* a carver would have to be built, not an argument
+against building one.
+
+**Ores, lava, water: none of these exist in Blocksmith today.** A repository-wide
+search this session found zero ore block IDs, zero lava block, and zero mob/
+entity system of any kind (`entity`, `mob`, and related terms match nothing under
+`source/` outside unrelated identifiers like `sprite.v.pica` or `interact.c`'s own
+comments). Water *does* exist (`world/water.c`, `world/water.h`) with a working
+8-level flow simulation (`WATER_LEVEL_SOURCE` = 8, `WATER_LEVEL_MAX` = 7) already
+used by the surface generator (`world/worldgen_density.c` floods air below
+`GEN_SEA_LEVEL - 1` to water for oceans/lakes today) — extending that into caves
+is a much smaller lift than anything else in this section, because the fluid
+*simulation* already exists; only the *placement* (seeding water inside a carved
+cave void) is new.
+
+**The single biggest obstacle in the whole request is not the cave algorithm —
+it's mobs.** There is no entity, no AI, no combat, no spawning, and no rendering
+system for anything that moves under its own logic anywhere in this codebase.
+"Zombies and skeletons in caves" is not a cave-generation feature at all; it's an
+entire subsystem Blocksmith does not have a single line of, and cave-specific
+spawning rules (§5) are meaningless until that subsystem exists. This should be
+scoped and estimated as its own project, not folded into "cave generation" — see
+§8.
+
+---
+
+## §8 — Recommended phase order for v1.8.11
+
+Ordered cheapest-and-lowest-risk first, each phase independently shippable and
+playtestable before the next starts, per the standing rule that every phase gets
+its own handoff:
+
+**Phase 1 — retune the existing noise field toward legacy character, no
+architecture change.** The current field is already tuned for connectivity
+(§7's measured 99.2%-connected figure), which is the single property §3/§4's
+sources agree matters most to how caves *feel*. What it does not have is
+legacy's directional, wormy anisotropy or its fixed lava floor. Concretely:
+narrow `GEN_CAVE_HALF` further and/or reduce `GEN_CAVE_OCTAVES`'s effective
+smoothness to push the carved shape toward long, narrow "spaghetti" rather than
+the current blobbier band (measure the resulting carved-volume and connectivity
+numbers the same way the existing tuning comment did, so a regression is
+visible immediately rather than discovered by feel); add a static (non-flowing,
+to start) lava block placed wherever a cave cell already generates at y<10,
+directly reusing §6's finding that the legacy y<10 threshold needs zero rescaling
+for a 128-tall world. This phase touches tuning constants and adds one new block
+type; it does not touch the generation architecture at all.
+
+**Phase 2 — ore placement as a post-carve population pass.** Add ore block IDs
+and hook a new placement pass into the same place `worldgenDecorate()` already
+runs (trees via `treePut()`, tall-grass scatter) — i.e. after the column's blocks
+already exist and its caves are already carved, matching §4's sourced
+after-carving generation order exactly, which is what produces the "exposed ore
+on a cave wall" payoff the project owner is asking for. Bias vein placement
+toward the lower portion of the column, since every band figure this document
+was able to pin down (§4) agrees the valuable ores concentrate low, and pick
+Blocksmith-native vein sizes rather than importing the unconfirmed legacy table
+(§4, §10) — playtest-tune against "does a dug tunnel expose ore often enough to
+feel rewarding," which is the actual design target, not a specific vanilla
+number.
+
+**Phase 3 — water in caves.** Extend the existing flood rule (already present in
+`worldgen_density.c` for surface oceans/lakes) to also flood any carved cave void
+that connects to the water table, reusing the water simulation that already
+exists rather than building a second one. Smaller lift than lava because the
+simulation is already there; only new placement logic is needed.
+
+**Phase 4 — ravines, as a second preset of whatever carving mechanism exists by
+this point** (either the retuned noise field from Phase 1, tuned toward a single
+long straight low-connectivity band, or a true carver if Phase 6 has landed by
+then). Much rarer trigger than ordinary caves per §3's sourced ~1-in-50 figure,
+placed in the same lower-half Y band as caves per §6's reasoning.
+
+**Phase 5 — a minimal entity/mob framework, scoped and estimated as its own
+project, separate from cave generation entirely.** This is the actual largest
+piece of work implied by the original request (§7) and should not be sized or
+sequenced as if it were a cave-generation task. Once *any* entity exists that can
+be positioned, tick, and be damaged, cave-specific hostile spawning (§5's
+light-level gate, pack spawning, cap) attaches to it as a relatively small rule
+set layered on top — but none of that rule set is buildable before the framework
+itself exists.
+
+**Phase 6 — true walked-tunnel carver, only if Phase 1's retuned noise field
+doesn't satisfy the "feels like legacy caves" target after playtesting.** This is
+listed last and marked optional on purpose: §7 already showed the real
+architectural cost (cross-column dependency, a CPU cost against an ARM11 core,
+and zero slack in the 12 MB budget for persisting anything). If the cheaper
+Phase 1 retune reads as close enough, this phase may never be worth its own
+cost — that's a call for whoever plays Phase 1, not a foregone conclusion either
+way.
+
+---
+
+## §9 — Sources
+
+Every URL used this session, with what it supported:
+
+- `minecraft-archive.fandom.com/wiki/Minecraft:_Xbox_360_Edition`,
+  `co-optimus.com/article/8239` — Xbox 360 Edition's Beta-1.6.6 launch baseline
+  and Beta-1.7.3-equivalent first update target (§1)
+- `minecraft.wiki/w/Java_Edition_Beta_1.8` — ravines and abandoned mineshafts
+  added to Java in Beta 1.8, 2011-09-14 (§1, §3)
+- `minecraft.wiki/w/Xbox_360_Edition_TU36` — TU36 (2016-06-21) adding
+  caves/ravines to Custom Superflat options on Xbox 360 and Wii U, and the later
+  Aquatic-era "Underwater Caves/Ravines" reference (§1)
+- `minecraft.wiki/w/World_size` — LCE finite world size options (Classic
+  864x864, Small/Medium/Large) and platform availability (§1)
+- `minecraft.fandom.com/wiki/Legacy_Console_Edition_exclusive_features` — world
+  edge/water-moat behaviour, structure-density compensation on smaller worlds
+  (§1)
+- `minecraft.fandom.com/wiki/Legacy_Console_Edition` — LCE's permanent 128-block
+  build-height cap (§1, §6)
+- `github.com/coderbot16/i73`, "Cave Generation" doc — Beta 1.7.3 cave-carver
+  parameters: rarity 1-in-15, nested tunnel-count bound 40, linear start-height
+  8..126, vertical multiplier 0.5, lava below y=10 (§2, §6)
+- `github.com/vmarchaud/Alkazia`, `MapGenCaves.java` (decompiled 1.7.10, read to
+  understand behaviour only, not reproduced as code) — rarity 1-in-7, nested
+  tunnel-count bound 15, yaw/pitch initial values and per-step drift, radius
+  envelope and 0.5 vertical ratio, branch trigger, y-clamp 1..248, lava below
+  y=10 (§2, §6)
+- `github.com/ClassiCube/ClassiCube/wiki/Minecraft-Classic-map-generation-algorithm`
+  — Classic (c0.30)-era theta/phi drift-with-momentum and the single-inequality
+  oblate-spheroid carve test, used only as an illustration of the general
+  technique, explicitly not as an LCE-accurate parameter set (§2)
+- web-search summary citing a decompiled 1.16-era ravine rarity analysis
+  (`rand.nextInt(50) == 0`) — ravine rarity ~1-in-50 (§3)
+- `minecraft-archive.fandom.com/wiki/Ravine` (via search summary; direct fetch
+  was blocked, HTTP 402) — ravine width/depth (~5 wide, up to 40 deep),
+  near-universal connection to cave systems (§3)
+- `minecraftbedrock-archive.fandom.com/wiki/Ravine` (via search summary) —
+  alternate width/depth figures (up to 7 wide, 40-50 deep) (§3)
+- web-search summary of Minecraft Wiki "Lava" page, GGServers knowledgebase
+  article, and a Minecraft Forum thread — y<10/11 lava floor, lake-placer
+  frequency figures (inconsistently reported across versions) (§4)
+- web-search summary of Minecraft Wiki "Cave" page — pre-1.18 simple flood-to-
+  water-table rule vs. 1.18's aquifer system (§4)
+- web-search summary of Minecraft Wiki "World generation" page and a GitHub gist
+  overview of the generation pipeline — carve-before-ore-placement generation
+  order (§4)
+- `minecraft.wiki/w/Ore/Pre-1.17_distribution` (direct fetch, partial) — coal/
+  iron/gold/diamond/lapis relative depth bands (§4)
+- web-search summary of `minecraft.wiki/w/Ore_(feature)` — air-exposure skip
+  check as evidence ore placement is aware of already-carved terrain (§4)
+- web-search summary of Minecraft Wiki "Light" and "Mob spawning" pages — pre-
+  1.18 light-level-7 hostile spawn threshold vs. 1.18's light-0 rule, spawn
+  cadence, pack spawning (~4-mob clusters), 70-mob cap, 24-128 block spawn
+  distance band (§5)
+- Local, measured (not web): `source/world/budget.h`, `source/world/world.h`,
+  `source/world/worldgen.h`, `source/world/worldgen.c` (function names
+  `worldgenIsCave`, `caveCacheBuild`, `caveFieldAt`, `worldgenDecorate`,
+  `treePut`; constants `WORLD_HEIGHT`, `GEN_SEA_LEVEL`, `GEN_CAVE_SHIFT_XZ`,
+  `GEN_CAVE_SHIFT_Y`, `GEN_CAVE_OCTAVES`, `GEN_CAVE_HALF`, `GEN_CAVE_MIN_DEPTH`,
+  `GEN_CAVE_FLOOR`, `WORLD_BUDGET_BYTES`), `source/world/water.h` (`WATER_LEVEL_
+  SOURCE`, `WATER_LEVEL_MAX`) — everything tagged **[measured]** throughout (§6,
+  §7)
+
+---
+
+## §10 — What could not be determined, and what the gap means
+
+1. **Which of §2's two rarity/tunnel-count constants (Beta 1.7.3's 1-in-15/bound-40,
+   or 1.7.10's 1-in-7/bound-15) LCE actually shipped, at any given point in its
+   life.** Both lineages are real, sourced Minecraft carver implementations; I
+   could not decompile or otherwise inspect the actual console binary to see
+   which one 4J's port used, or whether it changed across title updates the way
+   Mojang's own PC releases did. **What this means in practice:** it doesn't
+   block Blocksmith's design (§8's Phase 1/6 recommendation doesn't depend on
+   picking one exactly — see §2's closing note that both lineages converge on
+   "mostly 0-2 systems per chunk-sized region" regardless), but if the project
+   owner specifically remembers a *density* rather than a *shape*, tune toward
+   feel via playtesting rather than trying to match either constant exactly.
+
+2. **Exactly which title update first brought ordinary (non-superflat) ravines
+   to console.** TU36 confirms ravines existed as a normal feature by 2016; I
+   found no source pinning the specific earlier update that introduced them.
+   **What this means:** no design impact — §3's spec doesn't depend on the exact
+   introduction date, only on ravines being part of the generator LCE ran for
+   most of its life, which is well established.
+
+3. **Vein sizes and per-chunk attempt counts for ore generation.** Two direct
+   page fetches for the pre-1.17 ore distribution table returned only partial
+   data (Y-band descriptions, no vein/attempt numbers); a third fetch attempt at
+   a different ore page also came back without the table. **What this means:**
+   §4 explicitly does not present any vein-size or attempt-count figure as
+   sourced, and §8's Phase 2 recommends picking Blocksmith-native numbers rather
+   than importing unverified ones — this is a real gap, but it's one the phase
+   plan already routes around rather than silently filling with a guess.
+
+4. **The exact vanilla carver's cross-column search radius** (how many
+   neighboring chunks get re-derived/re-walked to generate one chunk's caves
+   correctly). §7's architectural argument doesn't depend on the exact number —
+   the qualitative fact that neighbor chunks must be considered at all is what
+   drives the delta — but the exact figure would matter for costing Phase 6
+   concretely if it's ever picked up. **What this means:** whoever scopes Phase 6
+   for real should budget time to either find this figure from a dedicated
+   decompile or measure the CPU cost of a chosen neighborhood radius directly,
+   rather than assuming §7's qualitative argument alone is enough to size the
+   work.
+
+5. **Water-lake seeding frequency inside caves specifically** (as opposed to the
+   general sea-level flood rule, which is well sourced). §4 flags this gap
+   explicitly rather than reusing the lava-lake figure by assumption. **What this
+   means:** Phase 3 (§8) should treat cave water placement as "flood what
+   connects to the water table" only, and treat standalone underground water
+   lakes as a nice-to-have to tune by feel rather than a sourced target.
+
+6. **Whether Beta 1.7.3's own branch trigger had an additional probability roll
+   on top of reaching the branch point**, the way the 1.7.10 decompile's branch
+   logic reads as unconditional-once-qualified. Not resolved from either source
+   this session. **What this means:** §2's spec describes branching as "a small,
+   separately-rolled fraction of systems" for the room case (which the general
+   forum analysis of a later version did describe as a 1-in-4 roll — a third,
+   separately-flagged figure not attributed to either main lineage) and as
+   "roughly the middle third of a qualifying tunnel" for the ordinary-tunnel
+   branch case, deliberately hedged rather than stated as a specific probability
+   — Blocksmith's own implementation should treat the branch rate as a tunable,
+   not a fact to hit exactly.

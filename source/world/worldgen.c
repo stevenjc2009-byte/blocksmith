@@ -4,6 +4,7 @@
 #include "world/noise.h"
 #include "world/rng.h"
 #include "world/worldgen_density.h"
+#include "world/worldgen_scratch.h"
 
 // v1.7.0. Everything below that is not explicitly dispatched is the LEGACY generator, and it
 // is deliberately unchanged: a world stamped GEN_VERSION_LEGACY — which is every world that
@@ -11,14 +12,18 @@
 // byte. The suite pins that with a hash of generated columns taken from the tree BEFORE the
 // density generator was written. See world/genversion.h for the whole rule.
 
-// Step 9.2a/9.1b. A flat staging buffer for one chunk's worth of cells, built here and then
-// committed in one shot via worldSetChunkAll — never CHUNK_BLOCKS individual worldSet calls,
-// which would promote a freshly generated chunk's storage cell by cell (UNIFORM ->
-// PALETTE4 -> RAW) for a chunk whose final content is already fully known before the first
-// write. Static rather than a stack array, following worker.c's s_load_buf convention: this
-// runs on whatever thread calls worldgenColumn, and 4 KB is not something to risk on a stack
-// that also has to hold the rest of a generation call's frames.
-static BlockId s_gen_flat[CHUNK_BLOCKS];
+// Step 9.2a/9.1b. The legacy fill's flat staging buffer for one chunk's worth of cells is
+// `s->gen_flat`, and it is built here and then committed in one shot via worldSetChunkAll —
+// never CHUNK_BLOCKS individual worldSet calls, which would promote a freshly generated
+// chunk's storage cell by cell (UNIFORM -> PALETTE4 -> RAW) for a chunk whose final content is
+// already fully known before the first write.
+//
+// **v1.8.7 moved it, and the cave cache below it, out of this file's .bss and into the
+// caller's WorldGenScratch.** It was a file static "following worker.c's s_load_buf
+// convention", on the contract that generation runs on one worker thread; that contract is
+// exactly what the New 3DS's spare core needs broken. It is still not a stack array — 4 KB is
+// not something to risk on a 32 KB worker stack — it is now the lane's, and there can be two
+// lanes. See world/worldgen.h's WorldGenScratch note for the measured failure.
 
 // How far apart the terrain's largest features are, as a power of two in blocks. 64 gives
 // hills you walk over in a few seconds at 4.31 blocks/s rather than continent-scale
@@ -102,6 +107,8 @@ bool worldgenInit(WorldGen* g, uint32_t seed, uint32_t version)
 	if (!genVersionKnown(version)) {
 		g->seed    = 0;
 		g->version = 0;
+		g->cave_salt[0] = rngMix(g->seed ^ SALT_CAVE);
+		g->cave_salt[1] = rngMix(g->seed ^ SALT_CAVE2);
 		return false;
 	}
 
@@ -115,6 +122,17 @@ bool worldgenInit(WorldGen* g, uint32_t seed, uint32_t version)
 	// version in here would have changed every existing world.
 	g->seed    = rngMix(seed ^ 0x424C4B53U);   // 'BLKS'
 	g->version = version;
+
+	// v1.8.7. The two cave salts, mixed once here rather than twice per cave test
+	// -- about 20,900 rngMix calls per column at the old call site, for two values
+	// that cannot change while the WorldGen exists. Output-neutral by construction:
+	// rngMix is a pure function of its argument and the argument is g->seed, so this
+	// is the identical number the old expression produced every time it ran. Written
+	// from g->seed in BOTH arms of this function, so a refused WorldGen's salts are
+	// still exactly rngMix(g->seed ^ SALT_X) and the cache below can key on g->seed
+	// alone without a refused generator ever aliasing a real one.
+	g->cave_salt[0] = rngMix(g->seed ^ SALT_CAVE);
+	g->cave_salt[1] = rngMix(g->seed ^ SALT_CAVE2);
 	return true;
 }
 
@@ -210,21 +228,220 @@ static inline bool inCaveBand(fx v)
 	return v >= GEN_CAVE_CENTRE - GEN_CAVE_HALF && v <= GEN_CAVE_CENTRE + GEN_CAVE_HALF;
 }
 
+// The cave field, evaluated the long way: two fBms, eight fresh lattice hashes per octave
+// per field. This is the v1.8.6 body of worldgenIsCave verbatim, and it is kept for the one
+// case the per-column cache below cannot answer — a y above the world ceiling, which is
+// outside every caller's loop bounds but not outside this function's signature. Everything
+// inside the world goes through the cache.
+static bool caveDirect(const WorldGen* g, int32_t x, int y, int32_t z)
+{
+	const fx cx = caveCoordXZ(x), cy = caveCoordY(y), cz = caveCoordXZ(z);
+
+	if (!inCaveBand(noiseFbm3(g->cave_salt[0], cx, cy, cz, GEN_CAVE_OCTAVES)))
+		return false;
+
+	return inCaveBand(noiseFbm3(g->cave_salt[1], cx, cy, cz, GEN_CAVE_OCTAVES));
+}
+
+// ── The cave field's per-column corner cache (v1.8.7) ─────────────────────────────────
+//
+// **This is the "call the noise fewer times" that world/rng.h asks for, and it is NOT the
+// hand-factoring that same note forbids.** Task 48b's rng.h note records an rngHash3Cell()
+// that returned all eight corners of ONE lattice cell by sharing the hash stages the eight
+// rngHash3 calls inside a single value3At() appear to recompute. It was bit-correct and it
+// was 10.5 % SLOWER, for a reason specific to it: rngHash2 and rngHash3 are `static inline`,
+// so GCC had already common-subexpression-eliminated those stages across the eight call
+// sites, and writing the corners out through an array only cost scheduling freedom.
+//
+// Nothing below touches the inside of a value3At() call. What it shares is work between
+// THOUSANDS OF SEPARATE worldgenIsCave() calls — different calls, from a loop in another
+// translation unit, whose agreement about a corner is decided by the column coordinate and
+// not by anything the optimiser can see in the call. That is the half of the problem the
+// optimiser does not see, and it is the half rng.h's closing line points at.
+//
+// **The redundancy is a property of the shifts, not an accident.** GEN_CAVE_SHIFT_XZ is 5,
+// so the first octave's lattice steps 32 blocks in x and z and the second steps 16; a column
+// is 16 blocks wide and begins on a multiple of 16, so BOTH octaves' x and z lattice indices
+// are constant over the whole 16 x 16 column and only the y index varies. Measured on the
+// host for one biome column at seed 1337: 18,571 worldgenIsCave() calls, 41,786 octave
+// evaluations, and only 342 distinct lattice cells behind them — a 131x redundancy, and 90 %
+// of all the octave work a column does.
+//
+// So a column needs 2 salts x 2 octaves x a handful of y rows x 4 corners of hashing, paid
+// once when the column changes, instead of eight fresh rngHash3 calls per octave per field
+// per block.
+//
+// The table itself is WorldGenCaveCache in world/worldgen_scratch.h, and CAVE_SALTS,
+// CAVE_ROWS_AT and CAVE_ROWS are defined beside it: v1.8.7 moved the cache out of this file's
+// .bss and into the caller's per-lane scratch, and the type has to be visible to size the
+// struct. Nothing about the scheme changed with it.
+
+// The four conditions the whole scheme rests on, asserted rather than described, because
+// every one of them is a tuning constant somebody is entitled to change and the failure mode
+// of changing one is silently generating a different world rather than a compile error.
+_Static_assert(GEN_CAVE_OCTAVES >= 1 && GEN_CAVE_OCTAVES <= GEN_CAVE_SHIFT_Y + 1,
+               "a cave octave finer than one lattice row per block has no y index to cache");
+_Static_assert((1 << (GEN_CAVE_SHIFT_XZ - (GEN_CAVE_OCTAVES - 1))) >= CHUNK_DIM,
+               "the finest cave octave must not step more than once across a column, or the "
+               "x and z lattice indices are no longer constant over it");
+_Static_assert((1 << GEN_CAVE_SHIFT_Y) <= CHUNK_DIM,
+               "the y fraction must repeat within CHUNK_DIM, or sy[] is indexed too narrowly");
+_Static_assert(CAVE_ROWS_AT(0) <= CAVE_ROWS, "the row table must be sized for every octave");
+
+// noise.c advances the per-octave seed with rngMix(s ^ this). Restated here rather than
+// shared because it is a file-local literal in noise.c and world/noise.h exports no way to
+// ask for octave i's seed. If it ever moves, this file computes a different cave field —
+// which the suite's twelve pinned legacy terrain fingerprints turn into a red run rather
+// than into a quietly reshaped world.
+#define CAVE_OCTAVE_ADVANCE 0x2545F491U
+
+// smooth() and lerp() are byte-for-byte world/noise.c's, for the same reason: both are
+// `static inline` in that file and neither is exported. The 64-bit intermediate in smooth()
+// is not defensive — t^3 at t = 1.0 is 2^48 before the shifts — see the comment there.
+static inline fx caveSmooth(fx t)
+{
+	const int64_t t2 = ((int64_t)t * t) >> FX_SHIFT;
+	const int64_t t3 = (t2 * t) >> FX_SHIFT;
+	return (fx)(3 * t2 - 2 * t3);
+}
+
+static inline fx caveLerp(fx a, fx b, fx t)
+{
+	return a + (fx)((((int64_t)b - a) * t) >> FX_SHIFT);
+}
+
+// Rebuilds the whole table for the column whose -x/-z corner is (bx, bz).
+//
+// 2 salts x 2 octaves x (9 + 17) rows x 4 corners = 208 rngHash3 calls and 96 smooths for a
+// column that then answers up to 32,768 cave tests out of it.
+static void caveCacheBuild(WorldGenCaveCache* c, const WorldGen* g, int32_t bx, int32_t bz)
+{
+	c->valid = false;                       // not usable until every field below is written
+	c->seed  = g->seed;
+	c->bx    = bx;
+	c->bz    = bz;
+
+	for (int o = 0; o < GEN_CAVE_OCTAVES; o++) {
+		// The octave's sample position is the block's 16.16 cave coordinate doubled once per
+		// octave — exactly what noiseFbm3 does to px/py/pz — and the split into a lattice
+		// index and a fraction is value3At's arithmetic shift. The truncation to `fx` before
+		// the widening is kept because worldgenIsCave has always done it in that order.
+		const int64_t px = (int64_t)caveCoordXZ(bx) << o;
+		const int64_t pz = (int64_t)caveCoordXZ(bz) << o;
+		const int32_t ix = (int32_t)(px >> FX_SHIFT);
+		const int32_t iz = (int32_t)(pz >> FX_SHIFT);
+
+		for (int i = 0; i < CHUNK_DIM; i++) {
+			const int64_t qx = (int64_t)caveCoordXZ(bx + i) << o;
+			const int64_t qz = (int64_t)caveCoordXZ(bz + i) << o;
+			const int64_t qy = (int64_t)caveCoordY(i) << o;
+			c->sx[o][i] = caveSmooth((fx)(qx & (FX_ONE - 1)));
+			c->sz[o][i] = caveSmooth((fx)(qz & (FX_ONE - 1)));
+			c->sy[o][i] = caveSmooth((fx)(qy & (FX_ONE - 1)));
+		}
+
+		const int rows = CAVE_ROWS_AT(o);
+		for (int s = 0; s < CAVE_SALTS; s++) {
+			// Octave 0 uses the salt itself; each later one is the previous seed advanced the
+			// way noise.c advances it.
+			uint32_t seed = g->cave_salt[s];
+			for (int k = 0; k < o; k++)
+				seed = rngMix(seed ^ CAVE_OCTAVE_ADVANCE);
+
+			for (int row = 0; row < rows; row++) {
+				c->corner[s][o][row][0] = (fx)(rngHash3(seed, ix,     row, iz)     >> 16);
+				c->corner[s][o][row][1] = (fx)(rngHash3(seed, ix + 1, row, iz)     >> 16);
+				c->corner[s][o][row][2] = (fx)(rngHash3(seed, ix,     row, iz + 1) >> 16);
+				c->corner[s][o][row][3] = (fx)(rngHash3(seed, ix + 1, row, iz + 1) >> 16);
+			}
+		}
+	}
+
+	c->valid = true;
+}
+
+// One fBm of the cave field, read out of the table. Trilinear interpolation and the octave
+// sum in world/noise.c's order and with world/noise.c's normalisation, so the result is the
+// same integer noiseFbm3 would have returned — not an approximation of it.
+static inline fx caveFieldAt(const WorldGenCaveCache* c, int s, int lx, int y, int lz)
+{
+	int64_t total = 0;
+	int32_t amp   = FX_ONE;
+
+	for (int o = 0; o < GEN_CAVE_OCTAVES; o++) {
+		const int row = y >> (GEN_CAVE_SHIFT_Y - o);
+		const fx* v0  = c->corner[s][o][row];        // the lattice row at or below y
+		const fx* v1  = c->corner[s][o][row + 1];    // and the one above it
+		const fx  sx  = c->sx[o][lx];
+		const fx  sy  = c->sy[o][y & (CHUNK_DIM - 1)];
+		const fx  sz  = c->sz[o][lz];
+
+		const fx y0 = caveLerp(caveLerp(v0[0], v0[1], sx), caveLerp(v1[0], v1[1], sx), sy);
+		const fx y1 = caveLerp(caveLerp(v0[2], v0[3], sx), caveLerp(v1[2], v1[3], sx), sy);
+
+		total += (int64_t)caveLerp(y0, y1, sz) * amp;
+		amp  >>= 1;
+	}
+
+	return noiseFbmNormalise(total, GEN_CAVE_OCTAVES);
+}
+
+// v1.8.7's destaticising split what used to be one function in two.
+//
+// The public worldgenIsCave() is the plain body: no state, no cache, safe from any thread and
+// from a caller that has no lane at all. Until the scratch became a parameter it consulted the
+// cache too, because the cache lived in a file static it could reach for free; now that the
+// cache belongs to a lane, a caller who has one says so.
+//
+// Bit-identity between the two is not an assumption. It was measured on the host over
+// 3,436,800 cells across 4 seeds — every cell of a 5 x 5 column grid, plus 160,000 interleaved
+// samples that change column on every call and run y from -8 to WORLD_HEIGHT + 39 — with zero
+// mismatches, against a verbatim copy of the pre-cache body. The two fill loops call the
+// cached form; nothing else does.
 bool worldgenIsCave(const WorldGen* g, int32_t x, int y, int32_t z)
 {
 	if (y < GEN_CAVE_FLOOR)
 		return false;
 
-	const fx cx = caveCoordXZ(x), cy = caveCoordY(y), cz = caveCoordXZ(z);
+	return caveDirect(g, x, y, z);
+}
+
+bool worldgenIsCaveCached(const WorldGen* g, WorldGenScratch* s, int32_t x, int y, int32_t z)
+{
+	if (y < GEN_CAVE_FLOOR)
+		return false;
+
+	// Above the world. No generator loop reaches here — every one of them stops at
+	// WORLD_HEIGHT — but the signature allows it and the table is sized for the world, so it
+	// is answered the long way rather than by an out-of-range read.
+	if (y >= WORLD_HEIGHT)
+		return caveDirect(g, x, y, z);
+
+	// >> 4 then << 4 rather than a divide, so x = -1 lands in column -1 and not column 0 —
+	// world.c's rule everywhere, and the reason the cache key is exact on the negative side.
+	const int32_t bx = (x >> 4) << 4;
+	const int32_t bz = (z >> 4) << 4;
+
+	WorldGenCaveCache* c = &s->cave;
+	if (!c->valid || c->seed != g->seed || c->bx != bx || c->bz != bz)
+		caveCacheBuild(c, g, bx, bz);
+
+	const int lx = (int)(x - bx), lz = (int)(z - bz);
 
 	// The first field is evaluated for every underground block and the second only for the
 	// ~22 % that survive it. Ordering the test this way is worth about a third of the whole
 	// pass, and it is free: the two fields are independent, so either order gives the same
 	// answer for the same block.
-	if (!inCaveBand(noiseFbm3(rngMix(g->seed ^ SALT_CAVE), cx, cy, cz, GEN_CAVE_OCTAVES)))
+	if (!inCaveBand(caveFieldAt(c, 0, lx, y, lz)))
 		return false;
 
-	return inCaveBand(noiseFbm3(rngMix(g->seed ^ SALT_CAVE2), cx, cy, cz, GEN_CAVE_OCTAVES));
+	return inCaveBand(caveFieldAt(c, 1, lx, y, lz));
+}
+
+void worldgenScratchInit(WorldGenScratch* s)
+{
+	s->cave.valid = false;
+	s->top_valid  = false;
 }
 
 // The legacy heightmap, moved here verbatim from worldgenHeight when the dispatch was added.
@@ -611,12 +828,18 @@ static bool worldgenFlora(const WorldGen* g, World* w, int32_t cx, int32_t cz,
 // Gated on the generator by its only caller, exactly as the tree pass's waterline rule is: a
 // legacy world has no water block, no plant, and no measurement behind either, and the whole
 // point of world/genversion.h is that nothing new reaches an old world.
-bool worldgenScatter(const WorldGen* g, World* w, int32_t cx, int32_t cz)
+bool worldgenScatter(const WorldGen* g, WorldGenScratch* s, World* w, int32_t cx, int32_t cz)
 {
-	// The surface heights wgdColumn already computed for this column. Refused rather than
-	// recomputed if they belong to somewhere else — see wgdColumnTops() for why asking
-	// worldgenHeight() 256 times instead is not an option.
-	const int16_t* tops = wgdColumnTops(cx, cz);
+	// The surface heights wgdColumn already computed for this column, in THIS LANE's scratch.
+	// Refused rather than recomputed if they belong to somewhere else — see wgdColumnTops()
+	// for why asking worldgenHeight() 256 times instead is not an option.
+	//
+	// **This check is where the old file statics failed loudest.** With one shared `s_top` key,
+	// the other thread moved it between wgdColumn and here and the whole column reported
+	// failure: 159 of 192 generations refused in the measured two-thread run. Keyed on a
+	// per-lane scratch it can only fail for the reason it was written for — a caller pairing
+	// the scatter with the wrong column.
+	const int16_t* tops = wgdColumnTops(s, cx, cz);
 	if (!tops)
 		return false;
 
@@ -819,9 +1042,10 @@ static bool worldgenFlora(const WorldGen* g, World* w, int32_t cx, int32_t cz,
 	return ok;
 }
 
-static bool legacyColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz);
+static bool legacyColumn(const WorldGen* g, WorldGenScratch* s, World* w,
+                         int32_t cx, int32_t cz);
 
-bool worldgenColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz)
+bool worldgenColumn(const WorldGen* g, WorldGenScratch* s, World* w, int32_t cx, int32_t cz)
 {
 	// v1.7.0. The two generators share the decoration pass and nothing else — the tree rules
 	// are about where a tree may stand, not about how the ground got there, so duplicating
@@ -830,20 +1054,21 @@ bool worldgenColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 	// `>=`: the density FIELD builds every world from version 2 upward. What differs above it
 	// is biome identity, and that is decided inside the passes, not here. See genversion.h.
 	if (g->version >= GEN_VERSION_DENSITY) {
-		if (!wgdColumn(g, w, cx, cz))
+		if (!wgdColumn(g, s, w, cx, cz))
 			return false;
 		// Both are run even if the first fails, and both results are reported: a refused
 		// allocation in the tree pass is a real condition the caller has to see, and
 		// short-circuiting past the scatter would make a half-decorated column look like a
 		// fully decorated one on the next visit.
 		const bool decorated = worldgenDecorate(g, w, cx, cz);
-		return worldgenScatter(g, w, cx, cz) && decorated;
+		return worldgenScatter(g, s, w, cx, cz) && decorated;
 	}
 
-	return legacyColumn(g, w, cx, cz);
+	return legacyColumn(g, s, w, cx, cz);
 }
 
-static bool legacyColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz)
+static bool legacyColumn(const WorldGen* g, WorldGenScratch* s, World* w,
+                         int32_t cx, int32_t cz)
 {
 	// 256 heights, computed once for the whole 8-chunk stack. Doing this per chunk would
 	// evaluate the same fBm up to eight times for the same answer, and the fBm is the
@@ -882,19 +1107,19 @@ static bool legacyColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 		// does not have to think about depth at all — one constant governs both the
 		// layering (5 > 3, so it is all stone) and the carve.
 		if (y0 + CHUNK_DIM <= min_h - GEN_CAVE_MIN_DEPTH) {
-			for (int i = 0; i < CHUNK_BLOCKS; i++) s_gen_flat[i] = BLOCK_STONE;
+			for (int i = 0; i < CHUNK_BLOCKS; i++) s->gen_flat[i] = BLOCK_STONE;
 			for (int lz = 0; lz < CHUNK_DIM; lz++)
 				for (int lx = 0; lx < CHUNK_DIM; lx++)
 					for (int ly = 0; ly < CHUNK_DIM; ly++)
-						if (worldgenIsCave(g, cx * CHUNK_DIM + lx, y0 + ly,
-						                   cz * CHUNK_DIM + lz))
-							s_gen_flat[chunkIndex(lx, ly, lz)] = BLOCK_AIR;
-			if (!worldSetChunkAll(w, cx, cy, cz, s_gen_flat))
+						if (worldgenIsCaveCached(g, s, cx * CHUNK_DIM + lx, y0 + ly,
+						                         cz * CHUNK_DIM + lz))
+							s->gen_flat[chunkIndex(lx, ly, lz)] = BLOCK_AIR;
+			if (!worldSetChunkAll(w, cx, cy, cz, s->gen_flat))
 				return false;
 			continue;
 		}
 
-		for (int i = 0; i < CHUNK_BLOCKS; i++) s_gen_flat[i] = BLOCK_AIR;
+		for (int i = 0; i < CHUNK_BLOCKS; i++) s->gen_flat[i] = BLOCK_AIR;
 		for (int lz = 0; lz < CHUNK_DIM; lz++) {
 			for (int lx = 0; lx < CHUNK_DIM; lx++) {
 				const int32_t x = cx * CHUNK_DIM + lx, z = cz * CHUNK_DIM + lz;
@@ -909,25 +1134,26 @@ static bool legacyColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 					// The depth guard comes first because it is a compare against a local
 					// and the cave test is two fBms.
 					if (depth >= GEN_CAVE_MIN_DEPTH &&
-					    worldgenIsCave(g, x, y0 + ly, z))
+					    worldgenIsCaveCached(g, s, x, y0 + ly, z))
 						continue;
-					s_gen_flat[chunkIndex(lx, ly, lz)] = blockAtDepth(depth, sandy[lz][lx]);
+					s->gen_flat[chunkIndex(lx, ly, lz)] = blockAtDepth(depth, sandy[lz][lx]);
 				}
 			}
 		}
-		if (!worldSetChunkAll(w, cx, cy, cz, s_gen_flat))
+		if (!worldSetChunkAll(w, cx, cy, cz, s->gen_flat))
 			return false;
 	}
 
 	return worldgenDecorate(g, w, cx, cz);
 }
 
-int worldgenArea(const WorldGen* g, World* w, int32_t cx, int32_t cz, int radius)
+int worldgenArea(const WorldGen* g, WorldGenScratch* s, World* w, int32_t cx, int32_t cz,
+                 int radius)
 {
 	int failed = 0;
 	for (int dz = -radius; dz <= radius; dz++)
 		for (int dx = -radius; dx <= radius; dx++)
-			if (!worldgenColumn(g, w, cx + dx, cz + dz))
+			if (!worldgenColumn(g, s, w, cx + dx, cz + dz))
 				failed++;
 	return failed;
 }

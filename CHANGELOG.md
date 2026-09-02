@@ -4,6 +4,110 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.8.7] - 2026-09-02
+
+Terrain — and, unexpectedly, the release where two bugs that had been quietly corrupting
+worlds got caught. The terrain work this version is named for is validation and refinement of
+the Beta 1.7.3-style generator that arrived in v1.7.0, not a new generator. What grew around
+it is a set of correctness fixes, a large speed pass, and the groundwork that makes a second
+generator thread possible on the New 3DS.
+
+Most of this release is identical on both consoles. Where a console genuinely differs, it is
+said so explicitly below and nowhere else.
+
+### Fixed
+
+- **Lighting could be relit wrong, on both consoles, since v1.8.0.** The main thread and the
+  world worker were both running flood fills over **one shared queue**. A comment in
+  `worker.c` asserted they never shared one — that comment had been false since v1.8.0, when
+  the edit path was rebuilt on top of the queue engine. Measured under contention: **116 of
+  120 columns relit wrong**.
+
+  The queue is now claimed atomically; whichever thread loses the race falls back to the sweep
+  engine this file already keeps and the tests already prove produces identical output. Nobody
+  waits, and lighting output is byte-identical — the reference digests and the suite's own hash
+  pin are unchanged.
+
+  *Console difference, and the only reason this is worth splitting out:* on the **New 3DS** the
+  worker runs on the third core, so the two threads run genuinely at the same time and the
+  window was permanently open. On the **Old 3DS** they share a core, but a relight holds the
+  queue for milliseconds — many scheduler slices — so it was wide open there too. Both consoles
+  were affected; the New 3DS was affected more often.
+
+- **A block you broke or placed could silently fail to reach other players.** The send result
+  was discarded, and sends can fail *per packet*. The local world changed, the server never
+  heard, and the two diverged permanently with no way back. The edit is now rolled back if the
+  packet did not leave, and the inventory action is suppressed with it, so breaking a block
+  that failed to send no longer hands you the item.
+
+  Single player is untouched — the naive version of this fix would have deleted **every** edit
+  offline, because the send path also reports failure when there is no session at all.
+
+- **Joining a server running a different version put you in a world full of holes.** If the two
+  sides disagreed about what block ids mean, the client noticed, said nothing, waited two
+  seconds, and let you in anyway — with every disagreed block resolving to **air**. It could
+  never repair itself. It now refuses the join and tells you: *"Server is a different Blocksmith
+  version - update"*.
+
+  No change to the network protocol, no new bytes on the wire, and no server update needed.
+
+- **You could break and place blocks from inside the pause menu.** Break and place are X and Y;
+  the pause menu only reads the D-pad, A and B — so both still fired, with the crosshair frozen
+  wherever you opened the menu. Water also kept flowing while paused. A paused world now
+  actually pauses.
+
+### Changed
+
+- **Cave generation is 3.09× faster**, and generating a whole column is **2.20× faster** (1.190
+  → 0.542 ms/column on host). The cave field was asking for the same handful of noise lattice
+  corners over and over — roughly 20,900 cave tests per column re-deriving values that are
+  constant across the column's whole 16-block span. Those corners are now computed once per
+  column.
+
+- **The terrain interpolator skips cells that cannot change.** Measured: **92.2%** of lattice
+  cells are uniform — 43.2% entirely air, 49.0% entirely solid — and each was running 224
+  interpolations to produce a constant. They are now short-circuited exactly, not
+  approximately. Worth **7.6–9.7%** off generation on host.
+
+- **Chunk culling does less work per candidate.** A square root was being recomputed for every
+  candidate-versus-blocker pair; it now happens once per blocker. The view matrix is also built
+  directly instead of via three library calls, proved bit-identical across 341,280 cases —
+  including the signed-zero cases where the obvious shortcut is wrong.
+
+- **Chunks load nearest-first.** Column requests were queued from the far corner of the ring
+  outward, so the ground you are standing on could wait behind terrain far behind you. Columns
+  submitted before your own immediate surroundings finish dropped from **98 to 8**, and the
+  column directly ahead of you went from sixth in the queue to first.
+
+  (All ratios above are host x86-64. A host ratio is not a console frame cost and is not quoted
+  as one.)
+
+### Added
+
+- **The world generator no longer keeps its working memory in globals**, which is what stood
+  between the New 3DS and a second generator thread. Two threads generating separate columns
+  previously produced **25 of 32 columns wrong, and refused 145 of 192 generations** — and a
+  refused generation is not a slow frame, it is a permanent hole in the world. It is now 0
+  wrong and 0 refused, proved by a test that runs two real threads and is in the suite
+  permanently.
+
+  *Console difference:* nothing changes yet on either console — there is still only one
+  generator thread. This is the prerequisite, and the second lane is the next version's work.
+  It is groundwork for the **New 3DS** only; the Old 3DS has no spare core to give it.
+
+- **A 50-seed audit of the terrain amplitude table**, 29,491,200 lattice steps, confirming that
+  the overhang preconditions the Beta 1.7.3-style terrain depends on hold across every seed
+  tested rather than the handful previously spot-checked.
+
+### Notes
+
+Terrain is byte-identical to v1.8.6 — the same seed gives the same world, and saves are
+unchanged. A 1.8.7 client and a 1.8.6 client can still play together.
+
+Binary size: text +9,064 bytes, static memory +5,056 bytes, initialised data unchanged.
+
+Not run on real 3DS hardware.
+
 ## [1.8.6] - 2026-09-02
 
 Speed. No new features and nothing that looks different on screen — this release is four

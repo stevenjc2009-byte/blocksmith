@@ -259,11 +259,15 @@ int wgdHeight(const WorldGen* g, int32_t x, int32_t z);
 // because it has to go through the same staged worldSetChunkAll the terrain does: an ocean
 // written a cell at a time with worldSet would promote every one of its chunks out of the
 // UNIFORM form (world/chunk.h) — 2 KB of palette storage each for a chunk whose whole content
-// is one repeated id — and an ocean is a great many such chunks. Written into s_flat it costs
-// nothing at all.
-bool wgdColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz);
+// is one repeated id — and an ocean is a great many such chunks. Written into the scratch's
+// staging buffer it costs nothing at all.
+//
+// `s` is the calling thread's own scratch and holds every working buffer this pass uses — see
+// world/worldgen.h's WorldGenScratch note. Two threads must never be inside this function on
+// the same one.
+bool wgdColumn(const WorldGen* g, WorldGenScratch* s, World* w, int32_t cx, int32_t cz);
 
-// The topmost-solid height of every cell of the column wgdColumn generated MOST RECENTLY, as
+// The topmost-solid height of every cell of the column `s` generated MOST RECENTLY, as
 // [z * CHUNK_DIM + x], in worldgenHeight()'s convention (the y of the first air above the
 // ground, so the top solid block is at that value minus one).
 //
@@ -271,12 +275,18 @@ bool wgdColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz);
 // pass and needs the surface height of all 256 cells. Asking worldgenHeight() for them would
 // cost 256 evaluations of a 2 x 2 x 17 corner lattice — 204 fBm3 each, more than three times
 // the whole column's generation — for numbers wgdColumn has already computed and is holding
-// in a static a few lines above.
+// in the scratch.
 //
-// (cx, cz) is REQUIRED and checked rather than being a comment, because the buffer is a static
-// that the next wgdColumn overwrites: a caller that asks for the wrong column gets NULL and a
-// refusal it must report, not a plausible set of heights belonging to somewhere else.
-const int16_t* wgdColumnTops(int32_t cx, int32_t cz);
+// (cx, cz) is REQUIRED and checked rather than being a comment, because the buffer is reused
+// by the next wgdColumn on the same scratch: a caller that asks for the wrong column gets NULL
+// and a refusal it must report, not a plausible set of heights belonging to somewhere else.
+//
+// **v1.8.7: the key is per lane, which is the point of the change.** It used to be a file
+// static, so a second thread generating its own column moved the key out from under this one
+// and the answer was NULL — measured at 159 refusals in 192 generations, i.e. that many
+// permanent holes in the world. Reading it out of the caller's own scratch cannot go wrong
+// that way.
+const int16_t* wgdColumnTops(const WorldGenScratch* s, int32_t cx, int32_t cz);
 
 // The raw density at one block, in 16.16 blocks, positive inside the ground. Exposed so the
 // tests can assert the field's shape directly — that it is deeply positive at bedrock, deeply

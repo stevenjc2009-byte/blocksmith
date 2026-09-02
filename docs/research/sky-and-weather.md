@@ -798,7 +798,7 @@ mul r5.z, dayLevel.xxxx, r5.xxxx     ; day-scaled sky
 max r5.w, r5.zzzz, r5.yyyy           ; lum = max(daySky, block)
 ```
 
-`source/scene/chunk_render.c:862` currently writes:
+`source/scene/chunk_render.c:976` currently writes:
 
 ```c
 C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uloc_daylevel, 1.0f, 1.0f, 1.0f, 1.0f);
@@ -834,9 +834,9 @@ that is the wrong curve, and Part E has the three-instruction fix.
 
 `source/scene/chunk_render.c`:
 
-- **Stage 0** (lines 738–741): `GPU_MODULATE(GPU_TEXTURE0, GPU_PRIMARY_COLOR)` — atlas texel
+- **Stage 0** (lines 847–849): `GPU_MODULATE(GPU_TEXTURE0, GPU_PRIMARY_COLOR)` — atlas texel
   times the baked light/AO vertex colour.
-- **Stage 1** (lines 814–822): `GPU_INTERPOLATE(GPU_CONSTANT, GPU_PREVIOUS, GPU_TEXTURE1)` —
+- **Stage 1** (lines 925–931): `GPU_INTERPOLATE(GPU_CONSTANT, GPU_PREVIOUS, GPU_TEXTURE1)` —
   fog, blending the terrain colour toward the constant sky colour by the fog ramp's alpha.
   Alpha passes through.
 - **Stages 2–5: unused.** citro3d leaves them at the default passthrough.
@@ -848,8 +848,8 @@ So **4 stages and 1 texture unit are free**. Two constraints on using them, both
 same sources: only the **first four** stages can write the TEV buffer, and a TEV buffer write
 in one stage is **not readable until two stages later**.
 
-The hardware fog unit is **deliberately disabled** (`C3D_FogGasMode(GPU_NO_FOG, ...)` around
-`chunk_render.c:770`) and replaced by the ramp texture — `source/gfx/fogramp.h` explains why
+The hardware fog unit is **deliberately disabled** (`C3D_FogGasMode(GPU_NO_FOG, ...)` at
+`chunk_render.c:897`) and replaced by the ramp texture — `source/gfx/fogramp.h` explains why
 at length: the PICA fog LUT is indexed by 1/w, its knots bunch against the camera, and the
 half-visibility distance saturated at ~14.4 blocks no matter the render distance. **Do not
 try to reintroduce the hardware fog unit for weather.** The note that fog does not consume a
@@ -858,7 +858,7 @@ one, and that is a price already paid for a measured reason.
 
 ## D4. The sky is a compile-time constant, in two byte orders
 
-`source/scene/chunk_render.h:44–51`:
+`source/scene/chunk_render.h:68–69`:
 
 ```c
 #define SKY_CLEAR_RGBA8  0x102A33FF
@@ -870,7 +870,7 @@ colour as the background it fades into. Fog that does not match the clear colour
 grey sheet hung in front of the sky instead of as distance."*
 
 `main.c:84` aliases it to `CLEAR_COLOR` and clears the top screen with it at three call sites
-(1631, 2235, 2779). `chunk_render.c:822` feeds the same three bytes to `C3D_TexEnvColor` for
+(1651, 2255, 2799). `chunk_render.c:932` feeds the same three bytes to `C3D_TexEnvColor` for
 the fog stage.
 
 So today the sky is **(16, 42, 51) — a dark teal**, fixed, and there is **no sky geometry, no
@@ -982,7 +982,7 @@ generation time as the tundra surface cap by `worldgen_density.c`. **It is not a
 no depth state, and does not accumulate.** `BLOCK_ICE = 11` exists similarly as a water
 surface cap.
 
-There is also already a greyed-out **"Weather"** entry in the debug menu (`main.c:1140`,
+There is also already a greyed-out **"Weather"** entry in the debug menu (`main.c:1160`,
 `e->available = false`) with a comment saying a later version flips the flag rather than
 redesigning the menu.
 
@@ -1297,7 +1297,7 @@ Feed `rainStrength` and `thunderStrength` straight into the A3 formula. Both the
 `dayLevel` and the gameplay `skylightSubtracted` then darken during weather automatically,
 with no separate weather-darkening code path — which is also why it will be consistent.
 
-Flip `main.c:1140`'s `"Weather"` debug entry to `available = true` (D8) — the comment there
+Flip `main.c:1160`'s `"Weather"` debug entry to `available = true` (D8) — the comment there
 says that is exactly the intended migration.
 
 **Lightning: [INFERENCE] cut it from v1.8.9.** It needs a light source that does not exist, a

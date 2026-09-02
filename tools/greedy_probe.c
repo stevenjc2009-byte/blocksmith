@@ -30,6 +30,7 @@
 #include "world/scratch.h"
 #include "world/world.h"
 #include "world/worldgen.h"
+#include "world/worldgen_scratch.h"
 
 #define PROBE_SEED    1337u
 #define PROBE_RADIUS  3           // 7x7 columns, the ring main.c loads around the player
@@ -142,6 +143,7 @@ static int greedyCount(SameFn same)
 int main(void)
 {
 	static World world;
+	static WorldGenScratch wgs;   // this probe's one lane; too big for main's frame
 	WorldGen gen;
 
 	worldInit(&world);
@@ -152,7 +154,7 @@ int main(void)
 	// density field's caves change both the quad count and the AO variation this counts.
 	// If the prize needs re-measuring on Beta terrain, that is a NEW probe, not an edit here.
 	worldgenInit(&gen, PROBE_SEED, GEN_VERSION_LEGACY);
-	const int failed = worldgenArea(&gen, &world, 0, 0, PROBE_RADIUS);
+	const int failed = worldgenArea(&gen, &wgs, &world, 0, 0, PROBE_RADIUS);
 
 	// worldgenColumn already ends by calling worldgenDecorate, so the trees are in. Counting
 	// the leaves says so out loud, because trees carry the most AO variation in the world and

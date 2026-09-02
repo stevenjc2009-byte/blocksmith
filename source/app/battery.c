@@ -103,6 +103,40 @@ void batteryExit(void)
 
 void batteryPoll(void)
 {
+#if BS_FAKE_BATTERY
+	// Verification instrument, off in every shipping build. The ONLY thing it replaces is
+	// where the reading comes from: it feeds a made-up level through batteryApplyReading —
+	// the same call the real read below ends in — and then gets out of the way. batteryLow(),
+	// the 1000/600 ms cadence and batteryDraw are all reached by their normal path and are
+	// not touched, because an override that reimplemented them would prove nothing about the
+	// code that ships.
+	//
+	// It exists because the low-battery state is otherwise unreachable by anybody. Azahar's
+	// PTM:U stub (src/core/hle/service/ptm/ptm.cpp) answers GetBatteryLevel with a hardcoded
+	// CompletelyFull (5) and GetBatteryChargeState with a battery_is_charging that is
+	// initialised true and never assigned, so batteryLow()'s `s_level <= 1` and `!s_charging`
+	// each fail on their own, and there is no config key or UI toggle to change either. Real
+	// hardware is out under the standing never-run rule. So without this flag, "the gauge
+	// blinks at one bar" is a claim nothing on this machine can check.
+	//
+	// Ramps 5 -> 0, four seconds a level, twenty-four seconds a lap, then repeats. A ramp
+	// rather than a fixed level 1 so one boot shows the steady gauge, the transition into the
+	// warning, and the warning itself — a fixed value would only ever demonstrate the end
+	// state, and could not tell a blink from a gauge that had been blinking all along.
+	//
+	// Sits above the s_ptmu_open check on purpose: the instrument must not need the service
+	// it is standing in for. It reads the clock and writes the cached reading, and nothing
+	// else — no file, no archive, no sdmc path, no SD access of any kind. That is deliberate
+	// and load-bearing: a previous verification build on this project shared the emulator's
+	// SD folder and overwrote a real save, so a build that exists only to be looked at must
+	// not be able to write.
+	{
+		const unsigned step = (unsigned)((tickMs() / 4000u) % 6u);
+		batteryApplyReading(5 - (int)step, false, true);
+		return;
+	}
+#endif
+
 	// No handle, nothing to poll. Returning early rather than calling anyway also stops
 	// the module from overwriting the unknown state with a stale zero every second.
 	if (!s_ptmu_open) return;

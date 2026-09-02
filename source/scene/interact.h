@@ -38,6 +38,7 @@ typedef uint32_t u32;
 
 #include "world/physics.h"
 #include "world/raycast.h"
+#include "world/relightq.h"
 #include "world/world.h"
 
 // How far the player can reach, in blocks. Five is the distance the genre trained people
@@ -91,6 +92,31 @@ typedef struct {
 #define INTERACT_BREAK_STAGES  8
 
 void interactInit(Interact* it);
+
+// Where a local break or place should QUEUE its column relight (v1.8.7). Call once at start
+// up with the same RelightQueue the main loop drains; pass NULL to go back to relighting
+// inline.
+//
+// Why this exists at all: lightRelightColumn() recomputes a whole 32768-cell column, and
+// until v1.8.7 a local edit paid for that synchronously on the frame the player pressed the
+// button — med 0.156 ms, p95 0.227 ms, max 0.287 ms on the host at -O1 over 240 samples
+// (world/relight_drain.h), and dearer by an unmeasured factor on a 268 MHz ARM11 with no L2.
+// Every OTHER caller in the tree already queued: source/main.c's onRemoteEdit does exactly
+// `if (lightEnabled() && !relightqPush(...)) lightRelightColumn(...)`, and this makes the
+// local edit path the same shape rather than the last exception to it.
+//
+// Nothing goes stale by deferring it. main.c calls interactEdit(), then relightDrain(), then
+// chunkRenderDrainDirty(), in that order in the SAME frame — so a relight queued here is
+// still drained ahead of the remesh that bakes it, and there is no frame on which a broken
+// block can be drawn with the light it had before it broke.
+//
+// A setter rather than a parameter on interactEdit(): the queue is one process-wide object
+// with one owner, exactly like the chunkRenderTouch() pool this module already calls into,
+// and threading it through a signature that thirty host-test call sites already use would
+// change all of them to say the same thing. NULL is the default and is not a special case —
+// it relights inline, which is what a full queue already does (world/relightq.h calls that
+// posture "slow, never wrong").
+void interactSetRelightQueue(RelightQueue* q);
 
 // Which crack picture to draw over Interact.target right now, 0..INTERACT_BREAK_STAGES-1,
 // or -1 when nothing is being broken and the overlay should draw nothing at all.

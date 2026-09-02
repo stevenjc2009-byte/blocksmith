@@ -732,6 +732,88 @@ static void registryFetchTick(void)
 	sendRegistryFetch(registryFetchIndex());
 }
 
+// ---- the verdict (v1.8.7) -------------------------------------------------------------------
+// Whether the registry question has been ANSWERED yet this session, in the one sense that
+// matters below: has the moment the bounded wait stops holding entry open already been and
+// gone. Latched rather than recomputed because the answer is taken at an edge and acted on
+// once — see registryVerdictTick() for why firing twice would be actively dangerous — and
+// cleared by networldInit() with every other per-session flag above.
+static bool s_reg_verdict_taken;
+
+// What used to happen when the fingerprint never reproduced: nothing at all. The gate released
+// on the deadline, the player walked into the world with s_reg_synced false, and every id the
+// two builds disagreed about resolved to air through registryView()'s never-NULL contract — a
+// world full of holes that reads as terrain. The long comment above registryMatchesInfo()
+// records v1.8.1 hitting exactly that, and records the lockstep it forced onto the release
+// process precisely because nothing at runtime enforced it. This function is the enforcement.
+//
+// WHY A REFUSAL RATHER THAN A WARNING. There is no repair available to offer instead. A DEFS
+// batch can only ever carry DYNAMIC rows — registryDefUnpack() (world/registry.c) returns false
+// for any id below REG_ID_DYN_LO — so a CORE disagreement is untransmittable by construction
+// and no amount of retrying converges on it. The choice is between entering a world where block
+// ids mean something else on the server and not entering at all, and only one of those two is
+// something the player can recover from.
+//
+// WHEN. Exactly once per session, on the frame networldRegistryWaiting() stops holding entry
+// open. That edge is chosen over a clock of this function's own for a reason that is about
+// ordering and not about tidiness: main.c pumps networldUpdate() BEFORE titleUpdateDraw() every
+// frame (main.c's title loop), so the verdict is taken and networldInit() below has already
+// cleared the world seed by the time scene/title.c reads networldWorldSeed() and
+// networldRegistryWaiting() for the same frame's entry gate. A verdict on a separate deadline
+// would land one frame late and the player would enter the degraded world anyway.
+//
+// And s_reg_verdict_taken is not merely an optimisation. It is what guarantees the refusal can
+// only ever fire BEFORE world entry: the one edge exists once, and after it this function is
+// inert for the rest of the session. Without it a later frame could reach networldInit() —
+// which calls registryInitCore() — with the worker thread already running against that table,
+// which is the one thing networldInit()'s own comment says the ordering must never allow.
+//
+// WHAT IS DELIBERATELY NOT REFUSED: a server that never sent a BS_APP_REGISTRY_INFO at all.
+// Every server older than v1.6.0 is one. It names no fingerprint, so nothing about its table
+// can be proved in either direction, and refusing on no evidence would make every one of those
+// servers unjoinable over a disagreement nobody has established exists. That case joins exactly
+// as it always has, degraded exactly as it always was.
+//
+// SINGLE PLAYER is untouched, and not by a session check: s_reg_gate_armed is set only from
+// applyWorldInfo()/applyRegistryInfo(), i.e. only ever by a decoded server packet, and an
+// offline session decodes none. This deliberately does NOT consult networldSessionActive() —
+// a transport-state guard here is the trap that breaks offline play, and it is not needed,
+// because the gate flag already answers "is this a session" more precisely than the transport
+// can.
+//
+// DIRECTIONALITY, stated here because it cannot be fixed from here. This refuses on the CLIENT
+// and only on the client. A NEW client against an OLD server refuses, with the message below.
+// An OLD client — one already released, running code this change cannot reach — against a NEW
+// server still degrades silently, and no client-side change can alter what a shipped binary
+// does. The server cannot catch that half either: no crc16, count or revision ever travels
+// C->S (see registryMatchesInfo() above for the byte-level reason), so it holds nothing to
+// compare against. Closing it would need a new C->S field, which every already-released server
+// answers with a kick — a coordinated protocol change, not a code change.
+static void registryVerdictTick(void)
+{
+	if (s_reg_verdict_taken)       return;
+	if (!s_reg_gate_armed)         return;   // single player, or the join has not started
+	if (networldRegistryWaiting()) return;   // still inside the bounded wait
+
+	s_reg_verdict_taken = true;
+
+	if (s_reg_synced)          return;   // the table demonstrably reproduces the server's
+	if (!s_have_registry_info) return;   // pre-v1.6.0 server: nothing named, nothing provable
+
+	// The session is over, so it is torn down exactly the way net/bsnet.c's netDisconnect()
+	// tears one down. s_have_world_seed goes with it, and that is what closes
+	// scene/title_nav.h's entry gate on this very frame rather than one frame late —
+	// titleMpNav()'s own comment already names the seed going away as how DISCONNECT closes
+	// that gate, so this is the same shape reached from a different intent.
+	networldInit();
+
+	// One line, and scene/title.c's error row is 52 characters wide, so it names the single
+	// next thing to do and nothing else — the convention every string in net/bsnet.c's
+	// begin_connect() follows. Not a hex dump: "0x4066 != 0x189B" is true, unactionable, and
+	// means nothing to the person holding the console.
+	netTransportRefuse("Server is a different Blocksmith version - update");
+}
+
 // BS_APP_REGISTRY_DEFS: one batch of consecutive dynamic defs {first u8, n u8, last u8,
 // n x 28B}. Exactly BS_APP_REGISTRY_DEFS_BYTES(n) or dropped; n over the sender's own cap is
 // dropped rather than trusted. The records themselves are validated twice over — once for
@@ -1004,6 +1086,11 @@ void networldInit(void)
 	s_reg_fetch_last_ms  = 0;
 	s_reg_gate_armed     = false;
 	s_reg_gate_ms        = 0;
+	// v1.8.7: and the verdict itself, so the next session takes its own. registryVerdictTick()
+	// reaches this function on the refusal path, which means this line also un-latches the flag
+	// the call was made under — deliberately, and harmlessly: s_reg_gate_armed is cleared two
+	// lines up, and that is what keeps the tick inert until a new join arms it again.
+	s_reg_verdict_taken  = false;
 
 	// v1.6.0 task 8: and the TABLE itself, not just the flags that describe it. The dynamic
 	// rows above REG_ID_DYN_LO were installed by one server's REGISTRY_DEFS; leaving them
@@ -1077,6 +1164,13 @@ void networldUpdate(void)
 	// applied by the loop above, so a fetch that has just completed cancels the retry instead
 	// of racing it out onto the wire one last time.
 	registryFetchTick();
+
+	// And after the retry, for the same kind of reason one step further on: a FETCH that has
+	// only just gone out must have had its chance before anything is allowed to call the table
+	// hopeless. This is also the last statement in the frame pump on purpose — it can end the
+	// session (see registryVerdictTick()), and nothing above it should run on state it has
+	// already torn down.
+	registryVerdictTick();
 }
 
 // blockdiffDrain()'s apply callback (net/blockdiff.h): one already-recorded, already-valid
@@ -1119,6 +1213,14 @@ bool networldSendBlockEdit(int x, int y, int z, uint8_t block)
 	const bool ok = netTransportSend(out, sizeof out);
 	if (ok) s_sent_edits++;
 	return ok;
+}
+
+// See networld.h for why this is a separate question from "did the send work". One read of
+// the transport's cached state enum and nothing else — no packet, no side effect, so it is
+// safe to ask on the edit path once per block.
+bool networldSessionActive(void)
+{
+	return netTransportState() == NET_TRANSPORT_ESTABLISHED;
 }
 
 // See networld.h's own comment on this for why the capability-probe check comes first and

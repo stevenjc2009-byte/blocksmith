@@ -11,6 +11,7 @@
 #include "world/light.h"
 #include "world/region.h"
 #include "world/registry.h"
+#include "world/worldgen_scratch.h"
 
 // 32 KB. worldgenColumn's frame is about 1.3 KB (the 16x16 height and sandy tables) and
 // nothing below it recurses, so this is mostly margin: a stack overflow on this console
@@ -52,6 +53,12 @@ static int32_t    s_ready_cx, s_ready_cz;
 // parked, which is the whole handshake — see worker.h.
 static World      s_staging;
 static const WorldGen* s_gen;
+
+// v1.8.7. THIS LANE's generator scratch, 16,253 B — the buffers world/worldgen.c and
+// world/worldgen_density.c used to keep in file statics. It is exactly one lane's worth: a
+// second worker thread would need a second one of these, which is the point of the move but
+// not part of it.
+static WorldGenScratch s_wgs;
 
 static u64 s_busy_ticks, s_install_ticks;
 
@@ -270,7 +277,7 @@ static void workerMain(void* arg)
 				// count IS the number of columns the card did not have — the other half of
 				// the fresh-versus-reloaded question region_io/decode opens above.
 				const uint64_t t_gen = loadprofMark();
-				ok = worldgenColumn(s_gen, &s_staging, job.cx, job.cz);
+				ok = worldgenColumn(s_gen, &s_wgs, &s_staging, job.cx, job.cz);
 				loadprofSince(LOAD_STAGE_GENERATE, t_gen);
 			}
 
@@ -339,6 +346,7 @@ bool workerStart(const WorldGen* g)
 
 	s_gen = g;
 	jobqInit(&s_queue);
+	worldgenScratchInit(&s_wgs);
 	worldInit(&s_staging);
 	s_quit = s_in_flight = s_ready = s_ready_ok = false;
 	s_busy_ticks = s_install_ticks = 0;

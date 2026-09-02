@@ -57,6 +57,7 @@
 #include "scene/loading_draw.h"
 #include "scene/player.h"
 #include "scene/pausemenu.h"
+#include "scene/ringorder.h"
 #include "scene/title.h"
 #include "scene/ui.h"
 #include "world/budget.h"
@@ -844,38 +845,81 @@ _Static_assert(JOBQ_CAP >= RENDER_DIST_MAX_COLUMNS * COLUMN_CHUNKS,
 _Static_assert((JOBQ_CAP & (JOBQ_CAP - 1)) == 0,
                "JOBQ_CAP must stay a power of two: jobq.c wraps head/tail with % JOBQ_CAP and "
                "ARM11 has no integer divide instruction.");
+
+// v1.8.7. Both loops below walk scene/ringorder.h's table instead of `for dz { for dx }`, so the
+// ring is asked for and meshed NEAREST FIRST. See that header for why the order matters at all;
+// the short version is that the worker's queue is FIFO, so submission order is arrival order, and
+// row-major spent its first columns on the corner furthest from the player.
+//
+// The table has to COVER the widest ring either loop can be walked over, which is the AREA ring
+// (mesh radius + 1), not the mesh ring. A table one short would not fail to compile and would not
+// crash: the outermost columns would simply never be visited, so the far edge of the world would
+// stop generating. That is the exact silent-staleness failure the two JOBQ_CAP asserts above
+// exist for, twice over, so it gets the same treatment.
+_Static_assert(RING_ORDER_MAX_RADIUS >= GEN_AREA_RADIUS_MAX,
+               "scene/ringorder.h's table is narrower than the generated ring, so the outermost "
+               "columns would never be requested and the far edge of the world would stop "
+               "loading — with a completely clean build. RING_ORDER_MAX_RADIUS is derived from "
+               "RENDER_DIST_MAX; GEN_AREA_RADIUS_MAX is GEN_MESH_RADIUS_MAX + 1.");
 static void genQueueReadyColumns(void)
 {
 	bool still_short = false;
 
-	for (int32_t dz = -s_mesh_radius; dz <= s_mesh_radius; dz++) {
-		for (int32_t dx = -s_mesh_radius; dx <= s_mesh_radius; dx++) {
-			const int32_t cx = s_center_cx + dx, cz = s_center_cz + dz;
-			if (genSlotHas(&s_col_queued[0][0], GEN_MESH_SPAN, cx, cz)) continue;
-			if (!genColumnRingComplete(cx, cz)) continue;
+	// Nearest first. This loop is also the one that decides who gets the mesh queue's remaining
+	// room when it is short (s_mesh_queue_short below), so the old order meant a full queue
+	// spent its last slots on the columns furthest away and left the near ones to the retry.
+	//
+	// `seen < want` is what keeps this from being a regression at short render distances. The
+	// table always holds the WIDEST ring the game can ask for, so a radius-1 player walking it
+	// end to end would test 169 entries to find the 9 that are theirs, where the old nested pair
+	// tested exactly 9. Stopping once every in-range column has been visited is exact, not an
+	// approximation: the table is a permutation of the square (ringorder_test.c checks it), so a
+	// ring of radius r contains precisely (2r+1)^2 of its entries and there is nothing left to
+	// find after the last one. At radius 1 that stops on entry 9.
+	const RingOffset* const ord = ringOrder();
+	const int want = (2 * s_mesh_radius + 1) * (2 * s_mesh_radius + 1);
+	int seen = 0;
+	for (int i = 0; i < RING_ORDER_COUNT && seen < want; i++) {
+		const int32_t dx = ord[i].dx, dz = ord[i].dz;
+		if (dx < -s_mesh_radius || dx > s_mesh_radius ||
+		    dz < -s_mesh_radius || dz > s_mesh_radius) continue;
+		seen++;
 
-			if (meshqPushColumn(&s_meshq, &s_world, cx, cz, &s_genr.mesh_refused))
-				genSlotSet(&s_col_queued[0][0], GEN_MESH_SPAN, cx, cz);
-			else
-				still_short = true;
-		}
+		const int32_t cx = s_center_cx + dx, cz = s_center_cz + dz;
+		if (genSlotHas(&s_col_queued[0][0], GEN_MESH_SPAN, cx, cz)) continue;
+		if (!genColumnRingComplete(cx, cz)) continue;
+
+		if (meshqPushColumn(&s_meshq, &s_world, cx, cz, &s_genr.mesh_refused))
+			genSlotSet(&s_col_queued[0][0], GEN_MESH_SPAN, cx, cz);
+		else
+			still_short = true;
 	}
 
 	s_mesh_queue_short = still_short;
 }
 
-// Submits every column of the current area that has neither arrived nor been asked for.
+// Submits every column of the current area that has neither arrived nor been asked for, nearest
+// first — so on a recentre the column the player is walking INTO is the first one asked for
+// rather than the seventh of thirteen, and on a boot the ring fills outward from their feet.
 static void genRequestArea(void)
 {
-	for (int32_t dz = -s_area_radius; dz <= s_area_radius; dz++) {
-		for (int32_t dx = -s_area_radius; dx <= s_area_radius; dx++) {
-			const int32_t cx = s_center_cx + dx, cz = s_center_cz + dz;
-			if (genSlotHas(&s_col_in[0][0], GEN_AREA_SPAN, cx, cz)) continue;
-			if (genSlotHas(&s_col_asked[0][0], GEN_AREA_SPAN, cx, cz)) continue;
+	// See genQueueReadyColumns above for why the walk stops at `want` rather than at the end of
+	// the table.
+	const RingOffset* const ord = ringOrder();
+	const int want = (2 * s_area_radius + 1) * (2 * s_area_radius + 1);
+	int seen = 0;
+	for (int i = 0; i < RING_ORDER_COUNT && seen < want; i++) {
+		const int32_t dx = ord[i].dx, dz = ord[i].dz;
+		if (dx < -s_area_radius || dx > s_area_radius ||
+		    dz < -s_area_radius || dz > s_area_radius) continue;
+		seen++;
 
-			if (workerSubmitColumn(cx, cz)) genSlotSet(&s_col_asked[0][0], GEN_AREA_SPAN, cx, cz);
-			else                            s_genr.submit_failed++;
-		}
+		const int32_t cx = s_center_cx + dx, cz = s_center_cz + dz;
+		if (genSlotHas(&s_col_in[0][0], GEN_AREA_SPAN, cx, cz)) continue;
+		if (genSlotHas(&s_col_asked[0][0], GEN_AREA_SPAN, cx, cz)) continue;
+
+		if (workerSubmitColumn(cx, cz)) genSlotSet(&s_col_asked[0][0], GEN_AREA_SPAN, cx, cz);
+		else                            s_genr.submit_failed++;
 	}
 }
 
@@ -3930,6 +3974,13 @@ session_start:
 
 	Interact it;
 	interactInit(&it);
+	// v1.8.7. Hands scene/interact.c the same worklist onRemoteEdit above already pushes to
+	// and the frame loop below already drains (relightDrain, ahead of chunkRenderDrainDirty),
+	// so a LOCAL break or place stops paying for a full 32768-cell column relight on the very
+	// frame the player pressed the button. It was the last caller in the tree still doing
+	// that inline. Set once and never cleared: s_relightq outlives every edit, and interact.c
+	// treats a NULL queue as "relight inline", which is only what the host tests want.
+	interactSetRelightQueue(&s_relightq);
 
 #ifdef BS_WATER_VIS_TEST
 	// VERIFICATION ONLY. Never defined by the Makefile, never in a release build — it exists
@@ -4508,8 +4559,18 @@ session_start:
 		// machines, which is the whole reason the clock exists. Each step is capped at
 		// WATER_TICK_BUDGET cells, so the catch-up clamp handing four ticks to one frame costs
 		// at most four budgets and not an unbounded drain.
-		const int ticks_now = tickClockAdvance(&s_tickclock,
-		                                       (int64_t)(metricsFrameMs() * 1000.0f));
+		//
+		// v1.8.7. `paused ? 0 :` and not a plain call. The block comment at `const bool paused`
+		// further up states the contract — "A paused world does not tick. Everything from here to
+		// the draw is gated on this" — and this line was never gated on it, so the simulation
+		// clock kept running with the pause menu open and waterTick below kept spreading water
+		// while the player sat in a menu. Skipping the ADVANCE rather than the loop is what makes
+		// it a real stop: TickClock accumulates the elapsed microseconds it is handed, so feeding
+		// it nothing holds the clock still, whereas advancing it and then not consuming the ticks
+		// would bank them and dump the whole backlog into the frame the player unpauses on.
+		const int ticks_now = paused ? 0
+		                             : tickClockAdvance(&s_tickclock,
+		                                                (int64_t)(metricsFrameMs() * 1000.0f));
 		//
 		// Not separately timed into the CSV row below: MetricsWork lives in app/metrics.h,
 		// which this task does not own, and the cost is bounded by construction and measured
@@ -4542,7 +4603,22 @@ session_start:
 		// long-range break.
 		it.holding = inventoryHeldItem(&s_inv);
 
-		interactEdit(&it, &s_world, &player.body, down, held, ticks_now);
+		// v1.8.7. The masks are zeroed while the pause menu is open, and until now they were not.
+		// INTERACT_KEY_BREAK is KEY_X and INTERACT_KEY_PLACE is KEY_Y (scene/interact.h); the
+		// pause menu reads only the D-pad, A and B (scene/pausemenu.c), so X and Y fell straight
+		// through it into the world. With the menu up the player cannot move or look — playerUpdate
+		// is gated — so the crosshair is frozen on whatever it was on when they hit SELECT, and
+		// holding X for the block's break time destroyed it from inside the menu. Same for Y
+		// placing one. That contradicts this loop's own "a paused world does not tick" contract.
+		//
+		// MASKED rather than the call being skipped, and that is load-bearing: interactEdit clears
+		// broke_id and placed_id at the top of every call (see Interact.broke_id), and the two
+		// invBridge lines below read them immediately after. Skip the call and last frame's ids
+		// stay standing, so a block broken just before pausing would be re-awarded to the
+		// inventory on every single frame the menu stayed open.
+		const u32 edit_down = paused ? 0u : down;
+		const u32 edit_held = paused ? 0u : held;
+		interactEdit(&it, &s_world, &player.body, edit_down, edit_held, ticks_now);
 
 		// Read once, straight after the call that sets them, because interactEdit clears both
 		// at the top of its next call — see Interact.broke_id. A block that does not fit is

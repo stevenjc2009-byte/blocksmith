@@ -58,14 +58,37 @@ static int     s_edits_sent;
 static int     s_last_x, s_last_y, s_last_z;
 static uint8_t s_last_block;
 
+// v1.8.7. Until now this spy always answered true, which is why the whole class of bug the
+// send-failure cases below cover was invisible to it: the real networldSendBlockEdit returns
+// false whenever the packet did not leave the console, and nothing in this file could ever
+// produce that answer. These two knobs are the two independent facts interact.c now has to
+// combine, and they are set by the cases that care and left at the honest defaults (the send
+// works, there is no server) by every other one.
+//
+// Knobs, not decisions: neither is read anywhere except in the two stub bodies here, so a
+// case that forgets to set one gets the old behaviour rather than a silent pass.
+static bool s_send_ok      = true;
+static bool s_session_live = false;
+
 bool networldSendBlockEdit(int x, int y, int z, uint8_t block)
 {
+	// Counted even when it fails. "How many times did interact.c TRY to tell the server" and
+	// "how many landed" are different questions, and a spy that only counted successes could
+	// not tell a send that was suppressed from one that was refused — which is exactly the
+	// distinction the send-failure cases turn on.
 	s_edits_sent++;
 	s_last_x = x;
 	s_last_y = y;
 	s_last_z = z;
 	s_last_block = block;
-	return true;
+	return s_send_ok;
+}
+
+// The real one (net/networld.c) reads the transport's state enum. Here it reads a knob, for
+// the same reason the send above does: net/networld.c is not in this binary's link.
+bool networldSessionActive(void)
+{
+	return s_session_live;
 }
 
 // ── fixtures ────────────────────────────────────────────────────────────────────────────
@@ -114,6 +137,12 @@ static void freshAimedAt(Interact* it, BlockId target_block)
 	worldInit(&s_world);
 	s_edits_sent = 0;
 	s_last_block = 0xFF;
+	// v1.8.7. Back to "the send works, there is no server, relight inline" for every case, so
+	// that the three cases which change any of them cannot leak into the twenty-odd that were
+	// written before these knobs existed and assume the old behaviour.
+	s_send_ok      = true;
+	s_session_live = false;
+	interactSetRelightQueue(NULL);
 
 	if (target_block != BLOCK_AIR)
 		worldSet(&s_world, TX, TY, TZ, target_block);
@@ -829,6 +858,306 @@ static void testAPlaceRelightsTheColumnItLeftBehind(void)
 	CHECK(lightColumnsAttached() == 1);
 }
 
+// ── v1.8.7 F1: a block edit the server never got must not move the bag ──────────────────
+//
+// THE DEFECT. Both edit paths called networldSendBlockEdit() and threw the bool away. The
+// local worldSet() had already run, the column was already marked dirty (so the edit SAVES),
+// and main.c then read broke_id/placed_id and sent BS_INV_OP_PICKUP / BS_INV_OP_CONSUME —
+// which deps/blocksmith-server/game/bsgame.c's handle_inv_action takes on trust, under a
+// comment that says so. So on a refused send the server's INVENTORY moved and its WORLD did
+// not, permanently and silently: the periodic BS_APP_INV_STATE snapshot puts the bag back and
+// has nothing to say about the block.
+//
+// The send really can fail on its own, per packet, which is what makes this reachable rather
+// than theoretical: net/bsnet_transport.c's send_app_packet returns false on a closed socket,
+// a refused AEAD encrypt, or a short/failed sendto, none of which are session-wide.
+//
+// WHY A SESSION CHECK AND NOT JUST "the send failed". networldSendBlockEdit is false in
+// single player too — there is no transport, so nothing can be sent, and nothing is out of
+// step either. A fix that reverted on every false would delete every edit in single player.
+// The third case below is the one that fails if anyone ever writes that fix.
+static void testAFailedSendInASessionUndoesTheBreak(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_STONE);
+	s_session_live = true;    // there IS a server
+	s_send_ok      = false;   // and this packet did not reach it
+
+	// ONE break's worth of ticks in one frame, not holdBreakUntilDone: a refused break cancels
+	// the hold (breakCancel) without setting `broke`, so that helper would keep re-starting
+	// the hold for its whole 200-tick budget and land four or five attempts. That re-try is
+	// correct behaviour — it is the module's existing "a veto restarts the timer" rule, which
+	// bounds the noise to one refusal per full break time — but it makes "how many times did
+	// this try to send" unreadable, and that count is the point of this case.
+	const Body body = farAwayBody();
+	holdBreakFrame(&it, &body, TICKS_STONE);
+
+	// It was TRIED, exactly once. A fix that suppressed the send instead of reacting to its
+	// failure would be a different (and wrong) thing, and this is what tells them apart.
+	CHECK(s_edits_sent == 1);
+
+	// The world is where it was. This is the divergence closing: the server still has the
+	// stone, and so do we.
+	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_STONE);
+
+	// And nothing is offered to the bag, so main.c sends no BS_INV_OP_PICKUP. broke_id is
+	// the only channel it reads (see main.c's `if (it.broke_id != BLOCK_AIR)`), so this one
+	// check is the whole of "the inventory action was suppressed".
+	CHECK(it.broke_id == BLOCK_AIR);
+	CHECK(it.broke == 0);
+	CHECK(it.refused == 1);
+
+	// And it stays refused rather than slipping through on a later attempt: holding on for a
+	// further full break time re-tries and is turned away again, with the block still there.
+	holdBreakFrame(&it, &body, TICKS_STONE);
+	CHECK(s_edits_sent == 2);
+	CHECK(it.refused == 2);
+	CHECK(it.broke == 0);
+	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_STONE);
+}
+
+static void testAFailedSendInASessionUndoesThePlace(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_STONE);
+	it.holding     = BLOCK_PLANKS;
+	s_session_live = true;
+	s_send_ok      = false;
+
+	const Body body = farAwayBody();
+	interactEdit(&it, &s_world, &body, placeKey(), 0, 0);
+
+	CHECK(s_edits_sent == 1);
+	// The place cell is empty again — the plank went back into the hand, not into a world
+	// the server does not know about.
+	CHECK(worldGet(&s_world, TX, TY + 1, TZ) == BLOCK_AIR);
+	// So main.c charges nothing: no BS_INV_OP_CONSUME, and the block stays in the hotbar.
+	CHECK(it.placed_id == BLOCK_AIR);
+	CHECK(it.placed == 0);
+	CHECK(it.refused == 1);
+	// The block that WAS under the crosshair is untouched — the revert put back the place
+	// cell and nothing else.
+	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_STONE);
+}
+
+// The guard on the fix above. In single player every send fails and every break must still
+// work; if the revert is ever written without the session test, this is the case that goes
+// red instead of a player losing the game.
+static void testAFailedSendWithNoSessionStillBreaksAndPlaces(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_STONE);
+	s_session_live = false;   // single player
+	s_send_ok      = false;   // as it always is with no transport
+
+	const Body body = farAwayBody();
+	CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) > 0);
+	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_AIR);
+	CHECK(it.broke_id == BLOCK_STONE);   // the drop still reaches the bag
+	CHECK(it.broke == 1);
+	CHECK(it.refused == 0);
+
+	// And the place path likewise.
+	freshAimedAt(&it, BLOCK_STONE);
+	it.holding     = BLOCK_PLANKS;
+	s_session_live = false;
+	s_send_ok      = false;
+	interactEdit(&it, &s_world, &body, placeKey(), 0, 0);
+	CHECK(worldGet(&s_world, TX, TY + 1, TZ) == BLOCK_PLANKS);
+	CHECK(it.placed_id == BLOCK_PLANKS);
+	CHECK(it.placed == 1);
+	CHECK(it.refused == 0);
+}
+
+// ── v1.8.7 F2: the local relight is queued, not run on the frame that caused it ─────────
+//
+// Every cell of one column, both channels: 32768 cells x 2 = 65536 bytes.
+#define SNAP_CELLS  (CHUNK_DIM * CHUNK_DIM * WORLD_HEIGHT)
+#define SNAP_BYTES  (SNAP_CELLS * 2)
+
+// Deliberately the WHOLE column and not a sample, and not a checksum. The claim under test is
+// "queueing the relight changes nothing about the result", and a sampled compare would pass
+// for a relight that got every cell anyone thought to name and none of the others — which is
+// precisely the shape of bug a threading change in world/light.c could introduce underneath
+// this. A checksum would catch that but could not say which cell moved, and that is the first
+// thing anyone asks of a red light test.
+static bool lightSnapshot(World* w, int cx, int cz, uint8_t* out)
+{
+	Column* col = worldColumn(w, cx, cz);
+	if (col == NULL) return false;
+
+	size_t i = 0;
+	for (int y = 0; y < WORLD_HEIGHT; y++)
+		for (int lz = 0; lz < CHUNK_DIM; lz++)
+			for (int lx = 0; lx < CHUNK_DIM; lx++) {
+				out[i++] = lightGetSky(col, lx, y, lz);
+				out[i++] = lightGetBlock(col, lx, y, lz);
+			}
+	return true;
+}
+
+// A real baseline with the target block still in place, the same way the v1.8.6 cases above
+// take theirs — so the "before the drain" reading below is a genuine lit column and not the
+// zeroed one a fresh World would hand back.
+static bool propagateBaseline(void)
+{
+	LightQueue* q = (LightQueue*)malloc(sizeof(LightQueue));
+	if (q == NULL) return false;
+	lightQueueInit(q);
+	const bool ok = lightPropagateColumn(&s_world, TX >> 4, TZ >> 4, q);
+	free(q);
+	return ok;
+}
+
+// Drains the queue the way source/main.c's frame does — relightDrain() at main.c:4656, which
+// is AHEAD of chunkRenderDrainDirty() at main.c:4666 and behind interactEdit() at main.c:4545.
+// That ordering is the entire reason deferring the relight is safe, so the test walks it in
+// the same order rather than in a convenient one.
+static int drainRelights(RelightQueue* q)
+{
+	int cx = 0, cz = 0, n = 0;
+	while (relightqPop(q, &cx, &cz)) {
+		lightRelightColumn(&s_world, cx, cz);
+		n++;
+	}
+	return n;
+}
+
+static void testQueuedAndInlineRelightsAgreeByteForByte(void)
+{
+	uint8_t* inline_snap = (uint8_t*)malloc(SNAP_BYTES);
+	uint8_t* queued_pre  = (uint8_t*)malloc(SNAP_BYTES);
+	uint8_t* queued_post = (uint8_t*)malloc(SNAP_BYTES);
+	CHECK(inline_snap != NULL && queued_pre != NULL && queued_post != NULL);
+	if (inline_snap == NULL || queued_pre == NULL || queued_post == NULL) {
+		free(inline_snap); free(queued_pre); free(queued_post);
+		return;
+	}
+
+	const Body body = farAwayBody();
+	Interact it;
+
+	// ARM A — inline, exactly as v1.8.6 shipped. freshAimedAt leaves the queue NULL.
+	freshAimedAt(&it, BLOCK_STONE);
+	CHECK(propagateBaseline());
+	CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) > 0);
+	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_AIR);
+	CHECK(lightSnapshot(&s_world, TX >> 4, TZ >> 4, inline_snap));
+
+	// ARM B — same fixture, same block, same break, with a queue attached.
+	RelightQueue q;
+	relightqInit(&q);
+	freshAimedAt(&it, BLOCK_STONE);
+	interactSetRelightQueue(&q);
+	CHECK(propagateBaseline());
+	CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) > 0);
+
+	// The WORLD write is not deferred and must never be — only the light is.
+	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_AIR);
+	CHECK(relightqCount(&q) == 1);
+	CHECK(lightSnapshot(&s_world, TX >> 4, TZ >> 4, queued_pre));
+
+	// Before the drain the column still holds the light it had while the stone was there, so
+	// it differs from arm A. THIS is the check that stops the whole case from passing for an
+	// interact.c that ignores the queue and relights inline anyway — without it, "equal after
+	// the drain" is trivially true for a build that never deferred anything.
+	CHECK(memcmp(queued_pre, inline_snap, SNAP_BYTES) != 0);
+
+	CHECK(drainRelights(&q) == 1);
+	CHECK(lightSnapshot(&s_world, TX >> 4, TZ >> 4, queued_post));
+
+	// The claim: all 32768 cells, both channels, identical either way.
+	CHECK(memcmp(queued_post, inline_snap, SNAP_BYTES) == 0);
+
+	// Proof this comparison can actually go red — a single nibble in a single cell, moved by
+	// one, in a buffer of 65536 bytes. A memcmp that had been written against the wrong
+	// length, or over a buffer nothing filled, would pass the check above and fail here.
+	queued_post[2 * (size_t)((TY + 1) * CHUNK_DIM * CHUNK_DIM)] ^= 1u;
+	CHECK(memcmp(queued_post, inline_snap, SNAP_BYTES) != 0);
+
+	free(inline_snap);
+	free(queued_pre);
+	free(queued_post);
+	interactSetRelightQueue(NULL);
+}
+
+// The place-path twin of the break case above, and the same three-way comparison.
+static void testAPlacedBlocksQueuedRelightMatchesTheInlineOne(void)
+{
+	uint8_t* inline_snap = (uint8_t*)malloc(SNAP_BYTES);
+	uint8_t* queued_post = (uint8_t*)malloc(SNAP_BYTES);
+	CHECK(inline_snap != NULL && queued_post != NULL);
+	if (inline_snap == NULL || queued_post == NULL) {
+		free(inline_snap); free(queued_post);
+		return;
+	}
+
+	const Body body = farAwayBody();
+	Interact it;
+
+	freshAimedAt(&it, BLOCK_STONE);
+	it.holding = BLOCK_PLANKS;
+	CHECK(propagateBaseline());
+	interactEdit(&it, &s_world, &body, placeKey(), 0, 0);
+	CHECK(it.placed == 1);
+	CHECK(lightSnapshot(&s_world, TX >> 4, TZ >> 4, inline_snap));
+
+	RelightQueue q;
+	relightqInit(&q);
+	freshAimedAt(&it, BLOCK_STONE);
+	it.holding = BLOCK_PLANKS;
+	interactSetRelightQueue(&q);
+	CHECK(propagateBaseline());
+	interactEdit(&it, &s_world, &body, placeKey(), 0, 0);
+	CHECK(it.placed == 1);
+	CHECK(worldGet(&s_world, TX, TY + 1, TZ) == BLOCK_PLANKS);
+	CHECK(relightqCount(&q) == 1);
+
+	CHECK(drainRelights(&q) == 1);
+	CHECK(lightSnapshot(&s_world, TX >> 4, TZ >> 4, queued_post));
+	CHECK(memcmp(queued_post, inline_snap, SNAP_BYTES) == 0);
+
+	free(inline_snap);
+	free(queued_post);
+	interactSetRelightQueue(NULL);
+}
+
+// A full queue must relight inline rather than drop the request — world/relightq.h's stated
+// overflow posture, and the same fallback source/main.c:2957 already relies on. Filled with
+// columns this test never edits, so the only way the edited column gets its light is the
+// fallback path.
+static void testAFullQueueStillRelightsInline(void)
+{
+	RelightQueue q;
+	relightqInit(&q);
+	for (int i = 0; i < RELIGHTQ_CAP; i++)
+		CHECK(relightqPush(&q, 1000 + i, 2000 + i));
+	CHECK(relightqCount(&q) == RELIGHTQ_CAP);
+
+	Interact it;
+	freshAimedAt(&it, BLOCK_STONE);
+	interactSetRelightQueue(&q);
+	CHECK(propagateBaseline());
+
+	Column* col = worldColumn(&s_world, TX >> 4, TZ >> 4);
+	CHECK(col != NULL);
+	CHECK(lightGetSky(col, TX, TY, TZ) == 0);   // the stone blocks the sky
+
+	const Body body = farAwayBody();
+	CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) > 0);
+
+	// Nothing was queued (there was no room), and the queue counted the refusal.
+	CHECK(relightqCount(&q) == RELIGHTQ_CAP);
+	CHECK(relightqOverflows(&q) > 0);
+
+	// So the light must already be right, with no drain anywhere.
+	col = worldColumn(&s_world, TX >> 4, TZ >> 4);
+	CHECK(col != NULL);
+	CHECK(lightGetSky(col, TX, TY, TZ) == 15);
+
+	interactSetRelightQueue(NULL);
+}
+
 int main(void)
 {
 	// v1.8.6: see the section comment above testABreakRelightsTheColumnItLeftBehind for why
@@ -864,6 +1193,16 @@ int main(void)
 	// v1.8.6.
 	testABreakRelightsTheColumnItLeftBehind();
 	testAPlaceRelightsTheColumnItLeftBehind();
+
+	// v1.8.7 F1 — the discarded send result.
+	testAFailedSendInASessionUndoesTheBreak();
+	testAFailedSendInASessionUndoesThePlace();
+	testAFailedSendWithNoSessionStillBreaksAndPlaces();
+
+	// v1.8.7 F2 — the relight is queued, not inline.
+	testQueuedAndInlineRelightsAgreeByteForByte();
+	testAPlacedBlocksQueuedRelightMatchesTheInlineOne();
+	testAFullQueueStillRelightsInline();
 
 	if (s_fails == 0)
 		printf("interact self-test: PASS  %d checks\n", s_checks);

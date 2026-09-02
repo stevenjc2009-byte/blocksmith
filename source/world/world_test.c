@@ -27,12 +27,18 @@
 #include "world/world.h"
 #include "world/worldgen.h"
 #include "world/worldgen_density.h"
+#include "world/worldgen_scratch.h"
 #include "world/genversion.h"
 #include "world/genrefuse.h"
 
 // Big enough to matter on a 32 KB console stack, and only ever one of each.
 static World       s_world;
 static MeshScratch s_scratch;
+
+// v1.8.7. The generator's per-lane scratch, which used to be file statics inside
+// world/worldgen.c and world/worldgen_density.c. The suite is single-threaded, so one
+// is enough; tests/worldgen_mt_test.c is the binary that gives each thread its own.
+static WorldGenScratch s_wgs;
 
 static int  s_checks;
 static int  s_fails;
@@ -5257,9 +5263,9 @@ static void testWorldgenTerrain(void)
 	CHECK(steep == 0);
 
 	worldInit(&s_world);
-	CHECK(worldgenColumn(&g, &s_world, 0, 0));
-	CHECK(worldgenColumn(&g, &s_world, 1, 0));
-	CHECK(worldgenColumn(&g, &s_world, -1, -1));
+	CHECK(worldgenColumn(&g, &s_wgs, &s_world, 0, 0));
+	CHECK(worldgenColumn(&g, &s_wgs, &s_world, 1, 0));
+	CHECK(worldgenColumn(&g, &s_wgs, &s_world, -1, -1));
 
 	// Layering, checked on every one of the 256 columns of chunk (0,0) rather than a
 	// sample: the surface cap on top, stone below it, and only air or a tree above.
@@ -5358,7 +5364,7 @@ static void testWorldgenDeterminism(void)
 	worldInit(&s_world);
 	for (int cz = 0; cz < GEN_TEST_COLS; cz++)
 		for (int cx = 0; cx < GEN_TEST_COLS; cx++)
-			CHECK_QUIET(worldgenColumn(&g, &s_world, cx, cz));
+			CHECK_QUIET(worldgenColumn(&g, &s_wgs, &s_world, cx, cz));
 
 	const uint32_t forward_hash = genTestHash();
 
@@ -5370,7 +5376,7 @@ static void testWorldgenDeterminism(void)
 	worldInit(&s_world);
 	for (int cz = GEN_TEST_COLS - 1; cz >= 0; cz--)
 		for (int cx = GEN_TEST_COLS - 1; cx >= 0; cx--)
-			CHECK_QUIET(worldgenColumn(&g, &s_world, cx, cz));
+			CHECK_QUIET(worldgenColumn(&g, &s_wgs, &s_world, cx, cz));
 
 	CHECK(genTestHash() == forward_hash);
 	CHECK(s_world.columns == columns_forward);
@@ -5490,7 +5496,7 @@ static void testWorldgenTrees(void)
 	worldInit(&s_world);
 	for (int cz = 0; cz < 3; cz++)
 		for (int cx = 0; cx < 3; cx++)
-			CHECK_QUIET(worldgenColumn(&g, &s_world, cx, cz));
+			CHECK_QUIET(worldgenColumn(&g, &s_wgs, &s_world, cx, cz));
 
 	// There are trees at all. GEN_TREE_CHANCE is 96/256 over 8x8 cells, so a 48x48 area has
 	// 36 cells and should carry roughly a dozen trees; a generator that placed none would
@@ -5584,7 +5590,7 @@ static void testWorldgenTrees(void)
 	// nothing of its own lost. A decoration pass that wrote into its neighbours directly
 	// would fail this in both directions at once.
 	worldInit(&s_world);
-	CHECK(worldgenColumn(&g, &s_world, 1, 1));
+	CHECK(worldgenColumn(&g, &s_wgs, &s_world, 1, 1));
 	CHECK(colHash(1, 1) == centre_with_neighbours);
 
 	// And it must have touched nothing else. A tree that wrote its far side straight into
@@ -5631,7 +5637,7 @@ static void testWorldgenCaves(void)
 	worldInit(&s_world);
 	for (int cz = -GEN_CAVE_TEST_R; cz <= GEN_CAVE_TEST_R; cz++)
 		for (int cx = -GEN_CAVE_TEST_R; cx <= GEN_CAVE_TEST_R; cx++)
-			CHECK_QUIET(worldgenColumn(&g, &s_world, cx, cz));
+			CHECK_QUIET(worldgenColumn(&g, &s_wgs, &s_world, cx, cz));
 
 	long underground = 0, hollow = 0, deep_hollow = 0, lonely = 0;
 	int  shallowest = WORLD_HEIGHT;
@@ -5748,7 +5754,7 @@ static void testWorldgenMemoryProjection(void)
 	worldgenInit(&g, 20260819u, GEN_VERSION_LEGACY);
 
 	const int radius = 8;
-	const int failed = worldgenArea(&g, &s_world, 0, 0, radius);
+	const int failed = worldgenArea(&g, &s_wgs, &s_world, 0, 0, radius);
 	CHECK(failed == 0);
 	CHECK(s_world.columns == 289);
 
@@ -7809,7 +7815,7 @@ static void testWorldgenLegacyByteIdentity(void)
 		WorldGen g;
 		CHECK(worldgenInit(&g, pinned[i].seed, GEN_VERSION_LEGACY));
 		worldInit(&s_world);
-		CHECK(worldgenColumn(&g, &s_world, pinned[i].cx, pinned[i].cz));
+		CHECK(worldgenColumn(&g, &s_wgs, &s_world, pinned[i].cx, pinned[i].cz));
 		CHECK(genTestHashColumn(&s_world, pinned[i].cx, pinned[i].cz) == pinned[i].hash);
 		worldExit(&s_world);
 	}
@@ -7823,12 +7829,12 @@ static void testWorldgenLegacyByteIdentity(void)
 		CHECK(worldgenInit(&density, 1337u, GEN_VERSION_DENSITY));
 
 		worldInit(&s_world);
-		CHECK(worldgenColumn(&legacy, &s_world, 0, 0));
+		CHECK(worldgenColumn(&legacy, &s_wgs, &s_world, 0, 0));
 		const uint32_t h_legacy = genTestHashColumn(&s_world, 0, 0);
 		worldExit(&s_world);
 
 		worldInit(&s_world);
-		CHECK(worldgenColumn(&density, &s_world, 0, 0));
+		CHECK(worldgenColumn(&density, &s_wgs, &s_world, 0, 0));
 		const uint32_t h_density = genTestHashColumn(&s_world, 0, 0);
 		worldExit(&s_world);
 
@@ -8243,7 +8249,7 @@ static void testDensityField(void)
 	// and interpolates it. They must agree for every cell of a column, or spawn-finding and
 	// the terrain disagree about where the ground is.
 	worldInit(&s_world);
-	CHECK(worldgenColumn(&g, &s_world, 3, -2));
+	CHECK(worldgenColumn(&g, &s_wgs, &s_world, 3, -2));
 	int checked = 0;
 	for (int lz = 0; lz < CHUNK_DIM; lz++)
 		for (int lx = 0; lx < CHUNK_DIM; lx++) {
@@ -8287,7 +8293,7 @@ static void testDensityDistribution(void)
 		// bug in the generator.
 		for (int32_t cz = -2; cz <= 2; cz++)
 			for (int32_t cx = -2; cx <= 2; cx++)
-				CHECK_QUIET(worldgenColumn(&g, &s_world, cx, cz));
+				CHECK_QUIET(worldgenColumn(&g, &s_wgs, &s_world, cx, cz));
 
 		int hmin = WORLD_HEIGHT, hmax = 0;
 		long surface_mat = 0, air_under = 0, solid_total = 0;
@@ -8431,7 +8437,7 @@ static void testDensityDistribution(void)
 		worldInit(&s_world);
 		for (int32_t cz = -1; cz <= 1; cz++)
 			for (int32_t cx = -1; cx <= 1; cx++)
-				CHECK_QUIET(worldgenColumn(&g, &s_world, cx, cz));
+				CHECK_QUIET(worldgenColumn(&g, &s_wgs, &s_world, cx, cz));
 
 		long above_sea = 0, cols = 0, grass_high = 0, cliff_stone = 0;
 		for (int32_t cz = -1; cz <= 1; cz++)
@@ -8458,6 +8464,265 @@ static void testDensityDistribution(void)
 		worldExit(&s_world);
 	}
 }
+
+// ── v1.8.7 Phase 2: the seed-sweep amplitude audit ────────────────────────────────────
+//
+// docs/plan-1.8.7-terrain.md §4 Phase 2 is this function's specification, and §1.A is the
+// criterion it answers. Nothing here changes the generator: it calls the existing public
+// wgdDensityAt/wgdBiomeParams and adds zero evaluations to wgdColumn.
+//
+// **What it exists to catch.** The overhang behaviour of the biome amplitude table was
+// measured on exactly two seeds — worldgen_density.c:130-141, seeds 4242 and 90210, 16,384
+// lattice steps each. That same comment records the failure mode: at the PREVIOUS amplitudes
+// (10/18/34/58) the largest upward step on those two seeds was -2.68 and -0.56 blocks, i.e.
+// no overhang was geometrically possible anywhere in those worlds. Two seeds cannot say the
+// current table does not do the same thing somewhere else. This sweeps 50.
+//
+// **The quantity.** Density is 16.16 fixed point in blocks and the vertical bias falls one
+// density-block per world block, so over one 8-block lattice cell the bias subtracts 8 and
+// only a noise term that gains more than that leaves a positive difference. A positive
+// wgdDensityAt(y + GEN_D_CELL_Y) - wgdDensityAt(y) therefore means the field is rising as it
+// goes up, which is the precondition for it to cross zero twice above one (x, z) — an
+// overhang. This is the exact quantity the two-seed comment measured.
+//
+// **Bucketed by AMPLITUDE, not by BiomeId, and the difference is not cosmetic.** The relief
+// table is keyed on the raw worldgenBiome() scalar (worldgen_density.c:146-151). BiomeId is a
+// different axis entirely — a temperature x rainfall classification whose temperature is
+// FX_ONE - worldgenBiome() (worldgen.h:298) — so a desert or a tundra can occur at any
+// amplitude at all. Bucketing by BiomeId would silently answer a different question from the
+// one the amplitude table asks.
+//
+// **What is asserted and what deliberately is not.** The amp-48 and amp-64 bands must show at
+// least one rising step on EVERY seed; that is the failure mode above and the whole reason
+// this test exists. The amp-14 and amp-28 bands sitting at or near 0% is DESIGN INTENT, not a
+// regression — worldgen_density.c:100-104 wants the shoreline and the coastal plain flat, and
+// the arithmetic there forces it — so nothing here asserts on them, and the printed table
+// says so in as many words rather than leaving a future reader to read a flat lowland as a
+// bug.
+//
+// **The negative control, run before this was reported green.** A check that cannot go red
+// proves nothing, so the same sweep was run against the PREVIOUS amplitude table — the four
+// literals in worldgen_density.c:146-151 set back to 10/18/34/58, built, run, then restored
+// and the restore verified by sha256. It goes red, hard: the suite exits 1 with
+// "FAILED - 75 of 6135 checks", and this test's own share of that is 29 SWEEP THIN lines plus
+// 2 SWEEP FAIL lines, all of them in the amp-64 band. Twenty-six of the twenty-nine thin
+// seeds hold ZERO amp-64 steps at all — an old top amplitude of 58 only clears this file's
+// bucket midpoint of 56 within a hair of the top control point — and the two outright
+// failures are seed 31 (0 rising steps of 288) and seed 707 (0 of 352), which is the exact
+// failure mode worldgen_density.c:130-141 recorded on its own two seeds. Worth writing down
+// honestly rather than only the headline: the amp-48 band did NOT go red in that arm, because
+// at the old table that bucket holds interpolated mid-slope terrain rather than the band the
+// regression lived in. The red lands entirely on amp-64, which is where the old measurement
+// said it would.
+//
+// **Host only, and on purpose.** ~29.5 million lattice steps, about ten seconds at this
+// suite's -O1 on x86-64. The same work on a 268 MHz ARM11 would run for minutes and would
+// measure nothing new: wgdDensityAt is integer throughout, for the reason worldgen_density.h
+// states, so both machines produce the same bits by construction. The spec calls this phase
+// host-only for the same reason.
+#ifndef __3DS__
+
+// 50 seeds — 25x the sample on record — fixed and checked in, never rand(), so the report is
+// reproducible run to run and machine to machine. The first three are the seeds already used
+// elsewhere in this file and in worldgen_density.c's own comment, so this sweep's numbers can
+// be read against them; the rest are an arbitrary but frozen spread that includes both 32-bit
+// extremes.
+#define GEN_D_SWEEP_SEEDS 50
+
+// Grid points per axis, at GEN_D_CELL_XZ spacing, centred on the origin: 192 x 192 points is
+// a 768 x 768-block window, and 192 * 192 * 16 = 589,824 steps per seed — 36x the 16,384 the
+// two-seed measurement used, which the spec asks this to match or exceed.
+//
+// **Why the window is this big rather than the on-record 128 x 128 blocks.** The amp-64 band
+// is rare: about 0.1% of sampled steps pooled. A small window simply does not contain any of
+// it on most seeds, and a bucket with no samples in it cannot fail an assertion. Measured
+// over these 50 seeds, centred on the origin, at this same spacing: a 128 x 128-block window
+// leaves the amp-64 bucket EMPTY on 34 of the 50 seeds, a 640 x 640 one on 1 of 50, and this
+// 768 x 768 one on none of them — the thinnest seed (27182818) still gets 640 steps. That is
+// also why GEN_D_SWEEP_MIN_BUCKET below is checked per seed: it is the thing that stops a
+// later shrink of this window turning the assertion into one that cannot go red.
+#define GEN_D_SWEEP_SPAN 192
+
+// The fewest steps a high-amplitude bucket may hold on one seed before its overhang rate is
+// treated as an answer rather than as an absence of data. 256 steps is 16 lattice columns.
+#define GEN_D_SWEEP_MIN_BUCKET 256
+
+static const uint32_t s_sweep_seeds[GEN_D_SWEEP_SEEDS] = {
+	1337u, 4242u, 90210u, 1u, 2u, 3u, 7u, 11u, 13u, 17u,
+	19u, 23u, 29u, 31u, 37u, 41u, 43u, 47u, 53u, 59u,
+	101u, 202u, 303u, 404u, 505u, 606u, 707u, 808u, 909u, 1010u,
+	12345u, 54321u, 65535u, 99999u, 123456u, 654321u, 777777u, 8675309u,
+	31415926u, 27182818u, 16180339u, 14142135u, 2147483647u, 4294967295u,
+	305419896u, 2596069104u, 3735928559u, 3405691582u, 48879u, 61374u
+};
+
+// The four amplitudes of s_biome_table (worldgen_density.c:146-151). wgdBiomeParams
+// interpolates continuously between the control points, so every sample is filed under
+// whichever of the four its amplitude is NEAREST to; the midpoints are 21, 38 and 56.
+static const int s_sweep_amps[4] = {14, 28, 48, 64};
+
+static int genTestAmpBucket(int amp)
+{
+	if (amp < 21) return 0;
+	if (amp < 38) return 1;
+	if (amp < 56) return 2;
+	return 3;
+}
+
+static void testDensitySeedSweep(void)
+{
+	long tot_n[4]   = {0, 0, 0, 0};
+	long tot_pos[4] = {0, 0, 0, 0};
+	int  tot_max[4] = {-100000, -100000, -100000, -100000};
+
+	// The worst seed per band, by rising-step rate, so the report can name it instead of
+	// only saying that all fifty passed. Compared as a cross-product of longs — pos_a/n_a <
+	// pos_b/n_b is pos_a*n_b < pos_b*n_a — rather than in floating point, which is the same
+	// integer discipline the generator itself keeps.
+	uint32_t worst_seed[4] = {0, 0, 0, 0};
+	long     worst_pos[4]  = {0, 0, 0, 0};
+	long     worst_n[4]    = {0, 0, 0, 0};
+
+	// Two exemplars for Phase 4's playtest, printed with the table: the single most
+	// dramatic rising step found anywhere in the mountains band, and the flattest lowland
+	// point found anywhere. Phase 4 goes and looks at these two coordinates.
+	uint32_t hi_seed = 0, lo_seed = 0;
+	int32_t  hi_x = 0, hi_z = 0, lo_x = 0, lo_z = 0;
+	int      hi_y = 0, hi_amp = -1, hi_d = -100000, lo_amp = 1000;
+
+	long total_steps = 0;
+	int  seeds_run = 0, thin_seeds = 0, zero_seeds = 0;
+
+	for (int si = 0; si < GEN_D_SWEEP_SEEDS; si++) {
+		const uint32_t seed = s_sweep_seeds[si];
+		WorldGen g;
+		CHECK_QUIET(worldgenInit(&g, seed, GEN_VERSION_BIOME));
+		seeds_run++;
+
+		long n[4]   = {0, 0, 0, 0};
+		long pos[4] = {0, 0, 0, 0};
+
+		for (int iz = 0; iz < GEN_D_SWEEP_SPAN; iz++) {
+			for (int ix = 0; ix < GEN_D_SWEEP_SPAN; ix++) {
+				const int32_t x = (ix - GEN_D_SWEEP_SPAN / 2) * GEN_D_CELL_XZ;
+				const int32_t z = (iz - GEN_D_SWEEP_SPAN / 2) * GEN_D_CELL_XZ;
+
+				int amp;
+				wgdBiomeParams(worldgenBiome(&g, x, z), NULL, &amp);
+				const int b = genTestAmpBucket(amp);
+
+				if (amp < lo_amp) {
+					lo_amp = amp; lo_seed = seed; lo_x = x; lo_z = z;
+				}
+
+				// 17 lattice points up the column give 16 cells; the 17th closes the top
+				// at y = WORLD_HEIGHT, exactly as the generator's own grid does. Each
+				// sample is reused as the next step's lower point, so this is 17 density
+				// evaluations per column rather than 32.
+				int32_t prev = wgdDensityAt(&g, x, 0, z);
+				for (int k = 1; k < GEN_D_GRID_Y; k++) {
+					const int y   = k * GEN_D_CELL_Y;
+					const int32_t cur = wgdDensityAt(&g, x, y, z);
+					const int d   = (int)((cur - prev) >> FX_SHIFT);
+					prev = cur;
+
+					n[b]++;
+					if (d > 0) pos[b]++;
+					if (d > tot_max[b]) tot_max[b] = d;
+					if (b == 3 && d > hi_d) {
+						hi_d = d; hi_seed = seed; hi_amp = amp;
+						hi_x = x; hi_z = z; hi_y = y - GEN_D_CELL_Y;
+					}
+				}
+			}
+		}
+
+		for (int b = 0; b < 4; b++) {
+			tot_n[b]   += n[b];
+			tot_pos[b] += pos[b];
+			total_steps += n[b];
+			if (n[b] > 0 &&
+			    (worst_n[b] == 0 ||
+			     (long long)pos[b] * worst_n[b] < (long long)worst_pos[b] * n[b])) {
+				worst_seed[b] = seed;
+				worst_pos[b]  = pos[b];
+				worst_n[b]    = n[b];
+			}
+		}
+
+		// The two high-amplitude bands, per seed. Coverage first — a bucket too thin to
+		// have an opinion is reported as thin, not quietly passed — then the assertion
+		// this whole phase exists for.
+		for (int b = 2; b < 4; b++) {
+			if (n[b] < GEN_D_SWEEP_MIN_BUCKET)
+				printf("  SWEEP THIN: seed %u amp-%d bucket holds only %ld steps"
+				       " (need %d); its overhang rate is not an answer.\n",
+				       seed, s_sweep_amps[b], n[b], GEN_D_SWEEP_MIN_BUCKET);
+			else if (pos[b] == 0)
+				printf("  SWEEP FAIL: seed %u amp-%d bucket has 0 rising steps of %ld"
+				       " — no overhang is geometrically possible in that band on this"
+				       " seed.\n", seed, s_sweep_amps[b], n[b]);
+
+			if (n[b] < GEN_D_SWEEP_MIN_BUCKET) thin_seeds++;
+			if (pos[b] == 0)                   zero_seeds++;
+
+			CHECK_QUIET(n[b] >= GEN_D_SWEEP_MIN_BUCKET);
+			CHECK_QUIET(pos[b] > 0);
+		}
+	}
+
+	// ── The report ────────────────────────────────────────────────────────────────────
+	//
+	// Printed, not only returned as an exit code, so a run of tools/run_host_tests.sh
+	// leaves the table in the console output where a reader can see the distribution
+	// rather than only whether it tripped. The percentages are display-only doubles; every
+	// assertion above is integer.
+	printf("\n  v1.8.7 Phase 2 — seed-sweep amplitude audit\n");
+	printf("  %d seeds, %d x %d lattice columns each at %d-block spacing (a %d-block"
+	       " window centred on the origin), 16 vertical cells per column:\n"
+	       "  %ld steps per seed, %ld total.\n",
+	       GEN_D_SWEEP_SEEDS, GEN_D_SWEEP_SPAN, GEN_D_SWEEP_SPAN, GEN_D_CELL_XZ,
+	       GEN_D_SWEEP_SPAN * GEN_D_CELL_XZ,
+	       seeds_run ? total_steps / seeds_run : 0L, total_steps);
+	printf("   amp |    samples | rising steps |  rate  | largest rise |"
+	       " lowest-rate seed\n");
+	for (int b = 0; b < 4; b++) {
+		const double rate = tot_n[b] ? 100.0 * (double)tot_pos[b] / (double)tot_n[b] : 0.0;
+		const double wrate = worst_n[b]
+		                   ? 100.0 * (double)worst_pos[b] / (double)worst_n[b] : 0.0;
+		printf("   %3d | %10ld | %12ld | %5.2f%% | %+12d | %10u %6.3f%%\n",
+		       s_sweep_amps[b], tot_n[b], tot_pos[b], rate,
+		       tot_n[b] ? tot_max[b] : 0, worst_seed[b], wrate);
+	}
+	printf("  amp 14 (lowland) and amp 28 (coastal plain) at or near 0%% is DESIGN INTENT,"
+	       " not a failure:\n"
+	       "  worldgen_density.c:100-104 wants the waterline flat, and nothing above"
+	       " asserts on those two rows.\n");
+	printf("  Phase 4 exemplars — mountains: seed %u at (%d, %d), amp %d, largest rise"
+	       " %+d blocks across the cell at y=%d..%d.\n",
+	       hi_seed, hi_x, hi_z, hi_amp, hi_d, hi_y, hi_y + GEN_D_CELL_Y);
+	printf("                      lowland:   seed %u at (%d, %d), amp %d.\n",
+	       lo_seed, lo_x, lo_z, lo_amp);
+
+	// The sweep ran at the size it claims to have run at. Without these, a future edit that
+	// shrank the window or dropped seeds would still print a green table.
+	CHECK(seeds_run == GEN_D_SWEEP_SEEDS);
+	CHECK(total_steps >= (long)GEN_D_SWEEP_SEEDS * 16384L);
+
+	// All four bands were actually sampled. The amp-14 and amp-28 rows are not asserted on
+	// for their rate, but an EMPTY bucket would make "0%, by design" a statement about
+	// nothing at all, so their presence is checked.
+	CHECK(tot_n[0] > 0);
+	CHECK(tot_n[1] > 0);
+	CHECK(tot_n[2] > 0);
+	CHECK(tot_n[3] > 0);
+
+	// The two lines this phase exists for, summarised loudly. The per-seed CHECK_QUIETs
+	// above name the line; the SWEEP FAIL / SWEEP THIN prints name the seed.
+	CHECK(thin_seeds == 0);
+	CHECK(zero_seeds == 0);
+}
+#endif  // !__3DS__
 
 // ── Tasks 17 and 19: the sea-level water fill and the tall-grass scatter ──────────────
 //
@@ -8537,7 +8802,7 @@ static void testWorldgenBiomeSurface(void)
 	const int32_t ox = 10, oz = -20, r = 3;
 	for (int32_t cz = oz - r; cz <= oz + r; cz++)
 		for (int32_t cx = ox - r; cx <= ox + r; cx++)
-			CHECK_QUIET(worldgenColumn(&g, &s_world, cx, cz));
+			CHECK_QUIET(worldgenColumn(&g, &s_wgs, &s_world, cx, cz));
 
 	long usable[BIOME_COUNT] = {0}, wrong_cap[BIOME_COUNT] = {0};
 	long eligible[BIOME_COUNT] = {0}, plants[BIOME_COUNT] = {0};
@@ -8775,7 +9040,7 @@ static void testWorldgenTreeVariants(void)
 	worldInit(&s_world);
 	for (int32_t cz = oz - r; cz <= oz + r; cz++)
 		for (int32_t cx = ox - r; cx <= ox + r; cx++)
-			CHECK_QUIET(worldgenColumn(&g, &s_world, cx, cz));
+			CHECK_QUIET(worldgenColumn(&g, &s_wgs, &s_world, cx, cz));
 
 	// ── Find every trunk ──────────────────────────────────────────────────────────────
 	//
@@ -8930,7 +9195,7 @@ static void testWorldgenTreeVariants(void)
 	worldInit(&s_world);
 	for (int32_t cz = oz + r; cz >= oz - r; cz--)
 		for (int32_t cx = ox + r; cx >= ox - r; cx--)
-			CHECK_QUIET(worldgenColumn(&g, &s_world, cx, cz));
+			CHECK_QUIET(worldgenColumn(&g, &s_wgs, &s_world, cx, cz));
 	n = 0;
 	for (int32_t cz = oz - 1; cz <= oz + 1; cz++)
 		for (int32_t cx = ox - 1; cx <= ox + 1; cx++)
@@ -8974,7 +9239,7 @@ static void testWorldgenPhase3Flora(void)
 	worldInit(&s_world);
 	for (int32_t cz = oz - r; cz <= oz + r; cz++)
 		for (int32_t cx = ox - r; cx <= ox + r; cx++)
-			CHECK_QUIET(worldgenColumn(&g, &s_world, cx, cz));
+			CHECK_QUIET(worldgenColumn(&g, &s_wgs, &s_world, cx, cz));
 
 	long snow = 0, snow_wrong_biome = 0, snow_not_cap = 0;
 	long ice  = 0, ice_wrong_biome  = 0, ice_off_line = 0;
@@ -9123,7 +9388,7 @@ static void testWorldgenPhase3Flora(void)
 			worldInit(&s_world);
 			for (int32_t cz = -1; cz <= 1; cz++)
 				for (int32_t cx = -1; cx <= 1; cx++)
-					CHECK_QUIET(worldgenColumn(&lg, &s_world, cx, cz));
+					CHECK_QUIET(worldgenColumn(&lg, &s_wgs, &s_world, cx, cz));
 
 			long intruders = 0, cells = 0;
 			for (int32_t z = -CHUNK_DIM; z < 2 * CHUNK_DIM; z++)
@@ -9227,7 +9492,7 @@ static void testWorldgenWaterAndGrass(void)
 		WorldGen g;
 		CHECK(worldgenInit(&g, pinned[i].seed, GEN_VERSION_BIOME));
 		worldInit(&s_world);
-		CHECK(worldgenColumn(&g, &s_world, pinned[i].cx, pinned[i].cz));
+		CHECK(worldgenColumn(&g, &s_wgs, &s_world, pinned[i].cx, pinned[i].cz));
 		CHECK_QUIET(genTestHashColumnTerrain(&s_world, pinned[i].cx, pinned[i].cz)
 		            == pinned[i].hash);
 		worldExit(&s_world);
@@ -9254,7 +9519,7 @@ static void testWorldgenWaterAndGrass(void)
 		worldInit(&s_world);
 		for (int32_t cz = -1; cz <= 1; cz++)
 			for (int32_t cx = -1; cx <= 1; cx++)
-				CHECK_QUIET(worldgenColumn(&g, &s_world, cx, cz));
+				CHECK_QUIET(worldgenColumn(&g, &s_wgs, &s_world, cx, cz));
 		long legacy_water = 0, legacy_plants = 0, land_eligible = 0;
 		for (int32_t z = -CHUNK_DIM; z < 2 * CHUNK_DIM; z++)
 			for (int32_t x = -CHUNK_DIM; x < 2 * CHUNK_DIM; x++) {
@@ -9300,7 +9565,7 @@ static void testWorldgenWaterAndGrass(void)
 		worldInit(&s_world);
 		for (int32_t cz = oz - 2; cz <= oz + 2; cz++)
 			for (int32_t cx = ox - 2; cx <= ox + 2; cx++)
-				CHECK_QUIET(worldgenColumn(&g, &s_world, cx, cz));
+				CHECK_QUIET(worldgenColumn(&g, &s_wgs, &s_world, cx, cz));
 
 		long water = 0, plants = 0, eligible = 0, sealed_air = 0, trunk_bases = 0;
 		long water_above_line = 0, unfilled_ocean = 0, detached_water = 0;
@@ -9471,7 +9736,7 @@ static void testWorldgenWaterAndGrass(void)
 		worldInit(&s_world);
 		for (int cz = 0; cz < GEN_TEST_COLS; cz++)
 			for (int cx = 0; cx < GEN_TEST_COLS; cx++)
-				CHECK_QUIET(worldgenColumn(&g, &s_world, cx, cz));
+				CHECK_QUIET(worldgenColumn(&g, &s_wgs, &s_world, cx, cz));
 		const uint32_t forward = genTestHash();
 
 		// Non-vacuity: the hashed region has to contain what this seed is here for.
@@ -9490,7 +9755,7 @@ static void testWorldgenWaterAndGrass(void)
 		worldInit(&s_world);
 		for (int cz = GEN_TEST_COLS - 1; cz >= 0; cz--)
 			for (int cx = GEN_TEST_COLS - 1; cx >= 0; cx--)
-				CHECK_QUIET(worldgenColumn(&g, &s_world, cx, cz));
+				CHECK_QUIET(worldgenColumn(&g, &s_wgs, &s_world, cx, cz));
 		CHECK(genTestHash() == forward);
 
 		// And the hash can see one block move, or the line above proves nothing.
@@ -11434,6 +11699,9 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testDensityBiomeTable();
 	testDensityField();
 	testDensityDistribution();
+#ifndef __3DS__
+	testDensitySeedSweep();   // v1.8.7 Phase 2, host only — see the note above the function
+#endif
 	testWorldgenWaterAndGrass();
 	testWorldgenBiomeSurface();
 	testWorldgenTreeVariants();
@@ -11655,21 +11923,36 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 // So the ceiling lift this version is named for contributes exactly ZERO checks, which is worth
 // writing down: the pin moving in the same commit as RENDER_DIST_MAX is a coincidence of timing,
 // and a future reader who assumes the two are connected will mis-derive the next number.
+//
+// v1.8.7 Phase 2, the seed-sweep amplitude audit: 6056 + 8 = 6064, and this one IS countable
+// off the source. testDensitySeedSweep emits exactly eight loud CHECKs, all of them outside
+// every loop — seeds_run, total_steps, the four "this band was sampled at all" lines, and the
+// two summary lines (thin_seeds, zero_seeds) the phase exists for. Everything inside its seed
+// loop is CHECK_QUIET on purpose: 50 worldgenInit calls plus 100 coverage and 100 overhang
+// assertions, 250 in all, which contribute NOTHING to this total while they pass, per the
+// rule already stated above. The test is inside `#ifndef __3DS__` and so is its call, so the
+// console-side total (still unmeasured, see the note further down) is unchanged by it.
+//
+// Predicted 6064 before running, then confirmed against the run — that order. And confirmed
+// able to move: in the negative-control arm (worldgen_density.c's amplitudes set back to the
+// old 10/18/34/58) the same tree printed "FAILED - 75 of 6135 checks", because a failing
+// CHECK_QUIET DOES count. A red arm's total is not a measurement of anything, which is why
+// only the green one is pinned. What went red there is recorded above testDensitySeedSweep.
 #ifndef __3DS__
 	{
 		const int ran = s_checks;
-		if (ran != 6056)
+		if (ran != 6064)
 			printf("\nCHECK-COUNT GUARD: %d checks ran, %d expected.\n"
 			       "  %s\n"
 			       "  This is NOT an ordinary assertion failure.\n"
 			       "  Read the comment above this guard in world/world_test.c before"
 			       " touching the pinned number.\n",
-			       ran, 6056,
-			       ran < 6056
+			       ran, 6064,
+			       ran < 6064
 			           ? "Checks went MISSING: checks that should have run never ran at all."
 			           : "Extra checks appeared: either you added checks and did not update"
 			             " the pin, or something is emitting checks it should not.");
-		CHECK(ran == 6056);
+		CHECK(ran == 6064);
 	}
 #endif
 

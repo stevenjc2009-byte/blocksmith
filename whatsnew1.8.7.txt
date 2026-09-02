@@ -1,0 +1,21 @@
+# Release notes shown on the 3DS top screen before the update downloads.
+#
+# Two sections, both optional, one item per line. Plain English, no markdown: this is read
+# by a player on a 400 px screen, not by a developer. A leading "- " is optional.
+#
+# Long lines wrap on their own, so write a sentence rather than fighting the width.
+#
+# The two lines below are placeholders. This script REFUSES the file while either of them is
+# still here, so replace each with a real sentence about this release, or delete it if that
+# section has nothing in it.
+
+[features]
+Chunks load nearest-first, so the ground under you fills in before terrain behind you.
+Caves and terrain generate over twice as fast, so the world keeps up better as you move.
+Groundwork for a second world-building thread on the New 3DS. Nothing changes yet.
+
+[fixes]
+Lighting could come out wrong after a block was broken or placed. Both consoles, since 1.8.0.
+A block you broke or placed could silently never reach other players, splitting the world.
+Joining a server on a different version let you in to a world full of holes. Now it refuses.
+You could break and place blocks from inside the pause menu, and water kept flowing.

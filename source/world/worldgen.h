@@ -475,7 +475,61 @@ typedef struct {
 	// on it, so a world stamped GEN_VERSION_LEGACY produces byte-identical terrain to what
 	// it produced before the density generator was written, forever.
 	uint32_t version;
+
+	// v1.8.7. rngMix(seed ^ SALT_CAVE) and rngMix(seed ^ SALT_CAVE2), the two mixed
+	// seeds worldgenIsCave() draws its pair of 3D fBms from. Derived here rather than
+	// at the call site because that call site is asked roughly 20,900 times per
+	// generated column and the answer cannot change while the WorldGen lives.
+	//
+	// Set by worldgenInit() in both arms, always as rngMix(g->seed ^ SALT_X) -- a
+	// WorldGen built any other way has never existed in this tree and would carry
+	// uninitialised salts.
+	uint32_t cave_salt[2];
 } WorldGen;
+
+// ── Per-lane scratch (v1.8.7) ─────────────────────────────────────────────────────────
+//
+// **Every buffer the generator carries from one call to the next lives in here, and nowhere
+// else.** Until v1.8.7 that state was a set of file statics split across world/worldgen.c and
+// world/worldgen_density.c, which made the whole generator single-entry: two threads
+// generating DIFFERENT columns stamped on each other's scratch. Measured rather than argued —
+// tests/worldgen_mt_test.c against the old code, two threads over disjoint columns: 24 of 32
+// columns wrong and 159 of 192 generations REFUSED, against a serialised control arm that was
+// clean in every run. A refused column is a permanent hole in the world (main.c genInstallOne
+// -> columns_failed), not a slow frame.
+//
+// **A WorldGen is shared and read-only; a WorldGenScratch is owned by exactly one thread.**
+// That split is the whole design. The seed, the version and the cave salts are the same for
+// every lane and must be; the scratch is per lane and must never be. Making it a parameter
+// rather than a static puts the rule in the type system instead of in a comment: a second
+// generator lane is one more WorldGenScratch, and there is no longer a way to forget which
+// half is shared.
+//
+// **Caller-owned storage, deliberately.** Not allocated here, not a static array indexed by a
+// lane number — that would be the same file static wearing a subscript, and the .bss would
+// grow rather than move — and not thread-local, because __thread is not something to rely on
+// in this toolchain. The lane owns the object; the generator only borrows it.
+//
+// It is about 16 KB, so it belongs in a caller's static storage and not on a stack: the
+// worker thread's is 32 KB (app/worker.c). It is NOT charged against WORLD_BUDGET_BYTES
+// (world/budget.h) — that budget counts block storage, and this is paid once per lane rather
+// than once per column.
+//
+// The definition is in world/worldgen_scratch.h, which any caller that needs to DECLARE one
+// includes. It lives in its own header because the struct is sized by the density generator's
+// grid geometry, which is in world/worldgen_density.h — and that header includes this one, so
+// the definition cannot come back the other way.
+typedef struct WorldGenScratch WorldGenScratch;
+
+// Puts a WorldGenScratch into the state a freshly zeroed one is already in: nothing cached,
+// nothing valid. **Call it once before the scratch's first generation call**, unless the
+// object is in static storage, where the C runtime has already done it.
+//
+// Only the two validity flags are written — the cave cache's and the column-tops key's —
+// because they are the only fields ever read before they are written. Every buffer in the
+// struct is filled in full by the pass that consumes it, so memsetting 16 KB here would cost
+// real time to hide nothing.
+void worldgenScratchInit(WorldGenScratch* s);
 
 // `version` is a GEN_VERSION_* from world/genversion.h, and there is deliberately no default:
 // the one thing a caller must never do is generate a world without saying which generator it
@@ -555,13 +609,35 @@ bool worldgenIsSandy(const WorldGen* g, int32_t x, int32_t z);
 // that actually matters anyway.
 //
 // Always false below GEN_CAVE_FLOOR, so the bottom of the world is solid.
+//
+// **Stateless as of v1.8.7, and therefore safe to call from any thread.** It evaluates the
+// two fBms the long way every time. The per-column corner cache that v1.8.7 added lives in a
+// WorldGenScratch and is reached through worldgenIsCaveCached() below; this entry point kept
+// the plain body so that a caller which has no lane — the suite's scattered sweeps, a debug
+// probe — does not have to invent one to ask a question about the field.
 bool worldgenIsCave(const WorldGen* g, int32_t x, int y, int32_t z);
+
+// The same answer as worldgenIsCave(), out of the caller's per-column corner cache.
+//
+// **Bit-identical to worldgenIsCave() by construction and by measurement**: the cache holds
+// the same lattice corners the fBm would have hashed, interpolated in world/noise.c's order
+// with world/noise.c's normalisation. Verified over 3,436,800 cells across 4 seeds — every
+// cell of a 5 x 5 column grid plus a 160,000-sample interleaved sweep that crosses columns on
+// every call and runs y from -8 to WORLD_HEIGHT + 39 — with zero mismatches.
+//
+// This is the form the two fill loops use, because they ask it up to 32,768 times for one
+// column and the cache is 90 % of the octave work a column does. It is on `s` rather than on
+// a file static so that two lanes carve their own columns without sharing a key.
+bool worldgenIsCaveCached(const WorldGen* g, WorldGenScratch* s, int32_t x, int y, int32_t z);
 
 // Generates one column (all 8 chunks at cx, cz) into the world. False if the block
 // budget or the column table refused an allocation — a real condition the caller must
 // report rather than draw a hole for. Generating a column that already exists overwrites
 // it, so this is not a way to preserve player edits; that is Phase 8's job.
-bool worldgenColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz);
+//
+// `s` is this thread's scratch and must not be shared with another thread that is inside the
+// generator at the same time — see WorldGenScratch above for the measurement that says so.
+bool worldgenColumn(const WorldGen* g, WorldGenScratch* s, World* w, int32_t cx, int32_t cz);
 
 // The scatter pass for one column: tall grass (roadmap task 19). Called by worldgenColumn
 // after worldgenDecorate, and only for a GEN_VERSION_DENSITY world.
@@ -582,7 +658,10 @@ bool worldgenColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz);
 //
 // Returns false only if the world refused an allocation, or if the density generator's
 // per-column surface heights are not the ones for (cx, cz) — see wgdColumnTops().
-bool worldgenScatter(const WorldGen* g, World* w, int32_t cx, int32_t cz);
+//
+// `s` must be the same scratch the immediately preceding wgdColumn() filled, because that is
+// where the surface heights it reads live.
+bool worldgenScatter(const WorldGen* g, WorldGenScratch* s, World* w, int32_t cx, int32_t cz);
 
 // The decoration pass for one column: trees. Called by worldgenColumn after the ground is
 // in, and exposed so the tests can run it on its own.
@@ -592,9 +671,15 @@ bool worldgenScatter(const WorldGen* g, World* w, int32_t cx, int32_t cz);
 // That clip is what makes the pass order-independent: a tree that wrote into its neighbour
 // directly would be erased when that neighbour's ground was filled, which happens earlier,
 // later, or in another session depending on where the player walked.
+//
+// **No scratch parameter, and that is a fact about the pass rather than an omission.** Every
+// input it has is a hash of a tree cell or a heightmap query, both pure functions of the
+// WorldGen; it carries nothing between calls. It was already re-entrant before v1.8.7 and
+// giving it a scratch it would not read would only suggest otherwise.
 bool worldgenDecorate(const WorldGen* g, World* w, int32_t cx, int32_t cz);
 
 // Generates a square of columns centred on (cx, cz), radius in columns. Returns the
 // number of columns that failed, so a caller can report "generated 289, refused 3"
 // instead of silently drawing a world with holes in it.
-int worldgenArea(const WorldGen* g, World* w, int32_t cx, int32_t cz, int radius);
+int worldgenArea(const WorldGen* g, WorldGenScratch* s, World* w, int32_t cx, int32_t cz,
+                 int radius);

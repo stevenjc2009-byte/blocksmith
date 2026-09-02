@@ -1258,6 +1258,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/world/registry.c \
 	source/world/chunk.c \
 	source/world/budget.c \
+	source/world/relightq.c \
 	source/app/options.c \
 	source/app/hw.c \
 	source/scene/render_dist.c \
@@ -3501,3 +3502,267 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 rm -rf "$BHFR"
 
 rm -rf "$BHRD"
+
+# tests/light_race_test.c -- world/light.c's file-static state under TWO REAL THREADS (v1.8.7).
+# Appended, like every stanza in this file, because an append is the one edit shape that cannot
+# drop another session's work.
+#
+# THE ONLY THREADED BINARY IN THIS SUITE, and that is why the two defects it covers survived so
+# long: light.c's statics are only wrong when two threads reach them at once, and until now
+# nothing here had ever done that. -pthread is on the link for that reason and no other.
+#
+# WHAT IT COVERS.
+#  * lightColumnAttach/lightColumnDetach did a plain `s_attached++/--`. The worker reaches them
+#    from JOB_GENERATE (app/worker.c:286) while it is NOT parked -- the handshake app/worker.h
+#    describes covers workerInstall only -- and the main thread reaches them from the edit path
+#    (scene/interact.c:115, :309, world/relight_drain.c:26) and the streaming unload
+#    (world/world.c:148). world/budget.c:5-25 had already been given CAS loops for exactly this
+#    interleaving; light.c never was.
+#  * lightRelightColumn has run the flood fill over ONE file-static queue since v1.8.0, and
+#    worker.c:287 calls it. app/worker.c:108 still claims "the main thread's edit path uses the
+#    queue-free sweep engine precisely so the two never share one", which stopped being true in
+#    v1.8.0 and was never revisited. Two threads on one LightQueue is wrong light, not a lost
+#    statistic.
+#
+# MEASURED, red arm, against light.c as it stood before the fix:
+#   attached after: -3673 (want 0, drift -3673)      <- 240,000 balanced attach/detach pairs
+#   budget used   : 0 B (want 0)                     <- budget.c's CAS, same threads, no drift
+#   column 0: 56/60 wrong digests / column 1: 60/60
+#   light race self-test: FAILED - 3 of 15 checks
+# Green after: 0 drift, 0/60 and 0/60, PASS 15 checks.
+#
+# The two REFERENCE DIGEST lines it prints are its second job: an FNV-1a of both 16 KiB channels
+# of two fixed columns. They read f130485b and fa839901 both before and after the v1.8.7
+# synchronisation, which is what says the fix moved not one nibble. Anything that changes what
+# light.c computes will move them, and that is the point -- re-baseline them deliberately or not
+# at all.
+BHLR="build-host/run-$$-lightrace"
+mkdir -p "$BHLR"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/world.c \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/budget.c \
+	source/world/scratch.c \
+	tests/net_stub.c \
+	tests/light_race_test.c \
+	-pthread \
+	-o "$BHLR/light_race_test"
+
+"./$BHLR/light_race_test"
+
+rm -rf "$BHLR"
+
+# tests/worldgen_density_opt_test.c -- the TERRAIN IDENTITY pin for world/worldgen_density.c
+# (v1.8.7). Appended, like every stanza in this file, because an append is the one edit shape
+# that cannot drop another session's work.
+#
+# WHY IT EXISTS. v1.8.7 put three optimisations into the density generator, and all three are
+# only allowed to exist if the terrain they produce does not move: changing generated terrain
+# on this project needs a new GEN_VERSION and a coordinated server release, so "faster" and
+# "faster and identical" are different outcomes and nothing in the suite could previously tell
+# them apart. The three:
+#   * the density salt hoist -- densityCore re-mixed rngMix(seed ^ SALT_DLOW/DHIGH/DSEL) on
+#     every call, and it is called 425 times per column built plus 68 per wgdHeight query.
+#     They are now derived once per call into the file and passed down in a DensitySalts
+#     stack local. A parameter and NOT a file static, deliberately: this generator's statics
+#     are what stand between it and the New 3DS's spare core.
+#   * the uniform-cell short circuit in interpolateColumn -- a lattice cell whose eight
+#     corners are all positive is solid in all 128 of its blocks and one whose corners are all
+#     non-positive is air in all of them, so neither needs interpolating. Exact rather than
+#     approximate because lerpSh cannot leave the interval its endpoints span; the test
+#     brute-forces that property as well as pinning the terrain.
+#   * the bitmask top scan -- s_top was filled by walking down from the ceiling once per
+#     (x, z), so the empty sky above the terrain was re-walked sixteen times per z row. It now
+#     resolves sixteen cells per row at once and stops when the row is done.
+#
+# WHAT IT PINS. 600 generated columns: 12 seeds x 25 column coordinates x both density
+# generator versions, FNV-1a over every cell of every allocated chunk plus the chunk-present
+# flags. Not four fixtures -- a fixture set that small is a sample and not a distribution, and
+# this project has been caught by that before. The coordinates deliberately mix a contiguous
+# patch, negatives (the floor-shift path) and far-field coordinates out to +/-30,000 blocks
+# (the 64-bit octave position widening). A second digest covers wgdHeight and wgdDensityAt,
+# which are the other doors into densityCore. A third check reads wgdColumnTops() back against
+# the generated blocks themselves.
+#
+# The two REFERENCE DIGEST lines it prints are the point: they read 1a26d43b4b39eee3 and
+# c9dce475c6cb6830 both BEFORE and AFTER the three optimisations, which is what says they moved
+# not one nibble. Anything that changes what the density generator computes will move them.
+# Re-baseline them deliberately, alongside a GEN_VERSION bump, or not at all.
+#
+# MEASURED, red arms, each one a single substitution into worldgen_density.c and each restored
+# afterwards. Green control throughout: "PASS 102 checks", exit 0 -- and the same 102 with
+# HEAD's pre-optimisation worldgen_density.c compiled in its place, which is the identity claim
+# stated as a measurement rather than as an argument.
+#
+#  * SALT_DSEL 0x4453454C -> 0x4453454D (the class of bug a wrong hoist makes)
+#      -> "FAILED - 2 of 102 checks (first: L320 terrain == PIN_TERRAIN)", both digests moved:
+#         terrain 01fa52dafe718064, pointapi 1166e9c38bc72702.
+#  * the uniform-SOLID fast path filling three of its four x-blocks
+#      -> "FAILED - 1 of 102 checks", terrain a597c6c3dfc2cc2e, pointapi UNMOVED (it does not
+#         go through interpolateColumn, which is the right answer, not a miss).
+#  * the uniform-AIR test widened to "the first corner is non-positive", so it skips cells
+#      that are not uniform -> "FAILED - 1 of 102 checks", terrain b6cb0e44558baa3a.
+#  * the top-scan mask forgetting to retire a resolved column, so s_top ends up holding the
+#      BOTTOM-most solid block -> "FAILED - 31 of 72 checks (first: L180 tops col(0,0)
+#      cell(0,0))", with lines like "tops mismatch col(0,0) cell(0,0) got 1 want 74". That arm
+#      is what says the tops cross-check is not a check that cannot fail.
+#
+# TIMING is NOT asserted here and deliberately so -- this machine is shared by several agents
+# and two runs of one unchanged binary measured 0.4524 and 0.8915 ms/column. The figures were
+# taken by alternating both arms in ONE process: 600 columns/round, 15 rounds, host x86-64
+# gcc -O2 under WSL, NOT the ARM11 -- mean 0.2767 s ref against 0.2557 s new, -7.6 % (two
+# earlier runs of the same harness: -9.72 % and -9.69 %). Per phase, 1800 columns:
+# interpolateColumn 0.0329 -> 0.0043 ms/col, top scan 0.0071 -> 0.0026 ms/col, buildGrid
+# 0.0612 -> 0.0633 ms/col i.e. unchanged. The salt hoist timed in isolation on wgdHeight read
+# +3.01 % in one run and -1.67 % in another: it is BELOW this harness's noise floor and is not
+# quoted as a win. It stays because it removes a counted 1,275 redundant rngMix per column.
+#
+# ARM: worldgen_density.c compiled alone to a .o with the Makefile's own flags
+# (arm-none-eabi-gcc -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft -O3
+# -mword-relocations -ffunction-sections) -- .text 10,624 -> 11,388 bytes, and .bss 10,672
+# UNCHANGED, which was the check that said no file-static was added. No console timing exists:
+# nothing in this project has run on real 3DS hardware since v1.2.5.
+#
+# SUPERSEDED LATER IN v1.8.7 by the generator destaticisation: this TU's .bss is now 0, because
+# all eight of its former file-statics moved into the caller-owned WorldGenScratch (see
+# world/worldgen_scratch.h). Do NOT read the "10,672 UNCHANGED" above as a live expectation and
+# do not re-baseline anything to it -- 0 is correct here now, and it is a stronger version of the
+# same check: nm -S reports no .bss symbols in this TU at all. The .text figure above still
+# stands for the change it describes.
+BHWD="build-host/run-$$-wgdopt"
+mkdir -p "$BHWD"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/chunk_codec.c \
+	source/world/crc32.c \
+	source/world/world.c \
+	source/world/scratch.c \
+	source/world/noise.c \
+	source/world/budget.c \
+	source/world/worldgen.c \
+	source/world/worldgen_density.c \
+	source/world/genversion.c \
+	tests/net_stub.c \
+	tests/worldgen_density_opt_test.c \
+	-lm \
+	-o "$BHWD/worldgen_density_opt_test"
+
+"./$BHWD/worldgen_density_opt_test"
+
+rm -rf "$BHWD"
+
+# tests/ringorder_test.c -- v1.8.7. The nearest-first order main.c's genRequestArea() and
+# genQueueReadyColumns() walk the streaming ring in. Both loops used to be `for dz { for dx }`,
+# and workerSubmitColumn() pushes onto a FIFO, so submission order IS arrival order: the far
+# corner of the ring was generated before the column under the player's feet. This links the
+# real scene/ringorder.c rather than a copy of it, the same carve-out world/meshq.c got.
+#
+# What it gates: the table is a PERMUTATION of the square (a dropped entry is a column of the
+# world that is never asked for -- a permanent hole with a clean build, not a slow load);
+# squared distance never decreases along it; and the `seen < want` early stop main.c applies
+# returns exactly (2r+1)^2 columns at every radius, still sorted. That stop is what keeps the
+# change from being a regression at short render distance: the table always holds the widest
+# ring the game can ask for, so a radius-1 walk without it would scan 169 entries to do 9
+# columns' work.
+#
+# Measured, host x86-64 gcc -O1 under WSL, at the area radius (RENDER_DIST_MAX + 1 = 6):
+# columns submitted before the player's own 3x3 ring is complete 98 -> 8; position of the
+# column DEAD AHEAD within a +X recentre strip of 13 6 -> 0; mean distance of the first 9
+# columns submitted 6.781 -> 1.073. Table entries scanned per pass, old nested pair vs new
+# walk: r=1 9/9, r=2 25/25, r=3 49/61, r=4 81/101, r=5 121/149, r=6 169/169.
+#
+# Red arm: neutering the insertion sort's comparator in scene/ringorder.c (`> vk` -> `> vk +
+# 1000000`) reproduces row-major exactly and fails 311 of 975 checks, first at the distance
+# monotonicity check. Deleting the sort loop outright does NOT work as a red arm -- it makes
+# key() unused and -Werror=unused-function stops the build before the test can run.
+#
+# NOT proved here: that main.c walks the table at all. Nothing on the host can reach main.c's
+# loops (it carries main() and includes <3ds.h>), so the integration is checked by reading the
+# two call sites and by an ARM compile, and the pop-in this is meant to improve is a VISUAL
+# claim that needs the console. ARM, ringorder.c alone with the Makefile's own flags:
+# .text 324, .bss 339 (the 169-entry 2-byte table plus its built flag).
+BHRO="build-host/run-$$-ringorder"
+mkdir -p "$BHRO"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	tests/ringorder_test.c \
+	source/scene/ringorder.c \
+	-lm \
+	-o "$BHRO/ringorder_test"
+
+"./$BHRO/ringorder_test"
+
+rm -rf "$BHRO"
+
+# tests/worldgen_mt_test.c -- v1.8.7. Can worldgenColumn() be entered from TWO threads at
+# once? Until this release it could not, and that was the blocking prerequisite for a second
+# generator lane on the New 3DS's spare core: world/worldgen.c and world/worldgen_density.c
+# kept their per-column scratch in eight file statics, so two threads on DISJOINT columns
+# still trampled each other. The scratch now lives in a caller-owned WorldGenScratch
+# (world/worldgen_scratch.h) and this test is the guard that says nobody may put it back.
+#
+# WHAT IT MEASURES. Three arms over the same 32 fixed columns, seed 0x5EEDCAFE,
+# GEN_VERSION_NEWEST, 6 rounds = 192 generations per arm, each column digested FNV-1a over
+# all 32,768 blocks read back through worldGet(). BASELINE is one thread and produces the
+# reference digests. SERIALISED is two threads with one mutex held across worldgenColumn()
+# -- the control that stops a CONCURRENT failure being blamed on the harness. CONCURRENT is
+# the same two threads with no lock. Each thread generates into its OWN World, which is what
+# a real second lane does (app/worker.c stages into a worker-owned world).
+#
+# MEASURED BEFORE THE FIX, three consecutive runs, host gcc 15.2.0 -O1 under WSL:
+#   CONCURRENT  generated 23+24 refused 73+72 wrong 25/32 missing 3
+#   CONCURRENT  generated 16+20 refused 80+76 wrong 23/32 missing 6
+#   CONCURRENT  generated 12+20 refused 84+76 wrong 22/32 missing 10
+# with SERIALISED 0/32 wrong in every one. Note what dominated: most of the 192 generations
+# were REFUSED, not merely wrong -- worldgenColumn() returning false is a permanent hole in
+# the world (main.c genInstallOne -> columns_failed), which is worse than wrong terrain.
+#
+# MEASURED AFTER, same three-run protocol: SERIALISED and CONCURRENT both
+# "generated 96+ 96 refused 0+ 0 wrong 0/32 missing 0", "PASS - 4 of 4 checks", exit 0.
+#
+# RED ARM, so this is not a check that cannot fail: runArm()'s two scratch assignments were
+# pointed at the SAME element of g_wgs, reintroducing exactly the sharing that was removed.
+# Three runs -> "CONCURRENT generated 20+ 26 refused 76+70 wrong 25/32 missing 6",
+# "21+ 22 refused 75+74 wrong 20/32 missing 7", "22+ 23 refused 74+73 wrong 25/32 missing 7",
+# each "FAIL tests/worldgen_mt_test.c:287  con == 0" and "FAILED - 1 of 4 checks", exit 1.
+# The file was restored afterwards and the restore confirmed by md5
+# (e0350451a8b3ab2468edf2e11670fe97, byte-identical to the pre-sabotage copy).
+#
+# NOT proved here: that two lanes are FASTER. This test says the generator is re-entrant,
+# not that a second lane pays for itself -- that is the worker split, a separate task, and
+# no console timing exists either way (nothing has run on real hardware since v1.2.5).
+BHMT="build-host/run-$$-worldgenmt"
+mkdir -p "$BHMT"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/chunk_codec.c \
+	source/world/crc32.c \
+	source/world/world.c \
+	source/world/scratch.c \
+	source/world/noise.c \
+	source/world/budget.c \
+	source/world/worldgen.c \
+	source/world/worldgen_density.c \
+	source/world/genversion.c \
+	tests/net_stub.c \
+	tests/worldgen_mt_test.c \
+	-pthread \
+	-lm \
+	-o "$BHMT/worldgen_mt_test"
+
+"./$BHMT/worldgen_mt_test"
+
+rm -rf "$BHMT"

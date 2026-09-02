@@ -23,6 +23,73 @@
 int chunkRenderTouch(const World* w, int x, int y, int z);
 #endif
 
+// ── where a local edit's relight goes (v1.8.7) ──────────────────────────────────────────
+//
+// NULL until source/main.c hands over the queue it drains, and NULL for every host case that
+// does not ask for one. See interact.h for why this is a setter rather than a parameter on
+// interactEdit, and why a NULL queue relighting inline is the honest default rather than a
+// special case.
+static RelightQueue* s_relightq;
+
+void interactSetRelightQueue(RelightQueue* q)
+{
+	s_relightq = q;
+}
+
+// The edited column's relight, queued where there is a queue and run on the spot where there
+// is not. This is source/main.c's onRemoteEdit shape verbatim (main.c:2957) — a remote edit
+// and a local one produce exactly the same work, and until v1.8.7 only the remote one queued
+// it. See interact.h for the cost, the measurement behind it, and why deferring is safe.
+static void relightEdited(World* w, int cx, int cz)
+{
+	if (!lightEnabled())
+		return;
+	if (s_relightq == NULL || !relightqPush(s_relightq, cx, cz))
+		lightRelightColumn(w, cx, cz);
+}
+
+// ── v1.8.7 F1: a local edit the server never heard about is undone, not kept ─────────────
+//
+// Tells the server about a write that has ALREADY been made locally, and says whether that
+// write may stand. False means the caller must treat the edit as refused — the cell has been
+// put back before returning, so there is nothing left for the caller to undo.
+//
+// WHY THE WRITE HAPPENS FIRST AND IS ROLLED BACK, rather than the send happening first: only
+// worldSet() can say whether the edit is legal at all (it refuses y outside the world), and
+// sending an edit the world would then have rejected would tell the server to do something
+// this client did not do — the same divergence in the other direction. So the world decides,
+// then the wire, and the rollback pays for the ordering. It is cheap precisely because this
+// runs BEFORE worldMarkDirty, the relight and chunkRenderTouch: nothing has been marked, lit
+// or queued yet, so an undone edit costs two world writes and not a 2.1 ms chunk rebuild.
+//
+// WHY THE SESSION CHECK IS NOT OPTIONAL. networldSendBlockEdit() is false in single player as
+// well — there is no transport, so nothing can be sent, and nothing is out of step either.
+// Reverting on every false would delete every edit in a single-player game. Only
+// networldSessionActive() separates "the packet did not leave this console" from "there was
+// never anywhere for it to go"; see net/networld.h, which was given that call for this.
+//
+// A false here also stops main.c sending the matching BS_INV_OP_PICKUP / BS_INV_OP_CONSUME,
+// because the caller leaves broke_id/placed_id at BLOCK_AIR and those are the only channel
+// main.c reads (main.c:4559, :4571). That is the point: the server takes those two ops on
+// trust (deps/blocksmith-server/game/bsgame.c's handle_inv_action says so in as many words),
+// so a bag that moved on a block edit that never arrived is a divergence the periodic
+// BS_APP_INV_STATE snapshot silently repairs on the bag and never on the block.
+static bool sendEditOrRevert(World* w, int x, int y, int z, BlockId written, BlockId before)
+{
+	if (networldSendBlockEdit(x, y, z, (uint8_t)written))
+		return true;
+	if (!networldSessionActive())
+		return true;
+
+	// A live session that did not get the packet. net/bsnet_transport.c's send_app_packet
+	// is false only when nothing went out at all — no socket, the AEAD encrypt refused, or a
+	// short/failed sendto — so there is no case where the server has the edit and this client
+	// has thrown it away. Putting the cell back cannot itself fail: it is the same cell
+	// worldSet just accepted, with the id that was in it.
+	worldSet(w, x, y, z, before);
+	return false;
+}
+
 // Does the player's box overlap the unit cube at (bx,by,bz)? This is a plain geometric
 // test rather than a call into physics.c's bodyBlocked, because the block in question has
 // not been written to the world yet — and it must not be, since writing it and then
@@ -104,19 +171,30 @@ static int breakComplete(Interact* it, World* w, int x, int y, int z, BlockId br
 	// worldSet refuses y outside the world, which is exactly what should happen when the
 	// ray hit the solid floor below y == 0 — that is not a block anyone owns.
 	if (worldSet(w, x, y, z, BLOCK_AIR)) {
+		// v1.8.7 F1. The server is told FIRST, and the answer is read. Until now this was a
+		// fire-and-forget call whose bool went in the bin, three lines further down and after
+		// the column had already been marked dirty — so a refused send left the block gone
+		// and SAVED here while the server still had it, and main.c then moved the bag on top
+		// of that. See sendEditOrRevert for the whole shape of it.
+		if (!sendEditOrRevert(w, x, y, z, BLOCK_AIR, broken)) {
+			// Counted as a refusal, which is this module's existing word for "the press did
+			// nothing" (a miss, an occupied cell, an empty hand, an uncarryable block) and is
+			// already on the debug overlay as `r`. broke_id stays BLOCK_AIR, so main.c offers
+			// nothing to the bag and sends no BS_INV_OP_PICKUP.
+			it->refused++;
+			breakCancel(it);
+			return queued;
+		}
 		// Step 8.1. Only edits mark a column for saving — see the note on Column.dirty.
 		worldMarkDirty(w, x, z);
-		// Adaptive lighting: recompute the edited column's channels before the remesh is
-		// queued, so the drained mesh bakes the new light in the same frame. The relight is
-		// column-local and idempotent — it memsets and recomputes from the blocks — so this
-		// is exactly a full reflood of that one column, and no neighbour can go stale
-		// behind it.
-		if (lightEnabled())
-			lightRelightColumn(w, x >> 4, z >> 4);
+		// Adaptive lighting: the edited column's channels are refreshed before the remesh is
+		// queued, so the drained mesh bakes the new light in the same frame. v1.8.7 makes
+		// that a QUEUE push rather than a full 32768-cell recompute charged to this frame —
+		// see relightEdited, and interact.h for why the main loop's drain still lands ahead
+		// of the remesh. The relight itself is unchanged: column-local and idempotent, a
+		// full reflood of that one column, with no neighbour able to go stale behind it.
+		relightEdited(w, x >> 4, z >> 4);
 		queued += chunkRenderTouch(w, x, y, z);
-		// Fire-and-forget to the server: the local write above is already done and is
-		// authoritative for this client's own view, so nothing here waits on it.
-		networldSendBlockEdit(x, y, z, BLOCK_AIR);
 		it->broke++;
 		// Left as BLOCK_AIR for a plant, which is exactly how main.c already spells "this
 		// break earned nothing" — it adds to the bag only when broke_id != BLOCK_AIR. So the
@@ -290,7 +368,12 @@ int interactEdit(Interact* it, World* w, const Body* body,
 		// Do not overwrite something solid. The place cell is the cell the ray was in
 		// before the hit, so it is air in the ordinary case, but a caller could aim at a
 		// block through a gap narrower than a block and land here.
-		if (blockIsSolid(worldGet(w, t->px, t->py, t->pz))) {
+		//
+		// Kept rather than re-read, because v1.8.7's rollback below has to put back what was
+		// really there and "air" is only the ordinary case: a non-solid cell can hold tall
+		// grass, and reverting that to BLOCK_AIR would delete the plant on a failed send.
+		const BlockId place_was = worldGet(w, t->px, t->py, t->pz);
+		if (blockIsSolid(place_was)) {
 			it->refused++;
 			return queued;
 		}
@@ -303,13 +386,19 @@ int interactEdit(Interact* it, World* w, const Body* body,
 		}
 
 		if (worldSet(w, t->px, t->py, t->pz, it->holding)) {
+			// v1.8.7 F1, the break path's twin — same reasoning, same order, and `place_was`
+			// is what the cell goes back to if the packet did not leave. placed_id stays
+			// BLOCK_AIR on the failure, so main.c charges the hotbar nothing and sends no
+			// BS_INV_OP_CONSUME.
+			if (!sendEditOrRevert(w, t->px, t->py, t->pz, it->holding, place_was)) {
+				it->refused++;
+				return queued;
+			}
 			worldMarkDirty(w, t->px, t->pz);
-			// Same relight-before-remesh ordering as the break path above.
-			if (lightEnabled())
-				lightRelightColumn(w, t->px >> 4, t->pz >> 4);
+			// Same relight-before-remesh ordering as the break path above, and since v1.8.7
+			// the same queue-with-inline-fallback.
+			relightEdited(w, t->px >> 4, t->pz >> 4);
 			queued += chunkRenderTouch(w, t->px, t->py, t->pz);
-			// Fire-and-forget to the server, same as the break path above.
-			networldSendBlockEdit(t->px, t->py, t->pz, it->holding);
 			it->placed++;
 			it->placed_id = it->holding;
 		} else {

@@ -104,6 +104,25 @@ void networldSetEditHook(NetworldEditFn fn, void* userdata);
 // did not make it" UDP outcome, not a caller error.
 bool networldSendBlockEdit(int x, int y, int z, uint8_t block);
 
+// Is there a live server session at all? (v1.8.7.)
+//
+// This exists because networldSendBlockEdit() above returns false for two situations that
+// look identical to a caller and are not remotely the same thing:
+//
+//   * SINGLE PLAYER. There is no transport, so every send "fails". Nothing was supposed to
+//     go out, nothing is out of step, and the local write is the whole truth.
+//   * A LIVE SESSION whose packet did not leave this console — no socket, the AEAD encrypt
+//     refused, or a short/failed sendto (net/bsnet_transport.c's send_app_packet). THAT is a
+//     divergence: the client has applied an edit the server has never heard of.
+//
+// A caller that wants to undo or suppress something on a failed send must ask this first, or
+// it will undo every edit in single player. scene/interact.c is the caller this was added for.
+//
+// True only in NET_TRANSPORT_ESTABLISHED. Deliberately NOT "the send would have succeeded":
+// this answers "is there a server on the other end", and the send's own false answers the
+// rest. Cheap enough to call per edit — it is one comparison against a cached enum.
+bool networldSessionActive(void);
+
 // ---- inventory sync -----------------------------------------------------------------------
 //
 // See proto/bs_proto.h's own long comment on BS_APP_INV_STATE/BS_APP_INV_ACTION for why the
@@ -331,8 +350,20 @@ bool networldRegistrySynced(void);
 //   * synced                                          -> false immediately
 //   * joined but no INFO heard (old server)           -> false after a short grace
 //   * INFO heard, fetch still outstanding             -> false at the sync deadline
-// Falling through either of the last two leaves networldRegistrySynced() false, which is the
-// documented degraded state above rather than a failure to report.
+//
+// v1.8.7 changed what falling through the LAST of those four means, and only that one. Dropping
+// out of it used to enter the world with networldRegistrySynced() false — the degraded state
+// documented above, which on a CORE-row disagreement is permanent, unrepairable and effectively
+// invisible to the player (registryVerdictTick() in networld.c carries the whole argument). It
+// now ends the session instead: networldUpdate() takes the verdict on that exact edge, refuses
+// the server through netTransportRefuse() with a line saying the two builds are different
+// versions, and clears this module the way netDisconnect() does — so networldWorldSeed() goes
+// false on the same frame and scene/title_nav.h's entry gate closes rather than opening.
+//
+// The no-INFO arm is untouched and must stay that way: a server that never sent one named no
+// fingerprint, so nothing about its table has been disproved, and it joins degraded exactly as
+// it always has. Both remaining fall-throughs still leave networldRegistrySynced() false, which
+// is still the documented degraded state above rather than a failure to report.
 bool networldRegistryWaiting(void);
 
 // v1.8.3 Phase 4. True while this session is still waiting to hear BS_APP_WORLD_GEN, in exactly

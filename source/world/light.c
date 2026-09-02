@@ -22,13 +22,54 @@ typedef struct {
 } LightColumn;
 
 static bool    s_enabled;
+
+// ── Why the counters below are atomic ────────────────────────────────────────
+//
+// Two threads reach this file, and world/budget.c:5-25 already carries the argument in full
+// for exactly this interleaving. The worker generates — app/worker.c:286, JOB_GENERATE ->
+// lightPropagateColumn -> lightColumnAttach — while it is NOT parked: the handshake
+// app/worker.h describes covers workerInstall only. The main thread attaches from the edit
+// path (scene/interact.c:115 and :309, main.c:2958, world/relight_drain.c:26, all
+// lightRelightColumn) and detaches from the streaming unload (world/world.c:148,
+// worldColumnRemove) at the same time. On a New 3DS the worker sits on core 2 (app/hw.c:8),
+// so the two are simultaneous rather than timesliced.
+//
+// A plain `s_attached++` is a load, an add and a store; two of those interleaved lose one
+// column's worth of accounting, permanently.
+//
+// RELAXED, not the sequentially-consistent CAS budget.c uses for s_used, and the difference
+// is deliberate rather than a shortcut. s_used is a GATE — an allocation is refused against
+// it — so it needs the ordering. s_attached and s_sweep_fallbacks are STATISTICS, read by
+// lightColumnsAttached(), lightBytesUsed() and lightSweepFallbacks() for the host suite and
+// the debug overlay and by nothing that decides anything. That is the case budget.c's own
+// comment covers — "`s_peak` and `s_refusals` are statistics rather than gates, and are
+// relaxed on purpose" — and its s_refusals is incremented with the same
+// __atomic_fetch_add(..., __ATOMIC_RELAXED) used here.
+//
+// MEASURED before this changed, tests/light_race_test.c: two threads, 120,000 balanced
+// attach/detach pairs each, lightColumnsAttached() read -3673 instead of 0 — while
+// budgetUsed(), driven by those same two threads through those same calls, read 0. The lost
+// updates were this file's, not budget.c's.
 static int     s_attached;
-static int     s_queue_dropped;   // BFS refusals this call; must stay zero (see the CAP note)
 // The effective luminance both engines read, one entry per id in the WHOLE registry
 // id space, core and dynamic alike — not BLOCK_COUNT entries.
 //
 // This is a CACHE of BlockDef.luminance, rebuilt by syncLuminance() below. Nothing
 // else writes it: the registry is the single source of truth for what a block emits.
+//
+// v1.8.7, and deliberately NOT synchronised — both threads do write it, and it is still safe.
+// syncLuminance() is a pure function of s_lum_test[i] and registryGet(i)->luminance, so the
+// worker and the main thread do not write DIFFERENT values into an entry, they write the same
+// value into it. Each entry is one byte and a byte store is indivisible, so a reader sees the
+// old value or the new one and those are equal. Adding a lock or a per-thread copy here would
+// buy nothing and would touch the one thing in this file that must not move: what the engines
+// read when they seed. Left alone on purpose.
+//
+// What that argument does NOT cover, and what is a real gap: the registry itself. If
+// registryRemoteApply() lands a new luminance on the main thread while the worker is inside
+// its seeding loop, the worker can seed some ids from the old table and some from the new. It
+// cannot corrupt anything — every entry is a whole byte either way — and the next relight of
+// that column is correct. That race lives in world/registry.c, not here.
 static uint8_t s_luminance[REGISTRY_MAX];
 
 // Test overrides, laid over the registry by syncLuminance(). Zero means "no override"
@@ -81,6 +122,34 @@ static LightQueue* s_edit_queue;
 static bool s_edit_queue_refused;
 static int  s_sweep_fallbacks;
 
+// v1.8.7. Whether a thread is inside the edit queue right now, claimed with a CAS.
+//
+// app/worker.c:108 says of its own queue: "Owned by this thread for its whole life — the main
+// thread's edit path uses the queue-free sweep engine precisely so the two never share one."
+// That was true when lightRelightColumn WAS lightRelightColumnSweeps. v1.8.0 rebuilt it on top
+// of the flood fill over s_edit_queue and did not revisit the sentence, and worker.c:287 calls
+// lightRelightColumn — so on a BFS refusal the worker takes the main thread's queue while the
+// main thread's per-frame relight drain (world/relight_drain.c:26) may be inside it. One
+// LightQueue, two threads: queuePush and queuePop both read-modify-write head and count, and
+// lightQueueInit resets them from under whoever is mid-sweep.
+//
+// This is not a lost statistic. It is wrong LIGHT, and a popped index from the other thread's
+// column can also address past the 16 KiB channel. MEASURED before this existed,
+// tests/light_race_test.c: two threads relighting two different columns, 116 of 120 relights
+// produced a channel digest that disagreed with the same call's single-threaded answer.
+//
+// A CAS claim rather than a lock, for the reason world/ has no locks at all: this directory
+// compiles with no <3ds.h>, which is what makes it host-testable, so LightLock is not
+// reachable from here. The refused case does not wait either — it takes
+// lightRelightColumnSweeps, the queue-free engine this file already keeps and that the host
+// suite already proves agrees with the flood fill byte for byte. So contention costs the
+// loser 26x on that ONE relight and changes not a single light value, and it is counted in
+// the place every other degraded state in this file is counted.
+//
+// ACQUIRE on the claim and RELEASE on the drop, not relaxed: unlike the counters above this
+// one really is a gate, and it has to order the queue writes that follow it.
+static int  s_edit_queue_busy;
+
 // Test hook, in the same spirit as lightSetLuminanceForTest below: makes the next
 // lightEngineInit(true) behave exactly as a refused malloc does, so the degraded path can be
 // entered on purpose instead of only by running out of memory. Nothing in production sets it.
@@ -101,19 +170,28 @@ void lightEngineInit(bool enable)
 		free(s_edit_queue);
 		s_edit_queue        = NULL;
 		s_edit_queue_refused = false;
+		// v1.8.7. Cleared with the queue it guards. Nothing may be inside it at this point —
+		// this runs on the main thread with the worker stopped — but a claim left set after
+		// the queue it named has gone would send every later relight down the 26x sweep path
+		// for the rest of the session, which is precisely the silent degradation v1.8.3 was
+		// written to stop.
+		__atomic_store_n(&s_edit_queue_busy, 0, __ATOMIC_RELEASE);
 	}
 }
 
 bool lightFastEngineReady(void) { return s_enabled && !s_edit_queue_refused; }
-int  lightSweepFallbacks(void)  { return s_sweep_fallbacks; }
+int  lightSweepFallbacks(void)  { return __atomic_load_n(&s_sweep_fallbacks, __ATOMIC_RELAXED); }
 
 void lightFailEditQueueForTest(bool fail)   { s_fail_edit_queue_for_test = fail; }
-void lightResetSweepFallbacksForTest(void)  { s_sweep_fallbacks = 0; }
+void lightResetSweepFallbacksForTest(void)  { __atomic_store_n(&s_sweep_fallbacks, 0, __ATOMIC_RELAXED); }
 
 bool lightEnabled(void)           { return s_enabled; }
 
-int    lightColumnsAttached(void) { return s_attached; }
-size_t lightBytesUsed(void)       { return (size_t)s_attached * sizeof(LightColumn); }
+// The relaxed loads cost nothing — on ARM11 a relaxed load of an aligned word is the same
+// single LDR a plain read compiles to, with no barrier — and they are what makes reading a
+// counter the other core is writing defined rather than merely lucky.
+int    lightColumnsAttached(void) { return __atomic_load_n(&s_attached, __ATOMIC_RELAXED); }
+size_t lightBytesUsed(void)       { return (size_t)lightColumnsAttached() * sizeof(LightColumn); }
 
 bool lightColumnAttach(Column* col)
 {
@@ -129,7 +207,7 @@ bool lightColumnAttach(Column* col)
 	}
 
 	col->light = lc;
-	s_attached++;
+	__atomic_fetch_add(&s_attached, 1, __ATOMIC_RELAXED);
 	return true;
 }
 
@@ -140,7 +218,7 @@ void lightColumnDetach(Column* col)
 	budgetRelease(sizeof(LightColumn));
 	free(col->light);
 	col->light = NULL;
-	s_attached--;
+	__atomic_fetch_sub(&s_attached, 1, __ATOMIC_RELAXED);
 }
 
 bool lightColumnCopy(const Column* src, Column* dst)
@@ -284,9 +362,16 @@ void lightQueueInit(LightQueue* q)
 	q->count = 0;
 }
 
-static bool queuePush(LightQueue* q, uint16_t ci)
+// v1.8.7. `dropped` is the caller's local, not a file static any more. It was
+// s_queue_dropped: zeroed at the top of lightPropagateColumn, incremented here, and read at
+// the bottom to decide the return value — i.e. state scoped to ONE call, kept in a place two
+// threads share. The main thread's `s_queue_dropped = 0` landed in the middle of the worker's
+// propagation and erased its refusals, so the worker returned true, took no fallback and
+// shipped a half-lit column; the reverse made a main-thread relight report a failure that
+// belonged to the worker. An int on the stack has neither problem and costs a register.
+static bool queuePush(LightQueue* q, uint16_t ci, int* dropped)
 {
-	if (q->count >= LIGHT_QUEUE_CAP) { s_queue_dropped++; return false; }
+	if (q->count >= LIGHT_QUEUE_CAP) { (*dropped)++; return false; }
 	q->slots[(q->head + q->count) % LIGHT_QUEUE_CAP] = ci;
 	q->count++;
 	return true;
@@ -308,7 +393,7 @@ static uint16_t queuePop(LightQueue* q)
 // same level, every edge decrements by exactly one, so later offers can never
 // exceed an earlier one) and bounds the queue at one entry per cell.
 static void spread(uint8_t* chan, const Chunk* const chunks[COLUMN_CHUNKS],
-                   LightQueue* q)
+                   LightQueue* q, int* dropped)
 {
 	while (q->count > 0) {
 		const int ci = queuePop(q);
@@ -334,7 +419,7 @@ static void spread(uint8_t* chan, const Chunk* const chunks[COLUMN_CHUNKS],
 			if (level - 1 <= lightNibble(chan, nci)) continue;
 
 			setNibble(chan, nci, (uint8_t)(level - 1));
-			queuePush(q, (uint16_t)nci);
+			queuePush(q, (uint16_t)nci, dropped);
 		}
 	}
 }
@@ -349,7 +434,7 @@ bool lightPropagateColumn(World* w, int cx, int cz, LightQueue* q)
 
 	LightColumn* lc = (LightColumn*)col->light;
 	memset(lc, 0, sizeof(*lc));
-	s_queue_dropped = 0;
+	int dropped = 0;   // BFS refusals this call; must stay zero (see the CAP note)
 
 	// The column's chunks, resolved once. Gaps are air, matching scratch.c.
 	const Chunk* chunks[COLUMN_CHUNKS];
@@ -389,11 +474,11 @@ bool lightPropagateColumn(World* w, int cx, int cz, LightQueue* q)
 				if (y == hm.top[z][x] + 1 && !opaqueAt(chunks, x, y - 1, z))
 					border = true;
 
-				if (border) queuePush(q, (uint16_t)lightIndex(x, y, z));
+				if (border) queuePush(q, (uint16_t)lightIndex(x, y, z), &dropped);
 			}
 		}
 	}
-	spread(lc->sky, chunks, q);
+	spread(lc->sky, chunks, q, &dropped);
 
 	// Block seeds: luminous cells. syncLuminance() refreshes the table from the
 	// registry and answers whether anything in it emits at all; no core row declares
@@ -411,13 +496,13 @@ bool lightPropagateColumn(World* w, int cx, int cz, LightQueue* q)
 				const int ci = lightIndex(i & 15, (i >> 8) + cy * CHUNK_DIM,
 				                          (i >> 4) & 15);
 				setNibble(lc->blk, ci, lum);
-				queuePush(q, (uint16_t)ci);
+				queuePush(q, (uint16_t)ci, &dropped);
 			}
 		}
-		spread(lc->blk, chunks, q);
+		spread(lc->blk, chunks, q, &dropped);
 	}
 
-	return s_queue_dropped == 0;
+	return dropped == 0;
 }
 
 // ── engine 2: relaxation sweeps (reference implementation) ───────────────────
@@ -440,13 +525,26 @@ bool lightRelightColumn(World* w, int cx, int cz)
 	// v1.8.3: counted on the way past. Without this the fallback is indistinguishable from the
 	// fast path at every level above it — same signature, same return value, same light, 26x the
 	// cost. See s_sweep_fallbacks above for why a counter and not a log line.
-	if (!s_edit_queue) {
-		s_sweep_fallbacks++;
+	//
+	// v1.8.7 adds the second reason to take that same fallback: somebody else is already inside
+	// the one shared queue. Claimed with a CAS and never waited on — see s_edit_queue_busy
+	// above for why a lock is not available in this directory and why losing the race is
+	// harmless. The two reasons share a counter on purpose: what lightSweepFallbacks() has
+	// always meant is "a relight paid 26x", and both of these are that.
+	// Strong, unlike budget.c's weak CAS: there is no retry loop here to absorb a spurious
+	// failure, and a spurious failure would send a relight down the 26x path for no reason.
+	int idle = 0;
+	if (!s_edit_queue ||
+	    !__atomic_compare_exchange_n(&s_edit_queue_busy, &idle, 1, false,
+	                                 __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+		__atomic_fetch_add(&s_sweep_fallbacks, 1, __ATOMIC_RELAXED);
 		return lightRelightColumnSweeps(w, cx, cz);
 	}
 
 	lightQueueInit(s_edit_queue);
-	return lightPropagateColumn(w, cx, cz, s_edit_queue);
+	const bool ok = lightPropagateColumn(w, cx, cz, s_edit_queue);
+	__atomic_store_n(&s_edit_queue_busy, 0, __ATOMIC_RELEASE);
+	return ok;
 }
 
 bool lightRelightColumnSweeps(World* w, int cx, int cz)

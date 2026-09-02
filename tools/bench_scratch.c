@@ -54,9 +54,11 @@
 #include "world/scratch.h"
 #include "world/world.h"
 #include "world/worldgen.h"
+#include "world/worldgen_scratch.h"
 
 static World       s_world;
 static WorldGen    s_gen;
+static WorldGenScratch s_wgs;   // this bench's one generator lane
 static MeshScratch s_scratch;
 
 // render_dist.h caps RENDER_DIST_MAX at 3, a 7x7 = 49 column area — that is the widest
@@ -93,7 +95,7 @@ int main(void)
 	worldInit(&s_world);
 	worldgenInit(&s_gen, 1337u, GEN_VERSION_LEGACY);
 
-	const int cols = worldgenArea(&s_gen, &s_world, 0, 0, RADIUS);
+	const int cols = worldgenArea(&s_gen, &s_wgs, &s_world, 0, 0, RADIUS);
 	printf("generated %d columns, %d chunks\n", cols, s_world.chunks);
 
 	// Count the form mix, so a change in timing can be read against a change in what is

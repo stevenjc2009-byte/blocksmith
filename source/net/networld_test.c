@@ -104,12 +104,22 @@ static size_t  fake_sent_len;
 static int     fake_sent_calls;
 static bool    fake_send_fail;
 
+/* v1.8.7. The fourth link-time double, and the only one of the four that is not merely a
+ * stand-in for something this suite ignores: net/networld.c's registry verdict ends a session
+ * through netTransportRefuse(), so this IS the observable the refusal scenarios below check.
+ * There is no transport in this binary to put into a failed state, so the call is recorded
+ * rather than acted on — that it happened, how many times, and with which line. */
+static int     fake_refuse_calls;
+static char    fake_refuse_why[128];
+
 static void fakeTransportReset(void)
 {
     fake_recv_head = fake_recv_tail = fake_recv_count = 0;
     fake_sent_len   = 0;
     fake_sent_calls = 0;
     fake_send_fail  = false;
+    fake_refuse_calls  = 0;
+    fake_refuse_why[0] = '\0';
 }
 
 static void fakeRecvPush(const uint8_t *data, size_t len)
@@ -142,6 +152,22 @@ bool netTransportSend(const uint8_t *payload, size_t len)
     memcpy(fake_sent_buf, payload, len);
     fake_sent_len = len;
     return true;
+}
+
+/* v1.8.7. networld.c gained networldSessionActive(), which reads this — so it is a third
+ * extern the link has to satisfy, doubled here for exactly the reason the two above are:
+ * bsnet_transport.c is not in this binary. ESTABLISHED is the honest default for a suite whose
+ * every case is about a client that already has a session; fake_send_fail above is how a case
+ * says "this packet did not go", which is a different question from "is there a server". */
+NetTransportState netTransportState(void)
+{
+    return NET_TRANSPORT_ESTABLISHED;
+}
+
+void netTransportRefuse(const char *why)
+{
+    fake_refuse_calls++;
+    snprintf(fake_refuse_why, sizeof fake_refuse_why, "%s", why ? why : "");
 }
 
 /* ------------------------------------------------------- fake clock ----------------------- */
@@ -3026,6 +3052,212 @@ static void test_registry_sync_is_proved_by_the_fingerprint(void)
     check(!networldRegistrySynced(), "but a foreign table revision is never verifiable");
 }
 
+/* ---- the verdict (v1.8.7) -------------------------------------------------------------------
+ *
+ * Everything above this line establishes what networldRegistrySynced() MEANS. None of it says
+ * what happens when the answer is no, because until v1.8.7 the answer was "nothing happens":
+ * the bounded wait expired, scene/title.c's entry gate opened, and the player walked into a
+ * world where every id the two builds disagreed about was an air hole. On a CORE-row
+ * disagreement that state is permanent — a DEFS batch cannot carry a core row — and the only
+ * lasting indicator is a "!" on a debug overlay that is off unless the player turned it on.
+ * v1.8.1 shipped exactly that, which is why the comment above registryMatchesInfo() in
+ * networld.c is as long as it is.
+ *
+ * These two scenarios are the enforcement and its blast radius. The first is what must now be
+ * refused; the second is the much longer list of things that must still NOT be, because a
+ * refusal that fires one case too wide takes offline play or every pre-v1.6.0 server with it.
+ *
+ * The observable is netTransportRefuse(): net/networld.c really calls it, and the double at the
+ * top of this file really records it. Nothing here re-implements the decision — registryVerdict-
+ * Tick() is reached the only way it is ever reached in production, through networldUpdate(). */
+
+/* One frame of the real pump, `n` times, for the cases that are about a decision NOT being
+ * taken: a single call cannot tell "never fires" from "has not fired yet". */
+static void pumpFrames(int n)
+{
+    for (int i = 0; i < n; i++) networldUpdate();
+}
+
+static void test_registry_mismatch_refuses_instead_of_degrading(void)
+{
+    puts("registry: a table that never reproduces the server's fingerprint refuses the session");
+
+    /* Direction one: the server names FEWER rows than this build's core table has. That is what
+     * an older server looks like to a newer client — v1.8.3 Phase 3 took the core table from 10
+     * rows to 15 — and it is unreachable by construction, not merely unreached: a DEFS batch can
+     * only ADD rows, so no delivery can ever bring this table back down to the count named. */
+    registryInitCore();
+    networldInit();
+    fakeTransportReset();
+    fakeNowSet(30000);
+
+    uint8_t wi[BS_WORLD_INFO_BYTES];
+    buildWorldInfoMsg(wi, 4242);
+    networldApplyPayload(wi, sizeof wi);
+
+    uint8_t info[BS_APP_REGISTRY_INFO_BYTES];
+    buildRegistryInfo(info);
+    info[2] = (uint8_t)(registryCount() - 1u);   /* one core row fewer than this build has */
+    info[3] ^= 0xA5u;                            /* and, necessarily, a different fingerprint */
+    networldApplyPayload(info, sizeof info);
+
+    check(fake_refuse_calls == 0,
+          "nothing is refused while the bounded retry still has time and tries left");
+    check(networldRegistryWaiting(),
+          "control: the gate really is still holding, so the check above is not vacuous");
+
+    /* The deadline. This is the exact edge scene/title.c would have entered the world on. */
+    fakeNowAdvance(NETWORLD_REG_SYNC_DEADLINE_MS);
+    networldUpdate();
+
+    check(fake_refuse_calls == 1,
+          "at the instant the gate would have released, the session is refused instead");
+    printf("    [measured] refusal text: \"%s\"\n", fake_refuse_why);
+    check(strstr(fake_refuse_why, "version") != NULL,
+          "and the reason names a version disagreement, which is the thing the player can act on");
+    /* The emptiness clause is not padding. Neutralising the refusal leaves fake_refuse_why
+     * an empty string, and an empty string contains no "0x" — so without it this check
+     * passed in the red arm, against a session that had refused nothing at all. */
+    check(fake_refuse_why[0] != '\0' && strstr(fake_refuse_why, "0x") == NULL,
+          "there is a real line, and it is not a hex dump of two crc16s (true, useless)");
+    check(!networldWorldSeed(NULL),
+          "the world seed is gone with the session, which is what closes title_nav.h's entry "
+          "gate on this same frame rather than one frame late");
+    check(!networldRegistrySynced(),
+          "and nothing about the refusal pretends the table was ever agreed");
+    check(!networldRegistryWaiting(),
+          "the bound networld.h promises is still kept: this does not become a gate that hangs");
+
+    /* Once. The tick runs every frame forever after; a second refusal would mean a second
+     * netTransportRefuse() at a transport that has already been torn down. */
+    fakeNowAdvance(10u * NETWORLD_REG_SYNC_DEADLINE_MS);
+    pumpFrames(5);
+    check(fake_refuse_calls == 1, "and it is taken exactly once, however long the pump runs on");
+
+    /* Direction two: the COUNT agrees and the CONTENT does not. This is what a core-row change
+     * looks like from the other side — the server has a row this build does not, the fetch
+     * delivers a dynamic row that makes the totals line up, and only the crc16 knows. The
+     * fingerprint check already caught this (test_registry_sync_is_proved_by_the_fingerprint
+     * above); what is new is that catching it now ends the session. */
+    BlockDef declared[3] = { wireDef("verdict_a"), wireDef("verdict_b"), wireDef("verdict_c") };
+    BlockDef impostor[3] = { wireDef("verdict_a"), wireDef("verdict_b"), wireDef("verdict_X") };
+
+    registryJoinDeclaring(40000, declared, 3);
+    uint8_t wrong[BS_APP_REGISTRY_DEFS_BYTES(3)];
+    const size_t wlen = buildRegistryDefs(wrong, REG_ID_DYN_LO, impostor, 3, true);
+    networldApplyPayload(wrong, wlen);
+
+    check(registryCount() == 18,
+          "control: three rows landed, so the server's count is reproduced exactly");
+    check(!networldRegistrySynced(),
+          "control: and only the crc16 disagrees — this is the same-count, wrong-content case");
+    check(fake_refuse_calls == 0, "still nothing refused inside the wait");
+
+    fakeNowAdvance(NETWORLD_REG_SYNC_DEADLINE_MS);
+    networldUpdate();
+    check(fake_refuse_calls == 1,
+          "a table with the right number of the wrong rows is refused too, not entered");
+    check(!networldWorldSeed(NULL), "with the same gate-closing teardown as the first direction");
+}
+
+static void test_registry_agreement_and_silence_are_never_refused(void)
+{
+    puts("registry: agreement, an old server's silence and single player are never refused");
+
+    /* (a) The compiled-in table already IS the server's. The commonest join there is. */
+    registryInitCore();
+    networldInit();
+    fakeTransportReset();
+    fakeNowSet(50000);
+
+    uint8_t wi[BS_WORLD_INFO_BYTES];
+    buildWorldInfoMsg(wi, 4242);
+    networldApplyPayload(wi, sizeof wi);
+
+    uint8_t info[BS_APP_REGISTRY_INFO_BYTES];
+    buildRegistryInfo(info);
+    networldApplyPayload(info, sizeof info);
+
+    check(networldRegistrySynced(), "control: a matching fingerprint syncs on the INFO alone");
+    fakeNowAdvance(10u * NETWORLD_REG_SYNC_DEADLINE_MS);
+    pumpFrames(5);
+    check(fake_refuse_calls == 0, "and no amount of pumping afterwards refuses an agreed table");
+    check(networldWorldSeed(NULL), "the session is untouched: the seed is still there to enter on");
+
+    /* (b) A fetch that really converges. The rows arrive late, which is the case the deadline
+     * exists for, and the verdict must read the settled table rather than the timer. */
+    BlockDef declared[2] = { wireDef("agree_a"), wireDef("agree_b") };
+    registryJoinDeclaring(60000, declared, 2);
+    uint8_t batch[BS_APP_REGISTRY_DEFS_BYTES(2)];
+    const size_t blen = buildRegistryDefs(batch, REG_ID_DYN_LO, declared, 2, true);
+    networldApplyPayload(batch, blen);
+
+    check(networldRegistrySynced(), "control: the delivered rows reproduce the fingerprint");
+    fakeNowAdvance(10u * NETWORLD_REG_SYNC_DEADLINE_MS);
+    pumpFrames(5);
+    check(fake_refuse_calls == 0, "so the deadline passing afterwards refuses nothing");
+
+    /* (c) A server older than v1.6.0: WORLD_INFO, and no BS_APP_REGISTRY_INFO, ever. It named
+     * no fingerprint, so nothing about its table has been disproved and there is nothing to
+     * refuse ON. Refusing here would make every one of those servers unjoinable. */
+    registryInitCore();
+    networldInit();
+    fakeTransportReset();
+    fakeNowSet(70000);
+    networldApplyPayload(wi, sizeof wi);
+
+    fakeNowAdvance(10u * NETWORLD_REG_SYNC_DEADLINE_MS);
+    pumpFrames(5);
+    check(!networldRegistrySynced(),
+          "control: with no INFO there is no fingerprint, so nothing is verified");
+    check(fake_refuse_calls == 0, "and an unverifiable table is not a disproved one: no refusal");
+    check(networldWorldSeed(NULL),
+          "the old server is still joinable, degraded, exactly as it always was");
+    check(!networldRegistryWaiting(), "with the short grace still bounding the wait");
+
+    /* (d) Single player. The trap this guard is written against: netTransportState() is doubled
+     * ESTABLISHED at the top of this file, so anything gating on networldSessionActive() would
+     * treat an offline session as a live one and refuse it. networld.c gates on the registry
+     * gate flag instead, which only a decoded server packet can arm — and offline decodes none. */
+    registryInitCore();
+    networldInit();
+    fakeTransportReset();
+    fakeNowSet(80000);
+
+    check(networldSessionActive(),
+          "control: the transport double claims ESTABLISHED, so a session-state guard would "
+          "have believed this offline pump was a join");
+    fakeNowAdvance(100u * NETWORLD_REG_SYNC_DEADLINE_MS);
+    pumpFrames(10);
+    check(fake_refuse_calls == 0, "single player is never refused, however far the clock runs");
+    check(!networldRegistryWaiting(), "and was never held on the registry in the first place");
+    check(!networldWorldSeed(NULL), "no server named a world, so there was never one to lose");
+
+    /* And the part that costs something if the guard above is the wrong one. net/bsnet.c's
+     * netConnect() does NOT call networldInit() — only netDisconnect() does — so a join can
+     * begin on exactly the module state the offline pump above just left behind. A guard that
+     * let those frames take the session's one verdict would latch it against a session that
+     * had not started, and this join would then be unrefusable however wrong its table was.
+     * Deliberately no networldInit() here: that call is what the scenario is testing the
+     * absence of. */
+    uint8_t wi2[BS_WORLD_INFO_BYTES];
+    buildWorldInfoMsg(wi2, 4242);
+    networldApplyPayload(wi2, sizeof wi2);
+
+    uint8_t bad[BS_APP_REGISTRY_INFO_BYTES];
+    buildRegistryInfo(bad);
+    bad[2] = (uint8_t)(registryCount() - 1u);
+    bad[3] ^= 0xA5u;
+    networldApplyPayload(bad, sizeof bad);
+    check(networldRegistryWaiting(),
+          "control: the join really did arm the gate on top of the offline frames");
+
+    fakeNowAdvance(NETWORLD_REG_SYNC_DEADLINE_MS);
+    networldUpdate();
+    check(fake_refuse_calls == 1,
+          "and the verdict was still there to be taken: single player spent none of it");
+}
+
 /* How many block faces one emitted quad covers. Since v1.6.0 task 11 meshChunk()
  * merges runs of identical co-planar faces along u into one wide quad, so out.faces
  * counts QUADS, not block faces: a merged quad w blocks wide spans u0 .. u0+TILE_PX*w.
@@ -3197,6 +3429,8 @@ int main(void)
     test_registry_join_after_a_single_player_quit_to_title();
     test_registry_terminator_alone_is_not_a_synced_table();
     test_registry_sync_is_proved_by_the_fingerprint();
+    test_registry_mismatch_refuses_instead_of_degrading();
+    test_registry_agreement_and_silence_are_never_refused();
     test_mesher_tables_after_register();
 
     /* ---- check-count guard -----------------------------------------------------------------
@@ -3229,8 +3463,14 @@ int main(void)
     /* 368 -> 389. Delta computed from what was added, per the instructions above, not pasted
      * off a failing run: test_pending_store_is_absent_in_single_player adds 12 and
      * test_pending_store_allocation_failure_is_counted_not_swallowed adds 9. Nothing removed. */
-    check(g_checks == 389,
-          "check-count guard: every check in this suite actually ran (389 before this line)");
+    /* 389 -> 416, same rule. test_registry_mismatch_refuses_instead_of_degrading adds 14 (9 for
+     * the short-count direction, 5 for the wrong-content one) and
+     * test_registry_agreement_and_silence_are_never_refused adds 15 (3 + 2 + 4 + 6 for its four
+     * must-not-refuse cases; the last one grew by 2 when a red arm showed its single-player
+     * checks could not tell the gate guard from a transport-state guard). 14 + 15 = 29.
+     * Nothing removed. */
+    check(g_checks == 418,
+          "check-count guard: every check in this suite actually ran (418 before this line)");
 
     printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;

@@ -45,6 +45,16 @@
 
 #include "world/chunk.h"   // CHUNK_DIM — the real one, not a number retyped here
 
+// v1.8.7. HznCol and hznDerive() — the real ones, for the same reason as CHUNK_DIM above and
+// the same reason the function under test is extracted rather than copied. horizonHidden() now
+// READS four per-blocker values that horizonBuild() derives, instead of recomputing them in its
+// inner loop, so this file has to produce those values the way the renderer produces them. It
+// does that by calling the renderer's own hznDerive() (see derivePool below), not by filling
+// the fields itself: a hand-filled copy of the derivation would test nothing, which is the
+// failure this whole file is built around. Break hznDerive() in the header and this binary
+// goes red — demonstrated, not assumed.
+#include "scene/horizon_derive.h"
+
 static int  s_checks;
 static int  s_fails;
 static char s_first[200];
@@ -66,20 +76,39 @@ static char s_first[200];
 
 // ── The state horizonHidden() reads ────────────────────────────────────────────────────
 //
-// Same names and same types as chunk_render.c's, because the extracted function refers to
-// them by name. HZN_MAX_COLUMNS is larger here than the renderer's 65 only so the sweeps can
-// push denser blocker sets through the loop; the function does not read the bound.
+// Same names as chunk_render.c's, because the extracted function refers to them by name.
+// HZN_MAX_COLUMNS is larger here than the renderer's 65 only so the sweeps can push denser
+// blocker sets through the loop; the function does not read the bound.
+//
+// HznCol itself is no longer declared here — it comes from scene/horizon_derive.h, shared with
+// the renderer. It used to be a copy carrying the same three fields, which was safe only
+// because the fields were pure inputs the test filled itself. v1.8.7 added four DERIVED fields,
+// and a copied struct plus a copied derivation is exactly the "second copy that drifts" this
+// file exists to prevent.
 
 #define HZN_MAX_COLUMNS 128
-
-typedef struct {
-	int   cx, cz;
-	float top_y;
-} HznCol;
 
 static HznCol s_hzn_cols[HZN_MAX_COLUMNS];
 static int    s_hzn_n;
 static float  s_cam_x, s_cam_y, s_cam_z;
+
+// v1.8.7. What horizonBuild() does to the pool after every write to cx/cz/top_y, and the only
+// way this file is allowed to fill the derived fields.
+//
+// The sweeps below build blocker sets directly rather than through horizonBuild(), because the
+// point is to enumerate configurations the renderer's pool would take a very long time to
+// reach. That is fine for the inputs. It is NOT fine for the derived half: filling ndx/ndz/
+// ndist/blk_h here by hand would hand horizonHidden() values computed by this file and then
+// congratulate the renderer on agreeing with itself. So the renderer's own hznDerive() is
+// called instead, over the whole pool, immediately before anything reads it — the same
+// function the shipped horizonBuild() calls, out of the same header, with no copy in between.
+//
+// Whole-pool and re-run per candidate rather than incremental: correctness here, not speed, and
+// one call site that cannot be forgotten beats four fill sites that each have to remember.
+static void derivePool(void)
+{
+	for (int c = 0; c < s_hzn_n; c++) hznDerive(&s_hzn_cols[c], s_cam_x, s_cam_y, s_cam_z);
+}
 
 // The real thing. Generated at build time — see the file comment.
 #include "horizon_extract.inc"
@@ -276,11 +305,14 @@ static long s_zero_ndist;
 
 static void checkDegenerateDistances(void)
 {
+	// v1.8.7: reads the derived fields rather than recomputing them, because the branch this
+	// guards is now taken on s_hzn_cols[c].ndist and not on a distance this file worked out.
+	// Checking the one the renderer will actually branch on is the point.
+	derivePool();
+
 	for (int c = 0; c < s_hzn_n; c++) {
-		const float ncx = (float)(s_hzn_cols[c].cx * CHUNK_DIM) + (float)CHUNK_DIM * 0.5f;
-		const float ncz = (float)(s_hzn_cols[c].cz * CHUNK_DIM) + (float)CHUNK_DIM * 0.5f;
-		const float ndx = ncx - s_cam_x, ndz = ncz - s_cam_z;
-		if (sqrtf(ndx * ndx + ndz * ndz) == 0.0f) {
+		const float ndx = s_hzn_cols[c].ndx, ndz = s_hzn_cols[c].ndz;
+		if (s_hzn_cols[c].ndist == 0.0f) {
 			s_zero_ndist++;
 			if (ndx != 0.0f || ndz != 0.0f) {
 				// A zero distance from nonzero components would mean the branch in the
@@ -293,6 +325,12 @@ static void checkDegenerateDistances(void)
 
 static void compareAt(int cx, int cy, int cz)
 {
+	// v1.8.7. The pool's derived half, produced by the renderer's hznDerive() — see derivePool.
+	// horizonHidden() reads it; horizonHiddenRef() and horizonHiddenExact() still compute their
+	// own from cx/cz/top_y, which is what makes this a comparison and not a tautology: the two
+	// oracles never see these fields, so a wrong derivation shows up as a disagreement.
+	derivePool();
+
 	const bool ref = horizonHiddenRef(cx, cy, cz);
 	const bool now = horizonHidden(cx, cy, cz);
 	const bool exa = horizonHiddenExact(cx, cy, cz);

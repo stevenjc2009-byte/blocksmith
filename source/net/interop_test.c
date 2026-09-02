@@ -68,6 +68,7 @@
 #include "net/bsnet_sock.h"
 #include "net/bsnet_transport.h"
 #include "world/block.h"
+#include "world/registry.h"
 #include "world/world.h"
 
 #include "proto/bs_proto.h"
@@ -132,9 +133,13 @@ static void check(bool cond, const char *what)
  * boundary), which makes 10 checks. Recomputed as 56 + 10 by counting the check() calls added,
  * not read off the run - the paragraph below is the reason that distinction matters.
  *
+ * 77 on 2026-09-02: v1.8.7 added scenario 10 (the registry fingerprint verdict, against the
+ * real daemon), which makes 11 checks. Recomputed as 66 + 11 by counting the check() calls
+ * added, not read off the run.
+ *
  * Legitimately adding or removing a check means editing this by hand. The suite going red until
  * you do is deliberate friction, not an accident. */
-#define INTEROP_TEST_EXPECTED_CHECKS 66
+#define INTEROP_TEST_EXPECTED_CHECKS 77
 
 /* Deliberately NOT routed through check(): it must not perturb the number it is testing, so it
  * bumps g_fails only and leaves g_checks alone. Reporting shape is check()'s, so a failure here
@@ -491,6 +496,29 @@ bool netTransportSend(const uint8_t *payload, size_t len)
     memcpy(buf + BS_GAME_ENVELOPE_BYTES, payload, len);
     gate_sendto(buf, BS_GAME_ENVELOPE_BYTES + len);
     return true;
+}
+
+/* v1.8.7. networld.c's new networldSessionActive() reads this. Doubled here for the same
+ * reason the send above is: this binary talks to the real server through a socket gate rather
+ * than through bsnet_transport.c, so the state enum has no real owner in the link. ESTABLISHED
+ * is what the gate models — by the time any case runs, the client is in session. */
+NetTransportState netTransportState(void)
+{
+    return NET_TRANSPORT_ESTABLISHED;
+}
+
+/* v1.8.7. The registry fingerprint verdict's only way out of networld.c, and the one observable
+ * scenario 10 is written on. Recorded rather than acted on: there is no bsnet_transport.c in this
+ * link (see the header comment), so there is no session for a real refusal to end, and the daemon
+ * on the other side of the gate socket is a child process this suite still has to reap. Scenarios
+ * 1-9 leave this counter at zero, which is what makes it a control as well as an observable. */
+static int  g_refuse_calls;
+static char g_refuse_why[128];
+
+void netTransportRefuse(const char *why)
+{
+    g_refuse_calls++;
+    snprintf(g_refuse_why, sizeof g_refuse_why, "%s", why ? why : "");
 }
 
 int netTransportRecv(uint8_t *out, size_t cap)
@@ -1103,6 +1131,84 @@ static void test_world_gen_declared_at_join(void)
           "so the entry gate is open by the end of the burst rather than held for the grace");
 }
 
+/* ----------------------------------------------------------------------------- scenario 10 --
+ * The v1.8.7 verdict, against the real daemon rather than a scripted INFO packet.
+ *
+ * networld_test.c proves the DECISION; this proves the SITUATION is reachable. Everything in the
+ * loop is real: bsgame's own send_registry_info() packs the fingerprint from its own
+ * registryCrc16(), it crosses a Unix socket into another process, networld.c decodes it,
+ * disagrees, sends real BS_APP_REGISTRY_FETCHes that the real handle_registry_fetch() answers,
+ * and NETWORLD_REG_SYNC_DEADLINE_MS of real wall-clock time expires on bsSockNowMs() reading
+ * CLOCK_MONOTONIC. No fake clock, no scripted packet, neither side reimplemented.
+ *
+ * The perturbation is one extra DYNAMIC row registered on the client before the join, which
+ * models the core-table disagreement without needing two builds: it makes this table's count and
+ * crc16 differ from the server's, and it is unfixable from the wire for the same reason a core
+ * row is - a DEFS batch can only ADD rows, so no answer the server can give ever brings the
+ * count back DOWN to the one it announced. That is the shape of the v1.8.1 defect.
+ *
+ * Last, because it is the only scenario that deliberately leaves the registry wrong. The refusal
+ * itself puts it back (networldInit() -> registryInitCore()), and the last check is that it did. */
+
+static void test_registry_mismatch_refuses_against_the_real_server(void)
+{
+    puts("real interop: a table the real server's fingerprint disproves ends the session instead "
+         "of entering the world with it");
+
+    check(g_refuse_calls == 0,
+          "control: nine real joins against this daemon with the shipped table refused nothing");
+
+    const uint32_t client = 0xC1E00015u;
+
+    networldInit();   /* clears the table to core rows, so perturb it AFTER this, not before */
+    g_client_sid = client;
+    captureReset();
+    captureInvReset();
+    captureGenReset();
+
+    const uint8_t core_n = registryCount();
+
+    BlockDef extra;
+    memset(&extra, 0, sizeof extra);
+    snprintf(extra.name, sizeof extra.name, "interop_ghost");
+    extra.flags      = REG_FLAG_SOLID;
+    extra.hardness   = 1;
+    extra.variant_of = REG_ID_DYN_LO;
+    const BlockId ghost = registryRegister(&extra);
+
+    check(ghost >= REG_ID_DYN_LO,
+          "control: the client really carries a row this server has never heard of");
+    check(registryCount() == (uint8_t)(core_n + 1u),
+          "so its count sits one above the server's, which no DEFS batch can ever undo");
+
+    send_join(client, "crcclient1");
+
+    pumpFor(300);   /* the join burst, the first FETCH, and the real server's answer to it */
+    check(!networldRegistrySynced(),
+          "the real server's own crc16 does not match this table, across a process boundary");
+    check(g_refuse_calls == 0,
+          "and nothing is refused while the bounded retry still has time left to converge");
+    check(networldRegistryWaiting(),
+          "control: the gate really is still holding, so the check above is not vacuous");
+
+    /* Real time, not a fake clock: NETWORLD_REG_SYNC_DEADLINE_MS is 2000 ms and the bsSockNowMs()
+     * at the top of this file is CLOCK_MONOTONIC. The margin covers the pump's 5 ms sleep. */
+    pumpFor(NETWORLD_REG_SYNC_DEADLINE_MS + 600u);
+
+    check(g_refuse_calls == 1,
+          "at the instant the entry gate would have opened, the session is refused instead");
+    printf("    [measured] refusal text: \"%s\"\n", g_refuse_why);
+    check(g_refuse_why[0] != '\0' && strstr(g_refuse_why, "version") != NULL,
+          "with a real line that names a version disagreement, not an empty string");
+    check(!networldWorldSeed(NULL),
+          "the seed the real server sent is gone with the session, which is what closes "
+          "title_nav.h's entry gate on the same frame");
+    check(!networldRegistryWaiting(),
+          "and the bound networld.h promises is kept: this is not a gate that hangs");
+    check(registryCount() == core_n,
+          "the ghost row went with it, so the next join would start from the compiled-in table");
+}
+
 /* --------------------------------------------------------------------------------------- main */
 
 int main(void)
@@ -1157,6 +1263,10 @@ int main(void)
     test_inv_pickup_roundtrip_reflected_in_snapshot();
 
     test_world_gen_declared_at_join();
+
+    /* Last: the only scenario that deliberately leaves the client's registry wrong, and the
+     * only one that spends ~3 s of real wall clock waiting for a real deadline. */
+    test_registry_mismatch_refuses_against_the_real_server();
 
     reap_daemon();
 

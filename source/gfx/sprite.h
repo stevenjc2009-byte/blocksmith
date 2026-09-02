@@ -62,8 +62,8 @@ void spriteExit(void);
 // batch of a frame silently overwrote the first one's vertices before the GPU ever saw
 // them, and the first batch was drawn with the second's geometry.
 //
-// A frame that never calls this still renders — it just keeps consuming buffer until it
-// wraps (see spriteOverflowCount) — so a missed call degrades rather than corrupts.
+// A frame that never calls this still renders — it just keeps consuming buffer until the
+// cursor wraps back to the start — so a missed call degrades rather than corrupts.
 void spriteFrameBegin(void);
 
 // Opens a 2D pass. `w` and `h` are the target's logical size in pixels — 400x240 for the
@@ -98,13 +98,13 @@ void spriteRect(float x, float y, float w, float h, uint32_t colour);
 // simply lost.
 void spriteEnd(void);
 
-// Draw calls and quads issued since the last spriteBegin. Reported rather than assumed:
-// "the UI is one draw call" is a claim, and this is the number that settles it.
-int spriteDrawCount(void);
-int spriteQuadCount(void);
-
-// How many times this frame the buffer wrapped back to the start because a frame asked for
-// more quads than it holds. Nonzero means some batch this frame is drawing another batch's
-// geometry — the exact fault the frame-scoped cursor exists to prevent — so it is a number
-// worth looking at rather than a soft limit. Reset by spriteFrameBegin.
-int spriteOverflowCount(void);
+// v1.8.7: spriteDrawCount(), spriteQuadCount() and spriteOverflowCount() were here and are
+// gone. All three were grep-proven to have no caller anywhere in the tree — not in source/,
+// tests/, tools/, server/ or the vendored deps/ — so the three counters behind them were
+// maintained every frame and read by nothing. Their increments went with them.
+//
+// What that costs, said plainly rather than left to be discovered: the buffer-wrap condition
+// described at spriteFrameBegin above is now UNOBSERVABLE. It was already unobservable in
+// practice, because nothing called the accessor, but a future reader should know the number
+// is not merely hidden — it is not being counted. If a wrap is ever suspected, put back a
+// counter and a reader together, not a counter alone.

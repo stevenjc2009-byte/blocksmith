@@ -4,6 +4,7 @@
 #include "world/genversion.h"
 #include "world/noise.h"
 #include "world/rng.h"
+#include "world/worldgen_scratch.h"
 
 // The grid geometry is derived from the world's, not chosen independently of it. A change to
 // CHUNK_DIM or WORLD_HEIGHT that these did not follow would silently sample the wrong lattice
@@ -24,39 +25,23 @@ _Static_assert(1 << GEN_D_CELL_Y_SHIFT == GEN_D_CELL_Y, "y shift must match the 
 
 // ── Working buffers ───────────────────────────────────────────────────────────────────
 //
-// All static, none on the linear heap, none claimed against WORLD_BUDGET_BYTES (world/
-// budget.h) — that budget counts block storage, and none of this outlives a call. Static
-// rather than automatic for world/worldgen.c's reason: this runs on the worker thread, whose
-// stack is 32 KB (app/worker.c), and 6.4 KB of frame is not something to spend there.
+// **They live in the caller's WorldGenScratch as of v1.8.7 — `grid`, `solid`, `top`, `slope`,
+// `flat` and the `top_cx`/`top_cz`/`top_valid` key — and are declared in
+// world/worldgen_scratch.h.** They were file statics until then, none on the linear heap and
+// none claimed against WORLD_BUDGET_BYTES (world/budget.h), which is still true of them: that
+// budget counts block storage, and none of this outlives the call that fills it. What changed
+// is the owner. Static was chosen over automatic because this runs on the worker thread, whose
+// stack is 32 KB (app/worker.c), and it is still not on a stack; it is the lane's, and there
+// can now be two lanes on a New 3DS's spare core.
 //
-// Total added .bss for this generator: 1,700 + 4,096 + 512 + 256 = **6,564 bytes**.
-
-// The coarse lattice: [y][z][x], 16.16 blocks, positive inside the ground.
-static int32_t s_grid[GEN_D_GRID_Y][GEN_D_GRID_XZ][GEN_D_GRID_XZ];
-
-// The interpolated result, one bit per block: [y][z] holds a 16-bit mask over x. 4,096 bytes
-// for a whole 16 x 16 x 128 column, against 32,768 for a byte per block — and the surface
-// pass wants to scan downwards through a column, which a bitmask makes a shift rather than a
-// strided memory walk.
-static uint16_t s_solid[WORLD_HEIGHT][CHUNK_DIM];
-
-// Topmost solid y + 1 per (x, z), i.e. exactly worldgenHeight()'s convention. 0 where the
-// whole column came out empty, which the vertical bias makes impossible but which the fill
-// loop must still not read past the end of.
-static int16_t s_top[CHUNK_DIM][CHUNK_DIM];
-
-// Slope at each (x, z) in blocks-per-block doubled — see GEN_D_CLIFF_SLOPE_X2.
-static uint8_t s_slope[CHUNK_DIM][CHUNK_DIM];
-
-// Which column s_top currently describes, for wgdColumnTops(). -1/-1 would be a real column
-// coordinate, so validity is its own flag rather than a sentinel pair.
-static int32_t s_top_cx, s_top_cz;
-static bool    s_top_valid;
-
-// One chunk's cells, staged and committed in one worldSetChunkAll. Same buffer discipline and
-// the same reason as world/worldgen.c's s_gen_flat, kept separate from it only because the
-// two generators must not be able to interfere with each other.
-static BlockId s_flat[CHUNK_BLOCKS];
+// **The .bss figure this comment used to quote — "1,700 + 4,096 + 512 + 256 = 6,564 bytes" —
+// was wrong, and is corrected here rather than repeated.** It omitted the 4,096-byte chunk
+// staging buffer (the old s_flat, now `flat`) and the 9 bytes of column key. MEASURED with
+// arm-none-eabi-size on this TU compiled alone with the Makefile's own flags: **10,672 bytes
+// of .bss**, of which 10,669 is the seven objects (1,700 + 4,096 + 512 + 256 + 4,096 + 4 + 4
+// + 1) and 3 is section alignment. Together with world/worldgen.c's 5,584 that is 16,256
+// bytes, which is sizeof(WorldGenScratch) on ARM to the byte — the move added no padding.
+// After it, both TUs measure .bss 0.
 
 // ── Coordinates ───────────────────────────────────────────────────────────────────────
 //
@@ -185,6 +170,40 @@ void wgdBiomeParams(fx biome, int* base_h, int* amp)
 
 // ── One density sample ────────────────────────────────────────────────────────────────
 
+// The three mixed field seeds, derived once and carried.
+//
+// They are a pure function of g->seed and cannot change while the WorldGen lives, but
+// densityCore below used to re-mix all three on every call — and it is called 425 times for
+// every column built, plus 68 more for every standalone wgdHeight query. That is 1,275 rngMix
+// per column computing three values that were the same all along. world/worldgen.h's
+// cave_salt[2] is the same fix for worldgenIsCave, made for the same reason.
+//
+// **A parameter, not a file static, and deliberately.** Everything in this file's working-
+// buffer block above is a static, and that is exactly what stands between this generator and
+// running on a second thread on the New 3DS's spare core. A salt set is three words; it lives
+// on the caller's stack and is passed down, so the hoist costs nothing in shareability. Do not
+// promote it to a file static to save the pointer — that trade is the wrong way round.
+//
+// **It is not quoted as a speed-up, because it did not measure as one.** Timed in isolation on
+// wgdHeight, which nothing else in the same change touches, 36,000 queries per round on the
+// host: +3.01 % in one run and -1.67 % in another, i.e. inside that harness's noise floor.
+// What is counted rather than estimated is the redundant work removed — 1,275 rngMix per
+// generated column — and that is the whole claim being made for it.
+typedef struct {
+	uint32_t low;
+	uint32_t high;
+	uint32_t sel;
+} DensitySalts;
+
+static inline DensitySalts densitySalts(const WorldGen* g)
+{
+	DensitySalts s;
+	s.low  = rngMix(g->seed ^ SALT_DLOW);
+	s.high = rngMix(g->seed ^ SALT_DHIGH);
+	s.sel  = rngMix(g->seed ^ SALT_DSEL);
+	return s;
+}
+
 // The selector, shaped: centred on the field's measured median, amplified so it saturates,
 // clamped to [0, FX_ONE]. See GEN_D_SEL_GAIN in the header for why saturation is the point.
 static inline fx selectorAt(uint32_t seed, int32_t x, int y, int32_t z)
@@ -200,28 +219,26 @@ static inline fx selectorAt(uint32_t seed, int32_t x, int y, int32_t z)
 	return (fx)t;
 }
 
-// The density at one lattice point, given the biome pair already resolved for that point.
+// The density at one lattice point, given the biome pair and the salt set already resolved
+// for that point.
 //
 // Split out from wgdDensityAt so the column builder can resolve the biome once per xz grid
-// point (25 fBm2 evaluations per column) instead of once per lattice point (425).
-static inline int32_t densityCore(const WorldGen* g, int32_t x, int y, int32_t z,
+// point (25 fBm2 evaluations per column) instead of once per lattice point (425), and the
+// salts once per call into this file instead of 425 times.
+static inline int32_t densityCore(const DensitySalts* s, int32_t x, int y, int32_t z,
                                   int base_h, int amp)
 {
-	const uint32_t s_low  = rngMix(g->seed ^ SALT_DLOW);
-	const uint32_t s_high = rngMix(g->seed ^ SALT_DHIGH);
-	const uint32_t s_sel  = rngMix(g->seed ^ SALT_DSEL);
-
-	const fx lo = noiseFbm3(s_low,
+	const fx lo = noiseFbm3(s->low,
 	                        dCoord(x, GEN_D_LOW_SHIFT_XZ),
 	                        dCoord(y, GEN_D_LOW_SHIFT_Y),
 	                        dCoord(z, GEN_D_LOW_SHIFT_XZ),
 	                        GEN_D_LOW_OCTAVES);
-	const fx hi = noiseFbm3(s_high,
+	const fx hi = noiseFbm3(s->high,
 	                        dCoord(x, GEN_D_HIGH_SHIFT_XZ),
 	                        dCoord(y, GEN_D_HIGH_SHIFT_Y),
 	                        dCoord(z, GEN_D_HIGH_SHIFT_XZ),
 	                        GEN_D_HIGH_OCTAVES);
-	const fx t  = selectorAt(s_sel, x, y, z);
+	const fx t  = selectorAt(s->sel, x, y, z);
 
 	// lerp(lo, hi, t). Both are [0, FX_ONE] and t is [0, FX_ONE], so the product is at most
 	// 2^32 and must be widened; the shift brings it back to 16.16.
@@ -239,9 +256,10 @@ static inline int32_t densityCore(const WorldGen* g, int32_t x, int y, int32_t z
 
 int32_t wgdDensityAt(const WorldGen* g, int32_t x, int y, int32_t z)
 {
+	const DensitySalts salts = densitySalts(g);
 	int base_h, amp;
 	wgdBiomeParams(worldgenBiome(g, x, z), &base_h, &amp);
-	return densityCore(g, x, y, z, base_h, amp);
+	return densityCore(&salts, x, y, z, base_h, amp);
 }
 
 // ── Trilinear interpolation ───────────────────────────────────────────────────────────
@@ -256,25 +274,74 @@ static inline int32_t lerpSh(int32_t a, int32_t b, int t, int sh)
 	return a + (((b - a) * t) >> sh);
 }
 
-// Fills s_solid for one column from s_grid.
+// Fills s->solid for one column from s->grid.
 //
 // Structured as cell-at-a-time with the y, then z, then x interpolations hoisted out of the
 // loops that do not need them — the same nesting Beta uses, and for the same reason: done
 // naively this is seven lerps for every one of the 32,768 blocks, and hoisted it is about
 // 1.3. On a 268 MHz ARM11 that difference is the whole feasibility of the design.
-static void interpolateColumn(void)
+//
+// ── The uniform-cell short circuit ────────────────────────────────────────────────────
+//
+// Most of a column is not near the surface. A cell whose eight corners are ALL positive is
+// solid in every one of its 128 blocks and one whose eight corners are all non-positive is
+// air in all of them, so neither needs interpolating at all — the first is 32 mask ORs and
+// the second is nothing, against 224 lerps.
+//
+// **This is exact, not an approximation, and the proof is that lerpSh cannot leave the
+// interval its endpoints span.** lerpSh(a, b, t, sh) is a + floor((b - a) * t / 2^sh) with
+// 0 <= t < 2^sh, so:
+//   * a > 0 and b > 0. If b >= a the floored term is >= 0 and the result is >= a > 0. If
+//     b < a then (b - a) * t / 2^sh is strictly greater than (b - a), and its floor is
+//     therefore >= b - a because b - a is an integer — so the result is >= b > 0.
+//   * a <= 0 and b <= 0, mirrored: the result is <= max(a, b) <= 0.
+// Each of the three interpolation stages takes its endpoints from the stage above, so the
+// property carries from the eight corners to every block of the cell.
+//
+// Measured rather than argued, in tests/worldgen_density_opt_test.c: the interval property
+// above is brute-forced over both shift counts and over corner magnitudes past the range
+// s->grid holds, and — the check that actually covers this file — the terrain of 600 generated
+// columns over 12 seeds hashes the same with this short circuit as it did without it.
+//
+// Measured on the host (x86-64 gcc -O2; NOT the ARM11) over 1800 columns: 43.2 % of lattice
+// cells come out all-air and 49.0 % all-solid, so only 7.8 % reach the loops below. That took
+// interpolateColumn from 0.0329 to 0.0043 ms per column.
+static void interpolateColumn(WorldGenScratch* s)
 {
 	for (int cy = 0; cy < GEN_D_GRID_Y - 1; cy++) {
 		for (int cz = 0; cz < GEN_D_GRID_XZ - 1; cz++) {
 			for (int cx = 0; cx < GEN_D_GRID_XZ - 1; cx++) {
-				const int32_t c000 = s_grid[cy][cz][cx];
-				const int32_t c001 = s_grid[cy][cz][cx + 1];
-				const int32_t c010 = s_grid[cy][cz + 1][cx];
-				const int32_t c011 = s_grid[cy][cz + 1][cx + 1];
-				const int32_t c100 = s_grid[cy + 1][cz][cx];
-				const int32_t c101 = s_grid[cy + 1][cz][cx + 1];
-				const int32_t c110 = s_grid[cy + 1][cz + 1][cx];
-				const int32_t c111 = s_grid[cy + 1][cz + 1][cx + 1];
+				const int32_t c000 = s->grid[cy][cz][cx];
+				const int32_t c001 = s->grid[cy][cz][cx + 1];
+				const int32_t c010 = s->grid[cy][cz + 1][cx];
+				const int32_t c011 = s->grid[cy][cz + 1][cx + 1];
+				const int32_t c100 = s->grid[cy + 1][cz][cx];
+				const int32_t c101 = s->grid[cy + 1][cz][cx + 1];
+				const int32_t c110 = s->grid[cy + 1][cz + 1][cx];
+				const int32_t c111 = s->grid[cy + 1][cz + 1][cx + 1];
+
+				// Zero counts as AIR, not as solid, because the per-block test below is
+				// `d > 0`. The two predicates are therefore `all > 0` and `all <= 0` and are
+				// not each other's negation — a cell with corners either side of zero is
+				// neither, and falls through to the full interpolation.
+				const bool all_solid = (c000 > 0) && (c001 > 0) && (c010 > 0) && (c011 > 0) &&
+				                       (c100 > 0) && (c101 > 0) && (c110 > 0) && (c111 > 0);
+				const bool all_air   = (c000 <= 0) && (c001 <= 0) && (c010 <= 0) && (c011 <= 0) &&
+				                       (c100 <= 0) && (c101 <= 0) && (c110 <= 0) && (c111 <= 0);
+
+				if (all_air)
+					continue;   // s->solid is zeroed before this pass, so there is nothing to do
+
+				if (all_solid) {
+					const uint16_t bits =
+						(uint16_t)(((1u << GEN_D_CELL_XZ) - 1u) << (cx * GEN_D_CELL_XZ));
+					for (int ly = 0; ly < GEN_D_CELL_Y; ly++) {
+						const int y = cy * GEN_D_CELL_Y + ly;
+						for (int lz = 0; lz < GEN_D_CELL_XZ; lz++)
+							s->solid[y][cz * GEN_D_CELL_XZ + lz] |= bits;
+					}
+					continue;
+				}
 
 				for (int ly = 0; ly < GEN_D_CELL_Y; ly++) {
 					// Interpolate the cell's four vertical edges once for this y slice.
@@ -291,7 +358,7 @@ static void interpolateColumn(void)
 						const int32_t r1 = lerpSh(e01, e11, lz, GEN_D_CELL_XZ_SHIFT);
 
 						const int z = cz * GEN_D_CELL_XZ + lz;
-						uint16_t mask = s_solid[y][z];
+						uint16_t mask = s->solid[y][z];
 
 						for (int lx = 0; lx < GEN_D_CELL_XZ; lx++) {
 							// One lerp per block, and nothing else.
@@ -300,7 +367,7 @@ static void interpolateColumn(void)
 							if (d > 0)
 								mask |= (uint16_t)(1u << x);
 						}
-						s_solid[y][z] = mask;
+						s->solid[y][z] = mask;
 					}
 				}
 			}
@@ -308,14 +375,17 @@ static void interpolateColumn(void)
 	}
 }
 
-// Evaluates the whole 5 x 5 x 17 lattice for column (cx, cz) into s_grid.
-static void buildGrid(const WorldGen* g, int32_t cx, int32_t cz)
+// Evaluates the whole 5 x 5 x 17 lattice for column (cx, cz) into s->grid.
+static void buildGrid(const WorldGen* g, WorldGenScratch* s, int32_t cx, int32_t cz)
 {
 	// The biome pair is resolved once per xz grid point — 25 fBm2 evaluations per column,
 	// against 425 if it were resolved per lattice point. It varies over 128 blocks
 	// (GEN_BIOME_SHIFT), so a 4-block sample spacing is already far finer than the field.
 	int base_h[GEN_D_GRID_XZ][GEN_D_GRID_XZ];
 	int amp[GEN_D_GRID_XZ][GEN_D_GRID_XZ];
+
+	// Once for the whole 425-point lattice, not once per point. See DensitySalts.
+	const DensitySalts salts = densitySalts(g);
 
 	for (int j = 0; j < GEN_D_GRID_XZ; j++) {
 		for (int i = 0; i < GEN_D_GRID_XZ; i++) {
@@ -331,7 +401,7 @@ static void buildGrid(const WorldGen* g, int32_t cx, int32_t cz)
 			for (int i = 0; i < GEN_D_GRID_XZ; i++) {
 				const int32_t x = cx * CHUNK_DIM + i * GEN_D_CELL_XZ;
 				const int32_t z = cz * CHUNK_DIM + j * GEN_D_CELL_XZ;
-				s_grid[k][j][i] = densityCore(g, x, y, z, base_h[j][i], amp[j][i]);
+				s->grid[k][j][i] = densityCore(&salts, x, y, z, base_h[j][i], amp[j][i]);
 			}
 		}
 	}
@@ -339,7 +409,7 @@ static void buildGrid(const WorldGen* g, int32_t cx, int32_t cz)
 
 // ── Slope (task 20) ───────────────────────────────────────────────────────────────────
 
-static void buildSlope(void)
+static void buildSlope(WorldGenScratch* s)
 {
 	for (int z = 0; z < CHUNK_DIM; z++) {
 		for (int x = 0; x < CHUNK_DIM; x++) {
@@ -353,8 +423,8 @@ static void buildSlope(void)
 			// Doubled units: a central difference already spans two blocks, and a one-sided
 			// one is doubled to match rather than halving the central one, which would throw
 			// away the odd values on a CPU with no divide.
-			int dx = s_top[z][xb] - s_top[z][xa];
-			int dz = s_top[zb][x] - s_top[za][x];
+			int dx = s->top[z][xb] - s->top[z][xa];
+			int dz = s->top[zb][x] - s->top[za][x];
 			if (xb - xa == 1) dx *= 2;
 			if (zb - za == 1) dz *= 2;
 			if (dx < 0) dx = -dx;
@@ -363,9 +433,9 @@ static void buildSlope(void)
 			// The larger of the two axes, not their sum: a slope that is steep along one axis
 			// and flat along the other is a cliff, and adding them would call a gentle
 			// diagonal one too.
-			int s = (dx > dz) ? dx : dz;
-			if (s > 255) s = 255;
-			s_slope[z][x] = (uint8_t)s;
+			int mag = (dx > dz) ? dx : dz;
+			if (mag > 255) mag = 255;
+			s->slope[z][x] = (uint8_t)mag;
 		}
 	}
 }
@@ -474,6 +544,8 @@ int wgdHeight(const WorldGen* g, int32_t x, int32_t z)
 	const int fx_ = lx & (GEN_D_CELL_XZ - 1);
 	const int fz_ = lz & (GEN_D_CELL_XZ - 1);
 
+	const DensitySalts salts = densitySalts(g);
+
 	int32_t edge[GEN_D_GRID_Y][2][2];
 	for (int di = 0; di < 2; di++) {
 		for (int dj = 0; dj < 2; dj++) {
@@ -482,7 +554,7 @@ int wgdHeight(const WorldGen* g, int32_t x, int32_t z)
 			int base_h, amp;
 			wgdBiomeParams(worldgenBiome(g, gx, gz), &base_h, &amp);
 			for (int k = 0; k < GEN_D_GRID_Y; k++)
-				edge[k][dj][di] = densityCore(g, gx, k * GEN_D_CELL_Y, gz, base_h, amp);
+				edge[k][dj][di] = densityCore(&salts, gx, k * GEN_D_CELL_Y, gz, base_h, amp);
 		}
 	}
 
@@ -513,32 +585,46 @@ int wgdHeight(const WorldGen* g, int32_t x, int32_t z)
 
 // ── The column ────────────────────────────────────────────────────────────────────────
 
-bool wgdColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz)
+bool wgdColumn(const WorldGen* g, WorldGenScratch* s, World* w, int32_t cx, int32_t cz)
 {
-	buildGrid(g, cx, cz);
+	buildGrid(g, s, cx, cz);
 
 	for (int y = 0; y < WORLD_HEIGHT; y++)
 		for (int z = 0; z < CHUNK_DIM; z++)
-			s_solid[y][z] = 0;
-	interpolateColumn();
+			s->solid[y][z] = 0;
+	interpolateColumn(s);
 
 	// Topmost solid per (x, z). Scanned down from the ceiling, which is the same convention
 	// wgdHeight uses and the same one the rest of the game reads heights in.
+	//
+	// **Sixteen cells at a time, because s->solid is already a bitmask.** Asking the question
+	// one (x, z) at a time re-walked the empty sky sixteen times per z row — every one of the
+	// 16 cells reading its own way down through the same all-zero words. `rem` is the columns
+	// of this row that have not found their top yet; the row's y walk stops the moment it is
+	// empty, and the per-x loop below runs only on a y that actually resolved something, which
+	// can happen at most 16 times per row.
 	int max_h = 0;
 	for (int z = 0; z < CHUNK_DIM; z++) {
-		for (int x = 0; x < CHUNK_DIM; x++) {
-			int top = 0;
-			for (int y = WORLD_HEIGHT - 1; y >= 0; y--) {
-				if (s_solid[y][z] & (uint16_t)(1u << x)) { top = y + 1; break; }
-			}
-			s_top[z][x] = (int16_t)top;
-			if (top > max_h) max_h = top;
+		for (int x = 0; x < CHUNK_DIM; x++)
+			s->top[z][x] = 0;
+
+		uint16_t rem = 0xFFFFu;
+		for (int y = WORLD_HEIGHT - 1; y >= 0 && rem; y--) {
+			const uint16_t hit = (uint16_t)(s->solid[y][z] & rem);
+			if (!hit)
+				continue;
+
+			rem = (uint16_t)(rem & (uint16_t)~hit);
+			for (int x = 0; x < CHUNK_DIM; x++)
+				if (hit & (uint16_t)(1u << x))
+					s->top[z][x] = (int16_t)(y + 1);
+			if (y + 1 > max_h) max_h = y + 1;
 		}
 	}
-	s_top_cx    = cx;
-	s_top_cz    = cz;
-	s_top_valid = true;
-	buildSlope();
+	s->top_cx    = cx;
+	s->top_cz    = cz;
+	s->top_valid = true;
+	buildSlope(s);
 
 	// v1.8.3 Phase 2. The biome per (x, z), resolved once for the column and consumed by the
 	// surface pass below.
@@ -629,14 +715,14 @@ bool wgdColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 			continue;
 
 		bool any = false;
-		for (int i = 0; i < CHUNK_BLOCKS; i++) s_flat[i] = BLOCK_AIR;
+		for (int i = 0; i < CHUNK_BLOCKS; i++) s->flat[i] = BLOCK_AIR;
 
 		for (int ly = CHUNK_DIM - 1; ly >= 0; ly--) {
 			const int y = y0 + ly;
 			// Hoisted out of the 256 cells of this slice: one compare per y, not per block.
 			const bool under_line = (y < GEN_SEA_LEVEL);
 			for (int z = 0; z < CHUNK_DIM; z++) {
-				const uint16_t mask = s_solid[y][z];
+				const uint16_t mask = s->solid[y][z];
 				for (int x = 0; x < CHUNK_DIM; x++) {
 					if (!(mask & (uint16_t)(1u << x))) {
 						// Air ends the run. Only a run that has actually started can close
@@ -645,7 +731,7 @@ bool wgdColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 						if (run[z][x] >= 0) exposed[z][x] = false;
 						run[z][x] = -1;
 						if (under_line && sea[z][x]) {
-							s_flat[chunkIndex(x, ly, z)] =
+							s->flat[chunkIndex(x, ly, z)] =
 								seaBlockAt(y, (BiomeId)biome[z][x]);
 							any = true;
 						}
@@ -668,9 +754,9 @@ bool wgdColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 					// and forbid another for five blocks under it, which turns a tunnel
 					// system into a scatter of isolated pockets. Measured: run-depth gave
 					// 10,360 air cells under the surface against 27,312 in legacy.
-					const int d_surf = s_top[z][x] - 1 - y;
+					const int d_surf = s->top[z][x] - 1 - y;
 					if (d_surf >= GEN_CAVE_MIN_DEPTH &&
-					    worldgenIsCave(g, wx0 + x, y, wz0 + z)) {
+					    worldgenIsCaveCached(g, s, wx0 + x, y, wz0 + z)) {
 						exposed[z][x] = false;
 						run[z][x] = -1;
 						// A carved cell is air, so the fill treats it as air. It is almost
@@ -684,7 +770,7 @@ bool wgdColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 						// waterline y, and a carved cell AT y == GEN_SEA_LEVEL - 1 that the
 						// walk can still see is the sea surface however it came to be air.
 						if (under_line && sea[z][x]) {
-							s_flat[chunkIndex(x, ly, z)] =
+							s->flat[chunkIndex(x, ly, z)] =
 								seaBlockAt(y, (BiomeId)biome[z][x]);
 							any = true;
 						}
@@ -700,9 +786,9 @@ bool wgdColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 					// from the sea whatever it turns out to be.
 					if (under_line) sea[z][x] = false;
 
-					s_flat[chunkIndex(x, ly, z)] =
+					s->flat[chunkIndex(x, ly, z)] =
 						exposed[z][x]
-							? surfaceBlock(depth, s_top[z][x], s_slope[z][x],
+							? surfaceBlock(depth, s->top[z][x], s->slope[z][x],
 							               (BiomeId)biome[z][x])
 							: BLOCK_STONE;
 					any = true;
@@ -717,16 +803,16 @@ bool wgdColumn(const WorldGen* g, World* w, int32_t cx, int32_t cz)
 		if (!any)
 			continue;
 
-		if (!worldSetChunkAll(w, cx, cy, cz, s_flat))
+		if (!worldSetChunkAll(w, cx, cy, cz, s->flat))
 			return false;
 	}
 
 	return true;
 }
 
-const int16_t* wgdColumnTops(int32_t cx, int32_t cz)
+const int16_t* wgdColumnTops(const WorldGenScratch* s, int32_t cx, int32_t cz)
 {
-	if (!s_top_valid || s_top_cx != cx || s_top_cz != cz)
+	if (!s->top_valid || s->top_cx != cx || s->top_cz != cz)
 		return NULL;
-	return &s_top[0][0];
+	return &s->top[0][0];
 }

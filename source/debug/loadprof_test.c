@@ -64,6 +64,7 @@
 #include "world/scratch.h"
 #include "world/world.h"
 #include "world/worldgen.h"
+#include "world/worldgen_scratch.h"
 
 // The ring the console fills at RENDER_DIST_MAX: main.c's s_area_radius is the render distance
 // plus one, so radius 3 generates a 9x9 area and meshes the 7x7 inside it. This is the worst
@@ -103,6 +104,7 @@ static BlockId     s_install[CHUNK_BLOCKS];   // worker.c's s_install_blocks
 static uint8_t     s_iobuf[REGION_COL_MAX];   // worker.c's s_load_buf
 static uint8_t     s_savebuf[REGION_COL_MAX];
 static WorldGen    s_gen;
+static WorldGenScratch s_wgs;   // worker.c's s_wgs: this lane's generator scratch
 
 static MeshVertex* s_verts;
 static uint16_t*   s_idx;
@@ -227,7 +229,7 @@ static uint64_t runLoad(const char* dir, int reloaded, int light_on)
 
 			if (!ok) {
 				const uint64_t t_gen = loadprofMark();
-				ok = worldgenColumn(&s_gen, &s_stage, cx, cz);
+				ok = worldgenColumn(&s_gen, &s_wgs, &s_stage, cx, cz);
 				loadprofSince(LOAD_STAGE_GENERATE, t_gen);
 			}
 
@@ -296,7 +298,7 @@ static int saveEdits(const char* dir, int32_t half)
 	worldInit(&s_live);
 	for (int32_t dz = -half; dz <= half; dz++)
 		for (int32_t dx = -half; dx <= half; dx++) {
-			CHECK(worldgenColumn(&s_gen, &s_live, dx, dz));
+			CHECK(worldgenColumn(&s_gen, &s_wgs, &s_live, dx, dz));
 
 			// One edit per column, in the chunk the surface is in. worldSet raises nothing —
 			// world.h documents `dirty` as raised at the EDIT SITE — so this stands in for

@@ -25,6 +25,7 @@
 #include "net/inv_bridge.h"
 
 #include <stdio.h>
+#include <stdlib.h>   /* abort(), in the netTransportRefuse() double below */
 #include <string.h>
 
 #include "net/bsnet_sock.h"
@@ -83,6 +84,25 @@ bool netTransportSend(const uint8_t *payload, size_t len)
     }
     fake_sent_calls++;
     return true;
+}
+
+/* v1.8.7. networld.c's new networldSessionActive() reads this, so the link needs it too — the
+ * same link-time double, for the same reason, as the send above. ESTABLISHED: every case here
+ * is about a client with a live session mirroring its bag to a server. */
+NetTransportState netTransportState(void)
+{
+    return NET_TRANSPORT_ESTABLISHED;
+}
+
+/* v1.8.7. networld.c's registry verdict can call this, so the link needs it. Nothing in this
+ * file arms that verdict — no scenario here sends a BS_APP_WORLD_INFO or a REGISTRY_INFO, so
+ * networld.c's gate is never armed and registryVerdictTick() returns before it could reach
+ * here — and the abort() says so out loud rather than letting a silently refused session make
+ * some later inventory check fail for a reason that has nothing to do with inventories. */
+void netTransportRefuse(const char *why)
+{
+    fprintf(stderr, "inv_bridge_test: unexpected session refusal: %s\n", why ? why : "(null)");
+    abort();
 }
 
 /* Link-time double for net/bsnet_sock.h's clock, for the same reason networld_test.c has one:

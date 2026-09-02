@@ -14,6 +14,7 @@
 #include "world/mesher.h"
 #include "world/remesh.h"
 #include "scene/frustum.h"
+#include "scene/horizon_derive.h"
 #include "scene/mesh_pool_sizing.h"
 #include "scene/render_dist.h"
 #include "world/scratch.h"
@@ -129,6 +130,41 @@ static const float kFaceShade[BLOCK_FACES] = {
 	[FACE_SOUTH]  = 0.86f,   // +Z
 	[FACE_NORTH]  = 0.72f,   // -Z
 };
+
+// v1.8.7. The 64 faceShade uniform rows, built once instead of per bind.
+//
+// pipelineBind runs twice per stereo frame and used to derive all 64 rows every time — two
+// inline calls, a bounds test and a float divide per row — for values that are pure functions
+// of the row index and therefore never change after boot. The UPLOAD stays where it was and
+// still happens on every bind: the vertex shader's float uniform bank is shared hardware and
+// the highlight program's own uniforms land in the same registers (see the comment on
+// pipelineBind), so re-asserting these is load-bearing even though the numbers are constant.
+// Only the arithmetic was redundant, and only the arithmetic is gone.
+//
+// Filled by faceShadeTableBuild() at the top of chunkRenderInit, which is before the
+// pipelineBind() that same function ends with — the only ordering this needs, and the reason
+// the fill sits at the top rather than beside the other GPU setup.
+static float s_faceshade_rows[MESH_NRM_STATES][4];
+
+// The row derivation, moved verbatim out of pipelineBind's loop. Kept as its own function so
+// the numbers and the upload can be read apart: this is what the values ARE, pipelineBind is
+// when they reach the GPU. Idempotent — running it twice writes the same 64 rows.
+//
+// All four components are stored even though pipelineBind reads three: [2] is the uniform's
+// third component, which has always been the same number as [0] (the upload passes `s` twice),
+// and keeping it makes this table a complete record of the row rather than a compressed one —
+// so a check comparing it against the old per-bind loop compares all four values, not three.
+static void faceShadeTableBuild(void)
+{
+	for (unsigned i = 0; i < MESH_NRM_STATES; i++) {
+		const unsigned face = meshNrmFace((uint8_t)i);
+		const unsigned drop = meshNrmDrop((uint8_t)i);
+		s_faceshade_rows[i][0] = (face < BLOCK_FACES) ? kFaceShade[face] : 1.0f;
+		s_faceshade_rows[i][1] = -(float)drop / (float)SCRATCH_WATER_STEPS;
+		s_faceshade_rows[i][2] = s_faceshade_rows[i][0];
+		s_faceshade_rows[i][3] = meshNrmAlpha((uint8_t)i);
+	}
+}
 
 typedef struct {
 	// Step 9.2b. No per-slot index buffer any more. meshChunk's emitFace always advances
@@ -597,10 +633,9 @@ _Static_assert(HZN_MAX_COLUMNS > RENDER_DIST_MAX_COLUMNS,
                "the horizon blocker set must cover the whole widest ring, with room for a "
                "slot still in flight from a distance change");
 
-typedef struct {
-	int   cx, cz;
-	float top_y;   // world-space y of the highest meshed chunk's ceiling in this column
-} HznCol;
+// HznCol and hznDerive() live in scene/horizon_derive.h (included at the top of this file)
+// rather than here, so that tests/horizon_test.c compiles the one real definition of the
+// derivation instead of a copy of it. See that header for why.
 
 // The blocker set is the one piece of this that the BS_HORIZON=0 arm genuinely does not use:
 // horizonBuild() and horizonHidden() are already inside #if BS_HORIZON and nothing else reads
@@ -922,12 +957,16 @@ static void pipelineBind(void)
 	// see-through surface — no extra vertex byte, no extra instruction, no extra register.
 	// meshNrmAlpha is called rather than restated so world/water_alpha_test.c can prove the
 	// rule against the real function instead of against a copy of it.
+	// v1.8.7: s, dy and a are now READ from s_faceshade_rows rather than derived here — the
+	// derivation moved to faceShadeTableBuild() and runs once at init instead of twice a
+	// frame. The C3D_FVUnifSet line below is deliberately unchanged, down to its argument
+	// spelling: world/water_alpha_test.c pins this exact text to prove the meshNrmAlpha value
+	// reaches the uniform's .w component, and rewriting the call would silently retire that
+	// check. The 64 uploads stay here for the reason given on s_faceshade_rows.
 	for (unsigned i = 0; i < MESH_NRM_STATES; i++) {
-		const unsigned face = meshNrmFace((uint8_t)i);
-		const unsigned drop = meshNrmDrop((uint8_t)i);
-		const float    s    = (face < BLOCK_FACES) ? kFaceShade[face] : 1.0f;
-		const float    dy   = -(float)drop / (float)SCRATCH_WATER_STEPS;
-		const float    a    = meshNrmAlpha((uint8_t)i);
+		const float s  = s_faceshade_rows[i][0];
+		const float dy = s_faceshade_rows[i][1];
+		const float a  = s_faceshade_rows[i][3];
 		C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uloc_faceshade + (int)i, s, dy, s, a);
 	}
 
@@ -939,6 +978,12 @@ static void pipelineBind(void)
 
 bool chunkRenderInit(int max_radius)
 {
+	// v1.8.7. Before everything else, including every early return below: this function ends by
+	// calling pipelineBind(), which uploads all 64 rows and no longer computes them. A fill
+	// placed further down would upload a zeroed table on the first bind — sixty-four black
+	// faces, and no error anywhere to say why.
+	faceShadeTableBuild();
+
 	// v1.8.5. The whole point of the argument: the three tier arenas below are claimed for THIS
 	// many slots, not for MESH_SLOTS. At radius 3 that is 392 slots and 9,199,616 bytes, which
 	// is byte-for-byte what every build before this one allocated; at radius 5 it is 968 slots
@@ -1699,11 +1744,19 @@ static void horizonBuild(void)
 			if (s_hzn_cols[c].cx == s->cx && s_hzn_cols[c].cz == s->cz) { found = c; break; }
 		}
 		if (found >= 0) {
-			if (top > s_hzn_cols[found].top_y) s_hzn_cols[found].top_y = top;
+			if (top > s_hzn_cols[found].top_y) {
+				s_hzn_cols[found].top_y = top;
+				// blk_h is a function of top_y, so raising the column re-derives it. Only
+				// blk_h can actually have changed here - cx/cz are what matched - but the
+				// derive is one call and splitting it would give the two files two different
+				// ways to fill the same struct.
+				hznDerive(&s_hzn_cols[found], s_cam_x, s_cam_y, s_cam_z);
+			}
 		} else if (s_hzn_n < HZN_MAX_COLUMNS) {
 			s_hzn_cols[s_hzn_n].cx = s->cx;
 			s_hzn_cols[s_hzn_n].cz = s->cz;
 			s_hzn_cols[s_hzn_n].top_y = top;
+			hznDerive(&s_hzn_cols[s_hzn_n], s_cam_x, s_cam_y, s_cam_z);
 			s_hzn_n++;
 		}
 		// A column past HZN_MAX_COLUMNS is silently dropped from the blocker set — see the
@@ -1776,16 +1829,20 @@ static bool horizonHidden(int cx, int cy, int cz)
 	for (int c = 0; c < s_hzn_n; c++) {
 		if (s_hzn_cols[c].cx == cx && s_hzn_cols[c].cz == cz) continue;   // never self-block
 
-		const float ncx = (float)(s_hzn_cols[c].cx * CHUNK_DIM) + (float)CHUNK_DIM * 0.5f;
-		const float ncz = (float)(s_hzn_cols[c].cz * CHUNK_DIM) + (float)CHUNK_DIM * 0.5f;
-		const float ndx = ncx - s_cam_x, ndz = ncz - s_cam_z;
-		const float ndist = sqrtf(ndx * ndx + ndz * ndz);
+		// v1.8.7: read, not recomputed. These four depend only on the blocker column and the
+		// camera, so they were the same values on every one of this loop's passes and on every
+		// candidate's pass through it - a sqrtf among them, once per (candidate x blocker)
+		// pair. horizonBuild() derives them once per blocker instead, with hznDerive(), which
+		// is the same arithmetic in the same order and therefore the same floats. See
+		// scene/horizon_derive.h.
+		const float ndx = s_hzn_cols[c].ndx, ndz = s_hzn_cols[c].ndz;
+		const float ndist = s_hzn_cols[c].ndist;
 
 		// Must be genuinely nearer, with a full block of margin against two columns at
 		// essentially the same distance flickering across the cull from one frame to the next.
 		if (ndist >= dist - 1.0f) continue;
 
-		const float blk_h = s_hzn_cols[c].top_y - s_cam_y;
+		const float blk_h = s_hzn_cols[c].blk_h;
 
 		if (ndist > 0.0f) {
 			const double dot = (double)dx * ndx + (double)dz * ndz;
@@ -1814,17 +1871,52 @@ static bool horizonHidden(int cx, int cy, int cz)
 static const MeshSlot* s_bound;
 #endif
 
+// v1.8.7. The modelview for a chunk sitting at (tx,ty,tz), without building the model matrix.
+//
+// This is Mtx_Identity + Mtx_Translate(right side) + Mtx_Multiply(view, model) with the model
+// matrix's constants substituted in and nothing else changed. What it saves is the identity
+// matrix's clear, Mtx_Translate's four FVec4_Dot calls (16 mul / 12 add), and one out-of-line
+// call per bind. It does NOT save the 64 multiplies — see below.
+//
+// It would be very tempting to write this as `*mv = *view` plus a new w column, since model is
+// only a translation. That is WRONG and it was measured wrong before this landed. citro3d's
+// Mtx_Multiply computes every component as x*b0 + y*b1 + z*b2 + w*b3, so an untouched
+// component comes out of `v*1.0f + 0.0f + 0.0f + 0.0f` — and in IEEE round-to-nearest
+// -0.0f + (+0.0f) is +0.0f. Copying the row preserves a -0.0f that the real multiply flushes
+// to +0.0f. Swept over the camera's real pitch/yaw/position range against verbatim citro3d:
+// 169,344 of 338,688 view/chunk pairs differed, 192,696 components in all, every one of them
+// the sign of a zero. Half of ordinary frames, not a corner case. So the zeros and ones are
+// written out and multiplied through, and the products are summed in Mtx_Multiply's order,
+// which makes this bit-identical rather than merely close: 0 differences over 341,280 cases.
+//
+// Note for anyone tempted to "simplify" the *0.0f and *1.0f away: the compiler cannot do it
+// either (x*0.0f is not 0.0f for negative x, and GCC honours that without -ffast-math), which
+// is exactly why the result is exact. Deleting them by hand reintroduces the bug above.
+//
+// c[0] is .w, c[3] is .x — C3D_FVec's union declares w,z,y,x in that order (c3d/types.h), so
+// the component indices below are NOT x,y,z,w. Getting that backwards silently transposes the
+// matrix.
+static void modelviewFromView(C3D_Mtx* mv, const C3D_Mtx* view, float tx, float ty, float tz)
+{
+	for (int j = 0; j < 4; j++) {
+		const float vx = view->r[j].x, vy = view->r[j].y;
+		const float vz = view->r[j].z, vw = view->r[j].w;
+		mv->r[j].c[0] = vx*tx   + vy*ty   + vz*tz   + vw*1.0f;
+		mv->r[j].c[1] = vx*0.0f + vy*0.0f + vz*1.0f + vw*0.0f;
+		mv->r[j].c[2] = vx*0.0f + vy*1.0f + vz*0.0f + vw*0.0f;
+		mv->r[j].c[3] = vx*1.0f + vy*0.0f + vz*0.0f + vw*0.0f;
+	}
+}
+
 // Points the GPU at one chunk: the model matrix that places its chunk-local 0..16 vertices in
 // the world, and its vertex buffer. Split out from the draw in step 9.2, because a chunk is
 // now up to three opaque runs plus a transparent one and all four share this — setting a
 // matrix per run would hand back a good part of what the buckets save.
 static void slotBind(const C3D_Mtx* view, const MeshSlot* s)
 {
-	C3D_Mtx model, mv;
-	Mtx_Identity(&model);
-	Mtx_Translate(&model, (float)(s->cx * CHUNK_DIM), (float)(s->cy * CHUNK_DIM),
-	              (float)(s->cz * CHUNK_DIM), true);
-	Mtx_Multiply(&mv, view, &model);
+	C3D_Mtx mv;
+	modelviewFromView(&mv, view, (float)(s->cx * CHUNK_DIM), (float)(s->cy * CHUNK_DIM),
+	                  (float)(s->cz * CHUNK_DIM));
 	C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_uloc_modelview, &mv);
 
 	C3D_BufInfo* buf = C3D_GetBufInfo();

@@ -50,6 +50,25 @@ bool netTransportConnect(const char *host, uint16_t port);
 /* Sends a disconnect if a session is up, then tears down. Safe in any state. */
 void netTransportDisconnect(void);
 
+/* Ends the session the way a failed handshake ends one: the server is told, the
+ * socket goes down, and netTransportState() becomes NET_TRANSPORT_FAILED with
+ * `why` as netTransportError() — so net/bsnet.c's netUpdate() surfaces it as
+ * NET_FAILED and scene/title.c prints it on the error row it already draws.
+ *
+ * For the layer ABOVE this one to refuse a server it has decided is unusable,
+ * as opposed to a link that stopped working. net/networld.c's registry
+ * fingerprint verdict is the only caller: a client and server that disagree
+ * about what block ids mean cannot share a world, and nothing below this layer
+ * can see that.
+ *
+ * A sibling of netTransportDisconnect() rather than a flag on it, because the
+ * two say different things to the player — leaving is NET_IDLE and silent,
+ * refusing is NET_FAILED with a reason. `why` must be one short line a player
+ * can act on; the menu's error row is 52 characters. Copied, not retained.
+ *
+ * No-op when there is no session to end. */
+void netTransportRefuse(const char *why);
+
 /* Drives handshake retries, keepalives and timeouts. Bounded work; never
  * blocks. Call once per frame. */
 void netTransportUpdate(void);

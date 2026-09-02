@@ -899,6 +899,30 @@ void netTransportDisconnect(void)
     s.state    = NET_TRANSPORT_IDLE;
 }
 
+/* See bsnet_transport.h. Everything netTransportDisconnect() above does, except that the
+ * session ends in NET_TRANSPORT_FAILED carrying a reason instead of in a silent
+ * NET_TRANSPORT_IDLE — which is the whole difference between the player leaving and this
+ * client refusing to stay.
+ *
+ * The DISCONNECT still goes out first, for the reason it does above: the server is holding a
+ * player slot, and a refusal is a decision this end made rather than a link that stopped
+ * working, so there is nothing to stop us saying so. Best-effort like every send here.
+ *
+ * fail() is what the rest of this file already reaches for when an attempt cannot go on, and
+ * reusing it verbatim is the point — the socket teardown, the key zeroing and the state
+ * transition are then identical to a refused handshake, and net/bsnet.c needs no new case. */
+void netTransportRefuse(const char *why)
+{
+    if (!s.inited) return;
+    if (s.substate == CSTATE_NONE) return;   /* no session to refuse */
+
+    if (s.fd >= 0 && (s.substate == CSTATE_AWAIT_WELCOME || s.substate == CSTATE_RUNNING)) {
+        send_app_packet(BS_PKT_DISCONNECT, EMPTY_PAYLOAD, 0);
+    }
+    s.ping_ms = -1;
+    fail(why);
+}
+
 void netTransportUpdate(void)
 {
     if (!s.inited) return;
