@@ -3667,7 +3667,7 @@ rm -rf "$BHMR"
 #   radius 6: loaded ring 15x15 = 225 columns +1 staging  bytes=14836448  MB=14.15  OVER CAP
 #   Old 3DS  max radius 3  world store 5383136 of cap 12582912  (42.8 %)
 #   New 3DS  max radius 5  world store 11160160 of cap 12582912  (88.7 %)
-#   one further (radius 6) needs 14836448, which is 2253536 over the cap
+#   one further (radius 6) needs 14902096, which is 2319184 over the cap
 #   world budget bytes self-test: PASS / 25 checks / exit=0
 # The one "BUDGET REFUSED 14836448 B (used 0 of 12582912)" line in a GREEN run is expected and
 # is printed by the real budgetClaim(): the last four checks run the shipped claim path against
@@ -3683,7 +3683,7 @@ rm -rf "$BHMR"
 # 18,972,272 B (18.09 MB), a 2x understatement -- and a case that would NOT fit the 12 MB the
 # comment was justifying. It is why nobody could tell whether radius 5 fitted.
 #
-# It does. 12 MB holds radius 5 at 88.7 % and refuses radius 6 by 2,253,536 bytes, so the cap
+# It does. 12 MB holds radius 5 at 88.7 % and refuses radius 6 by 2,319,184 bytes, so the cap
 # did not need raising and did not need to become per-console -- and a per-console cap would
 # have bought nothing anyway, because world/budget.c is three scalars and a comparison and
 # reserves no memory at all, so an Old 3DS charged the shared figure is charged nothing.
@@ -5742,3 +5742,73 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 "./$BHEM/entitymodel_test"
 
 rm -rf "$BHEM"
+
+#---------------------------------------------------------------------------------------
+# tests/food_placeable_invariant_test.c -- FOOD-INVARIANT lane: the v1.8.16 apple/meat fix has
+# no cross-check tying it to the future. v1.8.16 shipped a user-visible fix (steve, verbatim:
+# "make the apple an item, not a block, similar to Minecraft") by hand-listing nine ids in
+# world/placeable.c's kUnplaceable[] -- the apple and eight meats -- as refused by the place
+# button. world/survival.c's kFoods[] independently lists the same nine ids with a hunger value
+# each. Nothing before this stanza checked that the two tables AGREE: a tenth food added to
+# kFoods without a matching entry in kUnplaceable would silently reopen the reported bug and
+# every existing suite would stay green, because none of them ever asks "is this food
+# placeable?" across both modules at once.
+#
+# The test walks every one of the 43 DEFINED core rows (registryIsDefined(), not a hand-picked
+# list of the nine known foods) and checks the real survivalFoodValue() against the real
+# itemIsPlaceable() for each: food>0 must imply !placeable. A hand-picked list could only ever
+# re-prove today's nine names; the loop is what a future food has to satisfy too, the moment
+# its registry row is defined.
+#
+# Own binary, own main(), for the same reason every suite in this file has one: a broken
+# invariant here must not stop the rest of the host suite running, and two mains cannot share a
+# link. Link set mirrors world/survival_test.c's above (block/registry/chunk/chunk_codec/
+# crc32/world/scratch/budget/physics/inventory link survival.c's water-submersion path for
+# real), plus world/placeable.c for itemIsPlaceable() and tests/net_stub.c for the same network
+# seam every world/ stanza in this file stubs.
+#
+# CONFIRMED holding on this tree before the test was written: a throwaway probe linking these
+# same real files walked all 43 rows and printed rows=43 food_count=9 violations=0.
+#
+# PROVEN ABLE TO GO RED, on SCRATCH COPIES only -- source/world/placeable.c and
+# source/world/survival.c on disk were never edited, and their md5s (placeable.c
+# 2aaeec48c66847d9dfe312422e07d748, survival.c 86d66b29ddddb73b6033e072516fe6a1) were identical
+# before and after both arms below:
+#
+#   arm A  BLOCK_APPLE removed from a scratch copy of kUnplaceable[] (apple stays food, becomes
+#          placeable again -- exactly the v1.8.16 regression this test exists to catch)
+#          -> FAIL 45 checks, 1 failed, exit 1: "id 26 (apple): food=4 placeable=1"
+#   arm B  a scratch copy of survivalFoodValue() stubbed to report BLOCK_STONE (an ordinary
+#          placeable core block) as food=5, dropping every real food to 0
+#          -> FAIL 45 checks, 2 failed, exit 1: "id 3 (stone): food=5 placeable=1" AND the
+#             food-count sanity check ("exactly 9 of them are food"), since the stub zeroed the
+#             other eight real rows -- two independent checks catching two independent
+#             consequences of one stub, which is what makes both arms evidence rather than luck.
+#
+# Green re-confirmed on the real, untouched files immediately after both arms: "PASS 45 checks,
+# 0 failed", exit 0.
+BHFPI="build-host/run-$$-foodplaceable"
+mkdir -p "$BHFPI"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/chunk_codec.c \
+	source/world/crc32.c \
+	source/world/world.c \
+	source/world/scratch.c \
+	source/world/budget.c \
+	source/world/physics.c \
+	source/world/inventory.c \
+	source/world/survival.c \
+	source/world/placeable.c \
+	tests/net_stub.c \
+	tests/food_placeable_invariant_test.c \
+	-lm \
+	-o "$BHFPI/food_placeable_invariant_test"
+
+"./$BHFPI/food_placeable_invariant_test"
+
+rm -rf "$BHFPI"
