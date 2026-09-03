@@ -83,6 +83,17 @@
 #define COL_PICKED    SPRITE_RGBA(120, 200, 255, 255)   // slot lifted for a move
 #define COL_CRAFT_OK  SPRITE_RGBA(70, 110, 70, 255)     // recipe currently makeable
 
+// v1.8.13 SURV-HUD. Three states per pip, and the half state gets its own colour rather than
+// being rounded away — see drawPipRow for the whole reading of it. The empty track is a lift
+// off COL_BG rather than COL_BG itself, so a drained bar still reads as ten pips that are
+// empty instead of as a bar that has vanished; that is the difference between "you are at
+// zero" and "the HUD stopped drawing", and at 12x8 px it is the only thing telling them apart.
+#define COL_PIP_TRACK   SPRITE_RGBA(58, 48, 74, 255)
+#define COL_HEALTH      SPRITE_RGBA(226, 64, 64, 255)
+#define COL_HEALTH_HALF SPRITE_RGBA(236, 130, 112, 255)
+#define COL_HUNGER      SPRITE_RGBA(226, 158, 64, 255)
+#define COL_HUNGER_HALF SPRITE_RGBA(240, 202, 132, 255)
+
 // ── Small shared helpers ──────────────────────────────────────────────────────────────
 //
 // URect, ptInRect, hotbarSlotRect, gridSlotRect, craftCloseRect, craftRowRect,
@@ -246,6 +257,77 @@ static void drawSlotIcon(DrawPass pass, URect r, const InvSlot* s, bool selected
 	           u0, v0, u1, v1, SPRITE_WHITE);
 }
 
+// ── Vitals: health and hunger pips ─────────────────────────────────────────────────────
+//
+// v1.8.13 SURV-HUD. Ten flat rects a bar, no art asset and no atlas tile, drawn in the font
+// pass with spriteRect — the same mechanism this file already uses for the picked-slot border
+// and the crafting rows, so this adds nothing to the two-draw-call budget uiUpdateDraw's own
+// comment sets out. There is deliberately no new texture: a pip is a rectangle, and a rectangle
+// that has to come out of the block atlas would tie the vitals readout to a sheet that has no
+// spare tiles and would put the whole strip behind the `block_icons != NULL` check, which is
+// exactly the condition ui.h says the HUD must still draw usefully under.
+//
+// ── How a half pip reads ────────────────────────────────────────────────────────────────
+//
+// Health is 0..20 over ten pips, so a pip is worth two points and an odd value leaves exactly
+// one pip half. That half is drawn as a HALF-WIDTH rect in its own third colour
+// (COL_HEALTH_HALF / COL_HUNGER_HALF) rather than being rounded to the nearest whole pip.
+//
+// Rounding was the alternative and it was rejected on what it costs at exactly the moment the
+// number matters: health 1 and health 2 are the difference between one more hit killing you and
+// not, and rounding makes them draw identically. The cost of keeping the half state is one extra
+// colour and a /2 on the width.
+//
+// Both cues are used together on purpose, because at 12x8 px neither is reliable alone. Width
+// alone asks the player to judge 6 px against 12 px in their peripheral vision; colour alone
+// asks them to tell two reds apart at 96 px². Half width AND a distinctly lighter tone is
+// unambiguous even at a glance, and it stays legible if either cue is degraded — a bad
+// screenshot, a scaled-down capture, or a player who is not looking straight at it.
+//
+// The half colour is LIGHTER than the full one rather than darker, which is the opposite of
+// what "less health" suggests and is a deliberate choice: the empty track (COL_PIP_TRACK) is
+// already the dark end of this strip, so a dark half pip would be competing with the state it
+// most needs to be distinguishable from. Lighter puts the three states at three separate
+// brightnesses — track darkest, full mid, half brightest — instead of two of them close together.
+static void drawPipRow(int row, int points, uint32_t col_full, uint32_t col_half,
+                        const char* label)
+{
+	const URect first = hudPipRect(row, 0);
+
+	// The label sits in the gutter left of HUD_PIP_X0 (x 6..18 for a two-glyph string at
+	// FONT_ADVANCE 6), vertically centred on an 8 px pip against a 7 px glyph.
+	fontDraw(6.0f, (float)first.y + (HUD_PIP_H - FONT_GLYPH_H) * 0.5f, 1, COL_TEXT_DIM, label);
+
+	for (int i = 0; i < HUD_PIP_COUNT; i++) {
+		const URect r = hudPipRect(row, i);
+
+		// Every pip gets its track first, then the fill on top, rather than branching to draw
+		// one rect of the right colour: the half state needs both (a half-width fill over a
+		// full-width track is what makes the empty half visible at all), and drawing the track
+		// unconditionally is what keeps an empty bar readable as ten empty pips.
+		spriteRect((float)r.x, (float)r.y, (float)r.w, (float)r.h, COL_PIP_TRACK);
+
+		switch (hudPipFill(points, i)) {
+		case PIP_FULL:
+			spriteRect((float)r.x, (float)r.y, (float)r.w, (float)r.h, col_full);
+			break;
+		case PIP_HALF:
+			spriteRect((float)r.x, (float)r.y, (float)(r.w / 2), (float)r.h, col_half);
+			break;
+		case PIP_EMPTY:
+			break;
+		}
+	}
+}
+
+// `stats` is non-NULL here — drawHudFont has already returned if it wasn't, which is what
+// keeps ui.h's "NULL draws exactly what it drew before, with no pips" promise true.
+static void drawHudVitals(const UiStats* stats)
+{
+	drawPipRow(HUD_PIP_ROW_HEALTH, (int)stats->health, COL_HEALTH, COL_HEALTH_HALF, "HP");
+	drawPipRow(HUD_PIP_ROW_HUNGER, (int)stats->hunger, COL_HUNGER, COL_HUNGER_HALF, "FD");
+}
+
 // ── HUD screen (font pass only — no icons beyond the hotbar's, drawn separately) ────────
 
 static void drawHudFont(const UiStats* stats)
@@ -328,6 +410,14 @@ static void drawHudFont(const UiStats* stats)
 
 	y += 2;
 	fontDraw(6, y, 1, COL_TEXT_DIM, "tap a hotbar slot to select it");
+
+	// v1.8.13 SURV-HUD. Appended after every existing row rather than inserted among them, and
+	// positioned from its own constants (HUD_PIPS_Y0) rather than from the running `y` above,
+	// so the status block is byte-for-byte the one that was already here and so a row added or
+	// removed up there cannot silently shove the vitals off the bottom of the screen. The gap
+	// between the two is checked, not assumed — see ui_layout_test.c's
+	// testPipsClearTheStatusRows against HUD_STATUS_BOTTOM.
+	drawHudVitals(stats);
 }
 
 // ── Inventory overlay (font pass) ─────────────────────────────────────────────────────

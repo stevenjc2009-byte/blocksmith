@@ -83,6 +83,7 @@
 #include "world/registry.h"
 #include "world/relight_drain.h"
 #include "world/relightq.h"
+#include "world/survival.h"
 #include "world/tick.h"
 #include "world/water.h"
 #include "world/weather.h"
@@ -2727,6 +2728,40 @@ static void drawEye(C3D_RenderTarget* target, const C3D_Mtx* view, const RayHit*
 // bottom-screen draw below is a file-scope function and needs it.
 static Inventory s_inv;
 
+// v1.8.13 SURV-WIRE. The player's vitals, reachable from file scope for exactly the two
+// reasons s_sleep_player below is a file static: the bottom-screen draw is a file-scope
+// function and the lid-close flush hook is a callback, and neither can see main()'s locals.
+//
+// ONE pointer rather than one per consumer, and deliberately outside both #if BS_BOTTOM_UI
+// and #if BS_WORLD_GEN: a second static holding the same address is how the two end up
+// pointing at different things after a refactor. Set once at world entry beside
+// s_sleep_player, cleared in the same teardown — a stale pointer read after `survival` has
+// gone out of scope is the one way this could be worse than not drawing the bars at all.
+static const Survival* s_survival = NULL;
+
+// v1.8.13 SURV-WIRE. The whole of death: full vitals, a cleared fall tracker, and the body
+// back at the spawn the world entry already computed.
+//
+// A function rather than the same six lines written twice, because there are two callers —
+// the fall-damage check on the frame path and the tick that could one day poison or drown —
+// and the failure mode of letting them drift is invisible: one of them forgetting to reset
+// the FallTrack means the player dies, respawns, and is immediately killed again by the fall
+// damage of their own respawn drop, over and over, with nothing on screen to explain it.
+// fallTrackInit here is what makes that unrepresentable rather than remembered.
+//
+// Takes the spawn as three floats rather than reading a global: the spawn is a const local of
+// the world-entry function under #if BS_WORLD_GEN, and passing it keeps this honest about
+// having no opinion on where spawn is.
+static void survivalRespawn(Player* p, Survival* s, FallTrack* ft,
+                            float sx, float sy, float sz)
+{
+	survivalInit(s);
+	fallTrackInit(ft);
+	// The same yaw and pitch the world-entry playerInit uses, so a respawn faces the way a
+	// fresh spawn does instead of keeping the angle the player happened to die at.
+	playerInit(p, sx, sy, sz, C3D_AngleFromDegrees(135.0f), C3D_AngleFromDegrees(35.0f));
+}
+
 #if BS_BOTTOM_UI
 
 static UiState s_ui;
@@ -2791,6 +2826,12 @@ static void drawBottomUi(bool ok, const char* status, const char* netline, const
 		.status     = status,
 		.net        = netline,
 		.timing     = timing[0] ? timing : NULL,
+		// v1.8.13 SURV-WIRE. Zero when s_survival is NULL, which ui.h's own comment already
+		// names as a legitimate reading drawn as an empty bar rather than as "unset" — so the
+		// one frame between this panel first drawing and the pointer being handed over at
+		// world entry shows two empty bars, never a crash and never a stale value.
+		.health     = s_survival ? s_survival->health : 0,
+		.hunger     = s_survival ? s_survival->hunger : 0,
 	};
 
 	// atlasTexture() rather than atlasBind(): gfx/sprite.c tracks the bound texture itself so
@@ -3065,6 +3106,17 @@ static bool sleepFlushOneColumn(void)
 				s_sleep_player->cam.yaw, s_sleep_player->cam.pitch
 			};
 			(void)playerPoseSave(&pose, s_sleep_pose_dir);
+			// v1.8.13 SURV-WIRE, and written on the SAME one-shot slot as the pose rather
+			// than given a slot of its own. Two reasons. It is 14 bytes against the pose's
+			// 32, so the budget argument above covers both together; and the two must not be
+			// able to diverge — a lid closed between them would restore a player at the
+			// position they slept at with the health they had some earlier session, which is
+			// a stranger bug than losing both.
+			//
+			// Not gated on world_refused the way the quit path below is: a refused world
+			// never registers this hook (s_sleep_pose_dir stays NULL), so the guard above
+			// already covers it.
+			if (s_survival) (void)survivalSave(s_survival, s_sleep_pose_dir);
 			return true;
 		}
 	}
@@ -3144,6 +3196,11 @@ _Static_assert(OPT_KEY_DUP    == KEY_DUP,    "OPT_KEY_DUP drifted from libctru K
 _Static_assert(OPT_KEY_DDOWN  == KEY_DDOWN,  "OPT_KEY_DDOWN drifted from libctru KEY_DDOWN");
 _Static_assert(OPT_KEY_DLEFT  == KEY_DLEFT,  "OPT_KEY_DLEFT drifted from libctru KEY_DLEFT");
 _Static_assert(OPT_KEY_DRIGHT == KEY_DRIGHT, "OPT_KEY_DRIGHT drifted from libctru KEY_DRIGHT");
+// v1.8.13 survival. Same guard as the seven above, for the two bits ACTION_EAT's default
+// needed — options.h cannot include <3ds.h>, so this is the only place the hex literals it
+// hardcodes are ever checked against the real header.
+_Static_assert(OPT_KEY_ZL     == KEY_ZL,     "OPT_KEY_ZL drifted from libctru KEY_ZL");
+_Static_assert(OPT_KEY_ZR     == KEY_ZR,     "OPT_KEY_ZR drifted from libctru KEY_ZR");
 
 #if BS_TITLE
 
@@ -4232,6 +4289,27 @@ session_start:
 	PlayerPose saved_pose;
 	const bool have_saved_pose = playerPoseLoad(&saved_pose, boot_dir);
 
+	// v1.8.13 SURV-WIRE. Read HERE, beside the pose, and off the same `boot_dir` — not off a
+	// second saveWorldDir() call — so the directory and its lifetime are the ones the pose
+	// already proved correct rather than a second opinion that could disagree.
+	//
+	// The server rule comes free rather than being restated: boot_dir is NULL in a server
+	// session (line above's comment), and survival.c's dirUsable() refuses a NULL directory,
+	// so survivalLoad() declines for exactly the reason playerPoseLoad() does — the server
+	// owns that world's state and this console must not read a local file for it. The server
+	// arm that DOES restore vitals in a session is the networldPlayerMeters() read down beside
+	// the pose replay, which is where the server's own copy arrives.
+	//
+	// survivalInit FIRST and unconditionally: survivalLoad's contract is that a false leaves
+	// *out untouched, so the caller must already hold a valid struct rather than reading one
+	// the load half-filled. A world with no survival.dat — every world on the card today —
+	// starts at full health and full hunger, which is what survivalInit gives.
+	Survival  survival;
+	FallTrack falltrack;
+	survivalInit(&survival);
+	fallTrackInit(&falltrack);
+	(void)survivalLoad(&survival, boot_dir);
+
 	// Centred on the restored column, or on the spawn column (0, 0) when there is no pose to
 	// restore — the same column playerInit puts the feet in below. From here on the ring
 	// follows the player (genFollow).
@@ -4549,6 +4627,51 @@ session_start:
 #endif
 	}
 
+	// v1.8.13 SURV-WIRE, and the vitals half of the exact same decision the pose block above
+	// makes: in a server session the server had the last word on where this player is, so it
+	// gets the last word on their health and hunger too. net/networld.h retained the meters
+	// block from the join-time PLAYER_STATE for precisely this — its own comment says the
+	// block is "held only so those systems can hook in without a wire redesign", and this is
+	// that hook.
+	//
+	// Consulted exactly once, here, for the same accepted race networldSavedPose() has: both
+	// arrive immediately after JOIN, long before this line. A false — single player, an old
+	// server, or a fresh spawn the server has nothing saved for — leaves the survivalLoad
+	// above untouched, and the two can never compete for real because boot_dir is NULL in a
+	// session and the local load already declined.
+	//
+	// The wire carries these as 0..20 floats; Survival keeps them as 0..20 bytes. Rounded and
+	// clamped rather than cast, because the cast alone would turn a server's 19.7 health into
+	// 19 and a malformed 300.0 into whatever a u8 truncation happens to give.
+	{
+		const NetworldPlayerMeters* const m = networldPlayerMeters();
+		if (m) {
+			const float h = m->health, g = m->hunger;
+			survival.health = (uint8_t)(h < 0.0f ? 0.0f
+			                          : h > (float)SURVIVAL_MAX_HEALTH ? (float)SURVIVAL_MAX_HEALTH
+			                          : h + 0.5f);
+			survival.hunger = (uint8_t)(g < 0.0f ? 0.0f
+			                          : g > (float)SURVIVAL_MAX_HUNGER ? (float)SURVIVAL_MAX_HUNGER
+			                          : g + 0.5f);
+		}
+	}
+
+	// Re-armed AFTER every playerInit above, not before them. playerInit places the body at a
+	// restored or spawned y, and a tracker still holding a peak from the previous placement
+	// would score the difference as a fall and take the damage for it on the first frame the
+	// player touches the ground. Cheap insurance: this is two stores.
+	fallTrackInit(&falltrack);
+
+	// v1.8.13 SURV-WIRE, the send half. What the last PLAYER_REPORT put on the wire, so the
+	// frame loop can send on CHANGE rather than every frame — the server persists a report
+	// that differs (save_player_state), so sixty identical reports a second would be sixty
+	// card writes a second on the far end for no new information.
+	//
+	// Seeded from the values just restored, not from a sentinel, so simply walking into a
+	// world does not immediately send a report echoing back what the server just told us.
+	uint8_t last_sent_health = survival.health;
+	uint8_t last_sent_hunger = survival.hunger;
+
 	Interact it;
 	interactInit(&it);
 	// v1.8.7. Hands scene/interact.c the same worklist onRemoteEdit above already pushes to
@@ -4741,6 +4864,11 @@ session_start:
 	s_sleep_player   = &player;
 	s_sleep_pose_dir = inv_dir;
 #endif
+	// v1.8.13 SURV-WIRE. Handed over beside the pair above and for the identical reason, but
+	// OUTSIDE the BS_WORLD_GEN guard: the bottom-screen draw reads this in every build, not
+	// just a generated-world one, whereas the lid-close hook only exists under that guard.
+	// Cleared in the same teardown.
+	s_survival = &survival;
 
 	// Registered HERE, and not up with the edit hook, because both halves of the order matter and
 	// v1.3.0 got both of them wrong.
@@ -5014,6 +5142,33 @@ session_start:
 		if (!paused && (down & KEY_R)) genSetRadius(s_mesh_radius + 1);
 #endif
 
+		// v1.8.13 SURV-WIRE. Eat the SELECTED hotbar slot, on the edge and never on held —
+		// world/survival.h takes a slot rather than an item id precisely so the slot the player
+		// is pointing at is the one that empties, and a held button would drain a stack in a
+		// third of a second.
+		//
+		// Outside the BS_WORLD_GEN && !BS_FLY guard above so it works in every build that has a
+		// survival state to feed, and behind inputKey(ACTION_EAT) rather than a literal so the
+		// remap screens actually reach it. inputKey answers 0 for an action the map does not
+		// know, and `down & 0` is false, so a build whose options never loaded simply cannot eat
+		// rather than eating on every button.
+		//
+		// The return is deliberately dropped: survivalEat refuses at full hunger and on a slot
+		// that is not food, both of which are "nothing happened", and there is no HUD message
+		// system to report either through. The hunger bar not moving IS the feedback.
+		// ONE flag for both eat paths, and it is what stops them doubling up. ACTION_EAT is
+		// rebindable, so a player is free to put it on the very key ACTION_PLACE already holds
+		// — and then a single press would satisfy the dedicated check here AND the held-food
+		// check below, eating two apples for one button press. Neither path is wrong on its
+		// own; the flag is what makes them exclusive.
+		bool ate_this_frame = false;
+
+		if (!paused) {
+			const uint32_t eat_key = inputKey(ACTION_EAT);
+			if (eat_key && (down & eat_key))
+				ate_this_frame = survivalEat(&survival, &s_inv, s_inv.selected_hotbar);
+		}
+
 #if BS_WORLD_GEN
 		// Take delivery of at most one generated column, before anything reads the world
 		// this frame. One column is all the worker can hand over per install
@@ -5107,6 +5262,21 @@ session_start:
 			// and no footsteps is the right answer for a camera that is not a person walking.
 			audioFootstepsUpdate(&footsteps, player.body.x, player.body.y, player.body.z,
 			                      player.body.on_ground);
+
+			// v1.8.13 SURV-WIRE. IMMEDIATELY after the step that moved the body, and this
+			// placement is forced rather than tidy: world/survival.h says on_ground is set by
+			// bodyMove() on the frame the fall was stopped and physics.c zeroes vy in the same
+			// branch, so the landing is observable on exactly one frame and nowhere else.
+			// Anything between this and playerUpdate that could step the body again would eat
+			// the landing; nothing does.
+			//
+			// Inside the !paused gate with the step it reads, so a paused world cannot land a
+			// player who is not moving. Under !BS_FLY only, for the reason audioFootsteps is:
+			// the free-fly camera never touches player.body, so there is no fall to score.
+			if (fallDamageUpdate(&falltrack, &survival, &player.body, &s_world)) {
+				survivalRespawn(&player, &survival, &falltrack,
+				                (float)spawn_x + 0.5f, (float)spawn_y, (float)spawn_z + 0.5f);
+			}
 		}
 #endif
 #if BS_WALK_STRESS
@@ -5227,6 +5397,24 @@ session_start:
 		// which this task does not own, and the cost is bounded by construction and measured
 		// directly in world/water_test.c against a real body of water.
 		for (int t = 0; t < ticks_now; t++) {
+			// v1.8.13 SURV-WIRE. In the TICK loop, not the frame loop, because world/survival.h
+			// specifies hunger drain and regen as 20 TPS periods (SURVIVAL_HUNGER_PERIOD 1200 =
+			// 60 s, SURVIVAL_REGEN_PERIOD 80 = 4 s). Counting those down per rendered frame
+			// would make a console holding 60 fps starve twice as fast as one at 30 — the same
+			// argument the entity tick immediately below is written from.
+			//
+			// paused already zeroed ticks_now, so a paused world neither starves nor regenerates.
+			//
+			// The return is death, and it is wired even though survival.h states it is always
+			// false under this version's rules (starvation floors at 1). That is deliberate: the
+			// day a lethal tick effect lands — poison, drowning, lava — the handling is already
+			// here and the change stays inside survival.c rather than needing a new call site
+			// found in this file.
+			if (survivalTick(&survival)) {
+				survivalRespawn(&player, &survival, &falltrack,
+				                (float)spawn_x + 0.5f, (float)spawn_y, (float)spawn_z + 0.5f);
+			}
+
 			(void)waterTick(&s_water, &s_world, WATER_TICK_BUDGET, onWaterChange, NULL);
 			// v1.8.9 entity foundation. Ticked alongside water, once per simulation tick and
 			// not once per frame, for the same reason water is: a creature must not move
@@ -5264,6 +5452,41 @@ session_start:
 			}
 		}
 
+		// v1.8.13 SURV-WIRE, the wire half. AFTER the tick loop and after the frame's fall
+		// check, so one report carries the frame's final vitals rather than an intermediate
+		// one, and only when a value actually moved.
+		//
+		// Seeded from the retained INBOUND meters rather than from a zeroed struct, and that
+		// is the load-bearing line here. deps/blocksmith-server's playerStateApplyMeters()
+		// takes a report as authoritative and overwrites everything in it — armour, XP level
+		// and XP progress included. This client has no armour or XP system to source those
+		// from, so a report built from {0} would silently wipe both on the server every time
+		// the player took a point of fall damage. networld.h kept the decoded block for
+		// exactly this ("held only so those systems can hook in without a wire redesign"), so
+		// health and hunger are overwritten onto it and everything else round-trips untouched.
+		//
+		// NULL meters means the server sent a pose-only PLAYER_STATE or none at all — a fresh
+		// spawn or an old server. Then there is nothing to preserve, a zeroed block is the
+		// truth rather than a wipe, and networldSendPlayerReport's own capability probe still
+		// refuses to send if no PLAYER_STATE was ever heard.
+		if (survival.health != last_sent_health || survival.hunger != last_sent_hunger) {
+			NetworldPlayerMeters m;
+			const NetworldPlayerMeters* const held = networldPlayerMeters();
+			if (held) m = *held;
+			else      memset(&m, 0, sizeof m);
+
+			m.health = (float)survival.health;
+			m.hunger = (float)survival.hunger;
+
+			// Only bank the values on a send that actually went out. A false — no session, no
+			// PLAYER_STATE heard — must leave the pair unchanged so the report is retried on
+			// the next frame rather than dropped and never mentioned again.
+			if (networldSendPlayerReport(&m)) {
+				last_sent_health = survival.health;
+				last_sent_hunger = survival.hunger;
+			}
+		}
+
 		// v1.8.9 weather rendering: the render-side poll, per
 		// docs/plan-1.8.9-weather-integration.md §3. Deliberately NOT reusing the `wx_tick`
 		// declared above -- that one lives inside `for (int t = 0; t < ticks_now; t++)` and
@@ -5286,6 +5509,36 @@ session_start:
 		}
 		weatherDrawUpdate(&s_weatherdraw, metricsFrameMs() / 1000.0f,
 		                   player.cam.x, player.cam.y, player.cam.z);
+
+		// v1.8.13 SURV-WIRE. The SECOND eat path, and the one that has to exist: ACTION_EAT
+		// defaults to ZR, which an original 3DS or 2DS does not physically have, so a dedicated
+		// button alone would ship a game where a whole class of console cannot eat without
+		// first visiting the remap screen. This is Minecraft's own rule — you eat by using the
+		// item in your hand — so it is what a player tries first, and it needs no button that
+		// an Old 3DS lacks.
+		//
+		// DELIBERATELY ABOVE interactAim(), which is the raycast. Nothing here consults
+		// it.has_target or any aimed cell, and putting it above the aim is what guarantees that
+		// stays true: eating must work while facing open sky, which is exactly where a player
+		// running from something at 2 hunger will be looking. Buried inside the "am I aiming at
+		// a placeable face" branch it would fail precisely when it matters most.
+		//
+		// The hunger test is what keeps BLOCK_APPLE a placeable block. At full hunger this
+		// whole branch declines and the press falls through to the ordinary place path, so
+		// apples can still be built with — an existing capability is not being removed to add
+		// a new one. survivalEat refuses at full hunger on its own, but the test is repeated
+		// here because it also decides whether the press gets swallowed below.
+		if (!paused && !ate_this_frame) {
+			const uint32_t place_key = inputKey(ACTION_PLACE);
+			if (place_key && (down & place_key)
+			    && survivalFoodValue(inventoryHeldItem(&s_inv)) > 0
+			    && survival.hunger < SURVIVAL_MAX_HUNGER) {
+				// survivalEat's return, not the guard above, is the authority on whether the
+				// input was consumed — a refusal for any reason must leave the place path its
+				// press rather than swallowing it into nothing.
+				ate_this_frame = survivalEat(&survival, &s_inv, s_inv.selected_hotbar);
+			}
+		}
 
 		// Aim first, then edit, so the highlight and the edit in the same frame cannot
 		// disagree about which block was being pointed at.
@@ -5325,7 +5578,14 @@ session_start:
 		// invBridge lines below read them immediately after. Skip the call and last frame's ids
 		// stay standing, so a block broken just before pausing would be re-awarded to the
 		// inventory on every single frame the menu stayed open.
-		const u32 edit_down = paused ? 0u : down;
+		// v1.8.13 SURV-WIRE: the place bit is stripped on a frame the food above was eaten, so
+		// one press cannot both feed the player and place the apple they just swallowed.
+		// Masked here rather than out of `down` itself, because `down` is read by several other
+		// consumers between the eat check and this line and none of them should see a press
+		// disappear. interact.c:405 reads exactly inputKey(ACTION_PLACE), so this is the same
+		// bit it is about to test.
+		const u32 edit_down = (paused ? 0u : down)
+		                    & ~(ate_this_frame ? inputKey(ACTION_PLACE) : 0u);
 		const u32 edit_held = paused ? 0u : held;
 		interactEdit(&it, &s_world, &player.body, edit_down, edit_held, ticks_now);
 
@@ -6019,6 +6279,12 @@ session_start:
 		const PlayerPose pose = { player.body.x, player.body.y, player.body.z,
 		                          player.cam.yaw, player.cam.pitch };
 		(void)playerPoseSave(&pose, inv_dir);
+		// v1.8.13 SURV-WIRE. Same line, same guard, same reasoning as the pose it sits under:
+		// inv_dir is NULL in a server session (the server owns these vitals and this console
+		// writes nothing for them), and !world_refused keeps a world this build could not open
+		// exactly as it was found rather than dropping a survival.dat into it describing a
+		// session that never happened.
+		(void)survivalSave(&survival, inv_dir);
 	}
 
 	// v1.8.9 day/night. Same guard, same reasoning, as the inventory and pose saves above: a
@@ -6049,6 +6315,10 @@ session_start:
 	s_sleep_player   = NULL;
 	s_sleep_pose_dir = NULL;
 #endif
+	// v1.8.13 SURV-WIRE. Cleared with them and for the same reason — `survival` is about to go
+	// out of scope, and the bottom-screen draw reads this pointer every frame it runs. Outside
+	// the guard because the handover was.
+	s_survival = NULL;
 
 	// Before worldExit: the worker holds a staging world of its own and must be joined
 	// before anything it could still be writing into is freed.

@@ -4,6 +4,77 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.8.13] - 2026-09-03
+
+Survival. Up to now you could not be hurt and did not need to eat — the world was something you
+walked around in. This adds health, hunger, damage from falling, and food, which together are the
+first version where the world can actually kill you.
+
+Almost everything here is identical on both consoles. There is exactly one difference, and it is
+called out where it applies.
+
+### Added
+
+- **Health and hunger, shown on the touch screen.** Two rows of ten pips sit along the bottom of
+  the touch screen below the debug text — `HP` in red, `FD` in orange. Each pip is worth two
+  points, so a bar runs 0 to 20. When you are on an odd number the pip in question is drawn as a
+  half, in a lighter shade, rather than rounded to the nearest whole one: at low health the
+  difference between one point and two is the difference between surviving the next fall and not,
+  and rounding them to the same picture would hide exactly the thing you need to see.
+
+  The bars are not drawn while the inventory is open. There is no free space on that screen — the
+  grid and the crafting rows fill it completely — so they are on the main screen only.
+
+- **Hunger, which drains slowly and then starts to hurt.** You lose one point of hunger every
+  minute of play. While your hunger is 18 or above you heal one point of health every four
+  seconds, so keeping yourself fed is what keeps you topped up. When hunger reaches zero you
+  start losing health instead, one point every four seconds.
+
+  **Starving cannot kill you.** It stops at one health and leaves you there. That is deliberate:
+  starving to death in a game with one food item and no farming would mostly be an annoyance
+  rather than a challenge. Falling, on the other hand, can absolutely kill you.
+
+- **Fall damage.** Falls of three blocks or less are free. Past that you take one point of damage
+  per extra block — a four-block drop costs one, a ten-block drop costs seven. Landing in water
+  cancels the damage entirely, however far you fell.
+
+  The fall is measured from the highest point you reached, not from wherever you were when you
+  walked off the edge, so jumping off a ledge correctly counts the height of the jump as well as
+  the drop.
+
+- **Eating.** Apples restore four hunger. **Hold an apple and press the place button to eat it** —
+  the same button you build with. If your hunger is already full it places the apple as a block
+  instead, exactly as before, so nothing you could do previously has been taken away.
+
+  Eating works no matter what you are looking at, including open sky. You do not have to be
+  aiming at a block.
+
+- **A rebindable Eat button, defaulting to ZR.** This is the one thing on this list that differs
+  between consoles. **ZR only exists on a New 3DS**, so on a New 3DS you get a dedicated eat
+  button out of the box, and on an original 3DS or a 2DS you do not — the ZR default does nothing
+  there. This costs original-console players nothing, because eating with the place button
+  described above works identically on every console and is the main way to do it. If you would
+  rather have a dedicated key, Eat can be rebound to anything in Options like every other control.
+
+  Your existing controls are not disturbed by this. Saved keybinds are stored by name rather than
+  by position, so adding a new action leaves every key you have already set exactly where it was,
+  and Eat simply arrives at its default.
+
+- **Dying and respawning.** Running out of health puts you back at your world's spawn point with
+  full health and full hunger. Your inventory is not touched.
+
+- **Health and hunger are saved with your world** and are still there when you load it, including
+  if you quit from the sleep menu. On a server the server owns those numbers, as it already did
+  for everything else about your player.
+
+### Notes
+
+- Verified before release with 2,555 new automated checks covering the survival rules alone, each
+  one demonstrated to actually fail when the rule it tests is deliberately broken, plus 573 more
+  covering the layout of the new pips.
+- Not shipped: any food other than apples. Meat arrives with animals in 1.8.14 and cooking with
+  the furnace in 1.8.15, and the food table is built so those are a one-line addition each.
+
 ## [1.8.12] - 2026-09-03
 
 Ores, and a pass over the parts of the engine that were quietly doing more work than they

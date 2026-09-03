@@ -51,10 +51,18 @@ static void testCleanup(void)
 // that ignored the caller entirely produced byte-identical state — the suite could
 // not tell them apart, so a player's saved bindings could have been loading as
 // defaults with every check still green. This table is the fix: every one of the
-// seven entries differs from the shipped default, so any code path that quietly
+// entries differs from the shipped default, so any code path that quietly
 // substitutes defaults shows up as a failed compare rather than as nothing.
 //
-// Defaults, for reference: DUP DDOWN DLEFT DRIGHT A X Y.
+// Defaults, for reference: DUP DDOWN DLEFT DRIGHT A X Y ZR.
+//
+// This table is sized by ACTION_COUNT but written out by hand, so it MUST gain a row
+// whenever the enum does. It is not merely stale if it does not: C zero-fills the missing
+// entries, 0x00000000 is not in OPTIONS_VALID_KEYS, and the round-trip check at the bottom
+// of this file then fails with `bad == 0` reading 1 — which is what v1.8.13 actually did
+// when ACTION_EAT was appended and this row was not. Worse, remapFindAction treats 0 as the
+// "nothing is bound" sentinel (see the check below), so a zero row is not a wrong binding,
+// it is an absent one wearing a binding's clothes.
 static const uint32_t s_saved_bindings[ACTION_COUNT] = {
 	OPT_KEY_DDOWN,   // ACTION_MOVE_FORWARD  (default DUP)
 	OPT_KEY_DUP,     // ACTION_MOVE_BACK     (default DDOWN)
@@ -63,6 +71,7 @@ static const uint32_t s_saved_bindings[ACTION_COUNT] = {
 	OPT_KEY_Y,       // ACTION_JUMP          (default A)
 	OPT_KEY_A,       // ACTION_BREAK         (default X)
 	OPT_KEY_X,       // ACTION_PLACE         (default Y)
+	OPT_KEY_ZL,      // ACTION_EAT           (default ZR)
 };
 
 // Fills `o` with the defaults and then overlays the saved table above, the way

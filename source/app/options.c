@@ -20,6 +20,9 @@
 const uint32_t OPTIONS_VALID_KEYS[OPTIONS_VALID_KEY_COUNT] = {
 	OPT_KEY_A, OPT_KEY_X, OPT_KEY_Y,
 	OPT_KEY_DRIGHT, OPT_KEY_DLEFT, OPT_KEY_DUP, OPT_KEY_DDOWN,
+	// v1.8.13: appended on the END so every index above keeps its position — app/remap.c's
+	// s_key_names is parallel to this array by index, not by lookup.
+	OPT_KEY_ZL, OPT_KEY_ZR,
 };
 
 // One string per OptionsAction, in the same order, so the two arrays can never disagree by
@@ -33,6 +36,7 @@ static const char* const s_action_keys[ACTION_COUNT] = {
 	"bind.jump",
 	"bind.break",
 	"bind.place",
+	"bind.eat",
 };
 
 // The default binding for each action, same order again. This is the one place the game's
@@ -43,6 +47,7 @@ static const char* const s_action_keys[ACTION_COUNT] = {
 static const uint32_t s_action_defaults[ACTION_COUNT] = {
 	OPT_KEY_DUP, OPT_KEY_DDOWN, OPT_KEY_DLEFT, OPT_KEY_DRIGHT,
 	OPT_KEY_A, OPT_KEY_X, OPT_KEY_Y,
+	OPT_KEY_ZR,   // v1.8.13 eat — New 3DS only, see the note in options.h
 };
 
 // ── Defaults ───────────────────────────────────────────────────────────────────────────

@@ -291,6 +291,7 @@ static const char* actionLabel(int action)
 	case ACTION_JUMP:         return "JUMP";
 	case ACTION_BREAK:        return "BREAK";
 	case ACTION_PLACE:        return "PLACE";
+	case ACTION_EAT:          return "EAT";
 	default:                  return "?";
 	}
 }
@@ -310,6 +311,8 @@ static const char* keyBitLabel(uint32_t bit)
 	case OPT_KEY_DLEFT:  return "D-PAD LEFT";
 	case OPT_KEY_DUP:    return "D-PAD UP";
 	case OPT_KEY_DDOWN:  return "D-PAD DOWN";
+	case OPT_KEY_ZL:     return "ZL";
+	case OPT_KEY_ZR:     return "ZR";
 	default:             return "?";
 	}
 }

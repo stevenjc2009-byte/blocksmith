@@ -5156,3 +5156,115 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 "./$BHMET/metrics_timing_test"
 
 rm -rf "$BHMET"
+
+# ── source/world/survival_test.c — v1.8.13 health, hunger and fall damage ──────────────────
+#
+# Own binary rather than more checks in world_test.c, the same split world/playerpose_test.c
+# and world/ore_gen_test.c already use: one file per contract says which contract broke
+# without anybody reading a line number.
+#
+# The link is wider than survival.c strictly needs because the water rule is checked against
+# a REAL world rather than a flag. fallDamageUpdate() asks physics.h's own bodySubmerged(),
+# which reaches worldGet() -> blockInfo() -> the registry, so physics.c, world.c, chunk.c,
+# chunk_codec.c, budget.c, registry.c and block.c are all linked for real. inventory.c is in
+# for the same reason on the eating side: survivalEat() writes into a real Inventory, not
+# into a double. Nothing here is stubbed but the network seam (tests/net_stub.c), which is
+# what every other world/ stanza in this file does.
+#
+# ── What this suite is built to hold, and the sabotage that proves each one can go red ────
+#
+# Twelve arms, run 2026-09-03. EVERY sabotage was applied to a SCRATCH COPY of
+# source/world/survival.c passed to gcc in its place — this tree's file was never edited, and
+# its md5 was 538b88d9d698bb029b0967fc67d6dae9 both before and after the whole run. Green arm
+# throughout: "survival self-test: PASS 2555 checks, 0 failed".
+#
+# Every arm below BUILT (build_exit=0) and RAN before it went red. That distinction is the
+# whole point of recording them: an arm that dies at the compiler exits 127, which is a build
+# failure wearing a red arm's clothes and proves nothing about the check. One arm did exactly
+# that on the first pass and is written up at the bottom.
+#
+#   fall_threshold_3_to_0       `- SURVIVAL_FALL_FREE` -> `- 0`            FAIL 11/2555
+#                               first "1-block fall is free: health got 19, want 20"
+#   peak_captured_once          the fmaxf line -> `(void)0;`                FAIL  2/2555
+#                               "L232 ft.peak_y: got 64, want 65" / "L233 s.health: got 19,
+#                               want 18". THE APEX BUG, and the reason this suite exists in
+#                               the shape it does — see below.
+#   water_does_not_negate       `bodySubmerged(w, body)` -> `&& false`      FAIL  2/2555
+#                               "L274 !died" / "L275 s.health: got 0, want 20"
+#   regen_ge_to_gt              regen gate `>=` -> `>`                      FAIL  1/2555
+#                               "regen at hunger 18: health got 10, want 11"
+#   regen_gate_dropped          regen gate always true                      FAIL 12/2555
+#                               first "regen at hunger 17: health got 11, want 10"
+#   starvation_floor_removed    `health > 1` -> `health > 0`                FAIL  4/2555
+#                               first "L468 !ever_died" — starvation killed
+#   eat_hunger_cap_removed      the 20-clamp dropped                        FAIL  1/2555
+#                               "L611 s.hunger: got 21, want 20"
+#   eat_wrong_slot              `&inv->slots[slot]` -> `&inv->slots[0]`     FAIL  9/2555
+#                               first "L549 inv.slots[5].count: got 7, want 6"
+#   countdown_off_by_one        countdown fires one tick early              FAIL  8/2555
+#                               first "L341 s.hunger: got 19, want 20"
+#   load_crc_check_removed      stored-vs-computed compare dropped          FAIL  4/2555
+#                               first "refused: one payload bit flipped (load returned true)"
+#   load_health_range_removed   `health > SURVIVAL_MAX_HEALTH` dropped      FAIL  4/2555
+#   load_hunger_range_removed   `hunger > SURVIVAL_MAX_HUNGER` dropped      FAIL  4/2555
+#
+# The last two are a pair on purpose. Sabotaging the health bound goes red on the two health
+# rows and leaves the two hunger rows GREEN, and vice versa — which is the measurement saying
+# the two bounds are independently load-bearing rather than one guard covering both. A single
+# arm would have left half of that guard unproven.
+#
+# ── THE APEX, which is the one rule a clean implementation gets wrong ──────────────────────
+#
+# peak_captured_once is worth more than the other eleven put together. Capturing peak_y once,
+# at the moment on_ground goes false, is the obvious reading of "highest y since the fall
+# started" and it is wrong: a jump LEAVES the ground and then rises, so that capture is the
+# take-off height and the whole jump is missing from the measurement. The error is about 1.3
+# blocks at PLAYER_JUMP_SPEED, which is under the 3-block free threshold — so short falls are
+# unaffected, long falls are off by exactly one point of health, and nothing looks broken.
+#
+# It cost 2 checks out of 2555, and both of them are in one test written for it
+# (testJumpThenFallIsMeasuredFromTheApex). Every threshold check in the file stayed green
+# under that sabotage, because they all drop a body that never rises.
+#
+# ── Why fall damage cannot be computed from vy, stated here so it is not "simplified" ──────
+#
+# physics.c's resolveY() sets b->vy = 0.0f in the SAME branch that sets b->on_ground = true.
+# By the time a landing is observable the impact speed is already gone, so distance has to be
+# tracked across frames — which is the whole reason FallTrack exists rather than
+# fallDamageUpdate() just reading the body's velocity. Anyone deleting FallTrack as redundant
+# should read that branch first.
+#
+# ── The arm that proved nothing, recorded because it is the trap ───────────────────────────
+#
+# regen_gate_dropped was first written as `if (s->hunger >= 0)`. gcc refused it:
+# "error: comparison is always true due to limited range of data type [-Werror=type-limits]",
+# build_exit=1, harness exit 127. That is a COMPILE failure, and had the harness only checked
+# "did the exit code go nonzero" it would have been scored as a successful red arm while
+# testing nothing at all. The rewritten arm compares against SURVIVAL_MAX_HUNGER instead —
+# equally always-true, but not a limited-range comparison — and the binary actually runs.
+# The exit-code reader itself was proven with a deliberate `( exit 5 )` control ahead of the
+# whole run, printed as "control=5".
+BHSURV="build-host/run-$$-survival"
+mkdir -p "$BHSURV"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/chunk_codec.c \
+	source/world/crc32.c \
+	source/world/world.c \
+	source/world/scratch.c \
+	source/world/budget.c \
+	source/world/physics.c \
+	source/world/inventory.c \
+	source/world/survival.c \
+	tests/net_stub.c \
+	source/world/survival_test.c \
+	-lm \
+	-o "$BHSURV/survival_test"
+
+"./$BHSURV/survival_test"
+
+rm -rf "$BHSURV"

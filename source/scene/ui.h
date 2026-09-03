@@ -95,10 +95,11 @@ typedef struct {
 // know either type's shape — main.c already computes every one of these for its own status
 // line and console overlay and just hands the same numbers over again.
 //
-// May be passed as NULL to uiUpdateDraw, in which case the metrics/status block is simply
-// not drawn (the hotbar and the open/close button still are) — that is the only condition
-// under which any field here is treated as optional; a non-NULL UiStats has every field
-// read, never written.
+// May be passed as NULL to uiUpdateDraw, in which case the metrics/status block — and, since
+// v1.8.13, the health/hunger pips below it, which live on the same `stats` — is simply not
+// drawn (the hotbar and the open/close button still are) — that is the only condition under
+// which any field here is treated as optional; a non-NULL UiStats has every field read, never
+// written.
 typedef struct {
 	int         columns, chunks;
 	int         meshes, culled;
@@ -117,6 +118,23 @@ typedef struct {
 	// debug/metrics.h's averages for the same reason it builds `status`: this header must not
 	// grow a dependency on <3ds.h>, and every other number on this panel arrives the same way.
 	const char* timing;
+
+	// v1.8.13 SURV-HUD. The player's vitals, drawn as two 10-pip bars at the bottom of the
+	// HUD screen (see scene/ui_layout.h's vitals block for where on the panel they fit and
+	// why nothing else could move to make room).
+	//
+	// 0..20, i.e. two points per pip, the same scale world/survival.h keeps them on — so an
+	// odd value is half a pip and ui.c draws it as one. Values outside 0..20 are clamped by
+	// ui_layout.h's hudPipFill rather than trusted, so a caller that has not wired these up
+	// yet gets an empty bar, never a crash and never a bar drawn past its tenth pip.
+	//
+	// Zero is a legitimate reading (an empty bar), NOT "unset". main.c builds this struct with
+	// a designated initialiser, so both fields are already zero-initialised in every build that
+	// has not populated them; a build in that state draws two empty bars, which is exactly what
+	// health 0 looks like. That is a deliberate contract and not a placeholder: there is no
+	// spare sentinel in a uint8_t 0..20 that would mean "no data", and inventing one would put
+	// a second meaning on a field ui.c only ever reads.
+	uint8_t health, hunger;   // 0..20
 } UiStats;
 
 // What this frame's screen was, in case the caller wants to gate something on it — e.g.

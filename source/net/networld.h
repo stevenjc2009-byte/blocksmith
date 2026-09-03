@@ -242,8 +242,19 @@ const NetworldPlayerMeters* networldPlayerMeters(void);
 // real values to networldSendPlayerReport(), this stays 0 and the send path does not exist
 // in the compiled binary at all. A future milestone flips it to 1 the day real meters do;
 // the capability probe below keeps the wire side safe either way.
+// v1.8.13 SURV-WIRE: flipped to 1. world/survival.c now simulates real health and hunger, and
+// main.c builds each report by copying the RETAINED inbound meters block and overwriting only
+// those two fields — so the armour and XP this client still has no system for round-trip back
+// to the server untouched instead of going out as the zeros that the paragraph above warns
+// would wipe them. The zero-wipe hazard was never about the wire format; it was about sending
+// values this client could not source, and health and hunger it can now source.
+//
+// Nothing about the wire changed with this flip. BS_PLAYER_REPORT_BYTES is a fixed 30 built
+// from BS_APP_HDR_BYTES + BS_PLAYER_METERS_BYTES + 5 in the shared proto header, with no
+// dependency on this flag — the flag appears nowhere outside this file, networld.c and
+// networld_test.c. All it does is decide whether the send path below is compiled in at all.
 #ifndef BS_CLIENT_HAS_METERS
-#define BS_CLIENT_HAS_METERS 0
+#define BS_CLIENT_HAS_METERS 1
 #endif
 
 // Encodes and sends this client's own armour+meters as BS_APP_PLAYER_REPORT, from `m`.

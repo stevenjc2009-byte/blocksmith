@@ -44,6 +44,10 @@ typedef enum {
 	ACTION_JUMP,           // KEY_A
 	ACTION_BREAK,          // KEY_X
 	ACTION_PLACE,          // KEY_Y
+	// v1.8.13 survival. Appended on the END, per the paragraph above — the ini matches by
+	// name, so every options.ini already on a card keeps all seven bindings it names and
+	// simply does not mention this one, which optionsDefaults() then supplies.
+	ACTION_EAT,            // KEY_ZR — see the note on OPT_KEY_ZL/ZR below about Old 3DS
 	ACTION_COUNT
 } OptionsAction;
 
@@ -74,11 +78,29 @@ typedef enum {
 #define OPT_KEY_DUP     0x00000040u
 #define OPT_KEY_DDOWN   0x00000080u
 
+// v1.8.13 survival. Added because ACTION_EAT needed a default and, at the time it landed,
+// every button on an Old 3DS was already spoken for: A/X/Y and the four D-pad directions are
+// the seven above, B is the universal menu cancel, SELECT opens the pause menu, START quits,
+// and L/R step the render distance live in-game (main.c, under BS_WORLD_GEN && !BS_FLY). The
+// shoulder Z buttons were the only bits nothing in source/ referenced at all.
+//
+//   KEY_ZL      BIT(14)  = 0x00004000
+//   KEY_ZR      BIT(15)  = 0x00008000
+//
+// The catch, stated here rather than discovered on hardware: these exist ONLY on New 3DS /
+// New 2DS. On an original 3DS or 2DS they can never be pressed, so ACTION_EAT's default is
+// unreachable there and the player has to rebind it before they can eat. That is a real gap
+// and it is a design call, not a coding one — the alternatives were doubling up on Y (which
+// also places, and BLOCK_APPLE is a placeable block, so one press would eat AND place) or
+// taking L/R away from the render-distance shortcut.
+#define OPT_KEY_ZL      0x00004000u
+#define OPT_KEY_ZR      0x00008000u
+
 // The set a binding is allowed to hold. A value read from the ini that is not one of
 // these is treated as malformed (see optionsLoad) rather than accepted verbatim — an
 // unrecognised bit would silently never fire, which is the same failure mode as the
 // invented-action trap above, just reachable from a hand-edited file instead of from code.
-#define OPTIONS_VALID_KEY_COUNT 7
+#define OPTIONS_VALID_KEY_COUNT 9
 extern const uint32_t OPTIONS_VALID_KEYS[OPTIONS_VALID_KEY_COUNT];
 
 // ── Ranges ─────────────────────────────────────────────────────────────────────────────

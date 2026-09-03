@@ -81,6 +81,66 @@
 #define HUD_TOGGLE_H  32
 #define HUD_STATUS_Y0 (HUD_TOGGLE_Y + HUD_TOGGLE_H + 6)   // 78
 
+// The vertical extent the HUD screen's status text can reach, as a constant, so the vitals
+// strip below can be checked against it instead of against a number somebody remembered.
+//
+// ui.c's drawHudFont draws its rows at HUD_STATUS_Y0 + k * 12 and there are at most seven of
+// them (cols/chunks, meshes/tris/cull, blocks/peak, `status`, `net`, biome, and the optional
+// `timing` row), after which it adds a 2 px gap and draws the "tap a hotbar slot to select it"
+// hint. Worst case — every optional row present — the hint sits at 164 and its glyphs end at
+// 171 (FONT_GLYPH_H is 7). HUD_STATUS_BOTTOM budgets one whole extra row on top of that, so it
+// is 174: a deliberate over-estimate, because the point of the constant is to be a floor the
+// vitals strip stays below, not a tight measurement.
+//
+// Deliberately NOT wired into drawHudFont's own `y += 12` steps. Those literals are what
+// shipped, three separate comments in that function assert the rows above them are unchanged
+// byte-for-byte, and rewriting them to derive from here would be a re-layout of a panel this
+// change is only appending to. This constant exists to be *checked against* (see
+// ui_layout_test.c's testPipsClearTheStatusRows), and it goes red if either side moves.
+#define HUD_STATUS_STEP     12
+#define HUD_STATUS_MAX_ROWS  7
+#define HUD_STATUS_BOTTOM   (HUD_STATUS_Y0 + (HUD_STATUS_MAX_ROWS + 1) * HUD_STATUS_STEP)  // 174
+
+// ── Vitals strip (health + hunger pips) ────────────────────────────────────────────────
+//
+// Where these can actually go on a 320x240 bottom screen, which is the whole reason they are
+// down here at y=200 and not tucked under the hotbar where a first sketch put them:
+//
+//   HUD screen (overlay closed)      hotbar        y   0..40   (HOTBAR_Y/HOTBAR_H)
+//                                    OPEN INVENTORY y  40..72   (HUD_TOGGLE_Y/_H)
+//                                    status text    y  78..171  (see HUD_STATUS_BOTTOM)
+//                                    FREE           y 172..240
+//   INVENTORY screen (overlay open)  hotbar        y   0..40
+//                                    main grid      y  40..120  (GRID_Y/GRID_H)
+//                                    crafting panel y 120..240  (CRAFT_Y/CRAFT_H)
+//                                    FREE           nothing
+//
+// So the only unoccupied band on the whole panel is the bottom ~68 px of the HUD screen, and
+// it is unoccupied *only* on that screen. Anything at y=2/y=10 lands inside the 40 px hotbar
+// band; anything between 40 and 72 lands on the inventory toggle; anything from 78 down to
+// ~171 lands on the debug/status rows. Nothing moved to make room — HOTBAR_Y, HUD_TOGGLE_Y and
+// HUD_STATUS_Y0 are all byte-identical to what shipped — because nothing needed to.
+//
+// The consequence, and it is a real one rather than an oversight: ui.c draws this strip from
+// drawHudFont only, so the vitals are visible on the HUD and not while the inventory overlay
+// is open. On the overlay screen every pixel from y=40 down belongs to the grid or the
+// crafting panel, and a vitals row there would have to sit on top of a crafting row.
+//
+// HUD_PIPS_Y0 is written as SCR_H - 40 rather than as 200 so it stays pinned to the bottom of
+// the panel if SCR_H ever changes, which is the edge it is actually anchored to. The two rows
+// then occupy y 200..208 (health) and 212..220 (hunger), leaving a 20 px margin under them.
+#define HUD_PIP_COUNT      10   // pips per bar
+#define HUD_STAT_MAX       20   // points a full bar represents, so 2 points per pip
+#define HUD_PIP_W          12
+#define HUD_PIP_H           8
+#define HUD_PIP_GAP         3
+#define HUD_PIP_X0         32   // left of this is the 2-char row label, drawn by ui.c at x=6
+#define HUD_PIP_ROW_STEP   12
+#define HUD_PIP_ROWS        2
+#define HUD_PIP_ROW_HEALTH  0
+#define HUD_PIP_ROW_HUNGER  1
+#define HUD_PIPS_Y0        (SCR_H - 40)   // 200
+
 // ── Rects ──────────────────────────────────────────────────────────────────────────────
 
 typedef struct { int x, y, w, h; } URect;
@@ -105,3 +165,53 @@ URect hudToggleRect(void);
 // is true and returns -1 for the same point when it is false, and (c) a point in the gutter
 // between cells, or below the grid when the overlay is closed, returns -1.
 int hitInventorySlot(int x, int y, bool overlay_open);
+
+// ── Vitals pip arithmetic ──────────────────────────────────────────────────────────────
+//
+// `static inline` in the header, and not a pair of functions in ui_layout.c, because
+// ui_layout.c is not this change's to edit — see the lane scope this landed under. The
+// consequence that matters is that scene/ui.c and scene/ui_layout_test.c compile the *same*
+// definitions rather than two hand-kept copies, which is the only property the test needs to
+// be worth running: a test that re-implements the rule it is checking proves nothing about
+// the code that ships.
+
+// How full pip `i` of a bar is. `points` is the 0..HUD_STAT_MAX value (health or hunger) and
+// each pip is worth 2 points, so pip i covers points [2i, 2i+2).
+//
+// Out-of-range inputs are safe, which matters because UiStats.health is filled in by another
+// module and a 0..20 contract written down only in a comment is one off-by-one from drawing
+// nonsense. `i` is guarded explicitly — an empty pip is the only answer that cannot be
+// mistaken for a real reading — but `points` needs no clamp: the subtraction below already
+// saturates, since any value above HUD_STAT_MAX leaves rem >= 2 for all ten pips (a full bar)
+// and any value below 0 leaves rem <= 0 for all ten (an empty one).
+//
+// That is stated as a fact because it was measured, not assumed. An explicit
+// `if (points > HUD_STAT_MAX) points = HUD_STAT_MAX;` was written here first and then deleted:
+// a sabotage run that removed it left ui_layout_test.c at PASS 703/703, which is the proof
+// that the line could never change an answer. Dead code no check can catch is worse than no
+// code, so it is gone; the saturating behaviour it was guarding is still checked, by
+// testPipFillClampsOutOfRangeValues.
+typedef enum {
+	PIP_EMPTY = 0,
+	PIP_HALF  = 1,   // an odd `points` leaves exactly one pip in this state
+	PIP_FULL  = 2,
+} PipFill;
+
+static inline PipFill hudPipFill(int points, int i)
+{
+	if (i < 0 || i >= HUD_PIP_COUNT) return PIP_EMPTY;
+
+	const int rem = points - 2 * i;
+	if (rem >= 2) return PIP_FULL;
+	if (rem == 1) return PIP_HALF;
+	return PIP_EMPTY;
+}
+
+// Pixel rect for pip `i` of row `row` (HUD_PIP_ROW_HEALTH / HUD_PIP_ROW_HUNGER).
+static inline URect hudPipRect(int row, int i)
+{
+	URect r = { HUD_PIP_X0 + i * (HUD_PIP_W + HUD_PIP_GAP),
+	            HUD_PIPS_Y0 + row * HUD_PIP_ROW_STEP,
+	            HUD_PIP_W, HUD_PIP_H };
+	return r;
+}

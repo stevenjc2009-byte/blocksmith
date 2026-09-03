@@ -1,0 +1,15 @@
+# Release notes shown on the 3DS top screen before the update downloads.
+#
+# Two sections, both optional, one item per line. Plain English, no markdown: this is read
+# by a player on a 400 px screen, not by a developer. A leading "- " is optional.
+#
+# Long lines wrap on their own, so write a sentence rather than fighting the width.
+
+[features]
+Health and hunger, shown as two rows of pips along the bottom of the touch screen.
+Fall damage. Drops over three blocks hurt, and landing in water cancels it entirely.
+Eat an apple by holding it and pressing the place button. It restores four hunger.
+Starving hurts but cannot kill you - it stops at one health. Falling can kill you.
+Dying puts you back at spawn with full health and hunger. Your inventory is kept.
+A rebindable Eat button, default ZR. ZR is New 3DS only; the place button works on both.
+Health and hunger are saved with your world, and on a server the server owns them.

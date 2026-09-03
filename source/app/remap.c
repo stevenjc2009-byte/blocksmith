@@ -11,11 +11,15 @@ static const char* const s_action_names[ACTION_COUNT] = {
 	"Jump",
 	"Break",
 	"Place",
+	"Eat",
 };
 
 // Human-readable names for each valid key bit, same order as OPTIONS_VALID_KEYS.
 static const char* const s_key_names[OPTIONS_VALID_KEY_COUNT] = {
 	"A", "X", "Y", "D-right", "D-left", "D-up", "D-down",
+	// v1.8.13, appended in the same order OPTIONS_VALID_KEYS appends them — remapKeyName()
+	// indexes this array by the position it found the bit at, so the two must stay parallel.
+	"ZL", "ZR",
 };
 
 // The default binding for each action, same order as s_action_defaults in
@@ -24,6 +28,7 @@ static const char* const s_key_names[OPTIONS_VALID_KEY_COUNT] = {
 static const uint32_t s_defaults[ACTION_COUNT] = {
 	OPT_KEY_DUP, OPT_KEY_DDOWN, OPT_KEY_DLEFT, OPT_KEY_DRIGHT,
 	OPT_KEY_A, OPT_KEY_X, OPT_KEY_Y,
+	OPT_KEY_ZR,   // v1.8.13 eat — must match options.c's s_action_defaults
 };
 
 void remapInit(RemapState* rs, const Options* o)
