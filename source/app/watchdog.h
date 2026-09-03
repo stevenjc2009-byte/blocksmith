@@ -71,6 +71,27 @@ typedef enum {
 // player coming back from lunch must not find a hang report on their card.
 #define WD_TIMEOUT_MS 10000
 
+// ── v1.8.16 FRZ-FIX: the DEATH SPIRAL the timeout above is blind to ───────────────────────
+//
+// WD_TIMEOUT_MS only ever fires when the beat STOPS. Any beat at all resets the clock, so a
+// game whose frames keep arriving — one every three seconds — never accumulates toward it and
+// no hang.txt is ever written. That is exactly what steve reported: "the framerate was slightly
+// lagging" first, then a console that would not respond, and NOTHING on the SD card afterwards.
+// A permanently parked main thread would have left a file; a spiral does not.
+//
+// So there is a second, slower accumulator that a beat does NOT clear.
+//
+// A frame that takes longer than this is not a hitch. Picked above the worst legitimate
+// main-thread pause this game has — a region rewrite landing behind a save — so a single slow
+// frame never trips it.
+#define WD_SLOW_BEAT_MS 2000u
+
+// ...and this much of them, in an unbroken run, is a hang whatever the beat says. Same budget as
+// WD_TIMEOUT_MS, so "ten seconds of not playing" means one thing. Five consecutive two-second
+// frames trip it; one three-second region rewrite does not; a HOME suspend of any length does
+// not, because the WD_PHASE_APT branch zeroes the clock on every poll.
+#define WD_SLOW_TOTAL_MS 10000u
+
 // Starts the monitor thread. False if the thread could not be created, in which case
 // everything below is a no-op and the game runs exactly as it did before this file existed.
 bool watchdogStart(void);
@@ -80,6 +101,14 @@ void watchdogStop(void);
 
 // One store. Called around anything that could block.
 void watchdogPhase(WdPhase p);
+
+// v1.8.16 FRZ-FIX. One load, so a caller can bracket a blocking call and put the phase BACK to
+// whatever it actually was rather than to whatever it usually is. main.c's genUnloadColumn needs
+// this: it is called both from the in-frame ring follow (WD_PHASE_SIM) and from the startup save
+// self-check (WD_PHASE_HANDOFF_SAVE), so a hardcoded restore would be right in one place and a
+// lie in the other — and a phase that lies is worse than no phase, which is the whole reason
+// WD_PHASE_SAVE is being set around the save at all.
+WdPhase watchdogPhaseGet(void);
 
 // Once per frame, from the frame loop. This is the signal the monitor watches: not the phase,
 // which a hung frame leaves pointing at the right place, but the count, which only a frame

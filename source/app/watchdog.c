@@ -609,15 +609,18 @@ void watchdogGxSelfTest(void)
 }
 #endif
 
-static void reportBuild(u32 phase, u32 frames, u32 stuck_ms)
+// v1.8.16 FRZ-FIX. `slow` says WHICH of the two conditions fired, and the header line changes
+// with it — a report that says "stopped completing frames" when the frames were in fact still
+// arriving, one every few seconds, sends the next reader looking for a deadlock that is not
+// there. The two are different bugs and the file has to name which one it saw.
+static void reportBuild(u32 phase, u32 frames, u32 stuck_ms, bool slow)
 {
 	const int n = snprintf(s_report, sizeof(s_report),
 		"Blocksmith hang report\n"
 		"\n"
-		"The main thread stopped completing frames. This file was written by the watchdog\n"
-		"thread (source/app/watchdog.c), not by a crash handler: no exception was raised,\n"
-		"the main thread simply stopped returning to aptMainLoop(), which is what makes the\n"
-		"HOME button stop responding as well.\n"
+		"%s"
+		"This file was written by the watchdog thread (source/app/watchdog.c), not by a crash\n"
+		"handler: no exception was raised.\n"
 		"\n"
 		"version      : %s\n"
 		"phase        : %s\n"
@@ -630,6 +633,12 @@ static void reportBuild(u32 phase, u32 frames, u32 stuck_ms)
 		"\n"
 		"'phase' is the last place the main thread reported being, listed in\n"
 		"source/app/watchdog.h. That name is the answer this file exists to give.\n",
+		slow
+			? "The main thread KEPT completing frames, but took seconds over each of them for\n"
+			  "long enough to count as a hang. It is a DEATH SPIRAL, not a deadlock: frames were\n"
+			  "still arriving, which is why the ordinary WD_TIMEOUT_MS check never fired.\n"
+			: "The main thread stopped completing frames. It stopped returning to aptMainLoop(),\n"
+			  "which is what makes the HOME button stop responding as well.\n",
 		BLOCKSMITH_VERSION_SET ? BLOCKSMITH_VERSION : "(unset)",
 		phaseName(phase),
 		(unsigned long)frames,
@@ -732,6 +741,11 @@ static void watchdogMain(void* arg)
 	u32 last_beat = s_beat;
 	u32 stuck_ms  = 0;
 
+	// v1.8.16 FRZ-FIX. The slow-beat run, in milliseconds. Deliberately NOT cleared by a beat —
+	// that is the entire difference between it and stuck_ms, and the reason it can catch the
+	// death spiral stuck_ms is blind to. See WD_SLOW_BEAT_MS in watchdog.h.
+	u32 slow_ms = 0;
+
 	while (!s_quit) {
 		svcSleepThread(WD_POLL_NS);
 
@@ -739,8 +753,23 @@ static void watchdogMain(void* arg)
 		const u32 phase = s_phase;
 
 		if (beat != last_beat) {
+			// How long THIS beat took to arrive, to a quarter second. stuck_ms is zeroed by the
+			// WD_PHASE_APT branch below on every poll, so a HOME suspension reads as one poll
+			// interval here and cannot trip the slow accumulator.
+			const u32 gap = stuck_ms + WD_POLL_MS;
 			last_beat = beat;
 			stuck_ms  = 0;
+
+			if (gap >= WD_SLOW_BEAT_MS) {
+				slow_ms += gap;
+				if (slow_ms >= WD_SLOW_TOTAL_MS && !s_fired)
+					reportBuild(phase, beat, slow_ms, true);
+			} else {
+				// One frame at a normal pace ends the run. Not a decay: a game that recovered is
+				// not hanging, and a leaky accumulator would eventually fire on a long session of
+				// ordinary hitches.
+				slow_ms = 0;
+			}
 			continue;
 		}
 
@@ -764,7 +793,7 @@ static void watchdogMain(void* arg)
 			s_fc_b[1] = C3D_FrameCounter(1);
 			stuck_ms += WD_FC_GAP_MS;
 #endif
-			reportBuild(phase, beat, stuck_ms);
+			reportBuild(phase, beat, stuck_ms, false);
 		}
 	}
 }
@@ -815,6 +844,11 @@ void watchdogStop(void)
 void watchdogPhase(WdPhase p)
 {
 	s_phase = (u32)p;
+}
+
+WdPhase watchdogPhaseGet(void)
+{
+	return (WdPhase)s_phase;
 }
 
 void watchdogBeat(void)

@@ -1157,8 +1157,22 @@ static void genUnloadColumn(int32_t cx, int32_t cz)
 		// worker that shares core 0 with this thread. That only ever happens where the player
 		// has built — which is exactly the "certain spots" in steve's report, and is invisible
 		// to every other column in this CSV.
+		//
+		// v1.8.16 FRZ-FIX. Bracketed with its own phase for the same reason gpuWaitPrevFrame is
+		// bracketed: without it a stall in here reports `phase: SIM` in hang.txt, because
+		// WD_PHASE_SIM was set at the top of the frame and WD_PHASE_SAVE was only ever set on
+		// the quit path. A report naming SIM points at player and camera code that has nothing
+		// to do with the SD card, which defeats the point of having a phase at all.
+		//
+		// The phase is SAVED and RESTORED rather than set back to WD_PHASE_SIM, because this
+		// function has two callers: the in-frame ring follow (SIM) and the startup save
+		// self-check (HANDOFF_SAVE). A hardcoded restore would be correct for one and a lie for
+		// the other.
 		const u64 t0 = svcGetSystemTick();
+		const WdPhase prev_phase = watchdogPhaseGet();
+		watchdogPhase(WD_PHASE_SAVE);
 		workerSubmitSave(col);
+		watchdogPhase(prev_phase);
 		s_frame_save_ms +=
 			(float)((double)(svcGetSystemTick() - t0) / CPU_TICKS_PER_MSEC);
 	}
@@ -1369,6 +1383,26 @@ static const char* bsDbgInfoPlayer(char* buf, int cap, void* ctx)
 	return buf;
 }
 
+// v1.8.16 FRZ-FIX. The save-slot wait, in the one place a shipped CIA can show a number.
+//
+// workerSaveWaits() has shipped since v1.7.1 and has never once been readable by anybody: its
+// only readout is a printf inside #if !BS_BOTTOM_UI, and BS_BOTTOM_UI defaults to 1, so the
+// installed CIA has no text console and that line is not even compiled. This row is the fix for
+// that, and it is the readout for the freeze work: sv/w/max say whether the main thread ever
+// waited for a save slot at all, and sync/over say whether the v1.8.16 deadline fired and
+// whether the card was locked when it did.
+//
+// No ctx: these are four calls into app/worker.c, which keeps the counters itself. Every one of
+// them is safe before workerStart — they read plain statics.
+static const char* bsDbgInfoSaves(char* buf, int cap, void* ctx)
+{
+	(void)ctx;
+	snprintf(buf, (size_t)cap, "sv%d w%d max%.0fms sync%d over%d",
+	         workerSaveSubmits(), workerSaveWaits(), (double)workerSaveWaitMaxMs(),
+	         workerSaveSync(), workerSaveOverrun());
+	return buf;
+}
+
 // v1.8.8 NEON BIOME BORDERS. Thin wrappers because DebugEntry's TOGGLE callbacks take a void*
 // ctx and debug/biomeborder.h's do not — the flag has no per-entry state to carry, so rather
 // than widen the module's API to fit the menu, the menu's shape is absorbed here. (void)ctx
@@ -1471,6 +1505,9 @@ static void bsDebugRegister(void)
 		{ "World",   bsDbgInfoWorld  },
 		{ "Memory",  bsDbgInfoMem    },
 		{ "Player",  bsDbgInfoPlayer },
+		// v1.8.16 FRZ-FIX. The save-slot wait, in the one place a shipped CIA can show a
+		// number: this menu. See bsDbgInfoSaves above for why it has never been visible.
+		{ "Saves",   bsDbgInfoSaves  },
 	};
 	for (int i = 0; i < (int)(sizeof(infos) / sizeof(infos[0])); i++) {
 		e = debugMenuRegister();

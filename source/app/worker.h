@@ -274,6 +274,13 @@ int   workerSaveWaits(void);        // ...of which this many blocked the main th
 float workerSaveWaitMs(void);       // total main-thread time lost to that wait
 float workerSaveWaitMaxMs(void);    // the worst single wait, which is the frame spike
 
+// v1.8.16 FRZ-FIX. What the deadline in app/savewait.h actually did when it fired. Both are
+// zero on a healthy session, and both are on the pause -> Options -> Debug "Saves" row — the
+// only readout a shipped CIA has, since BS_BOTTOM_UI owns the bottom screen and there is no
+// text console to printf to.
+int   workerSaveSync(void);         // saves the main thread had to write itself
+int   workerSaveOverrun(void);      // ...and the ones it could not, and waited out
+
 // Which CPU core LANE 0 actually ended up on, not which one it asked for: 2 on a New 3DS
 // whose exheader granted core 2, 1 only if APT_SetAppCpuTimeLimit and the thread creation
 // both succeeded, 0 otherwise, -1 before workerStart. Reported rather than assumed, because

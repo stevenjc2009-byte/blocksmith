@@ -7,6 +7,11 @@
 
 #include "app/hw.h"
 #include "app/lanes.h"
+// v1.8.16 FRZ-FIX. The save-slot wait's policy half, extracted so it can be run on a host —
+// see app/savewait.h. watchdog.h is here for watchdogWriteFile(), the raw-FS writer the hang
+// report uses; workerSaveStallNote below needs the same one and for the same reason.
+#include "app/savewait.h"
+#include "app/watchdog.h"
 #include "debug/loadprof.h"
 #include "world/jobq.h"
 #include "world/light.h"
@@ -170,6 +175,12 @@ static int      s_save_submits;         // calls that got as far as wanting a sl
 static int      s_save_waits;           // ...of which this many had to sleep at least once
 static u64      s_save_wait_ticks;      // total slept
 static u64      s_save_wait_max_ticks;  // worst single wait
+
+// v1.8.16 FRZ-FIX. The two outcomes the deadline added, counted for the same reason the four
+// above are counted: without a number, "the deadline never fires" and "the deadline fires and
+// the card is always free" look identical from the debug menu.
+static int      s_save_sync;            // written on the MAIN thread after the deadline
+static int      s_save_overrun;         // deadline expired AND the card was locked
 
 // Empty means "no save file": every column is generated and nothing is written. Sized for a
 // path under REGION_ROOT plus a world name.
@@ -493,6 +504,7 @@ bool workerStart(const WorldGen* g)
 	// one's waits and the capture would be unattributable.
 	s_save_submits = s_save_waits = 0;
 	s_save_wait_ticks = s_save_wait_max_ticks = 0;
+	s_save_sync = s_save_overrun = 0;
 
 	LightLock_Init(&s_lock);
 	LightLock_Init(&s_fs_lock);
@@ -660,6 +672,64 @@ bool workerSubmitColumn(int32_t cx, int32_t cz)
 	return ok;
 }
 
+// ── v1.8.16 FRZ-FIX: the console-side halves of app/savewait.c's loop ─────────────────────
+//
+// Separate functions and not lambdas-by-macro because tests/savewait_test.c substitutes its
+// own three, which is the only way the loop's policy can be run anywhere but on a console.
+
+static bool workerSaveRoom(void* ud)
+{
+	(void)ud;
+	LightLock_Lock(&s_lock);
+	const bool room = s_save_count < SAVE_SLOTS;
+	LightLock_Unlock(&s_lock);
+	return room;
+}
+
+static bool workerSaveRingEmpty(void* ud)
+{
+	(void)ud;
+	LightLock_Lock(&s_lock);
+	const int n = s_save_count;
+	LightLock_Unlock(&s_lock);
+	return n == 0;
+}
+
+static void workerSaveIdle(void* ud, bool pump)
+{
+	(void)ud;
+	// APT only once the wait is already visible (SAVEWAIT_PUMP_MS). aptMainLoop() here is a
+	// re-entry into APT from the middle of a frame — genUnloadColumn runs after
+	// gpuWaitPrevFrame and before this frame's C3D_FrameBegin — so it is not something to do on
+	// the common path. It IS the thing that keeps HOME working once the alternative is a
+	// console the player has to hold the power button to escape, which is the bug being fixed.
+	if (pump) (void)aptMainLoop();
+	svcSleepThread(1000000ULL);
+}
+
+static uint32_t workerNowMs(void* ud)
+{
+	(void)ud;
+	return (uint32_t)((double)svcGetSystemTick() / CPU_TICKS_PER_MSEC);
+}
+
+// One line, once per session, straight to the card — because the counters above are only
+// readable from a menu the player has to already be in, and the event this is trying to catch
+// happens while they are walking. Same raw-FS writer the watchdog uses, for the same reason:
+// whatever is wrong, stdio may be locked.
+static void workerSaveStallNote(int32_t cx, int32_t cz)
+{
+	static bool done;
+	if (done) return;
+	done = true;
+
+	char line[160];
+	const int n = snprintf(line, sizeof line,
+		"save slot wait exceeded %u ms at column %ld %ld (sync %d, overrun %d)\n",
+		(unsigned)SAVEWAIT_BUDGET_MS, (long)cx, (long)cz, s_save_sync, s_save_overrun);
+	if (n > 0) watchdogWriteFile("/blocksmith/savestall.txt", line, (size_t)n);
+}
+
 bool workerSubmitSave(const Column* col)
 {
 	if (!s_started || !s_world_dir[0] || !col) return true;
@@ -693,22 +763,94 @@ bool workerSubmitSave(const Column* col)
 	s_save_submits++;
 	{
 		const u64 t_wait = svcGetSystemTick();
-		bool slept = false;
+		uint32_t iters = 0;
 
-		for (;;) {
-			LightLock_Lock(&s_lock);
-			const bool room = s_save_count < SAVE_SLOTS;
-			LightLock_Unlock(&s_lock);
-			if (room) break;
-			slept = true;
-			svcSleepThread(1000000ULL);
-		}
+		// ── v1.8.16 FRZ-FIX ────────────────────────────────────────────────────────────────
+		//
+		// This wait used to be a bare unbounded loop with a 1 ms sleep and nothing else, and it
+		// is the mechanism behind steve's "it has froze the entire console" report: it runs on
+		// the MAIN thread, from genUnloadColumn (main.c), up to seven times in the one frame a
+		// ring step unloads a built edge — and while it ran, aptMainLoop() was not called, so
+		// APT went unserviced, HOME stopped responding, and the console read as dead rather
+		// than as slow. That is the same defect main.c records for the 2026-08-19 report; it
+		// was fixed in the loading loop and left standing here.
+		//
+		// Three changes, each doing one thing:
+		//   * APT is serviced once the wait passes one frame (SAVEWAIT_PUMP_MS), so HOME works.
+		//     Below that threshold nothing changed — an ordinary save must not re-enter APT
+		//     from the middle of a frame.
+		//   * The wait has a deadline (SAVEWAIT_BUDGET_MS).
+		//   * On expiry the column is written HERE rather than dropped. Dropping it would
+		//     silently lose what the player built, which is the one outcome worse than a stall.
+		//
+		// The loop itself lives in app/savewait.c so it can be run on a host; this file keeps
+		// only the three console-side callbacks above. tests/savewait_guard_test.c asserts that
+		// no loop of its own has crept back in here.
+		const SaveWait sw = {
+			.room      = workerSaveRoom,
+			.idle      = workerSaveIdle,
+			.now_ms    = workerNowMs,
+			.ud        = NULL,
+			.budget_ms = SAVEWAIT_BUDGET_MS,
+		};
+		const SaveWaitResult r = saveWaitForRoom(&sw, NULL, &iters);
 
-		if (slept) {
+		if (iters) {
 			const u64 waited = svcGetSystemTick() - t_wait;
 			s_save_waits++;
 			s_save_wait_ticks += waited;
 			if (waited > s_save_wait_max_ticks) s_save_wait_max_ticks = waited;
+		}
+
+		if (r == SAVEWAIT_EXPIRED) {
+			// The ring never freed. Write it on this thread instead of queueing it — bounded by
+			// ONE column write rather than by whatever lane 0 is in the middle of.
+			//
+			// TryLock and not Lock: lane 0 holds s_fs_lock across regionMaintain, which is a
+			// whole-region rewrite, and libctru has no timed lock — so a blocking acquire here
+			// would trade an unbounded queue wait for an unbounded lock wait and fix nothing.
+			// If the card is busy we fall through and keep waiting with APT alive, which is
+			// survivable; losing the column is not. LightLock_TryLock returns zero on success
+			// (libctru synchronization.h), checked rather than assumed.
+			if (LightLock_TryLock(&s_fs_lock) == 0) {
+				// s_load_buf, NOT s_save[s_save_head]. The ring is FULL on this path, which
+				// means s_save_head == s_save_tail — the slot lane 0 is at this moment reading
+				// out to the card — so encoding into it would corrupt the save already in
+				// flight. s_load_buf is the one buffer in this file whose documented rule is
+				// "only ever touched inside s_fs_lock", which is exactly where this is, so it
+				// costs no extra .bss and cannot collide with lane 1's load.
+				const uint32_t n = regionEncodeColumn(col, s_load_buf, sizeof(s_load_buf));
+				bool written = false;
+				// regionMaintain is deliberately NOT called on this path: it is the whole-region
+				// rewrite, and running it on the main thread would reintroduce exactly the
+				// unbounded pause this branch exists to escape. The next worker-side save
+				// compacts instead.
+				if (n) written = regionWriteColumn(s_world_dir, col->cx, col->cz, s_load_buf, n);
+				LightLock_Unlock(&s_fs_lock);
+
+				if (written) {
+					__atomic_fetch_add(&s_saved, 1, __ATOMIC_RELAXED);
+					s_save_sync++;
+					workerSaveStallNote(col->cx, col->cz);
+					return true;
+				}
+				__atomic_fetch_add(&s_save_failed, 1, __ATOMIC_RELAXED);
+				return false;
+			}
+
+			// Card busy. Back to waiting, no deadline, APT pumped every iteration past the
+			// threshold. Unbounded in DURATION and bounded in CONSEQUENCE: the player can press
+			// HOME and leave, and nothing they built is thrown away.
+			s_save_overrun++;
+			workerSaveStallNote(col->cx, col->cz);
+			const SaveWait sw2 = {
+				.room      = workerSaveRoom,
+				.idle      = workerSaveIdle,
+				.now_ms    = workerNowMs,
+				.ud        = NULL,
+				.budget_ms = 0,
+			};
+			(void)saveWaitForRoom(&sw2, NULL, NULL);
 		}
 	}
 
@@ -735,14 +877,23 @@ void workerFlushSaves(void)
 {
 	if (!s_started) return;
 
-	for (;;) {
-		LightLock_Lock(&s_lock);
-		const int n = s_save_count;
-		LightLock_Unlock(&s_lock);
-		if (n == 0) return;
-		LightEvent_Signal(&s_lane[0]->work);
-		svcSleepThread(1000000ULL);
-	}
+	// v1.8.16 FRZ-FIX. Same treatment as workerSubmitSave and for the same reason, minus the
+	// deadline: this is the quit and lid-close path, where a long wait is legitimate — but a
+	// long wait with APT unserviced is a console that cannot be closed, and the lid-close caller
+	// is by definition a player who has already asked the system for something.
+	//
+	// The per-iteration LightEvent_Signal is dropped: lane 0 is signalled on entry here and by
+	// every workerSubmitSave, and re-signalling a sticky event forty times a second was never
+	// load-bearing.
+	LightEvent_Signal(&s_lane[0]->work);
+	const SaveWait sw = {
+		.room      = workerSaveRingEmpty,
+		.idle      = workerSaveIdle,
+		.now_ms    = workerNowMs,
+		.ud        = NULL,
+		.budget_ms = 0,
+	};
+	(void)saveWaitForRoom(&sw, NULL, NULL);
 }
 
 int workerLoaded(void)     { return __atomic_load_n(&s_loaded, __ATOMIC_RELAXED); }
@@ -903,3 +1054,6 @@ float workerSaveWaitMaxMs(void)
 {
 	return (float)((double)s_save_wait_max_ticks / CPU_TICKS_PER_MSEC);
 }
+
+int   workerSaveSync(void)    { return s_save_sync; }
+int   workerSaveOverrun(void) { return s_save_overrun; }
