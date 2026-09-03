@@ -120,6 +120,10 @@ enum {
 	// carries the same figure and stayed correct, so the two disagreed in the same file —
 	// which is exactly how a reader ends up trusting the wrong one.)
 	//
+	// Nor is it the number of PAINTED slots any more. Since v1.8.16 that is 57, not 48: the
+	// sheet also carries nine ITEM ICONS at 48..56 which this enum deliberately does not name.
+	// See the note below TILE_USED_COUNT for why, and source/gfx/item_icons.h for the ids.
+	//
 	// It exists to be counted against, not to be used as a bound: world/block_tiles_check.c
 	// asserts that the number of BTEX/TILE assert lines equals this number, which is what
 	// turns "somebody forgot to add the assert" from silence into a build error. Same shape
@@ -134,7 +138,23 @@ enum {
 	// claimed 38..41 for the four raw meats, and forty-two until v1.8.15 claimed 42..47 for
 	// the four cooked meats and the furnace's unlit/lit front faces.
 	//
-	// Fifteen free slots remain, 48..62: slot 63 is ATLAS_TILE_MISSING (world/atlas_uv.h)
+	// v1.8.16 IMP-ICONS then PAINTED 48..56 without naming them here, and the distinction is
+	// the whole point of the change. Those nine are ITEM ICONS — an apple, four raw cuts, four
+	// cooked cuts — with real alpha-0 texels around the item's silhouette, drawn only by
+	// scene/ui.c's inventory quad. They must NEVER be a block face: the opaque terrain pass
+	// runs with the alpha test off and the blend func at ONE/ZERO (scene/chunk_render.c), so a
+	// transparent texel on a cube would write its RGB at full strength over whatever was
+	// behind it rather than disappearing. Leaving them out of this enum is what makes that
+	// unrepresentable — world/registry.c can only name a BTEX_*, every BTEX_* must have a
+	// TILE_* twin (world/block_tiles_check.c asserts the two counts are equal), and neither
+	// enum has a name for these. Their ids live in source/gfx/item_icons.h instead, which the
+	// block-face path never includes.
+	//
+	// So TILE_USED_COUNT stays 48 and still means exactly what it says: block-face tiles. The
+	// number that moved is ATLAS_PAINTED_SLOTS in world/atlas_uv_shader_test.c, 48 -> 57,
+	// because that one counts what tools/make_atlas.py actually paints.
+	//
+	// Six free slots remain, 57..62: slot 63 is ATLAS_TILE_MISSING (world/atlas_uv.h)
 	// and cannot be claimed.
 	//
 	// It was twelve of FIFTEEN until v1.8.2's task 13b. The old ceiling was not the sheet
@@ -145,9 +165,11 @@ enum {
 	// dimension — for 64 slots, all addressable. The vertex is still 8 bytes. See the long
 	// note in world/atlas_uv.h.
 	//
-	// The 32 spares (32..62, and the reserved 63) are NOT blank. Since v1.6.0 F7
-	// tools/make_atlas.py paints every slot this list does not name with the magenta/black
-	// missing-texture marker, and ATLAS_TILE_MISSING (slot 63, world/atlas_uv.h) is reserved
+	// The spares (57..62 as of v1.8.16, and the reserved 63 — this sentence said "32 spares
+	// (32..62)" and had been stale since v1.8.14) are NOT blank. Since v1.6.0 F7
+	// tools/make_atlas.py paints every slot its TILES list does not cover with the
+	// magenta/black missing-texture marker, and ATLAS_TILE_MISSING (slot 63, world/atlas_uv.h)
+	// is reserved
 	// as one permanently — it is where atlasRect() clamps an out-of-range tile id. Before
 	// that, tex 10..14 drew the sheet's near-black background fill and an out-of-range tex
 	// drew grass, so a server shipping a wrong tex byte looked like a rendering bug here.

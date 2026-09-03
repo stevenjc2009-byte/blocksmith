@@ -5,6 +5,7 @@
 
 #include "gfx/atlas.h"
 #include "gfx/font.h"
+#include "gfx/item_icons.h"   // itemIconTile, for the drops that have real item art
 #include "gfx/sprite.h"
 #include "debug/biomeinfo.h"
 #include "net/inv_bridge.h"
@@ -71,6 +72,29 @@
 #define ICON_INSET_TOP 2
 #define ICON_H         26   // icon spans rows [2, 28) of the 40-px cell; the badge (see
                              // drawSlotIcon) sits at row 31, a clear 3 px below it
+
+// v1.8.16 IMP-ICONS. The icon QUAD is square; ICON_INSET_X is not its inset any more.
+//
+// It was. The quad was drawn (SLOT_PX - 2*ICON_INSET_X) = 34 px wide and ICON_H = 26 px tall
+// from a 16x16 atlas tile, which is a 31% horizontal stretch. On a block face that is
+// invisible — dirt stretched is still dirt — so it survived from step 8.2 unnoticed. It stops
+// being invisible the moment an icon has a SHAPE: a round apple came out an oval, which is
+// the wrong shape, which is the thing steve was complaining about. So the quad is now
+// ICON_H x ICON_H and centred in the cell.
+//
+// ICON_INSET_X stays 3 and keeps its old meaning for the FONT fallback in drawSlotIcon —
+// that path draws the block's NAME when no atlas texture was handed in, and its comment's
+// "34px icon column at FONT_ADVANCE(6) fits every <=6-char name" arithmetic depends on the 3.
+// Narrowing that to 26 px would have cut every name to four characters. Two different things
+// wanted two different numbers; they now have them.
+//
+// Geometry check, against the cell the badge and the icon share (see the note above on why
+// they must not overlap): the quad spans x [7, 33) of the 40-px cell — a 7 px margin each
+// side, so it cannot leave the slot — and rows [2, 28), which ICON_INSET_TOP/ICON_H already
+// fixed and this does not touch. The badge is unmoved at rows [31, 38). Disjoint in y, which
+// is what the two-draw-call guarantee actually rests on; the x narrowing only adds slack.
+#define ICON_W       ICON_H                        // 26 — square, so a 16x16 tile is unstretched
+#define ICON_QUAD_X  ((SLOT_PX - ICON_W) / 2)      // 7 — centred, where ICON_INSET_X was 3
 
 // ── Palette ────────────────────────────────────────────────────────────────────────────
 
@@ -353,13 +377,25 @@ static void furnaceWithdraw(Inventory* inv, FurnaceState* fs, int which)
 // sets in U: a quad's texel centres interpolate strictly inside (0,1) and never land on the
 // wrapping endpoint itself.
 //
-// FACE_TOP is used for every block's icon — grass shows its green top, wood shows its ring
-// pattern, and every other block in this game's six-block list (world/block.h) is the same
-// texture on every face, so there is no "which face reads best as an icon" decision to make
-// beyond picking one consistently.
+// FACE_TOP is used for every BLOCK's icon — grass shows its green top, wood shows its ring
+// pattern, and every other cube in this game is the same texture on every face, so there is
+// no "which face reads best as an icon" decision to make beyond picking one consistently.
+//
+// v1.8.16 IMP-ICONS: items that are not really cubes no longer go through FACE_TOP at all.
+// A block face is a full opaque square by construction, so a porkchop's icon was a square of
+// pink with no chop in it — steve's report, and the reason this line moved. gfx/item_icons.h
+// answers with a dedicated item-art slot for the nine drops that have one (apple, the four
+// raw cuts, the four cooked cuts) and ITEM_ICON_NONE for everything else, which is every
+// placeable block in the game and keeps their icons byte-identical to what they drew before.
+//
+// The fallback is the FIRST thing to check if an icon ever looks wrong: an id with no case in
+// itemIconTile() lands on `default:` and draws its top face, which is a correct-looking icon
+// for a cube and a plain square for a drop — i.e. the failure mode here is exactly the old
+// behaviour, not a magenta marker, so it will not announce itself.
 static void iconUv(BlockId id, float* u0, float* v0, float* u1, float* v1)
 {
-	const AtlasRect r = atlasTile(blockFaceTex(id, FACE_TOP));
+	const int icon = itemIconTile(id);
+	const AtlasRect r = atlasTile(icon != ITEM_ICON_NONE ? icon : (int)blockFaceTex(id, FACE_TOP));
 	*u0 = (float)r.u0 / (float)ATLAS_W_PX;
 	*v0 = (float)(r.vslot1 * TILE_PX) / (float)ATLAS_H_PX;  // quad's top edge = art's top row
 	*u1 = (float)r.u1 / (float)ATLAS_W_PX;
@@ -417,8 +453,10 @@ static void drawSlotIcon(DrawPass pass, URect r, const InvSlot* s, bool selected
 
 	float u0, v0, u1, v1;
 	iconUv(s->item, &u0, &v0, &u1, &v1);
-	spriteQuad((float)(r.x + ICON_INSET_X), (float)(r.y + ICON_INSET_TOP),
-	           (float)(SLOT_PX - 2 * ICON_INSET_X), (float)ICON_H,
+	// ICON_QUAD_X / ICON_W, not ICON_INSET_X — see their definition for why the quad has to
+	// be square now that an icon can have a shape.
+	spriteQuad((float)(r.x + ICON_QUAD_X), (float)(r.y + ICON_INSET_TOP),
+	           (float)ICON_W, (float)ICON_H,
 	           u0, v0, u1, v1, SPRITE_WHITE);
 }
 

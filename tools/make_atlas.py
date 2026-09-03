@@ -264,6 +264,38 @@ TILES = [
     # BTEX_STONE for those — so this is two tiles, not six.
     "furnace_front",         # 46 — unlit
     "furnace_front_lit",     # 47 — lit
+    # v1.8.16 IMP-ICONS — nine ITEM icons, slots 48..56. Appended for the reason everything
+    # since the sentinel has been: this order IS the contract with the C side, so inserting
+    # would silently re-texture every tile after the insertion point.
+    #
+    # These are a NEW KIND of tile and the difference is load-bearing. Every slot 0..47 is a
+    # BLOCK FACE: it is sampled by the terrain pass, which runs with the alpha test OFF and
+    # blending at ONE/ZERO (scene/chunk_render.c), so a transparent texel there would draw as
+    # whatever the framebuffer already held. These nine are sampled ONLY by the inventory /
+    # hotbar quad in scene/ui.c, which runs after chunk_render.c has disabled the alpha test
+    # and with gfx/sprite.c's SRC_ALPHA/ONE_MINUS_SRC_ALPHA blend armed — so they may, and
+    # do, carry real alpha 0 around the item's silhouette.
+    #
+    # That is what makes them SAFE ONLY AS ICONS, and it is why they get no TILE_* name in
+    # gfx/atlas_tiles.h and no BTEX_* in world/block.h: those two enums are the block-face
+    # contract, and a tex byte pointing a block face at one of these would put a
+    # transparent-edged sprite on the side of a cube. The icon lookup lives in
+    # source/gfx/item_icons.h instead, which no block face can reach.
+    #
+    # Each has an opaque interior, alpha 0 outside, and a darkened one-texel rim
+    # (_icon_outline) so the silhouette still reads against scene/ui.c's COL_SLOT_BG.
+    # gfx/atlas.c sets GPU_NEAREST on both filters, so a transparent edge texel here cannot
+    # bleed into the vertically adjacent slot the way tile_leaves' border comment worries
+    # about for a linear-filtered sheet.
+    "icon_apple",             # 48
+    "icon_raw_porkchop",      # 49
+    "icon_raw_beef",          # 50
+    "icon_raw_chicken",       # 51
+    "icon_raw_mutton",        # 52
+    "icon_cooked_porkchop",   # 53
+    "icon_cooked_beef",       # 54
+    "icon_cooked_chicken",    # 55
+    "icon_cooked_mutton",     # 56
 ]
 
 
@@ -2342,6 +2374,434 @@ def tile_furnace_front_lit(rng):
     return img
 
 
+# ── v1.8.16 IMP-ICONS: nine ITEM icons, slots 48..56 ─────────────────────────────────────
+#
+# Every tile above this line is a BLOCK FACE, and until v1.8.16 the inventory drew one of
+# those as an item's icon (scene/ui.c's iconUv called blockFaceTex(id, FACE_TOP)). For a cube
+# that is right: a dirt icon should look like dirt. For a DROP it is wrong in the way steve
+# put it — a porkchop came out as a full opaque square of pink, with no chop in it, because a
+# 16x16 block face has no silhouette to have. These nine give the drops real item art:
+# item-shaped, alpha 0 around the edge, readable at a glance.
+#
+# THE CONSTRAINT, because getting it wrong is silent. A tile with transparent texels must
+# never be a placeable block's face. The opaque terrain pass runs with the alpha TEST off and
+# the blend func at ONE/ZERO (scene/chunk_render.c), so an alpha-0 texel on a cube face draws
+# its RGB at full strength over whatever is behind it — it does not vanish, it smears. These
+# nine are therefore reachable only through gfx/item_icons.h, which the block-face path never
+# consults; they deliberately have no TILE_* name in gfx/atlas_tiles.h and no BTEX_* in
+# world/block.h, so world/registry.c cannot name one even by accident.
+#
+# The UI path needs no state change to show them. gfx/sprite.c arms
+# SRC_ALPHA/ONE_MINUS_SRC_ALPHA per batch and MODULATE on C3D_Both, and chunk_render.c has
+# already turned the alpha test off by the time ui.c draws, so alpha here is a real
+# per-texel blend weight and not a 1-bit cutout. It is still written as 0 or 255 only:
+# gfx/atlas.t3s quantises this sheet to rgba5551, whose alpha is ONE bit, so an intermediate
+# value would round to one side and look like a mistake — the same reasoning tile_leaves'
+# docstring gives.
+#
+# Construction is shared: a silhouette predicate, a speckled fill, two soft relief blobs
+# (lit upper-left / shadowed lower-right, the same lighting every other tile on this sheet
+# uses), then _icon_outline darkens the rim by one texel. The rim is not decoration — without
+# it a mid-tone cut sits on scene/ui.c's COL_SLOT_BG (40,32,58) with no edge and reads as a
+# smudge at the 26 px the icon quad is drawn at.
+#
+# Raw and cooked share the silhouette on purpose (a chop is the same cut before and after the
+# furnace) and are told apart by PALETTE PLUS A SHAPE CUE — char flecks, grill stripes, a
+# crisped skin, a browned rind. Palette alone is not enough at this size: two brown-ish tiles
+# a few values apart are indistinguishable on a 240p screen.
+
+
+def _ell(x, y, cx, cy, rx, ry):
+    """Ellipse membership for TEXEL CENTRES.
+
+    x/y are integer texel indices; the centre of texel 0 is 0.5. Testing the corner instead
+    biases every shape half a texel up-left, which on a 16 px sprite is a visible lopsided
+    silhouette rather than a rounding detail.
+    """
+    dx = (x + 0.5 - cx) / rx
+    dy = (y + 0.5 - cy) / ry
+    return dx * dx + dy * dy <= 1.0
+
+
+def _seg_dist(x, y, x0, y0, x1, y1):
+    """Distance from texel (x, y)'s centre to the segment (x0,y0)-(x1,y1). Thresholding this
+    gives a capsule, which is what a bone shaft is: a stroke with rounded ends, not a rect."""
+    dx, dy = x1 - x0, y1 - y0
+    span = dx * dx + dy * dy
+    t = 0.0 if span == 0.0 else max(0.0, min(1.0, ((x + 0.5 - x0) * dx + (y + 0.5 - y0) * dy) / span))
+    return ((x + 0.5 - (x0 + t * dx)) ** 2 + (y + 0.5 - (y0 + t * dy)) ** 2) ** 0.5
+
+
+def _icon_canvas():
+    """A fully TRANSPARENT 16x16 RGBA tile. Every icon starts here rather than from
+    speckle(), which returns an opaque RGB field — that difference is the whole point of
+    these tiles."""
+    return Image.new("RGBA", (TILE_PX, TILE_PX), (0, 0, 0, 0))
+
+
+def _icon_fill(px, inside, rng, shades, weights=None):
+    """Paints the silhouette `inside` accepts with a weighted speckle, opaque; leaves
+    everything else at alpha 0."""
+    for y in range(TILE_PX):
+        for x in range(TILE_PX):
+            if inside(x, y):
+                shade = rng.choices(shades, weights=weights)[0] if weights else rng.choice(shades)
+                px[x, y] = shade + (255,)
+
+
+def _icon_blob(px, rng, cx, cy, r, colour, prob):
+    """Sprays `colour` over the ALREADY-OPAQUE texels within r of (cx, cy).
+
+    Jittered by `prob` rather than filled solid, and clipped to the existing silhouette so it
+    can never widen it — the same soft-blob relief tile_apple and tile_raw_porkchop use, which
+    reads as a rounded surface where a hard disc reads as a sticker.
+    """
+    for y in range(TILE_PX):
+        for x in range(TILE_PX):
+            if px[x, y][3] == 0:
+                continue
+            if ((x + 0.5 - cx) ** 2 + (y + 0.5 - cy) ** 2) ** 0.5 < r and rng.random() < prob:
+                px[x, y] = colour + (255,)
+
+
+def _icon_outline(px, colour, t=0.70):
+    """Darkens the one-texel rim of the silhouette toward `colour`.
+
+    Collected FIRST and applied afterwards, because darkening in place would let an
+    already-darkened texel count as the neighbour that darkens the next one and eat inward.
+    A texel on the tile's physical border counts as an edge too: out-of-bounds is outside.
+    """
+    edge = []
+    for y in range(TILE_PX):
+        for x in range(TILE_PX):
+            if px[x, y][3] == 0:
+                continue
+            for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                if not (0 <= nx < TILE_PX and 0 <= ny < TILE_PX) or px[nx, ny][3] == 0:
+                    edge.append((x, y))
+                    break
+    for x, y in edge:
+        r, g, b, _ = px[x, y]
+        px[x, y] = blend((r, g, b), colour, t) + (255,)
+
+
+# The two bone palettes. Cooked bone is toasted rather than cream: a snow-white bone against
+# a browned cut reads as a raw tile someone tinted, which is exactly the confusion these
+# icons exist to remove.
+_BONE_RAW = ([(238, 224, 196), (246, 236, 216), (222, 206, 176)], (196, 180, 150))
+_BONE_COOKED = ([(226, 208, 172), (236, 220, 188), (208, 188, 152)], (180, 158, 124))
+
+
+def _icon_chop(rng, pal):
+    """The porkchop silhouette: one fat meat lobe with a smaller shoulder lobe up-right and a
+    round BONE KNOB at the top-right corner.
+
+    The knob is at a corner and not on a side so this cut cannot be confused with
+    _icon_rack's full-length rind, and it is round rather than square so it reads as a bone
+    sitting in the meat instead of a flat swatch. Shared by the raw and cooked porkchop; only
+    `pal` differs.
+    """
+    bone, bone_shadow = pal["bone"]
+    img = _icon_canvas()
+    px = img.load()
+
+    def meat(x, y):
+        return _ell(x, y, 6.6, 9.8, 4.9, 5.0) or _ell(x, y, 9.6, 6.6, 3.7, 3.5)
+
+    def knob(x, y):
+        return _ell(x, y, 12.2, 4.0, 3.0, 3.0)
+
+    _icon_fill(px, lambda x, y: meat(x, y) or knob(x, y), rng, pal["meat"], weights=[4, 3, 2, 3])
+    _icon_blob(px, rng, 4.8, 8.0, 3.2, pal["lit"], 0.70)
+    _icon_blob(px, rng, 9.0, 12.4, 3.4, pal["shadow"], 0.62)
+    for y in range(TILE_PX):
+        for x in range(TILE_PX):
+            if px[x, y][3] and knob(x, y):
+                px[x, y] = (bone_shadow if (x + y) % 3 == 0 else rng.choice(bone)) + (255,)
+    if pal.get("char"):
+        # Char flecks, scattered over the meat only. A hand-held chop browns unevenly, so
+        # these are scattered rather than run along an edge.
+        for _ in range(11):
+            x, y = rng.randrange(3, 12), rng.randrange(7, 14)
+            if px[x, y][3] and not knob(x, y):
+                px[x, y] = pal["char"] + (255,)
+    _icon_outline(px, pal["outline"])
+    return img
+
+
+def _icon_steak(rng, pal):
+    """The beef silhouette: a rounded-rectangle SLAB. A steak keeps its cut edge, so this is
+    the one cut on the sheet with straight sides — that is its whole distinguishing feature
+    against three lobed ones, and it survives the 16 px downscale where a palette difference
+    would not."""
+    img = _icon_canvas()
+    px = img.load()
+
+    def inside(x, y):
+        fx, fy = x + 0.5, y + 0.5
+        # A rounded rect as "within r of the inset core box", which rounds all four corners
+        # with one expression instead of four corner tests.
+        cx = min(max(fx, 4.0), 12.2)
+        cy = min(max(fy, 5.4), 11.0)
+        return (fx - cx) ** 2 + (fy - cy) ** 2 <= 2.1 ** 2
+
+    _icon_fill(px, inside, rng, pal["meat"], weights=[4, 3, 2, 3])
+    _icon_blob(px, rng, 5.2, 6.4, 3.4, pal["lit"], 0.55)
+    _icon_blob(px, rng, 11.4, 11.2, 3.6, pal["shadow"], 0.58)
+
+    if pal.get("grill"):
+        # Cooked: three bold diagonal grill stripes plus a fully seared border. Two shape
+        # cues, not one, because this cut was already the darkest and reddest raw tile and a
+        # browner brown alone would not have read.
+        for k in (-4, 1, 6):
+            for y in range(TILE_PX):
+                for x in range(TILE_PX):
+                    if px[x, y][3] and abs((x - y) - k) <= 0.6:
+                        px[x, y] = pal["grill"] + (255,)
+        for y in range(TILE_PX):
+            for x in range(TILE_PX):
+                if not px[x, y][3]:
+                    continue
+                near = any(not (0 <= x + dx < TILE_PX and 0 <= y + dy < TILE_PX)
+                           or px[x + dx, y + dy][3] == 0
+                           for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)))
+                if near:
+                    px[x, y] = pal["sear"] + (255,)
+    else:
+        # Raw: pale marbling dashes, 2x1 so they read as fat seams rather than as noise.
+        # Ten attempts, not seven: they are placed by rejection and land on top of each
+        # other, and at seven the rendered tile came out with two visible seams on a large
+        # flat slab and read as a plain red rectangle.
+        for _ in range(10):
+            x, y = rng.randrange(3, 12), rng.randrange(4, 12)
+            if px[x, y][3] and px[x + 1, y][3]:
+                px[x, y] = pal["marble"] + (255,)
+                px[x + 1, y] = pal["marble"] + (255,)
+    _icon_outline(px, pal["outline"])
+    return img
+
+
+def _icon_drumstick(rng, pal):
+    """The chicken silhouette: a DRUMSTICK — a fat meat bulb up-left, a bone shaft running
+    down-right out of it, and a knuckle on the end.
+
+    Chicken is the one drop here that is not a flat cut, and giving it a limb shape is what
+    makes it the easiest of the four to name at a glance in a hotbar.
+    """
+    bone, bone_shadow = pal["bone"]
+    img = _icon_canvas()
+    px = img.load()
+
+    def flesh(x, y):
+        return _ell(x, y, 6.4, 5.8, 4.5, 4.3)
+
+    def shaft(x, y):
+        return _seg_dist(x, y, 8.0, 8.0, 11.0, 13.2) < 1.7 or _ell(x, y, 11.6, 13.6, 2.3, 2.2)
+
+    _icon_fill(px, lambda x, y: flesh(x, y) or shaft(x, y), rng, pal["meat"], weights=[4, 3, 2, 3])
+    _icon_blob(px, rng, 4.6, 4.2, 3.0, pal["lit"], 0.65)
+    _icon_blob(px, rng, 8.4, 8.0, 3.0, pal["shadow"], 0.50)
+    for y in range(TILE_PX):
+        for x in range(TILE_PX):
+            if px[x, y][3] and shaft(x, y) and not flesh(x, y):
+                px[x, y] = (bone_shadow if (x + y) % 3 == 0 else rng.choice(bone)) + (255,)
+    if pal.get("crisp"):
+        # Cooked: crisped skin, dark specks on the bulb only. The bone is not charred.
+        for _ in range(9):
+            x, y = rng.randrange(2, 11), rng.randrange(1, 10)
+            if px[x, y][3] and flesh(x, y):
+                px[x, y] = pal["crisp"] + (255,)
+    _icon_outline(px, pal["outline"])
+    return img
+
+
+def _icon_rack(rng, pal):
+    """The mutton silhouette: a wide meat lobe sitting on a HORIZONTAL RIB BAR that pokes out
+    past the meat on both sides — a T, near enough.
+
+    This is the second design. The first was a round lobe with a fat rind down its right side
+    and a bone spur off the bottom-left corner, and it FAILED when rendered and looked at: the
+    spur read as a bone shaft and the whole tile came out as a red drumstick, a mirror of
+    _icon_drumstick, with the cooked pair worse still (two brown drumsticks side by side in
+    the hotbar). A rind on a side and a knob at a corner are both small, local marks; what
+    separates four meat tiles at 16 px is the OUTLINE, so the rib had to become part of the
+    silhouette instead of a detail inside it.
+
+    Nothing else on the sheet is horizontal-symmetric like this: _icon_chop leans up-right,
+    _icon_drumstick runs diagonally, _icon_steak is a filled block.
+    """
+    bone, bone_shadow = pal["bone"]
+    img = _icon_canvas()
+    px = img.load()
+
+    def body(x, y):
+        return _ell(x, y, 8.0, 6.8, 5.2, 4.6)
+
+    def rib(x, y):
+        return _seg_dist(x, y, 2.4, 12.2, 13.6, 12.2) < 1.6
+
+    _icon_fill(px, lambda x, y: body(x, y) or rib(x, y), rng, pal["meat"], weights=[4, 3, 2, 3])
+    _icon_blob(px, rng, 5.4, 4.8, 3.2, pal["lit"], 0.62)
+    _icon_blob(px, rng, 10.6, 9.4, 3.2, pal["shadow"], 0.55)
+
+    # The rib itself, and a fat cap along the lobe's top arc. The cap is what keeps the meat
+    # half from being a plain oval; it is on the TOP edge, away from the rib, so the two
+    # cream regions do not merge into one bone running through the tile.
+    for y in range(TILE_PX):
+        for x in range(TILE_PX):
+            if px[x, y][3] == 0:
+                continue
+            if rib(x, y):
+                px[x, y] = (bone_shadow if (x + y) % 3 == 0 else rng.choice(bone)) + (255,)
+                continue
+            dx = (x + 0.5 - 8.0) / 5.2
+            dy = (y + 0.5 - 6.8) / 4.6
+            # 0.66, not 0.72. At 0.72 the top-centre texels fell just inside the threshold
+            # (normalised radius 0.717) and the cap rendered as two cream tufts on the
+            # shoulders with red between them — two ears rather than one arc.
+            if y + 0.5 < 6.8 and (dx * dx + dy * dy) ** 0.5 > 0.66:
+                px[x, y] = (bone_shadow if (x * 3 + y) % 4 == 0 else rng.choice(bone)) + (255,)
+    if pal.get("char"):
+        for _ in range(9):
+            x, y = rng.randrange(3, 13), rng.randrange(4, 11)
+            if px[x, y][3] and body(x, y) and not rib(x, y):
+                px[x, y] = pal["char"] + (255,)
+    _icon_outline(px, pal["outline"])
+    return img
+
+
+def tile_icon_apple(rng):
+    """The apple item, slot 48. The only one of the nine with no raw/cooked twin.
+
+    A single ellipse with a two-texel notch bitten out of the top centre for the stem well,
+    a stem leaning right out of it and a leaf on the other side. The notch is what stops it
+    reading as a plain red ball, and the leaf is the only green on the tile, so it also
+    carries the "fruit, not meat" read at a glance.
+    """
+    body = [(198, 42, 48), (178, 32, 40), (216, 58, 60), (162, 26, 34)]
+    img = _icon_canvas()
+    px = img.load()
+
+    def inside(x, y):
+        return _ell(x, y, 8.0, 9.4, 5.7, 5.2) and not (y <= 5 and 7 <= x <= 8)
+
+    _icon_fill(px, inside, rng, body, weights=[4, 3, 2, 3])
+    _icon_blob(px, rng, 5.0, 7.4, 3.0, (240, 108, 100), 0.70)
+    _icon_blob(px, rng, 11.4, 12.4, 3.4, (116, 14, 26), 0.62)
+    for x, y in ((4, 7), (5, 7), (4, 8)):
+        px[x, y] = (252, 206, 194, 255)
+    # Stem out of the notch, then the leaf beside it. Both sit OUTSIDE the body ellipse and
+    # so extend the silhouette rather than being a recolour inside it — the first version
+    # tucked the leaf into the fruit's own outline and, rendered, it came out as a single
+    # stray green texel that read as a speck of dirt. They are drawn before _icon_outline so
+    # they pick up the same dark rim the body does and stay attached to it.
+    for x, y in ((8, 5), (8, 4), (8, 3), (9, 2)):
+        px[x, y] = rng.choice([(104, 72, 44), (80, 54, 32)]) + (255,)
+    for x, y in ((4, 3), (5, 3), (6, 3), (7, 3), (4, 2), (5, 2), (6, 2), (5, 1)):
+        px[x, y] = rng.choice([(74, 156, 70), (58, 130, 58)]) + (255,)
+    _icon_outline(px, (52, 8, 18))
+    return img
+
+
+def tile_icon_raw_porkchop(rng):
+    """Raw porkchop, slot 49. The palest of the three mammal cuts, as tile_raw_porkchop's own
+    docstring reasons — pork is traditionally lighter than beef or mutton."""
+    return _icon_chop(rng, {
+        "meat": [(226, 122, 126), (208, 100, 108), (238, 142, 142), (192, 84, 92)],
+        "lit": (248, 172, 170),
+        "shadow": (150, 58, 68),
+        "bone": _BONE_RAW,
+        "outline": (94, 26, 38),
+    })
+
+
+def tile_icon_cooked_porkchop(rng):
+    """Cooked porkchop, slot 53. Same silhouette as tile_icon_raw_porkchop; the meat goes
+    roasted tan-brown and picks up char flecks the raw cut has no reason to carry."""
+    return _icon_chop(rng, {
+        "meat": [(180, 124, 78), (160, 106, 64), (196, 140, 92), (142, 90, 52)],
+        "lit": (216, 170, 118),
+        "shadow": (96, 56, 30),
+        "bone": _BONE_COOKED,
+        "char": (52, 30, 18),
+        "outline": (54, 30, 16),
+    })
+
+
+def tile_icon_raw_beef(rng):
+    """Raw beef, slot 50. The deepest red of the four, with pale marbling seams."""
+    return _icon_steak(rng, {
+        "meat": [(154, 38, 46), (134, 28, 38), (172, 52, 58), (116, 22, 32)],
+        "lit": (192, 76, 78),
+        "shadow": (84, 12, 24),
+        "marble": (234, 192, 188),
+        "outline": (58, 8, 18),
+    })
+
+
+def tile_icon_cooked_beef(rng):
+    """Cooked beef, slot 54. Brown through, a fully seared border ring, and three black grill
+    stripes — see _icon_steak for why this cut needs two cues where the others need one."""
+    return _icon_steak(rng, {
+        "meat": [(116, 64, 38), (98, 52, 30), (132, 78, 46), (82, 42, 24)],
+        "lit": (156, 98, 60),
+        "shadow": (54, 26, 14),
+        "grill": (24, 10, 8),
+        "sear": (44, 20, 12),
+        "outline": (22, 10, 8),
+    })
+
+
+def tile_icon_raw_chicken(rng):
+    """Raw chicken, slot 51. Pale pink-white flesh on a cream bone — the lightest tile of the
+    nine, which is its own read against three reds and four browns."""
+    return _icon_drumstick(rng, {
+        "meat": [(240, 200, 194), (226, 182, 178), (250, 216, 210), (212, 166, 164)],
+        "lit": (254, 232, 226),
+        "shadow": (186, 138, 138),
+        "bone": _BONE_RAW,
+        "outline": (124, 78, 82),
+    })
+
+
+def tile_icon_cooked_chicken(rng):
+    """Cooked chicken, slot 55. Golden roast skin with dark crisped specks; the largest
+    lightness swing of the four raw/cooked pairs, because the raw tile is the palest."""
+    return _icon_drumstick(rng, {
+        "meat": [(208, 148, 70), (186, 126, 56), (224, 170, 88), (166, 108, 44)],
+        "lit": (240, 194, 116),
+        "shadow": (126, 72, 28),
+        "bone": _BONE_COOKED,
+        "crisp": (92, 50, 18),
+        "outline": (70, 36, 12),
+    })
+
+
+def tile_icon_raw_mutton(rng):
+    """Raw mutton, slot 52. A mid-red between beef's deep red and pork's pink, wrapped in a
+    cream fat rind that runs the length of one side."""
+    return _icon_rack(rng, {
+        "meat": [(200, 76, 82), (180, 62, 70), (216, 94, 98), (162, 50, 60)],
+        "lit": (232, 122, 122),
+        "shadow": (120, 32, 42),
+        "bone": _BONE_RAW,
+        "outline": (82, 18, 30),
+    })
+
+
+def tile_icon_cooked_mutton(rng):
+    """Cooked mutton, slot 56. Browned through, and the rind browns WITH it — a cream rind on
+    a brown cut would have read as the raw tile with a tint on the middle only."""
+    return _icon_rack(rng, {
+        "meat": [(148, 88, 52), (128, 72, 42), (166, 104, 64), (110, 58, 34)],
+        "lit": (190, 132, 84),
+        "shadow": (76, 40, 22),
+        "bone": ([(208, 178, 132), (220, 192, 148), (190, 160, 116)], (166, 134, 96)),
+        "char": (48, 26, 14),
+        "outline": (44, 22, 12),
+    })
+
+
 def tile_sentinel(_rng):
     """Not art — a bleed alarm.
 
@@ -2435,6 +2895,18 @@ PAINTERS = {
     "cooked_mutton": tile_cooked_mutton,
     "furnace_front": tile_furnace_front,
     "furnace_front_lit": tile_furnace_front_lit,
+    # v1.8.16 IMP-ICONS. Named icon_* so they cannot be mistaken for the block-face tiles of
+    # the same drops above ("apple", "raw_porkchop", ...), which still exist and are still
+    # what a placed block samples.
+    "icon_apple": tile_icon_apple,
+    "icon_raw_porkchop": tile_icon_raw_porkchop,
+    "icon_raw_beef": tile_icon_raw_beef,
+    "icon_raw_chicken": tile_icon_raw_chicken,
+    "icon_raw_mutton": tile_icon_raw_mutton,
+    "icon_cooked_porkchop": tile_icon_cooked_porkchop,
+    "icon_cooked_beef": tile_icon_cooked_beef,
+    "icon_cooked_chicken": tile_icon_cooked_chicken,
+    "icon_cooked_mutton": tile_icon_cooked_mutton,
 }
 
 

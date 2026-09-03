@@ -211,7 +211,21 @@ static char s_first[512];
 // which is precisely the direction this pin is meant to fire in. The pin's OTHER direction --
 // a registered block whose tile is still unpainted -- remains the failure the whole file exists
 // for, and is unaffected.
-#define ATLAS_PAINTED_SLOTS 48
+//
+// v1.8.16 IMP-ICONS: 48 -> 57. tools/make_atlas.py's TILES list gained nine entries in slots
+// 48..56 - icon_apple, then the four raw cuts and the four cooked cuts as ITEM ICONS. This is
+// the first append in this file's history where the new slots have NO block id at all and no
+// TILE_* name in gfx/atlas_tiles.h either, so the id-to-slot paragraph above does not apply to
+// them in any form: they are addressed only through source/gfx/item_icons.h, by scene/ui.c's
+// inventory quad, and by nothing else. TILE_USED_COUNT stays 48 for exactly that reason - it
+// counts block-face tiles - which is the clearest demonstration yet of the point the paragraph
+// at the top of this note makes: THIS number belongs to the generator, not to the enum, and
+// the two have now genuinely diverged rather than merely being allowed to.
+//
+// They are also the first painted slots on the sheet with transparent texels in them (see
+// tools/make_atlas.py's TILES comment for why that is safe here and would not be on a cube),
+// which the fingerprint below covers for free: it hashes the decoded RGBA, alpha included.
+#define ATLAS_PAINTED_SLOTS 57
 
 // Slots 10 and 11 within that: water and tall grass (roadmap tasks 17 and 19). Named here
 // because the two texel-content checks further down are about what these two tiles ARE, not
@@ -1386,6 +1400,22 @@ int main(void)
 				0xEE9CE45C7B52C826ull,   // 45 cooked_mutton    (NEW pin, v1.8.15 -- see below)
 				0x7A99323A1EEDDADAull,   // 46 furnace_front    (NEW pin, v1.8.15 -- see below)
 				0x19A3B240EEFBFB75ull,   // 47 furnace_front_lit(NEW pin, v1.8.15 -- see below)
+				// v1.8.16 IMP-ICONS, nine NEW pins. These nine are ITEM ICONS, not block faces:
+				// no block id addresses them and gfx/atlas_tiles.h's TILE_* enum does not name
+				// them, so unlike every row above there is no id to read this table against.
+				// They are reached only through source/gfx/item_icons.h. They are also the first
+				// rows here whose art contains alpha 0 - the fingerprint hashes decoded RGBA, so
+				// the transparency is pinned along with the colour and a silhouette that changed
+				// shape would fail here just as a recoloured one would.
+				0x63033E7E6B3511ACull,   // 48 icon_apple          (NEW pin, v1.8.16 -- see below)
+				0xEE1CB334B25D6FECull,   // 49 icon_raw_porkchop   (NEW pin, v1.8.16 -- see below)
+				0x4824D2809C7DB5BFull,   // 50 icon_raw_beef       (NEW pin, v1.8.16 -- see below)
+				0x2E91134DF5D7061Full,   // 51 icon_raw_chicken    (NEW pin, v1.8.16 -- see below)
+				0xEA7409166319C3A9ull,   // 52 icon_raw_mutton     (NEW pin, v1.8.16 -- see below)
+				0x6DD195D8EF3C28ACull,   // 53 icon_cooked_porkchop(NEW pin, v1.8.16 -- see below)
+				0xAA762713344DB7BFull,   // 54 icon_cooked_beef    (NEW pin, v1.8.16 -- see below)
+				0x40F7DDD1B48EB222ull,   // 55 icon_cooked_chicken (NEW pin, v1.8.16 -- see below)
+				0x43A4875C71F6C61Eull,   // 56 icon_cooked_mutton  (NEW pin, v1.8.16 -- see below)
 			};
 			for (int slot = 0; slot < ATLAS_PAINTED_SLOTS; slot++) {
 				const uint64_t got = slotFingerprint(SLOT_PNG_TOP(slot));
@@ -1398,6 +1428,44 @@ int main(void)
 				      slot, got, kPaintedFingerprint[slot]);
 			}
 
+			// ── 2026-09-03: slots 48..56 are NINE new pins (v1.8.16 IMP-ICONS) ────────────
+			//
+			// tools/make_atlas.py gained nine painters — icon_apple, then the four raw cuts and
+			// the four cooked cuts — appended to TILES at slots 48..56, taking the sheet from
+			// forty-eight painted tiles to fifty-seven. ATLAS_PAINTED_SLOTS moved 48 -> 57.
+			//
+			// These are ITEM ICONS, not block faces. No block id addresses them, gfx/
+			// atlas_tiles.h's TILE_* enum does not name them (so TILE_USED_COUNT is still 48
+			// and world/block_tiles_check.c is untouched), and they are reached only through
+			// source/gfx/item_icons.h by scene/ui.c's inventory quad. That is deliberate and it
+			// is a safety property: they contain alpha-0 texels, and the opaque terrain pass
+			// runs with the alpha test off and the blend func at ONE/ZERO, so one of these on a
+			// cube face would write its RGB over the framebuffer instead of vanishing. Not
+			// being nameable as a BTEX_* is what makes that unrepresentable.
+			//
+			// The RUN, not the reasoning. With ATLAS_PAINTED_SLOTS already at 57 and all nine
+			// pins set to zero, this binary reported "FAIL 9/5847" — exactly nine failures, one
+			// per new slot, every one of slots 0..47 green in the same run, and H9's marker
+			// sweep over 57..62 green as well. The nine values above were READ OUT of those
+			// nine failure lines, not chosen.
+			//
+			// Slots 0..47 holding their pinned values across the append is the control, and it
+			// is the specific thing the check's own message demands before anyone re-pins. It
+			// was also confirmed independently at the PNG level: gfx/atlas.png rows 256..1023
+			// (slots 0..47, after slot_png_y's flip) are byte-identical before and after the
+			// regeneration, which is what an APPEND to a single seeded stream must produce and
+			// an insert or a re-order could not.
+			//
+			//   48 icon_apple           0x63033E7E6B3511AC
+			//   49 icon_raw_porkchop    0xEE1CB334B25D6FEC
+			//   50 icon_raw_beef        0x4824D2809C7DB5BF
+			//   51 icon_raw_chicken     0x2E91134DF5D7061F
+			//   52 icon_raw_mutton      0xEA7409166319C3A9
+			//   53 icon_cooked_porkchop 0x6DD195D8EF3C28AC
+			//   54 icon_cooked_beef     0xAA762713344DB7BF
+			//   55 icon_cooked_chicken  0x40F7DDD1B48EB222
+			//   56 icon_cooked_mutton   0x43A4875C71F6C61E
+			//
 			// ── 2026-09-03: slots 42..47 are SIX new pins, same shape as the four below ────
 			//
 			// v1.8.15 "Furnace" gave tools/make_atlas.py six new painters — cooked_porkchop,
