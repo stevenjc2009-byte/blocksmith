@@ -4747,6 +4747,148 @@ static void testSwimOutOfWater(void)
 	worldExit(&s_world);
 }
 
+// v1.8.16 -- SHALLOW water, which is the half of "getting out again" that testSwimOutOfWater
+// above never asked about.
+//
+// Reported, twice, still unfixed at v1.8.15: "I told you to make it so I have to press, like,
+// hold A to bob up and down to get out the water, not just walk forward and boom, out the
+// water. Exactly how Minecraft does it. But you still have not done that."
+//
+// testSwimOutOfWater's fixture is nine blocks of water. A body in it FLOATS, so on_ground is
+// false, so tryStepUp refuses on its very first line and trySwimUp is the only climber that
+// can ever run -- which is why the v1.8.4 jump gate appeared to work. It worked BY ACCIDENT,
+// and only for water deep enough to float in.
+//
+// One block of water does not float anybody. The body stands on the bed with its feet in the
+// water, so BOTH of these are true of the same body on the same frame:
+//
+//   * resolveY (physics.c:162) set on_ground = true, because it is resting on the shelf floor.
+//   * wetAt (physics.c:396) returns BODY_SURFACE, because floorToInt(b->y) is the water cell
+//     and the eye cell above it is air.
+//
+// tryStepUp was gated on on_ground ALONE, so the ordinary land step-up fired and the player
+// walked out of a puddle with the jump button never touched.
+//
+// The fixture is the smallest thing that reproduces it: a one-block-deep shelf whose surface
+// plane is level with the top face of a one-block bank. That is a beach, and it is the shape
+// the player actually meets at a generated shoreline.
+static void testStepUpRefusedWadingInWater(void)
+{
+	const float dt = 1.0f / 60.0f;
+
+	worldInit(&s_world);
+
+	// The shelf floor: stone at y=4 everywhere, top face y = 5.0.
+	for (int x = 0; x < 16; x++)
+		for (int z = 0; z < 16; z++)
+			CHECK_QUIET(worldSet(&s_world, x, 4, z, BLOCK_STONE));
+	// ONE block of water over x < 8. Surface plane y = 6.0.
+	for (int x = 0; x < 8; x++)
+		for (int z = 0; z < 16; z++)
+			CHECK_QUIET(worldSet(&s_world, x, 5, z, BLOCK_WATER));
+	// The bank, one block proud of the shelf floor and exactly level with the water plane:
+	// stone at y=5 for x >= 8, top face y = 6.0. This is a one-block step for a walker.
+	for (int x = 8; x < 16; x++)
+		for (int z = 0; z < 16; z++)
+			CHECK_QUIET(worldSet(&s_world, x, 5, z, BLOCK_STONE));
+
+	// Drop in and let it settle. No input of any kind.
+	Body b; bodyInit(&b, 4.5f, 8.0f, 4.5f);
+	for (int i = 0; i < 180; i++)
+		bodyStep(&b, &s_world, dt);
+
+	// --- The premise, and the whole reason this test exists. If either of these goes red the
+	// fixture is not a wading fixture and nothing below it means anything. They are green
+	// both before and after the fix -- they describe the SITUATION, not the behaviour.
+	CHECK(b.y > 4.9f && b.y < 5.1f);          // standing on the shelf floor: 5.0000
+	CHECK(b.on_ground == true);
+	CHECK(b.wet == BODY_SURFACE);             // ...and wet at the same time. That is the bug.
+
+	const Body wading = b;
+
+	// --- ARM 1, the report. Walk east into the bank for two seconds with the jump button
+	// never pressed and never held. vx is re-set every frame because bodyMove zeroes it on a
+	// blocked axis, exactly as testSwimOutOfWater does and exactly as scene/player.c does.
+	//
+	// THIS IS A RED-CAPABLE ARM. On the v1.8.15 tree all three of these fail.
+	{
+		Body n = wading;
+		for (int i = 0; i < 120; i++) {
+			n.vx = bodyWalkSpeed(n.wet == BODY_SUBMERGED);
+			bodyJump(&n, bodyWetUpdate(&s_world, &n), false, false, dt);
+			bodyStep(&n, &s_world, dt);
+		}
+		CHECK(n.x < 8.0f);                     // held at the bank, not over it
+		CHECK(n.y < 5.9f);                     // and NOT lifted onto its top face at 6.0
+		CHECK(n.wet != BODY_DRY);              // still in the puddle he walked into
+	}
+
+	// --- ARM 2, the anti-trap. Same body, same walk, but he arrives at the bank first and
+	// THEN presses the button, which is what a player does. He must get out.
+	//
+	// This arm is green BEFORE the fix as well, for the wrong reason -- on the v1.8.15 tree
+	// tryStepUp carries him over on frame 1 and the press is never consulted. It therefore
+	// proves nothing about the bug, and it is not here for that. It is here because the
+	// failure mode to be afraid of when refusing a step-up is turning a puddle into a TRAP,
+	// and that is worth a loud assertion even though it cannot discriminate.
+	//
+	// 60 frames then 45, and both numbers are measured rather than tidy. The bank is 3.2
+	// blocks away and PLAYER_WALK_SPEED is 4.3, so arrival takes 44.7 frames and 60 is the
+	// smallest round number that clears it. The second loop is 45 because the body is walking
+	// under its own drive the whole time and the fixture is only 16 blocks wide: at 120 and 60
+	// the PRE-fix arm crossed on frame 45 and then had 135 more frames of walking, which
+	// carried it to x = 17.4000 -- off the east edge, into the void, y = 0.0000. Both position
+	// assertions went red for that reason and not for any reason about water.
+	{
+		Body y = wading;
+		for (int i = 0; i < 60; i++) {         // arrive, no jump at all
+			y.vx = bodyWalkSpeed(y.wet == BODY_SUBMERGED);
+			bodyJump(&y, bodyWetUpdate(&s_world, &y), false, false, dt);
+			bodyStep(&y, &s_world, dt);
+		}
+		for (int i = 0; i < 45; i++) {         // now press, and hold
+			y.vx = bodyWalkSpeed(y.wet == BODY_SUBMERGED);
+			bodyJump(&y, bodyWetUpdate(&s_world, &y), true, i == 0, dt);
+			bodyStep(&y, &s_world, dt);
+		}
+		CHECK(y.x > 8.0f);                     // over the bank
+		CHECK(y.y > 5.9f && y.y < 6.1f);       // standing on its top face: 6.0000
+		CHECK(y.on_ground == true);
+	}
+
+	// --- ARM 3, and this is the arm that matches what he actually SAID. "Hold A to bob up
+	// and down to get out the water" -- held, from before he ever reaches the bank, not
+	// tapped on arrival. Arm 2 taps; a player does not.
+	//
+	// This arm is red on BOTH the v1.8.15 tree and a tree carrying only the tryStepUp guard,
+	// and it is red for two DIFFERENT reasons, which is exactly why it is here:
+	//
+	//   v1.8.15                 he leaves the water on frame 1 without the button mattering.
+	//   guard only              PLAYER_SWIM_EXIT_WINDOW is 0.25s and bodyJump arms it on the
+	//                           PRESS EDGE only (physics.c:490). The bank is 0.74s away, so
+	//                           the window has expired by the time he arrives and trySwimUp
+	//                           refuses at its `swim_exit_t <= 0` gate. He is TRAPPED in the
+	//                           puddle -- measured, x = 7.7000, y = 5.0000, never rises.
+	//
+	// So a one-line guard on tryStepUp is NOT the fix on its own. It converts "walks out
+	// without asking" into "cannot get out at all while holding the button down", which is
+	// worse. bodyJump has to re-arm the window while he is wet and holding.
+	{
+		Body h = wading;
+		for (int i = 0; i < 120; i++) {
+			h.vx = bodyWalkSpeed(h.wet == BODY_SUBMERGED);
+			// held for every frame; pressed only on the first, as a real button reports it
+			bodyJump(&h, bodyWetUpdate(&s_world, &h), true, i == 0, dt);
+			bodyStep(&h, &s_world, dt);
+		}
+		CHECK(h.x > 8.0f);                     // he got over the bank
+		CHECK(h.y > 5.9f && h.y < 6.1f);       // onto its top face at 6.0, not stuck at 5.0
+		CHECK(h.wet == BODY_DRY);              // and out of the water
+	}
+
+	worldExit(&s_world);
+}
+
 // v1.8.3 — the surface swell, the LOOK half of "add the bobbing back but way calmer".
 //
 // Tested here rather than in scene/player.c for the reason bodyWalkSpeed is: player.c
@@ -12117,6 +12259,7 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testSwimming();
 	testSurfaceSwim();
 	testSwimOutOfWater();
+	testStepUpRefusedWadingInWater();
 	testSurfaceBob();
 #ifndef __3DS__
 	testPlayerWiresSwimming();
@@ -12384,21 +12527,40 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 // then confirmed against a real run of this file (see below), same discipline as every entry
 // above. This lane also fixed line 8237's CHECK from GEN_VERSION_CAVES to GEN_VERSION_ORES —
 // that pin was one release stale and would otherwise fail the version-contract assertion.
+//
+// v1.8.16 "wading", 6123 + 12 = 6135. testStepUpRefusedWadingInWater is one new test function
+// carrying twelve loud CHECKs: three premise (b.y, b.on_ground, b.wet — the whole point of the
+// fixture is that the last two are true of the SAME frame) and three per arm for three arms.
+// Counted off the source, then confirmed against a real run: the red arm printed "6135 checks
+// ran, 6123 expected", so the pin moved to a MEASURED number and not a predicted one.
+//
+// Worth recording because it is not obvious from the source: the fixture writes 512 blocks
+// through CHECK_QUIET and NONE of them reach this total. CHECK_QUIET does not increment
+// s_checks. Had it done so the arithmetic above would be 6123 + 524 and counting it off the
+// source would have been hopeless.
+//
+// What went red before the pin was touched, which is what the paragraph above demands:
+// "FAIL 4/6136  L4821 n.x < 8.0f" — three of those four are ARM 1 (x, y, wet), the walk into
+// the bank with the jump button never touched, which is the reported bug stated as an
+// assertion. The fourth is this guard's own CHECK. ARM 3 was GREEN on the v1.8.15 tree, for
+// the wrong reason: tryStepUp carried him over on frame one and the held button was never
+// consulted. It only becomes a real assertion once tryStepUp refuses while wet, which is why
+// both physics changes are one commit and neither is defensible alone.
 #ifndef __3DS__
 	{
 		const int ran = s_checks;
-		if (ran != 6123)
+		if (ran != 6135)
 			printf("\nCHECK-COUNT GUARD: %d checks ran, %d expected.\n"
 			       "  %s\n"
 			       "  This is NOT an ordinary assertion failure.\n"
 			       "  Read the comment above this guard in world/world_test.c before"
 			       " touching the pinned number.\n",
-			       ran, 6123,
+			       ran, 6135,
 			       ran < 6123
 			           ? "Checks went MISSING: checks that should have run never ran at all."
 			           : "Extra checks appeared: either you added checks and did not update"
 			             " the pin, or something is emitting checks it should not.");
-		CHECK(ran == 6123);
+		CHECK(ran == 6135);
 	}
 #endif
 

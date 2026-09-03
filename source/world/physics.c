@@ -235,6 +235,20 @@ static bool tryStepUp(Body* b, const World* w, float target_x, float target_z)
 {
 	if (!b->on_ground) return false;   // must never fire mid-air
 
+	// v1.8.16 — and must never fire while WET, which is the half the v1.8.4 jump gate missed.
+	//
+	// testSwimOutOfWater's fixture is nine blocks deep, so the body floats, so on_ground is
+	// false, so this function refused on the line above and trySwimUp was the only climber
+	// that could ever run. The gate looked complete because nothing ever reached this far
+	// while wet. One block of water does not float anybody: the body stands on the bed with
+	// its feet in the water and BOTH on_ground and BODY_SURFACE are true of the same frame
+	// (measured: y=5.0000 on_ground=1 wet=SURFACE). The walker's step-up then fired and he
+	// strolled out of a puddle onto the bank with the jump button never touched -- reported
+	// twice, and the reason this line exists.
+	//
+	// Wet means the climb belongs to trySwimUp, which asks for the button. See bodyJump.
+	if (b->wet != BODY_DRY) return false;
+
 	const float step_y = b->y + 1.0f;
 	if (bodyHits(b, w, target_x, step_y, target_z)) return false;
 
@@ -481,13 +495,40 @@ float bodySurfaceBob(BodyWet wet, float dt_s, float* phase, float* envelope)
 
 void bodyJump(Body* b, BodyWet wet, bool jump_held, bool jump_pressed, float dt_s)
 {
-	// Armed on the EDGE, and BEFORE the early return below, so a press that arrives on the
-	// same frame the body is still deciding whether it is wet is not lost. `jump_pressed`
-	// and not `jump_held`: holding A is how you swim, so a held gate would arm the climb
-	// permanently for anyone at the surface and gate nothing at all. Never cleared here --
-	// bodyStep counts it down and trySwimUp consumes it -- because a release is not a
-	// cancellation, it is just the player letting go after asking.
-	if (jump_pressed && wet != BODY_DRY) b->swim_exit_t = PLAYER_SWIM_EXIT_WINDOW;
+	// Armed BEFORE the early return below, so a press that arrives on the same frame the body
+	// is still deciding whether it is wet is not lost. Never cleared here -- bodyStep counts
+	// it down and trySwimUp consumes it -- because a release is not a cancellation, it is
+	// just the player letting go after asking.
+	//
+	// v1.8.16 — `jump_held && b->on_ground` was added, and `b->on_ground` is the whole of it.
+	//
+	// The comment that used to sit here argued against a held gate on the grounds that
+	// holding A is how you swim, so it would arm the climb permanently for anyone at the
+	// surface and gate nothing at all. That is still exactly right FOR A FLOATER, and
+	// testSwimOutOfWater is built on it: its negative arm holds A against the bank for five
+	// seconds and asserts he stays in the water, because steve asked for that in v1.8.4 --
+	// "you just stuck there in the water until you press jump, then you get out of it, but
+	// in the correct way." Arming on bare `jump_held` reddens that arm. Measured, not
+	// predicted: FAIL 5/6136, L4679 b.x < 8.0f. So bare `jump_held` is not the fix either;
+	// it would trade his v1.8.16 report for his v1.8.4 one.
+	//
+	// on_ground separates the two situations cleanly, and it separates them the way a player
+	// would describe them rather than the way the code happens to be shaped:
+	//
+	//   floating in deep water   on_ground false. Holding A IS the float input -- it is what
+	//                            keeps him at the surface -- so it cannot also mean "lift me
+	//                            onto the bank". He presses. v1.8.4's rule, untouched.
+	//   wading in one block      on_ground true, feet on the bed. He is not swimming; he is
+	//                            standing in a puddle. Holding A here means one thing only.
+	//
+	// Press-edge alone TRAPPED the wader, measured: PLAYER_SWIM_EXIT_WINDOW is 0.25s and the
+	// bank is 0.74s away at PLAYER_WALK_SPEED, so he arrives with the window long expired,
+	// trySwimUp refuses at its `swim_exit_t <= 0` gate, and he cannot leave a one-block
+	// puddle at all (x=7.7000, y=5.0000, never rises). Walking out unasked is a bug; being
+	// stuck is worse. b->on_ground is last frame's resolveY value, which is what a settled
+	// wader has had for every frame since he stopped falling.
+	if ((jump_pressed || (jump_held && b->on_ground)) && wet != BODY_DRY)
+		b->swim_exit_t = PLAYER_SWIM_EXIT_WINDOW;
 
 	if (wet != BODY_DRY) {
 		if (!jump_held) return;
