@@ -176,10 +176,60 @@
 // two kinds of ceiling are separate constants. RENDER_DIST_MAX_OLD/_NEW are what each console's
 // linear HEAP holds; RENDER_DIST_MAX is what the mesh pool was ALLOCATED for. renderDistMaxFor()
 // below is where the two are reconciled, and it takes the smaller.
+// ── v1.8.17 / 2026-09-03: the assert message below is FACTUALLY WRONG about the GPU ───────
+//
+// It used to say a New 3DS has "roughly twice the GPU clock". IT DOES NOT. There is no
+// documented New 3DS GPU clock increase of any size. The lane that found this was scoped to
+// comments and could not edit a _Static_assert, so it left the false clause standing and
+// struck it through here; the clause has since been REPLACED (see WHAT CHANGED, below).
+//
+// DOCUMENTED AND CITED (3dbrew.org/wiki/Hardware, /wiki/Memory_layout, /wiki/PDN_Registers):
+//
+//   GPU     DMP PICA200 at 268 MHz. 3dbrew carries this in its "Common hardware" table as ONE
+//           value with NO Old/New split — while the ARM11 row of that SAME table splits
+//           Old3DS from New3DS explicitly. The only New3DS clock register documented anywhere,
+//           PDN_LGR_SOCMODE, is introduced verbatim as "used for configuring the New3DS ARM11
+//           CPU clock-rate"; its modes select 256/536/804 MHz for the CPU and it has no GPU
+//           field. The GPU's own registers (PDN_GPU_CNT bit 16, PDN_VRAM_CNT bit 0) are
+//           clock ENABLES — on/off — not rates. So: same part, same clock, both models.
+//   CPU     Old3DS 268 MHz, 2x ARM11 MPCore. New3DS up to 804 MHz, 4x MPCore. 3x multiplier.
+//   L2      New3DS only, optional 2 MB (L2C-310 r3p3 at 0x17E10000). Old3DS has none.
+//   VRAM    6 MB (0x18000000, size 0x00600000) on BOTH. The New 3DS adds a SEPARATE 4 MB block
+//           at 0x1F000000 — that block, added to the 6 MB, is where the "10 MB" figure quoted
+//           by some secondary sources comes from. The GPU's VRAM proper did not grow.
+//   FCRAM   128 MB -> 256 MB (2x). APPLICATION memregion 64 MB (Old) -> 124 MB (New default).
+//
+// REASONED, not read: that the GPU is therefore identical in throughput. Nintendo never
+// published GPU clocks, so 268 MHz is a community figure (timed, and consistent across both
+// models) rather than a vendor spec. What is solid is the DIRECTION: every New 3DS uplift knob
+// that is documented — the exheader's cpuspeed_804MHz and EnableL2Cache bits, PTMSYSM's
+// ConfigureNew3DSCPU, svcKernelSetState type10, and libctru's osSetSpeedupEnable(true), which
+// is literally PTMSYSM_ConfigureNew3DSCPU(3) — moves the CPU clock, the L2 cache and the memory
+// map. Not one of them touches the GPU.
+//
+// UNKNOWN, and stated as unknown: whether the PICA200 differs on New 3DS in any way at all
+// (memory bandwidth to VRAM, fill rate). No source found either asserts or denies it.
+//
+// scene/chunk_render.c:1463 already had this right — "The split existed for CPU and memory,
+// never for the GPU — the PICA200 is the same part at the same clock on both models". This
+// header was the file that disagreed with it.
+//
+// WHAT SURVIVES: the assert's CONDITION, byte-for-byte. A New 3DS must not be offered a
+// narrower ring than an Old 3DS, because it does have twice the linear heap (33,554,432 ->
+// 67,108,864, both READINGS, recorded above at RENDER_DIST_LINEAR_HEAP_OLD/_NEW), twice the
+// FCRAM, more cores and the L2. The conclusion never needed the GPU clause; only the CPU and
+// memory halves were ever load-bearing, and those are documented.
+//
+// WHAT CHANGED: only the message STRING. "the linear heap and roughly twice the GPU clock"
+// became "the linear heap, twice the FCRAM, more cores and an L2 cache" — every item in the
+// replacement is a documented reading from the table above. A _Static_assert message is dead
+// weight until the condition fails, so this has zero effect on any build that compiles; it
+// matters on the one day someone inverts the ceilings and reads the diagnostic, which is
+// exactly the day they must not be told a GPU fact that is not true.
 _Static_assert(RENDER_DIST_MAX_OLD <= RENDER_DIST_MAX_NEW,
                "a New 3DS must never be offered a NARROWER ring than an Old 3DS: it has twice "
-               "the linear heap and roughly twice the GPU clock, so an inversion here is an "
-               "edit slip and not a policy anyone would choose");
+               "the linear heap, twice the FCRAM, more cores and an L2 cache, so an inversion "
+               "here is an edit slip and not a policy anyone would choose");
 _Static_assert(RENDER_DIST_MIN <= RENDER_DIST_MAX_OLD,
                "the narrowest per-console ceiling must still be reachable from the floor, or "
                "renderDistClampFor() would be clamping into an empty range");
@@ -508,6 +558,42 @@ _Static_assert(RENDER_DIST_DEFAULT_NEW >= RENDER_DIST_MIN &&
 // blocksmith-lesson-azahar-gpu-timing). An Old 3DS gets the radius that has been running
 // at 59.83 fps all along; a New 3DS, with roughly twice the GPU clock and four times the
 // memory, gets the wider one and is the machine the option was written for.
+//
+// ── v1.8.17 / 2026-09-03: the sentence above is wrong TWICE, and the error matters ────────
+//
+// Kept rather than deleted because it is the reasoning the New 3DS default was actually
+// chosen on, and a reader needs to see what was believed at the time. Both of its factual
+// claims are false. Sources and the full figures are written out above the _Static_assert on
+// RENDER_DIST_MAX_OLD <= RENDER_DIST_MAX_NEW; the short version:
+//
+//   "roughly twice the GPU clock"  — NO. DOCUMENTED: the PICA200 runs at 268 MHz and 3dbrew
+//       records it as common hardware with no Old/New split, while splitting the ARM11 row in
+//       the same table. The one New3DS clock register, PDN_LGR_SOCMODE, is documented as the
+//       "New3DS ARM11 CPU clock-rate" and has no GPU field. A New 3DS gets NO GPU headroom.
+//   "four times the memory"        — NO, and this one contradicts THIS FILE. 130 lines up,
+//       RENDER_DIST_LINEAR_HEAP_OLD/_NEW are 33,554,432 and 67,108,864: exactly 2x, both read
+//       off booted consoles. FCRAM is 128 -> 256 MB, also 2x. VRAM is 6 MB on BOTH (a separate
+//       4 MB New3DS block exists, which is where secondary sources get "10 MB"). Nothing on
+//       this console is 4x. The number appears to have been written from memory, not read.
+//
+// WHAT THIS DOES AND DOES NOT CHANGE. It does NOT change the first sentence, which is the
+// load-bearing one and is still exactly right: the binding cost of a wider ring is GPU time,
+// and this project cannot measure GPU time. If anything the correction sharpens it, because
+// the reason the two models differ was never that a New 3DS renders faster — it does not.
+//
+// So state what a New 3DS actually brings, all of it DOCUMENTED (see the citations above):
+// a 268 -> 804 MHz CPU clock, 4 ARM11 cores against 2, an optional 2 MB L2 cache, twice the
+// FCRAM and twice the linear heap. Every one of those is CPU-side or memory-side. Widening
+// the ring on a New 3DS is therefore a bet that the extra columns are paid for in MESHING and
+// GENERATION — work the faster CPU, the extra lane and the L2 genuinely do absorb — and NOT a
+// claim that its GPU can draw them. On the draw call itself the two consoles are the same
+// machine. That is a narrower and more honest case than the sentence above made, and it is
+// the case a future frame-time reading has to test.
+//
+// NOT RE-OPENED HERE: RENDER_DIST_DEFAULT_NEW itself. Its own block above argues the value
+// from the mesh pool already being claimed at boot and from the Old 3DS being permitted
+// radius 3 on strictly worse hardware — an argument that never used the GPU clock and so does
+// not fall with it. Whether 3 is still right is the coordinator's call, not this lane's.
 //
 // v1.8.5: the answer now goes out through renderDistClampFor(), so the value this hands to a
 // first boot is guaranteed to be one the same clamp would have accepted from options.ini. It is
