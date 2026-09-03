@@ -56,6 +56,13 @@
 //                  is, so this asserts it is left alone — a regression here is somebody
 //                  "finishing" the feature and browning the dirt.
 //
+//   THE DIRT       (v1.8.17) BLOCK_DIRT takes the column's biome colour on ALL SIX faces —
+//                  unlike grass it has no shared half-tile to protect, BTEX_DIRT is the same
+//                  texture on every face (world/registry.c), so there is nothing for a partial
+//                  restriction to guard. This was the one gap left in "per-biome wood, leaves,
+//                  grass, flowers, dirt" after v1.8.8; blockFaceTintable excluded BLOCK_DIRT
+//                  entirely until this task.
+//
 //   THE STRANDS    a tall-grass or fern cross takes the tint of the column it stands in, on all
 //                  four of its quads, so a strand is the colour of the grass under it from
 //                  every angle. That is the half of the ask that is most visible in motion.
@@ -366,9 +373,42 @@ static void testGrassTopTintedSidesAreNot(void)
 	CHECK(side_tinted == 0,
 	      "no side face is tinted — BTEX_GRASS_SIDE is grass OVER DIRT and there is no fragment "
 	      "shader to mask the dirt half (%d were)", side_tinted);
+}
 
-	// Dirt is not tintable at all, in any biome. If it ever became so, every underground wall
-	// in a desert would go olive.
+// v1.8.17: this used to be the fixture for "Dirt is not tintable at all, in any biome" — see the
+// log for v1.8.8 through v1.8.16. That was correct for THIS fixture's texture (BTEX_GRASS_SIDE,
+// grass over dirt, no fragment shader to mask it) but it was never true of dirt's OWN block:
+// world/registry.c gives BLOCK_DIRT plain BTEX_DIRT on all six faces, one uniform texture shared
+// with nothing else, so there was never a half-tile to protect there. steve's original ask —
+// "per-biome wood colours, blocks, textures, types, leaves, logs, planks, dirt, scenery, flowers,
+// grass" — shipped everything but dirt at v1.8.8; world/mesher.c's blockFaceTintable() excluded
+// BLOCK_DIRT outright and this is the fixture that proves it, MEASURED red against that code (see
+// tools/run_host_tests.sh's biome_tint_test stanza for the exact RED output).
+static void testDirtTintedOnAllFaces(void)
+{
+	puts("\n-- the dirt block: the one gap left after v1.8.8, closed at v1.8.17 --");
+
+	// A lone dirt block with air on every side, so all six faces are exposed and the rule can
+	// be checked per face the same way testGrassTopTintedSidesAreNot checks grass. Unlike grass,
+	// EVERY face should take the column's row — there is no shared texture to protect.
+	msReset();
+	msSet(4, 0, 4, (BlockId)BLOCK_DIRT);
+	msTint(4, 4, 5);   // desert — 1.00/0.50/0.40, not the identity
+	runMesh();
+
+	int seen = 0, tinted = 0;
+	for (int k = 0; k < quadCount(); k++) {
+		const Quad q = quadAt(k);
+		seen++;
+		if (q.tint == 5) tinted++;
+	}
+	CHECK(seen == 6, "the lone dirt block emits all six faces (%d)", seen);
+	CHECK(tinted == seen,
+	      "every face carries the column's biome row, top AND sides AND bottom (%d of %d)",
+	      tinted, seen);
+
+	// A whole plane of dirt in a tinted column, top and bottom faces alike — the exact fixture
+	// that used to assert the opposite.
 	msReset();
 	for (int lz = -1; lz <= CHUNK_DIM; lz++)
 		for (int lx = -1; lx <= CHUNK_DIM; lx++) {
@@ -377,12 +417,14 @@ static void testGrassTopTintedSidesAreNot(void)
 		}
 	runMesh();
 
-	int dirt_tinted = 0;
-	for (uint32_t i = 0; i < g_out.vert_count; i++)
-		if (meshAoTint(g_verts[i].ao) != 0) dirt_tinted++;
-	CHECK(g_out.vert_count > 0 && dirt_tinted == 0,
-	      "a whole plane of dirt in a tinted column stays untinted (%d of %u vertices were not)",
-	      dirt_tinted, g_out.vert_count);
+	int dirt_seen = 0, dirt_tinted = 0;
+	for (uint32_t i = 0; i < g_out.vert_count; i++) {
+		dirt_seen++;
+		if (meshAoTint(g_verts[i].ao) == 5) dirt_tinted++;
+	}
+	CHECK(g_out.vert_count > 0 && dirt_tinted == dirt_seen,
+	      "a whole plane of dirt in a tinted column is tinted on every vertex, top and bottom "
+	      "alike (%d of %u vertices carried row 5)", dirt_tinted, g_out.vert_count);
 }
 
 static void testStrandMatchesGroundBeneath(void)
@@ -538,6 +580,73 @@ static void testBiomeBorderIsExact(void)
 		CHECK(bad == 0,
 		      "%s at x/z=8: every cell is drawn in its own biome's colour (%d cells were not)",
 		      names[axis], bad);
+		printf("         (%s: %d merged quads, widest covers %d cells)\n",
+		       names[axis], merged, widest);
+	}
+}
+
+// ── 4b. THE SMEAR, for a full cube ───────────────────────────────────────────
+//
+// testBiomeBorderIsExact above proves the merge key holds for grass's single TOP face. Grass's
+// cross-shaped strands never reach mergeRun at all — meshPass returns before the six-face loop
+// for anything that is not BLOCK_SHAPE_FULL_CUBE — so grass only ever exercises ONE of dirt's six
+// tintable faces through that path. Dirt is a full cube on all six, so it is worth proving the
+// same key holds for a block whose faces are ALL tintable rather than assuming the shared
+// function behaves the same way it did for grass.
+
+// A flat plane of DIRT (full cube) at y = GROUND_Y filling the whole scratch including the
+// border, with air above — the same shape buildGrassPlain uses, but the cap itself is dirt so
+// the proof below runs dirt through its own mergeRun call rather than reusing grass's.
+static void buildDirtPlain(void)
+{
+	msReset();
+	for (int lz = -1; lz <= CHUNK_DIM; lz++)
+		for (int lx = -1; lx <= CHUNK_DIM; lx++)
+			msSet(lx, GROUND_Y, lz, (BlockId)BLOCK_DIRT);
+}
+
+// Same shape as borderMismatches, over a plane of dirt instead of grass.
+static int dirtBorderMismatches(int axis, int at, int* merged_quads, int* widest)
+{
+	buildDirtPlain();
+	for (int lz = -1; lz <= CHUNK_DIM; lz++)
+		for (int lx = -1; lx <= CHUNK_DIM; lx++)
+			msTint(lx, lz, wantTint(axis, at, lx, lz));
+	runMesh();
+
+	int bad = 0;
+	*merged_quads = 0;
+	*widest = 1;
+
+	for (int k = 0; k < quadCount(); k++) {
+		const Quad q = quadAt(k);
+		if (q.face != FACE_TOP) continue;   // the slab's bottom is never exposed in this fixture
+
+		const int cells = (q.x1 - q.x0 + 1) * (q.z1 - q.z0 + 1);
+		if (cells > 1) (*merged_quads)++;
+		if (cells > *widest) *widest = cells;
+
+		for (int z = q.z0; z <= q.z1; z++)
+			for (int x = q.x0; x <= q.x1; x++)
+				if (q.tint != wantTint(axis, at, x, z)) bad++;
+	}
+	return bad;
+}
+
+static void testDirtBiomeBorderIsExact(void)
+{
+	puts("\n-- THE SMEAR, for dirt: a full cube's own merge key must not jump the border --");
+
+	const char* names[2] = { "dirt border along x", "dirt border along z" };
+	for (int axis = 0; axis < 2; axis++) {
+		int merged = 0, widest = 1;
+		const int bad = dirtBorderMismatches(axis, 8, &merged, &widest);
+		CHECK(bad == 0,
+		      "%s at x/z=8: every dirt cell is drawn in its own biome's colour (%d cells were not)",
+		      names[axis], bad);
+		CHECK(merged > 0,
+		      "%s: dirt tops still merge away from the border (%d merged quads)",
+		      names[axis], merged);
 		printf("         (%s: %d merged quads, widest covers %d cells)\n",
 		       names[axis], merged, widest);
 	}
@@ -840,9 +949,11 @@ int main(void)
 	testTintPacking();
 	testUntintedIsUnchanged();
 	testGrassTopTintedSidesAreNot();
+	testDirtTintedOnAllFaces();
 	testStrandMatchesGroundBeneath();
 	testTwoBlockClumpIsOneColour();
 	testBiomeBorderIsExact();
+	testDirtBiomeBorderIsExact();
 	testMergingActuallyHappens();
 	testUntintableRunsStillMerge();
 	testPaletteIsSane();

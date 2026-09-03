@@ -371,6 +371,16 @@ static inline uint8_t cornerAO(int si, const CornerPlan* c)
 // LEAVES ARE NOT IN THIS LIST even though Minecraft tints them. Nobody asked for it; adding
 // BLOCK_LEAVES here is a one-line change if it is ever wanted.
 //
+// BLOCK_DIRT (v1.8.17) is tinted on ALL SIX faces, and that is not the same restriction grass
+// needed. world/registry.c gives dirt BTEX_DIRT on every face -- one uniform texture, not shared
+// with any other block's crust the way BTEX_GRASS_SIDE is -- so there is no half-tile to protect
+// and no reason to hold any face back. steve asked for this by name: "biome identity via TINT,
+// Minecraft-style," the same list as wood/leaves/grass/flowers with dirt as the one gap left in
+// it (v1.8.8 shipped the rest). The tint band this reads is per COLUMN with no y term -- see
+// faceTint()/scratchColumnOf() below -- so this colours every dirt face at every depth in a
+// tinted column, including underground walls, and that is a consequence of the existing per-
+// column design rather than a new kind of read.
+//
 // BLOCK_TALL_GRASS_TOP was MISSING here from v1.8.8 until v1.8.16, and the way it failed is
 // worth keeping. The two-block clump is one plant written as two stacked cross blocks
 // (world/worldgen.c puts TALL_GRASS at y and TALL_GRASS_TOP at y+1), so the tip fell through
@@ -387,6 +397,7 @@ static bool blockFaceTintable(BlockId id, int face)
 {
 	switch ((int)id) {
 	case BLOCK_GRASS:      return face == FACE_TOP;
+	case BLOCK_DIRT:
 	case BLOCK_TALL_GRASS:
 	case BLOCK_TALL_GRASS_TOP:
 	case BLOCK_FERN:       return true;
