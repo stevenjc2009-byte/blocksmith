@@ -363,11 +363,25 @@ static inline uint8_t cornerAO(int si, const CornerPlan* c)
 //
 // LEAVES ARE NOT IN THIS LIST even though Minecraft tints them. Nobody asked for it; adding
 // BLOCK_LEAVES here is a one-line change if it is ever wanted.
+//
+// BLOCK_TALL_GRASS_TOP was MISSING here from v1.8.8 until v1.8.16, and the way it failed is
+// worth keeping. The two-block clump is one plant written as two stacked cross blocks
+// (world/worldgen.c puts TALL_GRASS at y and TALL_GRASS_TOP at y+1), so the tip fell through
+// to `default` and emitted MESH_TINT_NONE — palette row 0, {1.00,1.00,1.00}. Row 0 is
+// byte-identical to row 3, plains, which is why nobody caught it for eight versions: in plains,
+// and only in plains, the bug is invisible. Everywhere else the tinted lower half and the
+// untinted plains-coloured tip read as two different plants stacked on each other, which is
+// what steve reported — "on top of a biome specific type of grass, there is another piece of
+// grass that is not for that biome."
+//
+// A test fixture in plains would still pass with this line deleted. biome_tint_test.c's
+// testTwoBlockClumpIsOneColour uses jungle for that reason.
 static bool blockFaceTintable(BlockId id, int face)
 {
 	switch ((int)id) {
 	case BLOCK_GRASS:      return face == FACE_TOP;
 	case BLOCK_TALL_GRASS:
+	case BLOCK_TALL_GRASS_TOP:
 	case BLOCK_FERN:       return true;
 	default:               return false;
 	}

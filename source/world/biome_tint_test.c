@@ -443,6 +443,47 @@ static void testStrandMatchesGroundBeneath(void)
 	}
 }
 
+// The two-block clump is ONE plant drawn as two stacked cross blocks — worldgen.c writes
+// BLOCK_TALL_GRASS at y and BLOCK_TALL_GRASS_TOP at y+1 — so the two halves have to come out
+// of the mesher the same colour or the plant reads as two different plants stacked on each
+// other. steve reported exactly that: "on top of a biome specific type of grass, there is
+// another piece of grass that is not for that biome."
+//
+// The fixture is JUNGLE and that is load-bearing. Row 3 (plains) is {1,1,1} and row 0
+// (MESH_TINT_NONE) is also {1,1,1} — byte-identical — so an untinted tip in a plains fixture
+// renders correctly by coincidence and this test would pass with the bug fully present. Only a
+// biome whose row is not the identity can tell "tinted plains" from "not tinted at all".
+static void testTwoBlockClumpIsOneColour(void)
+{
+	puts("\n-- both halves of a two-block clump take the same biome colour --");
+
+	buildGrassPlain();
+	for (int lz = -1; lz <= CHUNK_DIM; lz++)
+		for (int lx = -1; lx <= CHUNK_DIM; lx++)
+			msTint(lx, lz, 6);   // jungle — 0.62/1.00/0.44, not the identity
+
+	msSet(4, GROUND_Y + 1, 4, (BlockId)BLOCK_TALL_GRASS);
+	msSet(4, GROUND_Y + 2, 4, (BlockId)BLOCK_TALL_GRASS_TOP);
+	runMesh();
+
+	// Same cross-quad identification as testStrandMatchesGroundBeneath: a cross spans both
+	// horizontal axes, so it is the only thing here with two distinct y on one quad.
+	int cross_quads = 0, cross_tinted = 0;
+	for (int k = 0; k < quadCount(); k++) {
+		const MeshVertex* v = &g_verts[k * 4];
+		bool two_y = false;
+		for (int i = 1; i < 4; i++) if (v[i].y != v[0].y) two_y = true;
+		if (!two_y) continue;
+		cross_quads++;
+		if (quadAt(k).tint == 6) cross_tinted++;
+	}
+
+	CHECK(cross_quads == 8, "the clump emits both halves' quads (%d, want 8)", cross_quads);
+	CHECK(cross_tinted == cross_quads,
+	      "every quad of the clump carries the jungle row (%d of %d) — a shortfall of 4 is the "
+	      "tip falling through to MESH_TINT_NONE", cross_tinted, cross_quads);
+}
+
 // ── 4. THE SMEAR ─────────────────────────────────────────────────────────────
 
 // The tint column (lx, lz) is entitled to, for a border split on `axis` at `at`.
@@ -800,6 +841,7 @@ int main(void)
 	testUntintedIsUnchanged();
 	testGrassTopTintedSidesAreNot();
 	testStrandMatchesGroundBeneath();
+	testTwoBlockClumpIsOneColour();
 	testBiomeBorderIsExact();
 	testMergingActuallyHappens();
 	testUntintableRunsStillMerge();
