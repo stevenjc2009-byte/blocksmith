@@ -189,7 +189,13 @@ static char s_first[512];
 // the enum. What the enum's count governs is TILE_USED_COUNT in gfx/atlas_tiles.h, which
 // world/block_tiles_check.c asserts against the BTEX_* mirror - a separate guard over a
 // separate pair of lists, untouched by this and still reading 12 on both sides.
-#define ATLAS_PAINTED_SLOTS 38
+// v1.8.14 (lane ANIMAL-B): 38 -> 42. tools/make_atlas.py's TILES list gained raw_porkchop,
+// raw_beef, raw_chicken and raw_mutton in slots 38..41, appended after diamond_ore. Unlike the
+// snow/ice/cactus/dead_bush/fern case described above, this art does NOT land ahead of its
+// block ids: BLOCK_RAW_PORKCHOP..BLOCK_RAW_MUTTON are 34..37 and are registered in the same
+// version, so all four slots are addressed by a real tex byte from the moment they are painted.
+// The id and the slot are four apart and are not interchangeable.
+#define ATLAS_PAINTED_SLOTS 42
 
 // Slots 10 and 11 within that: water and tall grass (roadmap tasks 17 and 19). Named here
 // because the two texel-content checks further down are about what these two tiles ARE, not
@@ -1349,6 +1355,10 @@ int main(void)
 				0x85DE0E38C953AE49ull,   // 35 redstone_ore(NEW pin, v1.8.12 -- see below)
 				0xDD1E64A6A39A6613ull,   // 36 lapis_ore   (NEW pin, v1.8.12 -- see below)
 				0x5CE48BB82A7BE854ull,   // 37 diamond_ore (NEW pin, v1.8.12 -- see below)
+				0xDAC86A845BDEB167ull,   // 38 raw_porkchop(NEW pin, v1.8.14 -- see below)
+				0x85B9D38E60A9533Dull,   // 39 raw_beef    (NEW pin, v1.8.14 -- see below)
+				0x241259EE6CFD8292ull,   // 40 raw_chicken (NEW pin, v1.8.14 -- see below)
+				0x8827E818ECCB7EB7ull,   // 41 raw_mutton  (NEW pin, v1.8.14 -- see below)
 			};
 			for (int slot = 0; slot < ATLAS_PAINTED_SLOTS; slot++) {
 				const uint64_t got = slotFingerprint(SLOT_PNG_TOP(slot));
@@ -1361,6 +1371,34 @@ int main(void)
 				      slot, got, kPaintedFingerprint[slot]);
 			}
 
+			// ── 2026-09-03: slots 38..41 are FOUR new pins, same shape as the six below ────
+			//
+			// v1.8.14 "Animals" (lane ANIMAL-B) gave tools/make_atlas.py four new painters —
+			// tile_raw_porkchop, tile_raw_beef, tile_raw_chicken, tile_raw_mutton, appended to
+			// TILES at slots 38..41 — taking the sheet from thirty-eight painted tiles to
+			// forty-two. ATLAS_PAINTED_SLOTS moved 38 -> 42 with them, exactly as the ores note
+			// below describes, so the H9 marker sweep no longer demands the magenta checker in
+			// four slots that now hold real art.
+			//
+			// This is NOT the re-pin the block above forbids: slots 38..41 had no pin at all,
+			// because until this version they had no art. Everything painted before them was
+			// left alone, and the run PROVES it rather than asserting it — with all four pins
+			// set to zero the suite reported "atlas uv shader self-test: FAIL 4/5112", four
+			// failures and no more, one per new slot, every one of slots 0..37 green in the same
+			// run. The four fingerprints were read out of those four failure lines and pasted
+			// back, which is the same procedure the ores note below records:
+			//
+			//   38 raw_porkchop 0xDAC86A845BDEB167
+			//   39 raw_beef     0x85B9D38E60A9533D
+			//   40 raw_chicken  0x241259EE6CFD8292
+			//   41 raw_mutton   0x8827E818ECCB7EB7
+			//
+			// The claim "appending to TILES cannot disturb art already painted" is what slots
+			// 0..37 staying green in that run measured. It is not free: make_atlas.py draws from
+			// ONE seeded stream in TILES order, so this holds only because the four painters were
+			// APPENDED. Inserting them anywhere earlier would have moved every fingerprint after
+			// the insertion point, and re-pinning those would have shipped a re-textured sheet.
+			//
 			// ── 2026-09-03: slots 32..37 are SIX new pins, for the same reason slot 31 was one ──
 			//
 			// v1.8.12 "Ores" gave tools/make_atlas.py six new painters — coal_ore, iron_ore,
@@ -1546,7 +1584,7 @@ int main(void)
 			// duplicate only by accident - it compares each slot against its own pin, never
 			// against its neighbours - so a painter wired to the wrong function would pin
 			// cleanly and ship two identical tiles. Bounded by ATLAS_PAINTED_SLOTS, not by the
-			// slot count: the 47 unpainted slots are all the marker and ARE deliberately
+			// slot count: the 22 unpainted slots are all the marker and ARE deliberately
 			// identical to each other, which the marker sweep below owns instead.
 			for (int a = 0; a < ATLAS_PAINTED_SLOTS; a++) {
 				for (int b = a + 1; b < ATLAS_PAINTED_SLOTS; b++) {
@@ -1559,7 +1597,8 @@ int main(void)
 			// H9. Every slot the TILES list does not fill must be the marker, texel for texel.
 			// This is the check the F7 defect exists in: before it, the spare slots were a flat
 			// near-black fill and every geometry test in this file was green over them. Since
-			// v1.8.3 phase 3 claimed 12..16 that is slots 17..63 - 47 of them - and the bound is
+			// v1.8.14 claimed 38..41 that is slots 42..63 - 22 of them (the prose here said
+			// "17..63 - 47 of them" and had been stale since v1.8.10) - and the bound is
 			// ATLAS_TILE_SLOTS so it follows the sheet rather than a number written here.
 			for (int slot = ATLAS_PAINTED_SLOTS; slot < ATLAS_TILE_SLOTS; slot++) {
 				const int png_top = SLOT_PNG_TOP(slot);

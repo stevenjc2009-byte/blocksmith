@@ -1456,7 +1456,7 @@ bool chunkRenderInit(int max_radius)
 	// From v1.5.0 to v1.7.0 this asked APT_CheckNew3DS and gave an Old 3DS the baked shbin with
 	// the engine left off, so an Old 3DS had face shade and AO but no light LEVEL at all — a
 	// sealed cave was exactly as bright as open ground. That is what task 24 calls "Old 3DS gets
-	// nothing", and it is a gameplay problem as much as a visual one: v1.9.0's hostile spawning
+	// nothing", and it is a gameplay problem as much as a visual one: v1.8.16's hostile spawning
 	// is defined by light level, and a player who cannot see which places are dark cannot avoid
 	// them.
 	//

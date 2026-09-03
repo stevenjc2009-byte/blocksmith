@@ -510,6 +510,25 @@ static void testFoodTable(void)
 {
 	CHECK_I(survivalFoodValue(BLOCK_APPLE), 4);
 
+	/* v1.8.14 "Animals". Four raw meats, ids 34..37, named one per line and typed from the
+	 * intent rather than read back off kFoods[]. Two tiers, and the equality is deliberate:
+	 * the two big mammals are worth 3 and the two smaller animals 2. See world/survival.c's
+	 * table comment for why equal values are right HERE and wrong for hardness next door.
+	 *
+	 * Every one is strictly below the apple's 4, and that is the claim worth pinning rather
+	 * than the individual numbers: it is the headroom v1.8.15's cooked meat needs, since a
+	 * cooked cut must restore strictly more than the raw one it came from and
+	 * SURVIVAL_MAX_HUNGER is only 20. The three inequalities below go red the day somebody
+	 * raises raw meat to the apple's level and quietly spends that headroom. */
+	CHECK_I(survivalFoodValue(BLOCK_RAW_PORKCHOP), 3);
+	CHECK_I(survivalFoodValue(BLOCK_RAW_BEEF), 3);
+	CHECK_I(survivalFoodValue(BLOCK_RAW_CHICKEN), 2);
+	CHECK_I(survivalFoodValue(BLOCK_RAW_MUTTON), 2);
+	CHECK(survivalFoodValue(BLOCK_RAW_PORKCHOP) < survivalFoodValue(BLOCK_APPLE));
+	CHECK(survivalFoodValue(BLOCK_RAW_BEEF) < survivalFoodValue(BLOCK_APPLE));
+	CHECK(survivalFoodValue(BLOCK_RAW_CHICKEN) < survivalFoodValue(BLOCK_RAW_PORKCHOP));
+	CHECK(survivalFoodValue(BLOCK_RAW_MUTTON) < survivalFoodValue(BLOCK_RAW_BEEF));
+
 	/* Everything else this build ships is not food. Spot-checked across the id space rather
 	 * than exhaustively, plus air and an undefined high id. */
 	CHECK_I(survivalFoodValue(BLOCK_AIR), 0);
@@ -519,11 +538,16 @@ static void testFoodTable(void)
 	CHECK_I(survivalFoodValue((BlockId)0xFE), 0);
 
 	/* And nothing else in the whole 0..255 range is food. A table with a stray row, or a
-	 * lookup that fell through to a default, shows up here and nowhere else. */
+	 * lookup that fell through to a default, shows up here and nowhere else.
+	 *
+	 * 1 -> 5 on 2026-09-03, v1.8.14 "Animals": the apple plus the four raw meats. This is the
+	 * check that would catch a fifth meat row added by accident, or a cooked row landing a
+	 * version early, so it moves by exactly the number of rows added and never by "whatever
+	 * makes it pass". */
 	int food_ids = 0;
 	for (int id = 0; id <= 0xFF; id++)
 		if (survivalFoodValue((BlockId)id) != 0) food_ids++;
-	CHECK_I(food_ids, 1);
+	CHECK_I(food_ids, 5);
 }
 
 static void testEatingAnAppleConsumesExactlyOne(void)

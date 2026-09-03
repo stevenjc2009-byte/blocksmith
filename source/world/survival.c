@@ -167,6 +167,33 @@ static const struct {
 	uint8_t hunger;
 } kFoods[] = {
 	{ BLOCK_APPLE, 4 },
+	// v1.8.14 "Animals". Four rows, one line each, exactly as this table's header note above
+	// said they would be — that note is why this version's food change touches nothing else
+	// in this file.
+	//
+	// The values sit deliberately BELOW the apple's 4, and the reason is v1.8.15 rather than
+	// anything about this version: cooking has to be worth doing. A cooked cut must restore
+	// strictly more than the raw one it came from, and with SURVIVAL_MAX_HUNGER at 20 there
+	// is only so much room above. Start raw meat at the apple's level and the cooked tier has
+	// nowhere to go but a number big enough to refill most of the bar from one item.
+	//
+	// Two tiers rather than four distinct numbers, and the split is the honest one:
+	//
+	//   porkchop 3, beef 3   the two big mammals — the substantial cuts
+	//   chicken 2, mutton 2  the smaller animals
+	//
+	// This is the one table in this change where EQUAL values are right, which is worth
+	// saying out loud given that world/registry.c's hardness ladder next door is deliberately
+	// four distinct numbers. The two are not the same kind of number. A hardness is a
+	// per-block fact a player learns by feel, so four identical break times would be four
+	// blocks nobody can tell apart while mining — which is what coreHardnessIsDeclared()
+	// exists to catch. A hunger value is a balance number: beef and pork being worth the same
+	// is a statement that they ARE the same trade, and no distinctness rule reaches this
+	// table.
+	{ BLOCK_RAW_PORKCHOP, 3 },
+	{ BLOCK_RAW_BEEF,     3 },
+	{ BLOCK_RAW_CHICKEN,  2 },
+	{ BLOCK_RAW_MUTTON,   2 },
 };
 
 uint8_t survivalFoodValue(BlockId id)

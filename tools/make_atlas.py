@@ -232,6 +232,19 @@ TILES = [
     "redstone_ore",     # 35
     "lapis_ore",        # 36
     "diamond_ore",      # 37
+    # The four raw meat drops -- one per huntable animal (pig, cow, chicken, sheep).
+    # Appended for the reason everything since the sentinel has been: this order IS the
+    # contract with gfx/atlas_tiles.h's TILE_* enum and world/block.h's BTEX_* mirror of
+    # it, so inserting would silently re-texture every tile after the insertion point.
+    #
+    # All four are FULL_CUBE inventory icons and registered SOLID, not TRANSPARENT, so
+    # (like tile_apple, tile_water and the six ore tiles) none of them may put anything
+    # into an alpha channel at all -- see tile_raw_porkchop's docstring for why that is
+    # enforced by construction rather than by a rule someone has to remember.
+    "raw_porkchop",     # 38
+    "raw_beef",         # 39
+    "raw_chicken",      # 40
+    "raw_mutton",       # 41
 ]
 
 
@@ -1897,6 +1910,219 @@ def tile_diamond_ore(rng):
     return _ore_tile(rng, "diamond", base=(140, 228, 214), light=(198, 250, 240), dark=(88, 176, 166))
 
 
+# ── Raw meat drops ────────────────────────────────────────────────────────────────────
+#
+# Four FULL_CUBE inventory icons, one per huntable animal. The stated failure mode for
+# this set is "four meat icons that are all the same pink blob", so each is built to
+# differ from the other three in SILHOUETTE first and palette second, the same ordering
+# tile_planks/wood_side and tile_cactus/grass_top both rely on: a porkchop is a rounded
+# body with a bone nub at one end, a steak is a square-edged slab with marbling through
+# it, a drumstick is narrow-to-bulbous, and a mutton cut carries a fat-cap band down one
+# side. None of the four shares its base shape with another.
+#
+# None of the four ever constructs an RGBA pixel. That is the whole answer to the "zero
+# alpha-0 texels" requirement: speckle() returns a plain "RGB" image and every helper
+# called below (blend, rng.choice over a list of 3-tuples) stays in RGB, so there is no
+# alpha channel for a stray pixel to leave at 0 in the first place -- the same choice
+# tile_apple, tile_water, tile_ice and the six tile_*_ore painters already make for their
+# own FULL_CUBE, alpha-test-incompatible tiles. main() converts every painter's output to
+# RGBA before place() blits it, and PIL fills a channel that was never there with 255.
+
+
+def tile_raw_porkchop(rng):
+    """Raw porkchop -- the pig's drop, slot 38.
+
+    Pink-red body, the palest of the three mammal cuts (pork is traditionally the
+    lightest of pork/beef/mutton), lit top-left like every other relief cue in this sheet
+    (tile_dirt's pebbles, tile_snow's hollows, tile_apple's shoulder) with a matching
+    shadow lower-right for the roundness of the cut.
+
+    The bone nub sits in the TOP-RIGHT corner rather than competing with the top-left
+    highlight for the same space, and is drawn as its own rounded cap rather than a
+    square patch, so it reads as an object sitting IN the meat and not a flat corner
+    swatch. It is cream, not white: (238,224,196) and below, because 248 and 255 both
+    quantise to the same 5-bit value under RGBA5551 and white would leave no headroom for
+    the rim highlight where the bone meets the meat.
+
+    This is the shape tile_raw_mutton is built to be told apart from: mutton is a redder
+    cut with a cream FAT BAND running the full height of one SIDE, this is a pinker cut
+    with a cream nub at one CORNER. Silhouette differs before either palette does.
+    """
+    meat = [(224, 120, 124), (208, 100, 108), (236, 140, 140), (192, 84, 92)]
+    lit = (246, 168, 168)
+    shadow = (154, 62, 70)
+    bone = [(238, 224, 196), (246, 236, 216), (222, 206, 176)]
+    bone_shadow = (196, 180, 150)
+    rim = (250, 220, 210)
+
+    img = speckle(rng, TILE_PX, meat, weights=[4, 3, 2, 3])
+    px = img.load()
+
+    # Body relief: lit top-left, shadowed lower-right, the same soft-blob construction
+    # tile_apple's shoulder highlight uses -- a hard disc reads as a sticker, a jittered
+    # one reads as rounded meat.
+    for y in range(TILE_PX):
+        for x in range(TILE_PX):
+            dl = ((x - 4.0) ** 2 + (y - 8.0) ** 2) ** 0.5
+            ds = ((x - 12.0) ** 2 + (y - 12.0) ** 2) ** 0.5
+            if dl < 3.4 and rng.random() < 0.75:
+                px[x, y] = lit
+            elif ds < 4.2 and rng.random() < 0.65:
+                px[x, y] = shadow
+
+    # The bone nub: a rounded cap in the top-right corner, drawn over the body shading so
+    # it always wins there.
+    for y in range(6):
+        for x in range(10, TILE_PX):
+            d = ((x - 14.5) ** 2 + (y - 1.0) ** 2) ** 0.5
+            if d < 4.6:
+                px[x, y] = bone_shadow if (x + y) % 3 == 0 else rng.choice(bone)
+
+    # The fat/rind seam where the bone meets the meat -- the one detail that sells
+    # "attached" rather than "two shapes touching by coincidence".
+    for x, y in ((8, 5), (9, 5), (9, 6), (10, 6)):
+        px[x, y] = rim
+    return img
+
+
+def tile_raw_beef(rng):
+    """Raw beef -- the cow's drop, slot 39. The darkest and reddest of the four on
+    purpose: beef is the deepest-coloured of the three mammal cuts, and pushing it well
+    below tile_raw_porkchop's pink and tile_raw_mutton's mid-red (this tops out at 152 red
+    with green and blue both under 34; porkchop's palest shade alone is 236,140,140)
+    means the three can be told apart by VALUE alone before shape or marbling is even
+    read.
+
+    A slab, not a blob: the one meat icon that keeps a hard, roughly-square border rather
+    than fading its edges away, because a steak is a cut with a straight edge where a
+    chop and a cut of mutton are rounded. That border is also the darkest tone on the
+    tile -- a seared crust -- so it reads as an edge rather than as an outline stroke.
+
+    Marbling is drawn as short pale dashes rather than continuous lines, for the same
+    reason tile_water's glints and tile_ice's fracture highlights are both broken up: an
+    unbroken diagonal reads as a scratch across the meat, not fat worked through it.
+    """
+    meat = [(132, 20, 26), (112, 14, 20), (152, 30, 34), (96, 10, 16)]
+    sear = (74, 8, 12)
+    fat = [(214, 190, 168), (198, 172, 150), (226, 204, 182)]
+
+    img = speckle(rng, TILE_PX, meat, weights=[4, 3, 2, 2])
+    px = img.load()
+
+    # The seared crust: drawn along the tile's own border, jittered rather than a clean
+    # ruled line so it reads as a cut edge and not a frame someone drew around the icon.
+    for i in range(TILE_PX):
+        for x, y in ((i, 0), (i, TILE_PX - 1), (0, i), (TILE_PX - 1, i)):
+            px[x, y] = sear if rng.random() < 0.8 else blend(px[x, y], sear, 0.5)
+
+    # Marbling: short diagonal dashes of pale fat, kept off the border itself so a streak
+    # never gets swallowed by the sear.
+    for _ in range(9):
+        x = rng.randrange(1, TILE_PX - 4)
+        y = rng.randrange(1, TILE_PX - 2)
+        shade = rng.choice(fat)
+        for step in range(2 + rng.randrange(3)):
+            xx, yy = x + step, y + step // 2
+            if 1 <= xx < TILE_PX - 1 and 1 <= yy < TILE_PX - 1:
+                px[xx, yy] = shade
+    return img
+
+
+def tile_raw_chicken(rng):
+    """Raw chicken -- the chicken's drop, slot 40. The palest of the four, and the only
+    one built on an ELONGATED silhouette rather than a rounded blob: narrow at the top
+    (the bone end) and bulbous at the bottom (the meat end), which is a drumstick's
+    outline before it is anything about colour.
+
+    That shape has to come from an opaque colour boundary rather than from alpha -- this
+    tile, like the other three, never leaves a texel at alpha 0 (see the section note
+    above). The first version of this painter drew the drumstick against a cool GREY
+    backdrop, and that was wrong for a reason that only shows up off the sheet: this row
+    is FULL_CUBE and SOLID, so it is PLACEABLE, and a grey backdrop ships as a grey block
+    with a pink triangle on all six faces. Every other opaque tile here fills its whole
+    face with its own material (apple, the six ores, stone); the cutout tiles that draw a
+    subject smaller than their face are all BLOCK_SHAPE_CROSS with real alpha-0 holes,
+    which this is not. So the backdrop is DARKER POULTRY, not neutral grey -- the whole
+    16x16 is chicken either way, and the drumstick reads as the pale lit cut standing out
+    of the darker meat around it.
+
+    The bone (top, narrow) and the flesh (bottom, bulbous) are the palest thing on the
+    tile; the surrounding meat is the same hue family two steps down in value. That is
+    enough separation at 16 px, and it is the same lit/shadow construction the porkchop
+    and mutton painters use rather than a second mechanism invented for this one tile.
+    Against the porkchop this stays legible on SATURATION, not just value: chicken is a
+    desaturated tan-peach throughout (its meat tones keep G and B high, 128-152 against a
+    196-206 red), where porkchop is a saturated pink-red (G and B down at 84-108). Pale
+    warm tan next to hot pink, before either silhouette is read.
+
+    The taper itself is a curve (radius grows with y**1.6, not linearly): a straight taper
+    reads as a wedge or a carrot, the curve is what makes the wide end read as rounded
+    meat instead of a triangle.
+    """
+    board = [(196, 142, 124), (206, 152, 134), (182, 130, 112)]
+    flesh = [(244, 202, 188), (252, 214, 200), (234, 190, 176), (246, 208, 192)]
+    bone = [(240, 228, 206), (248, 238, 218), (228, 216, 194)]
+    skin_shadow = (204, 156, 142)
+    bone_shadow = (208, 194, 168)
+
+    img = speckle(rng, TILE_PX, board, weights=[4, 3, 3])
+    px = img.load()
+
+    cx = 7.5
+    for y in range(TILE_PX):
+        t = y / (TILE_PX - 1)
+        radius = 1.6 + 5.0 * (t ** 1.6)
+        is_bone = y < 6
+        for x in range(TILE_PX):
+            if abs(x - cx) <= radius:
+                if is_bone:
+                    px[x, y] = bone_shadow if abs(x - cx) > radius - 1 else rng.choice(bone)
+                else:
+                    px[x, y] = skin_shadow if abs(x - cx) > radius - 1.3 else rng.choice(flesh)
+    return img
+
+
+def tile_raw_mutton(rng):
+    """Raw mutton -- the sheep's drop, slot 41. A mid-red cut, deliberately sitting
+    between tile_raw_beef's dark red and tile_raw_porkchop's pink (its palest shade is
+    192,76,68 against beef's 152,30,34 and porkchop's 236,140,140), so the three mammal
+    cuts form a value ladder rather than three unrelated reds.
+
+    Told apart from the porkchop by shape as much as by that mid-tone: this carries a
+    cream FAT CAP running the full height of the RIGHT edge, three pixels wide, where
+    porkchop's bone is a rounded nub confined to one corner. A band down a side and a nub
+    in a corner do not read as the same silhouette even before the colour is read, which
+    is the point -- see tile_raw_porkchop's docstring for the other half of that
+    comparison.
+    """
+    meat = [(176, 64, 58), (160, 52, 48), (192, 76, 68), (144, 42, 40)]
+    lit = (214, 108, 96)
+    shadow = (108, 34, 32)
+    fat = [(226, 214, 192), (236, 226, 206), (214, 200, 176)]
+    fat_shadow = (196, 182, 158)
+
+    img = speckle(rng, TILE_PX, meat, weights=[4, 3, 2, 3])
+    px = img.load()
+
+    # Body relief: lit top-left, shadowed lower-right, same construction as porkchop's.
+    for y in range(TILE_PX):
+        for x in range(13):
+            dl = ((x - 4.0) ** 2 + (y - 5.0) ** 2) ** 0.5
+            ds = ((x - 8.0) ** 2 + (y - 12.0) ** 2) ** 0.5
+            if dl < 3.2 and rng.random() < 0.75:
+                px[x, y] = lit
+            elif ds < 4.5 and rng.random() < 0.6:
+                px[x, y] = shadow
+
+    # The fat cap: a band down the right edge, full height, three px wide -- a SIDE
+    # band rather than porkchop's CORNER nub, which is the shape difference the
+    # docstring above argues from.
+    for y in range(TILE_PX):
+        for x in range(13, TILE_PX):
+            px[x, y] = fat_shadow if (x == 13 and rng.random() < 0.5) else rng.choice(fat)
+    return img
+
+
 def tile_sentinel(_rng):
     """Not art — a bleed alarm.
 
@@ -1980,6 +2206,10 @@ PAINTERS = {
     "redstone_ore": tile_redstone_ore,
     "lapis_ore": tile_lapis_ore,
     "diamond_ore": tile_diamond_ore,
+    "raw_porkchop": tile_raw_porkchop,
+    "raw_beef": tile_raw_beef,
+    "raw_chicken": tile_raw_chicken,
+    "raw_mutton": tile_raw_mutton,
 }
 
 

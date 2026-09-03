@@ -280,7 +280,34 @@ PROTO_REPO	:=	https://github.com/stevenjc2009-byte/blocksmith-server.git
 # was reporting on disk. A pin naming a commit that exists only locally would break a fresh
 # clone, which is the failure this check is meant to prevent, so it is checked here and not
 # taken on trust.
-PROTO_COMMIT	:=	32795b9aecc26517fb19e4f49ab55d8c487b4ccf
+#
+# BUMPED 2026-09-03 for v1.8.14 "Animals", 32795b9a -> a22eea3a (server v1.9.4). This one is
+# the OPPOSITE case to the v1.9.3 bump above, and the difference is worth stating because it
+# would otherwise read as the same event:
+#
+#   proto/bs_proto.h DID NOT CHANGE. Its blob is 8303be83 at 32795b9a, at a22eea3a and on
+#   disk -- checked all three ways, not assumed -- so check-proto-drift was green before this
+#   bump and is green after it. Nothing in v1.9.4 touches the wire header: BS_RECIPE_COUNT
+#   stays 5u because v1.8.14 adds no recipe, and BS_BLOCK_COUNT stays 8u because appending
+#   core rows past the frozen wire item span does not move it.
+#
+# So this line moves to NAME THE DEPLOYED SERVER, not to unbreak a build. What v1.9.4 actually
+# carries is four raw meat rows (ids 34..37) vendored into the mirrored world sources, which
+# moves the registry core count 34 -> 38 and the crc16 0xE15E -> 0x9610.
+#
+# RELEASE ORDER, and this one is NOT free either -- but for the registry reason rather than
+# the recipe reason. networld.c's registryMatchesInfo() is a join-time lockstep on
+# rev/count/crc16, so a v1.8.14 client meeting a daemon still on the 34-row table is refused
+# outright. That failure is loud and recoverable; the reverse ordering is the quiet, worse one.
+# Server v1.9.4 is therefore released and tagged BEFORE this bump, exactly as v1.9.3 was.
+#
+# Verified rather than assumed, before bumping, the same three ways as the entry above:
+# `git ls-remote origin` shows refs/heads/v1.9.4 and refs/tags/v1.9.4 both present on the
+# remote, refs/tags/v1.9.4^{} dereferences to a22eea3a (an annotated tag, and only a TAG is
+# deployable), and a22eea3a:proto/bs_proto.h is blob 8303be83 -- the same blob the drift guard
+# reads on disk. A pin naming a commit that exists only locally would break a fresh clone,
+# which is the failure this check exists to prevent.
+PROTO_COMMIT	:=	a22eea3a5d24a9ba05d2f69c9b4aa5472df1653d
 PROTO		:=	deps/blocksmith-server
 
 .PHONY: deps

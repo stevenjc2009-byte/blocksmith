@@ -57,7 +57,7 @@
 #define REGISTRY_DYN_LO_PIN     0x80  // first dynamic block id
 #define REGISTRY_DYN_HI_PIN     0xFD  // last one; 0xFE/0xFF stay reserved
 #define REGISTRY_DYN_ROWS_PIN   126   // 0xFD - 0x80 + 1, WRITTEN OUT, never computed
-#define REGISTRY_FULL_COUNT_PIN 160   // 34 core rows (air + thirty-three) + 126 dyn rows
+#define REGISTRY_FULL_COUNT_PIN 164   // 38 core rows (air + thirty-seven) + 126 dyn rows
 
 // Compile-time layer. These fire when the host suite builds, which is every
 // tools/run_host_tests.sh run; the 3DS build never compiles this file (see the __3DS__
@@ -195,7 +195,22 @@ static void checkPin(bool cond, long got, long want, const char *what, const cha
 // 118 + 6 + 1 = 125. Nothing else in this suite gained a call: testRegistryCoreIdsStable and
 // its kPhase3 table are both written against fixed id lists, and the crc golden is still
 // exactly one check regardless of what value it holds (0x165E -> 0xE15E this time).
-#define REGISTRY_TEST_EXPECTED_CHECKS 125
+//
+// 125 -> 130 on 2026-09-03, v1.8.14 "Animals"'s four raw meat rows (ids 34..37). Counted off
+// the source first, same discipline as every entry above:
+//
+//   +4   coreHardnessIsDeclared()'s per-row loop runs four more iterations, one
+//        check(v->hardness != 0, v->name) each for porkchop/beef/chicken/mutton.
+//   +1   the new raw-meat hardness-ladder pin, the four-row analogue of the six-ore ladder
+//        check and of the snow/cactus/ice trio above it.
+//
+// 125 + 4 + 1 = 130. Nothing else in this suite gained a call, for the same reason nothing
+// else did in the six-row move above: testRegistryCoreIdsStable and its kPhase3 table are
+// both written against FIXED id lists, so four new registry rows do not enter either one, and
+// the crc golden is still exactly one check regardless of what value it holds (0xE15E ->
+// 0x9610 this time). REGISTRY_FULL_COUNT_PIN moved value too (160 -> 164) without adding a
+// call, exactly as it has every previous time.
+#define REGISTRY_TEST_EXPECTED_CHECKS 130
 
 // Deliberately NOT routed through check(): this must not perturb the number it is testing,
 // so it bumps g_fails only. Reporting shape is check()'s, so a failure here reads the same
@@ -248,10 +263,11 @@ static void testRegistryRoundTrip(void)
 	// twelve v1.8.8 adds — birch log/planks/leaves (0x0F..0x11), spruce log/planks/leaves
 	// (0x12..0x14), the tall-grass top (0x15), poppy/daisy/bluebell/orchid (0x16..0x19) and
 	// the apple (0x1A) — plus v1.8.10's torch (0x1B), the first light source, plus v1.8.12's
-	// six ores (0x1C..0x21): coal/iron/gold/redstone/lapis/diamond. Every one of the last
-	// twenty-six is a core block and deliberately NOT an item — world/block.h records why
-	// BLOCK_COUNT stayed at 8 while the registry's row count moved to 34.
-	check(registryCount() == 34, "a fresh table defines exactly air + the thirty-three core blocks");
+	// six ores (0x1C..0x21): coal/iron/gold/redstone/lapis/diamond, plus v1.8.14's four raw
+	// meats (0x22..0x25): porkchop/beef/chicken/mutton. Every one of the last thirty is a
+	// core block and deliberately NOT an item — world/block.h records why BLOCK_COUNT stayed
+	// at 8 while the registry's row count moved to 38.
+	check(registryCount() == 38, "a fresh table defines exactly air + the thirty-seven core blocks");
 	check(registryFind("grass") == BLOCK_GRASS, "core rows are findable by name");
 
 	// The runtime half of the dyn-range pin. The two _Static_asserts at the top of this
@@ -635,8 +651,47 @@ static void testRegistryCrcStability(void)
 	// server cannot name ids 28..33 and would render every ore as an invisible hole.
 	// deps/blocksmith-server/game/bsgame_test.c's BS_REGISTRY_CORE_CRC16_GOLDEN and
 	// BS_REGISTRY_CORE_COUNT_GOLDEN move with this literal.
-	check(base == 0xE15Eu,
-	      "core-only crc matches the pinned golden 0xE15E");
+	// MOVED A SIXTH TIME 2026-09-03, 0xE15E -> 0x9610, by v1.8.14 "Animals"'s four raw meat
+	// rows (ids 34..37: raw_porkchop/raw_beef/raw_chicken/raw_mutton). registryCount() moves
+	// 34 -> 38, the same shape as every move above: four records APPENDED, nothing renumbered,
+	// so REGISTRY_REV stays 1.
+	//
+	// ⚠ 34..37 AND NOT 27..30. docs/plan-1.8.14-animals.md names 27..30 for these rows and it
+	// is STALE — written before v1.8.10's torch took 27 and before v1.8.12's six ores took
+	// 28..33. The first free id was read off BLOCK_DIAMOND_ORE == 33 in this tree rather than
+	// off the plan. Recorded here because a reader who trusts that document over this table
+	// renumbers four ids that are already on the wire.
+	//
+	// All four are FULL_CUBE and SOLID, following the apple rather than the plants: a CROSS
+	// row is handed BLOCK_AIR by breakComplete(), i.e. an animal you kill and get nothing
+	// from. Each carries its own hardness, a four-step ladder ordered by the size of the
+	// animal — chicken 3 < porkchop 4 < mutton 5 < beef 6 — pinned as a ladder by
+	// coreHardnessIsDeclared() below so it cannot be flattened to one value later.
+	//
+	// Measured the same way as every move above: a scratchpad probe (animb_meat_crc_probe.c)
+	// linking this tree's real world/registry.c and world/block.c, no test file linked so the
+	// golden is unreachable from the binary being measured. Printed:
+	//
+	//     count=38 crc=0x9610 rev=1
+	//     id=34 name=raw_porkchop  hardness=  4 flags=0x01 tex0=38 solid=1 liquid=0
+	//     id=35 name=raw_beef      hardness=  6 flags=0x01 tex0=39 solid=1 liquid=0
+	//     id=36 name=raw_chicken   hardness=  3 flags=0x01 tex0=40 solid=1 liquid=0
+	//     id=37 name=raw_mutton    hardness=  5 flags=0x01 tex0=41 solid=1 liquid=0
+	//     targetable-rows=36 zero-hardness-count=0
+	//
+	// and cross-checked by compiling the identical probe against
+	// deps/blocksmith-server/game/world/registry.c after tools/sync-world-sources.sh ran (it
+	// reported block.h and registry.c `synced` and the other nine `unchanged`; a following
+	// cmp over all eleven reported every one identical): count=38 crc=0x9610, the same number
+	// from the other side.
+	//
+	// SERVER SHIPPED FIRST, and this time that is past tense rather than an instruction: the
+	// server release is blocksmith-server v1.9.4, commit a22eea3a, tag v1.9.4, published
+	// before this literal moved. Its game/bsgame_test.c carries the mirrored
+	// BS_REGISTRY_CORE_CRC16_GOLDEN 0x9610 / BS_REGISTRY_CORE_COUNT_GOLDEN 38, and Makefile's
+	// PROTO_COMMIT was bumped to that commit.
+	check(base == 0x9610u,
+	      "core-only crc matches the pinned golden 0x9610");
 
 	// Content sensitivity: one extra def must move the crc, and re-init must
 	// put it back - proving the crc covers table content, not process state.
@@ -747,7 +802,7 @@ static void coreHardnessIsDeclared(void)
 	// the rule is green in a build where registryIsDefined() answers false for everything —
 	// a check that cannot go red proves nothing, and a `continue` is the easiest way to
 	// neutralise one by accident.
-	check(rows == 32, "and it ran over 32 rows: 34 core rows less air and less water");
+	check(rows == 36, "and it ran over 36 rows: 38 core rows less air and less water");
 
 	// A row must have its OWN number, not a neighbour's. The loop above is satisfied by a
 	// table where every hardness is 9, which is exactly the failure mode "make sure every
@@ -775,6 +830,26 @@ static void coreHardnessIsDeclared(void)
 	      && registryGet(BLOCK_DIAMOND_ORE)->hardness == 100,
 	      "ore hardness is a six-step ladder, coal 60 < iron 70 < lapis 80 < gold 85 < "
 	      "redstone 90 < diamond 100, every step above stone's 45");
+
+	// v1.8.14's four raw meats, pinned as a LADDER for the identical reason the ore ladder
+	// above and the cactus/snow/ice trio above that are: the per-row loop is satisfied by a
+	// table where all four read the same number, and four identical break times tell the
+	// player nothing about which cut is which. The ladder rises with the size of the animal
+	// the meat comes off, every step clears the 1-tick floor the plants sit at, and every
+	// step is far under stone's 45 — this is soft material and the numbers say so.
+	//
+	// Written as inequalities and not as four `==` lines on purpose. Four equalities are all
+	// still true about a table where beef had simply borrowed the mutton row's byte; stated
+	// as a strict ordering, that cannot happen quietly.
+	check(registryGet(BLOCK_RAW_CHICKEN)->hardness == 3
+	      && registryGet(BLOCK_RAW_PORKCHOP)->hardness == 4
+	      && registryGet(BLOCK_RAW_MUTTON)->hardness == 5
+	      && registryGet(BLOCK_RAW_BEEF)->hardness == 6
+	      && registryGet(BLOCK_RAW_CHICKEN)->hardness < registryGet(BLOCK_RAW_PORKCHOP)->hardness
+	      && registryGet(BLOCK_RAW_PORKCHOP)->hardness < registryGet(BLOCK_RAW_MUTTON)->hardness
+	      && registryGet(BLOCK_RAW_MUTTON)->hardness < registryGet(BLOCK_RAW_BEEF)->hardness,
+	      "raw meat hardness is a four-step ladder, chicken 3 < porkchop 4 < mutton 5 < "
+	      "beef 6, every step above the plants' 1-tick floor and far under stone's 45");
 
 	// CONTROL. An id with no row still reads back as air, hardness 0, and that must NOT trip
 	// the rule above — the rule is about rows that exist. Green in every arm, including one

@@ -286,6 +286,15 @@ typedef struct {
 `RECIPE_COUNT` is 4 today (dirt→grass, stone→sand, leaves→dirt, wood→planks). `crafting.h`'s own
 comment states the project **rejected both shaped and shapeless multi-ingredient recipes** by
 design — `CraftRecipe` is "the degenerate case of shapeless with a bag of one," deliberately.
+
+> **⚠ CORRECTION [2026-09-03] — `RECIPE_COUNT` is 5 today, not 4.** `source/world/crafting.h`
+> (read directly): the enum is `RECIPE_DIRT_TO_GRASS, RECIPE_STONE_TO_SAND,
+> RECIPE_LEAVES_TO_DIRT, RECIPE_WOOD_TO_PLANKS, RECIPE_COAL_ORE_TO_TORCH, RECIPE_COUNT` — five
+> named recipes before `RECIPE_COUNT`, so `RECIPE_COUNT == 5`. `RECIPE_COAL_ORE_TO_TORCH`
+> landed via v1.8.12, unrelated to storage/QoL, between this document's research pass and now.
+> This means the chest recipe below does not move `RECIPE_COUNT` from 4 to 5 — it moves it
+> from **5 to 6**. This number was correct when researched and rotted once an unrelated
+> version landed a fifth recipe; the two spots below that repeat "4 to 5" need the same fix.
 **A chest recipe in this version stays inside that same shape** (§3.6) — the real Minecraft
 8-planks-in-a-ring recipe needs a multi-slot grid this codebase has already decided against once,
 and re-opening that decision is out of scope here (it belongs to whatever crafting-menu question
@@ -515,7 +524,8 @@ normal HUD.
 ```
 
 `RECIPE_COUNT` moves from 4 to 5, appended, never renumbered — the same append-only discipline
-`atlas_tiles.h` and `block.h`'s id lists already use. Six planks is a proposal, not sourced from
+`atlas_tiles.h` and `block.h`'s id lists already use. ⚠ CORRECTION [2026-09-03]: `RECIPE_COUNT`
+is already 5 today (see §2.8's correction) — this moves it from **5 to 6**, not 4 to 5. Six planks is a proposal, not sourced from
 anywhere — it is deliberately *not* eight (real Minecraft's ring recipe), specifically because
 this system has no concept of "arranged in a ring"; a flat count is the only shape
 `craftCanMake()`/`craftMake()` understand. If the owner wants the recipe to *feel* like the
@@ -732,6 +742,7 @@ does not belong in this section.
   tile, or the build fails its own `_Static_assert`.
 - **`source/world/crafting.c`** — `{ "Chest", BLOCK_PLANKS, 6, BLOCK_CHEST, 1 }` appended to the
   recipe table; **`source/world/crafting.h`** — `RECIPE_COUNT` moves from 4 to 5.
+  ⚠ CORRECTION [2026-09-03]: from **5 to 6** — `RECIPE_COUNT` is already 5 today, see §2.8.
 - **`source/world/registry_test.c`** — the pinned CRC golden and `REGISTRY_FULL_COUNT_PIN` both
   move to new values by hand, with a dated comment, the same way every prior core-row addition
   has recorded the move (`registry_test.c`'s own chain of such comments).

@@ -269,21 +269,22 @@ static void testTheCarryCeilingIsWhereItSays(void)
 	CHECK(inventoryCanHold((ItemId)BLOCK_FERN));         // 14
 
 	// The BOUNDARY, both sides of it, and it is now the edge of the DEFINED core table
-	// rather than a compile-time constant: id 33 is the last defined core row and id 34 is
-	// the first undefined one, now that v1.8.12's six ores (ids 28..33) have landed on top of
-	// v1.8.10's torch (id 27), which landed on top of v1.8.8's twelve per-biome rows (ids
-	// 15..26). registryCount() is read here rather than hard-coded so this pair keeps
-	// straddling the real edge if another core row ever lands on top of this one.
+	// rather than a compile-time constant: id 37 is the last defined core row and id 38 is
+	// the first undefined one, now that v1.8.14's four raw meats (ids 34..37) have landed on
+	// top of v1.8.12's six ores (ids 28..33), which landed on top of v1.8.10's torch (id 27),
+	// which landed on top of v1.8.8's twelve per-biome rows (ids 15..26). registryCount() is
+	// read here rather than hard-coded so this pair keeps straddling the real edge if another
+	// core row ever lands on top of this one.
 	//
 	// The NAMED constant on the right is the half that does NOT update itself, and it has now
-	// gone stale twice. It is deliberately not replaced by a bare 33: the point of naming the
+	// gone stale three times. It is deliberately not replaced by a bare 37: the point of naming the
 	// block is that the failure message says WHICH block the table now ends at, which is what
 	// tells the next reader whether a row was added on purpose or lost by accident. The price
 	// is that this line has to be edited whenever the table grows, and the noisy failure when
 	// nobody does is the thing being bought, not a defect in the check.
 	const ItemId last_defined  = (ItemId)(registryCount() - 1);
 	const ItemId first_beyond  = (ItemId)registryCount();
-	CHECK(last_defined == (ItemId)BLOCK_DIAMOND_ORE);    // premise: the table is 34 rows
+	CHECK(last_defined == (ItemId)BLOCK_RAW_MUTTON);     // premise: the table is 38 rows
 	CHECK(inventoryCanHold(last_defined));
 	CHECK(!inventoryCanHold(first_beyond));
 
@@ -558,7 +559,13 @@ static void testEveryCoreBlockStillBreaks(void)
 	// touches cross_seen, which is why that number does NOT move. Both figures below were read
 	// off a real run of this binary rather than worked out on paper: the arithmetic and the
 	// measurement agreed, but the measurement is what is quoted.
-	CHECK(targetable_seen == 32);   // 33 rows past air, less water
+	//
+	// v1.8.14: 32 -> 36, same shape of move. The four raw meats (ids 34..37) are FULL_CUBE and
+	// SOLID like the ores, so all four land in targetable_seen and cross_seen again does NOT
+	// move. Measured, not reasoned: the previous number went red as
+	// "interact self-test: FAIL 1/732  L562 targetable_seen == 32", and 36 is what the loop
+	// counted on the run after the four rows landed.
+	CHECK(targetable_seen == 36);   // 37 rows past air, less water
 	CHECK(cross_seen == 9);         // tall grass, dead bush, fern, tall grass top,
 	                                 // poppy, daisy, bluebell, orchid, torch
 }

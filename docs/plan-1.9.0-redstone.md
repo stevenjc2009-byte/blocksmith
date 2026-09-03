@@ -267,7 +267,10 @@ poll, and no torch exists to build a self-inverting clock loop from.
 
 ## 6. Blocks and atlas tiles — and the shape-enum budget this document nearly exhausts
 
-Registry currently has 27 of 127 core `BlockId` slots used, no pressure there. The
+Registry currently has 38 of 128 core `BlockId` slots used (counted 2026-09-03 from
+`registry.c`'s `kCoreDefs[REG_ID_DYN_LO]`, ceiling `REG_ID_DYN_LO = 0x80`; the 27
+this line previously carried predates the torch, the six ores and the four meats).
+No pressure there either way. The
 scarcer resource turns out **not** to be `BlockId`s or even atlas tiles — it is the
 **block-shape enum**, which this document did not expect to be a live constraint
 until counting it directly.

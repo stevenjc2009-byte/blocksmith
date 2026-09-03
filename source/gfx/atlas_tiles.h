@@ -89,9 +89,17 @@ enum {
 	TILE_REDSTONE_ORE,    // 35
 	TILE_LAPIS_ORE,       // 36
 	TILE_DIAMOND_ORE,     // 37
+	// v1.8.14 "Animals": four raw meat icons. Same order as world/block.h's BTEX_* mirror
+	// and as tools/make_atlas.py's TILES list; world/block_tiles_check.c fails the build if
+	// the two enums disagree. ⚠ These are slots 38..41 for BLOCK ids 34..37 — the id and
+	// the slot are four apart, exactly as they are for the six ores directly above.
+	TILE_RAW_PORKCHOP,    // 38
+	TILE_RAW_BEEF,        // 39
+	TILE_RAW_CHICKEN,     // 40
+	TILE_RAW_MUTTON,      // 41
 
 	// How many slots the list above NAMES. Not the sheet's capacity — that is
-	// ATLAS_TILE_COUNT (64) in world/atlas_uv.h, and these thirty-eight are 0..37 of it.
+	// ATLAS_TILE_COUNT (64) in world/atlas_uv.h, and these forty-two are 0..41 of it.
 	// (This sentence said "thirty-two are 0..31" until 2026-09-03; it had been stale since
 	// v1.8.10 added the torch and was a version behind again by v1.8.12. The paragraph below
 	// carries the same figure and stayed correct, so the two disagreed in the same file —
@@ -103,11 +111,15 @@ enum {
 	// as BLOCK_FACES in world/block.h, which terminates the face enum for the same reason.
 	TILE_USED_COUNT,
 
-	// Thirty-eight of ATLAS_TILE_COUNT (64) addressable slots used, 0..37 — twelve until
+	// Forty-two of ATLAS_TILE_COUNT (64) addressable slots used, 0..41 — twelve until
 	// v1.8.3 Phase 3 claimed 12..16 for snow, ice, cactus, dead bush and fern, seventeen
 	// until v1.8.8 claimed 17..30 for the birch and spruce materials, the tall grass top,
 	// the four flowers and the apple, thirty-one until v1.8.10 claimed 31 for the torch,
-	// and thirty-two until v1.8.12 claimed 32..37 for the six ores.
+	// thirty-two until v1.8.12 claimed 32..37 for the six ores, and thirty-eight until
+	// v1.8.14 claimed 38..41 for the four raw meats.
+	//
+	// Twenty-one free slots remain, 42..62: slot 63 is ATLAS_TILE_MISSING (world/atlas_uv.h)
+	// and cannot be claimed.
 	//
 	// It was twelve of FIFTEEN until v1.8.2's task 13b. The old ceiling was not the sheet
 	// height: MeshVertex.v held an atlas pixel row, so a uint8_t capped the sheet at 256 px

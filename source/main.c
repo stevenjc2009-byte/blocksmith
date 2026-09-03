@@ -44,6 +44,7 @@
 #include "debug/biomeborder_draw.h"   // ...and the half that binds a shader
 #include "debug/loadprof.h"
 #include "debug/metrics.h"
+#include "entity/animal.h"
 #include "entity/entity.h"
 #include "gfx/atlas.h"
 #include "gfx/font.h"
@@ -60,6 +61,7 @@
 #include "scene/crosshair.h"
 #include "scene/highlight.h"
 #include "scene/playermodel.h"
+#include "scene/entitymodel.h"
 #include "scene/interact.h"
 #include "scene/loading.h"
 #include "scene/loading_draw.h"
@@ -83,6 +85,7 @@
 #include "world/registry.h"
 #include "world/relight_drain.h"
 #include "world/relightq.h"
+#include "world/rng.h"
 #include "world/survival.h"
 #include "world/tick.h"
 #include "world/water.h"
@@ -106,10 +109,33 @@ static World s_world;
 
 // v1.8.8 entity foundation. Owns nothing but a fixed pool -- see entity/entity.h. Initialised
 // once a world is entered (worker_ok, beside the sleep hooks below) and ticked alongside water
-// in the per-tick loop. No renderer reads it yet: entity/entity.h's own "Rendering seam" comment
-// designs the draw side but nothing in scene/ implements it, so a spawned entity is simulated
-// and never drawn. See this session's report for why that half was left undone.
+// in the per-tick loop.
+//
+// v1.8.14. This comment used to end "No renderer reads it yet ... a spawned entity is simulated
+// and never drawn", and BOTH halves of that are now false, so it is corrected here rather than
+// left to be read as current -- a stale comment that still parses as a live statement has cost
+// this project time before. scene/entitymodel.c implements the draw side and drawEye() calls
+// entityModelDraw(view, &s_entities); entity/animal.c implements the creature side and the
+// per-tick entityTick() below now passes animalThink instead of NULL. An entity in this pool is
+// simulated, thought for, drawn, and can be hit.
 static EntityWorld s_entities;
+
+// v1.8.14 animals. The decision stream animalThink() and animalSpawnForColumn() roll against.
+//
+// It lives here, in main.c, and is handed to animal.c through entityTick()'s `user` pointer
+// inside an AnimalCtx -- entity/animal.h:121-127 requires exactly that shape, so that a host
+// test can own its own stream and no part of the creature layer holds hidden global state.
+//
+// A STREAM and not a positional hash, which is the distinction world/rng.h opens with. Terrain
+// must hash, because a chunk's contents cannot be allowed to depend on how many chunks were
+// generated before it. Animal decisions carry no such requirement -- a herd that rolled
+// differently after a reload is not a different world -- and a sequence of decisions is exactly
+// what a stream is for.
+//
+// Seeded from the world seed (below, beside entityWorldInit) rather than from the system clock,
+// so a session is reproducible from a cold load, and salted so it cannot be walking in step with
+// anything else derived from the same seed.
+static Rng s_animal_rng;
 
 // v1.8.0. Columns whose light a remote edit has invalidated, coalesced. Pushed by
 // onRemoteEdit, drained once per frame ahead of the mesh drain — see world/relightq.h for
@@ -1797,6 +1823,30 @@ static bool genInstallOne(void)
 	// this column instead of waiting a frame.
 	networldOnColumnLoad(&s_world, cx, cz);
 
+	// v1.8.14 animals. THE main-thread "this column is now genuinely part of the live world"
+	// moment, which is the whole reason the spawner is called from here.
+	//
+	// NOT from worldColumnCreate(), which docs/plan-1.8.14-animals.md P2 names and is wrong
+	// about: that runs on the terrain worker thread (app/worker.c's workerMain) against a
+	// STAGING world, and nothing in entity/entity.c is written to survive an EntityWorld
+	// mutated off the main thread. entity/animal.h says the same in its THREADING note.
+	//
+	// Verified rather than assumed, because "it reads like a main-loop site" is not evidence:
+	// genInstallOne() is a file static, so main.c is the only file that can call it, and it
+	// has exactly three callers -- runLoadingScreen() (which drives aptMainLoop() itself),
+	// saveCheck(), and the frame loop. All three are reached only from main(), and main.c
+	// creates no thread of its own: every threadCreate() in this tree is in app/worker.c,
+	// app/watchdog.c or app/updater.c, and none of them can reach a static in this file.
+	//
+	// AFTER networldOnColumnLoad above, so a herd is never rolled against terrain that a
+	// pending remote edit is about to change underneath it, and before genQueueReadyColumns
+	// below only to keep the meshing pass last.
+	//
+	// The return is dropped on purpose. 0 is the ORDINARY outcome -- about eleven columns in
+	// twelve roll no herd at all and a desert never rolls one (entity/animal.h) -- so it is
+	// not a failure and there is no counter here for it to feed.
+	(void)animalSpawnForColumn(&s_entities, &s_world, &s_gen, cx, cz, &s_animal_rng);
+
 	// And now ask the server for whatever it already holds for this column. Here rather than
 	// where the column was requested, because a subscription is a promise that the diffs can
 	// be applied on arrival, and until the blocks are in the world they cannot be. After the
@@ -2711,6 +2761,7 @@ static void drawEye(C3D_RenderTarget* target, const C3D_Mtx* view, const RayHit*
 	// of wrong that reads as a projection bug.
 	drawStage(WD_DRAW_PLAYERS, eye);
 	playerModelDraw(view);
+	entityModelDraw(view, &s_entities);
 	drawStage(WD_DRAW_TAGS, eye);
 	playerModelDrawTags(view, 400.0f, 240.0f);
 
@@ -4356,6 +4407,17 @@ session_start:
 		// the sleep hooks above are keyed on -- entityCapFor sizes the fixed pool per console
 		// the same way the render distance default above does.
 		entityWorldInit(&s_entities, entityCapFor(hwIsNew3ds()));
+		// v1.8.14 animals. Seeded beside the store the spawner writes into, and under the same
+		// worker_ok gate, because both facts this line needs are established by it: genStart()
+		// has run (it is what returned worker_ok) and genStart() is the only place a WorldGen
+		// is built, so s_gen.seed is the real seed of the world about to be walked into rather
+		// than whatever a zeroed static held. Seeding outside this branch would seed from 0 on
+		// a world that failed to open.
+		//
+		// Salted through rngMix so the animal stream is not the cave salts' or the terrain
+		// hashes' sequence wearing a different name. rngSeed() itself already refuses 0, which
+		// is xorshift32's fixed point, so a seed-0 world is handled without a special case.
+		rngSeed(&s_animal_rng, rngMix(s_gen.seed ^ 0xA14Du));
 	}
 	BOOT_WRITE();
 
@@ -4488,6 +4550,7 @@ session_start:
 	// completely irrelevant in single player, and either way is not a reason to refuse to
 	// boot. playerModelDraw checks its own ready flag, so nothing downstream needs this.
 	(void)playerModelInit();
+	(void)entityModelInit();
 
 	// v1.8.8 NEON BIOME BORDERS. Same not-load-bearing footing as the three above: a failure
 	// costs a debug overlay nobody has switched on, and biomeBorderDraw checks its own ready
@@ -5340,8 +5403,32 @@ session_start:
 		// A live readout wired to something that no longer measures the thing is worse than no
 		// readout, because it reads as evidence.
 		metricsSyncBegin();
+		watchdogPhase(WD_PHASE_MESH);
 		gpuWaitPrevFrame();
+		watchdogPhase(WD_PHASE_SIM);
 		metricsSyncEnd();
+
+		// Bracketed with its own phase, immediately above. WD_PHASE_SIM was set at the top of
+		// this iteration and, before this bracket existed, was never touched again until
+		// WD_PHASE_MESH further down — so a hang inside gpuWaitPrevFrame() itself (a bounded
+		// gxCmdQueueWait under BS_GPU_TESTS; an unbounded C3D_FrameBegin(C3D_FRAME_SYNCDRAW)
+		// without it) reported hang.txt phase SIM, pointing straight at player/camera/aim code
+		// that has nothing to do with a GPU wait. This IS "the single most likely place" a real
+		// freeze stops, per the bug this whole function exists for, so mislabelling it defeats
+		// the point of reporting a phase at all.
+		//
+		// WD_PHASE_MESH, not a new enumerator: this wait exists to protect exactly the mesh-slot
+		// work MESH already names — genFollow's chunkRenderReleaseColumn and the two drains
+		// further down, per the comment above. The DRAW phase marker would read more literally
+		// (this is where C3D_FrameBegin actually happens on the shipped path) but is not
+		// available here: world/framesync_guard_test.c's testNothingEmitsBetween() takes the
+		// call setting that phase, spelled exactly once in this file, as its own anchor for
+		// where the draw block begins — a second call setting the same phase would give that
+		// needle two matches and fail the guard rather than extend it. (Written split apart in
+		// this sentence on purpose, so this comment does not itself become a second match.)
+		// Restored to SIM immediately after: genFollow, the tick loop, and interactAim/Edit below
+		// are genuinely SIM's declared territory (player, camera, ring follow, aim, edit —
+		// app/watchdog.h) and must keep reporting as such.
 
 #if BS_WORLD_GEN
 		// After the move, so the ring is centred on where the player is now rather than
@@ -5418,10 +5505,32 @@ session_start:
 			(void)waterTick(&s_water, &s_world, WATER_TICK_BUDGET, onWaterChange, NULL);
 			// v1.8.9 entity foundation. Ticked alongside water, once per simulation tick and
 			// not once per frame, for the same reason water is: a creature must not move
-			// faster on a console holding 60 fps than on one struggling at 30. No renderer
-			// reads s_entities yet -- see the s_entities declaration above.
+			// faster on a console holding 60 fps than on one struggling at 30.
+			//
+			// This comment used to end "No renderer reads s_entities yet -- see the s_entities
+			// declaration above." That stopped being true when entityModelDraw(view,
+			// &s_entities) was spliced into drawEye(); the declaration's own comment has been
+			// corrected too, so neither of them still reads as a live claim.
+			//
+			// v1.8.14. The think hook and its user pointer were NULL through v1.8.13 and are
+			// now animalThink and an AnimalCtx (entity/animal.h). The tick/frame separation
+			// above survives the creature layer intact and is not something this call has to
+			// arrange: entityTick supplies the hook's `dt_s` itself as `period * ENTITY_DT`
+			// (entity.c:255) -- the SIMULATED seconds that entity is about to be advanced by,
+			// which for a distance-decimated entity is its own period and not the frame's
+			// time. Nothing here passes a frame duration, and there is no frame clock in
+			// reach of this hook to pass by accident.
+			//
+			// The ctx is a stack local, rebuilt each tick. It is two pointers, so a static
+			// would buy nothing measurable and would put the decision stream back into file
+			// scope inside animal.c, which is precisely what animal.h's AnimalCtx exists to
+			// prevent. `gen` is documented there as reserved -- the think does not read it
+			// today -- and is passed anyway rather than NULL, so the day a rule wants the
+			// heightmap or the biome it is a change inside animal.c and not a new argument
+			// every lane has to agree to.
+			AnimalCtx animal_ctx = { &s_gen, &s_animal_rng };
 			(void)entityTick(&s_entities, &s_world, tickClockCount(&s_tickclock),
-			                  player.body.x, player.body.z, NULL, NULL);
+			                  player.body.x, player.body.z, animalThink, &animal_ctx);
 
 			// v1.8.9 weather. docs/plan-1.8.9-weather.md §7 asked for exactly this and named
 			// the shape: once per loaded column, decimated through world/tick.h rather than
@@ -5540,9 +5649,100 @@ session_start:
 			}
 		}
 
+		// v1.8.14 animals, the aim half. Cast at the animals ALONG THE SAME RAY interactAim()
+		// is about to walk, and before it, so that the two results below are two answers to one
+		// question rather than to two slightly different ones.
+		//
+		// The forward vector is the project's one convention, copied from scene/interact.c:526-529
+		// (which is itself the vector scene/player.c's cameraUpdate moves along): the view matrix
+		// is Rx(pitch) * Ry(yaw) * T(-pos), so positive pitch looks down and -Z is forward at zero
+		// yaw. Re-derived here rather than reached through interactAim(), which keeps the vector
+		// to itself and hands back only a RayHit. If these four lines and interact.c's four lines
+		// ever disagree, the crosshair and the animal hit point in different directions, and
+		// interact.c's own comment is on record about how hard that is to find.
+		//
+		// INTERACT_REACH, the same constant the block cast uses, so an animal is hit at exactly
+		// the distance a block is broken at. A second reach constant is how the two silently
+		// drift apart.
+		//
+		// Gated on !paused: with the pause menu up the crosshair is frozen on whatever it was
+		// on and nothing in the world may be acted upon, which is the same contract the edit
+		// masks further down enforce for blocks.
+		int   animal_slot = -1;
+		float animal_dist = 0.0f;
+		if (!paused) {
+			const float acp = cosf(player.cam.pitch);
+			animal_slot = animalRaycast(&s_entities,
+			                            player.cam.x, player.cam.y, player.cam.z,
+			                            sinf(player.cam.yaw) * acp,
+			                            -sinf(player.cam.pitch),
+			                            -cosf(player.cam.yaw) * acp,
+			                            INTERACT_REACH, &animal_dist);
+		}
+
 		// Aim first, then edit, so the highlight and the edit in the same frame cannot
 		// disagree about which block was being pointed at.
 		interactAim(&it, &s_world, &player.cam);
+
+		// v1.8.14 animals, the tie-break entity/animal.h asks for. The two casts are deliberately
+		// separate walkers -- animalRaycast is a float box test, worldRaycast a block-grid DDA
+		// with integer hit coordinates -- and neither could sensibly be written in terms of the
+		// other. Comparing their distances is both the simpler structure and the honest one.
+		//
+		// They ARE comparable: both start at the camera, both normalise the direction internally,
+		// and both report blocks travelled to the surface (world/raycast.h's RayHit.distance,
+		// entity/animal.h's out_dist). If no block is hit at all -- open sky -- any animal
+		// within reach wins by default, which is the !it.target.hit arm below.
+		//
+		// `<=` and not `<`, so a TIE goes to the animal. That is the case the whole splice exists
+		// for: a pig standing flat against a wall has a box front and a wall face that can land on
+		// the same distance to the last bit, and a player who aimed at the pig has to hit the pig.
+		const bool animal_owns_aim =
+			animal_slot >= 0 && (!it.target.hit || animal_dist <= it.target.distance);
+
+		// v1.8.14 animals, the damage half. Mirrors ate_this_frame at the top of this loop and
+		// means the same thing: this frame's press was consumed by something other than the
+		// ordinary verb, so the mask below has to take it away from that verb.
+		//
+		// Edge-triggered on `down`, not `held`, so one press is one swing. A block break is a
+		// multi-second hold (scene/interact.h task 50) but a hit is instant, and reading the
+		// level here would land ANIMAL_FIST_DAMAGE every frame the button was down -- three
+		// frames would kill a cow.
+		//
+		// Behind inputKey(ACTION_BREAK) rather than INTERACT_KEY_BREAK, because the binding is
+		// remappable and interact.c:404 reads exactly this. inputKey answers 0 for an action the
+		// map does not know and `down & 0` is false, so a build whose options never loaded
+		// simply cannot swing rather than swinging on every button.
+		bool hit_animal_this_frame = false;
+		if (!paused && animal_owns_aim) {
+			const u32 break_key = inputKey(ACTION_BREAK);
+			if (break_key && (down & break_key)) {
+				uint8_t drop_item = 0, drop_count = 0;
+				// The return is whether this hit KILLED it, and it is dropped: the drop
+				// out-parameters already say so (animal.h writes 0 to both on a survivor), and
+				// there is nothing else here that treats a kill differently from a hit.
+				(void)animalHurt(&s_entities, animal_slot, ANIMAL_FIST_DAMAGE,
+				                 player.body.x, player.body.z, &drop_item, &drop_count);
+				hit_animal_this_frame = true;
+
+				// The drop goes STRAIGHT INTO THE BAG. There is no ground-item entity anywhere
+				// in this codebase -- a broken block goes to the inventory, which is what the
+				// it.broke_id line below does -- so inventing one here would be a design change
+				// nobody asked for and a second lifetime to get wrong.
+				//
+				// Through invBridgeAdd and not inventoryAdd, so the pickup is reported to the
+				// server as BS_INV_OP_PICKUP exactly like a mined block, and so a refusal by a
+				// full inventory tells the server nothing. A refusal is the honest outcome and
+				// is not tracked separately, matching the block pickup's comment below.
+				//
+				// The id is tested first, the same way that line tests against BLOCK_AIR:
+				// entity/animal.h defines drop_item 0 as "drops nothing", and it stays 0 on
+				// every row until the meat items land, so this must be a real branch and not an
+				// assumption that a kill always drops something.
+				if (drop_item != 0 && drop_count > 0)
+					invBridgeAdd(&s_inv, drop_item, drop_count, NULL);
+			}
+		}
 
 #if BS_INTERACT_DEMO
 		// v1.8.1 task 50. Break is a HOLD now, so the demo has to hold it: a single frame of
@@ -5585,8 +5785,31 @@ session_start:
 		// disappear. interact.c:405 reads exactly inputKey(ACTION_PLACE), so this is the same
 		// bit it is about to test.
 		const u32 edit_down = (paused ? 0u : down)
-		                    & ~(ate_this_frame ? inputKey(ACTION_PLACE) : 0u);
-		const u32 edit_held = paused ? 0u : held;
+		                    & ~(ate_this_frame ? inputKey(ACTION_PLACE) : 0u)
+		// v1.8.14 animals: and the break bit is stripped on a frame the swing above consumed it,
+		// so one press cannot both damage an animal and start breaking the block behind it.
+		// interact.c reads keys_down for break in two places -- `fresh & key_break` becomes
+		// breakProgress's `pressed`, and a press with no target counts a refusal -- so this is
+		// not a no-op, and clearing the bit out of prev_keys also re-arms the edge cleanly for
+		// the first press after the animal moves out of the way.
+		                    & ~(hit_animal_this_frame ? inputKey(ACTION_BREAK) : 0u);
+
+		// v1.8.14 animals: the HELD half, and it is the one that actually delivers "hitting a
+		// pig standing in front of a wall hits the pig". interact.c:410 reads break as a raw
+		// LEVEL (`keys_held & key_break`) because a break is a hold, so masking `down` alone
+		// would swing at the pig on the press frame and then quietly mine the wall through it
+		// for the next two seconds.
+		//
+		// Keyed on animal_owns_aim and not on hit_animal_this_frame, because the flag above is
+		// true for exactly one frame per press and one frame of masking cannot stop a hold.
+		// animal_owns_aim is true on every frame the animal is nearer than the block, which is
+		// the condition that has to be answered. The consequence is deliberate and worth
+		// stating: an animal wandering across a break already in progress cancels it
+		// (interactEdit's `if (!holding_break) breakCancel`), and the player starts that block
+		// again once it has moved. Progress not surviving an interruption is already this
+		// module's rule for letting go of the button.
+		const u32 edit_held = (paused ? 0u : held)
+		                    & ~(animal_owns_aim ? inputKey(ACTION_BREAK) : 0u);
 		interactEdit(&it, &s_world, &player.body, edit_down, edit_held, ticks_now);
 
 		// Read once, straight after the call that sets them, because interactEdit clears both
@@ -6356,6 +6579,7 @@ session_start:
 	particlesExit();
 
 	playerModelExit();
+	entityModelExit();
 
 	// v1.8.8 NEON BIOME BORDERS. Frees the vertex buffer and drops the world pointer, so a
 	// fence cannot outlive the WorldGen it was classified from. biomeBorderReset also puts the

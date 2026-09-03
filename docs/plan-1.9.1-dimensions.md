@@ -224,9 +224,25 @@ Unlike the ores and redstone documents — both of which found they needed **zer
 new opcodes, because every persistent change they make is expressible as an ordinary
 block edit — a dimension transition is not a block edit. It needs the client to ask
 to travel, and the server to confirm which world the client is now in. Two new
-opcodes, in the confirmed-free 0x05–0xFF range (`bs_proto.h`'s `bs_app_msg` enum
-currently runs 0x01–0x04 **[codebase]**, `networld.c`'s wider client-side range
-extends to 0x0F, still leaving 0x10–0xFF, 241 opcodes, entirely free **[codebase]**):
+opcodes, in the confirmed-free **0x10–0xFF** range — 240 opcodes, entirely free.
+
+> ⚠ CORRECTION [2026-09-03]: this paragraph previously called **0x05–0xFF**
+> confirmed-free, on the belief that `bs_proto.h`'s `bs_app_msg` enum stopped at
+> 0x04. It does not. Verified directly against
+> `deps/blocksmith-server/proto/bs_proto.h:217-331`, the enum runs **0x01 through
+> 0x0F**: `BLOCK_EDIT` 0x01, `POS_UPDATE` 0x02, `WORLD_SYNC` 0x03, `WORLD_INFO` 0x04,
+> `CHUNK_SUB` 0x05, `CHUNK_DIFFS` 0x06, `CHUNK_UNSUB` 0x07, `INV_STATE` 0x08,
+> `INV_ACTION` 0x09, `PLAYER_STATE` 0x0A, `PLAYER_REPORT` 0x0B, `REGISTRY_INFO` 0x0C,
+> `REGISTRY_FETCH` 0x0D, `REGISTRY_DEFS` 0x0E, `WORLD_GEN` 0x0F.
+>
+> Taking the old text at face value and assigning `BS_APP_DIM_ENTER = 0x05` would
+> have **collided with `BS_APP_CHUNK_SUB`** — a wire-format collision between two
+> live opcodes, which is a great deal worse than a stale number. The conclusion is
+> unchanged (there is ample room), but the usable floor is **0x10**, not 0x05.
+>
+> Also worth knowing when re-checking this: the Grep *tool* is silently blind to
+> `deps/` because it is gitignored, so it returns nothing here and reads as "no such
+> enum". This was checked with bash `grep` on an explicit path.
 
 - **`BS_APP_DIM_ENTER`** (client→server): "I am at a portal, requesting entry to
   dimension X." **This is client-to-server — the server must ship this opcode

@@ -217,6 +217,19 @@ the honest per-element count) is on the order of 60-100 quads — comfortably in
 existing headroom without raising `SPRITE_MAX_QUADS` at all. **reasoned**, from the measured
 numbers above; the exact new count is worked in §10 once the concrete element list is fixed.
 
+> **⚠ CORRECTION [2026-09-03] — the ~550/~450-headroom figure above is stale; the comment it
+> quotes has since been updated to a larger number.** `source/gfx/sprite.c:18-37` today gives
+> a different, already-revised accounting: bottom screen worst case ~450 (not this section's
+> ~220) plus top-screen stereo name tags 338 (not 330), "roughly 790 of 1024" — leaving
+> **~234** quads of headroom, not ~450. The file's own comment now explicitly notes "A UI
+> redesign is planned for v1.8.19," which is why it was revised after this research pass ran.
+> `SPRITE_MAX_QUADS` itself still comfortably covers this section's ~60-100-quad bar estimate
+> and §10's ~183-quad worked total either way, so the bottom-line conclusion ("fits without
+> raising the constant") survives — only the "not quite 2x headroom" framing is wrong. This
+> was an accurate read of the file when written and the file changed under it afterwards, not
+> a research error. `docs/plan-1.8.19-interface.md`'s own citation of this figure (§2, "~550
+> quads worst-case shipped") carries the same correction.
+
 **Bottom-screen usage today.** The 320x240 bottom screen already carries, top to bottom: the
 hotbar (`HOTBAR_Y=0`, 40px), the 2-row main inventory grid (`GRID_Y=40`, 80px), and a crafting
 panel with a close bar and one row per recipe (`CRAFT_Y=120` through `SCR_H=240`, i.e. 120px)
@@ -390,6 +403,22 @@ renderer already has (`source/scene/highlight.c` already draws a comparable bloc
 highlight today, by the same technique) rather than any TexEnv trick. **reasoned**, from
 `source/scene/highlight.c`'s existence as a precedent for "outline geometry drawn as extra
 quads, not a shader effect."
+
+> **⚠ CORRECTION [2026-09-03] — both of §7's proposals already shipped, in v1.8.8; this
+> section is not Phase-1 work still to build, it is a description of a feature that already
+> exists.** `CHANGELOG.md`'s v1.8.8 entry states both directly: "Debug-only neon biome
+> borders. A toggle in the debug menu — off by default... draws a glowing fence standing on
+> the ground exactly along every biome boundary" and "The current biome is now shown on the
+> bottom-screen debug readout." Verified live in code, not just the changelog:
+> `source/debug/biomeborder.c`/`.h`, `biomeborder_draw.c`/`.h`, `biomeborder_test.c` exist;
+> the toggle is a real `DEBUG_TOGGLE` registered at `source/main.c:1394-1398` (name "Biome
+> borders", `available = true`, wired to `bsDbgGetBiomeBorders`/`bsDbgSetBiomeBorders`), drawn
+> every frame once enabled. The readout is `source/debug/biomeinfo.c`/`.h` and
+> `biomeinfo_test.c`, a real host-tested bottom-screen debug row. This section was written
+> before v1.8.8 shipped and describes genuinely future work at the time it was drafted; it
+> simply rotted once that version landed. `docs/plan-1.8.19-interface.md` §0 already notes
+> this section is "unchanged by this version" and its own build order still lists this as
+> Phase 1 — that citation needs the same correction, made there directly.
 
 ---
 

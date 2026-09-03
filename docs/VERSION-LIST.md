@@ -8,12 +8,16 @@ and, for most versions from v1.8.7 onward, in that version's own `docs/plan-*.md
 (for example `docs/plan-1.8.11-caves.md`); run `ls docs/plan-*.md` for the current set,
 which now covers nearly every version through v1.9.1.
 
-**Newest published version: 1.8.11** (released 2026-09-02; the `releases/latest` redirect
-that the in-app updater follows resolves to `v1.8.11`, and the published `.cia` was
-downloaded back and md5-matched against the built file). Everything from `v0.1.0` up to
-and including `v1.8.11` is released and published on GitHub. Everything after `v1.8.11`
-is a plan, not a build; order, scope, and whether a given version ships at all can still
-change before it does.
+**Newest published version: 1.8.14** (released 2026-09-03). Everything from `v0.1.0` up
+to and including `v1.8.14` is released and published on GitHub. Everything after
+`v1.8.14` is a plan, not a build; order, scope, and whether a given version ships at all
+can still change before it does.
+
+This line is the one thing in this file that goes stale silently, so it is worth saying
+how it is meant to be kept: it moves in the release commit itself, not afterwards. It sat
+at `1.8.11` while v1.8.12 and v1.8.13 were already marked released further down the same
+document — two releases' worth of drift, in a summary that contradicted the body it was
+summarising. A reader who trusts a header over a body has no way to notice that.
 
 A console note appears below **only** where an Old 3DS and a New 3DS genuinely differ —
 a different render-distance ceiling, extra RAM, a higher clock, an extra core, anything
@@ -640,28 +644,74 @@ answer, and that answer is now obtainable.
 
 ---
 
+### v1.8.13 — Survival — released and published
+
+**Added.** Health and hunger, each 0–20, shown as two rows of ten pips along the bottom of
+the touch screen (`HP` in red, `FD` in orange) — hidden while the inventory is open, where
+there is no room for them. An odd value draws its last pip as a half in a lighter shade
+rather than rounding it away, because at low health the difference between one point and two
+is the difference between surviving the next fall and not. Hunger drains one point a minute;
+at 18 or above it heals one point of health every four seconds, and at zero it costs one
+point of health every four seconds instead. Starving stops at 1 HP and cannot kill you —
+falling can. Fall damage is free under three blocks and one point per block past that,
+measured from the highest point reached rather than the edge stepped off, and cancelled
+entirely by landing in water. Apples restore four hunger, eaten by holding one and pressing
+the place button — this works even aiming at open sky, and a full-hunger player still places
+the apple as a block, exactly as before. A rebindable Eat button defaults to ZR, which only
+exists on a New 3DS; an original 3DS or 2DS gets no default there, but the place-button route
+works identically on every console, so nothing is lost. Existing keybinds, stored by name
+rather than position, are untouched by the new action arriving. Dying at zero health
+respawns at world spawn with full health and hunger and an untouched inventory. Health and
+hunger save with the world, and are server-owned in multiplayer like the rest of the player
+already was.
+
+**Notes.** Verified with 2,555 new automated checks on the survival rules plus 573 more on
+the pip layout, each one shown to actually fail when the rule it covers is deliberately
+broken. Not shipped: any food besides apples — meat arrives with animals in v1.8.14 and
+cooking at the furnace in v1.8.15, with the food table already built so each is a one-line
+addition.
+
+---
+
+### v1.8.14 — Animals — released and published
+
+**Added.** The entity system, and the first four things running on it: pigs, cows, chickens
+and sheep, spawning in herds of two to four on loaded ground with room to stand, roughly one
+column of world in twelve. Which animals show up depends on biome — plains and forest get
+all four, tundra only sheep, taiga cows and sheep, jungle pigs and chickens, and the desert
+none at all. They are drawn as flat-coloured boxes sized and shaped like the real animal — a
+pink box for a pig, brown for a cow, cream for a chicken, off-white for a sheep — not yet
+modelled or textured; that is planned for later. Behaviour is idle and wander, switching
+every couple of seconds, plus flee: a hit turns the animal and sends it running directly away
+for about three seconds, with no pathfinding beyond that. Aiming at an animal takes priority
+over a block behind it. A punch does the same damage regardless of animal, so it is a one-hit
+kill on a chicken, two hits on a sheep, three on a pig or cow, and a kill drops its meat
+straight into the bag with nothing to pick up off the ground. Four new foods — raw porkchop,
+beef, chicken and mutton, eaten the same way as an apple — restore three hunger (porkchop,
+beef) or two (chicken, mutton), a point under the apple's four on purpose, so cooking at the
+furnace in v1.8.15 has room to restore more than the raw cut it comes from. Raw meat is also
+a placeable block, like the apple before it, when hunger is already full.
+
+**Changed.** A New 3DS keeps up to 32 animals alive around the player at once against 16 on
+an original 3DS or 2DS — the one console difference in this release, kept so both consoles
+stay smooth rather than the busier setting slowing an Old 3DS down. The built-in block count
+went from 34 to 38 to hold the four meat blocks, and that count has to match on both ends of
+a multiplayer connection; the server side shipped first as blocksmith-server v1.9.4, and
+joining an older server does not get refused outright, it just quietly renders every block
+this update added as empty air, with no on-screen warning unless the debug overlay is on.
+
+**Notes.** The GPU black-box recorder (`BS_GPU_TESTS`) is switched on by default from this
+version, so if the still-unconfirmed v1.8.10 freeze (see above) ever recurs, the console now
+writes `postmortem.txt` to the SD card instead of locking up silently.
+
+---
+
 ## Planned
 
 Everything from here down is a plan, not a build: none of it has been committed, tagged, or
 published as a GitHub Release, and scope, order, and even whether a given version ships at
 all can still change. Where a version has a dedicated research brief or plan document
 beyond `ROADMAP.md`'s own entry, that is named so the deeper detail can be found.
-
-### v1.8.13 — Survival — planned
-
-**Added.** Health, hunger, fall damage, eating, death and respawn.
-
-`docs/ROADMAP.md` gives this version one short paragraph; nothing beyond it has been
-researched or specified yet.
-
-### v1.8.14 — Animals — planned
-
-**Added.** The entity system, and the first animals on it: pigs, cows, chickens, sheep.
-They wander, they can be killed, and they drop meat.
-
-`docs/ROADMAP.md` gives this version one short paragraph; nothing beyond it has been
-researched or specified yet. This is the entity/mob framework v1.8.11's cave-monster work
-and v1.8.16 both depend on.
 
 ### v1.8.15 — Furnace — planned
 
@@ -691,6 +741,27 @@ half-built. Roughly 19–20 distinct clips cover everything the code can actuall
 today (grouped by acoustic class: earth/stone/wood/foliage for breaking and placing,
 those four plus snow/ice for footsteps, water entry/exit, one craft sound, and 2–3 UI
 sounds); CC0 packs from Kenney and OpenGameArt plausibly cover the whole list.
+
+> **⚠ CORRECTION [2026-09-03] — "no audio subsystem in the tree today at all" is FALSE, and
+> has been since v1.8.8.** `CHANGELOG.md`'s own v1.8.8 entry says sound effects "are wired
+> into the game and actually run for the first time... Three sounds ship (block break, block
+> place, footstep), CC0 from Kenney's Impact Sounds pack." Verified directly in source, not
+> just from the changelog: `source/audio/audio.c`/`.h`/`audio_backend.h`/`audio_ndsp.c` (a
+> real ndsp backend), `audio_mixer.c`/`.h`, `audio_pan.c`/`.h` (positional panning),
+> `audio_bsnd.c`/`.h` (a custom `.bsnd` sound container), and `audio_sfx.c`/`.h` all exist.
+> `romfs/sfx/block_break.bsnd`, `block_place.bsnd`, and `footstep.bsnd` exist on disk. And the
+> three cues are not merely registered — they fire in real gameplay through wrapper
+> functions, not the low-level primitive: `audioSfxPlayAtBlock(SFX_BLOCK_BREAK, ...)` at
+> `source/scene/interact.c:261`, `audioSfxPlayAtBlock(SFX_BLOCK_PLACE, ...)` at
+> `interact.c:500`, and `audioFootstepsUpdate(&footsteps, ...)` at `source/main.c:5266`
+> inside the per-frame tick loop. A grep for the lowest-level primitive alone
+> (`audioPlayAt`) returns nothing outside `source/audio/` and reads exactly like "nothing
+> calls the audio system" — that is what made this entry's claim look plausible; the actual
+> call sites are one layer up, in the wrappers gameplay code reaches for. The real remaining
+> work for this version is coverage (3 of a proposed ~19-20 slots exist today — no hurt/eat/
+> splash/craft/door cues, no per-material break/place variation), not building a subsystem
+> that doesn't exist. This entry was true when v1.8.17 was first drafted, before v1.8.8
+> shipped, and rotted afterwards rather than having been wrong from the start.
 
 *Two things named in `docs/ROADMAP.md`'s own wording — "animals" and "ambience" — have no
 hook to trigger them yet*, since neither a mob system nor a running world clock exists in

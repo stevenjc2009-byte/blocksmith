@@ -307,21 +307,33 @@ static void testEmptyInventoryRoundTrips(void)
  * remembering to look. That is the whole argument for keeping a hard-coded id on the left side
  * instead of `registryCount() - 1`: a derived bound would never go red, would never need this
  * comment, and would also never tell anyone that the table had grown. The recurring edit is
- * the feature. */
+ * the feature.
+ *
+ * Moved a FOURTH time, diamond_ore (33) -> raw_mutton (37), on 2026-09-03 by v1.8.14 "Animals",
+ * which added ids 34..37 in one go (raw_porkchop 34, raw_beef 35, raw_chicken 36, raw_mutton
+ * 37). The prediction written into the body below — "if a future row lands at 34 this goes red"
+ * — is the line that fired, verbatim, from a run of this stanza on its own:
+ *
+ *   FAIL  L319 !inventoryCanHold((ItemId)(BLOCK_DIAMOND_ORE + 1))
+ *
+ * and 34 is BLOCK_RAW_PORKCHOP. One failure and no others in that run ("inventory persistence
+ * self-test: FAIL 106 checks, 1 failed"), which is the control: the meat rows moved the edge
+ * and nothing else in this file. Re-pointed rather than patched, same reasoning as the three
+ * moves above. */
 static void testMaxValidItemIdRoundTrips(void)
 {
 	freshDir();
 
 	/* The premise, checked rather than assumed: these really are the two sides of the edge.
-	 * If a future row lands at 34 this goes red and the case gets re-pointed, instead of
+	 * If a future row lands at 38 this goes red and the case gets re-pointed, instead of
 	 * quietly testing the middle of the table while calling it the boundary. */
-	CHECK(inventoryCanHold((ItemId)BLOCK_DIAMOND_ORE));
-	CHECK(!inventoryCanHold((ItemId)(BLOCK_DIAMOND_ORE + 1)));
+	CHECK(inventoryCanHold((ItemId)BLOCK_RAW_MUTTON));
+	CHECK(!inventoryCanHold((ItemId)(BLOCK_RAW_MUTTON + 1)));
 
 	Inventory in;
 	inventoryInit(&in);
 	in.slots[0] = (InvSlot){ .item = BLOCK_LEAVES, .count = INV_STACK_MAX };  /* 6: the old top */
-	in.slots[1] = (InvSlot){ .item = BLOCK_DIAMOND_ORE, .count = INV_STACK_MAX }; /* 33: real one */
+	in.slots[1] = (InvSlot){ .item = BLOCK_RAW_MUTTON, .count = INV_STACK_MAX }; /* 37: real one */
 
 	CHECK(inventorySave(&in, INV_DIR));
 	Inventory out;
@@ -330,7 +342,7 @@ static void testMaxValidItemIdRoundTrips(void)
 	CHECK(invEqual(&out, &in));
 	/* Spelled out as well as compared, so a failure says WHICH id was lost rather than only
 	 * that two structs differ. invEqual is the check; this is the error message. */
-	CHECK(out.slots[1].item == BLOCK_DIAMOND_ORE && out.slots[1].count == INV_STACK_MAX);
+	CHECK(out.slots[1].item == BLOCK_RAW_MUTTON && out.slots[1].count == INV_STACK_MAX);
 }
 
 /* ── v1.8.8: the widened capacity, on disk ──────────────────────────────────────────────

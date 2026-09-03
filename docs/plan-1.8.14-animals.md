@@ -50,6 +50,25 @@ tested, host-buildable code that nothing calls yet — the same shape as the
 day/night clock's situation (see `plan-1.8.16-monsters.md`'s equivalent
 finding for that system).
 
+> **⚠ CORRECTION [2026-09-03] — the paragraph immediately above is FALSE as of
+> today, and was already false when this document shipped.** The same grep run
+> against `source/main.c` on branch `v1.8.14` returns five matches, not zero:
+> `s_entities` declared at `main.c:113`, `entityWorldInit(&s_entities,
+> entityCapFor(hwIsNew3ds()))` at `main.c:4360`, `entityTick(&s_entities,
+> &s_world, ...)` at `main.c:5426`, `entityModelDraw(view, &s_entities)` at
+> `main.c:2715`, and a comment at `main.c:5425`. The store is instantiated,
+> sized per console, and ticking every frame in the shipping build.
+>
+> **So P1 below is done as well as P0**, and any lane reading this document
+> should not re-wire `main.c`. Note also that the helper is spelled
+> `hwIsNew3ds()`, not `isNew3DS()` as the LINES SOMEONE ELSE MUST ADD section
+> below writes it, and the init sits at `:4360` rather than near line 3652.
+>
+> This is recorded rather than deleted because the error is instructive: a plan
+> that asserts absence from a grep is only as good as the day the grep was run,
+> and this one cost a lane real time. Read to the end of a block before trusting
+> its opening.
+
 This means v1.8.14's build order is shorter than `plan-entities.md`'s P0–P7
 implied when it was written: **P0 (the store itself) is done.** What remains is
 wiring it into `main.c`, defining what a pig/cow/chicken/sheep's `kind` and
@@ -272,7 +291,16 @@ dmg/hit, no knockback modeled — see HIS CALL).
    core item rows for raw porkchop/beef/chicken/mutton, following the exact
    five-step checklist `registry.c`'s own header already documents (*"⚠ ADDING
    A BLOCK — the five places"*): the `kCoreDefs` row (id 27–30, next free after
-   `BLOCK_APPLE=26`) including `.hardness` (these aren't targetable/breakable
+   `BLOCK_APPLE=26`)
+   <!-- ⚠ CORRECTION [2026-09-03]: 27-30 is WRONG and no longer free. Between
+        this document being written and v1.8.14 starting, BLOCK_TORCH took 27
+        and the six ores took 28-33 (verified by reading the enum in
+        source/world/block.h). The meat rows are ids **34-37**:
+        BLOCK_RAW_PORKCHOP 34, BLOCK_RAW_BEEF 35, BLOCK_RAW_CHICKEN 36,
+        BLOCK_RAW_MUTTON 37. Their ATLAS SLOTS are a different number again --
+        38-41 -- because the tile sheet and the id space are not aligned; see
+        the note at block.h:217. Do not assume id == slot. -->
+   including `.hardness` (these aren't targetable/breakable
    blocks in the world, only carryable items — see the apple row's own
    precedent for a carryable, non-placed-as-terrain item, though unlike apple
    these would never be placed in the world at all, only ever handed out by

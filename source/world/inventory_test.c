@@ -112,7 +112,17 @@ static char s_first[160];
 // entry above, and it matters more here, because the arithmetic for THIS delta depends on
 // knowing two loops exist rather than one. Somebody re-pinning from the sum alone would have
 // written 234 and quietly deleted eight real checks from the suite's expectations.
-#define INVENTORY_TEST_EXPECTED_CHECKS 242
+// 242 -> 246 on 2026-09-03, v1.8.14 "Animals"'s four raw meat rows (ids 34..37). Back to the
+// ORDINARY shape after the recipe-flavoured entry above: four registry rows appended, and the
+// whole delta lands in testTheBagTakesEveryDefinedBlock()'s per-row loop, one
+// CHECK(inventoryCanHold(id)) each. 242 + 4 = 246.
+//
+// Predicted off the source before the run and then confirmed by it — the pin printed
+// "CHECK COUNT: 4 check(s) were ADDED - expected 242, ran 246", the same 4 from the other
+// side. Two other lines in that same test moved VALUE without adding a call, exactly as the
+// entries above describe: `accepted == 32` -> 36, and the boundary pair's left-hand block
+// moved from BLOCK_DIAMOND_ORE to BLOCK_RAW_MUTTON.
+#define INVENTORY_TEST_EXPECTED_CHECKS 246
 
 // Deliberately NOT routed through CHECK(): this must not perturb the number it is testing,
 // so it bumps s_fails only. It fills s_first (with both numbers, so the one-line summary is
@@ -267,7 +277,7 @@ static void testTheBagTakesEveryDefinedBlock(void)
 	// The loop ran, over the whole table rather than a prefix of it. Without this a
 	// definedness query answering false for everything leaves the rule green having asserted
 	// nothing at all.
-	CHECK(accepted == 32);            // 34 core rows less air and less water
+	CHECK(accepted == 36);            // 38 core rows less air and less water
 	CHECK(accepted > BLOCK_COUNT);    // and genuinely more than the old ceiling admitted
 
 	// THE BOUNDARY, both sides, derived rather than hard-coded: the last id with a row is
@@ -285,13 +295,18 @@ static void testTheBagTakesEveryDefinedBlock(void)
 	//
 	// It is still not replaced with registryCount() - 1, on purpose. A bare count would keep
 	// this pair straddling the real edge with no edits ever, but the failure message would then
-	// say a number instead of a name — and "the table now ends at diamond_ore" is what tells the
+	// say a number instead of a name — and "the table now ends at raw_mutton" is what tells the
 	// next reader whether a row was ADDED deliberately or LOST by accident, which is the only
 	// question this check exists to answer. The recurring edit is the price of that message, not
 	// a defect in it.
-	CHECK(inventoryCanHold((ItemId)BLOCK_DIAMOND_ORE));           // 33, the last defined row
-	CHECK(!inventoryCanHold((ItemId)(BLOCK_DIAMOND_ORE + 1)));    // 34, no row
-	CHECK(!registryIsDefined((BlockId)(BLOCK_DIAMOND_ORE + 1)));  // ...and that is why
+	// v1.8.14: and a third time, to BLOCK_RAW_MUTTON = 37, the last of the four raw meats
+	// (34..37). Which is the paragraph above's point landing for the third time in four
+	// versions — the left-hand block is hard-coded, it goes stale every time a core row is
+	// appended, and it goes stale SILENTLY until a suite run says so. Kept as a name anyway,
+	// for the reason the next paragraph gives.
+	CHECK(inventoryCanHold((ItemId)BLOCK_RAW_MUTTON));           // 37, the last defined row
+	CHECK(!inventoryCanHold((ItemId)(BLOCK_RAW_MUTTON + 1)));    // 38, no row
+	CHECK(!registryIsDefined((BlockId)(BLOCK_RAW_MUTTON + 1)));  // ...and that is why
 
 	// The two exclusions that survive the widening, each for its own reason. Neither of them
 	// is about where the id sits.

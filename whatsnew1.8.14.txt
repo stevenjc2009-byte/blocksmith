@@ -1,0 +1,17 @@
+# Release notes shown on the 3DS top screen before the update downloads.
+#
+# Two sections, both optional, one item per line. Plain English, no markdown: this is read
+# by a player on a 400 px screen, not by a developer. A leading "- " is optional.
+#
+# Long lines wrap on their own, so write a sentence rather than fighting the width.
+
+[features]
+Animals. Pigs, cows, chickens and sheep now live in the world and wander about on their own.
+Which animals turn up depends on the biome. Plains and forest have all four, desert has none.
+Hit an animal and it runs away from you rather than standing there and taking it.
+Killing one drops raw meat straight into your bag - porkchop, beef, chicken or mutton.
+Eat raw meat like an apple. Pork and beef restore three hunger, chicken and mutton two.
+Raw meat is a block as well as a food, so you can place it and break it like anything else.
+Aiming at an animal now comes first, so punching one no longer breaks the wall behind it.
+New 3DS keeps up to 32 animals loaded at once. Old 3DS keeps 16, so both stay smooth.
+Update your server too. Against an older one the new blocks silently turn into air.

@@ -63,6 +63,20 @@ landed state, not against today's 4-recipe, chest-less tree, so a reader checkin
 against a v1.8.18-built tree will see the numbers this document quotes; a reader checking it
 against today's un-built tree will see one fewer recipe and one fewer block than quoted.
 
+> **⚠ CORRECTION [2026-09-03] — the "today's tree has `RECIPE_COUNT` 4" premise is false; it
+> is already 5, for a reason unrelated to the chest.** `source/world/crafting.h` (read
+> directly): `RECIPE_COUNT == 5` today — `RECIPE_COAL_ORE_TO_TORCH` landed via v1.8.12, which
+> has nothing to do with storage/QoL or a chest. No `BLOCK_CHEST` row exists anywhere in the
+> registry yet (confirmed: zero grep hits for chest/container/per-instance block state in
+> `source/`) — the chest itself has not landed, contrary to what this paragraph's framing
+> implies. So the real progression is: `RECIPE_COUNT` is 5 **today**, independent of v1.8.18,
+> and will become **6** once a chest recipe actually lands (per the same correction now in
+> `docs/plan-1.8.18-storage-qol.md` §2.8). A reader checking this document against the tree as
+> it stands right now will see `RECIPE_COUNT == 5` already — not because a chest shipped, but
+> because an unrelated torch recipe did. This same off-by-one, from the same pre-v1.8.12
+> research snapshot, is why §5.2's `CRAFT_ROW_H` worked example below lands on the right
+> number (5) for the wrong reason — see the correction there.
+
 ---
 
 ## 1. Success criteria
@@ -120,6 +134,9 @@ settled facts this document builds on directly:
   (§4: no stereo doubling, no depth buffer to fight).
 - The sprite pipeline is one shared textured-quad batcher, `SPRITE_MAX_QUADS=1024`, currently
   ~550 quads worst-case shipped, comfortable headroom (§4, §10).
+  > ⚠ CORRECTION [2026-09-03]: stale, carried from `ui-skin.md` — see the correction added
+  > there. `source/gfx/sprite.c`'s comment now gives ~790 of 1024 shipped, ~234 headroom, not
+  > ~550/~450. The conclusion ("fits without raising `SPRITE_MAX_QUADS`") is unaffected.
 - The XMB crossing-point model and why it suits a true digital d-pad better than a cursor (§2,
   §2b) — the interaction shape this whole version is built around.
 - What to take from LCE and XMB, and explicitly what not to (§3) — structure, never art, never
@@ -132,6 +149,9 @@ settled facts this document builds on directly:
   conclusion, though §3.1 below corrects its premise that the screen itself is new work.
 - The biome readout and neon-border-toggle design, fitting the existing `bsDebugRegister()`
   pattern (§7) — unaffected by anything in this document, not touched further here.
+  > ⚠ CORRECTION [2026-09-03]: both already shipped, in v1.8.8 — see the correction added to
+  > `ui-skin.md` §7. This document's own Build order (§6) repeats the stale "Phase 1 — biome
+  > readout + neon toggle" framing; corrected there too.
 - The battery blink already being shipped, real work being confirmation only (§8).
 - The art plan: one new script, `tools/make_ui_icons.py`, for category-bar pictograms only;
   everything else reuses existing atlas/font assets (§9).
@@ -310,6 +330,12 @@ y=240  +--------------------------------------------------------------+
 for `RECIPE_COUNT=4` — the constant self-adjusts by its own formula, per that file's comment,
 "so adding one costs no layout edit here"; **read in this codebase**, `ui_layout.h:51-56`.)
 
+> ⚠ CORRECTION [2026-09-03]: the `18.4` result is right, but "post-v1.8.18" is not why —
+> `RECIPE_COUNT` is already 5 today, before v1.8.18 or any chest lands (see §0's correction).
+> Once a chest recipe actually does land, `RECIPE_COUNT` becomes 6, and `CRAFT_ROW_H` becomes
+> `(120-28)/6 = 15.3`, not 18.4. This worked example is only valid for the tree as it stands
+> right now (5 recipes, no chest) — it will need redoing again once v1.8.18 actually ships.
+
 **The Blocks category, per §3.2's finding — the full screen, hotbar included, if the owner
 picks the "reuse it whole" resolution in §7:**
 
@@ -405,6 +431,16 @@ per §3.1's finding:
 1. **Phase 0 — confirm the battery blink on real hardware.** Unchanged from `ui-skin.md` §11.
 2. **Phase 1 — biome readout + neon toggle in the existing debug menu.** Unchanged from
    `ui-skin.md` §11; nothing in this document's own findings touches §7's design.
+
+   > **⚠ CORRECTION [2026-09-03] — this phase is not work; both pieces already shipped, in
+   > v1.8.8.** `source/debug/biomeborder.c`/`.h`/`biomeborder_draw.c`/`.h`/`biomeborder_test.c`
+   > and `source/debug/biomeinfo.c`/`.h`/`biomeinfo_test.c` all exist; the toggle is a real,
+   > available `DEBUG_TOGGLE` registered at `source/main.c:1394-1398`, wired at boot and drawn
+   > every frame once enabled. `CHANGELOG.md`'s v1.8.8 entry documents both directly. This
+   > "Phase 1" should be dropped from the build order entirely, not executed — a lane following
+   > this document as written would re-implement two features that have shipped for several
+   > versions. §7's design was accurate when this document cited it and rotted afterwards, not
+   > wrong from the start; `ui-skin.md` §7 itself carries the fuller correction.
 3. **Phase 2 — wire the existing block-list screen into a new, non-debug entry point, still
    reached from the pause menu or a temporary key for now, not yet the bar.** Revised from
    `ui-skin.md`'s "build a block list screen" to "add a second call site for the one that

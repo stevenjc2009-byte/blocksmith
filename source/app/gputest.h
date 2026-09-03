@@ -33,21 +33,42 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Default flipped ON. Every hardware freeze report to date has come back with nothing on the
+// card: not a crash (app/crash.c never fires — this is not a caught exception) and not a
+// console (BS_BOTTOM_UI owns the bottom screen, so there is nowhere to printf to). Each session
+// that reproduces it without this compiled in costs steve hours and returns zero evidence. The
+// bounded wait and the post-mortem below are what stop that: the main thread survives the wedge
+// instead of the whole console dying with it, and writes down what the GPU was doing. That is a
+// forensic win, not a functional one — the GPU itself is still stuck, HOME just works again and
+// the file is on the card for the next boot to read. Override for a build that genuinely should
+// not carry it, e.g. EXTRA_CFLAGS=-DBS_GPU_TESTS=0; the #ifndef guard means that still wins.
 #ifndef BS_GPU_TESTS
-#define BS_GPU_TESTS 0
+#define BS_GPU_TESTS 1
 #endif
 
-// The boot-time battery, separately switchable from the rest of BS_GPU_TESTS.
+// The boot-time battery, separately switchable from the rest of BS_GPU_TESTS, and defaulted OFF
+// to pair with BS_GPU_TESTS's default of ON: a shipping build wants the timed frame wait and the
+// post-mortem, but not several seconds of boot spent on memory fills, or a selftest.txt appearing
+// on every player's SD card. That is BS_GPU_TESTS=1 BS_GPU_PREFLIGHT=0, and it is now what an
+// unadorned `make` produces.
 //
-// A shipping build wants the timed frame wait and the post-mortem — they are what stops a wedged
-// GPU from taking the whole console down with it — but it does not want several seconds of boot
-// spent on memory fills, or a selftest.txt appearing on every player's SD card. Building with
-// -DBS_GPU_TESTS=1 -DBS_GPU_PREFLIGHT=0 keeps the safety net and drops the diagnostics.
+// This gate is call-site only (main.c's call to gpuTestPreflight()/gpuTestListProbe(), guarded by
+// `#if BS_GPU_TESTS && BS_GPU_PREFLIGHT`) — it does not touch this file, which is compiled
+// entirely under `#if BS_GPU_TESTS` regardless of this value. Do not expect it to change
+// gputest.o's size: this Makefile has no -Wl,--gc-sections, so with -ffunction-sections alone the
+// linker cannot drop the unreferenced boot-battery functions from an object something else in the
+// same .o still pulls in whole. Measured: gputest.c compiled standalone is text=18696 bss=65952
+// bytes at BS_GPU_PREFLIGHT=0 and BYTE-IDENTICAL at BS_GPU_PREFLIGHT=1. This switch buys boot
+// latency and a missing file, not bytes — a real size win would need --gc-sections added to
+// LDFLAGS, which is a linker-behaviour change outside what this header controls.
+//
+// For a full diagnostic build (boot battery + selftest.txt), override with
+// EXTRA_CFLAGS="-DBS_GPU_PREFLIGHT=1".
 //
 // The per-frame validator and the command-list replay are not switched here: they hang off
 // BS_DRAW_PROBE in app/watchdog.c and are already absent from any build without it.
 #ifndef BS_GPU_PREFLIGHT
-#define BS_GPU_PREFLIGHT 1
+#define BS_GPU_PREFLIGHT 0
 #endif
 
 #if BS_GPU_TESTS

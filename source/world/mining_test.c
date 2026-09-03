@@ -102,6 +102,18 @@ static void testCoreHardness(void)
 	CHECK(blockHardnessTicks(BLOCK_REDSTONE_ORE) ==  90, "redstone ore is 90 ticks (4.50 s)");
 	CHECK(blockHardnessTicks(BLOCK_DIAMOND_ORE)  == 100, "diamond ore is 100 ticks (5.00 s)");
 
+	// v1.8.14 "Animals". Four more core rows — the raw meats, ids 34..37 — each with its own
+	// break time, named one per line and typed from the intent rather than read back off the
+	// table, exactly as every block above. A four-step ladder rather than a flat value, for
+	// the identical reason the six ores above are six distinct numbers: four equal break
+	// times are four blocks a player cannot tell apart while mining. The ladder rises with
+	// the size of the animal, every step clears the 1-tick floor dead bush and fern sit at,
+	// and every step is far under stone's 45 — raw meat is soft, and these numbers say so.
+	CHECK(blockHardnessTicks(BLOCK_RAW_CHICKEN)  ==   3, "raw chicken is 3 ticks (0.15 s)");
+	CHECK(blockHardnessTicks(BLOCK_RAW_PORKCHOP) ==   4, "raw porkchop is 4 ticks (0.20 s)");
+	CHECK(blockHardnessTicks(BLOCK_RAW_MUTTON)   ==   5, "raw mutton is 5 ticks (0.25 s)");
+	CHECK(blockHardnessTicks(BLOCK_RAW_BEEF)     ==   6, "raw beef is 6 ticks (0.30 s)");
+
 	// DISTINCTNESS, and this is the check the roadmap actually asked for: "every single new
 	// block breakable with its own durability". The three lines above could all read 9 and
 	// each `==` would still be a true statement about a table where the cactus had simply
@@ -141,7 +153,12 @@ static void testCoreHardness(void)
 	// (the ore blocks, ids 28..33), each declaring its own nonzero hardness — see
 	// world/registry_test.c's coreHardnessIsDeclared() for the identical count, read off the
 	// table directly rather than through blockHardnessTicks().
-	CHECK(targetable_rows == 32, "and there are 32: 34 core rows less air and less water");
+	//
+	// 32 -> 36 on 2026-09-03, v1.8.14 "Animals": four more targetable, non-liquid core rows
+	// (the raw meats, ids 34..37). All four are FULL_CUBE and SOLID like the ores and the
+	// apple, so all four are targetable and all four enter this loop; none is a liquid, so
+	// none is exempt. Same count from the other side in registry_test.c.
+	CHECK(targetable_rows == 36, "and there are 36: 38 core rows less air and less water");
 
 	// The view is derived from the def, so the two must agree. This is what goes red if
 	// refreshView() copies the wrong field, or copies it from the wrong row.

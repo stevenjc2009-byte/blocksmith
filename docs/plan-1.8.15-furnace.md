@@ -260,6 +260,20 @@ touch rather than a face button, and leaves `KEY_B` (claimed by eating in
   27–30, so the furnace becomes 31 if those land first — order matters here
   and should be pinned at implementation time, not assumed from this
   document). See LINES SOMEONE ELSE MUST ADD.
+
+  > **⚠ CORRECTION [2026-09-03] — both 27 and 31 are wrong; the real next-free
+  > id is 38.** `source/world/block.h:201-206` states this directly, in its
+  > own header comment, naming this exact document: *"⚠ 34..37 AND NOT
+  > 27..30. docs/plan-1.8.14-animals.md and docs/plan-1.8.15-furnace.md both
+  > name 27..30 for these rows... both are stale on this point. The first
+  > free core id in this tree is 34."* Between this document being written
+  > and today, `BLOCK_TORCH` took id 27 and six ores took 28-33
+  > (`block.h:190-195`), then `plan-1.8.14-animals.md`'s four raw meats
+  > landed at 34-37 (`BLOCK_RAW_PORKCHOP=34` through `BLOCK_RAW_MUTTON=37`,
+  > `block.h:226-229`, verified by reading the enum). None of that was
+  > knowable when this P0 line was written — it was correct against the tree
+  > at the time and rotted as three later versions claimed ids out from under
+  > it. The furnace block's real next-free id today is **38**.
 - **P1 — `source/world/furnace.h`/`.c`.** `FurnaceState` table,
   `FurnaceRecipe` table, `furnaceTick()` (the O(64) per-tick scan), placement/
   removal helpers keyed by block position. Host tests, same red-arm
@@ -283,7 +297,7 @@ touch rather than a face button, and leaves `KEY_B` (claimed by eating in
 |---|---|
 | Breaking a furnace leaks its `FurnaceState` entry (table entry survives, position now holds a different block or air). | Host-test it directly: place, start cooking, break, assert the table no longer has an entry at that position. Cheap because both the world and the furnace table are host-testable. |
 | 64-furnace cap is reached in a real playthrough (unlikely soon, but not impossible on a long-lived world). | Cheapest fix if it happens: raise the constant. No format change needed — the sidecar already stores a count and only that many records, so a higher cap is backward-compatible with older `furnaces.dat` files (they simply have fewer records than the new cap allows). |
-| Recipe id ordering assumption in this document (meats at 27–30, furnace at 31) turns out wrong once animals and furnace are actually built in whatever order they land. | Not load-bearing — `registry.c`'s dynamic-row registration doesn't care about specific numbers, only that they're assigned once and pinned via `_Static_assert`. Re-derive the actual next-free id at implementation time; this document's numbers are illustrative, not a reservation. |
+| Recipe id ordering assumption in this document (meats at 27–30, furnace at 31) turns out wrong once animals and furnace are actually built in whatever order they land. | Not load-bearing — `registry.c`'s dynamic-row registration doesn't care about specific numbers, only that they're assigned once and pinned via `_Static_assert`. Re-derive the actual next-free id at implementation time; this document's numbers are illustrative, not a reservation. ⚠ CORRECTION [2026-09-03]: this already happened — see the P0 correction above. Real next-free id is 38, not 27 or 31. |
 | Two furnaces built at the exact same block position (shouldn't be possible if placement already refuses occupied cells, but worth stating). | Not a new risk — ordinary block placement already refuses a non-air target cell; the furnace table's placement helper should refuse an insert if a `FurnaceState` already exists at that position, as a second, cheap belt-and-braces check. |
 
 ## LINES SOMEONE ELSE MUST ADD

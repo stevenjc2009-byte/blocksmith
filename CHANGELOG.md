@@ -4,6 +4,67 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.8.14] - 2026-09-03
+
+Animals. Pigs, cows, chickens and sheep now live in the world — wandering in small herds,
+fleeing when you hit them, and leaving raw meat behind when you kill them. It is the first
+release with anything alive in it besides you.
+
+Almost everything here is identical on both consoles. There is exactly one difference, and it
+is called out where it applies.
+
+### Added
+
+- **Four animals, wandering the world in herds.** Pigs, cows, chickens and sheep spawn in small
+  groups of two to four as new ground loads, standing on grass, dirt or sand with room to stand.
+  About one column of world in twelve gets a herd; most do not. Which animals you meet depends
+  on the biome: plains and forest get all four, tundra gets only sheep, taiga gets cows and
+  sheep, jungle gets pigs and chickens, and the desert gets nothing at all — which is part of
+  what makes a desert feel like one.
+
+  Right now they are drawn as simple flat-coloured boxes roughly the size and shape of the real
+  animal, rather than fully modelled and textured creatures — a pink box for a pig, brown for a
+  cow, cream for a chicken, off-white for a sheep. Properly modelled animals are planned for a
+  later update; this release is about them existing, moving and being huntable.
+
+- **Simple behaviour: idle, wander, and flee.** An animal stands still or ambles in a random
+  direction, switching between the two every couple of seconds. Hit one and it turns and runs
+  directly away from you for about three seconds before settling back down. There is no
+  pathfinding and no awareness of anything except being hit — this is deliberately the same
+  simple behaviour the real game's passive animals use.
+
+- **Hitting animals, and what they drop.** Aiming at an animal takes priority over the block
+  behind it, so punching a pig standing against a wall hits the pig, not the wall. A punch does
+  the same damage regardless of which animal it lands on, which makes a chicken a one-hit kill,
+  a sheep two hits, and a pig or cow three. A kill drops its meat straight into your bag — no
+  need to pick anything up off the ground.
+
+- **Four new foods: raw porkchop, beef, chicken and mutton.** Eat them the same way you eat an
+  apple — hold one and press the place button. Porkchop and beef restore three hunger, chicken
+  and mutton two, both a point below the apple's four. That is deliberate, not a shortfall:
+  cooking these at the furnace is coming in the next update, and a cooked cut needs to restore
+  more than the raw one it came from, so raw meat leaves room above it rather than starting
+  level with the best food already in the game.
+
+  Raw meat is also a solid block. Like the apple before it, if your hunger is already full,
+  placing it puts it down as a block instead of doing nothing.
+
+### Changed
+
+- **New 3DS keeps more animals loaded at once.** Up to 32 animals can be alive around a New 3DS
+  player at a time; an original 3DS or 2DS caps out at 16. This is the one console difference in
+  this release, and it exists so both consoles stay smooth rather than the busier setting
+  slowing an Old 3DS down.
+
+- **The block table grew, and multiplayer needs a matching server.** Adding the four meat blocks
+  took the number of built-in blocks from 34 to 38, and that number is baked into both the game
+  and the server — it has to match on both ends of a multiplayer connection. The server side of
+  this shipped first, as blocksmith-server v1.9.4. Joining an older server does not get refused
+  outright, but the block table quietly falls out of agreement, and every block this update
+  added shows up as empty air until you rejoin a server that has been updated. There is no
+  on-screen warning if this happens unless you have the debug overlay turned on, so the fix is
+  simply to make sure the server is on v1.9.4 or later before you connect.
+
 ## [1.8.13] - 2026-09-03
 
 Survival. Up to now you could not be hurt and did not need to eat — the world was something you

@@ -87,6 +87,26 @@ not happened as of this document being written. This document specifies the
 surface rule as designed and ready; it flags, rather than assumes, that the
 prerequisite is done.
 
+> **⚠ CORRECTION [2026-09-03] — both stated blockers are now resolved in the
+> live tree; this document's own hedges above were correct to flag them as
+> "verify at implementation time," and it's worth doing that now.** Re-running
+> the greps this section describes against `source/main.c` on branch
+> `v1.8.14` today:
+> - `s_entities` is declared at `main.c:113`; `entityWorldInit(&s_entities,
+>   entityCapFor(hwIsNew3ds()))` runs at `main.c:4360`; `entityTick(&s_entities,
+>   &s_world, ...)` runs inside the tick loop at `main.c:5426`;
+>   `entityModelDraw(view, &s_entities)` runs at `main.c:2715`. The entity
+>   store is instantiated, sized per console, ticking, and rendering every
+>   frame — not "zero matches" any more.
+> - `dayNightAdvance(&s_daynight, ticks_now)` is called live at `main.c:5397`,
+>   guarded by `if (ticks_now > 0)`. The day/night clock is wired in.
+>
+> Both were accurately described as not-yet-wired when this document was
+> written and are simply no longer true — a lane reading only this section
+> today would underestimate how ready the tree is. Surface night-spawning's
+> prerequisite is done; nothing about this version's spawn rule is still
+> blocked on `main.c` wiring.
+
 **Divergence, darkness test:** `[research-given]` real Java's actual hostile
 spawn check is looser than the strict `skyLight == 0 && blockLight == 0` rule
 above — it's `skyLight <= 7 && blockLight == 0`, plus a further randomized 0–7

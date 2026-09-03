@@ -5268,3 +5268,82 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 "./$BHSURV/survival_test"
 
 rm -rf "$BHSURV"
+
+# entity/animal_test.c -- the animal layer (entity/animal.c, v1.8.14): the per-kind table, the
+# three-state think, the herd spawner, the box raycast and the damage/drop rule. Own binary, own
+# main(), APPENDED rather than merged into the entity stanza above, for the reason every stanza
+# in this file is appended: an append is the one edit shape that cannot silently drop another
+# session's work, and this file is shared by live sessions.
+#
+# THE LINK LINE IS THE ENTITY STANZA'S PLUS FIVE, AND THE FIVE ARE SURPRISING. Everything up to
+# tick.c is exactly what entity_test.c needs and is there for the same reasons: physics.c because
+# Entity embeds a Body and the collision sweep calls the real bodyStep, tick.c because the
+# schedule is world/tick.h's, tests/net_stub.c for networldOnColumnLoad, -lm for sqrtf/atan2f and
+# friends. Then animalSpawnForColumn() asks worldgenBiomeAt() which biome a column is in, and
+# THAT drags in the entire terrain generator -- worldgen.c, worldgen_density.c, noise.c, and the
+# cave and ore mask builders cave_carve.c and ore_gen.c -- none of which the animal rules
+# themselves touch. Anyone starting from the entity stanza's shorter list will get three rounds
+# of undefined references and should read this paragraph instead of guessing at them.
+#
+# entity/animal_test.c lives under source/, which Makefile:26 globs into the CONSOLE build, so it
+# carries #ifndef __3DS__ / #endif or it drags a second main() into the ELF. Files under tests/
+# are exempt and that asymmetry is the trap. Verified present on this file rather than assumed:
+# source/entity/animal_test.c:41 and :1173.
+#
+# THE TWO TRAPS THIS STANZA'S POSITION SITS ON, both recorded because this project has been bitten
+# by each of them.
+#
+#  1. `set -e` at the top of this file means a FAILING stanza takes every LATER stanza dark rather
+#     than red -- they do not run at all, and the suite's total quietly drops instead of going
+#     red in place. That is what hid a brand-new 2,555-check survival stanza in v1.8.13. This
+#     stanza is last, so it is the FIRST thing any earlier failure silences. Adding it and
+#     watching the suite "stay green" proves nothing whatever. The proof that it RUNS is the
+#     suite's total check count going UP by 236, and that is the number to check after any edit
+#     to this file.
+#
+#  2. Grepping this suite's log for FAIL gives false hits -- enum and block name strings contain
+#     the substring. THE EXIT CODE IS THE ONLY GATE. animal_test returns g_fails ? 1 : 0 and
+#     `set -e` turns that into the script's own exit code.
+#
+# Both were exercised rather than trusted. The exit-code reader was proven first with a
+# deliberate `( exit 5 )` control, which printed 5. Then the stanza was made to go RED without
+# touching Lane A's file, by building this exact gcc line against a copy of animal.c whose flee
+# yaw had been flipped from atan2f(away_x, -away_z) to atan2f(-away_x, away_z): "animal_test: 236
+# checks, 8 failed", RUN_EXIT=1, and the eight lines named were the four flee directions' two
+# assertions each. So this stanza can go red, and the exit code carries it.
+#
+# 236 is the whole-suite count on a healthy tree, and animal_test.c pins it internally as well
+# (ANIMAL_TEST_EXPECTED_CHECKS), so a check silently removed by an early return fails the suite
+# rather than shrinking the total unnoticed. It was 223 while AnimalDef.drop_item was still a
+# placeholder 0 on every row; filling in the four meat ids made the drop assertions real and
+# added 13. If you are changing that number, change it BOTH here and in animal_test.c -- the
+# pin there is what actually fails, this comment is only what tells you why.
+BHAN="build-host/run-$$-animal"
+mkdir -p "$BHAN"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	tests/net_stub.c \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/chunk_codec.c \
+	source/world/crc32.c \
+	source/world/world.c \
+	source/world/physics.c \
+	source/world/budget.c \
+	source/world/tick.c \
+	source/world/worldgen.c \
+	source/world/worldgen_density.c \
+	source/world/noise.c \
+	source/world/cave_carve.c \
+	source/world/ore_gen.c \
+	source/entity/entity.c \
+	source/entity/animal.c \
+	source/entity/animal_test.c \
+	-lm \
+	-o "$BHAN/animal_test"
+
+"./$BHAN/animal_test"
+
+rm -rf "$BHAN"
