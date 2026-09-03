@@ -178,8 +178,14 @@ independently of anything else in this version.
   screen and never runs in the gameplay frame.
 - **Camera and player trigonometry, and the per-frame projection matrix.** Both real, both
   microseconds, on a thread this project's own measurements put at GPU-blocked for roughly
-  15.7 of every 16.71 ms. The specific pair originally cited cannot even coexist — that
-  camera code is dead in a shipping build, though not for the reason first written here.
+  15.7 of every 16.71 ms. **Provenance, corrected 2026-09-03 (v1.8.17): measured, not a GPU
+  reading** — this is Azahar frame-time minus known CPU cost, not a GPU-busy sample; Azahar
+  has no GPU cost model and its `C3D_GetDrawingTime()` returns a constant 0.249 ms, so
+  "GPU-blocked" is an inference from the CPU side, not a reading of the GPU. See
+  `source/debug/metrics.h:132`. A real GPU-blocked figure would require hardware profiling on
+  console, which this project does not yet have. The specific pair originally cited cannot
+  even coexist — that camera code is dead in a shipping build, though not for the reason
+  first written here.
   **Corrected 2026-09-03:** the guard immediately around it is `#if BS_ORBIT`
   (`camera.c:102`), not `BS_FLY`. The conclusion survives, because the whole `cameraUpdate()`
   call is itself gated by `#if BS_FLY` at `main.c:4994`, which defaults off — so it is dead

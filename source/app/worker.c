@@ -52,6 +52,9 @@
 // workerStart), core 1 is the system core this game does not take, and core 3 is not offered
 // to applications. That leaves core 0, which is always available and is the core the main
 // thread is blocked on the GPU for ~15.7 ms of every 16.71 ms frame.
+//
+// [2026-09-03 CORRECTION, v1.8.17] That ~15.7 ms figure is an Azahar-measured inference, not
+// a GPU reading -- Azahar has no GPU cost model. See debug/metrics.h:132.
 #define WORKER_LANE1_CORE 0
 
 // ── One lane ──────────────────────────────────────────────────────────────────────────
@@ -557,6 +560,9 @@ bool workerStart(const WorldGen* g)
 	// priority step below the main thread is the step 5.5 arrangement and it works: the
 	// worker gets the CPU while the main thread is blocked on the GPU, which is ~15.7 ms of
 	// every 16.71 ms frame. Refusing to start would turn "no second core" into "no world".
+	//
+	// [2026-09-03 CORRECTION, v1.8.17] That ~15.7 ms figure is an Azahar-measured inference,
+	// not a GPU reading -- Azahar has no GPU cost model. See debug/metrics.h:132.
 	//
 	// v1.8.4 adds core 2 in front of that on a New 3DS. Cores 2 and 3 are the New 3DS's extra
 	// pair and core 2 is the one an application may be granted; nothing else on the console

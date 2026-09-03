@@ -65,6 +65,9 @@
 //           failure: the main thread is blocked on the GPU for ~15.7 ms of every 16.71 ms
 //           frame, and the worker gets that time.
 //
+// [2026-09-03 CORRECTION, v1.8.17] That ~15.7 ms figure is an Azahar-measured inference, not
+// a GPU reading -- Azahar has no GPU cost model. See debug/metrics.h:132.
+//
 // `new_3ds` false never offers core 2, because on an Old 3DS it does not exist and asking
 // costs a threadCreate that must fail.
 #define HW_CORE_LADDER_MAX 3

@@ -10,6 +10,10 @@
 // load. A SECOND generator lane on core 0 is therefore the largest single win available on a
 // New 3DS, and it is worth exactly nothing if the generator cannot be entered twice at once.
 //
+// [2026-09-03 CORRECTION, v1.8.17] The ~15.7 ms of every 16.71 ms figure above is an
+// Azahar-measured inference (frame time minus known CPU cost), not a GPU reading -- Azahar
+// has no GPU cost model. See debug/metrics.h:132.
+//
 // Reading the source said it could not: world/worldgen.c and world/worldgen_density.c held
 // their per-column scratch in file statics. Reading is a hypothesis. This file was the
 // measurement, and the measurement is recorded below.

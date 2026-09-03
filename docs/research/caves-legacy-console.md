@@ -501,8 +501,8 @@ generating columns on a background worker thread while the player moves.
 
 **Against the 12 MB budget specifically** (`world/budget.h`, all measured): the
 loaded column ring at New 3DS's radius 5 already uses **11,160,160 bytes of the
-12,582,912-byte cap (88.7%)**, with radius 6 (14,836,448 bytes) explicitly
-excluded by 2,253,536 bytes — the ceiling is asserted tight on purpose, not
+12,582,912-byte cap (88.7%)**, with radius 6 (14,902,096 bytes) explicitly
+excluded by 2,319,184 bytes — the ceiling is asserted tight on purpose, not
 loose. A carver that needs to *persist* tunnel objects (rather than re-derive
 them on demand, stateless, from the seed) would compete directly with that
 already-88.7%-committed budget, and there is essentially no slack to give it.

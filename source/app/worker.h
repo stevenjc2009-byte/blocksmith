@@ -176,6 +176,11 @@
 // when the main thread blocks, which it does for ~15.7 ms of every 16.71 ms frame inside
 // C3D_FrameBegin(C3D_FRAME_SYNCDRAW).
 //
+// [2026-09-03 CORRECTION, v1.8.17] That ~15.7 ms figure is an Azahar-measured inference
+// (frame time minus known CPU cost), not a GPU reading -- Azahar has no GPU cost model and
+// its C3D_GetDrawingTime() returns a constant 0.249 ms. See debug/metrics.h:132. A real
+// GPU-busy reading would need hardware profiling on console.
+//
 // The cache review this move needed, done rather than assumed. Two threads on one core
 // share an L1 data cache and two threads on two cores do not, so the staging handoff is
 // only safe if the primitives around it issue real memory barriers. Disassembling
