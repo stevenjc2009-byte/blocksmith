@@ -249,10 +249,58 @@ static int worldReportBuild(void)
 // visibility flood fill added to every build (chunkRenderVisUs), so ~1.55 ms. The worst case can
 // still be written down — 3 chunks, plus the one chunk each drain is always allowed to complete,
 // is ~6.2 ms and cannot grow — but it is now lower than before. It still fits (6.2 + 0.62 + 0.37
-// = 7.19 of 16.71) and the constants are left alone; if that stops being true, DRAIN_MAX_CHUNKS
-// is the knob, at the cost of a slower drain rather than a dropped frame.
+// = 7.19 of 16.71) and the constants are left alone; if that stops being true, the chunk count
+// (drainMaxChunks() below) is the knob, at the cost of a slower drain rather than a dropped
+// frame.
+//
+// v1.8.17: THE COUNT IS NOW PER-CONSOLE, THE CLOCK IS NOT. Until now both were flat, so a New
+// 3DS at 804 MHz with an L2 cache built exactly three chunks per frame, the same as an Old 3DS
+// at 268 MHz, and left more than half of its 4.0 ms clock unspent every frame.
+//
+// Which of the two limits actually stops this drain is arithmetic on the loop below, and the
+// loop checks the count BEFORE the clock: at a per-chunk cost c it admits 3 chunks whenever
+// 2c < 4.0 ms, and stops on the clock instead once c >= 2.0 ms. So the answer depends entirely
+// on c, and c was measured rather than assumed:
+//
+//   c on an OLD 3DS, MEASURED ON THE CONSOLE: 917 us meshChunk + 241 us neighbourhood gather
+//   (both from the step 9.4c paired measurement recorded in CHANGELOG.md's "292 -> 241 us ...
+//   with the mesher's own column unmoved (918 -> 917 us) as the control") + 630 us step 7.3
+//   visibility flood fill = 1.79 ms. 2c = 3.58 < 4.0, so THE COUNT BINDS at 3 and the worst
+//   case is 3 x 1.79 = 5.36 ms, not the 4.0 ms clock.
+//
+//   c on a NEW 3DS, PROJECTED, not measured: 1.79 / 3.0 = 0.60 ms, from the documented clock
+//   ratio 804 / 268 = 3.0 with the L2 cache's contribution deliberately ignored so the figure
+//   is a floor on the speedup rather than a hope. At 0.60 ms the unchanged 4.0 ms clock admits
+//   7 chunks; the count stopped it at 3, with 2.2 ms of clock unspent.
+//
+// Hence 3 x the count on a New 3DS, which is the clock ratio: the number of chunks a 3x faster
+// CPU gets through inside the SAME wall-clock budget. It is deliberately a little above the 7
+// the projection allows, so that the CLOCK is the binder on a New 3DS. That is what makes this
+// raise frame-safe without a console measurement of c_new, and the safety is a bound rather
+// than an estimate: with the clock binding, the worst case is 4.0 ms + one chunk = 4.60 ms,
+// which is LESS than the 5.36 ms an Old 3DS is already living inside today. Raising the count
+// can only convert clock the Old 3DS never had to spend into chunks; it cannot lengthen the
+// worst frame.
+//
+// DRAIN_BUDGET_MS is NOT per-console, on purpose. The frame is 16.71 ms on both consoles, so
+// the clock is a frame-safety limit and there is nothing about a faster CPU that makes 4.0 ms
+// of it safer to spend. Raising it would need a console measurement of what the rest of the
+// frame costs on a New 3DS, and nothing in this tree has run on hardware since v1.2.5. If the
+// New-3DS per-chunk cost ever turns out to be ABOVE 2.0 ms, the clock binds at 2 chunks there
+// too and this count raise is inert -- in that case DRAIN_BUDGET_MS is the constant to move,
+// and it should move on a measurement, not on this comment.
 #define DRAIN_BUDGET_MS   4.0f
-#define DRAIN_MAX_CHUNKS  3
+#define DRAIN_MAX_CHUNKS_OLD3DS  3
+#define DRAIN_MAX_CHUNKS_NEW3DS  9
+
+// Asked per use rather than cached in a file static, the same way audio.c:127 asks for its
+// pool size and main.c already asks for the render distance ceiling at six call sites.
+// hwIsNew3ds() returns a bool cached by hwInit() (app/hw.c), so this is a load and a branch,
+// and every call in a frame is guaranteed to give the same answer.
+static inline int drainMaxChunks(void)
+{
+	return hwIsNew3ds() ? DRAIN_MAX_CHUNKS_NEW3DS : DRAIN_MAX_CHUNKS_OLD3DS;
+}
 
 // The same two knobs for the relight drain that runs just before the mesh drain (v1.8.3). It had
 // none until now — see the drain itself in the main loop, and world/relight_drain.h for what the
@@ -272,7 +320,7 @@ static int worldReportBuild(void)
 // engine at med 0.950 / max 1.650 ms, and 720.1 us sits in that range, so relightq.h is quoting
 // a pre-v1.8.0 sweeps-era cost. It is left alone here because correcting it is not this fix.
 //
-// The count cap binds the worst case, for the reason DRAIN_MAX_CHUNKS above binds the mesh one:
+// The count cap binds the worst case, for the reason the mesh count above binds the mesh one:
 // a clock can only stop the loop after a column has already overrun it. Four columns at the
 // measured max of 0.287 ms is 1.148 ms, and that is the number to write down. Plus the mesh
 // drain's own written-down 6.2 ms worst case, 0.62 ms of steady-state CPU and a 0.37 ms submit,
@@ -297,6 +345,32 @@ static int worldReportBuild(void)
 // Cost of the deferral: a 64-entry backlog now takes 16 frames to clear at 4/frame, so 0.27 s at
 // 59.83 Hz instead of one 18.4 ms frame. If that turns out to be visible, this is the knob, at
 // the cost of a slower drain rather than a dropped frame.
+//
+// v1.8.17: BOTH OF THESE STAY FLAT, and that is a measured decision rather than an oversight.
+// The mesh count above went per-console in the same change, so the obvious symmetric move was
+// to take RELIGHT_MAX_COLUMNS 4 -> 12 beside it. It was measured first, and the measurement
+// says it would buy nothing on either console:
+//
+//   The four-column cap only throttles anything while the 1.0 ms clock still has room. Driven
+//   through the REAL relightDrain on the host (gcc -O1, a real 7x7 generated ring rather than
+//   the six synthetic profiles the figures above came from), one lightRelightColumn measures
+//   101-146 us over six repeats, and the count/clock crossover is exactly where that predicts:
+//   at max_columns 4 the drain returns 4 columns in 422-457 us of its 1000 us clock, and at
+//   max_columns 12 or more it returns 10 columns in 1011-1130 us. So on the HOST the count is
+//   the binder and raising it is worth 2.5x.
+//
+//   On a console it is not the binder at all. The host-to-console ratio for this project's own
+//   code is ~19.5x, from the one function measured on both: meshChunk at 917 us on the console
+//   (see the mesh block above) against 46.4-47.7 us for the same function on this host. At
+//   that ratio a column costs ~2.1 ms on an Old 3DS and ~0.7 ms on a New one, and the sentence
+//   three paragraphs up already says what happens then -- above 1.0 ms the clock stops the
+//   drain after ONE column. Old 3DS: 1 column per frame. New 3DS: 2. Neither is anywhere near
+//   4, so a cap of 12 would never be reached on either.
+//
+// So the binder here is RELIGHT_BUDGET_MS, not the count, and raising a TIME budget is the one
+// move that can actually drop a frame. It needs a console measurement of one lightRelightColumn
+// -- which this tree has never had, as the paragraph above says -- and not an argument. Left
+// alone deliberately; do not "finish the job" by bumping the count to match the mesh one.
 #define RELIGHT_BUDGET_MS    1.0f
 #define RELIGHT_MAX_COLUMNS  4
 
@@ -586,7 +660,7 @@ static DigOutResult digOutCheck(bool run)
 static int s_mesh_radius = RENDER_DIST_MIN;                   // 3x3 columns = 48x48 blocks
 static int s_area_radius = RENDER_DIST_MIN + 1;               // 5x5 columns generated
 
-// Streaming shares DRAIN_BUDGET_MS / DRAIN_MAX_CHUNKS with the edit queue and takes
+// Streaming shares DRAIN_BUDGET_MS / drainMaxChunks() with the edit queue and takes
 // whatever the edit queue leaves; see the comment there for why that replaced a second
 // budget of its own in step 6.2.
 
@@ -2020,8 +2094,14 @@ static LoadingSample genLoadingSample(void)
 // spends watching a bar. Still bounded rather than "drain the queue": one frame that built all
 // forty chunks would freeze the bar for a quarter of a second, which is the exact impression
 // this screen exists to remove.
+//
+// v1.8.17: "6 chunks" in the first sentence is now the OLD 3DS figure. The count half rides
+// drainMaxChunks(), so it is 6 on an Old 3DS and 18 on a New one, for the reason that function's
+// comment gives; the time half stays 2 x 4.0 ms on both. Nothing else here changes: the loading
+// screen's whole point is that this is the one place with the frame to itself, so the console
+// that can build more chunks inside 8 ms should build them.
 #define LOADING_DRAIN_BUDGET_MS  (2.0f * DRAIN_BUDGET_MS)
-#define LOADING_DRAIN_MAX_CHUNKS (2 * DRAIN_MAX_CHUNKS)
+#define LOADING_DRAIN_MAX_CHUNKS (2 * drainMaxChunks())
 
 // Waits for the world with the console still alive, and shows the player what it is waiting
 // for. Returns true to go and play, false if the player asked to quit or the system closed us.
@@ -6206,9 +6286,15 @@ session_start:
 		// All of this frame's meshing, under one budget. Edits first: a broken block that
 		// takes two frames to disappear is felt, and a chunk of scenery that takes two
 		// frames to arrive at the edge of the render distance is not.
+		//
+		// v1.8.17: asked ONCE, into a local, and then shared between the two drains below.
+		// Not because the call is dear -- it is a cached bool -- but because "one budget for
+		// all meshing, not one each" is the invariant this block exists to hold, and two
+		// separate reads of a per-console count is exactly the shape that quietly becomes two
+		// wallets again the next time somebody edits one of the two call sites.
 		const u64 t_work = svcGetSystemTick();
-		const int edit_built = chunkRenderDrainDirty(&s_world, DRAIN_BUDGET_MS,
-		                                             DRAIN_MAX_CHUNKS);
+		const int max_chunks = drainMaxChunks();
+		const int edit_built = chunkRenderDrainDirty(&s_world, DRAIN_BUDGET_MS, max_chunks);
 		const float edit_ms =
 			(float)((double)(svcGetSystemTick() - t_work) / CPU_TICKS_PER_MSEC);
 		// Kept built in all configs; only used when BS_WORLD_GEN is 1, so the measurement of
@@ -6220,7 +6306,7 @@ session_start:
 		// Whatever is left of both limits. Negative time and a zero count are handled the
 		// same way at the far end — one chunk still completes — so no clamping here.
 		const int stream_built = genDrainMesh(DRAIN_BUDGET_MS - edit_ms,
-		                                      DRAIN_MAX_CHUNKS - edit_built);
+		                                      max_chunks - edit_built);
 		const float work_ms =
 			(float)((double)(svcGetSystemTick() - t_work) / CPU_TICKS_PER_MSEC) + install_ms;
 

@@ -97,11 +97,25 @@ typedef struct {
 	int32_t player_cx, player_cz;
 
 	float recenter_ms;   // inside genRecenter — nonzero ONLY on a boundary-crossing frame
-	float relight_ms;    // inside the relight drain, which is deliberately unbudgeted
-	float mesh_ms;       // inside both mesh drains, to be read against DRAIN_BUDGET_MS (4.0)
-	float save_ms;       // blocked in workerSubmitSave waiting for one of two save slots
+	// v1.8.17 — three of the four comments below had gone stale, and each named a number or a
+	// property the code no longer has. Corrected here rather than in the reader, because the
+	// CSV column names come from this struct and this is the only place that explains them.
+	float relight_ms;    // inside the relight drain, which is bounded TWICE — RELIGHT_MAX_COLUMNS
+	                     // caps the count and RELIGHT_BUDGET_MS the clock (main.c:374-375, and
+	                     // main.c:6275 says so at the call site). The old "deliberately
+	                     // unbudgeted" was simply false.
+	float mesh_ms;       // inside both mesh drains, to be read against DRAIN_BUDGET_MS (4.0).
+	                     // That one IS flat on both consoles on purpose: the frame is 16.71 ms
+	                     // either way, so the clock is a frame-safety limit, not a work budget.
+	float save_ms;       // the whole workerSubmitSave call. Usually a handoff costing nothing,
+	                     // but since v1.8.16 it can also include a bounded wait for one of the
+	                     // two save slots (250 ms deadline, APT pumped throughout) and, once
+	                     // that deadline expires, a SYNCHRONOUS write. So a large value here is
+	                     // the freeze this metric exists to catch, not merely a slow queue.
 
-	u16 built;   // chunks meshed this frame, against DRAIN_MAX_CHUNKS (3)
+	u16 built;   // chunks meshed this frame, against the per-frame chunk count — 3 on an Old
+	             // 3DS, 9 on a New one (main.c drainMaxChunks()). It was a flat
+	             // DRAIN_MAX_CHUNKS 3 until v1.8.17; that macro no longer exists.
 	u16 meshq;   // chunks still waiting after the drain — stream queue plus edit queue
 } MetricsWork;
 
