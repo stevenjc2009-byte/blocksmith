@@ -65,6 +65,26 @@ typedef struct {
 	BlockId broke_id;
 	BlockId placed_id;
 
+	// WHERE the break landed, added v1.8.15 for the furnace. broke_id answers "what did the
+	// player earn" and is deliberately BLOCK_AIR for a plant, which breaks and drops nothing;
+	// these answer the different question "which cell stopped containing a block", which a
+	// block carrying side-table state has to know so it can drop that state when it is mined.
+	//
+	// They exist as separate fields because the break coordinates that were already here —
+	// break_x/y/z above — are gone by the time the caller can read them. breakComplete() sets
+	// broke_id and then calls breakCancel(), which zeroes break_x/y/z as part of retiring the
+	// hold, so main.c currently learns WHAT broke but never WHERE. Reusing break_x/y/z would
+	// mean not clearing them, and they mean "the block this in-progress hold belongs to" —
+	// leaving a finished hold's coordinates standing there would make `breaking == false` with
+	// live coordinates a state the rest of this file does not expect.
+	//
+	// broke_valid rather than a sentinel coordinate: (0,0,0) is an ordinary cell a player can
+	// stand in and mine, so there is no coordinate triple free to mean "nothing happened".
+	// Set on ANY landed break, including one that drops nothing, because state cleanup has to
+	// happen whether or not the player got an item for it.
+	bool    broke_valid;
+	int     broke_x, broke_y, broke_z;
+
 	// ── v1.8.1 task 50: a break takes time ──────────────────────────────────────────────
 	//
 	// Progress against ONE block, measured in simulation ticks rather than frames. Frames

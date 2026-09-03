@@ -156,6 +156,16 @@ void interactInit(Interact* it)
 	it->prev_keys = 0;
 	it->broke_id  = BLOCK_AIR;
 	it->placed_id = BLOCK_AIR;
+
+	// Explicit, because this function initialises field by field rather than memsetting the
+	// struct — a new field that is not named here is left indeterminate, and an indeterminate
+	// broke_valid means the very first interactEdit could hand the caller a break at whatever
+	// coordinates happened to be on the stack. breakCancel() below does not cover it: that
+	// clears the in-progress hold (break_x/y/z), which is a different thing from the record of
+	// a finished one.
+	it->broke_valid = false;
+	it->broke_x = it->broke_y = it->broke_z = 0;
+
 	breakCancel(it);
 }
 
@@ -271,6 +281,19 @@ static int breakComplete(Interact* it, World* w, int x, int y, int z, BlockId br
 		if (!no_drop && blockIsAppleBearingLeaves(broken) && appleDropRoll(broken, x, y, z))
 			drop = BLOCK_APPLE;
 		it->broke_id = no_drop ? BLOCK_AIR : drop;
+
+		// Where it happened, for a caller that has to clean up side-table state keyed by
+		// position (v1.8.15, the furnace). Set here rather than beside breakCancel() below so
+		// it sits inside the branch that means "the world actually changed" — the else arm is
+		// a refusal, where the block is still standing and nothing should be cleaned up.
+		//
+		// Deliberately NOT conditioned on broke_id: a plant leaves broke_id at BLOCK_AIR and
+		// still vacates its cell. Tying cleanup to the drop would mean a block that dropped
+		// nothing kept its state forever, which is the leak this field exists to prevent.
+		it->broke_valid = true;
+		it->broke_x = x;
+		it->broke_y = y;
+		it->broke_z = z;
 	} else {
 		it->refused++;
 	}
@@ -397,6 +420,12 @@ int interactEdit(Interact* it, World* w, const Body* body,
 	// until the next edit.
 	it->broke_id  = BLOCK_AIR;
 	it->placed_id = BLOCK_AIR;
+
+	// Cleared on the same schedule and for the same reason (v1.8.15). Only the flag needs
+	// clearing — the coordinates are meaningless while it is false, and zeroing them too would
+	// invite a reader to trust (0,0,0) as "no break", which is exactly the sentinel this pair
+	// was designed to avoid.
+	it->broke_valid = false;
 
 	// Step 8.4. The two verbs come from the player's bindings rather than the INTERACT_KEY_*
 	// constants directly. app/input_map.c answers with exactly those constants' values until
