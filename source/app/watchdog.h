@@ -226,6 +226,29 @@ void watchdogGuardLine(const char* line);
 // this; nothing in the game does.
 bool watchdogFired(void);
 
+// v1.8.17 N3D-CORE. Where the monitor thread is, asked two different ways.
+//
+// watchdogCore()        -- the core threadCreate ACCEPTED. watchdogStart asks for core 1 and
+//                          falls back to core 0, so this is 1 or 0, or -1 if the thread never
+//                          started at all.
+// watchdogCoreRunning() -- what that thread's own svcGetProcessorID() returned, i.e. where it
+//                          is genuinely executing. -1 until it has been scheduled once.
+//
+// They are separate because only the second is a measurement. The first records which rung of
+// the ladder was taken, which is a useful thing to know and is NOT the same claim.
+//
+// Why anyone should care: the monitor asks for core 1 precisely because a main thread spinning
+// without yielding on core 0 starves a lower-priority thread pinned to core 0 -- so on the
+// fallback rung this watchdog cannot see the failure it exists to catch. Core 1 additionally
+// requires APT_SetAppCpuTimeLimit, which nothing in this tree calls (app/worker.c's only call
+// is behind BS_WORKER_CORE, default 0), so as of v1.8.17 the expected answer from BOTH of
+// these is 0. That is a known gap, not an accident; see the block in watchdogStart.
+//
+// Both values are also printed in the hang report, which is the only one of the two readouts
+// that survives into a shipped CIA -- BS_BOTTOM_UI compiles the overlay out.
+int watchdogCore(void);
+int watchdogCoreRunning(void);
+
 // Writes one file under sdmc:/blocksmith/, creating the directory if it is not there, and sizing
 // the file to exactly len so a shorter report cannot leave the tail of a longer previous one
 // trailing it. Exposed for app/gputest.c, which needs the same raw-FS path the hang report uses

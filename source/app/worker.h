@@ -107,18 +107,49 @@
 // is a hardware risk no emulator can measure. So the request is implemented, measured, and
 // off. Set -DBS_WORKER_CORE=1 to turn it back on; workerCore() reports where it landed.
 //
-// **v1.8.8, and read this before you set that flag on an installed CIA: it cannot work
-// today.** cia/blocksmith.rsf:112 sets `AffinityMask : 1`. That field is the exheader's
-// two-bit core-permission mask — bit 0 core 0, bit 1 core 1 — so 1 permits core 0 and
-// forbids core 1 outright, whatever APT_SetAppCpuTimeLimit answers. BS_WORKER_CORE=1 would
-// therefore succeed at the APT call, fail at the threadCreate, and fall silently down the
-// ladder to core 0, which is where it already runs. Making it work needs `AffinityMask : 3`
-// in the RSF and a reinstall, and that is a hardware change nothing here can measure.
+// **v1.8.8 said this could not work on an installed CIA because of the RSF's
+// `AffinityMask : 1`. v1.8.17 N3D-CORE went and checked, and that was WRONG.** The claim
+// was that AffinityMask is the exheader's core-permission mask for svcCreateThread, so 1
+// forbids core 1 outright. It is not, and it does not. Both halves of the correction:
 //
-// Note what this does NOT block: core 2 is granted by the separate New3DS exheader flag
-// `CanAccessCore2 : true` (cia/blocksmith.rsf:130) and not by AffinityMask, so lane 0 on
-// core 2 and lane 1 on core 0 are both permitted by the exheader exactly as it stands. The
-// two-lane split needed no RSF change and got none.
+//   * What the field IS. devkitPro/libctru/include/3ds/exheader.h declares it inside
+//     ExHeader_Arm11CoreInfo as `u8 affinity_mask : 2`, packed with `ideal_processor : 2`
+//     and `o3ds_system_mode : 4` into the single byte at AccessControlInfo + 0x0E. So it
+//     is a real two-bit field and it really can only ever describe cores 0 and 1 -- that
+//     much of the old note was right.
+//
+//   * What the KERNEL checks. 3dbrew's Multi-threading page enumerates the processor-id
+//     validation svcCreateThread performs and then says, verbatim: "These are the only
+//     restriction checks done by the kernel for processorid." The checks it lists are the
+//     kernel-flags 0x2000 test for core 2 and an outright refusal of core 3. AffinityMask
+//     is not among them. Core 1 is gated by APT_SetAppCpuTimeLimit instead, which is
+//     exactly what libctru's own svc.h says: "The processor with ID 1 is the system
+//     processor. To enable multi-threading on this core you need to call
+//     APT_SetAppCpuTimeLimit at least once with a non-zero value."
+//
+// Corroboration, because a documentation claim reversing an in-tree claim deserves some:
+// public 3DS homebrew RSFs ship `AffinityMask : 1` essentially universally (sm64-port's
+// 3ds/template.rsf and lpp-3ds' gw_workaround.rsf both do, both alongside
+// `CanAccessCore2 : true`), and no project was found shipping 3 -- yet the
+// APT_SetAppCpuTimeLimit + threadCreate(core 1) recipe is the standard one. If
+// AffinityMask really gated core 1, that recipe could not work anywhere.
+//
+// **So BS_WORKER_CORE=1 needs no RSF change and no reinstall.** What it needs is the
+// APT_SetAppCpuTimeLimit call this file already makes. The RSF was deliberately left at
+// `AffinityMask : 1` -- see the comment on that line in cia/blocksmith.rsf for why
+// changing it is unnecessary risk rather than a fix.
+//
+// What is still NOT known: whether taking core 1 is a good idea. That part of the v1.8.8
+// note stands untouched and is the reason the flag is still 0 -- see the measured table
+// above. The correction here is only about whether core 1 is REACHABLE, not whether it
+// is worth reaching.
+//
+// Note what none of this ever blocked: core 2 is granted by the separate New3DS exheader
+// flag `CanAccessCore2 : true` (cia/blocksmith.rsf:130) and not by AffinityMask, so lane 0
+// on core 2 and lane 1 on core 0 are both permitted by the exheader exactly as it stands.
+// The two-lane split needed no RSF change and got none. Confirmed in the ARTIFACT rather
+// than the RSF: the shipped blocksmith1.8.16.cia's ARM11 kernel-flags descriptor decodes
+// to 0xFF00316D, and 0xFF00316D & 0x2000 is set.
 //
 // v1.8.4: **none of the core-1 table above applies to core 2**, and it must not be read as if
 // it did. Every row of it is core 1 -- the system core, rationed by APT_SetAppCpuTimeLimit and
@@ -281,11 +312,19 @@ float workerSaveWaitMaxMs(void);    // the worst single wait, which is the frame
 int   workerSaveSync(void);         // saves the main thread had to write itself
 int   workerSaveOverrun(void);      // ...and the ones it could not, and waited out
 
-// Which CPU core LANE 0 actually ended up on, not which one it asked for: 2 on a New 3DS
-// whose exheader granted core 2, 1 only if APT_SetAppCpuTimeLimit and the thread creation
-// both succeeded, 0 otherwise, -1 before workerStart. Reported rather than assumed, because
-// every core above 0 is a request the system is allowed to refuse and a silent fallback would
-// make every measurement taken afterwards mean something other than what it says.
+// Which CPU core LANE 0 was GRANTED: the core argument a threadCreate accepted. 2 on a New
+// 3DS whose exheader granted core 2, 1 only if APT_SetAppCpuTimeLimit and the thread
+// creation both succeeded, 0 otherwise, -1 before workerStart.
+//
+// v1.8.17 N3D-CORE, and read this before quoting the number: until v1.8.17 this comment
+// said "actually ended up on, not which one it asked for", and that was an overstatement.
+// The value is the request that was ACCEPTED, which is a real thing -- a refused core makes
+// threadCreate return NULL and the ladder falls through, and 3dbrew is explicit that the
+// kernel returns 0xD9001BEA for a disallowed processor id rather than silently placing the
+// thread elsewhere -- but it is still not a reading taken from the running thread.
+//
+// workerLaneCoreRunning() below is that reading. If the two ever disagree, this one is the
+// one that is wrong.
 int workerCore(void);
 
 // v1.8.8. How many generator lanes are actually running: 1 or 2, and 0 before workerStart.
@@ -293,6 +332,22 @@ int workerCore(void);
 // this file for why a second lane on the same core as the first is not worth starting.
 int workerLanes(void);
 
-// v1.8.8. Which core lane `lane` landed on, or -1 if that lane is not running. Lane 0 is
-// workerCore(); lane 1 is core 0 when it exists at all.
+// v1.8.8. Which core lane `lane` was granted, or -1 if that lane is not running. Lane 0 is
+// workerCore(); lane 1 is core 0 when it exists at all. Same "granted, not measured"
+// caveat as workerCore() above.
 int workerLaneCore(int lane);
+
+// v1.8.17 N3D-CORE. Which core lane `lane` is ACTUALLY EXECUTING ON, read by that lane
+// itself with svcGetProcessorID() (SVC 0x11 GetCurrentProcessorNumber) as the first
+// statement of workerMain. -1 if the lane is not running, and -1 for a lane that exists
+// but has not yet been scheduled even once.
+//
+// This is the only number in this header that is a MEASUREMENT of where a thread is,
+// rather than a record of what was asked for and not refused. It exists because the whole
+// New-3DS core story -- lane 0 on core 2, lane 1 on core 0 -- has never once been observed
+// on hardware, and a claim that cannot go wrong in a way anyone would notice is not worth
+// much. Expect it to equal workerLaneCore(lane); the point is that now it can be checked.
+//
+// Cheap to read (one volatile load) but it is NOT free to call in a hot loop, and there is
+// no reason to: the value is written once and never changes for the life of the thread.
+int workerLaneCoreRunning(int lane);

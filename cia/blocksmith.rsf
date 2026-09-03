@@ -109,6 +109,31 @@ AccessControlInfo:
   MemoryType                    : Application # Application/System/Base
   SystemMode                    : 64MB # 64MB(Default)/96MB/80MB/72MB/32MB
   IdealProcessor                : 0
+  # AffinityMask is DELIBERATELY 1, and 1 is not a limitation to be fixed. Read this before
+  # "correcting" it to 3 -- v1.8.17 (N3D-CORE) spent a lane establishing the following.
+  #
+  # What it is: libctru's include/3ds/exheader.h declares it `u8 affinity_mask : 2`, packed
+  # with `ideal_processor : 2` and `o3ds_system_mode : 4` into the one byte at exheader
+  # AccessControlInfo + 0x0E. Measured, not assumed: building this RSF with 1 and with 3 and
+  # diffing the two .cia files changes exactly ONE byte, ACI+0x0E, 0x04 -> 0x0C. So the field
+  # is real and it does map where the header says it does.
+  #
+  # What it does NOT do: gate svcCreateThread. 3dbrew's Multi-threading page lists the
+  # kernel's processor-id checks -- kernel-flags 0x2000 for core 2, outright refusal of core
+  # 3 -- and then states "These are the only restriction checks done by the kernel for
+  # processorid." Core 1 is gated by APT_SetAppCpuTimeLimit instead, exactly as libctru's
+  # svc.h says. Public homebrew RSFs ship AffinityMask : 1 essentially universally while
+  # using the APT_SetAppCpuTimeLimit + core-1 recipe successfully, which could not happen if
+  # this field blocked core 1.
+  #
+  # Why it stays 1: changing it buys no capability, forces a reinstall, and deviates from
+  # what every shipping homebrew title does. 3dbrew also documents an AccessDesc cross-check
+  # for the neighbouring fields in this byte ("the AccessDesc must have the corresponding bit
+  # set, otherwise the invalid-exheader error is returned"), and a title that fails that
+  # check does not launch at all. That is a real launch risk taken for nothing.
+  #
+  # See the long note in source/app/worker.h, which used to claim the opposite and now
+  # carries the correction and its sources.
   AffinityMask                  : 1
   Priority                      : 16
   MaxCpu                        : 0x9E # Default

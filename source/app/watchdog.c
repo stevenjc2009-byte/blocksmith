@@ -28,6 +28,11 @@ extern u32 __C3D_Context[];
 #endif
 
 #include "app/gputest.h"
+// v1.8.17 N3D-CORE. For workerLaneCore()/workerLaneCoreRunning() in the hang report's core
+// map. app/worker.c already includes app/watchdog.h (for watchdogWriteFile), so the two
+// headers now name each other -- harmless, both are #pragma once and neither needs a type
+// from the other, only function declarations.
+#include "app/worker.h"
 #include "version.h"
 
 // Alongside the crash dump and the save data (app/crash.c, main.c's saveWorldDir()). Two
@@ -84,10 +89,27 @@ extern u32 __C3D_Context[];
 // two frame counter". Nothing decisive was lost that time, because the two lines that
 // mattered came out above the cut. The GX-queue section added below is decisive, and must
 // not be the thing that falls off the end.
+//
+// v1.8.17 N3D-CORE raised the shipped cap 768 -> 1280, and it was NOT a precaution. Measured,
+// by extracting reportBuild's format strings out of this file and rendering them with
+// worst-case field widths (scratchpad n3dcore_reportlen.py):
+//
+//   base report, worst case ....  747 bytes
+//   shipped cap ................  768 bytes   <- 21 bytes of slack, total
+//   N3D-CORE core-map block ....  408 bytes
+//   base + core map + NUL ...... 1156 bytes   -> truncated by 388 at the old cap
+//
+// So the core map would have been cut off almost in its entirety and the readout would have
+// shipped showing nothing, which is the failure workerSaveWaits() already had once. 1280 is
+// the next size up that fits with room to spare; the cost is 512 bytes of .bss on a static
+// buffer, paid once, never on the stack, and not on any hot path.
+//
+// Worth knowing for the next person adding a line: at 768 this report had 21 bytes of
+// headroom, so ANY new line would have vanished silently. It now has 124.
 #if BS_DRAW_PROBE
 #define WD_REPORT_MAX 4096
 #else
-#define WD_REPORT_MAX 768
+#define WD_REPORT_MAX 1280
 #endif
 
 static volatile u32  s_phase;
@@ -186,6 +208,19 @@ static volatile bool s_quit;
 static volatile bool s_fired;
 static Thread        s_thread;
 static char          s_report[WD_REPORT_MAX];
+
+// v1.8.17 N3D-CORE. Which core this thread was GRANTED (the rung of watchdogStart's ladder
+// that threadCreate accepted) and which core it is ACTUALLY running on (read by the thread
+// itself with svcGetProcessorID). -1 for "not started" and "not yet scheduled" respectively.
+//
+// Both are in the hang report, because the report is the ONLY readout this project has that
+// survives into a shipped CIA: BS_BOTTOM_UI defaults to 1, which compiles out
+// metricsDrawOverlay and every printf diagnostic, and this file writes its report through
+// raw FS regardless. A core placement nobody can see is a core placement nobody can check --
+// workerSaveWaits() shipped from v1.7.1 to v1.8.15 with its only readout inside
+// `#if !BS_BOTTOM_UI` and was therefore never once visible in an installed build.
+static int          s_core_req = -1;
+static volatile s32 s_core_run = -1;
 
 #if BS_DRAW_PROBE
 // The self-test's own buffer rather than a share of s_report. A share would work today, since
@@ -649,6 +684,41 @@ static void reportBuild(u32 phase, u32 frames, u32 stuck_ms, bool slow)
 	if (n <= 0) return;
 	size_t len = ((size_t)n < sizeof(s_report)) ? (size_t)n : sizeof(s_report) - 1;
 
+	// v1.8.17 N3D-CORE. The core map, and it is UNCONDITIONAL -- unlike the BS_DRAW_PROBE
+	// block below, this ships. Appended rather than woven into the format string above only to
+	// keep that diff at zero.
+	//
+	// Every number here is a svcGetProcessorID() reading taken by the thread it describes, not
+	// the argument that thread was created with, and the two are printed side by side so a
+	// disagreement is visible rather than inferred. "req" is what threadCreate accepted; "run"
+	// is where the thread reports being. On the documented kernel behaviour they must match --
+	// 3dbrew says a disallowed processor id makes CreateThread return 0xD9001BEA rather than
+	// silently relocating the thread -- so a mismatch here is a finding, not noise.
+	//
+	// -1 in a "run" column means that thread had not been scheduled even once when the report
+	// was written, which for the watchdog itself is impossible (it is the thread writing this)
+	// and for a worker lane means it never got the CPU at all -- which, in a hang report, is
+	// itself the answer.
+	{
+		const int cm = snprintf(s_report + len, sizeof(s_report) - len,
+			"\n"
+			"watchdog core: req %d  run %ld\n"
+			"worker lane 0: req %d  run %d\n"
+			"worker lane 1: req %d  run %d\n"
+			"\n"
+			"'req' is the core threadCreate accepted; 'run' is what that thread's own\n"
+			"svcGetProcessorID() returned. A lane with req -1 is not running. On a New 3DS the\n"
+			"expected map is lane 0 on core 2 and everything else on core 0; on an Old 3DS,\n"
+			"everything on core 0. The main thread is always core 0 (exheader IdealProcessor).\n",
+			s_core_req, (long)s_core_run,
+			workerLaneCore(0), workerLaneCoreRunning(0),
+			workerLaneCore(1), workerLaneCoreRunning(1));
+		if (cm > 0) {
+			const size_t room = sizeof(s_report) - len - 1;
+			len += ((size_t)cm < room) ? (size_t)cm : room;
+		}
+	}
+
 #if BS_DRAW_PROBE
 	// Appended rather than woven into the format above, so a shipped report stays byte-for-byte
 	// what it already was and only the bisect build carries the extra three lines.
@@ -738,6 +808,18 @@ static void watchdogMain(void* arg)
 {
 	(void)arg;
 
+	// v1.8.17 N3D-CORE. Before the loop, because this is the one question only this thread can
+	// answer: svcGetProcessorID() (SVC 0x11 GetCurrentProcessorNumber, granted by
+	// cia/blocksmith.rsf's SystemCallAccess) reads the core the CALLING thread is on.
+	//
+	// This matters more here than anywhere else in the tree. watchdogStart asks for core 1
+	// first and falls back to core 0, and the whole reason it wants core 1 is that a main
+	// thread spinning without yielding on core 0 starves a lower-priority thread pinned to
+	// core 0 -- which is this thread, on the fallback rung. So "did the ladder get core 1?"
+	// decides whether this monitor can see the exact failure it was written for, and until
+	// now nothing recorded the answer.
+	s_core_run = svcGetProcessorID();
+
 	u32 last_beat = s_beat;
 	u32 stuck_ms  = 0;
 
@@ -820,9 +902,27 @@ bool watchdogStart(void)
 	// scheduled at all. On core 1 the monitor still runs and still writes its report. Core 0 is
 	// the fallback because threadCreate on core 1 is refused outright under some launch paths,
 	// and a watchdog that only works on core 1 would silently not exist on those.
+	//
+	// v1.8.17 N3D-CORE, on why the core-1 rung is expected to be REFUSED as things stand and
+	// what that costs. libctru's svc.h is explicit that core 1 needs
+	// APT_SetAppCpuTimeLimit called at least once with a non-zero value, and nothing in this
+	// tree calls it: app/worker.c's only call sits behind BS_WORKER_CORE, which defaults to 0.
+	// So this ladder falls to core 0 on every console today, and the monitor lands on the one
+	// core its own comment above says it cannot do its job from.
+	//
+	// That is NOT fixed here, deliberately. Fixing it means calling APT_SetAppCpuTimeLimit --
+	// a process-wide ration on the system core, shared with the OS services -- and neither the
+	// grant nor its consequences can be measured off hardware. It is a placement change with a
+	// freeze risk and it needs steve's yes, not a guess. What v1.8.17 does instead is record
+	// where this thread actually landed (s_core_run), so the next hang report says whether the
+	// monitor was on a core that could see anything.
+	s_core_req = 1;
 	s_thread = threadCreate(watchdogMain, NULL, WD_STACK_BYTES, prio, 1, false);
-	if (!s_thread)
+	if (!s_thread) {
+		s_core_req = 0;
 		s_thread = threadCreate(watchdogMain, NULL, WD_STACK_BYTES, prio, 0, false);
+	}
+	if (!s_thread) s_core_req = -1;
 
 	return s_thread != NULL;
 }
@@ -889,3 +989,6 @@ bool watchdogFired(void)
 {
 	return s_fired;
 }
+
+int watchdogCore(void)        { return s_core_req; }
+int watchdogCoreRunning(void) { return (int)s_core_run; }

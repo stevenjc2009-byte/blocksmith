@@ -62,8 +62,27 @@
 typedef struct {
 	int        index;      // 0 or 1; the index into s_claims and the tag in the ready ring
 	Thread     thread;
-	int        core;       // where this lane actually ended up, not what it asked for
+	int        core;       // the core threadCreate ACCEPTED for this lane -- see below
 	LightEvent work;       // this lane's wake-up; see the note on the event scheme below
+
+	// v1.8.17 N3D-CORE. Where this lane is ACTUALLY running, read by the lane itself with
+	// svcGetProcessorID() as the first thing workerMain does. -1 until the thread has been
+	// scheduled once.
+	//
+	// Why both this and `core` exist, when `core` is already documented as "where it landed".
+	// `core` is the argument threadCreate accepted, and on the documented kernel behaviour
+	// that IS the core the thread got: 3dbrew's Multi-threading page says the kernel's only
+	// processor-id restriction checks are the kernel-flags 0x2000 test for core 2 and an
+	// outright refusal of core 3, and that a refused core makes CreateThread RETURN
+	// 0xD9001BEA rather than quietly placing the thread somewhere else. So `core` should
+	// equal `core_run`, and nothing in this tree has ever checked that it does.
+	//
+	// It has to stay a separate field rather than replacing `core`, because workerStart
+	// reads `s_lane0.core` to decide whether to start lane 1 at all, and it reads it
+	// immediately after threadCreate returns — before the new thread has necessarily run a
+	// single instruction. A measured field would still be -1 at that moment and the second
+	// lane would never start on any console.
+	volatile s32 core_run;
 
 	// Worker-owned. The main thread only touches this while this lane's claim is held and
 	// the lane is parked, which is the whole handshake — see worker.h.
@@ -326,6 +345,17 @@ static void workerMain(void* arg)
 {
 	Lane* const ln = (Lane*)arg;
 
+	// v1.8.17 N3D-CORE. First thing, before any work: which core did this lane actually get?
+	// svcGetProcessorID() is libctru's wrapper for SVC 0x11 GetCurrentProcessorNumber --
+	// verified by disassembling libctru.a's svc.o, which is two instructions:
+	//     svc 0x00000011
+	//     bx  lr
+	// It reads the core the CALLING thread is executing on right now, so it can only be
+	// answered from inside the thread being asked about. cia/blocksmith.rsf grants SVC 17
+	// (SystemCallAccess GetCurrentProcessorNumber), confirmed present in the shipped
+	// v1.8.16 exheader's system-call mask.
+	ln->core_run = svcGetProcessorID();
+
 	for (;;) {
 		// Cleared *before* the queue is inspected, so a job submitted between the
 		// inspection and the wait leaves the event signalled and the wait returns
@@ -463,6 +493,7 @@ static bool workerLaneStart(Lane* ln, int index, int core, s32 prio)
 {
 	ln->index      = index;
 	ln->core       = -1;
+	ln->core_run   = -1;
 	ln->thread     = NULL;
 	ln->lightq     = NULL;
 	ln->busy_ticks = 0;
@@ -610,6 +641,12 @@ int workerLaneCore(int lane)
 {
 	if (lane < 0 || lane >= WORKER_LANES_MAX || !s_lane[lane]) return -1;
 	return s_lane[lane]->core;
+}
+
+int workerLaneCoreRunning(int lane)
+{
+	if (lane < 0 || lane >= WORKER_LANES_MAX || !s_lane[lane]) return -1;
+	return (int)s_lane[lane]->core_run;
 }
 
 void workerStop(void)
