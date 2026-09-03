@@ -277,14 +277,24 @@ static void testTheCarryCeilingIsWhereItSays(void)
 	// core row ever lands on top of this one.
 	//
 	// The NAMED constant on the right is the half that does NOT update itself, and it has now
-	// gone stale three times. It is deliberately not replaced by a bare 37: the point of naming the
+	// gone stale four times. It is deliberately not replaced by a bare 42: the point of naming the
 	// block is that the failure message says WHICH block the table now ends at, which is what
 	// tells the next reader whether a row was added on purpose or lost by accident. The price
 	// is that this line has to be edited whenever the table grows, and the noisy failure when
 	// nobody does is the thing being bought, not a defect in the check.
+	//
+	// v1.8.15 "Furnace" made it four, moving the edge to BLOCK_FURNACE (id 42) past the four
+	// cooked meats (38..41). Worth recording HOW this file was found, because a grep did not
+	// find it and could not have: `git diff` reports interact_test.c clean against HEAD, since
+	// the furnace work touched interact.c and interact.h but never this file. Its TEXT did not
+	// change; its INPUT did. This was the SIXTH file in this one version to go stale that way,
+	// after inventory_test.c, session_test.c, atlas_uv_shader_test.c, networld_test.c and the
+	// server's own bsgame_test.c — every one of them clean in `git diff`, every one of them
+	// found by running the full suite. After appending a core row the instrument is a suite
+	// run, not a grep, and "I did not touch that file" reasons about the wrong thing entirely.
 	const ItemId last_defined  = (ItemId)(registryCount() - 1);
 	const ItemId first_beyond  = (ItemId)registryCount();
-	CHECK(last_defined == (ItemId)BLOCK_RAW_MUTTON);     // premise: the table is 38 rows
+	CHECK(last_defined == (ItemId)BLOCK_FURNACE);        // premise: the table is 43 rows
 	CHECK(inventoryCanHold(last_defined));
 	CHECK(!inventoryCanHold(first_beyond));
 
@@ -565,7 +575,13 @@ static void testEveryCoreBlockStillBreaks(void)
 	// move. Measured, not reasoned: the previous number went red as
 	// "interact self-test: FAIL 1/732  L562 targetable_seen == 32", and 36 is what the loop
 	// counted on the run after the four rows landed.
-	CHECK(targetable_seen == 36);   // 37 rows past air, less water
+	//
+	// v1.8.15: 36 -> 41, same shape a third time. The four cooked meats (38..41) and the furnace
+	// (42) are all FULL_CUBE and SOLID, so all five land in targetable_seen and cross_seen stays
+	// at 9 — no CROSS row was added this version. Measured, not reasoned, exactly as the entry
+	// above insists: the stale number went red as "interact self-test: FAIL 2/757  L568
+	// targetable_seen == 36", and 41 is what the loop counted afterwards.
+	CHECK(targetable_seen == 41);   // 42 rows past air, less water
 	CHECK(cross_seen == 9);         // tall grass, dead bush, fern, tall grass top,
 	                                 // poppy, daisy, bluebell, orchid, torch
 }

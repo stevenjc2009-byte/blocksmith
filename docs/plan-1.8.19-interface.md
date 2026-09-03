@@ -250,6 +250,19 @@ never used `BLOCK_COUNT` — it walks every **registry-defined** id, which (per
 pass) is **27 core rows today, 28 once the storage version's chest row lands** — and it pages 16
 at a time, not all-at-once.
 
+> ⚠ CORRECTION [2026-09-03]: the "27 today, 28 once the chest lands" premise is stale, and by
+> more than one version. Verified directly against the live tree, not against either plan: the
+> real count today is **43** — `source/world/block.h`'s enum runs `BLOCK_AIR=0` through
+> `BLOCK_FURNACE=42`, closed by `_Static_assert(BLOCK_COOKED_PORKCHOP == 38 && ... &&
+> BLOCK_FURNACE == 42, ...)`, and `source/world/registry.c`'s `kCoreDefs[]` has a designated
+> initialiser for every index `[0]` through `[42]` with no gaps — 43 rows. This is not the
+> chest arriving; no `BLOCK_CHEST` row exists anywhere in the registry yet, exactly as §0's own
+> correction already established. It is four versions' worth of appends this document's "27/28"
+> never accounted for: v1.8.10's torch (id 27), v1.8.12's six ores (28..33), v1.8.14's four raw
+> meats (34..37), and v1.8.15's four cooked meats plus the furnace (38..42) — the same
+> pre-v1.8.10 snapshot §0's `RECIPE_COUNT` correction traces to. §3.3 below (the paging and
+> quad-cost arithmetic) is corrected against 43, not 27 or 28.
+
 The honest number is not a new hand estimate — it is **already computed, exactly, by
 `blockListQuadsFor()` for whatever op list `blockListBuild()` returns for a given page**
 (§3.1). A full 16-block page's worst case (every cell filled, no air, every name near
@@ -267,6 +280,25 @@ behind it needed correcting. **My proposal, not yet in any code:** whoever wires
 call `blockListQuadsFor()` on the real built op list and log or assert the number once, rather
 than trust either this document's or `ui-skin.md`'s hand count — the function exists precisely
 so nobody has to.
+
+> ⚠ CORRECTION [2026-09-03]: re-derived at the real count (43, not 27/28 — see the correction
+> above). `BL_PER_PAGE` is `BL_COLS * BL_ROWS = 16` (`source/debug/blocklist.h:65`), unchanged —
+> nothing about the count-of-43 finding touches the 2x8 grid itself. What changes is the page
+> total: `ceil(43 / 16) = 3` pages, not 2 — page 1 holds ids `0x00..0x0F` (unchanged from the
+> mockup below), page 2 holds `0x10..0x1F`, and page 3 holds the remaining 11 ids `0x20..0x2A`,
+> a partial page. The worked header string becomes `"BLOCK LIST  43 blocks  page 3/3"` for the
+> last page (was `"...28 blocks  page 2/2"`) — same glyph count either way, since both the block
+> total and the page denominator stay two- and one-digit respectively, so the **~27 header-glyph
+> estimate does not change**. Nor does the **~368-quad worst-case-per-page figure**: it is
+> bounded by one *fully populated* page of `BL_PER_PAGE=16`, a quantity `BLOCK_COUNT`-independent
+> and registry-count-independent alike — going from 2 pages to 3 does not multiply the per-frame
+> cost, because the screen only ever draws one page at a time. **What this correction does NOT
+> re-verify**: whether ~368 quads still fits the sprite headroom this paragraph cites (~450) —
+> that figure was itself already corrected elsewhere in this document (§2's correction: real
+> headroom is ~234, not ~450, per `source/gfx/sprite.c`'s comment) for reasons unrelated to the
+> block count, and 368 > 234. That is a real, pre-existing tension this pass noticed but did not
+> resolve, since it is not caused by the stale block count this correction is scoped to fixing —
+> flagged for the owner, not fixed here.
 
 ---
 
@@ -362,6 +394,16 @@ If instead the owner picks the "keep the hotbar visible, shrink Blocks to fit un
 resolution in §7, this mockup does not apply and a new, denser layout (not designed in this
 document, since it would be new work with its own quad/paging cost, not the free reuse §3.1
 found) would be needed instead.
+
+> ⚠ CORRECTION [2026-09-03]: the header line above (`"BLOCK LIST  28 blocks  page 1/2"`) is
+> stale — the real registry count is 43, not 27/28 (§3.3's correction). The real header for
+> page 1 reads `"BLOCK LIST  43 blocks  page 1/3"`. **The grid body itself is unaffected and
+> still accurate**: page 1 always holds ids `0x00`-`0x0F` regardless of total registry size
+> (`BL_PER_PAGE=16` is unchanged), so every row shown above — `AIR` through `BIRCH_LOG` — is
+> still exactly what `blockListBuild()` emits for page 1 today. What the mockup does not show is
+> that there are now three pages, not two — page 2 covers `0x10`-`0x1F`
+> (`BIRCH_PLANKS`..`REDSTONE_ORE`), and page 3 covers the remaining eleven ids `0x20`-`0x2A`
+> (`LAPIS_ORE`..`FURNACE`), a partial page of 11 cells rather than a full 16.
 
 **The Inventory category** (identical to today's existing grid+hotbar layout, `y=0-120`, now
 reached via the bar rather than as the overlay's default content — the bar itself would sit

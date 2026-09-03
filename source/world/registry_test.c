@@ -57,7 +57,7 @@
 #define REGISTRY_DYN_LO_PIN     0x80  // first dynamic block id
 #define REGISTRY_DYN_HI_PIN     0xFD  // last one; 0xFE/0xFF stay reserved
 #define REGISTRY_DYN_ROWS_PIN   126   // 0xFD - 0x80 + 1, WRITTEN OUT, never computed
-#define REGISTRY_FULL_COUNT_PIN 164   // 38 core rows (air + thirty-seven) + 126 dyn rows
+#define REGISTRY_FULL_COUNT_PIN 169   // 43 core rows (air + forty-two) + 126 dyn rows
 
 // Compile-time layer. These fire when the host suite builds, which is every
 // tools/run_host_tests.sh run; the 3DS build never compiles this file (see the __3DS__
@@ -210,7 +210,31 @@ static void checkPin(bool cond, long got, long want, const char *what, const cha
 // the crc golden is still exactly one check regardless of what value it holds (0xE15E ->
 // 0x9610 this time). REGISTRY_FULL_COUNT_PIN moved value too (160 -> 164) without adding a
 // call, exactly as it has every previous time.
-#define REGISTRY_TEST_EXPECTED_CHECKS 130
+//
+// 130 -> 137 on 2026-09-03, v1.8.15 "Furnace"'s five rows (ids 38..42: the four cooked meats
+// and the furnace). Counted off the source first, same discipline as every entry above:
+//
+//   +5   coreHardnessIsDeclared()'s per-row loop runs five more iterations, one
+//        check(v->hardness != 0, v->name) each for cooked_porkchop/cooked_beef/
+//        cooked_chicken/cooked_mutton/furnace.
+//   +1   the new cooked-meat hardness-ladder pin, the four-row analogue of the raw-meat
+//        ladder check just above it (and of the ore ladder and the snow/cactus/ice trio
+//        above that).
+//   +1   the new furnace hardness pin — not a ladder, one block and one `==`, but pinned by
+//        name for the same reason the ladders are: 45 is stone's value on purpose, and a
+//        bare nonzero check would not catch it silently drifting off that.
+//
+// 130 + 5 + 1 + 1 = 137. Nothing else in this suite gained a call, for the same reason nothing
+// else did in every move above: testRegistryCoreIdsStable and its kPhase3 table are both
+// written against FIXED id lists, so five new registry rows do not enter either one, and the
+// crc golden is still exactly one check regardless of what value it holds (0x9610 -> 0xE486
+// this time). REGISTRY_FULL_COUNT_PIN moved value too (164 -> 169) without adding a call,
+// exactly as it has every previous time.
+//
+// Predicted (137) before the run, same discipline as the 117 move's comment describes; the
+// scratchpad WSL run of this exact suite after all of the above edits confirmed it: see this
+// lane's final report for the captured PASS transcript.
+#define REGISTRY_TEST_EXPECTED_CHECKS 137
 
 // Deliberately NOT routed through check(): this must not perturb the number it is testing,
 // so it bumps g_fails only. Reporting shape is check()'s, so a failure here reads the same
@@ -264,10 +288,12 @@ static void testRegistryRoundTrip(void)
 	// (0x12..0x14), the tall-grass top (0x15), poppy/daisy/bluebell/orchid (0x16..0x19) and
 	// the apple (0x1A) — plus v1.8.10's torch (0x1B), the first light source, plus v1.8.12's
 	// six ores (0x1C..0x21): coal/iron/gold/redstone/lapis/diamond, plus v1.8.14's four raw
-	// meats (0x22..0x25): porkchop/beef/chicken/mutton. Every one of the last thirty is a
-	// core block and deliberately NOT an item — world/block.h records why BLOCK_COUNT stayed
-	// at 8 while the registry's row count moved to 38.
-	check(registryCount() == 38, "a fresh table defines exactly air + the thirty-seven core blocks");
+	// meats (0x22..0x25): porkchop/beef/chicken/mutton, plus v1.8.15's four cooked meats and
+	// the furnace (0x26..0x2A): cooked_porkchop/cooked_beef/cooked_chicken/cooked_mutton/
+	// furnace. Every one of the last thirty-five is a core block and deliberately NOT an
+	// item — world/block.h records why BLOCK_COUNT stayed at 8 while the registry's row
+	// count moved to 43.
+	check(registryCount() == 43, "a fresh table defines exactly air + the forty-two core blocks");
 	check(registryFind("grass") == BLOCK_GRASS, "core rows are findable by name");
 
 	// The runtime half of the dyn-range pin. The two _Static_asserts at the top of this
@@ -338,7 +364,7 @@ static void testRegistryRoundTrip(void)
 	         kDynRangeWhy);
 	checkPin(registryCount() == REGISTRY_FULL_COUNT_PIN,
 	         (long)registryCount(), (long)REGISTRY_FULL_COUNT_PIN,
-	         "count reflects every defined row once the range is full: 34 core + 126 dyn",
+	         "count reflects every defined row once the range is full: 43 core + 126 dyn",
 	         kDynRangeWhy);
 }
 
@@ -690,8 +716,48 @@ static void testRegistryCrcStability(void)
 	// before this literal moved. Its game/bsgame_test.c carries the mirrored
 	// BS_REGISTRY_CORE_CRC16_GOLDEN 0x9610 / BS_REGISTRY_CORE_COUNT_GOLDEN 38, and Makefile's
 	// PROTO_COMMIT was bumped to that commit.
-	check(base == 0x9610u,
-	      "core-only crc matches the pinned golden 0x9610");
+	//
+	// MOVED A SEVENTH TIME 2026-09-03, 0x9610 -> 0xE486, by v1.8.15 "Furnace"'s five rows:
+	// the four cooked meats (ids 38..41: cooked_porkchop/cooked_beef/cooked_chicken/
+	// cooked_mutton) and the furnace itself (id 42). registryCount() moves 38 -> 43, the same
+	// shape as every move above: five records APPENDED, nothing renumbered, so REGISTRY_REV
+	// stays 1.
+	//
+	// Each cooked meat keeps its raw counterpart's hardness exactly (world/registry.c's own
+	// row comment says why: the four-step ladder chicken 3 < porkchop 4 < mutton 5 < beef 6
+	// is preserved rather than re-derived). The furnace is FULL_CUBE/SOLID with hardness 45,
+	// matching BLOCK_STONE — it is stone-built, and only its FACE_SOUTH ("front") tile
+	// differs from plain stone; the other five faces reuse BTEX_STONE. Both facts are pinned
+	// as a ladder and a hardness value respectively by coreHardnessIsDeclared() below.
+	//
+	// Measured the same way as every move above: a scratchpad probe (furnacec_crc_probe.c)
+	// linking this tree's real world/registry.c and world/block.c, no test file linked so the
+	// golden is unreachable from the binary being measured. Printed:
+	//
+	//     count=43 crc=0xE486 rev=1
+	//     id=38 name=cooked_porkchop  hardness=  4 flags=0x01 tex0=42 solid=1 liquid=0
+	//     id=39 name=cooked_beef      hardness=  6 flags=0x01 tex0=43 solid=1 liquid=0
+	//     id=40 name=cooked_chicken   hardness=  3 flags=0x01 tex0=44 solid=1 liquid=0
+	//     id=41 name=cooked_mutton    hardness=  5 flags=0x01 tex0=45 solid=1 liquid=0
+	//     id=42 name=furnace          hardness= 45 flags=0x01 tex0=3  solid=1 liquid=0
+	//     targetable-rows=41 zero-hardness-count=0
+	//
+	// tex0 for the furnace row is 3 (BTEX_STONE), FACE_EAST — expected, since only
+	// world/registry.c's furnace row's FACE_SOUTH slot (tex[4]) carries BTEX_FURNACE_FRONT;
+	// every other face reuses stone's tile.
+	//
+	// NOT cross-checked against deps/blocksmith-server this time: this lane (FURNACE-C) is
+	// explicitly forbidden from touching deps/blocksmith-server or mc/server/, and
+	// tools/sync-world-sources.sh writes into that tree. SERVER SHIPS FIRST still applies —
+	// the coordinator or wiring lane must run tools/sync-world-sources.sh from
+	// deps/blocksmith-server, confirm world/registry.c and world/block.h report `synced`, and
+	// bump BS_REGISTRY_CORE_CRC16_GOLDEN to 0xE486 / BS_REGISTRY_CORE_COUNT_GOLDEN to 43 in
+	// deps/blocksmith-server/game/bsgame_test.c (plus PROTO_COMMIT in this repo's Makefile)
+	// before this client's furnace rows are safe to run against a live server — an old server
+	// refuses a mismatched crc at join time, so this is a safety refusal, not silent
+	// corruption, but it does mean single-player only until that ships.
+	check(base == 0xE486u,
+	      "core-only crc matches the pinned golden 0xE486");
 
 	// Content sensitivity: one extra def must move the crc, and re-init must
 	// put it back - proving the crc covers table content, not process state.
@@ -802,7 +868,7 @@ static void coreHardnessIsDeclared(void)
 	// the rule is green in a build where registryIsDefined() answers false for everything —
 	// a check that cannot go red proves nothing, and a `continue` is the easiest way to
 	// neutralise one by accident.
-	check(rows == 36, "and it ran over 36 rows: 38 core rows less air and less water");
+	check(rows == 41, "and it ran over 41 rows: 43 core rows less air and less water");
 
 	// A row must have its OWN number, not a neighbour's. The loop above is satisfied by a
 	// table where every hardness is 9, which is exactly the failure mode "make sure every
@@ -850,6 +916,31 @@ static void coreHardnessIsDeclared(void)
 	      && registryGet(BLOCK_RAW_MUTTON)->hardness < registryGet(BLOCK_RAW_BEEF)->hardness,
 	      "raw meat hardness is a four-step ladder, chicken 3 < porkchop 4 < mutton 5 < "
 	      "beef 6, every step above the plants' 1-tick floor and far under stone's 45");
+
+	// v1.8.15's four cooked meats, pinned as the IDENTICAL ladder to the raw meats just above
+	// and for the identical reason: world/registry.c's own row comments say each cooked block
+	// keeps its raw counterpart's hardness rather than re-deriving one, on the grounds that
+	// cooking changes what an item does when eaten, not how hard the placed block is to break.
+	// Written the same way as the raw-meat check on purpose — as a strict ordering, not four
+	// `==` lines — so the same "beef borrowed mutton's byte" failure mode is caught here too.
+	check(registryGet(BLOCK_COOKED_CHICKEN)->hardness == 3
+	      && registryGet(BLOCK_COOKED_PORKCHOP)->hardness == 4
+	      && registryGet(BLOCK_COOKED_MUTTON)->hardness == 5
+	      && registryGet(BLOCK_COOKED_BEEF)->hardness == 6
+	      && registryGet(BLOCK_COOKED_CHICKEN)->hardness < registryGet(BLOCK_COOKED_PORKCHOP)->hardness
+	      && registryGet(BLOCK_COOKED_PORKCHOP)->hardness < registryGet(BLOCK_COOKED_MUTTON)->hardness
+	      && registryGet(BLOCK_COOKED_MUTTON)->hardness < registryGet(BLOCK_COOKED_BEEF)->hardness,
+	      "cooked meat hardness matches its raw counterpart's ladder, chicken 3 < porkchop 4 "
+	      "< mutton 5 < beef 6 — cooking changes what it feeds, not how hard it breaks");
+
+	// v1.8.15's furnace. Not a ladder — one block, one number — but pinned the same way as
+	// every other new-block row above rather than folded into the generic per-row loop's
+	// nonzero check, because 45 is not an arbitrary nonzero byte: it is deliberately equal to
+	// BLOCK_STONE's hardness. The furnace is a stone block with one re-painted face, and its
+	// break time says so.
+	check(registryGet(BLOCK_FURNACE)->hardness == 45
+	      && registryGet(BLOCK_FURNACE)->hardness == registryGet(BLOCK_STONE)->hardness,
+	      "furnace hardness is 45, matching stone: a stone block with one face re-painted");
 
 	// CONTROL. An id with no row still reads back as air, hardness 0, and that must NOT trip
 	// the rule above — the rule is about rows that exist. Green in every arm, including one

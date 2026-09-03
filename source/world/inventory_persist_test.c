@@ -319,21 +319,41 @@ static void testEmptyInventoryRoundTrips(void)
  * and 34 is BLOCK_RAW_PORKCHOP. One failure and no others in that run ("inventory persistence
  * self-test: FAIL 106 checks, 1 failed"), which is the control: the meat rows moved the edge
  * and nothing else in this file. Re-pointed rather than patched, same reasoning as the three
- * moves above. */
+ * moves above.
+ *
+ * Moved a FIFTH time, raw_mutton (37) -> furnace (42), on 2026-09-03 by v1.8.15 "Furnace",
+ * which added ids 38..42 in one go (cooked_porkchop 38, cooked_beef 39, cooked_chicken 40,
+ * cooked_mutton 41, furnace 42). The prediction in the body below — "if a future row lands at
+ * 38 this goes red" — fired verbatim a second version running:
+ *
+ *   FAIL  L331 !inventoryCanHold((ItemId)(BLOCK_RAW_MUTTON + 1))
+ *
+ * and 38 is BLOCK_COOKED_PORKCHOP. Again one failure and no others ("inventory persistence
+ * self-test: FAIL 106 checks, 1 failed"), the same control as last time.
+ *
+ * Worth recording what makes THIS pin different from the six other files v1.8.15 went stale in.
+ * All six of those pinned a COUNT, so they failed loudly by stating a number that moved. This
+ * one pins a PREMISE — "the id one past the table is undefined" — and a premise like that can
+ * rot in two directions. Here it rotted loudly, because the negation flipped. The server's
+ * bsgame_test.c has a pin of the identical shape in
+ * test_inv_pickup_undefined_core_id_refused(), and there the same rot was SILENT: the test kept
+ * passing, having quietly stopped testing that an undefined id is refused and started testing
+ * that a defined one is accepted. Same stale literal, same version, opposite failure mode. The
+ * only reason either was caught is that a full suite was run. */
 static void testMaxValidItemIdRoundTrips(void)
 {
 	freshDir();
 
 	/* The premise, checked rather than assumed: these really are the two sides of the edge.
-	 * If a future row lands at 38 this goes red and the case gets re-pointed, instead of
+	 * If a future row lands at 43 this goes red and the case gets re-pointed, instead of
 	 * quietly testing the middle of the table while calling it the boundary. */
-	CHECK(inventoryCanHold((ItemId)BLOCK_RAW_MUTTON));
-	CHECK(!inventoryCanHold((ItemId)(BLOCK_RAW_MUTTON + 1)));
+	CHECK(inventoryCanHold((ItemId)BLOCK_FURNACE));
+	CHECK(!inventoryCanHold((ItemId)(BLOCK_FURNACE + 1)));
 
 	Inventory in;
 	inventoryInit(&in);
 	in.slots[0] = (InvSlot){ .item = BLOCK_LEAVES, .count = INV_STACK_MAX };  /* 6: the old top */
-	in.slots[1] = (InvSlot){ .item = BLOCK_RAW_MUTTON, .count = INV_STACK_MAX }; /* 37: real one */
+	in.slots[1] = (InvSlot){ .item = BLOCK_FURNACE, .count = INV_STACK_MAX };   /* 42: real one */
 
 	CHECK(inventorySave(&in, INV_DIR));
 	Inventory out;
@@ -342,7 +362,7 @@ static void testMaxValidItemIdRoundTrips(void)
 	CHECK(invEqual(&out, &in));
 	/* Spelled out as well as compared, so a failure says WHICH id was lost rather than only
 	 * that two structs differ. invEqual is the check; this is the error message. */
-	CHECK(out.slots[1].item == BLOCK_RAW_MUTTON && out.slots[1].count == INV_STACK_MAX);
+	CHECK(out.slots[1].item == BLOCK_FURNACE && out.slots[1].count == INV_STACK_MAX);
 }
 
 /* ── v1.8.8: the widened capacity, on disk ──────────────────────────────────────────────

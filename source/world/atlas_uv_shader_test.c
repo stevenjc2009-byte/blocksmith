@@ -195,7 +195,23 @@ static char s_first[512];
 // block ids: BLOCK_RAW_PORKCHOP..BLOCK_RAW_MUTTON are 34..37 and are registered in the same
 // version, so all four slots are addressed by a real tex byte from the moment they are painted.
 // The id and the slot are four apart and are not interchangeable.
-#define ATLAS_PAINTED_SLOTS 42
+//
+// v1.8.15 "Furnace": 42 -> 48. tools/make_atlas.py's TILES list gained six more entries in
+// slots 42..47 - cooked_porkchop, cooked_beef, cooked_chicken, cooked_mutton, furnace_front and
+// furnace_front_lit. Same shape as the v1.8.14 entry above, art landing WITH its ids rather than
+// ahead of them, and the id/slot gap is now four for the meats and not constant across the
+// whole append: BLOCK_COOKED_PORKCHOP..BLOCK_COOKED_MUTTON are 38..41 in slots 42..45, but
+// BLOCK_FURNACE is a single id (42) owning TWO slots (46, 47) because its front face has an
+// unlit and a lit variant. That is the first time in this file's history that the id-to-slot
+// relationship has not been one-to-one, so any future reader tempted to compute one from the
+// other by adding a constant should stop here: there is no such constant any more.
+//
+// Found by the suite, not by the lane that painted the tiles: this went red as six separate
+// "slot N is not the missing-texture marker" failures at L1619, one per newly-painted slot,
+// which is precisely the direction this pin is meant to fire in. The pin's OTHER direction --
+// a registered block whose tile is still unpainted -- remains the failure the whole file exists
+// for, and is unaffected.
+#define ATLAS_PAINTED_SLOTS 48
 
 // Slots 10 and 11 within that: water and tall grass (roadmap tasks 17 and 19). Named here
 // because the two texel-content checks further down are about what these two tiles ARE, not
@@ -1359,6 +1375,17 @@ int main(void)
 				0x85B9D38E60A9533Dull,   // 39 raw_beef    (NEW pin, v1.8.14 -- see below)
 				0x241259EE6CFD8292ull,   // 40 raw_chicken (NEW pin, v1.8.14 -- see below)
 				0x8827E818ECCB7EB7ull,   // 41 raw_mutton  (NEW pin, v1.8.14 -- see below)
+				// v1.8.15 "Furnace", six NEW pins. Slots 46 and 47 are the first two entries in
+				// this table that are two faces of ONE block id -- BLOCK_FURNACE's unlit and lit
+				// fronts -- so the "one row per block" reading this list has supported for
+				// fifteen versions no longer holds. Read it as one row per SLOT, which is what
+				// it always literally was.
+				0x571742E8AA11E088ull,   // 42 cooked_porkchop  (NEW pin, v1.8.15 -- see below)
+				0x775D8331BEE41902ull,   // 43 cooked_beef      (NEW pin, v1.8.15 -- see below)
+				0x2B850348DDE4915Cull,   // 44 cooked_chicken   (NEW pin, v1.8.15 -- see below)
+				0xEE9CE45C7B52C826ull,   // 45 cooked_mutton    (NEW pin, v1.8.15 -- see below)
+				0x7A99323A1EEDDADAull,   // 46 furnace_front    (NEW pin, v1.8.15 -- see below)
+				0x19A3B240EEFBFB75ull,   // 47 furnace_front_lit(NEW pin, v1.8.15 -- see below)
 			};
 			for (int slot = 0; slot < ATLAS_PAINTED_SLOTS; slot++) {
 				const uint64_t got = slotFingerprint(SLOT_PNG_TOP(slot));
@@ -1371,6 +1398,53 @@ int main(void)
 				      slot, got, kPaintedFingerprint[slot]);
 			}
 
+			// ── 2026-09-03: slots 42..47 are SIX new pins, same shape as the four below ────
+			//
+			// v1.8.15 "Furnace" gave tools/make_atlas.py six new painters — cooked_porkchop,
+			// cooked_beef, cooked_chicken, cooked_mutton, furnace_front and furnace_front_lit,
+			// appended to TILES at slots 42..47 — taking the sheet from forty-two painted tiles
+			// to forty-eight. ATLAS_PAINTED_SLOTS moved 42 -> 48 with them.
+			//
+			// The procedure was the one every note below records, and the RUN is the evidence
+			// rather than the reasoning. Two suite runs, and both mattered:
+			//
+			//   1. with ATLAS_PAINTED_SLOTS still 42, the H9 marker sweep failed six times —
+			//      "slot 42..47 is not the missing-texture marker" — one per newly painted slot,
+			//      which is the direction that sweep is designed to fire in.
+			//   2. with the constant moved to 48 and all six pins still zero, the fingerprint
+			//      check failed SIX times and no more, at 5379 checks: one per new slot, with
+			//      every one of slots 0..41 green in the same run. The six values below were
+			//      read out of those six failure lines.
+			//
+			// That second run is the whole justification for re-pinning, and it is the specific
+			// thing the CHECK's own message demands before anyone does: "A SHEET RESIZE must
+			// not [move a fingerprint]: if this moved because ATLAS_H_PX changed, the generator's
+			// slot addressing is wrong and re-pinning would ship it." The sheet DID grow this
+			// version — six more rows of texels — so that warning was live, not hypothetical.
+			// Slots 0..41 holding their pinned values across that resize is what discriminates
+			// "the sheet grew and existing art stayed put" from "the sheet grew and moved
+			// everything", and only the second of those would have made re-pinning a way of
+			// shipping a re-textured atlas.
+			//
+			//   42 cooked_porkchop   0x571742E8AA11E088
+			//   43 cooked_beef       0x775D8331BEE41902
+			//   44 cooked_chicken    0x2B850348DDE4915C
+			//   45 cooked_mutton     0xEE9CE45C7B52C826
+			//   46 furnace_front     0x7A99323A1EEDDADA
+			//   47 furnace_front_lit 0x19A3B240EEFBFB75
+			//
+			// One thing changed shape this version and is worth flagging where the pins are
+			// read rather than only where they are written: slots 46 and 47 are two faces of a
+			// SINGLE block id. BLOCK_FURNACE (42) owns both, unlit and lit. Every append before
+			// this one kept a constant id-to-slot offset, so a reader could recover one from
+			// the other by adding a number; from here that is false, and the four cooked meats
+			// (ids 38..41 in slots 42..45, offset 4) sitting immediately above a block whose
+			// offset is not 4 makes it look regular right up until it isn't.
+			//
+			// The append-only constraint below applies here unchanged and was relied on: these
+			// six painters were APPENDED to TILES, which is the only reason slots 0..41 could
+			// stay green at all.
+			//
 			// ── 2026-09-03: slots 38..41 are FOUR new pins, same shape as the six below ────
 			//
 			// v1.8.14 "Animals" (lane ANIMAL-B) gave tools/make_atlas.py four new painters —

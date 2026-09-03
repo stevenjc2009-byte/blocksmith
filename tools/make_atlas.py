@@ -245,6 +245,25 @@ TILES = [
     "raw_beef",         # 39
     "raw_chicken",      # 40
     "raw_mutton",       # 41
+    # v1.8.15 "Furnace": the four raw meats' cooked counterparts, then the furnace's own
+    # unlit and lit front faces. Appended for the reason everything since the sentinel has
+    # been: this order IS the contract with gfx/atlas_tiles.h's TILE_* enum and
+    # world/block.h's BTEX_* mirror of it, so inserting would silently re-texture every tile
+    # after the insertion point.
+    #
+    # The four cooked meats stay FULL_CUBE inventory icons registered SOLID, not
+    # TRANSPARENT, exactly like the raw cuts they are built from — see each painter's
+    # docstring for why it never leaves a texel out of the return (no alpha channel at all,
+    # same as tile_raw_porkchop and its three siblings above).
+    "cooked_porkchop",       # 42
+    "cooked_beef",           # 43
+    "cooked_chicken",        # 44
+    "cooked_mutton",         # 45
+    # The furnace's front face, unlit and lit. Only ONE new slot's worth of art is needed
+    # for the other five faces of a furnace block — world/registry.c's [42] row reuses
+    # BTEX_STONE for those — so this is two tiles, not six.
+    "furnace_front",         # 46 — unlit
+    "furnace_front_lit",     # 47 — lit
 ]
 
 
@@ -2123,6 +2142,206 @@ def tile_raw_mutton(rng):
     return img
 
 
+def tile_cooked_porkchop(rng):
+    """Cooked porkchop -- slot 42. Same silhouette as tile_raw_porkchop (rounded blob,
+    bone nub top-right) so the two read as the same cut before and after the furnace, but
+    the whole meat body shifts from raw pink to a roasted tan-brown and picks up char
+    flecks the raw tile never has -- the one new cue that says "cooked" rather than "a
+    different animal".
+    """
+    meat = [(178, 122, 78), (160, 106, 64), (194, 138, 92), (144, 92, 54)]
+    lit = (214, 168, 118)
+    shadow = (102, 62, 36)
+    bone = [(228, 206, 172), (238, 220, 190), (212, 188, 154)]
+    bone_shadow = (188, 164, 132)
+    rim = (236, 196, 158)
+    char = (58, 36, 22)
+
+    img = speckle(rng, TILE_PX, meat, weights=[4, 3, 2, 3])
+    px = img.load()
+
+    for y in range(TILE_PX):
+        for x in range(TILE_PX):
+            dl = ((x - 4.0) ** 2 + (y - 8.0) ** 2) ** 0.5
+            ds = ((x - 12.0) ** 2 + (y - 12.0) ** 2) ** 0.5
+            if dl < 3.4 and rng.random() < 0.75:
+                px[x, y] = lit
+            elif ds < 4.2 and rng.random() < 0.65:
+                px[x, y] = shadow
+
+    for y in range(6):
+        for x in range(10, TILE_PX):
+            d = ((x - 14.5) ** 2 + (y - 1.0) ** 2) ** 0.5
+            if d < 4.6:
+                px[x, y] = bone_shadow if (x + y) % 3 == 0 else rng.choice(bone)
+
+    for x, y in ((8, 5), (9, 5), (9, 6), (10, 6)):
+        px[x, y] = rim
+
+    # Char flecks: the cue tile_raw_porkchop has no reason to carry. Scattered rather than
+    # along an edge, because a hand-held chop browns unevenly, not in a ring.
+    for _ in range(10):
+        x = rng.randrange(1, TILE_PX - 1)
+        y = rng.randrange(6, TILE_PX - 1)
+        px[x, y] = char
+    return img
+
+
+def tile_cooked_beef(rng):
+    """Cooked beef -- slot 43. tile_raw_beef's border stays a hard, roughly-square edge --
+    a steak keeps its cut shape on the grill -- but the seared crust that was already the
+    darkest tone on the raw tile goes fully black-brown here, and the marbling dashes are
+    replaced with bold parallel GRILL-MARK stripes, the one shape cue that says "cooked"
+    on a tile that was already dark and reddish before the furnace touched it.
+    """
+    meat = [(120, 58, 34), (104, 48, 28), (138, 68, 40), (88, 40, 24)]
+    sear = (40, 18, 12)
+    grill = (26, 12, 8)
+
+    img = speckle(rng, TILE_PX, meat, weights=[4, 3, 2, 2])
+    px = img.load()
+
+    for i in range(TILE_PX):
+        for x, y in ((i, 0), (i, TILE_PX - 1), (0, i), (TILE_PX - 1, i)):
+            px[x, y] = sear if rng.random() < 0.85 else blend(px[x, y], sear, 0.55)
+
+    # Grill marks: two sets of parallel diagonal bands, crossing at right angles the way a
+    # cross-hatched grill grate does. Distinct from raw beef's short scattered marbling
+    # dashes -- these are long and structured, not flecked.
+    for offset in range(-TILE_PX, TILE_PX, 5):
+        for i in range(TILE_PX):
+            x, y = i, i + offset
+            if 1 <= x < TILE_PX - 1 and 1 <= y < TILE_PX - 1:
+                px[x, y] = blend(px[x, y], grill, 0.7)
+    return img
+
+
+def tile_cooked_chicken(rng):
+    """Cooked chicken -- slot 44. Keeps tile_raw_chicken's elongated drumstick silhouette
+    (narrow bone top, bulbous flesh bottom, radius growing with y**1.6) so the two read as
+    the same cut, but the pale raw flesh becomes roasted golden-brown skin and the backdrop
+    darkens to match -- roast chicken skin is warm brown, not pink-tan -- with a scatter of
+    darker char toward the wide end, where a drumstick browns most under a flame.
+    """
+    board = [(132, 84, 46), (144, 94, 52), (118, 74, 40)]
+    flesh = [(214, 152, 78), (226, 164, 88), (200, 140, 68), (218, 158, 82)]
+    bone = [(224, 200, 150), (232, 210, 162), (212, 188, 138)]
+    skin_shadow = (168, 108, 56)
+    bone_shadow = (196, 170, 122)
+    char = (74, 44, 24)
+
+    img = speckle(rng, TILE_PX, board, weights=[4, 3, 3])
+    px = img.load()
+
+    cx = 7.5
+    for y in range(TILE_PX):
+        t = y / (TILE_PX - 1)
+        radius = 1.6 + 5.0 * (t ** 1.6)
+        is_bone = y < 6
+        for x in range(TILE_PX):
+            if abs(x - cx) <= radius:
+                if is_bone:
+                    px[x, y] = bone_shadow if abs(x - cx) > radius - 1 else rng.choice(bone)
+                else:
+                    px[x, y] = skin_shadow if abs(x - cx) > radius - 1.3 else rng.choice(flesh)
+                    if not is_bone and t > 0.55 and rng.random() < 0.12:
+                        px[x, y] = char
+    return img
+
+
+def tile_cooked_mutton(rng):
+    """Cooked mutton -- slot 45. Keeps tile_raw_mutton's shape cue, the cream fat cap down
+    the full right edge, but browns the body toward roasted red-brown and toasts the fat
+    cap from cream to a golden-tan -- rendered fat looks fried, not raw -- which is the pair
+    of colour shifts that mark this as the cooked half of the same cut.
+    """
+    meat = [(138, 70, 46), (122, 58, 38), (152, 82, 54), (108, 48, 32)]
+    lit = (182, 116, 80)
+    shadow = (86, 40, 26)
+    fat = [(216, 180, 122), (226, 192, 136), (204, 168, 110)]
+    fat_shadow = (176, 142, 92)
+
+    img = speckle(rng, TILE_PX, meat, weights=[4, 3, 2, 3])
+    px = img.load()
+
+    for y in range(TILE_PX):
+        for x in range(13):
+            dl = ((x - 4.0) ** 2 + (y - 5.0) ** 2) ** 0.5
+            ds = ((x - 8.0) ** 2 + (y - 12.0) ** 2) ** 0.5
+            if dl < 3.2 and rng.random() < 0.75:
+                px[x, y] = lit
+            elif ds < 4.5 and rng.random() < 0.6:
+                px[x, y] = shadow
+
+    for y in range(TILE_PX):
+        for x in range(13, TILE_PX):
+            px[x, y] = fat_shadow if (x == 13 and rng.random() < 0.5) else rng.choice(fat)
+    return img
+
+
+def tile_furnace_front(rng):
+    """The furnace's front face, unlit -- slot 46. world/registry.c's [42] row reuses
+    BTEX_STONE on the other five faces, so this is the ONE tile that has to say "furnace"
+    on sight: a stone frame (built from tile_stone's own palette, so the frame reads as the
+    same rock the rest of the block is) around a dark, empty firebox opening -- cold ash,
+    no glow. tile_furnace_front_lit is this tile with the opening lit instead of dark, and
+    the two share the frame construction so only the opening reads as having changed.
+    """
+    greys = [(112, 118, 128), (102, 108, 118), (122, 128, 138), (94, 100, 110)]
+    img = speckle(rng, TILE_PX, greys, weights=[4, 3, 2, 2])
+    px = img.load()
+
+    ash = [(46, 44, 46), (36, 34, 36), (54, 52, 54)]
+    dark_frame = (58, 60, 66)
+    # The opening: a centred rectangle, inset from every edge so a stone frame remains on
+    # all four sides -- the detail that says "an object built into the block" rather than
+    # "a block with a dark smear on it".
+    x0, x1 = 3, TILE_PX - 3
+    y0, y1 = 6, TILE_PX - 2
+    for y in range(y0, y1):
+        for x in range(x0, x1):
+            on_edge = x in (x0, x1 - 1) or y in (y0, y1 - 1)
+            px[x, y] = dark_frame if on_edge else rng.choice(ash)
+    return img
+
+
+def tile_furnace_front_lit(rng):
+    """The furnace's front face, lit -- slot 47. Identical stone frame to
+    tile_furnace_front, built from the same seeded call so the two tiles are
+    indistinguishable outside the opening; only the firebox itself changes, from cold ash to
+    an ember glow -- a dark-to-bright vertical gradient (hottest low, where fuel actually
+    sits) with a few brighter embers scattered near the bottom, rather than a flat orange
+    fill, so it reads as fire and not as a solid-coloured window.
+    """
+    greys = [(112, 118, 128), (102, 108, 118), (122, 128, 138), (94, 100, 110)]
+    img = speckle(rng, TILE_PX, greys, weights=[4, 3, 2, 2])
+    px = img.load()
+
+    dark_frame = (58, 60, 66)
+    ember_low = (255, 176, 48)
+    ember_mid = (224, 96, 24)
+    ember_high = (120, 40, 16)
+    x0, x1 = 3, TILE_PX - 3
+    y0, y1 = 6, TILE_PX - 2
+    for y in range(y0, y1):
+        for x in range(x0, x1):
+            on_edge = x in (x0, x1 - 1) or y in (y0, y1 - 1)
+            if on_edge:
+                px[x, y] = dark_frame
+                continue
+            t = (y - y0) / max(1, (y1 - 1 - y0))   # 0 top .. 1 bottom (bottom is hottest)
+            base = blend(ember_high, ember_low, t)
+            px[x, y] = blend(base, ember_mid, 0.35) if rng.random() < 0.4 else base
+
+    # A few brighter embers near the bottom of the firebox, the hottest and brightest points
+    # on the tile -- glowing coals rather than a smooth gradient.
+    for _ in range(4):
+        x = rng.randrange(x0 + 1, x1 - 1)
+        y = rng.randrange(y1 - 4, y1 - 1)
+        px[x, y] = (255, 214, 120)
+    return img
+
+
 def tile_sentinel(_rng):
     """Not art — a bleed alarm.
 
@@ -2210,6 +2429,12 @@ PAINTERS = {
     "raw_beef": tile_raw_beef,
     "raw_chicken": tile_raw_chicken,
     "raw_mutton": tile_raw_mutton,
+    "cooked_porkchop": tile_cooked_porkchop,
+    "cooked_beef": tile_cooked_beef,
+    "cooked_chicken": tile_cooked_chicken,
+    "cooked_mutton": tile_cooked_mutton,
+    "furnace_front": tile_furnace_front,
+    "furnace_front_lit": tile_furnace_front_lit,
 }
 
 

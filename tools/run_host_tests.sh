@@ -1576,6 +1576,40 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 rm -rf "$BHBST"
 
+# world/furnace.c -- v1.8.15 "Furnace"'s smelting state machine and recipe table. Placed
+# directly after the blockstate stanza for the same reason inventory-persistence sits next to
+# blockstate-persistence above it: furnace.c stores its live state (input/fuel/cook-progress/
+# output) through blockstate.c's own opaque 16-byte payload via furnaceStatePack()/
+# furnaceStateUnpack() rather than a second side table, so a regression in one is the first
+# place to look for the other.
+#
+# The link mirrors the blockstate stanza's reasoning exactly: furnace.c needs blockstate.h for
+# BLOCKSTATE_PAYLOAD_BYTES and the FurnaceState pack/unpack shape, and blockstate.c itself pulls
+# in world/crc32.h, so crc32.c joins the link the same way it does above. No registry.c, no
+# block.c, no world.c -- furnace.c takes ItemId values as opaque integers (BLOCK_RAW_PORKCHOP
+# and friends are #defines from world/block.h, included for the constants only) and never asks
+# the registry what they mean, the same independence blockstate.c itself has from the id space
+# it stores positions for.
+#
+# FURNACE_TEST_EXPECTED_CHECKS is pinned at 159 inside the test, seeded the identical way
+# BLOCKSTATE_TEST_EXPECTED_CHECKS above was: a placeholder 129 was seeded first, and the first
+# real run reported "CHECK COUNT: 30 check(s) were ADDED - expected 129, ran 159" and exited 1.
+# Watch the count, not just the pass, for the identical reason the blockstate comment gives.
+BHFN="build-host/run-$$-furnace"
+mkdir -p "$BHFN"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/blockstate.c \
+	source/world/crc32.c \
+	source/world/furnace.c \
+	source/world/furnace_test.c \
+	-o "$BHFN/furnace_test"
+
+"./$BHFN/furnace_test"
+
+rm -rf "$BHFN"
+
 # --- v1.7.1 task 49, install half -------------------------------------------------------
 #
 # Added testChunkPlanAllMatchesLoadAll() to source/world/world_test.c. It links the real

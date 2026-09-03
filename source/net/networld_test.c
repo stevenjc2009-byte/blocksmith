@@ -2276,7 +2276,7 @@ static void test_registry_defs_converge(void)
 
     check(registryFind("wire_a") == REG_ID_DYN_LO && registryFind("wire_b") == REG_ID_DYN_LO + 1,
           "both defs landed under their consecutive ids");
-    check(registryCount() == 40, "count moved from 38 to 40 defined rows");
+    check(registryCount() == 45, "count moved from 43 to 45 defined rows");
     check(blockIsSolid(REG_ID_DYN_LO), "after sync the same id resolves to the real def");
     check(worldGet(&w, 5, 10, 7) == REG_ID_DYN_LO,
           "the stored raw byte needed no rewrite — tables agree around it");
@@ -2337,8 +2337,30 @@ static void test_registry_defs_converge(void)
      * from the binary — calls registryInitCore() and prints registryCrc16(): `count=38
      * crc=0x9610 rev=1`. A second probe built the same way against the vendored
      * deps/blocksmith-server/game/world/registry.c printed the identical `count=38 crc16=0x9610
-     * rev=1`, which is the client/server lockstep networld.c:322-328 rejects a join over. */
-    check(registryCrc16() != 0x9610u,
+     * rev=1`, which is the client/server lockstep networld.c:322-328 rejects a join over.
+     *
+     * 0x9610 -> 0xE486 on 2026-09-03 by v1.8.15 "Furnace"'s five rows (four cooked meats and the
+     * furnace, ids 38..42, lane FURNACE-C). Same shape of move as the meat move directly above:
+     * a record range appended, registryCount() moving 38 -> 43.
+     *
+     * READ THE FAILURE LIST BEFORE BELIEVING THIS ONE WAS FOUND THE EASY WAY. It was not. The
+     * full suite run that caught this file reported TWENTY failed checks and this check was NOT
+     * among them -- it passed, exactly as every paragraph above predicts a stale `!=` golden
+     * will. The twenty that went red were all registryCount() pins, which state a number and so
+     * fail loudly when the number moves. This one states an INEQUALITY against a number that
+     * stopped being any table's fingerprint, and an inequality against a meaningless constant is
+     * satisfied by everything. It was moved because the count pins beside it moved, not because
+     * anything complained -- which is the entire reason this comment keeps being extended
+     * instead of being trimmed down to the current value.
+     *
+     * MEASURED, not fitted, and not taken on the word of the lane that added the rows: a probe
+     * linking world/registry.c and world/crc32.c alone -- no test file in the binary, so no
+     * golden constant is even reachable from what was measured -- printed `count=43 crc=0xE486
+     * rev=1`. The same probe built against the vendored deps/blocksmith-server copy printed the
+     * identical numbers, and a third arm built from `git show HEAD:` (pre-sync) printed
+     * `count=38 crc=0x9610 rev=1`, reproducing the OLD golden and proving the probe can tell the
+     * two tables apart rather than printing whatever it was pointed at. */
+    check(registryCrc16() != 0xE486u,
           "the converged table no longer hashes like the core-only one");
 }
 
@@ -2356,7 +2378,7 @@ static void test_registry_defs_malformed_dropped_whole(void)
 
     /* Short by one record byte: length-exact posture, drop without parsing. */
     networldApplyPayload(batch, len - 1);
-    check(registryCount() == 38 && registryFind("bad_a") == 0,
+    check(registryCount() == 43 && registryFind("bad_a") == 0,
           "a truncated DEFS applies nothing");
 
     /* Claiming more records than the sender's own cap can carry. */
@@ -2364,14 +2386,14 @@ static void test_registry_defs_malformed_dropped_whole(void)
     memcpy(greedy, batch, sizeof greedy);
     greedy[2] = BS_APP_REGISTRY_DEFS_MAX_N + 1u;
     networldApplyPayload(greedy, sizeof greedy);
-    check(registryCount() == 38, "an over-cap count is refused outright");
+    check(registryCount() == 43, "an over-cap count is refused outright");
 
     /* first below the dyn range would overwrite compiled-in core rows. */
     uint8_t hostile[BS_APP_REGISTRY_DEFS_BYTES(2)];
     memcpy(hostile, batch, sizeof hostile);
     hostile[1] = BLOCK_STONE;
     networldApplyPayload(hostile, sizeof hostile);
-    check(registryCount() == 38 && strcmp(blockInfo(BLOCK_STONE)->name, "stone") == 0,
+    check(registryCount() == 43 && strcmp(blockInfo(BLOCK_STONE)->name, "stone") == 0,
           "a batch aimed at the core range changes nothing");
 
     /* A record whose embedded id disagrees with its slot position: all-or-nothing. */
@@ -2379,7 +2401,7 @@ static void test_registry_defs_malformed_dropped_whole(void)
     memcpy(shuffled, batch, sizeof shuffled);
     shuffled[4] = REG_ID_DYN_LO + 1u;   /* record 0 claims id 0x81 */
     networldApplyPayload(shuffled, sizeof shuffled);
-    check(registryCount() == 38 && registryFind("bad_a") == 0 && registryFind("bad_b") == 0,
+    check(registryCount() == 43 && registryFind("bad_a") == 0 && registryFind("bad_b") == 0,
           "one inconsistent record refuses the WHOLE batch, not just itself");
 }
 
@@ -2438,12 +2460,12 @@ static void buildRegistryInfoFor(uint8_t *out /* BS_APP_REGISTRY_INFO_BYTES */,
     registryInitCore();
 }
 
-/* The thirty-eight core rows as world/block.h's own constants spell them, written out here so
+/* The forty-three core rows as world/block.h's own constants spell them, written out here so
  * the core-only fingerprint below can be DERIVED rather than recorded. This is deliberately not
  * read out of world/registry.c's kCoreDefs (it is static there anyway): a reference built from
  * the table under test would move whenever that table moved, and a pasted hash literal — which
  * is what this replaced — would pin whatever the table happened to hash to on the day it was
- * recorded, wrong answer included. Two independent spellings of the same thirty-four rows can
+ * recorded, wrong answer included. Two independent spellings of the same forty-three rows can
  * disagree;
  * a number copied out of a run cannot.
  *
@@ -2628,6 +2650,51 @@ static const CoreRowSpec kCoreRowSpecs[] = {
     { 37, "raw_mutton", { BTEX_RAW_MUTTON, BTEX_RAW_MUTTON, BTEX_RAW_MUTTON,
                           BTEX_RAW_MUTTON, BTEX_RAW_MUTTON, BTEX_RAW_MUTTON },
       REG_FLAG_SOLID, 5, 0 },
+
+    /* v1.8.15 "Furnace"'s five, ids 38..42 (FURNACE-C lane): four cooked meats and the furnace
+     * itself. Transcribed the same way every row above was -- from world/block.h's BLOCK_* and
+     * BTEX_* constants and from world/registry.c's own ROW COMMENTS stating the intent, never
+     * from its .tex/.flags/.hardness fields, which are the thing this list exists to disagree
+     * with when they are wrong.
+     *
+     * The four cooked cuts carry their RAW counterpart's hardness UNCHANGED -- chicken 3 <
+     * porkchop 4 < mutton 5 < beef 6, the identical four-step ladder as ids 34..37 directly
+     * above. That is the stated intent, not a coincidence to be tidied away: cooking changes
+     * what the meat feeds you, not how big or how tough the block is. Four identical bytes here
+     * would be the failure mode registry_test.c's hardness ladder exists to catch, so the
+     * repetition of the raw numbers is deliberate and must survive anyone "simplifying" it.
+     * REG_FLAG_SOLID alone, luminance 0, for the raw meats' and the apple's reason: an item in
+     * this engine IS a placeable block, and claiming TRANSPARENT would push four more opaque
+     * cubes into the mesher's deferred pass for nothing.
+     *
+     * The furnace is the first row in this entire table whose six faces are NOT all the same
+     * tile. Five faces are BTEX_STONE and only FACE_SOUTH carries BTEX_FURNACE_FRONT --
+     * FACE_SOUTH being index 4 in world/block.h's face order (EAST, WEST, TOP, BOTTOM, SOUTH,
+     * NORTH), and being, per registry.c's own comment, an ARBITRARY BUT FIXED choice: nothing
+     * in this build carries a facing, so any one face is as correct as any other and south
+     * means nothing. Anyone reading a direction into it is reading something that is not there.
+     * Hardness 45, BLOCK_STONE's own number, because a furnace is worked stone.
+     *
+     * BTEX_FURNACE_FRONT_LIT (atlas slot 47) is deliberately absent from this row. The registry
+     * is one static row per BLOCK, not one per STATE, so it cannot swap a face when a furnace
+     * lights; the lit tile is painted ahead of the renderer that will select it. That is why
+     * BLOCK_FURNACE is one id owning TWO atlas slots and why the id-to-slot offset that held
+     * for every append before this one no longer exists. */
+    { 38, "cooked_porkchop", { BTEX_COOKED_PORKCHOP, BTEX_COOKED_PORKCHOP, BTEX_COOKED_PORKCHOP,
+                               BTEX_COOKED_PORKCHOP, BTEX_COOKED_PORKCHOP, BTEX_COOKED_PORKCHOP },
+      REG_FLAG_SOLID, 4, 0 },
+    { 39, "cooked_beef", { BTEX_COOKED_BEEF, BTEX_COOKED_BEEF, BTEX_COOKED_BEEF,
+                           BTEX_COOKED_BEEF, BTEX_COOKED_BEEF, BTEX_COOKED_BEEF },
+      REG_FLAG_SOLID, 6, 0 },
+    { 40, "cooked_chicken", { BTEX_COOKED_CHICKEN, BTEX_COOKED_CHICKEN, BTEX_COOKED_CHICKEN,
+                              BTEX_COOKED_CHICKEN, BTEX_COOKED_CHICKEN, BTEX_COOKED_CHICKEN },
+      REG_FLAG_SOLID, 3, 0 },
+    { 41, "cooked_mutton", { BTEX_COOKED_MUTTON, BTEX_COOKED_MUTTON, BTEX_COOKED_MUTTON,
+                             BTEX_COOKED_MUTTON, BTEX_COOKED_MUTTON, BTEX_COOKED_MUTTON },
+      REG_FLAG_SOLID, 5, 0 },
+    { 42, "furnace", { BTEX_STONE, BTEX_STONE, BTEX_STONE,
+                       BTEX_STONE, BTEX_FURNACE_FRONT, BTEX_STONE },
+      REG_FLAG_SOLID, 45, 0 },
 };
 
 /* CRC-16/CCITT-FALSE, spelled out here rather than reached for in world/registry.c, so that the
@@ -2757,7 +2824,7 @@ static void test_registry_fetch_retries_a_lost_reply(void)
     uint8_t partial[BS_APP_REGISTRY_DEFS_BYTES(2)];
     len = buildRegistryDefs(partial, REG_ID_DYN_LO, two, 2, false);   /* not the last */
     networldApplyPayload(partial, len);
-    check(registryCount() == 40, "the partial batch landed two rows");
+    check(registryCount() == 45, "the partial batch landed two rows");
     fake_sent_calls = 0;
     fakeNowAdvance(NETWORLD_REG_FETCH_RETRY_MS);
     networldUpdate();
@@ -2916,13 +2983,13 @@ static void test_registry_table_resets_between_sessions(void)
     uint8_t batch[BS_APP_REGISTRY_DEFS_BYTES(2)];
     size_t len = buildRegistryDefs(batch, REG_ID_DYN_LO, defs, 2, true);
     networldApplyPayload(batch, len);
-    check(registryCount() == 40 && registryFind("srv1_a") == REG_ID_DYN_LO,
+    check(registryCount() == 45 && registryFind("srv1_a") == REG_ID_DYN_LO,
           "the first server's two rows are in the table");
 
     /* netDisconnect() runs networldInit() (net/bsnet.c), which is the whole of leaving a
      * session as far as this module is concerned. */
     networldInit();
-    check(registryCount() == 38, "after leaving, only the thirty-eight core rows remain");
+    check(registryCount() == 43, "after leaving, only the forty-three core rows remain");
     check(registryFind("srv1_a") == 0 && registryFind("srv1_b") == 0,
           "the first server's names are gone, not merely hidden");
     check(registryCrc16() == coreOnlyCrc16(),
@@ -2948,7 +3015,7 @@ static void test_registry_table_resets_between_sessions(void)
     networldApplyPayload(batch2, len);
     check(registryFind("srv2_only") == REG_ID_DYN_LO,
           "the second server's row takes 0x80, which server one had been holding");
-    check(registryCount() == 39, "and it is the only dynamic row in the table");
+    check(registryCount() == 44, "and it is the only dynamic row in the table");
 }
 
 /* v1.6.0 F2, and the scenario the test directly above could not be: it calls networldInit()
@@ -2986,7 +3053,7 @@ static void test_registry_join_after_a_single_player_quit_to_title(void)
     check(registryRegister(&sp) == REG_ID_DYN_LO,
           "control: the single-player world's sidecar row is really in the table");
     registryFreeze();
-    check(registryFrozen() && registryCount() == 39,
+    check(registryFrozen() && registryCount() == 44,
           "control: and genStart() has frozen it, in single player exactly as in a session");
 
     /* Quit to title. This is the whole of it. */
@@ -3008,7 +3075,7 @@ static void test_registry_join_after_a_single_player_quit_to_title(void)
 
     check(registryFind("srv_blk") == REG_ID_DYN_LO,
           "the server's block is committed at 0x80 rather than refused by the stale freeze");
-    check(registryCount() == 39 && registryFind("sp_sidecar") == 0,
+    check(registryCount() == 44 && registryFind("sp_sidecar") == 0,
           "and it is the only dynamic row: the last world's is gone");
     /* The NAME is checked, not just "a defined solid row exists at 0x80". Against the stale
      * table the single-player world's own row was sitting in that slot, defined and solid, so
@@ -3052,7 +3119,7 @@ static void test_registry_terminator_alone_is_not_a_synced_table(void)
     const size_t tlen = buildRegistryDefs(term, REG_ID_DYN_LO, declared, 0, true);
     networldApplyPayload(term, tlen);
 
-    check(registryCount() == 38,
+    check(registryCount() == 43,
           "the terminator carried no records, so the table is still core-only");
     check(!networldRegistrySynced(),
           "and a table that cannot reproduce the server's crc16 is not a synced table");
@@ -3118,7 +3185,7 @@ static void test_registry_terminator_alone_is_not_a_synced_table(void)
     uint8_t batch[BS_APP_REGISTRY_DEFS_BYTES(2)];
     const size_t blen = buildRegistryDefs(batch, REG_ID_DYN_LO, declared, 2, true);
     networldApplyPayload(batch, blen);
-    check(registryCount() == 38, "the frozen table refused the batch, per registry.h's contract");
+    check(registryCount() == 43, "the frozen table refused the batch, per registry.h's contract");
     check(!networldRegistrySynced(),
           "and a refused batch's LAST flag does not turn the indicator healthy");
 
@@ -3137,7 +3204,7 @@ static void test_registry_terminator_alone_is_not_a_synced_table(void)
     networldApplyPayload(wi, sizeof wi);
 
     networldApplyPayload(batch, blen);
-    check(registryCount() == 40, "the unsolicited batch's rows did land in the table");
+    check(registryCount() == 45, "the unsolicited batch's rows did land in the table");
     check(!networldRegistrySynced(),
           "but with no INFO there is no fingerprint, so nothing is verified");
 
@@ -3161,7 +3228,7 @@ static void test_registry_sync_is_proved_by_the_fingerprint(void)
     uint8_t all[BS_APP_REGISTRY_DEFS_BYTES(3)];
     size_t alen = buildRegistryDefs(all, REG_ID_DYN_LO, declared, 3, true);
     networldApplyPayload(all, alen);
-    check(registryCount() == 41, "all three declared rows landed");
+    check(registryCount() == 46, "all three declared rows landed");
     check(networldRegistrySynced(), "and the table reproduces the server's whole fingerprint");
     check(!networldRegistryWaiting(), "which releases world entry immediately");
 
@@ -3171,7 +3238,7 @@ static void test_registry_sync_is_proved_by_the_fingerprint(void)
     uint8_t two[BS_APP_REGISTRY_DEFS_BYTES(2)];
     const size_t twolen = buildRegistryDefs(two, REG_ID_DYN_LO, declared, 2, true);
     networldApplyPayload(two, twolen);
-    check(registryCount() == 40, "two of the three rows landed");
+    check(registryCount() == 45, "two of the three rows landed");
     check(!networldRegistrySynced(),
           "a short delivery is not a synced table however the LAST flag is set");
     fake_sent_calls = 0;
@@ -3187,7 +3254,7 @@ static void test_registry_sync_is_proved_by_the_fingerprint(void)
     uint8_t wrong[BS_APP_REGISTRY_DEFS_BYTES(3)];
     const size_t wlen = buildRegistryDefs(wrong, REG_ID_DYN_LO, impostor, 3, true);
     networldApplyPayload(wrong, wlen);
-    check(registryCount() == 41, "three rows landed, so rev and count both agree");
+    check(registryCount() == 46, "three rows landed, so rev and count both agree");
     check(registryFind("fp_X") == REG_ID_DYN_LO + 2u, "with the third row under its own name");
     check(!networldRegistrySynced(),
           "but the crc16 disagrees, so this is not the server's table and not synced");
@@ -3219,7 +3286,7 @@ static void test_registry_sync_is_proved_by_the_fingerprint(void)
 
     alen = buildRegistryDefs(all, REG_ID_DYN_LO, declared, 3, true);
     networldApplyPayload(all, alen);
-    check(registryCount() == 41, "control: the rows landed exactly as in the passing case");
+    check(registryCount() == 46, "control: the rows landed exactly as in the passing case");
     check(!networldRegistrySynced(), "but a foreign table revision is never verifiable");
 }
 
@@ -3318,7 +3385,7 @@ static void test_registry_mismatch_refuses_instead_of_degrading(void)
     const size_t wlen = buildRegistryDefs(wrong, REG_ID_DYN_LO, impostor, 3, true);
     networldApplyPayload(wrong, wlen);
 
-    check(registryCount() == 41,
+    check(registryCount() == 46,
           "control: three rows landed, so the server's count is reproduced exactly");
     check(!networldRegistrySynced(),
           "control: and only the crc16 disagrees — this is the same-count, wrong-content case");

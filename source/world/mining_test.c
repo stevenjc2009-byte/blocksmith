@@ -114,6 +114,20 @@ static void testCoreHardness(void)
 	CHECK(blockHardnessTicks(BLOCK_RAW_MUTTON)   ==   5, "raw mutton is 5 ticks (0.25 s)");
 	CHECK(blockHardnessTicks(BLOCK_RAW_BEEF)     ==   6, "raw beef is 6 ticks (0.30 s)");
 
+	// v1.8.15 "Furnace". Five more core rows — the four cooked meats (ids 38..41) and the
+	// furnace itself (id 42) — each with its own break time, named one per line as every block
+	// above. Each cooked meat keeps its raw counterpart's exact tick count rather than a
+	// re-derived one (world/registry.c's own row comment says why: cooking changes what an
+	// item does when eaten, not how hard the placed block is to break), so this is the same
+	// four-step ladder as the raw meats just above it, not a new one. The furnace is not a
+	// ladder member — one block, one number — and that number is deliberately stone's, because
+	// the furnace is a stone block with a single re-painted face.
+	CHECK(blockHardnessTicks(BLOCK_COOKED_CHICKEN)  ==   3, "cooked chicken is 3 ticks (0.15 s), same as raw");
+	CHECK(blockHardnessTicks(BLOCK_COOKED_PORKCHOP) ==   4, "cooked porkchop is 4 ticks (0.20 s), same as raw");
+	CHECK(blockHardnessTicks(BLOCK_COOKED_MUTTON)   ==   5, "cooked mutton is 5 ticks (0.25 s), same as raw");
+	CHECK(blockHardnessTicks(BLOCK_COOKED_BEEF)     ==   6, "cooked beef is 6 ticks (0.30 s), same as raw");
+	CHECK(blockHardnessTicks(BLOCK_FURNACE)         ==  45, "furnace is 45 ticks (2.25 s), same as stone");
+
 	// DISTINCTNESS, and this is the check the roadmap actually asked for: "every single new
 	// block breakable with its own durability". The three lines above could all read 9 and
 	// each `==` would still be a true statement about a table where the cactus had simply
@@ -158,7 +172,12 @@ static void testCoreHardness(void)
 	// (the raw meats, ids 34..37). All four are FULL_CUBE and SOLID like the ores and the
 	// apple, so all four are targetable and all four enter this loop; none is a liquid, so
 	// none is exempt. Same count from the other side in registry_test.c.
-	CHECK(targetable_rows == 36, "and there are 36: 38 core rows less air and less water");
+	//
+	// 36 -> 41 on 2026-09-03, v1.8.15 "Furnace": five more targetable, non-liquid core rows
+	// (the four cooked meats, ids 38..41, and the furnace, id 42). All five are FULL_CUBE and
+	// SOLID, so all five enter this loop; none is a liquid, so none is exempt. Same count from
+	// the other side in registry_test.c's coreHardnessIsDeclared().
+	CHECK(targetable_rows == 41, "and there are 41: 43 core rows less air and less water");
 
 	// The view is derived from the def, so the two must agree. This is what goes red if
 	// refreshView() copies the wrong field, or copies it from the wrong row.

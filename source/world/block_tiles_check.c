@@ -82,7 +82,13 @@
 	X(BTEX_RAW_PORKCHOP,    TILE_RAW_PORKCHOP)    \
 	X(BTEX_RAW_BEEF,        TILE_RAW_BEEF)        \
 	X(BTEX_RAW_CHICKEN,     TILE_RAW_CHICKEN)     \
-	X(BTEX_RAW_MUTTON,      TILE_RAW_MUTTON)
+	X(BTEX_RAW_MUTTON,      TILE_RAW_MUTTON)      \
+	X(BTEX_COOKED_PORKCHOP, TILE_COOKED_PORKCHOP) \
+	X(BTEX_COOKED_BEEF,     TILE_COOKED_BEEF)     \
+	X(BTEX_COOKED_CHICKEN,  TILE_COOKED_CHICKEN)  \
+	X(BTEX_COOKED_MUTTON,   TILE_COOKED_MUTTON)   \
+	X(BTEX_FURNACE_FRONT,     TILE_FURNACE_FRONT)     \
+	X(BTEX_FURNACE_FRONT_LIT, TILE_FURNACE_FRONT_LIT)
 
 // One _Static_assert per pair, exactly as before. The names are stringified into the message
 // because every one of these expands from the same source line, so the message is the only

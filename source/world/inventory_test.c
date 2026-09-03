@@ -122,7 +122,34 @@ static char s_first[160];
 // side. Two other lines in that same test moved VALUE without adding a call, exactly as the
 // entries above describe: `accepted == 32` -> 36, and the boundary pair's left-hand block
 // moved from BLOCK_DIAMOND_ORE to BLOCK_RAW_MUTTON.
-#define INVENTORY_TEST_EXPECTED_CHECKS 246
+// 246 -> 251 on 2026-09-03, v1.8.15 "Furnace"'s five rows: four cooked meats (38..41) and the
+// furnace itself (42). Same ordinary shape as the entry above — five registry rows appended,
+// the whole delta landing in testTheBagTakesEveryDefinedBlock()'s per-row loop as one
+// CHECK(inventoryCanHold(id)) each. 246 + 5 = 251.
+//
+// Worth recording HOW this one was found, because it is the case this pin exists for and it
+// still nearly slipped. This file is untouched by the furnace work — `git diff` against HEAD
+// reports it clean — yet it went red, because the loop below reads the REGISTRY rather than a
+// list written here. Its input changed while its text did not. The lane that added the rows
+// updated the identical `36 -> 41` pin in mining_test.c and reported this failure as
+// pre-existing on the strength of that clean `git diff`. It was not: a clean file with a
+// changed input is exactly the thing a count pin is for, and "I didn't touch that file" is
+// not evidence about a test that deliberately doesn't hard-code what it covers.
+//
+// 251 -> 260 on 2026-09-03, and this one is a DIFFERENT shape from every move above it, which
+// is why it gets its own entry instead of being folded into the one before. Nothing was added
+// to the block registry this time; RECIPE_COUNT went 5 -> 6, for v1.8.15's
+// RECIPE_STONE_TO_FURNACE (8 stone -> 1 furnace). The two loops in this file that walk
+// CRAFT_RECIPES contribute 9 checks between them per recipe, so 251 + 9 = 260.
+//
+// That recipe is not a balance tweak and the count move is not incidental. Without it
+// BLOCK_FURNACE was UNOBTAINABLE: blocks enter the bag by exactly three routes (an entity
+// drop, a block the player broke, or the crafting/withdraw path), worldgen places no furnace
+// and no entity drops one, so crafting was the only remaining route and it did not carry one.
+// v1.8.15 would have shipped its own headline block registered, textured, ticked, saved and
+// covered by a 159-check suite, and unreachable by any player -- every part green, the payoff
+// absent. See world/crafting.c's own comment on the row for the full reasoning.
+#define INVENTORY_TEST_EXPECTED_CHECKS 260
 
 // Deliberately NOT routed through CHECK(): this must not perturb the number it is testing,
 // so it bumps s_fails only. It fills s_first (with both numbers, so the one-line summary is
@@ -277,7 +304,7 @@ static void testTheBagTakesEveryDefinedBlock(void)
 	// The loop ran, over the whole table rather than a prefix of it. Without this a
 	// definedness query answering false for everything leaves the rule green having asserted
 	// nothing at all.
-	CHECK(accepted == 36);            // 38 core rows less air and less water
+	CHECK(accepted == 41);            // 43 core rows less air and less water
 	CHECK(accepted > BLOCK_COUNT);    // and genuinely more than the old ceiling admitted
 
 	// THE BOUNDARY, both sides, derived rather than hard-coded: the last id with a row is
@@ -304,9 +331,16 @@ static void testTheBagTakesEveryDefinedBlock(void)
 	// versions — the left-hand block is hard-coded, it goes stale every time a core row is
 	// appended, and it goes stale SILENTLY until a suite run says so. Kept as a name anyway,
 	// for the reason the next paragraph gives.
-	CHECK(inventoryCanHold((ItemId)BLOCK_RAW_MUTTON));           // 37, the last defined row
-	CHECK(!inventoryCanHold((ItemId)(BLOCK_RAW_MUTTON + 1)));    // 38, no row
-	CHECK(!registryIsDefined((BlockId)(BLOCK_RAW_MUTTON + 1)));  // ...and that is why
+	//
+	// v1.8.15: a fourth time, to BLOCK_FURNACE = 42, past the four cooked meats (38..41). The
+	// prediction three versions ago that this would keep happening has now been right four
+	// times running, so it is no longer a prediction — it is the maintenance cost of the
+	// named-block message, knowingly paid. What did NOT go stale silently this time is the
+	// count on the loop above: it went red the moment the rows landed, which is the whole
+	// argument for having both a loop and a pin rather than either alone.
+	CHECK(inventoryCanHold((ItemId)BLOCK_FURNACE));           // 42, the last defined row
+	CHECK(!inventoryCanHold((ItemId)(BLOCK_FURNACE + 1)));    // 43, no row
+	CHECK(!registryIsDefined((BlockId)(BLOCK_FURNACE + 1)));  // ...and that is why
 
 	// The two exclusions that survive the widening, each for its own reason. Neither of them
 	// is about where the id sits.
