@@ -2967,6 +2967,44 @@ static UiState s_ui;
 static bool s_furnace_open;
 static int  s_furnace_x, s_furnace_y, s_furnace_z;
 
+// v1.8.17. What a broken furnace hands back. Registered with scene/interact.c once at startup
+// and called by it from breakComplete, at the one moment the block has been decided broken but
+// its blockstate record still exists — the removal is twenty lines further down in this file's
+// edit handler, and reading after that would read nothing.
+//
+// It lives here rather than in interact.c because s_blockstate is this file's static and
+// interact.c has no world state of its own. The alternative was to hand interact.c a
+// BlockStateTable*, and that was rejected for a build reason rather than a design one: it
+// would pull blockstate.c, furnace.c and crc32.c into three separate shared gcc stanzas in
+// tools/run_host_tests.sh, and the callback needs no new link dependency at all.
+//
+// Returns the number of stacks written, never more than INTERACT_BROKE_EXTRA_MAX. The three
+// slots are exactly the three a furnace has, so the bound is the furnace's own shape and not
+// an arbitrary cap — if a future stateful block has more, that constant moves with it.
+//
+// The blockStateGet call is guarded on BLOCK_FURNACE by its expect_block_id argument as well
+// as by the test above it. That is not redundant: a cell can hold a record whose block_id
+// disagrees with what was just broken, and the id check is what stops a furnace's payload
+// being unpacked out of some other block's bytes.
+static int mainFurnaceBrokeContents(BlockId id, int x, int y, int z,
+                                    BlockId items_out[INTERACT_BROKE_EXTRA_MAX],
+                                    uint8_t counts_out[INTERACT_BROKE_EXTRA_MAX])
+{
+	if (id != BLOCK_FURNACE) return 0;
+
+	uint8_t payload[BLOCKSTATE_PAYLOAD_BYTES];
+	if (!blockStateGet(&s_blockstate, x, y, z, BLOCK_FURNACE, payload)) return 0;
+
+	FurnaceState fs;
+	furnaceStateUnpack(&fs, payload);
+
+	int n = 0;
+	if (fs.input_count  > 0) { items_out[n] = fs.input_item;  counts_out[n] = fs.input_count;  n++; }
+	if (fs.fuel_count   > 0) { items_out[n] = fs.fuel_item;   counts_out[n] = fs.fuel_count;   n++; }
+	if (fs.output_count > 0) { items_out[n] = fs.output_item; counts_out[n] = fs.output_count; n++; }
+	return n;
+}
+
 // Step 8.2. The bottom screen's whole content: hotbar, inventory grid, crafting panel, and
 // the engine numbers step 8.3's screen carried.
 //
@@ -4935,6 +4973,12 @@ session_start:
 	// treats a NULL queue as "relight inline", which is only what the host tests want.
 	interactSetRelightQueue(&s_relightq);
 
+	// v1.8.17. Without this line the whole broke-contents mechanism in scene/interact.c is
+	// dead code: it defaults to no reader, reports nothing, and every furnace's contents are
+	// destroyed exactly as they were before. Registered here, beside the relight queue, for
+	// the same reason — both are this file's state being lent to interact.c for the duration.
+	interactSetBrokeContentsFn(mainFurnaceBrokeContents);
+
 	// v1.9.0 audio. The footstep cadence, beside `it` because it has the same lifetime: one
 	// visit to one world. A break and a place each have an instant to hang a sound on inside
 	// scene/interact.c and are wired there; walking has none, so this accumulates horizontal
@@ -6126,8 +6170,23 @@ session_start:
 		// a "does this block have state" test here would be a second, separate opinion about
 		// which blocks are stateful, and the day it disagreed with the table the symptom would
 		// be a slot that never frees.
-		if (it.broke_valid)
+		//
+		// v1.8.17. Before the record goes, its contents come out. interactEdit filled
+		// broke_extra_* by calling mainFurnaceBrokeContents above while the record still
+		// existed; this is only the payout, and it must stay ahead of the blockStateRemove
+		// below in this same block. A furnace broken with ore in it used to destroy the ore
+		// silently, which is the one outcome a player cannot undo.
+		//
+		// Each stack goes through invBridgeAdd exactly as the block's own drop does twenty
+		// lines up, so a full inventory refuses it and reports the refusal rather than eating
+		// it — the contents are then lost, but they were already lost before this existed, and
+		// the block is gone from the world by the time we are told, so there is nothing here
+		// that could put it back.
+		if (it.broke_valid) {
+			for (int i = 0; i < it.broke_extra_count; i++)
+				invBridgeAdd(&s_inv, it.broke_extra_item[i], it.broke_extra_qty[i], NULL);
 			blockStateRemove(&s_blockstate, it.broke_x, it.broke_y, it.broke_z);
+		}
 
 		// Charged only for a placement the world actually accepted. it.placed_id stays
 		// BLOCK_AIR on every refusal path in interactEdit — no target, no entry face, cell

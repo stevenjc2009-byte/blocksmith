@@ -151,6 +151,10 @@ static void freshAimedAt(Interact* it, BlockId target_block)
 	s_send_ok      = true;
 	s_session_live = false;
 	interactSetRelightQueue(NULL);
+	// v1.8.16 F1: back to "no reader registered" for every case, so the cases below that DO
+	// register brokeContentsSpy cannot leak into the twenty-odd written before this fix
+	// existed — same reasoning as the relight-queue reset immediately above.
+	interactSetBrokeContentsFn(NULL);
 
 	if (target_block != BLOCK_AIR)
 		worldSet(&s_world, TX, TY, TZ, target_block);
@@ -1896,6 +1900,228 @@ static void testEveryNonFoodCoreBlockStillPlaces(void)
 	CHECK(food_refused == 9);
 }
 
+// ── v1.8.16 F1: a broken furnace must not silently destroy its contents ────────────────
+//
+// THE defect: main.c's break-cleanup calls blockStateRemove() on a broken furnace's
+// FurnaceState record WITHOUT ever reading it first, so whatever sat in the input, fuel and
+// output slots (ore mid-smelt, unburned fuel, a finished ingot) was thrown away with no drop
+// and no message. interact.h's InteractBrokeContentsFn is the fix: breakComplete() now
+// calls a registered reader BEFORE that removal happens and reports the result through
+// broke_extra_item/qty, exactly the way it already reports the single-item broke_id.
+//
+// This is a SPY, not a stand-in for something the host cannot link — world/blockstate.c and
+// world/furnace.c both build cleanly on the host (see tools/run_host_tests.sh's own
+// blockstate/furnace stanzas). It exists so this file can prove breakComplete() calls the
+// registered reader, with the right arguments, and threads the result into Interact's public
+// fields correctly — without dragging blockstate.c/furnace.c into THIS binary's link, which
+// is the whole point of the callback shape (see interact.h).
+static int     s_spy_calls;
+static BlockId s_spy_last_id;
+static int     s_spy_last_x, s_spy_last_y, s_spy_last_z;
+static int     s_spy_return;      // how many entries to hand back; < 0 exercises the clamp
+
+// Fixed content, standing in for a real furnace's input/fuel/output: a real recipe pair
+// (world/furnace.c's FURNACE_RECIPE_PORK) plus a real fuel item, so nothing here is inventing
+// an item combination the game could not actually produce.
+static const BlockId kSpyItems[INTERACT_BROKE_EXTRA_MAX] =
+	{ BLOCK_RAW_PORKCHOP, BLOCK_PLANKS, BLOCK_COOKED_PORKCHOP };
+static const uint8_t kSpyQtys[INTERACT_BROKE_EXTRA_MAX] = { 3, 7, 1 };
+
+// v1.8.16 F1, sub-case: index 1 (the fuel slot) reports qty 0 -- an empty slot, which a real
+// FurnaceState can legitimately have (no fuel loaded) and which breakComplete() must skip
+// rather than hand main.c an invBridgeAdd of nothing.
+static bool s_spy_zero_middle;
+
+static int brokeContentsSpy(BlockId id, int x, int y, int z,
+                             BlockId items_out[INTERACT_BROKE_EXTRA_MAX],
+                             uint8_t counts_out[INTERACT_BROKE_EXTRA_MAX])
+{
+	s_spy_calls++;
+	s_spy_last_id = id;
+	s_spy_last_x  = x;
+	s_spy_last_y  = y;
+	s_spy_last_z  = z;
+
+	// Only the furnace carries state today -- a real reader (main.c's) gates the same way,
+	// via blockStateGet's own expect_block_id check, so this mirrors that rather than
+	// inventing a different rule.
+	if (id != BLOCK_FURNACE)
+		return 0;
+
+	if (s_spy_return < 0)
+		return s_spy_return;   // deliberately out of range; never touches items_out/counts_out
+
+	// Never write past the real buffer even when told to CLAIM more than that -- s_spy_return
+	// itself is returned unclamped below, which is what lets testBrokenFurnaceClampsAnOverclaimingReader
+	// prove breakComplete() is the one doing the clamping, not this spy.
+	int write_n = s_spy_return;
+	if (write_n > INTERACT_BROKE_EXTRA_MAX) write_n = INTERACT_BROKE_EXTRA_MAX;
+
+	for (int i = 0; i < write_n; i++) {
+		items_out[i]  = kSpyItems[i];
+		counts_out[i] = (s_spy_zero_middle && i == 1) ? 0 : kSpyQtys[i];
+	}
+	return s_spy_return;
+}
+
+static void resetSpy(void)
+{
+	s_spy_calls       = 0;
+	s_spy_last_id     = BLOCK_AIR;
+	s_spy_last_x = s_spy_last_y = s_spy_last_z = -1;
+	s_spy_return       = INTERACT_BROKE_EXTRA_MAX;
+	s_spy_zero_middle  = false;
+}
+
+// THE case this section exists for. Every CHECK from broke_extra_count onward is red against
+// the pre-fix code, which has no such field at all (see this file's md5-restore note in the
+// section this test was verified against).
+static void testBreakingAFurnaceReportsItsContents(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_FURNACE);
+	resetSpy();
+	interactSetBrokeContentsFn(brokeContentsSpy);
+
+	const Body body = farAwayBody();
+	CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) > 0);
+
+	// The reader was called exactly once, for the right block at the right position -- proof
+	// breakComplete() is asking about the cell that actually broke, not a stale one.
+	CHECK(s_spy_calls == 1);
+	CHECK(s_spy_last_id == BLOCK_FURNACE);
+	CHECK(s_spy_last_x == TX && s_spy_last_y == TY && s_spy_last_z == TZ);
+
+	// The furnace itself still drops, exactly as before this fix -- this is an ADDITION to
+	// the existing broke_id contract, not a replacement of it.
+	CHECK(it.broke_id == BLOCK_FURNACE);
+
+	// And now its CONTENTS are reported too -- the whole point.
+	CHECK(it.broke_extra_count == 3);
+	CHECK(it.broke_extra_item[0] == BLOCK_RAW_PORKCHOP  && it.broke_extra_qty[0] == 3);
+	CHECK(it.broke_extra_item[1] == BLOCK_PLANKS        && it.broke_extra_qty[1] == 7);
+	CHECK(it.broke_extra_item[2] == BLOCK_COOKED_PORKCHOP && it.broke_extra_qty[2] == 1);
+
+	interactSetBrokeContentsFn(NULL);
+}
+
+// An ordinary block must not gain phantom drops just because a reader happens to be
+// registered -- the reader is asked about EVERY break (breakComplete does not pre-filter by
+// id), so this is what proves the spy's own furnace-only gate is what the real main.c reader
+// mirrors, not a coincidence of this test never breaking anything else.
+static void testBreakingAnOrdinaryBlockReportsNoExtraContents(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_STONE);
+	resetSpy();
+	interactSetBrokeContentsFn(brokeContentsSpy);
+
+	const Body body = farAwayBody();
+	CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) > 0);
+
+	CHECK(s_spy_calls == 1);
+	CHECK(s_spy_last_id == BLOCK_STONE);   // asked about, and correctly says no
+	CHECK(it.broke_extra_count == 0);
+	CHECK(it.broke_id == BLOCK_STONE);     // the ordinary drop is unaffected
+
+	interactSetBrokeContentsFn(NULL);
+}
+
+// The default, unwired state -- what every case before this section already got, and what
+// the real console gets until main.c registers a reader (see interact.h's setter comment).
+// A furnace still breaks and still drops ITSELF; only its contents go unreported, which is
+// the honest degrade rather than a crash or a refusal.
+static void testNoReaderRegisteredMeansNoExtraContentsForAFurnace(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_FURNACE);
+	interactSetBrokeContentsFn(NULL);   // explicit, though freshAimedAt already did this
+
+	const Body body = farAwayBody();
+	CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) > 0);
+
+	CHECK(it.broke_id == BLOCK_FURNACE);
+	CHECK(it.broke_extra_count == 0);
+}
+
+// A reader that skips an empty slot (a furnace with no fuel loaded, say) must not leave a
+// hole in the array -- the two real entries land at indices 0 and 1, not 0 and 2.
+static void testAnEmptySlotIsSkippedNotLeftAsAHole(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_FURNACE);
+	resetSpy();
+	s_spy_zero_middle = true;
+	interactSetBrokeContentsFn(brokeContentsSpy);
+
+	const Body body = farAwayBody();
+	CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) > 0);
+
+	CHECK(it.broke_extra_count == 2);
+	CHECK(it.broke_extra_item[0] == BLOCK_RAW_PORKCHOP    && it.broke_extra_qty[0] == 3);
+	CHECK(it.broke_extra_item[1] == BLOCK_COOKED_PORKCHOP && it.broke_extra_qty[1] == 1);
+
+	interactSetBrokeContentsFn(NULL);
+}
+
+// A reader that claims MORE than INTERACT_BROKE_EXTRA_MAX entries exist must be clamped, not
+// trusted -- trusting it would read past the 3-entry items[]/qtys[] stack buffers this file's
+// spy is careful never to write past, and past Interact's own 3-entry broke_extra_item/qty
+// arrays, which is the buffer that actually matters in production.
+static void testBrokenFurnaceClampsAnOverclaimingReader(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_FURNACE);
+	resetSpy();
+	s_spy_return = 5;   // more than INTERACT_BROKE_EXTRA_MAX; the spy still only WRITES 3
+	interactSetBrokeContentsFn(brokeContentsSpy);
+
+	const Body body = farAwayBody();
+	CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) > 0);
+
+	CHECK(it.broke_extra_count == INTERACT_BROKE_EXTRA_MAX);   // clamped, not 5
+
+	interactSetBrokeContentsFn(NULL);
+}
+
+// And a reader that claims a NEGATIVE count (a caller bug, not a real answer) must be treated
+// as zero rather than underflowing a loop bound.
+static void testBrokenFurnaceClampsANegativeReader(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_FURNACE);
+	resetSpy();
+	s_spy_return = -1;
+	interactSetBrokeContentsFn(brokeContentsSpy);
+
+	const Body body = farAwayBody();
+	CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) > 0);
+
+	CHECK(it.broke_extra_count == 0);
+
+	interactSetBrokeContentsFn(NULL);
+}
+
+// The clear-every-call contract, the same one broke_id/broke_valid already have: a furnace's
+// reported contents from one break must not survive into a later call that broke nothing.
+static void testBrokeExtraCountClearsOnTheNextCall(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_FURNACE);
+	resetSpy();
+	interactSetBrokeContentsFn(brokeContentsSpy);
+
+	const Body body = farAwayBody();
+	CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) > 0);
+	CHECK(it.broke_extra_count == 3);
+
+	// One more frame, nothing left to break (the cell is air now).
+	holdBreakFrame(&it, &body, 1);
+	CHECK(it.broke_extra_count == 0);
+
+	interactSetBrokeContentsFn(NULL);
+}
+
 int main(void)
 {
 	// v1.8.6: see the section comment above testABreakRelightsTheColumnItLeftBehind for why
@@ -1965,6 +2191,15 @@ int main(void)
 	testEveryFoodItemIsRefusedByThePlacePath();
 	testFoodStillBreaksAndStillReachesTheBag();
 	testEveryNonFoodCoreBlockStillPlaces();
+
+	// v1.8.16 F1 — a broken furnace must not silently destroy its contents.
+	testBreakingAFurnaceReportsItsContents();
+	testBreakingAnOrdinaryBlockReportsNoExtraContents();
+	testNoReaderRegisteredMeansNoExtraContentsForAFurnace();
+	testAnEmptySlotIsSkippedNotLeftAsAHole();
+	testBrokenFurnaceClampsAnOverclaimingReader();
+	testBrokenFurnaceClampsANegativeReader();
+	testBrokeExtraCountClearsOnTheNextCall();
 
 	if (s_fails == 0)
 		printf("interact self-test: PASS  %d checks\n", s_checks);

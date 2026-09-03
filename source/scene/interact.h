@@ -46,6 +46,46 @@ typedef uint32_t u32;
 // still reads as sitting on one particular block rather than somewhere over there.
 #define INTERACT_REACH  5.0f
 
+// How many (item, count) pairs a broken stateful block can report back through
+// broke_extra_item/qty below. 3 because a furnace — the only stateful block that exists
+// today — never carries more than input + fuel + output at once. Raise this if a future
+// stateful block (a chest) ever needs more slots than that.
+#define INTERACT_BROKE_EXTRA_MAX 3
+
+// v1.8.16 F1. Reads back what a just-broken STATEFUL block (`id`, the block that broke, at
+// `x,y,z`) was carrying, filling up to INTERACT_BROKE_EXTRA_MAX (item, count) pairs into
+// `items_out`/`counts_out` and returning how many were filled (0..INTERACT_BROKE_EXTRA_MAX).
+// Called by breakComplete() on the success path, BEFORE the caller's own side-table cleanup
+// (main.c's blockStateRemove(), driven off broke_valid/broke_x/y/z below) discards the
+// record — so this is the one chance anything has to read it.
+//
+// A CALLBACK rather than a concrete BlockStateTable* (contrast interactSetRelightQueue just
+// below, which takes a real RelightQueue* because world/relightq.c is already in every
+// consumer's link line — tools/run_host_tests.sh's interact stanzas prove it). The table
+// this needs lives in world/blockstate.c and the struct it unpacks lives in
+// world/furnace.c, and neither is linked into scene/interact.c today; a concrete-pointer
+// parameter would force both (and world/crc32.c, which blockstate.c needs) into every one of
+// this file's host-test stanzas just to satisfy a type this module otherwise never touches.
+// The callback keeps interact.c's link surface exactly what it was — a test can register a
+// spy that never touches blockstate.c or furnace.c at all (see scene/interact_test.c) — and
+// the real body (blockStateGet() + furnaceStateUnpack()) belongs in main.c, which already
+// links both and already contains that exact unpack shape for the furnace panel.
+//
+// A reader that hands back qty 0 for a slot, or a count outside 0..INTERACT_BROKE_EXTRA_MAX,
+// is a caller bug: breakComplete() drops a zero-qty entry and clamps an out-of-range count to
+// 0 rather than trust either, so a misbehaving reader cannot corrupt Interact's own fields.
+typedef int (*InteractBrokeContentsFn)(BlockId id, int x, int y, int z,
+                                        BlockId items_out[INTERACT_BROKE_EXTRA_MAX],
+                                        uint8_t counts_out[INTERACT_BROKE_EXTRA_MAX]);
+
+// Registers the reader above. NULL (the default, same posture as interactSetRelightQueue's
+// NULL) means a broken stateful block's contents are never recovered — the pre-v1.8.16
+// behaviour — which is what every host-test case gets unless it opts in, and what the
+// console gets until main.c is given the one new call this fix needs (see furnace.c's
+// v1.8.16 notes for the exact wiring: a reader function implemented in main.c, registered
+// once at startup next to the existing interactSetRelightQueue() call).
+void interactSetBrokeContentsFn(InteractBrokeContentsFn fn);
+
 typedef struct {
 	RayHit  target;      // what the camera is looking at, recomputed every frame
 	BlockId holding;      // what a place would put down
@@ -101,6 +141,23 @@ typedef struct {
 	// which are the same question today only by accident.
 	bool    placed_valid;
 	int     placed_x, placed_y, placed_z;
+
+	// ── v1.8.16 F1: a broken stateful block's own contents ──────────────────────────────
+	//
+	// FIX for the defect where breaking a furnace mid-smelt silently destroyed whatever sat
+	// in its input, fuel and output slots: main.c's break-cleanup already called
+	// blockStateRemove() on broke_x/y/z (the P3 leak-prevention defence
+	// docs/plan-1.8.15-furnace.md's own risk table asked for) WITHOUT ever reading the
+	// record first, so main.c never had a chance to bank what was inside it.
+	//
+	// Filled by breakComplete(), on the same success path and same schedule as broke_id/
+	// broke_valid above, by calling whatever reader interactSetBrokeContentsFn() was given —
+	// see that setter for why this is a callback and not a concrete BlockStateTable*. 0
+	// entries is the ordinary case: every block that carries no side-table state (which is
+	// everything except the furnace today) and any break for which no reader is registered.
+	int     broke_extra_count;
+	BlockId broke_extra_item[INTERACT_BROKE_EXTRA_MAX];
+	uint8_t broke_extra_qty[INTERACT_BROKE_EXTRA_MAX];
 
 	// ── v1.8.1 task 50: a break takes time ──────────────────────────────────────────────
 	//

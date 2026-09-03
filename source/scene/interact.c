@@ -42,6 +42,17 @@ void interactSetRelightQueue(RelightQueue* q)
 	s_relightq = q;
 }
 
+// ── v1.8.16 F1: a broken stateful block's contents ──────────────────────────────────────
+//
+// NULL until a caller opts in (main.c, or a host test's spy) — see interact.h for why this
+// is a callback and not a concrete BlockStateTable*, and why NULL is the honest default.
+static InteractBrokeContentsFn s_broke_contents_fn;
+
+void interactSetBrokeContentsFn(InteractBrokeContentsFn fn)
+{
+	s_broke_contents_fn = fn;
+}
+
 // The edited column's relight, queued where there is a queue and run on the spot where there
 // is not. This is source/main.c's onRemoteEdit shape verbatim (main.c:2957) — a remote edit
 // and a local one produce exactly the same work, and until v1.8.7 only the remote one queued
@@ -300,6 +311,29 @@ static int breakComplete(Interact* it, World* w, int x, int y, int z, BlockId br
 		it->broke_x = x;
 		it->broke_y = y;
 		it->broke_z = z;
+
+		// v1.8.16 F1. THE fix: read the broken block's own contents back HERE, while the
+		// side-table record the caller is about to blockStateRemove() still exists — this is
+		// the only point in the whole break path where anything still can. See interact.h's
+		// InteractBrokeContentsFn for why this is a callback (no reader registered is the
+		// ordinary case for every block that is not the furnace, and for every host-test case
+		// that has not opted in).
+		if (s_broke_contents_fn != NULL) {
+			BlockId items[INTERACT_BROKE_EXTRA_MAX];
+			uint8_t qtys[INTERACT_BROKE_EXTRA_MAX];
+			int n = s_broke_contents_fn(broken, x, y, z, items, qtys);
+			if (n < 0)                        n = 0;
+			if (n > INTERACT_BROKE_EXTRA_MAX) n = INTERACT_BROKE_EXTRA_MAX;
+			for (int i = 0; i < n; i++) {
+				// Defensive, not trusting: a reader handing back an empty slot would otherwise
+				// hand main.c an invBridgeAdd(..., 0, ...) call for nothing.
+				if (qtys[i] == 0)
+					continue;
+				it->broke_extra_item[it->broke_extra_count] = items[i];
+				it->broke_extra_qty[it->broke_extra_count]  = qtys[i];
+				it->broke_extra_count++;
+			}
+		}
 	} else {
 		it->refused++;
 	}
@@ -433,6 +467,11 @@ int interactEdit(Interact* it, World* w, const Body* body,
 	// was designed to avoid.
 	it->broke_valid = false;
 	it->placed_valid = false;
+
+	// v1.8.16 F1, same schedule again: only breakComplete() ever sets this above zero, on the
+	// success path, so a stale count from a previous call could otherwise survive into a call
+	// that broke nothing at all.
+	it->broke_extra_count = 0;
 
 	// Step 8.4. The two verbs come from the player's bindings rather than the INTERACT_KEY_*
 	// constants directly. app/input_map.c answers with exactly those constants' values until
