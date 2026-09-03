@@ -428,10 +428,60 @@ float renderDistVisibility(const RenderDist* rd, float blocks);
 //   * raising a ceiling costs an unattended player nothing. Raising a default makes every New
 //     3DS first boot the experiment.
 //
-// So the wider ring is available on both models and automatic on neither. Move this to 3 when
-// there is a frame-time reading from a real New 3DS at radius 3 and not before — it is one
-// constant and one test line (world_test.c's testRenderDist).
-#define RENDER_DIST_DEFAULT_NEW  2
+// So the wider ring is available on both models and automatic on neither.
+//
+// ── v1.8.17: 2 → 3. Everything above is HISTORY; here is what actually changed ─────────────
+//
+// The paragraph above ends "move this to 3 when there is a frame-time reading from a real New
+// 3DS at radius 3 and not before". THAT READING STILL DOES NOT EXIST and this constant has
+// moved anyway, so the reason has to be better than an opinion.
+//
+// What that instruction was protecting against was a MEMORY risk that no longer exists. It was
+// written when the mesh pool was one compile-time allocation, MESH_SLOTS, claimed identically on
+// both models at boot — so a wider default was a real question about bytes as well as frames.
+// v1.8.5 removed that: scene/chunk_render.c:1427 sets s_pool_slots from poolSlotsForRadius(the
+// radius chunkRenderInit was HANDED), and main.c:4048 hands it renderDistMaxFor(hwIsNew3ds()),
+// which is the per-console CEILING and not the setting. The consequence is the whole argument:
+//
+//   * a New 3DS ALREADY claims the radius-5 pool at boot — 46,948,352 B of linear heap — no
+//     matter what this default says. Measured at the default of 2, by the check in
+//     tests/render_dist_ceiling_test.c section 4: the console claims 968 mesh slots and occupies
+//     200 of them. 79.3 % of an allocation it has already paid for never holds a mesh.
+//   * so raising this constant costs ZERO bytes of linear heap. It is not a spend, it is the
+//     decision to use something already bought. That is a categorically different proposition
+//     from the one the paragraph above declined, and it is why the instruction is superseded
+//     rather than overruled.
+//
+// WHY 3 AND NOT 4 OR 5, which is not taste either — the value is forced from both sides:
+//
+//   * above, by the _Static_assert directly below: a default must be a radius a player could
+//     also have picked by hand on the NARROWER console, which bounds it at RENDER_DIST_MAX_OLD.
+//   * below, by tests/render_dist_ceiling_test.c's new gate: a New 3DS must not ship unattended
+//     at a ring narrower than the widest an Old 3DS is permitted to reach, which bounds it at
+//     RENDER_DIST_MAX_OLD from the other direction.
+//
+// The two meet at exactly 3. Going to 4 or 5 is not one constant — it requires deleting the
+// assert below, and it would make the default equal the ceiling on a machine where nothing has
+// ever measured the frame cost. It is not taken here.
+//
+// The application-heap side, gated in tests/world_budget_bytes_test.c: the loaded ring is one
+// column wider than the drawn one, so radius 3 is 9x9 + 2 staging = 83 columns at 65,648 B =
+// 5,448,784 B against the 12,582,912 B cap (43.3 %), up from 3,348,048 B (26.6 %) at radius 2.
+// 7,134,128 B of the cap is still free, and the cap itself is 21.1 % of the New 3DS's measured
+// 59,715,584 B application heap. Nothing is close to binding.
+//
+// STILL NOT MEASURED, and it is the same honest gap the paragraph above had: the FRAME RATE.
+// Radius 3 draws 49 columns against radius 2's 25 — 1.96x the columns submitted before culling —
+// and no console has rendered either. Azahar returns a constant 0.249 ms from
+// C3D_GetDrawingTime, so the emulator does not model it and this project cannot measure it. What
+// can be said, and it is reasoning rather than a reading: radius 3 is a radius this project
+// already permits an OLD 3DS to select (RENDER_DIST_MAX_OLD), on the slower CPU, one generator
+// lane, half the linear heap and no L2 — so a New 3DS at 3 is strictly the better-resourced of
+// two configurations the game already offers. That is an argument, not a frame time.
+//
+// If a New 3DS turns out not to hold a frame rate at 3, this is one constant back to 2 and the
+// gate in tests/render_dist_ceiling_test.c section 4 goes with it.
+#define RENDER_DIST_DEFAULT_NEW  3
 
 // v1.8.5. A default has to be a value the player could also have SELECTED, on the NARROWER
 // console, or it is not a default — it is a number the clamp moves at first boot.

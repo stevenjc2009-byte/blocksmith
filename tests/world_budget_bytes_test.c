@@ -186,6 +186,49 @@ int main(void)
 	CHECK((size_t)WORLD_BUDGET_BYTES <= APP_HEAP_NEW_3DS);
 	CHECK((size_t)WORLD_BUDGET_BYTES <= HEAPSPLIT_APP_FLOOR_BYTES);
 
+	// ── 2b. v1.8.17. The cost at each console's DEFAULT, not only at its ceiling ────────────
+	//
+	// Everything above sizes the cap against what a player can REACH. This is what an unattended
+	// console actually costs on first boot, which is a different number and until v1.8.17 was a
+	// much smaller one — the New 3DS default was radius 2, two steps below its ceiling of 5 and
+	// one step below the Old 3DS's ceiling of 3.
+	//
+	// Spelled with the MACROS rather than by calling renderDistDefault(), deliberately: this
+	// stanza links world/chunk.c, block.c, registry.c and budget.c and NOT scene/render_dist.c
+	// (tools/run_host_tests.sh:3730-3737), so a call to renderDistDefault() here would not be a
+	// failed check, it would be an undefined reference and a build failure. The per-console
+	// FUNCTION behaviour is gated in tests/render_dist_ceiling_test.c, which does link it; this
+	// binary owns the bytes.
+	const size_t need_def_old = budgetBytesForRadius(RENDER_DIST_MIN,         col_target);
+	const size_t need_def_new = budgetBytesForRadius(RENDER_DIST_DEFAULT_NEW, col_target);
+
+	// Both defaults have to fit the cap — and with real margin, not by a whisker. The cap is
+	// already tied to the measured New 3DS application heap at the two checks above, so "fits the
+	// cap" carries "fits the heap" without this file having to carry a second heap constant.
+	CHECK(need_def_new <= WORLD_BUDGET_BYTES);
+	CHECK(need_def_old <= WORLD_BUDGET_BYTES);
+
+	// The New default must cost MORE than the Old default: the whole point of a per-console
+	// default is that the two consoles differ, and a New 3DS that boots to the same ring as an
+	// Old 3DS is spending none of the memory it was given.
+	CHECK(need_def_new > need_def_old);
+
+	// And it must still leave the ceiling worth opting into — a default that already costs what
+	// the ceiling costs would mean the slider has nothing above it to offer.
+	CHECK(need_def_new < need_new);
+
+	printf("world store at each console's DEFAULT (what an unattended console costs):\n");
+	printf("  Old 3DS  default radius %d  world store %8zu of cap %u  (%.1f %%)\n",
+	       RENDER_DIST_MIN, need_def_old, WORLD_BUDGET_BYTES,
+	       100.0 * (double)need_def_old / (double)WORLD_BUDGET_BYTES);
+	printf("  New 3DS  default radius %d  world store %8zu of cap %u  (%.1f %%)"
+	       "  = %.1f %% of the measured New application heap\n",
+	       RENDER_DIST_DEFAULT_NEW, need_def_new, WORLD_BUDGET_BYTES,
+	       100.0 * (double)need_def_new / (double)WORLD_BUDGET_BYTES,
+	       100.0 * (double)need_def_new / (double)APP_HEAP_NEW_3DS);
+	printf("  headroom left under the cap at the New default: %zu B\n",
+	       (size_t)WORLD_BUDGET_BYTES - need_def_new);
+
 	// ── 3. The real budget, not arithmetic about it ────────────────────────────────────────
 	//
 	// Everything above compares numbers to a macro. These four run the shipped budgetClaim()

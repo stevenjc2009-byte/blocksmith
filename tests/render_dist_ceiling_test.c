@@ -170,6 +170,80 @@ int main(void)
 		CHECK(d < renderDistMaxFor(n));
 	}
 
+	// ── 4. v1.8.17. The New 3DS default must actually SPEND the New 3DS ───────────────────
+	//
+	// Everything in section 3 checks that the default is LEGAL — inside the clamp, below the
+	// ceiling, reachable. None of it checks that it is worth having, and at RENDER_DIST_DEFAULT_NEW
+	// 2 it was not: a New 3DS booted at a narrower ring than an Old 3DS is allowed to reach.
+	//
+	// WHAT MADE THAT DEFENSIBLE UNTIL NOW, and what changed. Until v1.8.5 the mesh pool was one
+	// compile-time allocation claimed on both models, so a wider default was a real memory
+	// question. It is not any more: scene/chunk_render.c:1427 sizes the pool from the radius
+	// chunkRenderInit is HANDED, and main.c:4048 hands it renderDistMaxFor(hwIsNew3ds()) — the
+	// per-console CEILING, not the setting. So a New 3DS already claims the radius-5 pool at boot
+	// whatever the default is, and the default only decides how many of those already-paid-for
+	// slots ever hold a mesh. Raising it costs zero bytes of linear heap. The printout below is
+	// that fact in numbers.
+	//
+	// THE GATE, and it is deliberately the one check here that could go red. A New 3DS has twice
+	// the linear heap (67,108,864 against 33,554,432, both boot readings — render_dist.h:196-197),
+	// twice the generator lanes (app/lanes.c's laneCountFor), the faster clock and the L2 cache,
+	// and a mesh pool sized for radius 5 rather than 3. It must therefore not ship, unattended, at
+	// a ring NARROWER than the widest an Old 3DS is permitted to reach. Written against
+	// renderDistMaxFor(false) rather than against the literal 3 so that it tracks the Old ceiling
+	// if that ever moves.
+	//
+	// Note what this does NOT say: nothing here claims radius 3 holds a frame rate on a New 3DS.
+	// That cannot be measured on this project's machine at all (Azahar's C3D_GetDrawingTime
+	// returns a constant 0.249 ms) and no console has run it. This is a MEMORY and POLICY gate.
+	CHECK(renderDistDefault(true) >= renderDistMaxFor(false));
+
+	// Together with render_dist.h's own _Static_assert that RENDER_DIST_DEFAULT_NEW <=
+	// RENDER_DIST_MAX_OLD — the rule that a default must be a radius a player could also have
+	// picked by hand on the narrower console — this pins the New default at EXACTLY
+	// RENDER_DIST_MAX_OLD. The assert bounds it above, this check bounds it below, and the value
+	// is forced rather than chosen. Restated here as a relation so that the pincer is visible in
+	// one place instead of being an accident of two files agreeing.
+	CHECK(renderDistDefault(true) == RENDER_DIST_MAX_OLD);
+
+	// Guards, green today and stated so they cannot regress quietly. Neither of these could have
+	// caught the thing above — a default of 2 satisfied both — which is exactly why the check
+	// above had to be added rather than these being tightened.
+	CHECK(renderDistDefault(true) > renderDistDefault(false));   // the models must differ at all
+	CHECK(renderDistDefault(false) == RENDER_DIST_MIN);          // Old 3DS keeps the measured one
+
+	// The mesh pool the console claims at boot, against what each default actually occupies.
+	// Slots per radius is render_dist.h's own formula (RENDER_DIST_SLOTS_PER_COLUMN per column of
+	// a (2r+1) square), so this is the same arithmetic chunkRenderInit sizes the arenas with.
+	{
+		const int alloc_new = (2 * renderDistMaxFor(true)  + 1) *
+		                      (2 * renderDistMaxFor(true)  + 1) * RENDER_DIST_SLOTS_PER_COLUMN;
+		const int alloc_old = (2 * renderDistMaxFor(false) + 1) *
+		                      (2 * renderDistMaxFor(false) + 1) * RENDER_DIST_SLOTS_PER_COLUMN;
+		const int used_new  = (2 * renderDistDefault(true)  + 1) *
+		                      (2 * renderDistDefault(true)  + 1) * RENDER_DIST_SLOTS_PER_COLUMN;
+		const int used_old  = (2 * renderDistDefault(false) + 1) *
+		                      (2 * renderDistDefault(false) + 1) * RENDER_DIST_SLOTS_PER_COLUMN;
+
+		printf("mesh pool slots claimed at boot vs occupied at the default:\n");
+		printf("  Old 3DS  pool for radius %d = %4d slots   default radius %d = %3d slots"
+		       "  (%.1f %% idle)\n",
+		       renderDistMaxFor(false), alloc_old, renderDistDefault(false), used_old,
+		       100.0 * (double)(alloc_old - used_old) / (double)alloc_old);
+		printf("  New 3DS  pool for radius %d = %4d slots   default radius %d = %3d slots"
+		       "  (%.1f %% idle)\n",
+		       renderDistMaxFor(true), alloc_new, renderDistDefault(true), used_new,
+		       100.0 * (double)(alloc_new - used_new) / (double)alloc_new);
+		printf("  the pool is sized from the CEILING, so the default costs no linear bytes\n");
+
+		// The pool is claimed for the ceiling, so no default can ever need more of it than was
+		// allocated. Monotone and therefore incapable of failing on its own — kept because it is
+		// the invariant the paragraph above rests on, and it WOULD go red if renderDistDefault
+		// ever stopped going out through renderDistClampFor.
+		CHECK(used_new <= alloc_new);
+		CHECK(used_old <= alloc_old);
+	}
+
 	printf("render distance ceiling self-test: %s\n", s_fails ? "FAILED" : "PASS");
 	if (s_fails)
 		printf("  %d of %d checks failed, first: %s\n", s_fails, s_checks, s_first);
