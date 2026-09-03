@@ -3837,6 +3837,29 @@ static void gpuWaitPrevFrame(void)
 static void onRemoteEdit(void* userdata, int x, int y, int z)
 {
 	(void)userdata;
+
+	// v1.8.17. The cell this hook names has just been overwritten by something that is
+	// not this player -- a remote player's break or place, or the water simulation via
+	// onWaterChange below -- so whatever block used to stand there no longer does, and
+	// any per-position state it carried is now an orphan.
+	//
+	// This is the exact mirror of the LOCAL break's blockStateRemove in the main loop,
+	// and it is here rather than in net/networld.c for the reason net/networld.h's own
+	// NetworldEditFn comment gives about chunkRenderTouch: that module stays host-testable
+	// precisely because it never reaches into world/'s tables, so it reports which block
+	// changed and the owner of the table -- this file -- decides what that means.
+	//
+	// Unconditional, and gated on nothing, for the same two reasons the local break path
+	// spells out: blockStateRemove on a cell holding no state is a no-op by contract, and
+	// asking "is this a stateful block" here would be a second, separate opinion about
+	// which blocks those are -- the day it disagreed with the table the symptom would be a
+	// slot that never frees. With BLOCKSTATE_SLOTS at 64 that is not a memory leak, it is
+	// a fixed pool that fills: enough remote furnace breaks and a legitimate new furnace
+	// gets no state at all. Worse, a furnace later placed on the same coordinate read the
+	// dead one's contents straight back out of blockStateGet, and since v1.8.17 breaking a
+	// furnace pays its contents into the inventory -- so a stale record was a duplication
+	// route, not merely stale data.
+	blockStateRemove(&s_blockstate, x, y, z);
 	// v1.5.0: remote edits relight before remeshing, same as scene/interact.c does for
 	// local break/place — otherwise another player's torch-adjacent or shade-casting
 	// change lands with stale light until the column happens to regenerate.

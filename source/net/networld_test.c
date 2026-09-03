@@ -1581,6 +1581,106 @@ static void test_edit_hook_fires_for_an_applied_edit(void)
     networldSetEditHook(NULL, NULL);
 }
 
+/* ---- a remote break must clear the broken block's per-position state -------------------- */
+/* v1.8.17. main.c's LOCAL break path removes the blockstate record for the cell it has just
+ * emptied (source/main.c, the `if (it.broke_valid)` block). The REMOTE path had no such step:
+ * a furnace another player broke vanished from the world here while its record stayed in the
+ * table. Two costs, both real. BLOCKSTATE_SLOTS is 64, so orphaned records fill a fixed pool
+ * and legitimate new furnaces silently get no state; and a furnace later placed on the same
+ * coordinate reads the DEAD one's contents back out of blockStateGet -- which, now that
+ * breaking a furnace pays its contents into the inventory, is an item duplication route
+ * rather than merely stale data.
+ *
+ * The fix cannot live in net/networld.c, and this binary could not link it if it did. See
+ * net/networld.h's own comment on NetworldEditFn: this module never reaches into world/'s
+ * state tables, which is exactly what keeps it host-testable, and the table itself is
+ * main.c's `s_blockstate` file static. So the behavioural half below proves what networld.c
+ * really owns -- the break lands, and the hook carries the cell's own coordinate out to the
+ * table's owner -- and the source-text half proves that owner acts on it. That second
+ * technique is app/session_test.c's, which reads source/main.c the same way to check the
+ * session_start lap really calls sessionBegin(); a behavioural test of the hook alone stays
+ * green against a game in which nothing ever clears the record. */
+static char *readWholeSourceFile(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    const long n = ftell(f);
+    if (n <= 0) { fclose(f); return NULL; }
+    rewind(f);
+    char *buf = (char *)malloc((size_t)n + 1);
+    if (buf == NULL) { fclose(f); return NULL; }
+    const size_t got = fread(buf, 1, (size_t)n, f);
+    fclose(f);
+    buf[got] = '\0';
+    return buf;
+}
+
+static void test_remote_break_of_a_stateful_block_clears_its_state(void)
+{
+    puts("a remote break of a stateful block drops it AND clears its blockstate record");
+
+    World w;
+    worldInit(&w);
+    networldInit();
+    networldSetWorld(&w);
+    hookReset();
+    networldSetEditHook(hookRecord, &hook_userdata_marker);
+
+    worldColumnCreate(&w, 0, 0);              /* column (0,0): x,z in 0..15 */
+    worldSet(&w, 6, 12, 9, BLOCK_FURNACE);    /* the stateful block, as placed */
+    check(worldGet(&w, 6, 12, 9) == BLOCK_FURNACE, "fixture: a furnace stands at (6,12,9)");
+
+    uint8_t msg[BS_BLOCK_EDIT_BYTES];
+    buildBlockEdit(msg, 6, 12, 9, BLOCK_AIR);
+    networldApplyPayload(msg, sizeof msg);
+
+    check(worldGet(&w, 6, 12, 9) == BLOCK_AIR, "the remote break emptied the cell");
+    check(hook_count == 1 && hook_log[0].x == 6 && hook_log[0].y == 12 && hook_log[0].z == 9,
+          "the edit hook carried the broken cell's own coordinate to the table's owner");
+
+    networldSetEditHook(NULL, NULL);
+
+    /* Run from the repository root, the same working directory app/session_test.c reads
+     * source/main.c out of. */
+    char *src = readWholeSourceFile("source/main.c");
+    check(src != NULL, "source/main.c could be read");
+    if (src == NULL) {
+        printf("  (source/main.c could not be read from this working directory)\n");
+        return;
+    }
+
+    check(strstr(src, "#include \"world/blockstate.h\"") != NULL,
+          "control: main.c owns the blockstate table at all");
+    check(strstr(src, "blockStateRemove(&s_blockstate, it.broke_x, it.broke_y, it.broke_z)") != NULL,
+          "control: the LOCAL break path still removes a record, so this search shape finds hits");
+
+    const char *fn = strstr(src, "static void onRemoteEdit(");
+    check(fn != NULL, "main.c still has the remote-edit hook this test is about");
+    if (fn != NULL) {
+        /* Body only. Every statement in onRemoteEdit is a call or an unbraced if, so the
+         * first line-initial closing brace after its signature is its own. */
+        const char *end = strstr(fn, "\n}");
+        check(end != NULL, "the hook's body is delimited");
+        if (end != NULL) {
+            const size_t body_len = (size_t)(end - fn);
+            char *body = (char *)malloc(body_len + 1);
+            check(body != NULL, "the body could be copied out for searching");
+            if (body != NULL) {
+                memcpy(body, fn, body_len);
+                body[body_len] = '\0';
+                check(strstr(body, "blockStateRemove(") != NULL,
+                      "the REMOTE break path removes the record too");
+                check(strstr(body, "blockStateRemove(&s_blockstate, x, y, z)") != NULL,
+                      "and removes it for the cell the remote edit actually named");
+                free(body);
+            }
+        }
+    }
+
+    free(src);
+}
+
 static void test_edit_hook_silent_while_the_edit_is_only_queued(void)
 {
     puts("a queued remote edit does not notify until it actually reaches the world");
@@ -3638,6 +3738,7 @@ int main(void)
     test_an_unhandled_app_type_changes_nothing();
     test_the_session_generator_resolves_and_refuses();
     test_edit_hook_fires_for_an_applied_edit();
+    test_remote_break_of_a_stateful_block_clears_its_state();
     test_edit_hook_silent_while_the_edit_is_only_queued();
     test_edit_hook_fires_per_entry_of_a_sync_batch();
     test_edit_hook_is_cleared_by_init_and_optional();
@@ -3707,8 +3808,15 @@ int main(void)
      * must-not-refuse cases; the last one grew by 2 when a red arm showed its single-player
      * checks could not tell the gate guard from a transport-state guard). 14 + 15 = 29.
      * Nothing removed. */
-    check(g_checks == 418,
-          "check-count guard: every check in this suite actually ran (418 before this line)");
+    /* 416 -> 429, same rule. test_remote_break_of_a_stateful_block_clears_its_state adds
+     * 11: 3 behavioural (the fixture furnace, the emptied cell, the hook's coordinate) and
+     * 8 source-text (main.c readable, the blockstate.h include, the local break path's own
+     * removal as a control that the search shape finds hits at all, onRemoteEdit found, its
+     * body delimited, the body copied out, and the two that are the point of the file: the
+     * remote path removes a record, and removes it for the coordinate it was handed).
+     * Nothing removed. */
+    check(g_checks == 429,
+          "check-count guard: every check in this suite actually ran (429 before this line)");
 
     printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;
