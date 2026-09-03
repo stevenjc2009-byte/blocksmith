@@ -8,10 +8,19 @@ and, for most versions from v1.8.7 onward, in that version's own `docs/plan-*.md
 (for example `docs/plan-1.8.11-caves.md`); run `ls docs/plan-*.md` for the current set,
 which now covers nearly every version through v1.9.1.
 
-**Newest published version: 1.8.14** (released 2026-09-03). Everything from `v0.1.0` up
-to and including `v1.8.14` is released and published on GitHub. Everything after
-`v1.8.14` is a plan, not a build; order, scope, and whether a given version ships at all
-can still change before it does.
+**Newest published version: 1.8.14** (released 2026-09-03; the `releases/latest` redirect
+was followed and resolves to `v1.8.14`, and the published `blocksmith1.8.14.cia` was
+downloaded and md5-matched against the built artefact at `2a840e07c02f2a5094155c422ba01b11`).
+Everything from `v0.1.0` up to and including `v1.8.14` is released and published on GitHub.
+Everything after `v1.8.14` is a plan, not a build; order, scope, and whether a given version
+ships at all can still change before it does.
+
+That parenthetical is deliberately about the *redirect* and not about the GitHub API. The
+in-game updater cannot use the API: it is rate limited to 60 requests an hour **per IP**, and
+that IP is shared by everyone behind the same NAT, so it fails for real players at random and
+for reasons they cannot see. The 302 is the path the console actually takes, so the 302 is the
+thing worth verifying — and verifying it means following it and hashing what comes back, not
+reading the release page.
 
 This line is the one thing in this file that goes stale silently, so it is worth saying
 how it is meant to be kept: it moves in the release commit itself, not afterwards. It sat
