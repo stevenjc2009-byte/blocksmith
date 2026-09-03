@@ -368,18 +368,71 @@ sheep. They wander, they can be killed, and they drop meat.
 ## v1.8.15 — Furnace
 
 **Added.** A furnace block with fuel and a smelting timer. Raw meat becomes cooked
-meat, ore becomes ingots.
+meat.
+
+> **⚠ CORRECTION [2026-09-03]** — this line used to end "…, ore becomes ingots."
+> It never shipped. `source/world/furnace.c:52-86` holds exactly four recipes and
+> all four are raw cuts from v1.8.14; `source/world/furnace.h:113` says so outright.
+> Ore smelting has no slot in this document yet — it needs one before it can be
+> planned, rather than being quietly assumed done.
 
 ---
 
-## v1.8.16 — Monsters
+## v1.8.16 — Fixes and polish ✅ released
+
+**Corrected 2026-09-03. This entry used to say "Monsters" — zombies and skeletons spawning
+in the dark. That did not ship; nothing about mobs is in this version at all.** What
+actually shipped: three fixes reported against earlier releases (holding jump is now
+required to climb out of shallow water, not only deep water; the random freeze while
+walking is fixed — a background save wait with no time limit and no APT pump, read by the
+console as a full lock-up; the top half of two-block grass now takes its own biome's
+colour), plus apples and meat becoming items rather than placeable blocks, real hotbar
+icons for all nine foods, painted animal textures, smooth per-vertex lighting on torches
+and plants, and a Saves row in the debug menu. Nothing here needed a server update — the
+block table is unchanged at 43 rows. Full detail: `docs/VERSION-LIST.md`'s own v1.8.16
+entry, and `CHANGELOG.md`'s `[1.8.16]` section.
+
+Monsters is not dropped — it still needs the entity system v1.8.14 added and nothing else
+has grown around it, so it moves to the next open slot rather than being descoped. See
+v1.8.18 below.
+
+---
+
+## v1.8.17 — New 3DS, in earnest
+
+**In flight, not committed as written.** This is being built right now, across parallel
+work, so treat everything below as scope rather than fact — no part of it is verified, and
+thread placement specifically cannot be tested without real hardware. The 804 MHz clock and
+L2 cache were switched on for a New 3DS back in v1.8.4, but almost nothing downstream of
+that request was ever gated on `hwIsNew3ds()`, so a New 3DS has been doing the same
+per-frame work as an Old one ever since. This version's job is to actually spend the extra
+RAM, CPU speed and L2 cache a New 3DS already has.
+
+**Planned.** Per-frame work budgets — the mesh drain, the relight pass, the loading-screen
+drain in `source/main.c` — gated per console instead of flat constants. The New-3DS render
+distance default raised from 2 toward the ceiling of 5 v1.8.5 already granted, and
+`WORLD_BUDGET_BYTES` (12 MB, flat and ungated today) raised on New, where roughly 29 MB of
+application heap currently goes unspent. Thread placement spread across the cores a New
+3DS is actually granted, instead of using two of its four.
+
+**Planned — fixed.** Breaking a furnace drops its contents instead of destroying them
+silently, and a burning furnace shows its lit front face — both carried over from v1.8.15.
+The water-entry splash moves from the player's feet to the water surface, plus a new splash
+on leaving the water and a wake while swimming at the surface.
+
+**Planned — added.** Per-biome dirt colour, by tint — the one item still missing from the
+per-biome materials list v1.8.8 otherwise completed.
+
+---
+
+## v1.8.18 — Monsters
 
 **Added.** Zombies and skeletons, spawning in the dark and in caves, on the light and
 space rules that make a torch worth placing.
 
 ---
 
-## v1.8.17 — Sound
+## v1.8.19 — Sound
 
 **Added.** A real audio system — footsteps that know what you are walking on, block
 breaking and placing per material, animals, water, ambience. Effects sourced under
@@ -387,14 +440,14 @@ licences that permit any use, credited in the repository.
 
 ---
 
-## v1.8.18 — Storage and quality of life
+## v1.9.0 — Storage and quality of life
 
 **Added.** Chests. Stack splitting and merging, shift-move, and the small conveniences
 that a game gets tiring without.
 
 ---
 
-## v1.8.19 — The new interface
+## v1.9.1 — The new interface
 
 **Changed.** The menus and inventory redrawn around a long horizontal bar of options —
 the shape the legacy console crafting menu and the PS3 system menu share. Referenced,
@@ -402,13 +455,13 @@ not copied: none of their art, none of their layout metrics, none of their icons
 
 ---
 
-## v1.9.0 — Redstone
+## v1.9.2 — Redstone
 
 **Added.** Wire, power, levers, buttons, pressure plates, doors, pistons.
 
 ---
 
-## v1.9.1 — The other worlds
+## v1.9.3 — The other worlds
 
 **Added.** Two more dimensions with their own names — the fire one and the end one —
 each with its own generator, its own blocks and its own way in.

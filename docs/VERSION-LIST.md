@@ -8,11 +8,12 @@ and, for most versions from v1.8.7 onward, in that version's own `docs/plan-*.md
 (for example `docs/plan-1.8.11-caves.md`); run `ls docs/plan-*.md` for the current set,
 which now covers nearly every version through v1.9.1.
 
-**Newest published version: 1.8.14** (released 2026-09-03; the `releases/latest` redirect
-was followed and resolves to `v1.8.14`, and the published `blocksmith1.8.14.cia` was
-downloaded and md5-matched against the built artefact at `2a840e07c02f2a5094155c422ba01b11`).
-Everything from `v0.1.0` up to and including `v1.8.14` is released and published on GitHub.
-Everything after `v1.8.14` is a plan, not a build; order, scope, and whether a given version
+**Newest published version: 1.8.16** (released 2026-09-03; the `releases/latest` redirect
+was followed and resolves to `v1.8.16`, and the published `blocksmith1.8.16.cia` was
+downloaded and md5-matched against the built artefact at `07937de620b5b1d7701b2b1567fb417e` —
+1,360,832 bytes, `cmp` reporting byte-identical).
+Everything from `v0.1.0` up to and including `v1.8.16` is released and published on GitHub.
+Everything after `v1.8.16` is a plan, not a build; order, scope, and whether a given version
 ships at all can still change before it does.
 
 That parenthetical is deliberately about the *redirect* and not about the GitHub API. The
@@ -715,6 +716,89 @@ writes `postmortem.txt` to the SD card instead of locking up silently.
 
 ---
 
+### v1.8.15 — Furnace — released and published
+
+Killing an animal in v1.8.14 left you with raw meat and nowhere to cook it; this release
+gives you somewhere. Eight stone gets you a furnace, and a furnace turns each of the four raw
+cuts from the last release into a better version of itself.
+
+**Added.** A furnace, craftable from eight stone — deliberately more than anything else in the
+crafting list costs, because this is the first crafted block that opens up a whole system
+rather than just converting one material into another. Aiming at a placed furnace and pressing
+the same button you build with opens a panel instead of placing a block: three slots — input,
+fuel and output — pulling from your whole bag rather than just the hotbar, and walking up to a
+different furnace while a panel is open just retargets it. Planks keep a furnace lit for 15
+seconds, a log for 60; cooking one item takes 10 seconds once lit, and a furnace with fuel but
+nothing valid in the input slot burns straight through that fuel doing nothing, rather than
+pausing to wait for something worth cooking — which is what the real thing does too. Wood is
+currently the only fuel there is; there is no coal or charcoal yet. Four cooked cuts — porkchop,
+beef, chicken and mutton — restore 8, 8, 6 and 6 hunger, more than double their raw v1.8.14
+counterpart in every case and above even the apple's 4, which is the entire reason to build a
+furnace rather than just eat the raw meat off the animal.
+
+**Changed.** The block table grew from 38 to 43 rows for the furnace and the four cooked meats,
+and that number has to match on both ends of a multiplayer connection. Unlike v1.8.14's block-
+count growth, which quietly degraded on an unmatched server with no on-screen warning, a client
+now checks the table against the server's and refuses the connection outright, showing "Server
+is a different Blocksmith version - update" instead. The matching server is blocksmith-server
+v1.9.6 or later.
+
+**Notes.** Two defects shipped in this release and are carried here as known, fixed-later
+issues rather than pretended away: breaking a furnace destroys its contents silently, and the
+lit front-face art exists in the texture atlas (`BTEX_FURNACE_FRONT_LIT`, slot 47) but is never
+selected by the mesher, so a burning furnace looks identical from the outside to an idle one —
+the burn bar and cook arrow inside the panel are the only way to tell it is actually running.
+Both are scheduled to be fixed in v1.8.17. **Not shipped, despite `docs/ROADMAP.md`'s own
+one-line description of this version naming it:** ore becoming ingots. `CHANGELOG.md`'s actual
+`[1.8.15]` entry covers only the furnace and cooking meat; nothing in it smelts ore.
+
+### v1.8.16 — Fixes and polish — released and published
+
+Three things reported against earlier releases, fixed for good, plus finishing touches that
+had been sitting half-done for several versions: real animal textures, smooth lighting on
+torches and plants, and food that finally looks like food in the hotbar. Everything here is
+identical on both consoles; nothing in this release is Old-3DS-only or New-3DS-only.
+
+**Fixed.** Water no longer lets you walk straight out of it — holding jump is now required to
+climb out of *shallow* water, the same requirement v1.8.4 already put on deep water. The two
+behaved differently because a body standing in one block of water, feet on the bottom, was
+being treated as an ordinary walker on ordinary ground rather than as a body in water; every
+shoreline is one block deep at its edge, so shallow water is the water most players actually
+meet, and the v1.8.4 gate had only ever worked in deep water, where you float. The random
+freeze while walking is fixed: unloading a column handed it to a background save thread with no
+time limit and, critically, without telling the console it was still alive — a 3DS that stops
+pumping `aptMainLoop()` stops answering the HOME and power buttons, which is why this read as
+the whole console locking up rather than the game running slow. It now keeps the console
+answering while it waits, gives up after a quarter second, and writes the column itself rather
+than dropping it. The top half of two-block-tall grass took the plains colour everywhere,
+because only the bottom half was being tinted per biome; it hid for eight versions because
+plains, where most of the world is, happens to look the same either way.
+
+**Changed.** Apples and the eight meats (four raw, four cooked) are items now, not placeable
+blocks — eating on a full stomach no longer places the food as a v1.8.15 side effect. You can
+still break an apple off a tree; that had to keep working, since apples genuinely grow in the
+canopy. The nine food items get their own drawn hotbar icons — a round apple, a pork chop with
+its bone knob, a chicken drumstick, a marbled slab of beef, mutton on the rib, each cooked
+version visibly cooked — replacing the stretched top-face-of-a-cube icon every other block uses.
+
+**Added.** Pigs, cows, chickens and sheep have painted faces, patterns and legs instead of flat
+coloured boxes, generated by the project's own texture scripts like every other piece of art in
+the game. Torches, grass and flowers — everything shaped like a cross rather than a cube — now
+get the same smooth per-vertex lighting cube-shaped blocks have had for several versions; a
+torch no longer lights the wall behind it beautifully while staying a flat, featureless bright
+slab itself. A "Saves" row in the debug menu shows how many columns have been handed off to
+save, how many times the game had to wait for a slot, the longest wait in milliseconds, and
+whether the new quarter-second limit ever fired — the counter behind it has existed since
+v1.7.1 and had never once been visible in an installed build.
+
+**Notes.** Nothing here needed a server update: the block table is unchanged at 43 rows and
+`net/bs_proto.h` did not move, so `PROTO_COMMIT` was deliberately not bumped and a
+blocksmith-server v1.9.6 gateway serves a v1.8.16 client as-is — unlike v1.8.14, whose block-
+count change did require a server release, this one does not need one at all. Not run on real
+3DS hardware.
+
+---
+
 ## Planned
 
 Everything from here down is a plan, not a build: none of it has been committed, tagged, or
@@ -722,15 +806,46 @@ published as a GitHub Release, and scope, order, and even whether a given versio
 all can still change. Where a version has a dedicated research brief or plan document
 beyond `ROADMAP.md`'s own entry, that is named so the deeper detail can be found.
 
-### v1.8.15 — Furnace — planned
+### v1.8.17 — New 3DS, in earnest — planned
 
-**Added.** A furnace block with fuel and a smelting timer. Raw meat becomes cooked meat,
-ore becomes ingots.
+**In flight, not committed.** Everything below is being implemented by parallel work right
+now: none of it is verified, none of it is committed, and none of it is certain to ship in
+this exact form. If any part of it turns out on inspection to be the wrong change, this entry
+will need revising rather than trusted as written. No numbers are quoted for it because none
+have been measured yet.
 
-`docs/ROADMAP.md` gives this version one short paragraph; nothing beyond it has been
-researched or specified yet.
+The 804 MHz clock and the L2 cache were already switched on for a New 3DS back in v1.8.4, but
+almost nothing downstream of that was ever gated on `hwIsNew3ds()` — so a New 3DS has been
+doing the same amount of work per frame as an Old one ever since. This version's purpose is to
+actually spend the extra RAM, CPU speed and L2 cache a New 3DS already has, rather than adding
+a new feature.
 
-### v1.8.16 — Monsters — planned
+**Planned — per-frame work budgets gated per console** instead of the flat constants they are
+today: the mesh drain, the relight pass and the loading-screen drain in `source/main.c`.
+
+**Planned — New 3DS render distance and world budget raised.** *A genuine Old/New split, if it
+lands as scoped.* The New-3DS render-distance *default* raised from 2 toward the ceiling of 5
+that v1.8.5 already granted the console, and `WORLD_BUDGET_BYTES` (currently 12 MB, flat and
+ungated on both consoles) raised on New, where roughly 29 MB of application heap currently goes
+unspent.
+
+**Planned — thread placement spread across the cores a New 3DS is actually granted**, instead
+of using two of its four. This is the part of the scope that cannot be tested without real
+hardware, and the one most likely to come back as "do not change this" once a lane actually
+measures it.
+
+**Planned — fixed.** Breaking a furnace drops its contents instead of destroying them
+silently, and a burning furnace shows its lit front face instead of looking identical to a
+cold one — both left over from v1.8.15, above.
+
+**Planned — fixed.** The water-entry splash spawned at the player's feet, below the waterline,
+instead of at the water surface. A new splash is planned on leaving the water, plus a wake
+while swimming at the surface.
+
+**Planned — added.** Per-biome dirt colour, by tint — the one item still missing from the
+per-biome materials list v1.8.8 otherwise completed.
+
+### v1.8.18 — Monsters — planned
 
 **Added.** Zombies and skeletons, spawning in the dark and in caves, on the light and
 space rules that make a torch worth placing.
@@ -738,7 +853,7 @@ space rules that make a torch worth placing.
 `docs/ROADMAP.md` gives this version one short paragraph; nothing beyond it has been
 researched or specified yet. Depends on v1.8.14's entity system existing first.
 
-### v1.8.17 — Sound — planned
+### v1.8.19 — Sound — planned
 
 **Added.** A real audio system — footsteps that know what surface they're on, block
 breaking and placing per material, water entry/exit, crafting, UI feedback, sourced under
@@ -769,7 +884,7 @@ sounds); CC0 packs from Kenney and OpenGameArt plausibly cover the whole list.
 > call sites are one layer up, in the wrappers gameplay code reaches for. The real remaining
 > work for this version is coverage (3 of a proposed ~19-20 slots exist today — no hurt/eat/
 > splash/craft/door cues, no per-material break/place variation), not building a subsystem
-> that doesn't exist. This entry was true when v1.8.17 was first drafted, before v1.8.8
+> that doesn't exist. This entry was true when v1.8.19 was first drafted, before v1.8.8
 > shipped, and rotted afterwards rather than having been wrong from the start.
 
 *Two things named in `docs/ROADMAP.md`'s own wording — "animals" and "ambience" — have no
@@ -786,7 +901,7 @@ missing, is called out as a required step for this version specifically.
 
 Full research, with sources and licence terms: `docs/research/audio.md`.
 
-### v1.8.18 — Storage and quality of life — planned
+### v1.9.0 — Storage and quality of life — planned
 
 **Added.** Chests. Stack splitting and merging, shift-move, and the small conveniences a
 game gets tiring without.
@@ -794,7 +909,7 @@ game gets tiring without.
 `docs/ROADMAP.md` gives this version one short paragraph; nothing beyond it has been
 researched or specified yet.
 
-### v1.8.19 — The new interface — planned
+### v1.9.1 — The new interface — planned
 
 **Changed.** The menus and inventory redrawn around a long horizontal bar of categories,
 with the focused category's items descending in a list below it — the interaction shape
@@ -827,14 +942,14 @@ already-built battery blink and the debug-menu biome readout/neon toggle before 
 itself is touched. Treat `ui-skin.md` as the authoritative source for this version; read
 `interface.md` only for its Part A/B reference analysis.
 
-### v1.9.0 — Redstone — planned
+### v1.9.2 — Redstone — planned
 
 **Added.** Wire, power, levers, buttons, pressure plates, doors, pistons.
 
 `docs/ROADMAP.md` gives this version one short paragraph; nothing beyond it has been
 researched or specified yet.
 
-### v1.9.1 — The other worlds — planned
+### v1.9.3 — The other worlds — planned
 
 **Added.** Two more dimensions with their own names — the fire one and the end one, named
 but not copied from anything — each with its own generator, its own blocks and its own
