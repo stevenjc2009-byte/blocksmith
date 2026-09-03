@@ -198,11 +198,27 @@ static bool cmdAt(const u32* w, u32 nwords, u32 i, Cmd* out)
 // Exponent is [30:23] with bias 127, so all-ones is Inf/NaN and 127+57 = 184 is the 2^57 cutoff.
 #define F32_HUGE   0xB8u
 
+// Every address checked here comes out of a GPU command list, so it is a PHYSICAL address --
+// the only kind the PICA can follow. Nothing below is ever dereferenced; a failing range only
+// raises a flag, so a bound that is too wide costs a missed catch, never a bad read.
+//
+// [2026-09-03] The middle line's comment used to read "QTM / extra VRAM on N3DS" and was wrong
+// twice over. That matters, because it was one of the places the false "the New 3DS has 6 MB of
+// extra VRAM" claim was being read off. Per libctru's own os.h: OS_VRAM_PADDR is 0x18000000 with
+// OS_VRAM_SIZE 0x600000 -- 6 MB of VRAM, the SAME on both consoles. 0x1F000000 is two different
+// things depending on which address space you are in: OS_VRAM_VADDR (the 6 MB virtual view of
+// that same VRAM) and OS_QTMRAM_PADDR (4 MB, physical, and not something the GPU reads geometry
+// from). The New 3DS extra FCRAM needs no clause of its own -- OS_FCRAM_PADDR 0x20000000 with
+// OS_FCRAM_SIZE 0x10000000 already spans it.
+//
+// The CONSTANTS are all correct and not one was touched. Narrowing the middle bound to
+// 0x1F400000 on the strength of the old comment would have cut 2 MB off a genuinely valid VRAM
+// window and turned a documentation error into a real one.
 static bool addrReadable(u32 a)
 {
-	return (a >= 0x18000000u && a < 0x18600000u) ||   // VRAM
-	       (a >= 0x1F000000u && a < 0x1F600000u) ||   // QTM / extra VRAM on N3DS
-	       (a >= 0x20000000u && a < 0x30000000u);     // FCRAM, including the N3DS extension
+	return (a >= 0x18000000u && a < 0x18600000u) ||   // VRAM, physical (OS_VRAM_PADDR, 6 MB)
+	       (a >= 0x1F000000u && a < 0x1F600000u) ||   // VRAM, virtual  (OS_VRAM_VADDR, 6 MB)
+	       (a >= 0x20000000u && a < 0x30000000u);     // FCRAM, physical, N3DS extension included
 }
 
 static int      s_vcode;        // 0 = nothing wrong has been seen this session
