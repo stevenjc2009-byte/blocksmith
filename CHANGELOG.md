@@ -876,6 +876,11 @@ gone. **This release makes the view further on both consoles, and further still 
   its memory holds. *This is the only setting in the release where the two consoles differ.*
   It is a ceiling, not a default — a New 3DS still starts at 2, the same as before, and 4 and 5
   are yours to opt into. Nothing about an Old 3DS's limits changed.
+
+  > **⚠ CORRECTION [2026-09-03]** — "a New 3DS still starts at 2" was true when v1.8.5 shipped
+  > and is false as of commit `bc6ddbd` (v1.8.17, not yet in a released changelog entry as of
+  > this note): `RENDER_DIST_DEFAULT_NEW` in `source/scene/render_dist.h` moved from 2 to 3. The
+  > Old 3DS default is unchanged at 1.
 - **A settings file from a New 3DS is safe in an Old 3DS.** Move the SD card and a render
   distance of 5 is quietly brought down to 3 on load, instead of being handed to a console that
   cannot hold it.
@@ -1718,6 +1723,13 @@ in the spec is a fresh build rather than a repair of that one.
   chunk meshes rather than against a formula. **The New 3DS default deliberately stays at 2** —
   raising a ceiling is opt-in and one shoulder-press reversible, while raising a default would
   make every console's first boot the experiment, and radius 3 has never run on hardware.
+
+  > **⚠ CORRECTION [2026-09-03]** — "deliberately stays at 2" was the v1.8.5 decision and held
+  > through two more versions, but commit `bc6ddbd` (v1.8.17, not yet in a released changelog
+  > entry as of this note) moved `RENDER_DIST_DEFAULT_NEW` to 3 once a New 3DS was shown to
+  > already be paying for the radius-5 mesh pool at boot regardless of the setting — see
+  > `source/scene/render_dist.h`'s `RENDER_DIST_DEFAULT_NEW` comment for the full reasoning. The
+  > Old 3DS default is unchanged at 1.
 - **A "what's new" screen in the updater.** When Options → Check for Update finds a newer
   release, the top screen shows a short plain-English changelog for the version about to be
   downloaded — features added, then bugs fixed — scrollable with D-pad up/down and carrying a

@@ -324,6 +324,16 @@ gap from a different angle: New 3DS's render-distance default is pinned at
 frame-time reading from a real New 3DS at radius 3 exists yet to justify
 moving it.
 
+> **⚠ CORRECTION [2026-09-03]** — this paragraph was already imprecise when written and is now
+> also stale. It misquotes `render_dist.h`: the comment never said "pinned at 2, not 3" — it
+> said the default deliberately did not move when the *ceiling* was raised. More importantly,
+> as of commit `bc6ddbd` the New 3DS default is no longer 2: `RENDER_DIST_DEFAULT_NEW` in
+> `source/scene/render_dist.h` moved to 3, and no frame-time reading from a real New 3DS has
+> been taken in the meantime either — the move was justified instead by the New 3DS already
+> paying for the radius-5 mesh pool at boot regardless of the setting (see that constant's
+> comment for the full argument). The underlying point this section makes — that GPU cost on
+> this project cannot be measured off real hardware — still stands.
+
 **Consequence**: "how many particles fit in the frame budget" cannot be
 answered in milliseconds here. §2's 512-particle pool cap and each effect's
 per-spawn quad count are sized by comparison to existing, shipped costs of

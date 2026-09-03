@@ -6588,10 +6588,16 @@ static void testRenderDist(void)
 	CHECK(renderDistDefault(true) >= RENDER_DIST_MIN && renderDistDefault(true) <= RENDER_DIST_MAX);
 	CHECK(renderDistDefault(false) == 1);
 	// v1.8.5: the ceiling moved 3 -> 5 and this line is the tripwire that made that a deliberate
-	// act rather than a silent one — it went red, was read, and is being updated on purpose. The
-	// defaults did NOT move with it: renderDistDefault is still 1 and 2, which is exactly what
-	// the three checks above are here to keep true. See scene/render_dist.h for why the fog
-	// rewrite is what unblocked the ceiling.
+	// act rather than a silent one — it went red, was read, and is being updated on purpose. At
+	// the time, the defaults did NOT move with it: renderDistDefault was still 1 and 2, which is
+	// exactly what the three checks above were there to keep true. See scene/render_dist.h for
+	// why the fog rewrite is what unblocked the ceiling.
+	//
+	// [2026-09-03 CORRECTION] "still 1 and 2" is stale: commit bc6ddbd (v1.8.17) moved the New
+	// 3DS default (RENDER_DIST_DEFAULT_NEW, scene/render_dist.h) from 2 to 3. Only the OLD 3DS
+	// default is still 1 — that is CHECK(renderDistDefault(false) == 1) above, which still holds.
+	// Nothing in this file asserts the New 3DS default's exact value, so no CHECK here needed to
+	// change for that move.
 	CHECK(RENDER_DIST_MAX == 5);
 
 	const RenderDist lo = renderDistFor(RENDER_DIST_MIN);

@@ -45,6 +45,10 @@ only setting in the release where the two consoles differ.*
 It is a **ceiling, not a default**. A New 3DS still starts at 2, exactly as before;
 4 and 5 are yours to opt into. Nothing about an Old 3DS's limits changed.
 
+> **⚠ CORRECTION [2026-09-03]** — "A New 3DS still starts at 2" was true when this release
+> shipped and is false as of commit `bc6ddbd`: `RENDER_DIST_DEFAULT_NEW` in
+> `source/scene/render_dist.h` moved from 2 to 3. The Old 3DS default is unchanged at 1.
+
 The chunk mesh pool is what sets that ceiling, and it is now claimed at startup for
 the widest distance the console will ever be offered rather than at a size fixed when
 the game was compiled — 9,199,616 bytes at distance 3 against 46,948,352 at distance

@@ -160,8 +160,15 @@ int main(void)
 	// MAXIMALITY, and it is the whole reason the two fits above say anything. Without it they
 	// would pass just as happily with the cap at 32 MB, or 64, and would be asserting only that
 	// some number large enough exists. With it, 12 MB is pinned as very nearly the smallest cap
-	// that holds radius 5 — one radius further is over by 2,253,536 bytes — which makes it a
+	// that holds radius 5 — one radius further is over by 2,319,184 bytes — which makes it a
 	// measurement rather than a round number somebody liked.
+	//
+	// [2026-09-03 CORRECTION] This comment previously said "2,253,536 bytes", which was the
+	// pre-v1.8.8 figure from when BUDGET_STAGING_COLUMNS was 1 instead of 2 (world/budget.h):
+	// one extra staging column costs 65,648 B (one column's worth, per world/budget.h's own
+	// per-column arithmetic), and 2,253,536 + 65,648 = 2,319,184 — exactly the gap between the
+	// stale number and the current one. The loop above this CHECK prints the live figure for
+	// radius 6 at runtime; that printed value is what confirms 2,319,184, not this comment.
 	CHECK(need_over > WORLD_BUDGET_BYTES);
 
 	// The host's own upper-bound arithmetic must reach the same three verdicts. If it ever did

@@ -83,10 +83,17 @@
 // lane: two lanes can hold a staged column simultaneously, which is the entire point of the
 // second lane. The v1.8.8 figure is 2. Radius 5 goes from 170 * 65,648 = 11,160,160 B
 // (88.7 %) to 171 * 65,648 = 11,225,808 B (89.2 %) of the 12,582,912-byte cap. It still fits
-// and radius 6 is still refused by 2,187,888 B, so nothing the player can select changes —
+// and radius 6 is still refused by 2,319,184 B, so nothing the player can select changes —
 // what changed is that the formula now describes the worst case instead of understating it
 // by one column. app/worker.h had recorded the understatement rather than fixing it, because
 // this file was out of that change's scope.
+//
+// [2026-09-03 CORRECTION] This paragraph previously said "2,187,888 B", which matched neither
+// the pre-v1.8.8 figure (1 staging column: 226 * 65,648 = 14,836,448 B, over by 2,253,536 B —
+// see tests/world_budget_bytes_test.c) nor the post-v1.8.8 one this paragraph is describing (2
+// staging columns: 227 * 65,648 = 14,902,096 B, over by 2,319,184 B against the 12,582,912 B
+// cap). It simply did not match the arithmetic anywhere in this file. Corrected to 2,319,184 B,
+// consistent with line 59 above and app/worker.h:86.
 //
 // It is the CEILING (app/lanes.h's WORKER_LANES_MAX), not the count of lanes actually
 // started, for the same two reasons the cap itself is shared: an Old 3DS runs one lane and is
