@@ -179,16 +179,27 @@ static inline uint8_t cellDrop(int si)
 }
 
 static FacePlan s_plan[BLOCK_FACES];
-static uint8_t  s_solid[256];                       // indexed by a raw BlockId byte
-static uint8_t  s_draws[256];                       // emits geometry: see s_cell_flags
+
+// OPT-MESHER finding 2 (measured): meshChunk's per-cell loop used to look up three
+// flags — solid, occludes, draws — from three separate 256-byte tables, three dependent
+// byte loads per cell. Compiling both forms in isolation with the project's real console
+// flags and reading the disassembly: the three-table loop body was 15 ARM instructions
+// per cell, the one-table form below is 3.5 (GCC unrolls it 8x and merges the byte
+// stores into word stores) — about 67,068 fewer instructions per chunk meshed. One byte
+// per raw BlockId, already carrying exactly the bits s_cell_flags wants; see meshChunk.
+static uint8_t  s_cell_flag_of[256];                // indexed by a raw BlockId byte
+// OPT-MESHER finding 7 (same change, same loop): blockFaceTintable() was a per-FACE
+// switch, evaluated up to six times per drawn cell by meshPass and once more by
+// emitCross. One bit per face, built once per id here instead of switched on at mesh
+// time. Bit `face` (FACE_EAST..FACE_NORTH) is set iff blockFaceTintable(id, face).
+static uint8_t  s_tint_mask[256];
 static uint8_t  s_shape[256];                       // BLOCK_SHAPE_*
 
 // Step 7.5: does this block's geometry belong in the transparent pass? Solid *and*
 // transparent — air is transparent and never drawn, so both flags have to be read.
-// A byte table for the same reason s_solid is one: the alternative is a call into
+// A byte table for the same reason s_cell_flag_of is one: the alternative is a call into
 // block.c per cell, and there is no link-time optimisation in this build.
 static uint8_t  s_deferred[256];
-static uint8_t  s_occludes[256];                    // solid and opaque: hides what is behind it
 // Sized for the whole id space, not just BLOCK_COUNT: dynamic block ids arrive
 // over the wire (0x80..0xFD) and meshPass indexes this table by that raw byte.
 // The old [BLOCK_COUNT] bound was only ever safe because every id in a chunk
@@ -205,6 +216,11 @@ void mesherInvalidateTables(void)
 	s_ready = false;
 }
 
+// Forward-declared so planBuild (below) can call it while building s_tint_mask — its own
+// definition, with the history of why each id/face answer is what it is, stays where it
+// was; only the number of call sites changes (OPT-MESHER finding 7).
+static bool blockFaceTintable(BlockId id, int face);
+
 // Builds the lookup tables. Runs once, on the first chunk meshed — and again
 // after mesherInvalidateTables(), since dynamic registrations can land between
 // joins. kFaces never changes; the block tables can.
@@ -213,18 +229,18 @@ static void planBuild(void)
 	// A raw id, not a validated one. blockInfo() already maps an unknown id to air, so
 	// this table answers for all 256 byte values and the mesher never bounds-checks.
 	for (int i = 0; i < 256; i++) {
-		const BlockInfo* info = blockInfo((BlockId)i);
-		const bool cube = info->shape == BLOCK_SHAPE_FULL_CUBE;
+		const BlockInfo* info  = blockInfo((BlockId)i);
+		const bool       cube  = info->shape == BLOCK_SHAPE_FULL_CUBE;
+		const bool       drawn = blockIsDrawn((BlockId)i);   // see s_cell_flag_of below
 
 		s_shape[i] = info->shape;
-		s_draws[i] = (uint8_t)blockIsDrawn((BlockId)i);
 
-		// v1.6.0 task 13 narrowed the three tables below by one term each, and every one
+		// v1.6.0 task 13 narrowed the three terms below by one term each, and every one
 		// of those terms is false for nothing in the registry as it stands — all eight
-		// core rows are solid-or-air full cubes, so all three tables come out byte-for-byte
-		// what they were. What each term buys:
+		// core rows are solid-or-air full cubes, so all three come out byte-for-byte what
+		// they were. What each term buys:
 		//
-		//   s_solid    "fills its cell", which is what the AO taps mean by solid. A shape
+		//   solid      "fills its cell", which is what the AO taps mean by solid. A shape
 		//              that only crosses its cell diagonally is not a crevice wall, so a
 		//              non-cube must never darken the corners of its neighbours even if
 		//              something registers it solid.
@@ -233,12 +249,30 @@ static void planBuild(void)
 		//              walks, one per direction) — so a non-cube in the opaque list would
 		//              be emitted six times over. Forcing it deferred is structural, not
 		//              a stylistic choice about alpha.
-		//   s_occludes what may hide the face behind it. This is the one that makes holes
+		//   occludes   what may hide the face behind it. This is the one that makes holes
 		//              in the world if it is wrong: an X of two quads does not cover the
 		//              cell's faces, so it can never cull its neighbour's.
-		s_solid[i]    = (uint8_t)(info->solid && cube);
-		s_deferred[i] = (uint8_t)(s_draws[i] && (info->transparent || !cube));
-		s_occludes[i] = (uint8_t)(info->solid && !info->transparent && cube);
+		const bool solid    = info->solid && cube;
+		const bool occludes = info->solid && !info->transparent && cube;
+		s_deferred[i] = (uint8_t)(drawn && (info->transparent || !cube));
+
+		// OPT-MESHER finding 2: the packed byte meshChunk's per-cell loop reads instead of
+		// three separate table lookups. solid/occludes are read ONLY here (re-verified by
+		// grep across the whole repo — both are `static`, so their scope is this file, and
+		// nothing outside this loop names either); drawn was also read at s_deferred just
+		// above, which is the only other place it was needed.
+		s_cell_flag_of[i] = (uint8_t)((solid    ? CELL_FLAG_SOLID : 0) |
+		                               (occludes ? CELL_FLAG_OCCL  : 0) |
+		                               (drawn    ? CELL_FLAG_DRAW  : 0));
+
+		// OPT-MESHER finding 7: one bit per face instead of a per-face switch evaluated at
+		// mesh time. blockFaceTintable() is pure and takes only (id, face), so building all
+		// six answers once per id here is exactly the six answers the old call sites got,
+		// just asked in advance.
+		uint8_t tint_mask = 0;
+		for (int face = 0; face < BLOCK_FACES; face++)
+			if (blockFaceTintable((BlockId)i, face)) tint_mask |= (uint8_t)(1u << face);
+		s_tint_mask[i] = tint_mask;
 	}
 
 	// Every raw byte value gets a row: blockInfo() maps undefined ids to air,
@@ -620,6 +654,19 @@ static void emitFace(MeshOut* o, const MeshScratch* s, int si, int lx, int ly, i
 // it. Cleared once per meshChunk; the opaque pass walks each direction separately and the
 // two passes never share a cell, so one table serves all seven walks.
 static uint8_t s_face_done[SCRATCH_BLOCKS];
+
+// OPT-MESHER finding 4 measurement. Counts how often mergeRun's result is actually a
+// merged run (w >= 2, faceFlatKey's corners computed for the run's first cell and then
+// recomputed by emitFace) against an unmerged single face (w == 1). Compiled out of every
+// build but the probe, same convention as world/region.c's BS_REGION_PROBE, so the game
+// pays nothing for it.
+#ifdef BS_MESH_MERGE_PROBE
+unsigned long g_mesh_merge_w1;
+unsigned long g_mesh_merge_w2plus;
+#define MERGE_PROBE_BUMP(w) do { if ((w) >= 2) g_mesh_merge_w2plus++; else g_mesh_merge_w1++; } while (0)
+#else
+#define MERGE_PROBE_BUMP(w) ((void)0)
+#endif
 
 // May cell `nb` join a run of `id` for this face? Everything meshPass would have tested for
 // the cell in its own right, in the same order and against the same tables — same block (so
@@ -1183,8 +1230,10 @@ static void meshPass(MeshOut* out, const MeshScratch* s, const EmitCell* cells,
 				// cross block's def should set all six to it.
 				// Crosses are never water and never short, so they carry no drop and their
 				// nrm byte is the bare CROSS_NRM it always was.
+				// OPT-MESHER finding 7: s_tint_mask[id] bit FACE_EAST instead of a call into
+				// the blockFaceTintable() switch — see s_tint_mask's own comment.
 				emitCross(out, s, si, e->lx, e->ly, e->lz, &rects[FACE_EAST], lit,
-				          faceTint(s, si, blockFaceTintable(e->id, FACE_EAST)));
+				          faceTint(s, si, (s_tint_mask[e->id] & (1u << FACE_EAST)) != 0));
 			}
 			continue;
 		}
@@ -1244,8 +1293,12 @@ static void meshPass(MeshOut* out, const MeshScratch* s, const EmitCell* cells,
 			// tint that decides whether two faces may share a quad is the same tint that ends
 			// up in that quad's vertices. Two answers here is the whole smear bug — see
 			// faceFlatKey.
-			const bool      tintable = blockFaceTintable(e->id, face);
+			//
+			// OPT-MESHER finding 7: s_tint_mask[id] bit `face` instead of a call into the
+			// blockFaceTintable() switch — see s_tint_mask's own comment at its declaration.
+			const bool      tintable = (s_tint_mask[e->id] & (1u << face)) != 0;
 			const int       w  = mergeRun(s, si, uc, face, e->id, deferred, lit, drop, tintable);
+			MERGE_PROBE_BUMP(w);   // OPT-MESHER finding 4 measurement — see the macro's comment
 
 			emitFaceRun(out, s, si, e->lx, e->ly, e->lz, face, &rects[face], lit, w, drop,
 			            faceTint(s, si, tintable));
@@ -1335,12 +1388,13 @@ void meshChunk(MeshOut* out, const MeshScratch* s)
 	// v1.8.6: one packed byte per cell instead of three separate arrays — see s_cell_flags'
 	// own comment above for the reasoning and for why the word-scan in emitCollect needed a
 	// mask, not just a renamed array, to stay exact.
-	for (int i = 0; i < SCRATCH_BLOCKS; i++) {
-		const BlockId id = s->blocks[i];
-		s_cell_flags[i] = (uint8_t)((s_solid[id]    ? CELL_FLAG_SOLID : 0) |
-		                            (s_occludes[id] ? CELL_FLAG_OCCL  : 0) |
-		                            (s_draws[id]    ? CELL_FLAG_DRAW  : 0));
-	}
+	//
+	// OPT-MESHER finding 2: that packed byte is now itself a single table lookup — the
+	// three-table read above (s_solid[id]/s_occludes[id]/s_draws[id]) folded once, per id,
+	// into s_cell_flag_of by planBuild. Same three bits, same values, one load instead of
+	// three per cell.
+	for (int i = 0; i < SCRATCH_BLOCKS; i++)
+		s_cell_flags[i] = s_cell_flag_of[s->blocks[i]];
 
 	// v1.6.0 task 11. No face has been claimed by a greedy run yet. One memset of 5,832
 	// bytes per chunk, against the ~24,000 face tests the passes below are about to do.
