@@ -1282,6 +1282,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/app/input_map.c \
 	source/world/mining.c \
 	source/scene/interact.c \
+	source/world/placeable.c \
 	source/audio/audio.c \
 	source/audio/audio_mixer.c \
 	source/audio/audio_pan.c \
@@ -5114,6 +5115,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/app/input_map.c \
 	source/scene/render_dist.c \
 	source/scene/interact.c \
+	source/world/placeable.c \
 	source/audio/audio.c \
 	source/audio/audio_mixer.c \
 	source/audio/audio_pan.c \
@@ -5188,6 +5190,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/app/input_map.c \
 	source/world/mining.c \
 	source/scene/interact.c \
+	source/world/placeable.c \
 	source/audio/audio.c \
 	source/audio/audio_mixer.c \
 	source/audio/audio_pan.c \
@@ -5476,3 +5479,266 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 "./$BHAN/animal_test"
 
 rm -rf "$BHAN"
+
+# ── v1.8.16 FRZ-FIX: the save-slot wait ───────────────────────────────────────────────────
+#
+# savewait_test.c -- source/app/savewait.c, the wait for a free save slot that runs on the
+# MAIN thread. This is the loop behind steve's number-one report, twice from real hardware:
+# "I walked a chunk or two from spawn, and my game is frozen, not unfrozen, and is
+# unresponsive. It has froze the entire console", with the framerate "slightly lagging"
+# first and nothing written to the SD card afterwards.
+#
+# The mechanism: main.c's genFollow -> genRecenter -> genUnloadColumn calls
+# workerSubmitSave once per DIRTY column leaving the ring -- nine columns on an axis-aligned
+# ring step at RENDER_DIST_MAX, seventeen on a diagonal -- and workerSubmitSave used to spin
+# the main thread in a bare `for (;;)` with a 1 ms sleep, no deadline, and no aptMainLoop().
+# SAVE_SLOTS is 2, so up to seven of those nine waits land in ONE frame, and while the main
+# thread is in that loop APT is unserviced: HOME stops responding and the console reads as
+# dead rather than as slow.
+#
+# savewait.c is that loop, lifted out of worker.c so it can be run here at all. worker.c
+# itself cannot be built on a host -- it is LightLock, LightEvent, svcSleepThread and
+# threadCreate all the way down, which is why this script's older note recorded the duration
+# of this wait as "NOT MEASURED, and not measurable from here". What was extracted is the
+# POLICY: the deadline, the pump threshold and the loop, with the three console-side halves
+# (room / idle / now_ms) behind function pointers that the test substitutes. It is the code
+# the console runs, not a model of it; the guard stanza below is what holds that true.
+#
+# Three arms:
+#   1. GREEN-capable -- a slot frees at 20 fake ms: SAVEWAIT_ROOM, waited_ms 19..21, and APT
+#      never pumped (20 ms is inside one frame, so the common path must be unchanged).
+#      Without this arm a deadline of "expire immediately" would satisfy arm 2 and be useless.
+#   2. THE CLAIM -- room() never true: SAVEWAIT_EXPIRED, waited_ms <= budget+2, and idle()
+#      called with pump == false before 32 ms and pump == true at and after it. That second
+#      half is the HOME-alive property, asserted rather than described.
+#   3. SABOTAGE -- the same two files rebuilt with -DSAVEWAIT_NO_DEADLINE, which compiles the
+#      deadline out of savewait.c. The binary MUST exit NON-ZERO. The exit VALUE is checked,
+#      not a grep for "FAIL" (see the survival stanza's note on suite-FAIL greps), and 127 is
+#      rejected explicitly: an arm that dies at the compiler is a build failure wearing a red
+#      arm's clothes and proves nothing about the check.
+#
+# The fake idle() trips a runaway flag and starts answering room() true after
+# SAVEWAIT_BUDGET_MS + 64 calls. That cap is what makes arm 3 FAIL instead of hanging the
+# suite forever -- a hanging test is not a failing test.
+#
+# Measured 2026-09-03, before worker.c was touched:
+#   green arm    build_exit=0, "PASS 15 checks, 0 failed", exit 0
+#   sabotage arm build_exit=0, "FAIL 15 checks, 3 failed", exit 1, first failure
+#                "L181 returns SAVEWAIT_EXPIRED rather than spinning the main thread forever
+#                (got 0)", with waited_ms 314 against a 250 ms budget.
+#
+# What it does NOT prove: anything about a real SD card, a real LightLock, or a real
+# aptMainLoop(). The clock, the slot and the sleep are all fakes.
+BHSW="build-host/run-$$-savewait"
+mkdir -p "$BHSW"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/app/savewait.c \
+	tests/savewait_test.c \
+	-o "$BHSW/savewait_test"
+
+"./$BHSW/savewait_test"
+
+# The red arm. `set -e` is on for this script, so the deliberately-failing run is taken out of
+# its way and its exit code inspected by hand.
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source -DSAVEWAIT_NO_DEADLINE \
+	source/app/savewait.c \
+	tests/savewait_test.c \
+	-o "$BHSW/savewait_test_nodeadline"
+
+sw_red=0
+"./$BHSW/savewait_test_nodeadline" > "$BHSW/red.log" 2>&1 || sw_red=$?
+echo "savewait sabotage arm (-DSAVEWAIT_NO_DEADLINE) exited $sw_red"
+if [ "$sw_red" -eq 0 ]; then
+	echo "FAILED - the deadline-free build PASSED. The deadline is not what makes the wait"
+	echo "         terminate, so tests/savewait_test.c is proving nothing."
+	sed -n '1,40p' "$BHSW/red.log"
+	exit 1
+fi
+if [ "$sw_red" -eq 127 ]; then
+	echo "FAILED - the sabotage arm exited 127, which is a BUILD failure, not a caught bug."
+	sed -n '1,40p' "$BHSW/red.log"
+	exit 1
+fi
+echo "savewait sabotage arm: correctly red (exit $sw_red, and not 127)"
+
+rm -rf "$BHSW"
+
+# savewait_guard_test.c -- the other half of the stanza above, and the reason it means
+# anything. Reads source/app/worker.c AS TEXT and asserts that workerSubmitSave() and
+# workerFlushSaves() each call saveWaitForRoom( and neither contains a `for (;;)` of its own,
+# and that workerSaveIdle() calls aptMainLoop(). Without this, savewait.c could be perfect,
+# its test green, and worker.c could still ship its own unbounded spin -- the
+# test-links-nothing failure mode, exactly.
+#
+# It is a TEXT SCAN and cannot follow calls: a new helper called from workerSubmitSave that
+# itself spun would leave every check here green. Modelled on
+# source/world/framesync_guard_test.c, which has the same limit, and the test file says so at
+# the top so nobody trusts it further than it goes. No project sources on the compile line --
+# the whole test is string parsing over plain-text lines.
+#
+# Measured 2026-09-03 against the UNFIXED worker.c (its own red arm, and a real one -- this is
+# the state the file was in when the stanza was written): "FAIL 9 checks, 5 failed", exit 1,
+# first failure "workerSubmitSave calls saveWaitForRoom( (found 0)", with the diagnostic
+# "first spin at L698: 'for (;;) {'".
+BHSWG="build-host/run-$$-savewait-guard"
+mkdir -p "$BHSWG"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	tests/savewait_guard_test.c \
+	-o "$BHSWG/savewait_guard_test"
+
+"./$BHSWG/savewait_guard_test"
+
+rm -rf "$BHSWG"
+
+# tests/cross_light_test.c -- smooth per-vertex light on BLOCK_SHAPE_CROSS geometry (v1.8.16).
+# Own binary, own main(), appended rather than merged into any stanza above it for the reason
+# every stanza in this file is appended: an append is the one edit shape that cannot drop
+# another session's work, and this file is shared.
+#
+# THE BUG. Cube faces have carried smooth per-vertex light since v1.5.0 -- world/mesher.c's
+# cornerLight() averages the four cells touching a face corner from outside the face into
+# MeshVertex.pad. Cross-shaped blocks (torch, tall grass, tall grass top, fern) were left out:
+# emitCross() wrote `v->pad = lit ? s->light[si] : 0;`, one flat value for all sixteen vertices,
+# taken from the plant's own cell. So crosses were the only geometry in the game still lit the
+# blocky pre-v1.5.0 way, which is exactly what steve reported wanting gone, and the torch is
+# where it shows worst -- a torch IS the steepest light gradient in the world and its own quads
+# were flattening it.
+#
+# THE FIX, and the design question it had to answer first. A cross quad is a diagonal plane
+# through the middle of the cell and has no face normal, so "the four cells outside the face"
+# has nothing to be outside of. What a cross vertex does have is a real lattice corner -- all
+# sixteen sit on the cell's eight integer corners, because MeshVertex positions are whole block
+# units and cannot express anything else -- and those eight corners are exactly the four corners
+# of FACE_BOTTOM plus the four of FACE_TOP. mesher.c's new crossCornerLight() is handed those
+# two existing FacePlans and their existing CornerPlans, so there is no new corner table and no
+# second copy of the face geometry, and it adds the cell's OWN light as a fifth, always-counted
+# tap. That fifth tap is not decoration: a torch stands on a floor, so all four outward taps of
+# a BOTTOM corner are occluding stone, cnt comes out 0, and avgByCnt(0,0) returns 0 -- every
+# torch in the world would get a black base. avgByCnt gained a `case 5` for it ((n*205)>>10,
+# exact for /5 over 0..75); cases 1..4 are untouched, which ARM 7's pin below proves.
+#
+# Cost: eight crossCornerLight() calls per cross CELL, not per vertex -- the two planes and the
+# two windings write each of the eight corners twice over, so the values are computed once into
+# a [2][2][2] table and shared. Forty tap-loads per plant against one before; a fully exposed
+# cube face pays sixteen per face and up to ninety-six per cell, so a plant is still cheaper
+# than the block it stands on. Nothing is computed at all when the light engine is off.
+#
+# CODE SIZE, priced rather than assumed. crossCornerLight is deliberately NOT inline (see the
+# comment on it in world/mesher.c). Compiled with the Makefile's own console flags:
+#
+#   /c/devkitPro/devkitARM/bin/arm-none-eabi-gcc.exe -g -Wall -Wextra -Werror -O3 \
+#     -mword-relocations -ffunction-sections -march=armv6k -mtune=mpcore -mfloat-abi=hard \
+#     -mtp=soft -Isource -Ideps/libhydrogen -Ideps/blocksmith-server \
+#     -I/c/devkitPro/libctru/include -I/c/devkitPro/portlibs/3ds/include -D__3DS__ \
+#     -c source/world/mesher.c -o mesher.o
+#
+# mesher.o .text: 13,856 B at HEAD before this task, 16,984 B with crossCornerLight inlined
+# (-O3 unrolls the caller's 2x4 loop and inlines eight copies), 14,856 B as shipped. Host
+# benchmark on a chunk holding 256 plants, 4,000 meshChunk() calls per run: inlined 0.0818 /
+# 0.0845 / 0.0887 ms per call, called 0.0862 / 0.0877 -- the spread inside one arm is wider
+# than the gap between the arms, so there is no measurable time cost to pay for the 2,128 B.
+# This is a compile-only check of one translation unit; NO full console build or CIA was made
+# and nothing was run on hardware.
+#
+# Crosses BYPASS the greedy merge entirely and this change does not alter that: meshPass returns
+# at `if (s_shape[e->id] != BLOCK_SHAPE_FULL_CUBE)` before the six-face loop that calls
+# mergeRun, so faceFlatKey is never asked about a cross and no run can split. ARM 6 pins it --
+# four plants in a row in identical light stay 16 quads / 64 vertices.
+#
+# RED, measured against the real pre-fix production mesher (this suite written first and run
+# before a line of mesher.c was touched):
+#   torch cell own=14   bottom corner pad=14   top corner pad=14
+#   FAIL  L283  the torch's bottom and top corners both read 14 - the cross is still taking one
+#               flat value from its own cell, which is the blocky lighting this task removes
+#   FAIL  L292  all 16 cross vertices carry pad 14 - flat
+#   band above the plant: -x=11  +x=9
+#   FAIL  L355  the two ends of one cross quad's top edge read 11 and 11
+#   FAIL  L393  the two torches' 16 light bytes are identical (all 14)
+#   FAIL  L396  both torches' bottom corners read 14
+#   cross light self-test: FAILED, RUN_EXIT=1
+#
+# GREEN after the fix, same fixtures, real numbers: torch bottom 14 / top 12; tall grass three
+# cells from a torch reads 10 at the near end of one diagonal and 9 at the far end; the torch
+# on stone reads 14 at its base and the floating one 12. PASS 33 checks.
+#
+# SECOND RED ARM, on a COPY of mesher.c outside the tree (the production file was never
+# sabotaged), with crossCornerLight's own-cell seed removed -- `int ssum = s->light[si] >> 4,
+# bsum = s->light[si] & 15, cnt = 1;` put back to `int ssum = 0, bsum = 0, cnt = 0;`:
+#   bottom corner (0,0,0) pad=0
+#   FAIL  L317  bottom corner (0,0,0) is pad 0: the base of every torch in the world is BLACK
+#   ... the same for (1,0,0), (0,0,1), (1,0,1) -- "FAILED - 4 of 33 checks", RUN_EXIT=1.
+# That is ARM 3 proving it can go red, and it is the check to run before anyone "simplifies"
+# crossCornerLight back into cornerLight.
+#
+# ARM 1 (engine OFF, hash 0x99623c99) and ARM 7 (a LIT world with no crosses in it, hash
+# 0x806ce44c) are the two controls, and both hashes were captured from the PRE-FIX tree. They
+# are the statement that an unlit build is byte-identical and that the shared cube-face lighting
+# path did not move. If either goes red the fix escaped emitCross.
+#
+# Sibling suites re-run green against the fixed mesher on the same tree: world self-test PASS
+# 6136 (which carries the four pinned mesh hashes), tests/mesher_hashcheck.c
+# "selfCheckPinnedHashes: OK, all 4 world_test.c fixtures reproduced byte-for-byte" over 408
+# chunks, world/water_mesh_test.c PASS 75, world/biome_tint_test.c PASS 79, light_seam PASS 18,
+# light_luminance 108/108, light_combine PASS 24, light_race PASS 28, relight_drain PASS 68,
+# scratch_light PASS 21.
+BHCL="build-host/run-$$-crosslight"
+mkdir -p "$BHCL"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/world.c \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/budget.c \
+	source/world/scratch.c \
+	source/world/mesher.c \
+	tests/net_stub.c \
+	tests/cross_light_test.c \
+	-lm \
+	-o "$BHCL/cross_light_test"
+
+"./$BHCL/cross_light_test"
+
+rm -rf "$BHCL"
+
+#---------------------------------------------------------------------------------------
+# scene/entitymodel_test.c -- THE ANIMAL MODEL (v1.8.16): the box table, the UV unwrap and
+# the vertex format.
+#
+# Links NOTHING but the test and its header, and that is the point rather than an oversight.
+# scene/entitymodel.c is citro3d code -- C3D_TexBind, Tex3DS_TextureImport, a TEV stage --
+# and none of it can run on a host. What CAN be checked on a host is everything that decides
+# what the GPU is handed: which boxes exist, where their UV islands land, that no two islands
+# overlap, that each island is inside the sheet, and that EmVertex is laid out the way
+# entitymodel.c's BufInfo_Add claims it is.
+#
+# That last one is worth a line of its own. The test reads pos/uv offsets and the stride with
+# offsetof rather than restating 0/12/20 as literals, so if somebody reorders the struct the
+# test moves with it and the ASSERTION about what the loader is told still bites. On the PICA
+# a wrong stride is not a wrong picture, it is a hang -- see the 3-component-attribute freeze
+# that Azahar cannot reproduce -- so this is a cheap guard against an expensive failure.
+#
+# PROVEN ABLE TO GO RED: sabotaging one UV seam gave 96 failures and exit 1. A layout test
+# that only ever passes is a layout test that is reading its own expectations.
+#
+# NOT PROVED HERE: that the sheet looks like a pig. The art is judged by rendering
+# gfx/animals.png over this same vertex data offline (see tools/make_animals.py) and, in the
+# end, by looking at a 3DS.
+BHEM="build-host/run-$$-entitymodel"
+mkdir -p "$BHEM"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/scene/entitymodel_test.c \
+	-lm \
+	-o "$BHEM/entitymodel_test"
+
+"./$BHEM/entitymodel_test"
+
+rm -rf "$BHEM"
