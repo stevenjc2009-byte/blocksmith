@@ -11,6 +11,7 @@
 // see app/savewait.h. watchdog.h is here for watchdogWriteFile(), the raw-FS writer the hang
 // report uses; workerSaveStallNote below needs the same one and for the same reason.
 #include "app/savewait.h"
+#include "app/stage_probe.h"
 #include "app/watchdog.h"
 #include "debug/loadprof.h"
 #include "world/jobq.h"
@@ -359,6 +360,20 @@ static void workerMain(void* arg)
 	// v1.8.16 exheader's system-call mask.
 	ln->core_run = svcGetProcessorID();
 
+	// FRZ-PROBE. One marker per lane, at thread start, naming which lane index this is — so a
+	// freeze that happens before ANY worker lane got scheduled at all shows up as "no
+	// WORKER_LANE line in stage.txt" rather than as silence. See app/stage_probe.h. The whole
+	// block sits behind its own #if, not just the BS_STAGE() call inside it — otherwise the
+	// snprintf() and its format-string literal would still be compiled into every shipped
+	// build, which is exactly what this flag promises never to do.
+#if BS_STAGE_PROBE
+	{
+		char sp_buf[32];
+		snprintf(sp_buf, sizeof(sp_buf), "WORKER_LANE%d core=%ld", ln->index, (long)ln->core_run);
+		BS_STAGE(sp_buf);
+	}
+#endif
+
 	for (;;) {
 		// Cleared *before* the queue is inspected, so a job submitted between the
 		// inspection and the wait leaves the event signalled and the wait returns
@@ -424,6 +439,12 @@ static void workerMain(void* arg)
 				const uint64_t t_gen = loadprofMark();
 				ok = worldgenColumn(s_gen, &ln->wgs, &ln->staging, job.cx, job.cz);
 				loadprofSince(LOAD_STAGE_GENERATE, t_gen);
+
+				// FRZ-PROBE. First column this process has ever actually generated (as
+				// opposed to loaded off the card) — the marker "create new world" needs,
+				// since a fresh world has nothing on the card and every column takes this
+				// path. Only fires once, whichever lane gets there first.
+				if (ok) BS_STAGE_ONCE(BS_STAGE_ID_WORLDGEN_COL, "WORLDGEN_COL_FIRST");
 			}
 
 			// v1.5.0 adaptive lighting: light the staged column while it is here, before
@@ -440,6 +461,10 @@ static void workerMain(void* arg)
 				if (!lightPropagateColumn(&ln->staging, job.cx, job.cz, ln->lightq))
 					lightRelightColumn(&ln->staging, job.cx, job.cz);
 				loadprofSince(LOAD_STAGE_LIGHT, t_light);
+
+				// FRZ-PROBE. First light pass this process has run, either engine (BFS or
+				// the sweep fallback) — see app/stage_probe.h.
+				BS_STAGE_ONCE(BS_STAGE_ID_LIGHT_PASS, "LIGHT_PASS_FIRST");
 			}
 			break;
 		// JOB_MESH is the main thread's — it writes GPU-visible memory, which belongs to

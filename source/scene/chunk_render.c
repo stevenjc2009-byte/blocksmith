@@ -8,6 +8,7 @@
 #include <tex3ds.h>
 
 #include "app/drawprobe.h"
+#include "app/stage_probe.h"
 #include "app/watchdog.h"
 #include "debug/metrics.h"
 #include "gfx/atlas.h"
@@ -65,9 +66,21 @@
 // the draw as well as recording it is not a guess at the fix — a draw that reaches outside the
 // buffer bound for it has no correct behaviour to fall back on.
 //
-// Off by default:  make EXTRA_CFLAGS="-DBS_DRAW_GUARD=1"
+// ON by default as of v1.8.17. It was OFF from the day it was written through v1.8.16 — the
+// whole run that includes the v1.8.16 build that froze steve's console on 2026-09-03 — and for
+// every one of those releases it was also silently unbuildable: boundVertCap() below referenced
+// kTierSlots[t], an identifier the v1.8.5 runtime-pool-sizing refactor deleted in favour of
+// s_tier_count[t] (declared above, set in chunkRenderInit) without updating this file's one
+// remaining use of the old name. Because the broken line sat inside `#if BS_DRAW_GUARD` and the
+// flag defaulted to 0, the shipped build never compiled it and nothing caught the stale
+// reference — `make EXTRA_CFLAGS="-DBS_DRAW_GUARD=1"`, the invocation this comment used to
+// document, failed outright with `'kTierSlots' undeclared`. So this guard contributed exactly
+// zero protection to any release from v1.8.5 to v1.8.16, including the one that froze his
+// console. Fixed and turned on now, for the reason its own doc comment above already gives:
+// refusing one malformed draw costs a chunk's geometry for a frame; issuing it wedges the GPU
+// and kills the console. That trade is not close enough to leave off by default.
 #ifndef BS_DRAW_GUARD
-#define BS_DRAW_GUARD 0
+#define BS_DRAW_GUARD 1
 #endif
 
 // Deliberately corrupts one draw so the guard above can be seen going red. See drawIndices.
@@ -1770,6 +1783,11 @@ void chunkRenderExit(void)
 
 bool chunkRenderBuild(const World* w, int cx, int cy, int cz)
 {
+	// FRZ-PROBE. First line of the function that actually meshes a chunk — genDrainMesh()
+	// (main.c) calls this once per chunk it drains. See app/stage_probe.h; a no-op unless
+	// built with -DBS_STAGE_PROBE=1.
+	BS_STAGE_ONCE(BS_STAGE_ID_MESH_BUILD, "MESH_BUILD_FIRST");
+
 	// Step 9.2c. Looked up before anything else and independent of size: whether this
 	// chunk already owns a slot decides both the empty-chunk path below and, in the
 	// meshed path further down, whether a rebuild can recycle its slot in place or has to
@@ -2512,7 +2530,7 @@ static uint32_t boundVertCap(const MeshSlot* s)
 		if (!s_tier_arena[t]) continue;
 		const uint32_t cap   = (uint32_t)kTierFaces[t] * 4;
 		const MeshVertex* lo = s_tier_arena[t];
-		const MeshVertex* hi = lo + (size_t)cap * (size_t)kTierSlots[t];
+		const MeshVertex* hi = lo + (size_t)cap * (size_t)s_tier_count[t];
 		if (s->verts < lo || s->verts >= hi) continue;
 		// Must be the *start* of a slot, not somewhere in the middle of one.
 		if ((size_t)(s->verts - lo) % cap) return 0;
@@ -3098,6 +3116,26 @@ void chunkRenderDraw(const C3D_Mtx* view)
 #endif
 	for (int k = n - 1; k >= 0; k--) {
 		const MeshSlot* s = &s_slots[s_vis_list[k]];
+		// v1.8.17. UNSIGNED, and that is the entire reason this line exists. The transparent
+		// run is the tail of the slot's index range, so its length is a subtraction — and if
+		// opaque_index_count ever exceeded index_count the result would not come out negative,
+		// it would come out near four billion, and C3D_DrawElements takes an int. The GPU gets
+		// handed -1 and fetches vertices forever.
+		//
+		// drawSane() below does NOT catch that, which is why the check is here and not left to
+		// it. Worked through with opaque_index_count = 901 and index_count = 900: count wraps
+		// to 0xFFFFFFFF, which is 0 mod 3, so the whole-triangles check passes; first + count
+		// wraps modularly back to exactly 900, which is inside MESH_SLOT_INDICES, so the range
+		// check passes; and the index it then reads is s_shared_indices[899], real in-range
+		// mesh data, so the capacity check passes as well. All four checks are walked straight
+		// through by the double wraparound. A guard a bad value can stroll past is not a guard.
+		//
+		// world/mesher.c does hold the invariant today — it sets opaque_index_count equal to
+		// index_count before the transparent pass, which only ever increments index_count
+		// further, and any overflow discards the whole mesh rather than publishing a partial
+		// one. This costs one comparison per visible chunk to stop that being a promise made
+		// in a different file, on the one code path whose failure mode is a wedged console.
+		if (s->index_count < s->opaque_index_count) continue;
 		const uint32_t  count = s->index_count - s->opaque_index_count;
 		if (!count) continue;
 

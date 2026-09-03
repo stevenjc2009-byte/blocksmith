@@ -37,6 +37,7 @@
 #include "app/sleep.h"
 #include "app/updater.h"
 #include "app/gputest.h"
+#include "app/stage_probe.h"
 #include "app/watchdog.h"
 #include "app/worker.h"
 #include "debug/biomeinfo.h"
@@ -2130,6 +2131,7 @@ static bool runLoadingScreen(bool draw, const char* heading, const char* world_n
 	while (aptMainLoop()) {
 		watchdogPhase(WD_PHASE_INPUT);
 		hidScanInput();
+		BS_STAGE_ONCE(BS_STAGE_ID_INPUT_POLL, "INPUT_POLL_FIRST");
 		const u32 down = hidKeysDown();
 
 		// Same two-signal touch read the title screen and the HUD use, for the same reason —
@@ -2182,6 +2184,7 @@ static bool runLoadingScreen(bool draw, const char* heading, const char* world_n
 		loadprofFrame();
 		if (bottom) {
 			C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+			BS_STAGE_ONCE(BS_STAGE_ID_FRAME_BEGIN, "FRAME_BEGIN_FIRST");
 			spriteFrameBegin();
 
 			// The top screen is cleared and bound every frame for the same reason the title
@@ -2195,6 +2198,7 @@ static bool runLoadingScreen(bool draw, const char* heading, const char* world_n
 			loadingDraw(&st, heading, world_name);
 
 			C3D_FrameEnd(0);
+			BS_STAGE_ONCE(BS_STAGE_ID_FRAME_END, "FRAME_END_FIRST");
 		} else {
 			gspWaitForVBlank();
 		}
@@ -3534,6 +3538,7 @@ static bool runTitleScreen(Options* opts, bool returning_from_server)
 
 	while (aptMainLoop()) {
 		hidScanInput();
+		BS_STAGE_ONCE(BS_STAGE_ID_INPUT_POLL, "INPUT_POLL_FIRST");
 
 		// KEY_TOUCH is read from *held*, not down: title.c needs "is the stylus on the
 		// screen right now" for its own tap-on-the-edge logic (TitleState.touch_prev), and a
@@ -3588,6 +3593,7 @@ static bool runTitleScreen(Options* opts, bool returning_from_server)
 		networldUpdate();
 
 		C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+		BS_STAGE_ONCE(BS_STAGE_ID_FRAME_BEGIN, "FRAME_BEGIN_FIRST");
 		spriteFrameBegin();
 
 		// title.c calls spriteBegin(320, 240) itself and assumes the caller has already
@@ -3611,6 +3617,7 @@ static bool runTitleScreen(Options* opts, bool returning_from_server)
 		titleDrawTop(&ts);
 
 		C3D_FrameEnd(0);
+		BS_STAGE_ONCE(BS_STAGE_ID_FRAME_END, "FRAME_END_FIRST");
 
 		if (r.action == TITLE_QUIT) return false;
 
@@ -4103,6 +4110,12 @@ static void memProbeBootFlush(void)
 
 int main(void)
 {
+	// FRZ-PROBE. Before literally anything else, so a stage.txt from a PREVIOUS boot can never
+	// be misread as this boot's history. See app/stage_probe.h; a no-op unless built with
+	// -DBS_STAGE_PROBE=1.
+	BS_STAGE_INIT();
+	BS_STAGE("MAIN_ENTER");
+
 	// Step 8.5, first of everything. It only writes this thread's TLS exception slot — no
 	// gfx, no FS, nothing that can itself fail — so every line after it is covered. A crash
 	// during screenInit is exactly the kind that is impossible to diagnose otherwise,
@@ -4166,9 +4179,19 @@ int main(void)
 	// Not yet confirmed on a console: nothing has run the memprobe since the change.
 	memProbeBootMark("net+networld");
 
+	// FRZ-PROBE. hwInit/audioInit/psInit/netInit/networldInit have all run; screenInit (the
+	// GPU/citro3d claim) has not. If the freeze is in one of the basic 3DS services rather
+	// than in anything game-specific, this is the last marker on the card.
+	BS_STAGE("SERVICES_INIT");
+
 	screenInit();
 	metricsInit();
 	memProbeBootMark("screenInit+metrics");
+
+	// FRZ-PROBE. screenInit() is gfxInit + C3D_Init — the GPU/citro3d context itself. If the
+	// freeze is inside citro3d's own setup, SERVICES_INIT is the last marker and this one
+	// never appears.
+	BS_STAGE("GPU_INIT");
 
 #if BS_GPU_TESTS && BS_GPU_PREFLIGHT
 	// Before the title screen and before a world exists, so a console that fails one of these
@@ -4207,6 +4230,11 @@ int main(void)
 	// disagrees, the console is right.
 	memProbeBootMark("chunkRenderInit");
 	memProbeBootFlush();
+
+	// FRZ-PROBE. chunkRenderInit() just succeeded: the shader program is bound, the terrain
+	// atlas is uploaded to the GPU and the three mesh-tier arenas are claimed (see this
+	// function's own "shader/atlas/pool init FAILED" message above for what it covers).
+	BS_STAGE("ATLAS_SHADER_INIT");
 
 	// v1.8.9 weather rendering. Same phase as chunkRenderInit above -- a one-time GPU-object
 	// claim (shader/texture/vertex buffer) made once for the process, before session_start,
@@ -4564,6 +4592,12 @@ session_start:
 	// and playerPoseLoad() refuses outright: the server owns that world and this console
 	// gains no file from it.
 	const char* const boot_dir = s_server_session ? NULL : saveWorldDir();
+
+	// FRZ-PROBE. saveWorldDir() just mkdir'd the world's save directory and write-probed the
+	// card — the save system is up (or, in a server session, deliberately not touched at
+	// all: boot_dir is NULL there and this still marks the point that decision was made).
+	BS_STAGE("SAVE_INIT");
+
 	const bool world_played_before = worldHasBeenPlayed(boot_dir);
 	BOOT_END("worldHasBeenPlayed");
 	// v1.7.1 task 48b. The distinction steve's report turns on — "creating a world" against
@@ -4619,6 +4653,21 @@ session_start:
 	const bool worker_ok = genStart(have_saved_pose ? genColumnOf(saved_pose.x) : 0,
 	                                have_saved_pose ? genColumnOf(saved_pose.z) : 0);
 	BOOT_END("genStart");
+
+	// FRZ-PROBE. genStart() just returned: it allocates the new World, centres the streaming
+	// ring and starts the worker lane(s) (app/worker.c's threadCreate — see WORKER_LANE0 /
+	// WORKER_LANE1 for whether either lane actually got scheduled). worker_ok says whether it
+	// was refused outright; either way, control reached here. The whole block sits behind its
+	// own #if, not just the BS_STAGE() call inside it — otherwise the snprintf() and its
+	// format-string literal would still be compiled into every shipped build, which is
+	// exactly what this flag promises never to do.
+#if BS_STAGE_PROBE
+	{
+		char sp_buf[48];
+		snprintf(sp_buf, sizeof(sp_buf), "NEW_WORLD_ALLOC worker_ok=%d", (int)worker_ok);
+		BS_STAGE(sp_buf);
+	}
+#endif
 
 	// v1.8.3. genStart() returning false has always meant "there is no world to walk into", and
 	// until now nothing acted on it. worker_ok gated the sleep hooks below and fed WORLD_INTACT()
@@ -6609,6 +6658,16 @@ session_start:
 		watchdogPhase(WD_PHASE_DRAW);
 		// v1.8.10: metricsSyncBegin/End no longer wrap this block. The queue wait they existed
 		// to time now happens in gpuWaitPrevFrame(), far above, and the metric moved with it.
+		//
+		// FRZ-NETFIX, 2026-09-03. True unless one of the two bounded waits below (BS_DRAW_PROBE's
+		// nested BS_GPU_TESTS arm, or the plain #elif BS_GPU_TESTS shipping arm) catches a wedged
+		// GPU, in which case it goes false and C3D_FrameBegin is skipped instead of being called
+		// unconditionally against a queue that has just proven it does not drain. Read below by
+		// the `if (frame_opened)` that wraps the whole draw body, from spriteFrameBegin() down to
+		// the metricsDrawOverlay()/worldReportDraw() at the end of the frame — see the shipping
+		// arm's comment for the reasoning. The plain #else arm (BS_GPU_TESTS=0, no bounded wait
+		// exists there to catch anything) never touches this flag and always draws.
+		bool frame_opened = true;
 #if BS_DRAW_PROBE
 		// The same two waits C3D_FrameBegin(C3D_FRAME_SYNCDRAW) performs internally, called
 		// separately so the hang report can name which of them the console stopped in. See the
@@ -6650,13 +6709,27 @@ session_start:
 		//
 		// On the normal path this changes nothing at all. The queue drains in microseconds, this
 		// wait returns true, and the C3D_FrameBegin below finds nothing left to wait for.
+		//
+		// FRZ-NETFIX, 2026-09-03. This arm had the same unconditional-FrameBegin-after-a-detected-
+		// wedge bug as the plain `#elif BS_GPU_TESTS` shipping arm below — see that arm's comment
+		// for the evidence and the full reasoning, which applies here unchanged. gpu_dead is its
+		// own static in this block rather than shared with the shipping arm's, the same way
+		// gpu_frame already was, because only one of the two arms is ever compiled into a given
+		// binary.
 		{
 			static uint32_t gpu_frame;
+			static bool     gpu_dead;
 			gpu_frame++;
-			if (!gpuTestFrameWait()) gpuTestPostMortem(gpu_frame);
+			if (gpu_dead) {
+				frame_opened = false;
+			} else if (!gpuTestFrameWait()) {
+				gpuTestPostMortem(gpu_frame);
+				gpu_dead     = true;
+				frame_opened = false;
+			}
 		}
 #endif
-		C3D_FrameBegin(0);
+		if (frame_opened) C3D_FrameBegin(0);
 #elif BS_GPU_TESTS
 		// The shipping build's safety net, and the only piece of the diagnostic battery it keeps.
 		//
@@ -6670,16 +6743,73 @@ session_start:
 		// held down to power off and one that writes postmortem.txt and keeps running. Up to
 		// v1.1.8 that wait was unbounded, which is why every freeze report had to be scraped out
 		// of the watchdog thread after the fact.
+		//
+		// FRZ-NETFIX, 2026-09-03. That difference was a lie. Up to and including v1.8.16 this was:
+		//
+		//   if (!gpuTestFrameWait()) gpuTestPostMortem(gpu_frame);
+		//   C3D_FrameBegin(0);
+		//
+		// — unconditional. The post-mortem ran, and the very next line called C3D_FrameBegin(0)
+		// anyway, which gpuWaitPrevFrame()'s own header comment (above, ~L3812) documents from the
+		// disassembly as C3D_FRAME_SYNCDRAW's vblank wait FOLLOWED BY an unconditional
+		// gxCmdQueueWait(-1) — the exact unbounded wait this whole file exists to avoid. Against a
+		// GPU that had JUST failed a 2-second bounded wait on the line above, that unbounded wait
+		// never returns. steve's console proved it on 2026-09-03 running v1.8.16: postmortem.txt
+		// was written to the card AND the console was still frozen solid, HOME included. The
+		// safety net caught the fall and then walked off the same cliff.
+		//
+		// The fix is frame_opened (declared above the #if BS_DRAW_PROBE chain this block sits in)
+		// and the sticky gpu_dead below. A detected wedge now skips C3D_FrameBegin(0) entirely for
+		// this iteration — no frame opens, so nothing is left unpaired — and the whole draw body
+		// from spriteFrameBegin() down to the metricsDrawOverlay()/worldReportDraw() at the bottom
+		// of the frame is wrapped in `if (frame_opened)` for the same reason: every line in that
+		// span either assumes an open C3D frame or submits GPU work of its own (spriteFrameBegin,
+		// both drawEye calls, the bottom-screen UI, C3D_FrameEnd, the BS_DRAW_PROBE hooks, the
+		// completion screenshot in worldReportDraw), and none of it can run against a queue that
+		// just proved it does not drain. watchdogCounters/watchdogBeat/probeFrame and
+		// watchdogPhase(WD_PHASE_APT) sit AFTER that guard's closing brace and stay unconditional —
+		// that split is the whole fix, because those are what keep aptMainLoop() serviced and HOME
+		// answering on a skipped frame.
+		//
+		// gpu_dead is sticky on purpose. The GPU does not un-wedge itself, so without it every
+		// later frame would pay another 2-second gxCmdQueueWait for an answer already known,
+		// turning a frozen console into one that merely runs at a small fraction of a frame per
+		// second — not a fix, just a slower version of the same failure. Once set, later frames
+		// skip gpuTestFrameWait() entirely and go straight to frame_opened = false.
+		// gpuTestPostMortem() already has its own one-shot `static bool done` guard
+		// (app/gputest.c) and would only ever run its report once regardless — gpu_dead is what
+		// stops paying for the 2-second wait that leads to it, not what stops it firing twice.
+		//
+		// There is deliberately no on-screen message. Every draw call this build has, including
+		// BS_BOTTOM_UI's text panel, is itself a GPU submission and lives inside the same
+		// frame_opened guard for the reason above — a wedged GPU cannot be asked to display a
+		// sentence about being wedged. What the player gets instead is the last frame that
+		// actually completed, held on both screens, with HOME still live. That is the entire
+		// distinction this fix draws: it does not un-wedge the GPU, it stops the wedge from
+		// taking the console down with it.
 		C3D_FrameSync();
 		{
 			static uint32_t gpu_frame;
+			static bool     gpu_dead;
 			gpu_frame++;
-			if (!gpuTestFrameWait()) gpuTestPostMortem(gpu_frame);
+			if (gpu_dead) {
+				frame_opened = false;
+			} else if (!gpuTestFrameWait()) {
+				gpuTestPostMortem(gpu_frame);
+				gpu_dead     = true;
+				frame_opened = false;
+			}
 		}
-		C3D_FrameBegin(0);
+		if (frame_opened) C3D_FrameBegin(0);
 #else
 		C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
 #endif
+		// FRZ-NETFIX, 2026-09-03. Everything from here down to the metricsDrawOverlay()/
+		// worldReportDraw() below either assumes C3D_FrameBegin actually opened a frame this
+		// iteration or submits GPU work of its own, so none of it is safe to run when the bounded
+		// wait above just caught a wedge and left frame_opened false. See the shipping arm's
+		// comment a few lines up for the full reasoning and what stays unconditional instead.
+		if (frame_opened) {
 		spriteFrameBegin();
 			// Step 7.6. In 2D this is one call with iod 0, which is exactly the frame this
 			// loop drew before the step existed. In 3D it is the same work twice, and that
@@ -6862,10 +6992,17 @@ session_start:
 		// indistinguishable from aiming at nothing.
 		metricsDrawOverlay(highlight_ok ? status : "HIGHLIGHT INIT FAILED");
 #endif
+		} // FRZ-NETFIX, 2026-09-03: if (frame_opened), opened just above spriteFrameBegin()
 
 		// Last in the iteration, so a frame only counts once it has actually finished. The
 		// counters go out with it: what the world was doing is half of what a hang report needs
 		// to be worth reading, the other half being the phase markers above.
+		//
+		// FRZ-NETFIX, 2026-09-03. Unconditional on purpose, on the far side of the frame_opened
+		// guard above: these are bookkeeping, not GPU work, and they are what keep aptMainLoop()
+		// serviced and HOME answering on an iteration whose draw was skipped. watchdogBeat() in
+		// particular is the watchdog thread's proof of life — a skipped frame that also skipped
+		// this would look exactly like the hang the wedge already survived.
 		watchdogCounters(s_world.columns, chunkRenderMeshes(), jobqCount(&s_meshq),
 		                 workerBusy());
 		watchdogBeat();
