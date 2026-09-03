@@ -70,6 +70,7 @@
 #include "scene/ringorder.h"
 #include "scene/title.h"
 #include "scene/ui.h"
+#include "world/blockstate.h"
 #include "world/budget.h"
 #include "world/daynight.h"
 #include "world/genrefuse.h"
@@ -2779,6 +2780,16 @@ static void drawEye(C3D_RenderTarget* target, const C3D_Mtx* view, const RayHit*
 // bottom-screen draw below is a file-scope function and needs it.
 static Inventory s_inv;
 
+// v1.8.15. Per-block state for blocks that carry any — currently only the furnace, which needs
+// to remember its fuel, its input and how far along the smelt is. A single 2 KB side table
+// (BLOCKSTATE_SLOTS 64 entries of 32 bytes) rather than widening the block id or the chunk
+// format, because the overwhelming majority of blocks carry no state at all and paying for a
+// payload on every cell in the world to serve sixty-four of them is the expensive way round.
+//
+// File static for the same two reasons as s_inv above: the bottom-screen draw is a file-scope
+// function, and the lid-close flush hook is a callback. Neither can see main()'s locals.
+static BlockStateTable s_blockstate;
+
 // v1.8.13 SURV-WIRE. The player's vitals, reachable from file scope for exactly the two
 // reasons s_sleep_player below is a file static: the bottom-screen draw is a file-scope
 // function and the lid-close flush hook is a callback, and neither can see main()'s locals.
@@ -4917,6 +4928,18 @@ session_start:
 	if (inv_dir) inventoryLoad(&s_inv, inv_dir);
 	else         inventoryInit(&s_inv);
 
+	// v1.8.15, on exactly the same guard and for exactly the same reasons. inv_dir is reused
+	// rather than calling saveWorldDir() a second time: two calls could in principle disagree,
+	// and a world whose inventory persists but whose furnaces do not would be a strange,
+	// hard-to-report halfway state. One directory decision, both files.
+	//
+	// blockStateLoad, like inventoryLoad, always leaves the table valid — a missing or corrupt
+	// sidecar is an empty table, not an error to handle here. Its return value says whether a
+	// file was actually read, which nothing needs yet; ignoring it is deliberate rather than an
+	// oversight, and is why the (void) is written out.
+	if (inv_dir) (void)blockStateLoad(&s_blockstate, inv_dir);
+	else         blockStateInit(&s_blockstate);
+
 	// v1.7.1 task 46b. What the lid-close flush hook needs to write a pose, handed over now
 	// that both halves exist — the Player was built above and the directory on the line
 	// above that. Pointers, not a copy: the hook fires at an arbitrary moment during play and
@@ -5826,6 +5849,25 @@ session_start:
 		if (it.broke_id != BLOCK_AIR)
 			invBridgeAdd(&s_inv, it.broke_id, 1, NULL);
 
+		// v1.8.15. A block that carried per-position state has just stopped existing, so the
+		// state goes with it. Read on the same schedule and immediately after the same call,
+		// for the same reason as broke_id above: interactEdit clears broke_valid at the top of
+		// its next call.
+		//
+		// Gated on broke_valid, NOT on broke_id, and the difference matters. broke_id is
+		// BLOCK_AIR for a break that dropped nothing — a plant, or a block mined by the wrong
+		// tool — and those still vacate the cell. Hanging this off broke_id would leave the
+		// state of any such block in the table forever, which with only BLOCKSTATE_SLOTS 64
+		// entries is a leak that fills a fixed pool rather than one that merely wastes memory.
+		//
+		// blockStateRemove on a cell holding no state is a no-op by contract, so this runs
+		// unconditionally on every landed break rather than asking first. That is deliberate:
+		// a "does this block have state" test here would be a second, separate opinion about
+		// which blocks are stateful, and the day it disagreed with the table the symptom would
+		// be a slot that never frees.
+		if (it.broke_valid)
+			blockStateRemove(&s_blockstate, it.broke_x, it.broke_y, it.broke_z);
+
 		// Charged only for a placement the world actually accepted. it.placed_id stays
 		// BLOCK_AIR on every refusal path in interactEdit — no target, no entry face, cell
 		// occupied, would entomb the player, empty hand — so a refused place cannot silently
@@ -6488,6 +6530,13 @@ session_start:
 	// it cannot afford: the world was never entered, so anything written here describes a session
 	// that did not happen. Same test on the pose immediately below.
 	if (inv_dir && !world_refused) inventorySave(&s_inv, inv_dir);
+
+	// v1.8.15, on the identical guard including !world_refused. A refused world is one this
+	// build cannot account for and must leave exactly as it was found, and a blockstate sidecar
+	// written into it would describe a session that did not happen — the same rule the two lines
+	// above and below are both keeping. Written whole for the same reason the inventory is: 2 KB
+	// is not worth an SD round trip inside the frame that just broke a block.
+	if (inv_dir && !world_refused) (void)blockStateSave(&s_blockstate, inv_dir);
 
 	// v1.7.1 task 46b, and deliberately on this exact line rather than anywhere else on the
 	// main thread. app/worker.h:92-97 allows exactly one thread inside the SD's FS service
