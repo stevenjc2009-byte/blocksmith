@@ -1,0 +1,18 @@
+# Release notes shown on the 3DS top screen before the update downloads.
+#
+# Two sections, both optional, one item per line. Plain English, no markdown: this is read
+# by a player on a 400 px screen, not by a developer. A leading "- " is optional.
+#
+# Long lines wrap on their own, so write a sentence rather than fighting the width.
+
+[fixes]
+Hold jump to climb out of shallow water. You can no longer just walk out of it.
+Fixed the freeze while walking around. The console stays awake while a chunk saves.
+The top half of two-block grass takes its own biome's colour now, not the plains one.
+
+[features]
+Apples and meat are items now, not blocks. They cannot be placed, only eaten.
+Food icons in the hotbar are the shape of the food. A pork chop looks like a pork chop.
+Pigs, cows, chickens and sheep have painted textures instead of flat coloured boxes.
+Torches, grass and flowers are lit smoothly now, the same as every ordinary block.
+A new Saves row in the debug menu shows how long the game ever waited to save a chunk.

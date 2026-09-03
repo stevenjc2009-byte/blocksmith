@@ -4,6 +4,97 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.8.16] - 2026-09-03
+
+Three things you reported, and three you did not. Food stops being something you can build a
+wall out of, water stops letting you walk out of it, and the freeze while walking around has
+had the thing that causes it taken out. Alongside those: the animals have real textures, torches
+and grass are lit properly for the first time, and the hotbar shows a pork chop shaped like a
+pork chop.
+
+Everything here is identical on both consoles. Nothing in this release is Old-3DS-only or
+New-3DS-only.
+
+### Fixed
+
+- **You can no longer walk straight out of shallow water.** You have to hold the jump button to
+  climb out, the way you always should have been able to. This was reported twice and fixed
+  twice before, and both of those fixes worked only in deep water — where you are floating, and
+  a floating body was already refused the ordinary one-block climb that gets you over a kerb on
+  land. One block of water does not float you: you stand on the bottom with your feet in the
+  water, so the game thought you were an ordinary walker on ordinary ground and let you step out
+  of the puddle without asking. Every shoreline in the world is one block deep at its edge, so
+  that was the water you actually met.
+
+  Holding jump in shallow water now lifts you. Deep water is unchanged and still wants a fresh
+  press, which is what you asked for back in 1.8.4 — floating at the surface IS holding the
+  button, so there it cannot also mean "climb out".
+
+- **The freeze while walking around.** When the world unloads a column behind you it hands it to
+  a background thread to be written to the SD card, and there are two slots for that. If both
+  were full, the game waited for one — with no time limit, and, worse, without telling the
+  console it was still alive. A 3DS that stops saying that stops answering the HOME button and
+  the power button, which is why it read as the whole console freezing rather than the game
+  being slow. Crossing a chunk boundary unloads nine columns at once, seventeen on a diagonal,
+  so a single frame could contain seven of those waits back to back.
+
+  It now keeps the console answering while it waits, gives up after a quarter of a second, and
+  writes the column itself rather than dropping it. Losing a column you built is worse than a
+  pause you probably cannot feel.
+
+  Two more things came out of chasing it. The crash report that would have named this bug said
+  "SIM" — player and camera code — because the phase was only ever set to SAVE on the quit path;
+  it now names SAVE, so if it happens again the report points at the right place. And the
+  watchdog could not catch this class of problem at all: it reset itself on any sign of life, so
+  many slow frames in a row looked healthy. It now adds them up.
+
+- **The top half of tall grass took the wrong biome's colour.** Two-block grass is one plant
+  drawn as two stacked pieces, and only the bottom piece was being tinted, so in a jungle or a
+  desert the tip stayed the plains colour and the plant read as two different plants standing on
+  each other. The plant itself is not a bug and is staying — you asked for two-block grass — but
+  the colour was, and it is fixed. It hid for eight versions because in plains, which is most of
+  the world, the untinted colour and the plains colour are exactly the same.
+
+### Changed
+
+- **Apples and meat are items, not blocks.** You cannot place them any more. Nine foods in total
+  — the apple, the four raw cuts and the four cooked ones — refuse to be put down as a block,
+  which also means the 1.8.15 behaviour where eating on a full stomach placed the food instead
+  is gone. You can still break an apple off a tree; that had to keep working, because apples
+  genuinely grow in the canopy.
+
+- **Hotbar icons are the shape of the item.** Those nine foods had been drawing the top face of
+  a cube, because that is what everything in the hotbar is — so a pork chop was a flat pink
+  square. Each now has its own drawn icon with a real outline: a round apple with a leaf, a pork
+  chop with the bone knob, a chicken drumstick, a marbled slab of beef, mutton on the rib. The
+  cooked version of each is visibly cooked rather than a recoloured copy, and the icons are no
+  longer stretched sideways to fill a rectangular slot.
+
+### Added
+
+- **The animals have textures.** Pigs, cows, chickens and sheep were flat coloured boxes; they
+  now have painted faces, patterns and legs. The pig has a snout with nostrils and a rosy flank;
+  the cow's patches run continuously from its body down onto its legs rather than stopping at
+  every joint; the chicken has a folded wing, a beak, a comb and a wattle; the sheep has clumped
+  fleece over a bare face. All four are meant to be distinguishable at a glance and from behind,
+  not just head-on.
+
+  The art is generated by a script in the project like every other texture here — nothing is
+  taken from any other game.
+
+- **Torches, grass and flowers are lit smoothly.** Everything shaped like a cube has had smooth
+  per-corner lighting for several versions; everything shaped like a cross — every torch, every
+  plant — was still taking one flat brightness for the whole thing. A torch therefore lit the
+  wall behind it beautifully and was itself a featureless bright slab, and a plant three blocks
+  from a torch was as bright at its far edge as its near one. Both are now shaded the same way
+  the blocks around them are.
+
+- **A "Saves" row in the debug menu.** It shows how many columns have been handed off, how many
+  times the game had to wait for a slot, the longest wait in milliseconds, and whether the new
+  quarter-second limit ever fired. The counter behind it has existed since 1.7.1 and has never
+  once been visible in an installed build, because its only readout was a text console that the
+  shipped version does not have. If the freeze ever comes back, this is the number to read.
+
 ## [1.8.15] - 2026-09-03
 
 Furnace. Killing an animal in 1.8.14 left you with raw meat and nowhere to cook it; this update
