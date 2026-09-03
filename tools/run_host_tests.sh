@@ -5867,3 +5867,81 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 "./$BHPLAYERWATER/player_water_test"
 
 rm -rf "$BHPLAYERWATER"
+
+#---------------------------------------------------------------------------------------
+# tests/mesher_write_bounds_test.c -- AddressSanitizer bounds check on meshChunk()'s
+# vertex/index writes, at the REAL production buffer size (scene/mesh_pool_sizing.h's
+# MESH_SLOT_VERTS 8,192 / MESH_SLOT_INDICES 12,288), not the padded MESH_MAX_VERTS/
+# MESH_MAX_INDICES (49,152 / 73,728) tests/mesher_hashcheck.c and tests/cross_light_test.c
+# mesh into. Every other host suite that exercises meshChunk() has slack the console never
+# has, so none of them could ever have caught an overflow at the size scene/chunk_render.c
+# actually allocates. See the test's own header comment for the full case, the GPU-wedge
+# report that motivated it, and what each of its four arms places.
+#
+# FIRST SANITIZER STANZA IN THIS FILE. No other gcc invocation above passes -fsanitize=
+# anything, so ASan's global-redzone instrumentation is new machinery here, not a pattern
+# being repeated -- -O1 -g matches the -std=c11 -Wall -Wextra -Werror -O1 -g every other
+# host stanza already uses, with -fsanitize=address -fno-omit-frame-pointer added and
+# nothing else changed. Same file list as tests/cross_light_test.c above (world.c, block.c,
+# registry.c, chunk.c, budget.c, scratch.c, mesher.c, net_stub.c) -- this test needs nothing
+# tests/cross_light_test.c's link line doesn't already need, and mesher.c pulls in neither
+# deps/libhydrogen nor deps/blocksmith-server on this path (checked: -I source alone links
+# and runs clean; those two -I's only exist for the console INCLUDES line and for
+# app/updater.c's TLS code, neither reachable from this file's link list).
+#
+# APPENDED AT THE ABSOLUTE END rather than merged near the other mesher stanzas, same
+# append-only reasoning as every stanza in this file, plus one more: this script runs under
+# `set -e` (see above), so the first failing stanza takes every later one dark. Placing a
+# brand-new sanitizer arm last means a red here can never hide any OTHER suite's coverage --
+# everything above it has already run and reported by the time this one gets a chance to
+# fail.
+#
+# tests/ is exempt from the console SOURCES glob -- verified by reading Makefile:26
+# (`SOURCES := source source/app source/audio source/entity source/gfx source/debug
+# source/net source/scene source/shaders source/world deps/libhydrogen`, no `tests` entry)
+# together with the actual expansion at Makefile:806, `CFILES := $(foreach dir,$(SOURCES),
+# $(notdir $(wildcard $(dir)/*.c)))` -- a non-recursive, per-directory wildcard over exactly
+# the SOURCES list. tests/mesher_write_bounds_test.c is not under any directory that list
+# names, so no `#ifndef __3DS__` guard is needed the way source/*_test.c files need one.
+#
+# PASS 11 checks, RUN_EXIT=0, confirmed on this host before wiring: ARM 1 verts=8192/8192
+# idx=12288/12288 overflow=1 (the dense-cross fixture correctly refused rather than
+# overran); ARM 2 floor/roof corner fixtures verts=128 idx=192 overflow=0 each; ARM 3
+# isolated-chunk fixture verts=144 idx=216 overflow=0; ARM 4 four-plant/clump fixture
+# verts=96 idx=144 faces=24 overflow=0.
+#
+# PROVEN ABLE TO GO RED, exactly reproducing the original FRZ-ASAN finding this file
+# documents in its own header: emitCross's overflow guard (`if (o->vert_count + 4 *
+# CROSS_QUADS > o->vert_cap || ...) { o->overflow = true; return; }`, world/mesher.c:914-918)
+# disabled on a SCRATCH COPY of mesher.c outside this tree (the real source/world/mesher.c
+# was never opened for writing -- md5 000a944ee77ca9f5607ad823977c3f8d before and after).
+# Re-linked against that copy in place of the real mesher.c, same flags, ARM 1's dense-cross
+# fixture aborts immediately:
+#   ==ERROR: AddressSanitizer: global-buffer-overflow ... WRITE of size 1 ...
+#     #0 emitCross ... mesher_sabotaged.c:955
+#     #1 meshPass ... #2 meshChunk ... #3 meshSlotSized tests/mesher_write_bounds_test.c:104
+#   0x... is located 0 bytes after global variable 's_verts_slot' ... of size 65536
+#   SUMMARY: AddressSanitizer: global-buffer-overflow ... in emitCross
+# REDRUN_EXIT=1. Re-linked against the real, untouched mesher.c immediately after: PASS 11
+# checks, RUN_EXIT=0 again -- the green above is the confirmed-restored state, not an
+# assumption.
+BHMWB="build-host/run-$$-mesherwritebounds"
+mkdir -p "$BHMWB"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address -fno-omit-frame-pointer \
+	-I source \
+	source/world/world.c \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/budget.c \
+	source/world/scratch.c \
+	source/world/mesher.c \
+	tests/net_stub.c \
+	tests/mesher_write_bounds_test.c \
+	-lm \
+	-o "$BHMWB/mesher_write_bounds_test"
+
+"./$BHMWB/mesher_write_bounds_test"
+
+rm -rf "$BHMWB"
