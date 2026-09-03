@@ -23,6 +23,10 @@ typedef struct {
 static Particle s_pool[PARTICLES_MAX];
 static int      s_next;             // ring cursor: the NEXT slot particlesSpawn will write
 static uint32_t s_spawn_counter;    // advances once per particlesSpawnSplash call, never per-particle
+// v1.8.17 WATER-FX task 3. A SEPARATE counter from s_spawn_counter -- see particlesSpawnWake's
+// own comment on why sharing one stream between two emitters would make each one's scatter
+// depend on how many times the OTHER had already been called.
+static uint32_t s_wake_counter;
 static bool     s_ready;
 
 // Matches world/physics.h's PLAYER_GRAVITY (-28.0f) exactly rather than inventing a second,
@@ -43,6 +47,7 @@ static void poolReset(void)
 		s_pool[i].life = 0.0f;
 	s_next = 0;
 	s_spawn_counter = 0;
+	s_wake_counter = 0;
 }
 
 // A small, fast integer mix (Thomas Wang's 32-bit hash), used ONLY to turn
@@ -145,6 +150,47 @@ void particlesSpawnSplash(float x, float y, float z, float impact_speed)
 			// Pale, fading dot, no texture (plan section 3a) — a light, slightly blue-white
 			// with a starting alpha well under opaque, since several overlap on one splash.
 			.rgba = PARTICLE_RGBA(0xE8, 0xF4, 0xFF, 0xC0),
+		};
+		particlesSpawn(&d);
+	}
+}
+
+// v1.8.17 WATER-FX task 3 -- the swim wake. See particles.h's own comment for the division of
+// labour with the caller (scene/player.c decides WHEN and WHERE and how often; this function
+// decides only what a wake particle looks like).
+void particlesSpawnWake(float x, float y, float z, float vx, float vz)
+{
+	if (!s_ready) return;
+
+	const uint32_t call = s_wake_counter++;
+
+	for (int i = 0; i < 2; i++) {
+		// Same Thomas Wang mix particlesSpawnSplash uses, on the SEPARATE s_wake_counter
+		// stream -- see this function's header comment and s_wake_counter's own comment for
+		// why the two effects do not share one.
+		const uint32_t h = particleHash(call, (uint32_t)i);
+		const float a = (float)(h & 0xFFFFu) / 65536.0f;
+		const float b = (float)((h >> 16) & 0xFFFFu) / 65536.0f;
+
+		const float angle   = a * 6.28318530718f;
+		const float scatter = 0.15f + b * 0.25f;   // 0.15..0.4 blocks/s outward [proposal]
+
+		const ParticleSpawnDesc d = {
+			.x = x, .y = y, .z = z,
+			// A fraction of the swimmer's own velocity, so the wake visibly trails him,
+			// plus the same kind of hash-derived scatter the splash uses so two particles
+			// spawned in the same call do not sit on top of each other. 0.3 [proposal]: the
+			// wake reads as "left behind by the swimmer", not "flung off him" -- a splash
+			// already owns the "flung off" look via its own, much larger outward speed.
+			.vx = vx * 0.3f + cosf(angle) * scatter,
+			.vy = 0.3f + b * 0.3f,    // 0.3..0.6 blocks/s -- a light bob, not a splash's leap
+			.vz = vz * 0.3f + sinf(angle) * scatter,
+			.life_seconds = 0.3f + b * 0.2f,   // 0.3..0.5s [proposal] -- shorter than a splash
+			.size = 0.035f,                     // smaller than a splash's 0.05 droplet [proposal]
+			// Foam-white rather than the splash's pale blue-white (0xE8F4FF), and a lower
+			// starting alpha (0x90 against the splash's 0xC0) -- a wake is meant to read as a
+			// faint trail, not a burst, even though both share this one renderer.
+			.rgba = PARTICLE_RGBA(0xF0, 0xF8, 0xFF, 0x90),
 		};
 		particlesSpawn(&d);
 	}

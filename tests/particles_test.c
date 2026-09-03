@@ -333,6 +333,96 @@ static void testInitAfterInitDoesNotInheritParticles(void)
 	CHECK(particlesLiveCount() == 0);
 }
 
+// v1.8.17 WATER-FX task 3 -- the swim wake. Mirrors the splash tests above in shape (this is
+// deliberate: particlesSpawnWake is the same convenience-wrapper pattern particlesSpawnSplash
+// already established, so the same three claims -- count, near-spawn-after-one-tick,
+// determinism -- apply), plus one claim the splash tests have no equivalent of: the wake's
+// hash stream must be independent of the splash's, because the two effects can fire in the
+// same session (a player can splash in and then swim) and a shared stream would make one
+// effect's look depend on how many times the OTHER had already fired.
+static void testWakeProducesTwoParticles(void)
+{
+	particlesInit();
+	particlesSpawnWake(1.0f, 2.0f, 3.0f, 1.0f, 0.0f);
+	CHECK(particlesLiveCount() == 2);
+}
+
+static void testWakeParticlesStayNearSpawnPointAfterOneTick(void)
+{
+	particlesInit();
+	particlesSpawnWake(10.0f, 20.0f, 30.0f, 1.0f, 1.0f);
+	particlesTick(0.01f);   // one small step -- a gross bug (wrong units, huge velocity) shows up fast
+
+	CHECK(particlesLiveCount() == 2);
+
+	int too_far = 0;
+	for (int i = 0; i < 2; i++) {
+		float x, y, z, a;
+		if (!particlesGet(i, &x, &y, &z, &a)) { too_far++; continue; }
+		const float dx = x - 10.0f, dy = y - 20.0f, dz = z - 30.0f;
+		const float dist2 = dx * dx + dy * dy + dz * dz;
+		if (dist2 > 25.0f) too_far++;   // 5 blocks, generously above the real one-tick displacement
+	}
+	CHECK(too_far == 0);
+}
+
+static void testWakeIsDeterministic(void)
+{
+	particlesInit();
+	particlesSpawnWake(5.0f, 6.0f, 7.0f, 2.0f, -1.0f);
+	particlesTick(0.2f);   // advance so the hash-derived velocities have actually separated
+	                        // the two particles' positions -- see testSplashIsDeterministic's
+	                        // sibling claim; here it matters more, because unlike the splash
+	                        // path particlesGet never exposes the raw scatter values, only
+	                        // position, and at spawn both particles sit at the same (x,y,z).
+	float ax[2], ay[2], az[2], aa[2];
+	for (int i = 0; i < 2; i++)
+		CHECK(particlesGet(i, &ax[i], &ay[i], &az[i], &aa[i]) == true);
+
+	particlesInit();
+	particlesSpawnWake(5.0f, 6.0f, 7.0f, 2.0f, -1.0f);
+	particlesTick(0.2f);
+
+	int mismatches = 0;
+	for (int i = 0; i < 2; i++) {
+		float x, y, z, a;
+		if (!particlesGet(i, &x, &y, &z, &a)) { mismatches++; continue; }
+		if (x != ax[i] || y != ay[i] || z != az[i] || a != aa[i]) mismatches++;
+	}
+	CHECK(mismatches == 0);
+}
+
+static void testWakeCounterIndependentOfSplashCounter(void)
+{
+	// Baseline: a wake call from a freshly reset pool (s_wake_counter == 0), ticked so its
+	// two particles' hash-derived velocities have separated their positions.
+	particlesInit();
+	particlesSpawnWake(0.0f, 0.0f, 0.0f, 0.5f, 0.5f);
+	particlesTick(0.2f);
+	float bx[2], by[2], bz[2], ba[2];
+	for (int i = 0; i < 2; i++)
+		CHECK(particlesGet(i, &bx[i], &by[i], &bz[i], &ba[i]) == true);
+
+	// Same wake call, same fresh pool, but preceded by an UNRELATED splash. If wake shared
+	// the splash's counter, this splash would advance the stream the wake call reads from and
+	// the two particles below would come out different from the baseline above. The splash's
+	// own particles occupy slots [0, splash_count); the wake's land at
+	// [splash_count, splash_count+2) since particlesSpawn's ring cursor only ever advances.
+	particlesInit();
+	particlesSpawnSplash(99.0f, 99.0f, 99.0f, 3.0f);
+	const int splash_count = particlesLiveCount();
+	particlesSpawnWake(0.0f, 0.0f, 0.0f, 0.5f, 0.5f);
+	particlesTick(0.2f);
+
+	int mismatches = 0;
+	for (int i = 0; i < 2; i++) {
+		float x, y, z, a;
+		if (!particlesGet(splash_count + i, &x, &y, &z, &a)) { mismatches++; continue; }
+		if (x != bx[i] || y != by[i] || z != bz[i] || a != ba[i]) mismatches++;
+	}
+	CHECK(mismatches == 0);
+}
+
 static void testCapacityConstantMatchesTheDocumentedBudget(void)
 {
 	// particles.h's own header comment computes the 55,296-byte linear-heap cost against
@@ -359,6 +449,10 @@ int main(void)
 	testGetWithNullOutParamsDoesNotCrash();
 	testInitAfterInitDoesNotInheritParticles();
 	testCapacityConstantMatchesTheDocumentedBudget();
+	testWakeProducesTwoParticles();
+	testWakeParticlesStayNearSpawnPointAfterOneTick();
+	testWakeIsDeterministic();
+	testWakeCounterIndependentOfSplashCounter();
 
 	printf("particles self-test: %s %d checks\n", fails ? "FAIL" : "PASS", checks);
 	return fails ? 1 : 0;

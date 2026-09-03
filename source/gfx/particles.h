@@ -129,6 +129,22 @@ void particlesSpawn(const ParticleSpawnDesc* desc);
 // bit-identical particles; see testSplashIsDeterministic.
 void particlesSpawnSplash(float x, float y, float z, float impact_speed);
 
+// Convenience wrapper over particlesSpawn for v1.8.17 WATER-FX task 3 -- the swim wake. Two
+// small particles per call [proposal], drifting with the body's own horizontal velocity
+// (vx, vz, blocks/second) plus a little scatter rather than firing outward the way a splash
+// impact does: a wake trails the swimmer, it does not explode away from him. Smaller and
+// paler than a splash droplet (see particlesSpawnWake's own comment in particles.c for the
+// exact numbers), so the two effects read as different things on screen even though they
+// share one renderer and one pool. The caller (scene/player.c) is the rate limiter -- this
+// function does not know or care how often it is being called, the same division of labour
+// particlesSpawnSplash already has with its own caller.
+//
+// DETERMINISTIC for the same reason particlesSpawnSplash is (see that function's own
+// comment): a pure hash of an internal call counter and the particle's index within the
+// call. A SEPARATE counter from the splash's, so a wake call and a splash call landing in
+// the same frame cannot perturb each other's sequences.
+void particlesSpawnWake(float x, float y, float z, float vx, float vz);
+
 // Read-only snapshot of pool slot `index` (0..PARTICLES_MAX-1), for tests and for any future
 // debug overlay. Returns false and touches no out-parameter if that slot is not currently
 // alive. `alpha01` is the particle's current fade fraction — 1.0 at spawn, falling linearly

@@ -5812,3 +5812,58 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 "./$BHFPI/food_placeable_invariant_test"
 
 rm -rf "$BHFPI"
+
+#---------------------------------------------------------------------------------------
+# tests/player_water_test.c -- WATER-FX lane: the three water particle effects added in
+# v1.8.17, tested headlessly. steve asked for "particles where needed (water splashing)",
+# and all three of these are things a player sees rather than things a number describes,
+# so each one is pinned to a rule a test CAN check even though the look itself cannot be:
+#
+#   entry splash   spawns at waterSurfaceY(), not at the body origin. Before this fix the
+#                  splash appeared at the player's feet -- which, once the player is under
+#                  the surface, is underwater, where a splash is invisible.
+#   exit splash    fires on the BODY_SURFACE -> BODY_DRY transition specifically, not on
+#                  any wet-to-dry change, so climbing out spawns one and swimming down
+#                  from the surface does not.
+#   swim wake      rate-limited by p->wake_timer at WAKE_INTERVAL 0.3 s above
+#                  WAKE_SPEED_THRESHOLD 0.5 blocks/s, with the remainder SUBTRACTED rather
+#                  than the timer reset -- resetting would make the wake rate depend on
+#                  frame rate, which is the bug this shape avoids.
+#
+# The wake is swept across dt_ms in {8,16,33,50,70,100,200}, deliberately spanning the
+# MAX_TICK = 0.05 s clamp, because a rate limiter that is correct either side of a clamp
+# and wrong at it is the failure this sweep exists to find.
+#
+# MEASURED live particle counts rather than reasoned about: steady state max 4, mean 2.63;
+# worst observed case max 25, at frame 13. PARTICLES_MAX is 512, so the headroom is not in
+# question.
+#
+# Needs a citro3d stub because player.c reaches the GPU through it. tests/player_water_stub/
+# holds a minimal 3ds.h, citro3d.h and citro3d_stub.c -- a stub, not a reimplementation of
+# any player logic: the real source/scene/player.c is linked and exercised.
+BHPLAYERWATER="build-host/run-$$-player-water"
+mkdir -p "$BHPLAYERWATER"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I tests/player_water_stub -I source \
+	tests/net_stub.c \
+	tests/player_water_stub/citro3d_stub.c \
+	source/world/block.c source/world/registry.c source/world/chunk.c \
+	source/world/chunk_codec.c source/world/crc32.c source/world/region.c \
+	source/world/world.c source/world/scratch.c source/world/mesher.c \
+	source/world/noise.c source/world/raycast.c source/world/physics.c \
+	source/world/remesh.c source/world/handbuilt.c source/world/budget.c \
+	source/world/dirtyq.c source/world/jobq.c source/world/meshq.c \
+	source/world/relightq.c source/world/tick.c source/world/visgraph.c \
+	source/world/worldgen.c source/world/worldgen_density.c \
+	source/world/cave_carve.c source/world/ore_gen.c source/world/genversion.c \
+	source/scene/render_dist.c source/scene/player.c source/scene/camera.c \
+	source/app/input_map.c source/app/options.c source/app/hw.c \
+	source/gfx/particles.c \
+	tests/player_water_test.c \
+	-lm \
+	-o "$BHPLAYERWATER/player_water_test"
+
+"./$BHPLAYERWATER/player_water_test"
+
+rm -rf "$BHPLAYERWATER"

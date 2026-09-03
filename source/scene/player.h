@@ -33,6 +33,12 @@ typedef struct {
 	// constants for what they are and why the effect is not in the body.
 	float  bob_phase;
 	float  bob_env;
+
+	// v1.8.17 WATER-FX task 3 -- the swim wake's own rate-limit accumulator, owned here for
+	// the identical reason bob_phase/bob_env are: it is a COSMETIC effect's timing state, not
+	// physics, so it does not belong on Body. Advanced and consumed entirely inside
+	// scene/player.c's playerUpdate; see WAKE_INTERVAL there for the rate it enforces.
+	float  wake_timer;
 } Player;
 
 // Places the feet at (x,y,z) and points the camera at the given yaw and pitch.
