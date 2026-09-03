@@ -307,7 +307,41 @@ PROTO_REPO	:=	https://github.com/stevenjc2009-byte/blocksmith-server.git
 # deployable), and a22eea3a:proto/bs_proto.h is blob 8303be83 -- the same blob the drift guard
 # reads on disk. A pin naming a commit that exists only locally would break a fresh clone,
 # which is the failure this check exists to prevent.
-PROTO_COMMIT	:=	a22eea3a5d24a9ba05d2f69c9b4aa5472df1653d
+#
+# BUMPED 2026-09-03 for v1.8.15 "Furnace", a22eea3a -> 11caee37 (server v1.9.6). This one is
+# the FIRST case of the three: proto/bs_proto.h ACTUALLY CHANGED, so this bump unbreaks a
+# build rather than merely naming a newer deployed server. The v1.9.3 entry moved the pin
+# because the header moved; the v1.9.4 entry moved it although the header had not; this one
+# is the v1.9.3 shape again, and the distinction is the whole reason those two entries were
+# written to read differently.
+#
+#   WHAT MOVED: BS_RECIPE_COUNT 5u -> 6u, and nothing else. blob 8303be83 -> 5a9886c2.
+#   v1.8.15 adds RECIPE_STONE_TO_FURNACE (8 stone -> 1 furnace) to world/crafting.h, taking
+#   RECIPE_COUNT 5 -> 6, and the server carries a compiled-in
+#   _Static_assert(RECIPE_COUNT == BS_RECIPE_COUNT) that pins the two together. Leaving the
+#   wire constant at 5u does not produce a subtle desync -- it fails the server's own build,
+#   loudly, which is what that assert is for. BS_BLOCK_COUNT stays 8u: the five new core rows
+#   (38..42) land past the frozen wire item span, exactly as v1.9.4's four meat rows did.
+#
+#   WHY THE RECIPE IS APPENDED LAST, since it is this bump's entire content: bsgame.c bounds
+#   an incoming wire recipe INDEX against RECIPE_COUNT, so recipes are identified by position
+#   over the wire and nothing else. Inserting anywhere but the end silently renumbers every
+#   recipe above it, and an old client would craft the wrong thing against a new server
+#   without either side noticing. Appending only ever adds an index neither side had before.
+#
+# RELEASE ORDER, and it is not free here either. A v1.8.15 client meeting a daemon still on
+# the 38-row table is refused at networld.c's registryMatchesInfo() lockstep on
+# rev/count/crc16 (43 rows, crc16 0x9610 -> 0xE486), which is loud and recoverable. The
+# reverse ordering -- new daemon, old client -- is the quiet one. Server v1.9.6 is therefore
+# released and tagged BEFORE this bump, exactly as v1.9.3 and v1.9.4 were.
+#
+# Verified rather than assumed, before bumping, the same three ways as both entries above:
+# `git ls-remote origin` shows refs/heads/v1.9.6 and refs/tags/v1.9.6 both present on the
+# remote, refs/tags/v1.9.6^{} dereferences to 11caee37 (an annotated tag, and only a TAG is
+# deployable), and 11caee37:proto/bs_proto.h is blob 5a9886c2 -- byte-identical to what
+# `git hash-object proto/bs_proto.h` reports on disk. A pin naming a commit that exists only
+# locally would break a fresh clone, which is the failure this check exists to prevent.
+PROTO_COMMIT	:=	11caee37f8b1bf7ea3e9b0d3534c47b90e48cd8d
 PROTO		:=	deps/blocksmith-server
 
 .PHONY: deps

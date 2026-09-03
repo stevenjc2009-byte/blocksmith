@@ -4,6 +4,68 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.8.15] - 2026-09-03
+
+Furnace. Killing an animal in 1.8.14 left you with raw meat and nowhere to cook it; this update
+gives you somewhere. Eight stone gets you a furnace, and a furnace turns each of the four raw
+cuts from the last update into a better version of itself.
+
+Everything here is identical on both consoles. Nothing in this release is Old-3DS-only or
+New-3DS-only.
+
+### Added
+
+- **The furnace, craftable from 8 stone.** Open the crafting list the same way you always have
+  and Stone -> Furnace sits at the bottom of it. Eight stone is more than anything else in that
+  list costs — deliberately: this is the first crafted block that opens up a whole system rather
+  than just converting one material into another, and it should feel like a project rather than
+  something you make without thinking about it.
+
+- **Aim at a placed furnace and press Place to open it.** The same button you build with (Y by
+  default) opens the furnace panel instead of placing a block when you are looking straight at
+  one. Walking up to a different furnace while a panel is already open just retargets the panel
+  to the one you are now looking at, rather than doing nothing or fighting you for control.
+
+  The panel gives you three slots — input, fuel and output — and pulls from your whole bag, not
+  just the hotbar, so you are not shuffling raw meat through the main inventory screen first
+  just to get it within reach.
+
+- **Fuel and cook times, and what a furnace actually burns.** Planks keep a furnace lit for 15
+  seconds, a log for 60. Cooking one item takes 10 seconds once the furnace is lit, and a
+  furnace with fuel but nothing valid in the input slot just burns through that fuel and sits
+  there doing nothing useful — it does not pause and wait for something worth cooking, which is
+  exactly what the real thing does too. Nothing burns except the wood you already had a use for;
+  there is no coal or charcoal in the game yet, so wood is the only fuel there is.
+
+  (Those numbers live on the console as ticks at 20 per second — 300, 1200 and 200 ticks
+  respectively — and the seconds above are that count divided by 20.)
+
+- **Four cooked cuts: porkchop, beef, chicken and mutton.** Cooked porkchop and beef restore 8
+  hunger, cooked chicken and mutton restore 6 — more than double the raw cut in every case (raw
+  restores 3, 3, 2 and 2), and above even the apple's 4. That gap is the entire reason to build
+  a furnace: a cooked cut is a meaningfully better meal than eating the raw meat straight off
+  the animal, not just a different-looking version of the same food. Eat a cooked cut the same
+  way as everything else — hold it and press Place — and, like every other food, placing it
+  while your hunger is already full puts it down as a block instead of doing nothing.
+
+### Changed
+
+- **The block table grew from 38 blocks to 43, and multiplayer needs a matching server.** The
+  furnace and the four cooked meats are five new rows, and that number has to match between the
+  game and the server it connects to. Unlike the block table growth in 1.8.14, joining a server
+  that has not been updated does not quietly degrade this time — the client now checks the table
+  against the server's and refuses the connection outright, showing "Server is a different
+  Blocksmith version - update" on screen instead of letting you in with a table that disagrees.
+  Update your server to blocksmith-server v1.9.6 or later before connecting.
+
+### Notes
+
+- **The furnace's lit face does not look any different yet.** The artwork for a lit front exists
+  in the texture atlas, but nothing draws it in place of the unlit one — a burning furnace looks
+  identical from the outside to an idle one. The burn bar and cook arrow inside the panel are the
+  only way to tell it is actually running. Making the outside show it too is planned for a later
+  update, not a bug in this one.
+
 ## [1.8.14] - 2026-09-03
 
 Animals. Pigs, cows, chickens and sheep now live in the world — wandering in small herds,

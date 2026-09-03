@@ -1,0 +1,16 @@
+# Release notes shown on the 3DS top screen before the update downloads.
+#
+# Two sections, both optional, one item per line. Plain English, no markdown: this is read
+# by a player on a 400 px screen, not by a developer. A leading "- " is optional.
+#
+# Long lines wrap on their own, so write a sentence rather than fighting the width.
+
+[features]
+Furnace. Craft one from 8 stone in the crafting list, same as anything else you make.
+Aim at a placed furnace and press Place to open it - the same button you build with.
+Put fuel in one slot and raw meat in the other. Planks burn 15 seconds, a log burns 60.
+Cooking an item takes 10 seconds. A lit furnace with nothing to cook just burns the fuel.
+Cook porkchop, beef, chicken or mutton. Cooked meat restores far more hunger than raw does.
+Cooked porkchop and beef restore 8 hunger, cooked chicken and mutton 6 - beats an apple's 4.
+Eat cooked meat the same way as anything else - hold it and press Place.
+Update your server too. Against an older one the game now refuses to connect at all.
