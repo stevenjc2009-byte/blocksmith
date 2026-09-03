@@ -314,6 +314,37 @@ int weatherTickColumn(const WorldGen* g, World* w, uint64_t tick, int32_t cx, in
 //     save/restore, and a hardware frame-time reading, because this console's emulator reports a
 //     constant for GPU time and cannot answer the one question ("does this fit the frame") that
 //     matters most.
+//
+//     ── v1.8.17 / 2026-09-03 correction ────────────────────────────────────────────────────
+//     Both counts above were accurate the moment they were written and stopped being true
+//     within the same day. "Zero hits for 'particle'" was correct when this section landed in
+//     v1.8.8 (commit 6e56f52, 2026-09-02 09:54): grepping that commit's tree for "particle"
+//     across source/ and tools/ turns up exactly one hit — this comment's own use of the
+//     word. It stopped being true 94 minutes later, in the very next commit, v1.8.9 (051a588,
+//     2026-09-02 11:28), which shipped source/gfx/particles.c and source/gfx/particles.h — a
+//     real particle system: a 512-slot pool with O(1) ring recycling, used for splash scatter
+//     (see its own call sites in source/scene/player.c). Grepping the tree today (2026-09-03,
+//     `grep -rlI -i particle source tools`) returns 11 files, not zero — particles.c/h,
+//     weatherdraw.c/h, main.c, player.c, entitymodel.c/h, shaders/particle.v.pica, this file,
+//     and tools/run_host_tests.sh.
+//
+//     The "roughly a dozen new files" estimate for the visible rendering half landed in that
+//     same v1.8.9 commit, and the real count came in lighter: 8 new files, not a dozen —
+//     source/gfx/weatherdraw.c, source/gfx/weatherdraw.h, source/shaders/weather.v.pica,
+//     tools/make_weathertex.py, gfx/weathertex.png, gfx/weathertex.t3s,
+//     tests/weatherdraw_test.c, and docs/plan-1.8.9-weather-integration.md. (particles.c/h and
+//     its shader/test were a separate, additional system built in the same commit for splash
+//     scatter, not part of this estimate.) The render pass this bullet scoped is real and
+//     wired in: source/gfx/weatherdraw.c, called from source/main.c
+//     (weatherDrawInit/SetState/Update/Draw/Exit — grep those names in main.c), and it does
+//     get driven by weatherAt() at the cadence and query shape the next bullet describes,
+//     exactly as scoped — see main.c's per-tick weather loop, which calls weatherAt() and
+//     feeds the result to weatherDrawSetState(). What was NOT done: the hardware frame-time
+//     reading. weatherdraw.c carries no such instrumentation, and v1.8.9's own commit message
+//     (051a588) says plainly "nothing here has run on real 3DS hardware." Read weatherdraw.c
+//     and weatherdraw.h for what actually shipped and which parts of this bullet's design they
+//     followed.
+//
 //   * The natural query surface for that pass is exactly weatherAt(g, tick, x, z), asked at the
 //     player's own position (or a small neighbourhood of it) a few times a second — not per
 //     particle, not per frame — to decide whether to spawn rain or snow geometry at all and

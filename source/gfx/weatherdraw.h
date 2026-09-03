@@ -14,6 +14,18 @@
 // whole static grid near the camera. See weatherdraw.c's own header for the full cost
 // account of why that split (static geometry, dynamic uniforms) is what makes this cheap.
 //
+// ── v1.8.17 / 2026-09-03 correction ──────────────────────────────────────────────────────
+// "There is still no particle system anywhere in this project after this file" was false
+// the moment this file was committed: source/gfx/particles.c and source/gfx/particles.h
+// shipped in the SAME commit as this header, v1.8.9 (051a588, 2026-09-02) — a real particle
+// system, a 512-slot pool with O(1) ring recycling, used for splash scatter (see its call
+// sites in source/scene/player.c). What the sentence was reaching for is still true and is
+// worth keeping distinct from the false part: THIS file's rain/snow strips are still not
+// that particle system and are still built the way the paragraph above describes — static
+// crossed-quad geometry, baked once by weatherDrawBuildVertices() and never re-uploaded,
+// animated only by the two float uniforms named above. The two systems ship side by side
+// (see source/main.c, which calls into both) without either being the other.
+//
 // This file does NOT call weatherAt(). world/weather.h's own header says plainly what the
 // render pass's query surface should be: weatherAt(g, tick, x, z), asked "at the player's
 // own position... a few times a second... not per particle, not per frame" — that sentence
@@ -61,6 +73,25 @@
 // these at, because this file is not permitted to edit main.c itself (two other lanes are
 // live on it). Until that integration lands, weatherDrawInit() existing and being callable
 // is the whole of what "done" means for this file.
+//
+// ── v1.8.17 / 2026-09-03 correction ──────────────────────────────────────────────────────
+// This was false the moment it was committed, not at some later date: this section shipped
+// in v1.8.9 (051a588, 2026-09-02 11:28:48) — the exact same commit that added +117 lines to
+// source/main.c wiring these calls in (git blame on this section resolves to 051a588, and
+// that commit's own diffstat shows source/main.c modified alongside it). The reasoning
+// above about WHY main.c had to be the one to call these (this file is not permitted to
+// touch main.c; docs/plan-1.8.9-weather-integration.md is the real hand-off) is still sound
+// and is kept for that reason — only the "nothing calls this yet" premise was wrong, and
+// wrong from the start.
+//
+// The six real call sites in source/main.c today (2026-09-03; main.c has other lanes live
+// on it right now, so treat these line numbers as of-today, not load-bearing):
+//   weatherDrawStateInit(&s_weatherdraw)                       -- main.c:1772
+//   weatherDrawInit()                                          -- main.c:4158
+//   weatherAt(...) -> weatherDrawSetState(&s_weatherdraw, wk)   -- main.c:5861, per-tick loop
+//   weatherDrawUpdate(&s_weatherdraw, dt, camX, camY, camZ)     -- main.c:5863
+//   weatherDrawDraw(chunkRenderProjection(), view, &s_weatherdraw) -- main.c:2815
+//   weatherDrawExit()                                          -- main.c:6987
 #pragma once
 
 #include <stdbool.h>
