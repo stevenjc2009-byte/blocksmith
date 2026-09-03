@@ -806,44 +806,63 @@ published as a GitHub Release, and scope, order, and even whether a given versio
 all can still change. Where a version has a dedicated research brief or plan document
 beyond `ROADMAP.md`'s own entry, that is named so the deeper detail can be found.
 
-### v1.8.17 — New 3DS, in earnest — planned
+### v1.8.17 — New 3DS, and the freeze — in release prep, not yet published
 
-**In flight, not committed.** Everything below is being implemented by parallel work right
-now: none of it is verified, none of it is committed, and none of it is certain to ship in
-this exact form. If any part of it turns out on inspection to be the wrong change, this entry
-will need revising rather than trusted as written. No numbers are quoted for it because none
-have been measured yet.
+**Landed on the `v1.8.17` branch, not yet tagged, built, or published.** A New 3DS froze
+solid — HOME included — the instant a new world was created on v1.8.16, and this version
+exists first and foremost to put a build with the freeze review's findings in front of that
+console, because nothing about them can be confirmed any other way. Two real bugs were found
+in the process and are fixed below; neither is proven to be *the* freeze. This entry will be
+revised once real hardware has actually run this build — see `CHANGELOG.md`'s `[1.8.17]` entry
+for the full detail behind every line here.
 
-The 804 MHz clock and the L2 cache were already switched on for a New 3DS back in v1.8.4, but
-almost nothing downstream of that was ever gated on `hwIsNew3ds()` — so a New 3DS has been
-doing the same amount of work per frame as an Old one ever since. This version's purpose is to
-actually spend the extra RAM, CPU speed and L2 cache a New 3DS already has, rather than adding
-a new feature.
+**Fixed — a chunk-draw safety guard was dead code, and silently unbuildable, from v1.8.5
+through v1.8.16.** It referenced a variable name the v1.8.5 pool-sizing rewrite deleted;
+because the guard defaulted off, nothing ever caught it. Fixed and switched on by default.
 
-**Planned — per-frame work budgets gated per console** instead of the flat constants they are
-today: the mesh drain, the relight pass and the loading-screen drain in `source/main.c`.
+**Fixed — a chunk's transparent draw length could wrap to near four billion instead of going
+negative**, and the guard above did not catch it — worked through with the numbers that break
+it, every one of its checks passes on the wrapped value. One comparison now stops it.
 
-**Planned — New 3DS render distance and world budget raised.** *A genuine Old/New split, if it
-lands as scoped.* The New-3DS render-distance *default* raised from 2 toward the ceiling of 5
-that v1.8.5 already granted the console, and `WORLD_BUDGET_BYTES` (currently 12 MB, flat and
-ungated on both consoles) raised on New, where roughly 29 MB of application heap currently goes
-unspent.
+**Fixed — the safety net for a stalled GPU called the exact unbounded wait it exists to
+prevent, immediately after proving that wait would never return.** This is what happened on
+the console that froze: a wedge report was written to the card and the console died anyway. A
+detected stall now skips the whole frame instead of opening one it cannot finish.
 
-**Planned — thread placement spread across the cores a New 3DS is actually granted**, instead
-of using two of its four. This is the part of the scope that cannot be tested without real
-hardware, and the one most likely to come back as "do not change this" once a lane actually
-measures it.
+**Fixed — breaking a furnace with items inside no longer destroys them.** Left over from
+v1.8.15, above.
 
-**Planned — fixed.** Breaking a furnace drops its contents instead of destroying them
-silently, and a burning furnace shows its lit front face instead of looking identical to a
-cold one — both left over from v1.8.15, above.
+**Fixed — the in-game updater's "Problem with the SSL CA cert" failure on real hardware.**
+That is curl error 77, the certificate file itself failing to load — not GitHub rejecting
+anything. A second, independent copy of the same trust bytes is now tried before giving up,
+and the on-screen message now shows the numeric curl code. Whether the certificate file
+briefly becoming unavailable — this game does not keep its data partition mounted
+continuously — is the real root cause is still open; this is a fallback for the symptom.
 
-**Planned — fixed.** The water-entry splash spawned at the player's feet, below the waterline,
-instead of at the water surface. A new splash is planned on leaving the water, plus a wake
-while swimming at the surface.
+**Done — New 3DS render distance default raised from 2 to 3, and the per-frame chunk-mesh
+drain raised from 3 to 9 on New 3DS (6 to 18 while loading).** Old 3DS is unchanged on both.
+Costs no extra memory: the mesh pool was already sized for the console's ceiling at boot
+regardless of the starting distance. Neither number has run on real hardware.
 
-**Planned — added.** Per-biome dirt colour, by tint — the one item still missing from the
-per-biome materials list v1.8.8 otherwise completed.
+**Not done, scope dropped for this release.** `WORLD_BUDGET_BYTES` was deliberately left flat
+and ungated — the cap allocates nothing and already holds the widest reachable radius at
+89.2%, so raising it would refuse nothing it does not already refuse. Thread placement across
+the New 3DS's four cores was investigated and NOT changed: no worker moved core. What landed
+instead is observability — the crash report now records which core every thread was granted
+*and* which core it is actually running on, read by the thread itself, so the question can be
+answered from a real hang report instead of reasoned about in the abstract.
+
+**Fixed.** The water-entry splash spawned at the player's feet, below the waterline, instead
+of at the water surface.
+
+**Added.** A splash on leaving the water, and a foam wake while swimming at the surface.
+
+**Added.** Per-biome dirt colour, by tint — the one item still missing from the per-biome
+materials list v1.8.8 otherwise completed.
+
+**Changed.** The mesher's per-cell lookup was rebuilt from three 256-entry tables into one,
+built once per mesh rather than read cell by cell. Output is unchanged; the shipped code
+measures slightly smaller as well as doing less work per cell.
 
 ### v1.8.18 — Monsters — planned
 

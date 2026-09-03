@@ -4,6 +4,129 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.8.17] - 2026-09-03
+
+This release exists because a New 3DS froze solid — HOME included — the instant you created a
+new world in 1.8.16. There is no way to test whether that is actually fixed without a build in
+your hands, so that is what tonight's work is: everything the freeze review turned up, landed
+and shipped rather than sat on. Two real bugs came out of that review and are fixed below, and
+the safety net that was supposed to catch a stalled GPU and clearly didn't — your console froze
+with a wedge report already written to the card — now behaves the way it was always meant to.
+None of this is proven to be *the* freeze. It is what was found wrong, described honestly, and
+whether it changes anything on your console can only be settled by trying it there.
+
+Alongside that: a furnace gives back what was inside it when you break it, water splashes when
+you leave it as well as when you enter it and leaves a wake while you swim, dirt takes its
+biome's colour, a New 3DS starts further out and meshes chunks faster, the world's block lookup
+got smaller and faster, and a crash report now says which processor core every thread actually
+ran on.
+
+### Fixed
+
+- **The draw-safety guard meant to refuse a malformed chunk draw had been dead code since
+  v1.8.5, and silently unbuildable the whole time.** It read `kTierSlots[t]`, a name the v1.8.5
+  pool-sizing rewrite deleted in favour of `s_tier_count[t]` without updating this one leftover
+  reference. Because the guard defaulted off, the shipped build never compiled that line and
+  nothing caught it — actually turning the guard on, `make EXTRA_CFLAGS="-DBS_DRAW_GUARD=1"`,
+  failed to build outright, for every version from v1.8.5 to v1.8.16, including the one that
+  froze. Fixed to point at the right variable, and switched on by default: every chunk draw is
+  now checked before it reaches the GPU, and a malformed one is refused instead of handed over.
+
+- **A chunk's transparent draw length could wrap to nearly four billion instead of going
+  negative, and the guard above did not catch it.** It was computed as `index_count -
+  opaque_index_count`, an unsigned subtraction with nothing checking that the first number
+  cannot be smaller than the second. Worked through with the values that break it, the wrapped
+  count comes out a multiple of 3, the wrapped range lands back inside the buffer, and the index
+  it reads is real mesh data — every one of the guard's checks passes on a value that should
+  have been refused. One comparison now stops that subtraction from running at all when the
+  operands are the wrong way round.
+
+- **The safety net for a stalled GPU did not actually work — it called the exact unbounded wait
+  it exists to prevent, immediately after proving that wait would never return.** Both the
+  shipping build and the diagnostic build detected a stalled GPU correctly and wrote
+  `postmortem.txt` to the SD card, and then called `C3D_FrameBegin(0)` unconditionally — which
+  itself performs an unbounded wait against a command queue that had just failed a *bounded*
+  one. That is what your console did: the report was written, and the console died anyway, HOME
+  included. A detected stall now skips the whole frame — no `C3D_FrameBegin`, no draws, no
+  `C3D_FrameEnd` — and stays skipped on every later frame instead of re-paying the two-second
+  detection wait each time. This is not proof the freeze is fixed. It is a real bug in the thing
+  that was supposed to catch it, and it is fixed now — whether it changes what your console does
+  is the question this build exists to answer.
+
+- **Breaking a furnace with items in it no longer destroys them.** The input, fuel and output
+  slots now drop with the furnace, whether you broke it or another player did, and a furnace
+  rebuilt from those pieces starts empty like any other freshly placed one.
+
+- **The in-game updater failed on real hardware with "Problem with the SSL CA cert."** That
+  message is curl error 77, and it means curl could not load or parse *its own* bundled
+  certificate file. It does not mean GitHub was rejected — that is a different error entirely,
+  so there is nothing wrong at your end and nothing for you to change on the console. The
+  bundled file is not the problem either: it was read straight back out of the shipped v1.8.16
+  install and checked byte for byte, all 121 certificates present and intact.
+
+  Three explanations were chased down and all three turned out to be wrong. The certificate
+  file is not going missing mid-transfer — the updater claims the game's data partition once at
+  startup and holds it until the game closes, and the only other part of the game that wants it
+  never takes it away. The path handed to curl is not going stale underneath it. And the
+  security library is not built without file support, which would have made every attempt fail
+  no matter how good the file was. So the real cause is still unknown, and rather than guess a
+  fourth time, this build measures it.
+
+  Two things change. The certificates are read into memory once at startup and handed to curl
+  directly, so no file is opened at any point during an update check — that removes an entire
+  category of possible cause, whether or not it was the one biting. And the game now reads that
+  bundle itself at startup and, if an update fails, puts the exact result on screen beside the
+  curl number. That reading separates every remaining possibility: whether it ran out of memory
+  assembling the certificates, whether one of them is malformed, or whether they are entirely
+  fine and the fault lies further into the connection. This build has no text console, so a
+  number on screen is the only diagnostic that can leave the console at all — if it still
+  fails, that message is the thing worth photographing.
+
+### Changed
+
+- **A New 3DS starts at render distance 3, not 2, and meshes chunks faster.** The New 3DS's
+  extra CPU speed, cache and memory have been switched on since v1.8.4, but almost nothing was
+  ever gated to actually use them — a New 3DS did the same amount of work per frame as an Old
+  one. Render distance 3 costs no extra memory: the mesh pool is already sized for the console's
+  ceiling at boot, regardless of the starting distance. The chunk-mesh drain per frame goes from
+  3 to 9 on a New 3DS (6 to 18 while a world is loading); an Old 3DS is unchanged at 3 either
+  way. Neither number has been run on real hardware — if a New 3DS stutters, these are the first
+  constants to turn back down.
+
+- **The world's block lookup was rebuilt smaller and faster.** Meshing a chunk used to run three
+  separate lookups per cell to decide whether it was solid, whether it blocked light and whether
+  it needed a face drawn; those are now one table read per cell, built once per mesh instead of
+  read cell by cell. Output is unchanged — the shipped code is measured slightly smaller as well
+  as doing less work per cell.
+
+### Added
+
+- **A splash when you climb out of water, and a wake while you swim.** The entry splash you
+  already had is fixed alongside it — it used to spawn at your feet, below the surface, where
+  you could not see it, and now appears where the water actually breaks.
+
+- **Dirt takes its biome's colour**, the one block v1.8.8's per-biome colouring missed. A desert
+  and a taiga no longer show the exact same brown dirt underfoot.
+
+- **The crash report now records which CPU core every thread actually ran on, not just which
+  one it asked for.** The two numbers are expected to agree; this build makes it possible to
+  check that instead of assuming it.
+
+- **A diagnostic for the freeze itself, on for this release only.** While the game boots and
+  builds your first world, it now writes a running list of the stages it reaches to
+  `blocksmith/stage.txt` on your SD card. If the console freezes, the last line in that file
+  names the exact stage it froze at — so if it happens again, look at that file and it will say
+  where, rather than the freeze staying as unexplained as it was in v1.8.16. There is no cost to
+  this once a world is up and running. It will be turned back off once the freeze is confirmed
+  cured on real hardware.
+
+### Notes
+
+Nothing here touches the block table or the multiplayer protocol, so no server update is
+needed. This build has not run on real hardware — that is the entire reason it exists: to put
+the freeze work in front of the New 3DS that froze, because nothing about it can be confirmed
+any other way.
+
 ## [1.8.16] - 2026-09-03
 
 Three things you reported, and three you did not. Food stops being something you can build a
