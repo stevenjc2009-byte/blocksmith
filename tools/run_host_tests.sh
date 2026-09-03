@@ -1562,19 +1562,19 @@ rm -rf "$BHI"
 # it was seeded at a placeholder 143 and the first real run reported "CHECK COUNT: 48 check(s)
 # were ADDED - expected 143, ran 191" and exited 1. Watch the count, not just the pass -- a
 # stanza that silently runs fewer checks than it used to looks identical to one that passes.
-BHBS="build-host/run-$$-blockstate"
-mkdir -p "$BHBS"
+BHBST="build-host/run-$$-blockstate"
+mkdir -p "$BHBST"
 
 gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	-I source \
 	source/world/blockstate.c \
 	source/world/crc32.c \
 	source/world/blockstate_test.c \
-	-o "$BHBS/blockstate_test"
+	-o "$BHBST/blockstate_test"
 
-"./$BHBS/blockstate_test"
+"./$BHBST/blockstate_test"
 
-rm -rf "$BHBS"
+rm -rf "$BHBST"
 
 # --- v1.7.1 task 49, install half -------------------------------------------------------
 #
@@ -4926,6 +4926,56 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 "./$BHBS/audio_bsnd_test"
 
 rm -rf "$BHBS"
+
+# audio/audio_sfx.c -- the named-slot table that maps a game event (SFX_BLOCK_BREAK, SFX_EAT,
+# SFX_SPLASH ...) onto a loaded sound, plus the positional helpers.
+#
+# WIRED 2026-09-03, and the reason is the same one that put the blockstate stanza in this file
+# earlier today: audio_sfx_test.c existed, passed, and was referenced by NOTHING. Counting the
+# mixer and bsnd stanzas directly above, that is FOUR suites found unwired in this tree in one
+# day, which stops looking like an accident and starts looking like a gap in the routine -- a
+# new _test.c gets written and verified by hand, and the step that makes it part of the gate
+# gets skipped because hand-verifying it already felt like finishing. Every one was found by
+# grep, none by a failure, because an unwired test's failure mode is silence: it cannot go red,
+# so it reports nothing, so nobody goes looking for it.
+#
+# Proven able to go red BEFORE being committed, which is the whole point of the paragraph above.
+# Moving the pool-byte pin at audio_sfx_test.c:205 from 159996u to 159997u -- out of tree, via a
+# sed'd copy in the build dir, because a sabotaged _test.c left under source/ would be globbed
+# into the console build by Makefile:26 -- gave "FAIL 1/121  L205 total_pool == 159997u", exit 1.
+# BUILD_EXIT was 0 on that arm, and that half matters as much as the exit 1: a stanza that fails
+# to COMPILE also exits nonzero, and would look like a caught bug while catching nothing.
+#
+# THE LINK LINE WAS FOUND BY TRYING IT, NOT BY READING THE INCLUDES. An include is not a link
+# dependency, and the guess that looked right was wrong three times running:
+#   * sfx + bsnd + pan          -> undefined audioPlayAt, audioTestReset, audioTestSetBackend
+#   * + app/hw.c                -> identical failure; hw.c was not the missing piece
+#   * + audio.c                 -> undefined mixerInit, mixerPlay, mixerStop, hwIsNew3ds
+# audio.c is where the host test backend lives (behind its own #ifndef __3DS__), and it calls
+# into audio_mixer.c -- which carries no __3DS__ guard anywhere in its 210 lines, so it links on
+# host perfectly well and simply had to be named. Green on the fourth attempt: 121 checks.
+#
+# Note this binary links audio.c, which the audio_bsnd stanza above deliberately does not. That
+# is the difference between the two: bsnd tests the FILE FORMAT and needs no mixer, this tests
+# the SLOT TABLE and needs a backend to observe what was played.
+BHASX="build-host/run-$$-audiosfx"
+mkdir -p "$BHASX"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/audio/audio.c \
+	source/audio/audio_mixer.c \
+	source/audio/audio_sfx.c \
+	source/audio/audio_bsnd.c \
+	source/audio/audio_pan.c \
+	source/app/hw.c \
+	source/audio/audio_sfx_test.c \
+	-lm \
+	-o "$BHASX/audio_sfx_test"
+
+"./$BHASX/audio_sfx_test"
+
+rm -rf "$BHASX"
 
 # ── tests/audio_cue_test.c — the v1.9.0 sound CUES (does anything play a sound at all) ─────
 #

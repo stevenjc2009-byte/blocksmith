@@ -59,6 +59,20 @@ MANIFEST = [
     ("block_break", "impactMining_000.ogg", ENC_PCM16),
     ("block_place", "impactPlank_medium_000.ogg", ENC_PCM16),
     ("footstep", "footstep_wood_000.ogg", ENC_PCM16),
+
+    # v1.8.17 lane SOUND-A. These six are synthesised, not sourced — the "source zip-
+    # relative name" column names a WAV tools/make_sfx_synth.py writes into this same
+    # assets/sfx_src/ directory rather than a file out of a downloaded pack, so there is
+    # no ATTRIBUTION.md row for any of them: procedurally generated audio was never
+    # anyone else's, and needs no licence. Re-run make_sfx_synth.py before this script if
+    # either file has changed; both are deterministic, so a clean re-run of both produces
+    # byte-identical .bsnd output.
+    ("hurt", "hurt_synth.wav", ENC_PCM16),
+    ("death", "death_synth.wav", ENC_PCM16),
+    ("eat", "eat_synth.wav", ENC_PCM16),
+    ("craft", "craft_synth.wav", ENC_PCM16),
+    ("splash", "splash_synth.wav", ENC_PCM16),
+    ("ui_tap", "ui_tap_synth.wav", ENC_PCM16),
 ]
 
 

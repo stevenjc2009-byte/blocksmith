@@ -59,6 +59,31 @@ SHA-256 of the originals, all three confirmed identical to `Audio/<name>` in the
 Each file also carries `ARTIST=KenneyG` in its own Vorbis comment header, which identifies
 the author without reference to where the download came from.
 
+## Synthesised sounds — v1.8.17 lane SOUND-A, no attribution needed
+
+The six sounds below are **not sourced from anywhere** — they are generated waveforms
+(sine partials, filtered noise, hand-shaped envelopes), written by
+`tools/make_sfx_synth.py` using nothing but Python's standard library. The rule at the top
+of this file is CC0-or-CC-BY *because everything else here was someone else's recording
+first*; a procedurally generated sample was never anyone else's, so there is no licence to
+trace and no credit line to carry. They are listed here anyway, for the same reason the
+sourced sounds are: so this file stays the one place that answers "where did every byte in
+`romfs/sfx/` come from" without exception.
+
+| Game sound | Source file | Generator | Licence |
+|---|---|---|---|
+| `romfs/sfx/hurt.bsnd` | `hurt_synth.wav` | `tools/make_sfx_synth.py::make_hurt` | none — procedural |
+| `romfs/sfx/death.bsnd` | `death_synth.wav` | `tools/make_sfx_synth.py::make_death` | none — procedural |
+| `romfs/sfx/eat.bsnd` | `eat_synth.wav` | `tools/make_sfx_synth.py::make_eat` | none — procedural |
+| `romfs/sfx/craft.bsnd` | `craft_synth.wav` | `tools/make_sfx_synth.py::make_craft` | none — procedural |
+| `romfs/sfx/splash.bsnd` | `splash_synth.wav` | `tools/make_sfx_synth.py::make_splash` | none — procedural |
+| `romfs/sfx/ui_tap.bsnd` | `ui_tap_synth.wav` | `tools/make_sfx_synth.py::make_ui_tap` | none — procedural |
+
+Deterministic: every noise burst comes from a fixed-seed integer LCG (see
+`tools/make_sfx_synth.py`'s `lcg_noise`), never from Python's `random` module, so re-running
+the generator and then `tools/make_sounds.py` reproduces the exact `.bsnd` bytes already in
+`romfs/sfx/`.
+
 ## Planned for v1.8.17 — licence-verified, not yet downloaded
 
 The sounds below have had their licence traced to the original upload page this session

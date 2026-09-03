@@ -33,14 +33,54 @@
 
 #include "audio/audio.h"
 
-// The three sounds tools/make_sounds.py packs into romfs:/sfx/. Slots, not ids — the id is
+// The nine sounds tools/make_sounds.py packs into romfs:/sfx/. Slots, not ids — the id is
 // whatever audioLoad returned for the file registered into this slot, and an unregistered
 // or failed slot is AUDIO_SOUND_NONE and plays nothing.
+//
+// v1.8.17 lane SOUND-A added the six slots below SFX_FOOTSTEP. Each has a real clip in
+// romfs/sfx/ and a real gameplay event to hang off — world/survival.h's health/hunger
+// tracking (hurt, death, eat), world/crafting.h's craftMake (craft), world/physics.h's
+// Body::wet transition (splash), and scene/ui.c's rising-edge tap (ui_tap) — but NO call
+// site for any of them exists yet in this tree. Wiring them into main.c/interact.c/ui.c is
+// deliberately not done by this lane; see the six slots' own comments for exactly where
+// each one is meant to fire.
 typedef enum {
 	SFX_BLOCK_BREAK = 0,
 	SFX_BLOCK_PLACE = 1,
 	SFX_FOOTSTEP    = 2,
-	SFX_SLOT_COUNT  = 3,
+
+	// Fires once per point of health LOST — a fall-damage or starvation tick from
+	// world/survival.h's fallDamageUpdate()/survivalTick(), whichever caller notices
+	// `survival.health` decreased since the last frame it checked. AUDIO_PRIO_HIGH: the
+	// mixer doc names damage as "things the player must hear" (audio_mixer.h).
+	SFX_HURT        = 3,
+
+	// Fires once, the frame health reaches 0 — the `true` return from
+	// fallDamageUpdate()/survivalTick() (world/survival.h). Also AUDIO_PRIO_HIGH.
+	SFX_DEATH       = 4,
+
+	// Fires on a `true` return from survivalEat() (world/survival.h) — a slot the player
+	// tapped actually fed them, not a tap on an empty or non-food slot. AUDIO_PRIO_NORMAL.
+	SFX_EAT         = 5,
+
+	// Fires on a `true` return from craftMake() (world/crafting.h), reached today from
+	// scene/ui.c's handleCraftTap(). Non-positional (audioPlay, not audioSfxPlayAtBlock) —
+	// a craft is "about the player", not somewhere in the world. AUDIO_PRIO_NORMAL.
+	SFX_CRAFT       = 6,
+
+	// Fires on the frame world/physics.h's bodyWetUpdate() output crosses the BODY_DRY /
+	// non-dry boundary in EITHER direction — entering or leaving water. Positional, at the
+	// body's own position, same as a footstep. AUDIO_PRIO_NORMAL.
+	SFX_SPLASH      = 7,
+
+	// Fires on every rising-edge UI tap scene/ui.c's uiUpdateDraw() accepts — the same
+	// `tap` variable ui.c's own comment describes as "rising edge only, same as title.c's
+	// own tap". Covers slot pickup/drop, hotbar selection and the crafting panel's own tap
+	// target alike; craft SUCCESS still gets its own SFX_CRAFT on top of this one.
+	// Non-positional, AUDIO_PRIO_UI — "never dropped, never positional" (audio_mixer.h).
+	SFX_UI_TAP      = 8,
+
+	SFX_SLOT_COUNT  = 9,
 } SfxSlot;
 
 // Records the id audioLoad() returned. Call once per sound at boot. A slot outside the
