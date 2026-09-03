@@ -76,6 +76,48 @@ static uint8_t s_luminance[REGISTRY_MAX];
 // — see lightSetLuminanceForTest, which is the only writer.
 static uint8_t s_lum_test[REGISTRY_MAX];
 
+// v1.8.17 perf. opaqueAt's predicate — solid && !transparent — precomputed per id, one
+// byte each, filled by syncLuminance() below beside s_luminance.
+//
+// WHY. opaqueAt is the single hottest thing in this file: it is called for every
+// neighbour offer in spread(), for every cell of every sweep pass in
+// lightRelightColumnSweeps, for all 2048 cells of each of the four sides in
+// seedCrossColumnSide, and once per sky strip in lightPropagateColumn's seed loop. It
+// used to end in `blockInfo(id)`, which lives in world/block.c and delegates to
+// registryView() in world/registry.c — a CROSS-TU call the console build cannot inline,
+// because Makefile:40-70 compiles at -O3 with no LTO. MEASURED on the host harness
+// described in this change's report (ld --wrap=blockInfo, so only calls that actually
+// cross a translation unit are counted): one lightRelightColumn on a column with real
+// relief made 5,164 blockInfo calls, 6,550 on a flat column carrying a torch, and 19,049
+// on a torch near a border with four loaded, lit neighbours. The control arm with the
+// engine off read 0, so those numbers are this engine's and nothing else's. After this
+// table all four arms read 256 — one pass over the registry, which is the syncLuminance()
+// walk itself and nothing else. Every light value the same harness dumped (both channels
+// of five columns across five handoff scenarios, FNV digests) was unchanged.
+//
+// WHY IT IS FILLED IN syncLuminance() AND NOT AN INIT FUNCTION. The registry is not
+// constant: registryRegister and registryRemoteApply can add or change a row at any
+// point in a session (a server registering blocks at join, registrySidecarLoad on a
+// world load), and a table built once at boot would go stale and light the world through
+// a block's OLD solidity. syncLuminance() already walks every registry entry exactly
+// once per propagate/relight, for s_luminance, for precisely this reason — so this rides
+// that walk and inherits its freshness guarantee whole. The cost of the extra column in
+// that walk is one blockInfo() per id, 256 per relight, against the thousands it deletes.
+//
+// THREADING. Identical to s_luminance's argument immediately above, and it holds for the
+// same reason: this is a pure function of blockInfo(i), so the worker and the main thread
+// write the SAME byte into the same entry rather than different ones, and a byte store is
+// indivisible — a reader sees the old value or the new one and they are equal.
+//
+// ORDERING, and the one real hazard. .bss starts this all-zero, which reads as "nothing
+// is opaque" — light would pour through stone. Nothing may call opaqueAt before
+// syncLuminance() has run at least once in this process. That is why the syncLuminance()
+// call in lightPropagateColumn moved ABOVE the sky pass in this change: the sky seed loop
+// and spread() both call opaqueAt, and it used to be called after them, purely because
+// the block pass was the only thing that needed its return value.
+// lightRelightColumnSweeps already called it before its first opaqueAt.
+static uint8_t s_opaque[REGISTRY_MAX];
+
 // The six in-column neighbour offsets, shared by both engines.
 static const int8_t kDirs[6][3] = {
 	{ 1, 0, 0}, {-1, 0, 0}, { 0, 1, 0}, { 0,-1, 0}, { 0, 0, 1}, { 0, 0,-1},
@@ -276,14 +318,16 @@ uint8_t lightGetBlock(const Column* col, int lx, int y, int lz)
 
 // Opaque means "stops light": solid and not transparent, byte-for-byte the same
 // predicate the mesher's occlusion table is built from. Air passes; leaves pass.
+//
+// v1.8.17: the predicate itself is unchanged; it is read out of s_opaque (see the table's
+// comment above) instead of recomputed through a cross-TU blockInfo() call per cell.
+// BlockId is a uint8_t (world/block.h:15) so the index cannot leave the 256-entry table.
 static bool opaqueAt(const Chunk* const chunks[COLUMN_CHUNKS], int lx, int y, int lz)
 {
 	if (y < 0) return true;   // below the floor reads as solid, like worldGet
 	const Chunk* c = chunks[y >> 4];
 	if (!c) return false;     // absent chunk is air
-	const BlockId id = chunkGet(c, chunkIndex(lx, y & 15, lz));
-	const BlockInfo* info = blockInfo(id);
-	return info->solid && !info->transparent;
+	return s_opaque[chunkGet(c, chunkIndex(lx, y & 15, lz))] != 0;
 }
 
 // Highest non-air cell per (x,z), -1 when the strip is all air. Everything above
@@ -342,10 +386,18 @@ static void heightMapFill(HeightMap* hm, const Chunk* const chunks[COLUMN_CHUNKS
 // propagate/relight. It now does a registryGet() per entry instead of an array read.
 // registryGet on an undefined id answers the air row, whose luminance is 0, so no
 // is-defined test is needed.
+//
+// v1.8.17: the same walk now also fills s_opaque, opaqueAt's predicate table — see that
+// table's comment above for the measurement and for why this walk, and not an init
+// function, is the only correct place to fill it. It rides here rather than in a second
+// loop so the two tables can never be refreshed a different number of times.
 static bool syncLuminance(void)
 {
 	bool any = false;
 	for (int i = 0; i < REGISTRY_MAX; i++) {
+		const BlockInfo* info = blockInfo((BlockId)i);
+		s_opaque[i] = (uint8_t)(info->solid && !info->transparent);
+
 		uint8_t lum = s_lum_test[i];
 		if (lum == 0) lum = registryGet((BlockId)i)->luminance;
 		s_luminance[i] = lum;
@@ -604,6 +656,14 @@ bool lightPropagateColumn(World* w, int cx, int cz, LightQueue* q)
 	for (int cy = 0; cy < COLUMN_CHUNKS; cy++)
 		chunks[cy] = worldChunk(w, cx, cy, cz);
 
+	// v1.8.17: HOISTED above the sky pass, and this is load-bearing rather than tidying.
+	// opaqueAt now reads s_opaque, which this call fills (see the table's comment), and the
+	// sky seed loop and spread() below both call opaqueAt. Called here it is the same pure
+	// function of s_lum_test and the registry it was thirty lines lower — neither changes
+	// inside this function — so `lum_any` is bit-for-bit the value `if (syncLuminance())`
+	// used to test, just computed before the first reader of the table instead of after it.
+	const bool lum_any = syncLuminance();
+
 	HeightMap hm;
 	heightMapFill(&hm, chunks);
 
@@ -658,7 +718,11 @@ bool lightPropagateColumn(World* w, int cx, int cz, LightQueue* q)
 	// all-stone chunk, neither of which is ever luminous) from 4096 chunkGet
 	// calls into 1. MEASURED, tests/light_seam_test.c: see its cost-comparison
 	// arm for the before/after numbers this comment does not want to go stale.
-	if (syncLuminance()) {
+	//
+	// v1.8.17: the syncLuminance() call that used to sit in this `if` is now above the sky
+	// pass and its answer is carried here in `lum_any`. Same value, same ONE call per
+	// propagate — see the hoist's own comment for why it had to move.
+	if (lum_any) {
 		for (int cy = 0; cy < COLUMN_CHUNKS; cy++) {
 			if (!chunks[cy]) continue;
 			if (chunkGetForm(chunks[cy]) == CHUNK_FORM_UNIFORM &&
