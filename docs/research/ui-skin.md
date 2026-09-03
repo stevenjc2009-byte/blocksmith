@@ -227,7 +227,7 @@ numbers above; the exact new count is worked in §10 once the concrete element l
 > and §10's ~183-quad worked total either way, so the bottom-line conclusion ("fits without
 > raising the constant") survives — only the "not quite 2x headroom" framing is wrong. This
 > was an accurate read of the file when written and the file changed under it afterwards, not
-> a research error. `docs/plan-1.8.19-interface.md`'s own citation of this figure (§2, "~550
+> a research error. `docs/plan-1.9.1-interface.md`'s own citation of this figure (§2, "~550
 > quads worst-case shipped") carries the same correction.
 
 **Bottom-screen usage today.** The 320x240 bottom screen already carries, top to bottom: the
@@ -416,7 +416,7 @@ quads, not a shader effect."
 > every frame once enabled. The readout is `source/debug/biomeinfo.c`/`.h` and
 > `biomeinfo_test.c`, a real host-tested bottom-screen debug row. This section was written
 > before v1.8.8 shipped and describes genuinely future work at the time it was drafted; it
-> simply rotted once that version landed. `docs/plan-1.8.19-interface.md` §0 already notes
+> simply rotted once that version landed. `docs/plan-1.9.1-interface.md` §0 already notes
 > this section is "unchanged by this version" and its own build order still lists this as
 > Phase 1 — that citation needs the same correction, made there directly.
 

@@ -1,5 +1,10 @@
 # v1.9.1 — The other worlds: a feasibility study, not a build plan
 
+> **⚠ RENAMED [2026-09-03, v1.8.17]** — this file was `docs/plan-1.9.1-dimensions.md`. It is
+> now `docs/plan-1.9.3-dimensions.md`. The other worlds (Nether/End) moved from v1.9.1 to
+> v1.9.3 in the roadmap renumber; the filename is corrected to match. The content below,
+> including its own "v1.9.1" title and prose, is unchanged from before the rename.
+
 `docs/VERSION-LIST.md` says nothing beyond `docs/ROADMAP.md`'s own one-line entry
 exists for this version yet: *"Two more dimensions with their own names — the fire
 one and the end one, named but not copied from anything — each with its own

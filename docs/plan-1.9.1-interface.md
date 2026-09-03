@@ -1,5 +1,10 @@
 # v1.8.19 — The new interface: implementation spec
 
+> **⚠ RENAMED [2026-09-03, v1.8.17]** — this file was `docs/plan-1.8.19-interface.md`. It is
+> now `docs/plan-1.9.1-interface.md`. The new interface moved from v1.8.19 to v1.9.1 in the
+> roadmap renumber; the filename is corrected to match. The content below, including its own
+> "v1.8.19" title and prose, is unchanged from before the rename.
+
 This is the detailed version of `docs/ROADMAP.md:386-390`'s v1.8.19 entry (*"Changed. The
 menus and inventory redrawn around a long horizontal bar of options — the shape the legacy
 console crafting menu and the PS3 system menu share. Referenced, not copied."*) and
@@ -57,7 +62,7 @@ Nothing about `BLOCK_COUNT`, `registryCrc16()`, or the wire protocol moves for t
 every change here is client-side presentation over data the client already has. The one
 cross-version dependency worth stating plainly: **v1.8.18 (storage/QoL) ships first** per the
 roadmap's own ordering, so by the time this version's work begins, `RECIPE_COUNT` is already 5
-(the chest recipe, `docs/plan-1.8.18-storage-qol.md` §3.6) and a `BLOCK_CHEST` row already
+(the chest recipe, `docs/plan-1.9.0-storage-qol.md` §3.6) and a `BLOCK_CHEST` row already
 exists in the registry — this document's own numbers (§3, §4) are read against that already-
 landed state, not against today's 4-recipe, chest-less tree, so a reader checking this document
 against a v1.8.18-built tree will see the numbers this document quotes; a reader checking it
@@ -71,7 +76,7 @@ against today's un-built tree will see one fewer recipe and one fewer block than
 > `source/`) — the chest itself has not landed, contrary to what this paragraph's framing
 > implies. So the real progression is: `RECIPE_COUNT` is 5 **today**, independent of v1.8.18,
 > and will become **6** once a chest recipe actually lands (per the same correction now in
-> `docs/plan-1.8.18-storage-qol.md` §2.8). A reader checking this document against the tree as
+> `docs/plan-1.9.0-storage-qol.md` §2.8). A reader checking this document against the tree as
 > it stands right now will see `RECIPE_COUNT == 5` already — not because a chest shipped, but
 > because an unrelated torch recipe did. This same off-by-one, from the same pre-v1.8.12
 > research snapshot, is why §5.2's `CRAFT_ROW_H` worked example below lands on the right
@@ -246,7 +251,7 @@ dangling one in the settled research, and this document is where it is finally a
 `ui-skin.md` §10 estimates the block list at "`BLOCK_COUNT=8` cells... 8 x 8 = 64 quads,"
 explicitly using `BLOCK_COUNT` as the item count. §3.1/§3.2 above establish that this screen
 never used `BLOCK_COUNT` — it walks every **registry-defined** id, which (per
-`docs/plan-1.8.18-storage-qol.md` §2.1 and §3.1, read directly against the live tree in that
+`docs/plan-1.9.0-storage-qol.md` §2.1 and §3.1, read directly against the live tree in that
 pass) is **27 core rows today, 28 once the storage version's chest row lands** — and it pages 16
 at a time, not all-at-once.
 
@@ -452,7 +457,7 @@ they are today.
 ## 5. Does crafting stay single-input?
 
 **Yes — this document proposes no change to `CraftRecipe`'s shape.** Confirmed directly
-(`docs/plan-1.8.18-storage-qol.md` §2.8, itself read from `source/world/crafting.h` in that
+(`docs/plan-1.9.0-storage-qol.md` §2.8, itself read from `source/world/crafting.h` in that
 pass): `CraftRecipe` is `{name, input_item, input_count, output_item, output_count}` — one
 ingredient, one result — and the header's own comment records that shaped and shapeless
 multi-ingredient recipes were **already considered and rejected** for this project. The v1.8.19
@@ -515,7 +520,7 @@ property and the storage document's §5.
    for within-tab movement — a real, differently-sourced convention from a reference this
    project is also drawing on. **This document recommends keeping `ui-skin.md`'s d-pad choice**,
    for a concrete reason beyond precedent: this version's storage/QoL sibling
-   (`docs/plan-1.8.18-storage-qol.md` §6.1) proposes repurposing the **shoulder** L/R for hotbar
+   (`docs/plan-1.9.0-storage-qol.md` §6.1) proposes repurposing the **shoulder** L/R for hotbar
    cycling during live gameplay. Since the bar's own d-pad left/right and the storage document's
    shoulder L/R are different physical controls, keeping the bar on d-pad avoids a direct button
    conflict between the two sibling versions' proposals — but this is exactly the kind of

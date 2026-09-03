@@ -43,18 +43,22 @@ now says so outright and points forward to v1.8.18. `docs/VERSION-LIST.md:848-85
 matching planned entry. Nothing was descoped in the move; the feature simply waited for a free
 slot.
 
-**A naming collision worth clearing up before anyone greps for it.** Two files in this
-directory are called `plan-1.8.18-storage.md` and `plan-1.8.18-storage-qol.md`. They are not
-about this version. Storage and quality of life moved to **v1.9.0** (`docs/ROADMAP.md:443`)
-in the same correction pass that moved monsters to v1.8.18, and those two filenames were not
-renamed with it. They are v1.9.0 documents wearing a v1.8.18 name. This document is the only
-v1.8.18 plan. Renaming them is not in this version's scope and is not proposed here.
+**A naming collision that existed when this was written, and has since been cleared.** Two
+files in this directory used to be called `plan-1.8.18-storage.md` and
+`plan-1.8.18-storage-qol.md` despite not being about this version: storage and quality of life
+moved to **v1.9.0** (`docs/ROADMAP.md:443`) in the same correction pass that moved monsters to
+v1.8.18, and those two filenames were not renamed with it. As of [2026-09-03] they have been,
+to `plan-1.9.0-storage.md` and `plan-1.9.0-storage-qol.md`, along with three more that had
+drifted the same way (`plan-1.9.1-interface.md`, `plan-1.9.2-redstone.md`,
+`plan-1.9.3-dimensions.md`). Each renamed file carries a header note recording its old name, so
+an old citation is traceable rather than merely broken. This document remains the only v1.8.18
+plan.
 
 ---
 
 ## 1. Success criteria
 
-Split the way `docs/plan-1.8.18-storage-qol.md:47-97` splits it, and for its stated reason: a
+Split the way `docs/plan-1.9.0-storage-qol.md:47-97` splits it, and for its stated reason: a
 green host suite and "it feels right in a cave" are different claims, and conflating them is
 how an unverified thing gets called done. Both halves must hold.
 

@@ -1,5 +1,10 @@
+> **⚠ RENAMED [2026-09-03, v1.8.17]** — this file was `docs/plan-1.8.18-storage.md`. It is
+> now `docs/plan-1.9.0-storage.md`. Storage/QoL moved from v1.8.18 to v1.9.0 in the roadmap
+> renumber; the filename is corrected to match. The content below, including its own "v1.8.18"
+> title and prose, is unchanged from before the rename.
+
 > **STATUS: SECOND OPINION, NOT THE CANONICAL SPEC.** The canonical v1.8.18 plan is
-> [`plan-1.8.18-storage-qol.md`](plan-1.8.18-storage-qol.md) (47,601 bytes), which is older,
+> [`plan-1.9.0-storage-qol.md`](plan-1.9.0-storage-qol.md) (47,601 bytes), which is older,
 > broader, and already committed. This document was written by a later lane that was dispatched
 > without being told the other one existed -- my error in briefing it, not the lane's. It is
 > kept rather than deleted because it independently verified three things the canonical spec
@@ -28,7 +33,7 @@ convention `docs/plan-1.8.16-monsters.md` uses.
 
 ## 0. A file already exists at a neighbouring name — read before anything below
 
-`docs/plan-1.8.18-storage-qol.md` (756 lines) already exists in this tree, dated with a
+`docs/plan-1.9.0-storage-qol.md` (756 lines) already exists in this tree, dated with a
 correction entry timestamped `2026-09-03` — today. It is a complete, thorough, well-cited plan
 for the identical feature (chest + QoL), independently researched, in the same house style. This
 document was written **after** discovering that file, not before, and reuses none of its prose —
@@ -385,9 +390,9 @@ the L/R conflict is deliberately resolved (a HIS CALL item, not a coding task).
    multiplayer wire-ceiling gap they build a "defer multiplayer sync" argument on was closed in
    v1.8.10 (2026-09-02, `inventory.h:145-186`). Whoever reconciles the two documents should
    re-open that decision with the corrected fact, not the stale one.
-6. **The two documents themselves** — `docs/plan-1.8.18-storage-qol.md` (756 lines, broader scope:
+6. **The two documents themselves** — `docs/plan-1.9.0-storage-qol.md` (756 lines, broader scope:
    also covers QoL items 2 and 3 from §5, network sync design, atlas budget, full build order) and
-   this file (`docs/plan-1.8.18-storage.md`, narrower: exactly the six questions this lane's brief
+   this file (`docs/plan-1.9.0-storage.md`, narrower: exactly the six questions this lane's brief
    specified) now both exist for the same version. Whether one supersedes the other, they get
    merged, or they stay as two lenses on the same problem is not this lane's call — flagged for
    whoever owns the version.

@@ -1,5 +1,10 @@
 # v1.9.0 — Redstone: what subset this hardware can actually afford
 
+> **⚠ RENAMED [2026-09-03, v1.8.17]** — this file was `docs/plan-1.9.0-redstone.md`. It is
+> now `docs/plan-1.9.2-redstone.md`. Redstone moved from v1.9.0 to v1.9.2 in the roadmap
+> renumber; the filename is corrected to match. The content below, including its own "v1.9.0"
+> title and prose, is unchanged from before the rename.
+
 This document answers what `docs/VERSION-LIST.md` says has nothing beyond
 `docs/ROADMAP.md`'s one-line entry yet: which pieces of Minecraft's redstone system
 Blocksmith should build. **This reads as a scoping decision, not a build plan** — the

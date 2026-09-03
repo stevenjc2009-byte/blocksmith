@@ -1,5 +1,10 @@
 # v1.8.18 — Storage and quality of life: implementation spec
 
+> **⚠ RENAMED [2026-09-03, v1.8.17]** — this file was `docs/plan-1.8.18-storage-qol.md`. It
+> is now `docs/plan-1.9.0-storage-qol.md`. Storage/QoL moved from v1.8.18 to v1.9.0 in the
+> roadmap renumber; the filename is corrected to match. The content below, including its own
+> "v1.8.18" title and prose, is unchanged from before the rename.
+
 This is the detailed version of `docs/ROADMAP.md:379-383`'s v1.8.18 entry (*"Added. Chests.
 Stack splitting and merging, shift-move, and the small conveniences that a game gets tiring
 without."*) and `docs/VERSION-LIST.md:545-551`'s matching entry. Neither document names a
@@ -298,7 +303,7 @@ design — `CraftRecipe` is "the degenerate case of shapeless with a bag of one,
 **A chest recipe in this version stays inside that same shape** (§3.6) — the real Minecraft
 8-planks-in-a-ring recipe needs a multi-slot grid this codebase has already decided against once,
 and re-opening that decision is out of scope here (it belongs to whatever crafting-menu question
-`docs/plan-1.8.19-interface.md` §6 answers, not to this document).
+`docs/plan-1.9.1-interface.md` §6 answers, not to this document).
 
 ### 2.9 The atlas today
 
@@ -759,7 +764,7 @@ does not belong in this section.
 
 ## Dated correction: 2026-09-03 06:55
 
-A second planning pass (`plan-1.8.18-storage.md`, kept alongside this file as a second opinion)
+A second planning pass (`plan-1.9.0-storage.md`, kept alongside this file as a second opinion)
 re-derived parts of this spec against a later tree and found three things worth carrying back
 here. This section is appended rather than edited into the body above, so the original reasoning
 stays readable and it is obvious what changed and when.
