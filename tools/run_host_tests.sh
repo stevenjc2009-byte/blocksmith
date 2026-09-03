@@ -1531,6 +1531,51 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 rm -rf "$BHI"
 
+# world/blockstate.c -- the per-block state side table v1.8.15's furnace is built on.
+#
+# WHY THIS STANZA EXISTS AT ALL, which is the part worth reading. blockstate_test.c was
+# written, run, and verified standalone -- 191 checks, four sabotage arms each compiled clean
+# and then failed red at a named line -- and was then referenced by NOTHING. It was not in this
+# file, so it was not in any suite run, so its 191 checks had never once executed as part of the
+# gate that actually decides whether this project is green. A test that nothing links is a test
+# that cannot go red, and a test that cannot go red is documentation with a compiler attached.
+#
+# It was found by grep during v1.8.15 planning, not by anything failing, which is exactly the
+# problem: the failure mode of an unwired test is silence. The check that found it is worth
+# copying -- grep this file for the module name, and give the grep a red control by grepping
+# for a module that IS wired (inventory_test returns 8 hits) so an empty result means "absent"
+# rather than "the grep was wrong".
+#
+# The link is deliberately tiny: blockstate.c pulls in only <stdio.h>, <string.h> and
+# world/crc32.h, and blockstate_test.c adds only <sys/stat.h> on top. No registry.c, no
+# world.c, no chunk.c -- unlike inventory.c above, blockstate.c does not validate ids against
+# the registry, because it stores an opaque payload and takes no view on what the payload means.
+# That independence is the reason it needed zero wiring into any existing file to be built, and
+# it is why this stanza is four lines rather than fourteen.
+#
+# The file is modelled on inventory.c's persistence: sidecar at <world_dir>/blockstate.dat,
+# magic "BSBX", tmp-write-then-rename so a power cut cannot leave a half-written table. It is
+# placed directly after the inventory-persistence stanza for that reason -- same on-disk
+# discipline, same failure modes, and if one of them regresses the other is where to look.
+#
+# BLOCKSTATE_TEST_EXPECTED_CHECKS is pinned at 191 inside the test. That pin is not decoration:
+# it was seeded at a placeholder 143 and the first real run reported "CHECK COUNT: 48 check(s)
+# were ADDED - expected 143, ran 191" and exited 1. Watch the count, not just the pass -- a
+# stanza that silently runs fewer checks than it used to looks identical to one that passes.
+BHBS="build-host/run-$$-blockstate"
+mkdir -p "$BHBS"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/blockstate.c \
+	source/world/crc32.c \
+	source/world/blockstate_test.c \
+	-o "$BHBS/blockstate_test"
+
+"./$BHBS/blockstate_test"
+
+rm -rf "$BHBS"
+
 # --- v1.7.1 task 49, install half -------------------------------------------------------
 #
 # Added testChunkPlanAllMatchesLoadAll() to source/world/world_test.c. It links the real
