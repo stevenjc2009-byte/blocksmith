@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include <curl/curl.h>
+#include <mbedtls/x509_crt.h>
 
 #include "app/updater_version.h"
 #include "app/whatsnew.h"
@@ -36,6 +37,31 @@ typedef enum
 static bool  s_available;      ///< Did updaterInit get its services up.
 static u32*  s_socBuf;
 static bool  s_socUp, s_amUp, s_romfsUp;
+
+// v1.8.18. The whole CA bundle, read once into a heap buffer while updaterInit() has RomFs
+// definitely mounted, and handed to curl as a blob instead of a path from then on. See the
+// comment above loadCertBundle() for why.
+static void*  s_caBundleData;
+static size_t s_caBundleLen;
+
+// v1.8.19. What probeCertBundle() found when it parsed s_caBundleData itself at boot, purely
+// to measure. s_caParseRet is mbedtls_x509_crt_parse()'s raw return: 0 all 121 parsed clean,
+// >0 that many failed while the rest made it into the chain, <0 an mbedtls error code (a
+// file-I/O-family code here would be impossible -- this parses memory, not a path -- so a
+// negative reading here can only be MBEDTLS_ERR_X509_ALLOC_FAILED-family exhaustion or the
+// content itself). s_caParseCount is the chain length actually walked. Both start at a
+// sentinel that cannot be confused with a real mbedtls return, so a failure screen that
+// somehow renders before updaterInit() has run is recognisable as exactly that rather than
+// read as "0 certs, parse succeeded".
+#define CA_PROBE_NOT_RUN (1)
+static int s_caParseRet   = CA_PROBE_NOT_RUN;
+static int s_caParseCount = -1;
+
+// v1.8.19. curl's own text for the last failed perform() on any handle, captured via
+// CURLOPT_ERRORBUFFER in applyCommonOptions(). Often more specific than
+// curl_easy_strerror(result) for a TLS/cert failure -- it is the only other thing this build
+// can put on the failure screen, since BS_BOTTOM_UI compiles the text console out entirely.
+static char s_curlError[CURL_ERROR_SIZE];
 
 static Thread s_worker;
 static bool   s_workerLive;    ///< A thread exists and has not been reaped.
@@ -211,6 +237,40 @@ static int reportProgress(void* userData, curl_off_t total, curl_off_t now,
 	return 0;
 }
 
+// The CA bundle's primary home: the RomFs copy baked into this exact build. Kept as a
+// named constant rather than a literal in applyCommonOptions() because
+// performWithCertFallback() below needs to be able to set curl back to it after a fallback
+// attempt, on the same handle, and a typo'd second copy of the string would silently break
+// that.
+#define CERT_BUNDLE_ROMFS "romfs:/cacert.pem"
+
+// v1.8.17. Second place to look for the same trust bytes when the RomFs copy can't be
+// opened or parsed on a given console. This is not a made-up path: it is the CAINFO
+// devkitPro's own 3ds-curl 8.4.0 package is built with by default
+// (--with-ca-bundle=sdmc:/config/ssl/cacert.pem), and the location several established
+// homebrew updaters (Universal-Updater among them) already populate and rely on. Nothing
+// about trust changes by trying it - it is asked to vouch for exactly the same Mozilla
+// bundle, just read off the SD card's ordinary FAT filesystem instead of RomFs.
+#define CERT_BUNDLE_SDMC_FALLBACK "sdmc:/config/ssl/cacert.pem"
+
+// v1.8.18. steve's report, second look: CURLE_SSL_CACERT_BADFILE (77) on real hardware means
+// curl could not open or parse whatever CURLOPT_CAINFO named AT THE INSTANT
+// curl_easy_perform() ran the TLS handshake -- libcurl opens that file lazily, during
+// perform(), not when the option is set. Every romfsInit()/romfsExit() call site in the tree
+// was mapped (source/app/updater.c and source/audio/audio.c are the only two; see the
+// v1.8.18 vault log for the full list) and updaterInit() below holds RomFs mounted
+// continuously from boot to updaterExit(), which runs after the worker thread is joined -- so
+// on the call graph as it exists today, nothing can unmount "romfs" out from under a transfer
+// in flight. That rules out an unmount race as the cause here specifically.
+//
+// It does not rule out every other way a lazy file read can fail on this device, and the
+// fix below removes the entire class regardless of which exact one it was: CURLOPT_CAINFO_BLOB
+// (curl 8.4.0, this portlib's own curl/easy.h has it -- CURLOPTTYPE_BLOB 309) hands curl the
+// trust bytes directly, so nothing opens romfs:/cacert.pem, or any file, at perform() time at
+// all. It is loaded exactly once, up front, in updaterInit(), while this function's own
+// romfsInit() a few lines above is definitely still in effect.
+static bool loadCertBundle(void);
+
 // Everything both requests need set the same way. Split out so the API call and the
 // download cannot drift apart on the settings that matter - particularly the certificate
 // bundle and redirect following, either of which silently breaks the updater if only one
@@ -218,6 +278,13 @@ static int reportProgress(void* userData, curl_off_t total, curl_off_t now,
 static void applyCommonOptions(CURL* curl, const char* url)
 {
 	curl_easy_setopt(curl, CURLOPT_URL, url);
+
+	// v1.8.19. Cleared per handle, before anything can write into it, so a failure screen can
+	// never show a previous request's text under a different one's curl code. curl only ever
+	// writes this on an actual error, so an empty string here after a failed perform() is
+	// itself informative -- it means curl had nothing more specific to add beyond the code.
+	s_curlError[0] = '\0';
+	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, s_curlError);
 
 	// GitHub serves release assets as a redirect to a separate host, and it has used
 	// relative Location headers in the past. Without this the download is a zero-byte file
@@ -228,8 +295,18 @@ static void applyCommonOptions(CURL* curl, const char* url)
 	// The API rejects requests with no User-Agent outright.
 	curl_easy_setopt(curl, CURLOPT_USERAGENT, "blocksmith-3ds/" BLOCKSMITH_VERSION);
 
-	// The whole reason RomFs exists in this project.
-	curl_easy_setopt(curl, CURLOPT_CAINFO, "romfs:/cacert.pem");
+	// The whole reason RomFs exists in this project, handed over as an in-memory blob rather
+	// than a path -- see the comment above loadCertBundle() declaration for why. NOCOPY is
+	// safe here specifically because s_caBundleData is freed nowhere but updaterExit(), and
+	// updaterExit() joins the worker thread before it gets there (see reapWorker()), so no
+	// transfer using this handle can still be alive when the buffer goes away.
+	// performWithCertFallback() below is what happens on top of this if a console still can't
+	// use the RomFs copy for some other reason.
+	struct curl_blob caBlob;
+	caBlob.data  = s_caBundleData;
+	caBlob.len   = s_caBundleLen;
+	caBlob.flags = CURL_BLOB_NOCOPY;
+	curl_easy_setopt(curl, CURLOPT_CAINFO_BLOB, &caBlob);
 	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
 	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
 
@@ -238,6 +315,55 @@ static void applyCommonOptions(CURL* curl, const char* url)
 	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 20L);
 	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 64L);
 	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 45L);
+}
+
+// v1.8.17. steve's report: on real New 3DS hardware, every single check and every single
+// download failed with "Could not reach GitHub: Problem with the SSL CA cert (path? access
+// rights?)" - curl_easy_strerror(CURLE_SSL_CACERT_BADFILE), meaning curl could not open or
+// parse the file CURLOPT_CAINFO named, not that a certificate was presented and rejected.
+//
+// Checked directly against the shipped v1.8.16 .cia (not the git tree - see the vault log
+// for the byte offsets): romfs:/cacert.pem is embedded whole and correct in that exact
+// release, all 121 certificates intact, dated three weeks old. And the same failure hit two
+// requests that share nothing but this one option - the unauthenticated /releases/latest
+// redirect probe and the api.github.com fallback, different hosts, same CAINFO. So the
+// broken link is local to loading romfs:/cacert.pem on that particular console, not
+// anything about GitHub's certificate or this project's bundle. Nobody has hardware to
+// single out which step of "open romfs:/cacert.pem, size it, read it whole" is failing
+// there, so this does not guess at one; it gives curl a second, independently-established
+// place to find the identical trusted bytes and retries once before giving up.
+//
+// Deliberately narrow: only CURLE_SSL_CACERT_BADFILE (77, "could not load CACERT file")
+// retries. CURLE_PEER_FAILED_VERIFICATION (60, aliased from the old CURLE_SSL_CACERT name)
+// is left alone on purpose - that is curl saying a certificate WAS read and did NOT check
+// out, which is a real trust decision this must not paper over by quietly trying a
+// different bundle. CURLOPT_SSL_VERIFYPEER/VERIFYHOST are never touched by either attempt.
+static CURLcode performWithCertFallback(CURL* curl)
+{
+	CURLcode result = curl_easy_perform(curl);
+	if (result != CURLE_SSL_CACERT_BADFILE) return result;
+
+	// v1.8.18: applyCommonOptions() now hands curl the primary bundle as a blob
+	// (CURLOPT_CAINFO_BLOB), not a path, so CURLE_SSL_CACERT_BADFILE reaching this point can
+	// no longer be the RomFs file failing to open -- there is no file access on that path any
+	// more. It is left in place regardless, narrow and harmless, in case some future console
+	// or curl backend still surfaces this exact code for a different reason. Blob and path
+	// are mutually exclusive per handle, so the blob is explicitly cleared before the path is
+	// set, rather than relying on undocumented precedence between the two options.
+	curl_easy_setopt(curl, CURLOPT_CAINFO_BLOB, NULL);
+	curl_easy_setopt(curl, CURLOPT_CAINFO, CERT_BUNDLE_SDMC_FALLBACK);
+	CURLcode retry = curl_easy_perform(curl);
+
+	// Leave the handle the way applyCommonOptions() set it up, in case anything above this
+	// function ever reuses the handle for a second request - true of none of today's
+	// callers, but nothing here should depend on that staying true.
+	curl_easy_setopt(curl, CURLOPT_CAINFO, NULL);
+	struct curl_blob caBlob;
+	caBlob.data  = s_caBundleData;
+	caBlob.len   = s_caBundleLen;
+	caBlob.flags = CURL_BLOB_NOCOPY;
+	curl_easy_setopt(curl, CURLOPT_CAINFO_BLOB, &caBlob);
+	return retry;
 }
 
 // ---------------------------------------------------------------------------
@@ -347,7 +473,7 @@ static void fetchReleaseNotes(const char* tag)
 	// this runs on the worker thread like everything else in this file.
 	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
 
-	const CURLcode result = curl_easy_perform(curl);
+	const CURLcode result = performWithCertFallback(curl);
 	long status = 0;
 	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
 	curl_easy_cleanup(curl);
@@ -379,7 +505,7 @@ static bool checkViaRedirect(char* tag, size_t tagSize)
 	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
 	curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
 
-	CURLcode result = curl_easy_perform(curl);
+	CURLcode result = performWithCertFallback(curl);
 	long  status   = 0;
 	char* redirect = NULL;
 	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
@@ -468,7 +594,7 @@ static void runCheck(void)
 	struct curl_slist* headers = curl_slist_append(NULL, "Accept: application/vnd.github+json");
 	if (headers) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
-	CURLcode result = curl_easy_perform(curl);
+	CURLcode result = performWithCertFallback(curl);
 	long status = 0;
 	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
 
@@ -477,9 +603,26 @@ static void runCheck(void)
 
 	if (result != CURLE_OK)
 	{
+		// The curl code is deliberate, not decoration: this build has no text console
+		// (BS_BOTTOM_UI defaults to 1), so this on-screen line is the only diagnostic that
+		// ever leaves the console. The bare code alone is what read as "problem with the
+		// SSLCassert" in steve's report before this. v1.8.19 adds the other two numbers
+		// alongside it: "ca parse" is probeCertBundle()'s raw mbedtls_x509_crt_parse() return
+		// from boot (0 = clean, >0 = that many certs failed while others made it in, <0 = an
+		// mbedtls error code -- alloc-failure and content-malformed read differently from
+		// each other here), and "certs" is how many ended up in that boot-time chain out of
+		// the 121 the bundle should hold. curl's own ERRORBUFFER text is appended in
+		// parentheses when it has anything to add beyond the bare code.
+		// %.48s on the errorbuffer text, not %s: it is a CURL_ERROR_SIZE (256-byte) buffer and
+		// this is a fixed-size stack buffer, and a 400-pixel screen has no use for the whole
+		// thing regardless -- see the coordinator's "keep it terse" instruction in the
+		// v1.8.19 vault log. The precision also lets the compiler prove this snprintf cannot
+		// truncate, which an unbounded %s here cannot (-Wformat-truncation, fatal under this
+		// project's -Werror).
 		char reason[192];
-		snprintf(reason, sizeof(reason), "Could not reach GitHub: %s",
-		         curl_easy_strerror(result));
+		snprintf(reason, sizeof(reason), "Could not reach GitHub: curl %d / ca parse %d / certs %d%s%.48s",
+		         (int)result, s_caParseRet, s_caParseCount,
+		         s_curlError[0] ? " - " : "", s_curlError);
 		setMessage(reason);
 		s_state = UPDATE_FAILED;
 		free(buffer.data);
@@ -578,7 +721,7 @@ static void runInstall(void)
 	curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
 	curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, reportProgress);
 
-	CURLcode result = curl_easy_perform(curl);
+	CURLcode result = performWithCertFallback(curl);
 	long status = 0;
 	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
 	curl_easy_cleanup(curl);
@@ -594,7 +737,13 @@ static void runInstall(void)
 		if (sink.failed)
 			snprintf(reason, sizeof(reason), "The console stopped accepting the download.");
 		else if (result != CURLE_OK)
-			snprintf(reason, sizeof(reason), "Download failed: %s", curl_easy_strerror(result));
+			// See the matching comment in runCheck()'s CURLE_OK branch for what the three
+			// numbers mean -- curl code, probeCertBundle()'s boot-time mbedtls_x509_crt_parse()
+			// return, and the certificate count that parse produced -- and for why the
+			// errorbuffer text is capped with %.48s rather than %s.
+			snprintf(reason, sizeof(reason), "Download failed: curl %d / ca parse %d / certs %d%s%.48s",
+			         (int)result, s_caParseRet, s_caParseCount,
+			         s_curlError[0] ? " - " : "", s_curlError);
 		else
 			snprintf(reason, sizeof(reason), "Download failed with HTTP %ld.", status);
 
@@ -670,12 +819,135 @@ static void startWorker(updateJob job)
 // Public surface
 // ---------------------------------------------------------------------------
 
+// Reads romfs:/cacert.pem whole into a heap buffer, growing it as needed rather than sizing
+// it with fseek(SEEK_END)/ftell() first. Two independent reasons, both already established
+// elsewhere in this codebase rather than new ones invented here:
+//
+//  - audio.c's readWhole() (source/audio/audio.c, right above romfsHoldBegin) makes the same
+//    choice for the same "romfs:" prefix, on the grounds that a devoptab reporting a length
+//    it then cannot deliver is a real failure mode on this platform (a truncated or
+//    bit-rotted RomFs region inside the installed .cia would still answer a stat/seek with
+//    its recorded size), and the read itself is the only thing that can be trusted. This
+//    file's own cert bundle deserves the same treatment its neighbour already gives sound
+//    assets loaded from the exact same "romfs:" device.
+//  - romfs_seek was disassembled directly out of this project's libctru.a (2.7.0-1;
+//    C:/devkitPro/libctru/lib/libctru.a, romfs_dev.o) to confirm SEEK_END is even implemented
+//    -- it is -- so this is belt-and-suspenders on top of a working primitive, not a
+//    workaround for a broken one.
+//
+// Called exactly once, from updaterInit(), while its own romfsInit() a few lines below is
+// definitely still in effect.
+#define CA_BUNDLE_INITIAL_CAP  (128 * 1024)
+#define CA_BUNDLE_HARD_CEILING (2 * 1024 * 1024)
+
+static bool loadCertBundle(void)
+{
+	size_t cap = CA_BUNDLE_INITIAL_CAP;
+	unsigned char* buf = (unsigned char*)malloc(cap);
+	if (!buf) return false;
+
+	FILE* f = fopen(CERT_BUNDLE_ROMFS, "rb");
+	if (!f) { free(buf); return false; }
+
+	size_t total = 0;
+	for (;;)
+	{
+		if (total == cap)
+		{
+			if (cap >= CA_BUNDLE_HARD_CEILING) { fclose(f); free(buf); return false; }
+			size_t newCap = cap * 2;
+			if (newCap > CA_BUNDLE_HARD_CEILING) newCap = CA_BUNDLE_HARD_CEILING;
+			unsigned char* grown = (unsigned char*)realloc(buf, newCap);
+			if (!grown) { fclose(f); free(buf); return false; }
+			buf = grown;
+			cap = newCap;
+		}
+
+		size_t n = fread(buf + total, 1, cap - total, f);
+		total += n;
+		if (n == 0) break;
+	}
+	fclose(f);
+
+	if (total == 0) { free(buf); return false; }
+
+	// mbedtls_x509_crt_parse() -- both curl's CURLOPT_CAINFO_BLOB path and this file's own
+	// probeCertBundle() below -- tells PEM text apart from raw DER by checking buf[buflen-1]
+	// == '\0'; without that, and buflen counting it, PEM data is silently sent down the DER
+	// parser and fails. The loop above always leaves at least one spare byte in buf (it grows
+	// BEFORE the read that would otherwise exactly fill it, so cap > total on every successful
+	// exit), so this is always safe within the current allocation.
+	buf[total] = '\0';
+
+	// Shrink to the size actually read, plus the terminator. A live-block shrink practically
+	// never fails; if it somehow does, the original (larger) allocation is still valid and
+	// still holds the same bytes -- including the NUL just written above -- so it is used
+	// as-is rather than treating this as a failure.
+	unsigned char* fit = (unsigned char*)realloc(buf, total + 1);
+	s_caBundleData = fit ? fit : buf;
+	s_caBundleLen  = total + 1; // counts the trailing NUL -- see CURLOPT_CAINFO_BLOB's docs
+	return true;
+}
+
+// v1.8.19. Parses s_caBundleData with our own throwaway mbedtls_x509_crt chain, once, at
+// boot -- see the comment on s_caParseRet above for what the two numbers mean. This exists
+// because curl 77 (CURLE_SSL_CACERT_BADFILE) is what mbedtls.c returns for ANY negative
+// result from mbedtls_x509_crt_parse(), and that one code covers three different failures
+// that all look identical from curl's side: the file could not be opened (already
+// impossible for the blob path, since there is no file access at all), the allocation burst
+// building 121 chained mbedtls_x509_crt nodes ran out of heap, or the content itself is
+// malformed. Reasoning cannot tell those apart from here; this measures it directly, on the
+// exact bytes curl will use, before any network access happens.
+static void probeCertBundle(void)
+{
+	mbedtls_x509_crt chain;
+	mbedtls_x509_crt_init(&chain);
+
+	s_caParseRet = mbedtls_x509_crt_parse(&chain, (const unsigned char*)s_caBundleData,
+	                                       s_caBundleLen);
+
+	// Per mbedtls's own contract: a negative return means every certificate in the buffer
+	// failed and the chain was never populated, so counting is skipped rather than walking a
+	// head node that mbedtls_x509_crt_init() only zeroed and never filled in. A return >= 0
+	// means the chain holds exactly the certificates that parsed, so it is walked as-is.
+	s_caParseCount = 0;
+	if (s_caParseRet >= 0)
+	{
+		for (mbedtls_x509_crt* cur = &chain; cur != NULL; cur = cur->next)
+			s_caParseCount++;
+	}
+
+	// Never kept -- this is a measurement, not a trust store the updater goes on to use. See
+	// task item 5 in the v1.8.19 vault log for the follow-up this opens (parsing once here and
+	// handing curl the already-built chain instead of re-parsing per request), which is a
+	// separate change and not part of this one.
+	mbedtls_x509_crt_free(&chain);
+}
+
 bool updaterInit(bool soc_already_up)
 {
 	// RomFs carries the certificate bundle. Without it every HTTPS request fails, so there
 	// is no point bringing the rest up.
 	if (R_FAILED(romfsInit())) return false;
 	s_romfsUp = true;
+
+	// v1.8.18: read the bundle into memory right here, before anything else, while this
+	// romfsInit() above is guaranteed to still be in effect. If this fails the updater cannot
+	// possibly work -- there is no fallback for the primary bundle not existing at all, only
+	// for it not being loadable by curl at perform() time -- so this gives up exactly the way
+	// the SOC/AM failure branches below already do.
+	if (!loadCertBundle())
+	{
+		romfsExit();
+		s_romfsUp = false;
+		return false;
+	}
+
+	// v1.8.19. Measurement only -- see probeCertBundle()'s own comment. Never itself a reason
+	// to fail updaterInit(): a bad reading here is exactly the thing the failure screen needs
+	// to be able to show, which requires the updater to still come up and attempt a real
+	// request rather than being greyed out before it can be observed at all.
+	probeCertBundle();
 
 	// Model Kit, which this file is ported from, is the only thing in its process that uses a
 	// socket. This game is not: net/bsnet_sock.c calls socInit() from netInit() at the very top
@@ -698,6 +970,7 @@ bool updaterInit(bool soc_already_up)
 		{
 			free(s_socBuf);
 			s_socBuf = NULL;
+			if (s_caBundleData) { free(s_caBundleData); s_caBundleData = NULL; s_caBundleLen = 0; }
 			romfsExit();
 			s_romfsUp = false;
 			return false;
@@ -715,6 +988,7 @@ bool updaterInit(bool soc_already_up)
 		// with them.
 		if (s_socUp)  { socExit(); s_socUp = false; }
 		if (s_socBuf) { free(s_socBuf); s_socBuf = NULL; }
+		if (s_caBundleData) { free(s_caBundleData); s_caBundleData = NULL; s_caBundleLen = 0; }
 		romfsExit();
 		s_romfsUp = false;
 		return false;
@@ -740,6 +1014,12 @@ void updaterExit(void)
 	if (s_amUp)    { amExit();    s_amUp = false; }
 	if (s_socUp)   { socExit();   s_socUp = false; }
 	if (s_socBuf)  { free(s_socBuf); s_socBuf = NULL; }
+
+	// reapWorker() above already joined the worker thread, so no CURL handle holding a
+	// CURLOPT_CAINFO_BLOB NOCOPY pointer into this buffer can still be alive -- safe to free
+	// before dropping the RomFs mount it was originally read from.
+	if (s_caBundleData) { free(s_caBundleData); s_caBundleData = NULL; s_caBundleLen = 0; }
+
 	if (s_romfsUp) { romfsExit(); s_romfsUp = false; }
 
 	s_available = false;
