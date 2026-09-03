@@ -1045,6 +1045,19 @@ crackatlas.t3x: crackatlas.png
 # reason.
 fogramp.t3x: fogramp.png
 
+# v1.8.16 animal textures. The same trap a FIFTH time. gfx/animals.t3s names gfx/animals.png,
+# tex3ds writes its dep file as build/animals.d, and the only reason that survives longer here
+# than it does for atlas/font/crackatlas/fogramp is that no source file is called animals.c
+# today — which is luck, not a guarantee, and is exactly the state gfx/atlas.png was in before
+# something else claimed its stem. The line is added now rather than after the collision.
+#
+# Without it, re-running tools/make_animals.py would leave the console drawing the previous
+# sheet while the .png on disk showed the new one. On four animals sharing one sheet by
+# quadrant that reads as the ART being wrong — a pig with last revision's snout — rather than
+# as a stale texture, which is a long way round to a one-line fix. animals.png is found through
+# VPATH, which already covers $(GRAPHICS).
+animals.t3x: animals.png
+
 -include $(DEPSDIR)/*.d
 
 #---------------------------------------------------------------------------------------
