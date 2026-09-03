@@ -178,10 +178,21 @@ independently of anything else in this version.
   screen and never runs in the gameplay frame.
 - **Camera and player trigonometry, and the per-frame projection matrix.** Both real, both
   microseconds, on a thread this project's own measurements put at GPU-blocked for roughly
-  15.7 of every 16.71 ms. The specific pair originally cited cannot even coexist —
-  `camera.c:109-116` is inside `#if BS_FLY`, default off. A genuine 4-transcendental residue
-  does exist between `player.c:40-43` and `interact.c:339-342`; it is not worth the version's
-  attention.
+  15.7 of every 16.71 ms. The specific pair originally cited cannot even coexist — that
+  camera code is dead in a shipping build, though not for the reason first written here.
+  **Corrected 2026-09-03:** the guard immediately around it is `#if BS_ORBIT`
+  (`camera.c:102`), not `BS_FLY`. The conclusion survives, because the whole `cameraUpdate()`
+  call is itself gated by `#if BS_FLY` at `main.c:4994`, which defaults off — so it is dead
+  via the OUTER gate, not the inner one. Worth correcting because "it is inside `#if BS_FLY`"
+  sends the next reader to the wrong line to check the claim, finds a different macro, and
+  has no way to tell whether the entry or the code moved.
+
+  A genuine 4-transcendental residue existed between `player.c` and `interact.c:339-342`.
+  **Half of it is now gone:** `player.c` asked for `sinf(yaw)` and `cosf(yaw)` twice each and
+  as of 2026-09-03 asks once each. Folded despite this entry's own "not worth the version's
+  attention", because it was free and provably exact rather than merely close — 16,000,025
+  sampled yaw values, zero bit differences, with a red control (negation dropped) catching
+  2,001. The `interact.c` half is untouched and remains not worth a review cycle on its own.
 
 ---
 

@@ -4,6 +4,100 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.8.12] - 2026-09-03
+
+Ores, and a pass over the parts of the engine that were quietly doing more work than they
+needed to. Coal, iron, gold, redstone, lapis and diamond are in the ground now, each with its
+own break time, and every one of them can be mined by hand.
+
+Everything here is identical on both consoles. Nothing in this release is Old-3DS-only or
+New-3DS-only.
+
+### Added
+
+- **Six ores, underground.** They appear in veins rather than as single blocks, and only ever
+  inside stone — you will never find one floating in the open air of a cave, only in the walls.
+
+  Roughly where to dig:
+
+  - **Coal** — everywhere below the surface, right down to the bottom. The first one you will
+    meet, and the one you will have most of.
+  - **Iron** — the lower half of the world. Once you are down there it is as common as coal.
+  - **Redstone** — very deep, close to the bottom.
+  - **Gold** — the bottom quarter, and much scarcer than iron.
+  - **Diamond** — the deepest, and one of the two rarest.
+  - **Lapis** — deep, in small pockets, and rarest of the lot. You will pass a lot of diamond
+    before you have a decent pile of lapis.
+
+  Break times, shortest to longest: coal, iron, lapis, gold, redstone, diamond. All six take
+  longer than plain stone.
+
+- **Ores appear only in worlds created after this update.** Existing worlds are not changed,
+  broken or reshaped — every world permanently keeps the world-generator it was made with, so
+  an old save keeps its terrain and everything you have built in it, and simply has no ore
+  anywhere in it. If you want to mine, make a new world.
+
+- **Frame timing can be shown on screen.** Pause > Options > Debug > Frame timing turns on an
+  extra line at the bottom of the touch screen reading something like
+  `cpu 2.1  wait 14.6  frame 16.7 ms  60 fps`. `cpu` is how long the game spends doing work each
+  frame; `wait` is time spent doing nothing while the screen and the graphics chip catch up. Off
+  by default, switched only from the debug menu, and it forgets itself when you reboot. The game
+  has always measured these numbers — there was simply nowhere to display them.
+
+### Changed
+
+- **The world builds faster.** Several parts of world generation were filling memory a byte at
+  a time where they could fill it in one go, and the cave carver was testing every single cell
+  against the chunk it was writing into instead of working out the range once. On the test bench
+  the plainest generator setting came out roughly **45-50% faster per column of world**. The
+  other settings improved too, but by an amount the measurement could not cleanly separate from
+  the noise of the machine it ran on, so only the figure that is solidly attributable is quoted.
+
+- **Deciding what is behind a hill got much cheaper.** The renderer keeps a list of the columns
+  of world in front of you and checks each one against the others to work out what is hidden.
+  That check was walking the whole list every time; it now goes straight to the entry it wants.
+  Measured **13.7 to 17.1 times faster** at the widest render distance. A second change sorts
+  that list nearest-first so the search can stop at the first thing that blocks the view instead
+  of examining everything: a further **2.4 to 2.6 times** on top.
+
+- **Lighting recalculates less when a chunk's neighbour changes.** A lookup that was being
+  repeated for every cell along a chunk edge — up to 8,192 times per column — now happens once
+  per edge.
+
+- **Sorting the world front-to-back no longer gets slower the further you walk.** Every frame
+  the renderer puts the visible chunks in order, nearest first. The method it used compared
+  each chunk against the ones before it, which is fine for a short list and gets rapidly worse
+  as the list grows — and the list is up to 968 chunks. Worse, a comment in the code claimed
+  the list arrived almost in order already, which was simply not true: it is rebuilt from
+  scratch every frame in memory order, so it arrives shuffled, which is the slowest case.
+  It has been replaced with a method whose cost grows in a straight line instead. Measured on
+  the test bench at the full 968 chunks: **20 times faster** on the kind of list the game
+  actually produces, and **29 times faster** in the worst case a frame can hit. The order it
+  produces is byte-for-byte the same list as before, so nothing on screen changes.
+
+  Honest caveat: on a list that happens to already be in order the new method is slower,
+  because it does the same fixed work regardless. That case costs at most 6 millionths of a
+  second, against the 250 millionths the old method could cost on a bad frame.
+
+- **The chunk list is laid out to match the hardware.** The data the renderer reads every frame
+  to decide what to draw was spread across both halves of each entry, so the console had to
+  fetch twice as much memory as it used. It is now packed into the half that is read, which
+  halves that traffic. The entries are the same size as before; only the order changed.
+
+- **Crash reports survive a relaunch.** If the game locks up, it writes a report to the SD card
+  describing where it stopped. Until now the next launch deleted that report before writing its
+  own, so starting the game again to see if the problem recurred also destroyed the only record
+  of the first time. Reports from the previous session are now kept alongside the current ones
+  with a `prev-` prefix. This does not fix any crash; it stops the evidence being thrown away.
+
+### Fixed
+
+- **Torches can be made.** Four torches from one coal ore. The torch arrived in the last update
+  and worked correctly — it lit rooms, it had a proper break time, it saved and loaded — but
+  there was no way whatsoever to actually get one: no recipe, no drop, and none placed anywhere
+  in the world. It was a working block that no player could hold. Now the first coal you mine
+  lights the cave you found it in.
+
 ## [1.8.11] - 2026-09-02
 
 The holes in the world. This release is mostly one fix: chunks that never loaded until you

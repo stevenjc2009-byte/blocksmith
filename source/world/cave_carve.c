@@ -1,5 +1,7 @@
 #include "world/cave_carve.h"
 
+#include <string.h>
+
 #include "world/rng.h"
 
 // This TU has no <3ds.h> and no divide by a runtime variable in any per-block hot path, the
@@ -68,10 +70,10 @@ static inline fx fxMul(fx a, fx b)
 // Tests every integer cell in a local bounding box around (cxw, cyw, czw) against the
 // divide-free ellipsoid inequality dx^2*rv^2 + dy^2*rh^2 + dz^2*rv^2 < rh^2*rv^2 -- the single-
 // inequality technique plan 2.3 cites, expanded out of dx^2 + k*dy^2 + dz^2 < r^2 with
-// k = (rh/rv)^2 to clear the division rv would otherwise need per cell. A hit outside the
-// target column's own bounds is discarded here -- treePut()'s clip idiom (worldgen.c:726-737),
-// `(coord >> 4) == column`, applied per axis before the multiply that would otherwise be spent
-// on a cell this column does not own.
+// k = (rh/rv)^2 to clear the division rv would otherwise need per cell. A cell outside the
+// target column's own bounds never reaches that inequality at all -- treePut()'s clip idiom
+// (worldgen.c:726-737), `(coord >> 4) == column`, solved for dz/dx ahead of the loop (Tier-1
+// opt, lane OPT-WORLDGEN, 2026-09-02) rather than tested per cell inside it.
 static void caveCarveStamp(WorldGenScratch* s, int32_t cx, int32_t cz,
                             int32_t cxw, int32_t cyw, int32_t czw, int32_t rh, int32_t rv)
 {
@@ -85,6 +87,26 @@ static void caveCarveStamp(WorldGenScratch* s, int32_t cx, int32_t cz,
 	const int64_t rv2 = (int64_t)rv * rv;
 	const int64_t bound = rh2 * rv2;
 
+	// Tier-1 opt (lane OPT-WORLDGEN, 2026-09-02): the per-cell "(coord >> 4) == column" clip
+	// above solved for dz/dx ahead of the loop instead of tested inside it -- the same
+	// inequality (col_z0 <= czw+dz <= col_z0+15, and the x equivalent), so this reaches exactly
+	// the same (dy, dz, dx) triples the old per-iteration clip accepted, just without spending a
+	// loop iteration (and, for dz, an inner dx loop entry) on the ones it always rejected. rh is
+	// caller-bounded well under CHUNK_DIM (CAVE_ROOM_RADIUS, the largest caller passes, is 6), so
+	// dz_lo can exceed dz_hi -- a stamp whose whole box misses this column on one axis -- which
+	// the early return below turns into zero wasted iterations instead of (2*rh+1)^2 rejected
+	// ones.
+	int32_t dz_lo = col_z0 - czw, dz_hi = col_z0 + CHUNK_DIM - 1 - czw;
+	if (dz_lo < -rh) dz_lo = -rh;
+	if (dz_hi > rh)  dz_hi = rh;
+
+	int32_t dx_lo = col_x0 - cxw, dx_hi = col_x0 + CHUNK_DIM - 1 - cxw;
+	if (dx_lo < -rh) dx_lo = -rh;
+	if (dx_hi > rh)  dx_hi = rh;
+
+	if (dz_lo > dz_hi || dx_lo > dx_hi)
+		return;   // this stamp's box cannot touch the column at all
+
 	for (int32_t dy = -rv; dy <= rv; dy++) {
 		const int32_t y = cyw + dy;
 		if (y < GEN_CAVE_FLOOR || y >= WORLD_HEIGHT)
@@ -93,18 +115,14 @@ static void caveCarveStamp(WorldGenScratch* s, int32_t cx, int32_t cz,
 		if (termY >= bound)
 			continue;
 
-		for (int32_t dz = -rh; dz <= rh; dz++) {
+		for (int32_t dz = dz_lo; dz <= dz_hi; dz++) {
 			const int32_t wz = czw + dz;
-			if ((wz >> 4) != cz)
-				continue;   // clip
 			const int64_t termYZ = termY + (int64_t)dz * dz * rv2;
 			if (termYZ >= bound)
 				continue;
 
-			for (int32_t dx = -rh; dx <= rh; dx++) {
+			for (int32_t dx = dx_lo; dx <= dx_hi; dx++) {
 				const int32_t wx = cxw + dx;
-				if ((wx >> 4) != cx)
-					continue;   // clip
 				const int64_t term = termYZ + (int64_t)dx * dx * rv2;
 				if (term >= bound)
 					continue;
@@ -264,9 +282,10 @@ static void caveCarveSystem(uint32_t seed, int32_t rx, int32_t rz, int sys,
 void caveCarveBuildMaskR(const WorldGen* g, WorldGenScratch* s, int32_t cx, int32_t cz,
                           int32_t radius)
 {
-	for (int y = 0; y < WORLD_HEIGHT; y++)
-		for (int z = 0; z < CHUNK_DIM; z++)
-			s->carve[y][z] = 0;
+	// Tier-1 opt (lane OPT-WORLDGEN, 2026-09-02): same memset conversion as
+	// worldgen_density.c's s->solid clear -- s->carve is the identical shape
+	// (WORLD_HEIGHT x CHUNK_DIM uint16_t) and an all-zero fill either way.
+	memset(s->carve, 0, sizeof(s->carve));
 
 	for (int32_t rz = cz - radius; rz <= cz + radius; rz++) {
 		for (int32_t rx = cx - radius; rx <= cx + radius; rx++) {

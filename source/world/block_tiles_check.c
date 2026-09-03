@@ -72,7 +72,13 @@
 	X(BTEX_BLUEBELL,        TILE_BLUEBELL)        \
 	X(BTEX_ORCHID,          TILE_ORCHID)          \
 	X(BTEX_APPLE,           TILE_APPLE)           \
-	X(BTEX_TORCH,           TILE_TORCH)
+	X(BTEX_TORCH,           TILE_TORCH)           \
+	X(BTEX_COAL_ORE,        TILE_COAL_ORE)        \
+	X(BTEX_IRON_ORE,        TILE_IRON_ORE)        \
+	X(BTEX_GOLD_ORE,        TILE_GOLD_ORE)        \
+	X(BTEX_REDSTONE_ORE,    TILE_REDSTONE_ORE)    \
+	X(BTEX_LAPIS_ORE,       TILE_LAPIS_ORE)       \
+	X(BTEX_DIAMOND_ORE,     TILE_DIAMOND_ORE)
 
 // One _Static_assert per pair, exactly as before. The names are stringified into the message
 // because every one of these expands from the same source line, so the message is the only

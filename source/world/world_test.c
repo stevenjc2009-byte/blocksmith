@@ -8234,7 +8234,7 @@ static void testGenVersionContract(void)
 	CHECK(GEN_VERSION_LEGACY == 1u);
 	CHECK(GEN_VERSION_DENSITY == 2u);
 	CHECK(GEN_VERSION_BIOME == 3u);
-	CHECK(GEN_VERSION_NEWEST == GEN_VERSION_CAVES);
+	CHECK(GEN_VERSION_NEWEST == GEN_VERSION_ORES);
 	CHECK(GEN_VERSION_FOR_NEW_WORLDS == GEN_VERSION_NEWEST);
 
 	CHECK(!genVersionKnown(0u));
@@ -12373,21 +12373,32 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 // "FAIL 2/6119  L8237 GEN_VERSION_NEWEST == GEN_VERSION_BIOME" — that is the version
 // contract assertion at line 8237 (correct, and updated to GEN_VERSION_CAVES) plus this
 // guard's own CHECK. Two failures, both explained, neither a behaviour regression.
+//
+// v1.8.12 "Ores", 6118 + 5 = 6123, by the same mechanism and nothing else: GEN_VERSION_ORES
+// = 5 makes GEN_VERSION_NEWEST 5 instead of 4, testGenVersionRoundTrip's loop above gains
+// exactly one more iteration (want = 5), and that iteration's body is the same five loud
+// CHECKs the v1.8.11 move counted (write, read == GENVER_OK, v == want, resolve == GENVER_OK,
+// v == want). +5 and nothing else — no new test function, no existing one grew a check, and
+// this move is a registry/version change only, not a worldgen output change, so the warning
+// about output moving the count on its own does not apply here. Counted off the source first,
+// then confirmed against a real run of this file (see below), same discipline as every entry
+// above. This lane also fixed line 8237's CHECK from GEN_VERSION_CAVES to GEN_VERSION_ORES —
+// that pin was one release stale and would otherwise fail the version-contract assertion.
 #ifndef __3DS__
 	{
 		const int ran = s_checks;
-		if (ran != 6118)
+		if (ran != 6123)
 			printf("\nCHECK-COUNT GUARD: %d checks ran, %d expected.\n"
 			       "  %s\n"
 			       "  This is NOT an ordinary assertion failure.\n"
 			       "  Read the comment above this guard in world/world_test.c before"
 			       " touching the pinned number.\n",
-			       ran, 6118,
-			       ran < 6118
+			       ran, 6123,
+			       ran < 6123
 			           ? "Checks went MISSING: checks that should have run never ran at all."
 			           : "Extra checks appeared: either you added checks and did not update"
 			             " the pin, or something is emitting checks it should not.");
-		CHECK(ran == 6118);
+		CHECK(ran == 6123);
 	}
 #endif
 

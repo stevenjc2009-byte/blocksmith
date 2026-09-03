@@ -49,11 +49,33 @@
 #define CRAFT_CLOSE_H 28
 #define CRAFT_ROW_Y0  (CRAFT_Y + CRAFT_CLOSE_H)              // 148
 // Divides the panel evenly among however many recipes crafting.h declares, so adding one
-// costs no layout edit here. (120-28)/4 = 23 px a row at RECIPE_COUNT 4; it was 30 at 3.
+// costs no layout edit here. 30 px a row at RECIPE_COUNT 3, 23 at 4, and 18 at 5.
 // The floor is the 7 px font (gfx/font.h FONT_GLYPH_H) plus enough slop to stay a usable
-// touch target, so there is room for two or three more recipes before this has to become a
-// scroll list instead of a fixed split. 92 divides exactly by 4, leaving no dead strip.
-#define CRAFT_ROW_H   ((CRAFT_H - CRAFT_CLOSE_H) / RECIPE_COUNT)   // (120-28)/4 = 23
+// touch target.
+//
+// 2026-09-03, v1.8.12's RECIPE_COAL_ORE_TO_TORCH: two claims that were true at 4 recipes are
+// no longer true at 5, and both are worth correcting rather than deleting.
+//
+// "92 divides exactly by 4, leaving no dead strip" — it does not divide by 5. 92/5 = 18 with
+// 2 px left over, so there IS now a 2 px dead strip at the bottom of the panel. Two pixels
+// below the last row is cosmetic, not a hit-testing bug: craftRowRect() derives every row from
+// CRAFT_ROW_Y0 + i * CRAFT_ROW_H, so the rows stay contiguous and correctly sized and the
+// leftover simply sits under the last one, inside the panel and outside every row. Nothing
+// lands in it and nothing is clipped by it.
+//
+// "room for two or three more recipes" — that estimate was made against a 23 px row and it
+// has now spent one of its own headroom steps. At 6 recipes this is 15 px, at 7 it is 13, and
+// 13 px for a 7 px font is a row with 3 px of clearance above and below the glyphs. So the
+// real remaining budget is ONE more recipe at a comfortable size and two at a cramped one,
+// after which this has to become a scroll list rather than a fixed split. Written as a number
+// rather than as "two or three more" because the previous phrasing is what let a fifth recipe
+// land without anyone noticing the row shrank by 5 px.
+//
+// NOT verified on hardware: whether an 18 px row is comfortable to hit with a stylus on a real
+// bottom screen, and whether the longest recipe label still fits. Both are playtest questions,
+// and neither is settled by the layout suite, which checks that the rects tile correctly — not
+// that a finger can hit them.
+#define CRAFT_ROW_H   ((CRAFT_H - CRAFT_CLOSE_H) / RECIPE_COUNT)   // (120-28)/5 = 18
 
 #define HUD_TOGGLE_Y  GRID_Y                       // 40, directly under the hotbar
 #define HUD_TOGGLE_H  32

@@ -220,6 +220,18 @@ TILES = [
     # source rather than terrain or flora. BLOCK_SHAPE_CROSS like tall_grass, dead_bush,
     # fern and the four flowers above it; docs/plan-1.8.10-light.md §2.3 is the design.
     "torch",            # 31
+    # v1.8.12 "Ores" — six FULL_CUBE tiles, appended for the reason everything since the
+    # sentinel has been: this order IS the contract with gfx/atlas_tiles.h's TILE_* enum
+    # and world/block.h's BTEX_* mirror of it, so inserting would silently re-texture every
+    # tile after the insertion point. Each is tile_stone(rng) itself with mineral flecks
+    # embedded over it (see tile_coal_ore etc.), not a second stone painter, so an ore block
+    # is provably the same rock the plain stone block is.
+    "coal_ore",         # 32
+    "iron_ore",         # 33
+    "gold_ore",         # 34
+    "redstone_ore",     # 35
+    "lapis_ore",        # 36
+    "diamond_ore",      # 37
 ]
 
 
@@ -1575,6 +1587,316 @@ def tile_torch(rng):
     return img
 
 
+# ── v1.8.12 "Ores" ────────────────────────────────────────────────────────────────────
+#
+# Six FULL_CUBE tiles, one per mineral. Each is stone-with-flecks rather than a new rock:
+# the background is tile_stone(rng) itself, called unmodified, so an ore block is provably
+# the same rock the plain stone tile is, instead of a repainted lookalike that only
+# resembles it. Calling tile_stone spends its own draws from the shared seeded stream (the
+# speckle fill and its two cracks) exactly as a plain stone tile placed here would, which is
+# the whole point — nothing about tile_stone itself is touched or duplicated.
+#
+# REVISED after steve looked at the first pass (oreart_comparison.png) and rejected it: at
+# the original radius (~4..10 px, 5 per tile) discs in a 16x16 tile routinely overlapped and
+# fused into one connected blob — gold and diamond came out as a single worm, coal as two
+# thin diagonal streaks that read as cracks, not ore. "5 irregular blobs" was true of the
+# CODE and false of the RENDERED RESULT, which is exactly the gap this project's whole F7
+# philosophy (module docstring, "bad art, never an error") warns never to trust a green run
+# over. Two changes fix the cause rather than the symptom: flecks are smaller (a couple of
+# px each instead of half a dozen) so a fusion needs many more of them to happen by chance,
+# and placement now REJECTS a candidate centre that lands too close to one already placed,
+# so a fleck can no longer overlap its neighbour at all. The fix is then measured, not
+# eyeballed a second time: _count_ore_flecks (below) runs an 8-connected component count
+# over exactly the pixels each ore painter changed and asserts at least 4 survive separate,
+# which is a check that goes red the same way place()'s size guard does — on the actual
+# rendered output, not on the intent of the code that produced it.
+
+
+def _ore_flecks(rng, px, base, light, dark, min_sep=3.4, r_lo=0.85, r_span=0.45):
+    """Embeds 6..9 small, mutually separated mineral flecks into an already-painted stone
+    tile, and returns the (x, y) centres it placed — _count_ore_flecks below checks the
+    RESULT of this rather than trusting the count requested.
+
+    min_sep/r_lo/r_span are per-ore tuning knobs, defaulted to the original fixed
+    constants (3.4, 0.85, 0.45) so every call site that does not pass them reproduces
+    the exact previous pixels bit-for-bit. tile_coal_ore below is the one caller that
+    overrides them — see its docstring for why.
+
+    Each fleck is a jittered disc (the same distance-plus-jitter construction tile_wood_top's
+    rings and tile_ice's fracture plates already use), sized 2..4 px so it reads as a speck
+    of embedded mineral rather than a boulder — real ore at 16x16 is scattered grain, not a
+    handful of stones.
+
+    Placement is reject-sampled: a candidate centre is thrown away and re-rolled if it falls
+    within MIN_SEP of any centre already placed, for up to 60 tries, and given up on rather
+    than forced if none is found. That is what stops flecks fusing into one connected mass —
+    the first version of this painter picked centres with no such test, discs of that size
+    routinely touched, and "5 blobs" in the code became 1 or 2 shapes on screen. Giving up on
+    a fleck that cannot find room is deliberate: a forced overlap would silently reintroduce
+    the exact fusion this exists to prevent, in exchange for hitting a target count that was
+    only ever a rough aim ("6..9", not a contract).
+
+    Shading is lit from the top-left like every other relief cue in this sheet (tile_dirt's
+    pebbles, tile_snow's hollows, tile_apple's shoulder highlight): the rim on a blob's
+    north-west side gets `light`, the rim on its south-east side gets `dark`, and the very
+    centre stays `base`. The rim band's width SCALES with the blob's own radius rather than
+    being a fixed distance, which matters here specifically because the blobs are now small:
+    a fixed band sized for a 10px blob would swallow a 3px one whole and leave it flat, and a
+    flat fleck is what made coal read as a dim smear instead of a lit lump.
+
+    The scan box is clamped a full pixel in from every edge of the tile, so a fleck can never
+    touch column 0 or 15: u is the axis greedy meshing merges along and GPU_REPEAT wraps this
+    art onto itself, so a fleck straddling the edge would join the one wrapping in from the
+    other side and draw a seam across a merged run — the same defect tile_water's glints,
+    tile_planks' seams and tile_birch_log_side's lenticels are all kept off the edge to avoid.
+    """
+    MIN_SEP = min_sep      # centre-to-centre; keeps discs up to radius ~1.3 from ever touching
+    ATTEMPTS = 60
+    count = 6 + rng.randrange(4)                          # aim for 6..9, not a hard contract
+
+    centres = []
+    for _ in range(count):
+        cx = cy = None
+        for _try in range(ATTEMPTS):
+            tx = rng.uniform(2.5, TILE_PX - 2.5)
+            ty = rng.uniform(2.5, TILE_PX - 2.5)
+            if all((tx - ox) ** 2 + (ty - oy) ** 2 >= MIN_SEP ** 2 for ox, oy in centres):
+                cx, cy = tx, ty
+                break
+        if cx is None:
+            continue                                       # no room left this separated; skip
+        centres.append((cx, cy))
+
+        r = r_lo + rng.uniform(0.0, r_span)                # ~2..4 px per fleck, "a few pixels"
+        rim = 0.30 * r                                     # scales with r — see docstring
+        x0 = max(1, int(cx - r - 1))
+        x1 = min(TILE_PX - 1, int(cx + r + 2))
+        y0 = max(1, int(cy - r - 1))
+        y1 = min(TILE_PX - 1, int(cy + r + 2))
+        for y in range(y0, y1):
+            for x in range(x0, x1):
+                d = ((x + 0.5 - cx) ** 2 + (y + 0.5 - cy) ** 2) ** 0.5 + rng.uniform(-0.25, 0.25)
+                if d >= r:
+                    continue
+                rel = (x + 0.5 - cx) + (y + 0.5 - cy)
+                if rel < -rim and rng.random() < 0.8:
+                    px[x, y] = light
+                elif rel > rim and rng.random() < 0.7:
+                    px[x, y] = dark
+                else:
+                    px[x, y] = base
+    return centres
+
+
+def _count_ore_flecks(before, after):
+    """8-connected component count of the pixels `after` changed from `before` — the check
+    _ore_flecks' minimum-separation logic exists to satisfy, run on the actual rendered
+    tile rather than trusted from the placement code that produced it. Every tile_*_ore
+    painter below asserts this is >= 4, the same way place() refuses a wrongly-sized tile:
+    loud and immediate, on the real output, not on what the code was supposed to do.
+    """
+    bpx, apx = before.load(), after.load()
+    diff = [[apx[x, y] != bpx[x, y] for x in range(TILE_PX)] for y in range(TILE_PX)]
+    seen = [[False] * TILE_PX for _ in range(TILE_PX)]
+    components = 0
+    for y in range(TILE_PX):
+        for x in range(TILE_PX):
+            if not diff[y][x] or seen[y][x]:
+                continue
+            components += 1
+            stack = [(x, y)]
+            seen[y][x] = True
+            while stack:
+                cx, cy = stack.pop()
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        nx, ny = cx + dx, cy + dy
+                        if (dx or dy) and 0 <= nx < TILE_PX and 0 <= ny < TILE_PX \
+                                and diff[ny][nx] and not seen[ny][nx]:
+                            seen[ny][nx] = True
+                            stack.append((nx, ny))
+    return components
+
+
+def _ore_components(before, after):
+    """8-connected components of the pixels `after` changed from `before`, as actual cell
+    lists rather than just a count — shared by _count_ore_flecks and
+    _assert_ore_compactness so both are reading the same real diff."""
+    bpx, apx = before.load(), after.load()
+    diff = [[apx[x, y] != bpx[x, y] for x in range(TILE_PX)] for y in range(TILE_PX)]
+    seen = [[False] * TILE_PX for _ in range(TILE_PX)]
+    comps = []
+    for y in range(TILE_PX):
+        for x in range(TILE_PX):
+            if not diff[y][x] or seen[y][x]:
+                continue
+            stack = [(x, y)]
+            seen[y][x] = True
+            cells = []
+            while stack:
+                cx, cy = stack.pop()
+                cells.append((cx, cy))
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        nx, ny = cx + dx, cy + dy
+                        if (dx or dy) and 0 <= nx < TILE_PX and 0 <= ny < TILE_PX \
+                                and diff[ny][nx] and not seen[ny][nx]:
+                            seen[ny][nx] = True
+                            stack.append((nx, ny))
+            comps.append(cells)
+    return comps
+
+
+def _assert_ore_compactness(before, after, name, aspect_max=2.5, fill_min=0.40):
+    """Second guard alongside _count_ore_flecks, added after steve's third-pass note that
+    coal still showed 'thin slivers, not lumps' even though its component COUNT already
+    passed: a fleck can be a separate component and still individually be a bar or streak
+    rather than a lump. Per surviving component this checks the component's OWN bounding
+    box is no more elongated than aspect_max:1, and that the component fills at least
+    fill_min of that box's area — a shape that fails either reads as a line/streak rather
+    than a rounded speck.
+
+    Both numbers were checked against the real, current output of all six approved ore
+    tiles before being trusted (tools/../scratchpad/oreart_compactness_analyze.py, run
+    against this exact code): every one of iron/gold/redstone/lapis/diamond's current
+    components, and coal's post-retune components, pass 2.5:1 / 40% cleanly, so this does
+    not fire on approved art. It DOES fire on the shape the original pre-separation
+    painter produced — large overlapping discs fusing into one long connected chain (see
+    the REVISED note above this section) — which is the red case this was proven against;
+    see oreart_sliver_guard_proof.py in the working notes for that run.
+    """
+    for cells in _ore_components(before, after):
+        xs = [p[0] for p in cells]
+        ys = [p[1] for p in cells]
+        bw = max(xs) - min(xs) + 1
+        bh = max(ys) - min(ys) + 1
+        aspect = max(bw, bh) / min(bw, bh)
+        fill = len(cells) / (bw * bh)
+        assert aspect <= aspect_max and fill >= fill_min, (
+            f"tile_{name}_ore: fleck {sorted(cells)} is a sliver, not a lump — "
+            f"bbox {bw}x{bh} gives aspect {aspect:.2f} (limit {aspect_max}) and "
+            f"fill {fill:.2f} (limit {fill_min})."
+        )
+
+
+def _ore_tile(rng, name, base, light, dark):
+    """Shared body for five of the six tile_*_ore painters (coal has its own body below,
+    to retune its fleck placement without touching this shared one — see its docstring):
+    paint stone, embed flecks on a COPY so the pre-fleck image survives as the `before`
+    for the two guards below, then assert the flecks actually came out separated AND that
+    none of them is individually a sliver, before handing the tile back."""
+    stone = tile_stone(rng)
+    img = stone.copy()
+    px = img.load()
+    _ore_flecks(rng, px, base, light, dark)
+    n = _count_ore_flecks(stone, img)
+    assert n >= 4, (
+        f"tile_{name}_ore: only {n} separate fleck(s) survived — flecks fused into a mass "
+        f"instead of reading as scattered ore. Re-run to confirm (should not happen, since "
+        f"the seed is fixed) or loosen MIN_SEP / shrink the radius in _ore_flecks."
+    )
+    _assert_ore_compactness(stone, img, name)
+    return img
+
+
+def tile_coal_ore(rng):
+    """Coal ore — near-black flecks with a visible blue-grey highlight. Steve's second-pass
+    note: the first version's near-black base carried almost no internal shading and its
+    flecks, chained together by overlap, read as scratches in the stone rather than lumps.
+    Separation stopped the chaining, and this palette's light/dark are pushed further from
+    `base` than any other ore's (light is 3x base's own value, dark is half of it) so a
+    fleck still shows a lit rim and a shadowed one against near-black, where a subtler
+    contrast would have gone flat again at this size. That pass fixed iron/gold/redstone/
+    lapis/diamond outright but left coal the weakest of the six: its component COUNT
+    passed (>=4, separate), yet two of those components were still slivers rather than
+    lumps — a dense near-solid 3x2 block that reads as a short bar, and a compact pair
+    landing close enough together to read as one diagonal streak by simple visual grouping
+    even though centre-to-centre they cleared the old MIN_SEP. Measured, not eyeballed:
+    _assert_ore_compactness below is the guard that names this precisely, and against the
+    unmodified painter it is marginal-to-failing on exactly those two shapes (bbox fill
+    0.78 and 0.67, both close to a solid block; see oreart_sliver_guard_proof.py).
+
+    This is coal's OWN body rather than a call into the shared _ore_tile, because the fix
+    is a coal-specific retune (tighter MIN_SEP, smaller max radius) that must not shift
+    iron/gold/redstone/lapis/diamond's art by even one pixel. The shared rng stream is
+    still advanced by exactly the same draws the old single _ore_flecks call made — that
+    call happens below and its result is thrown away — so every tile after coal in TILES
+    order starts from the same stream position it always did; this is the same idiom
+    _dead_bush_v1 uses to keep tile_fern's slot untouched after tile_dead_bush was redrawn.
+    The real art then comes from its own independent seeded stream, tuned specifically to
+    stop the two defects above: MIN_SEP raised from 3.4 to 4.6 so even two max-radius
+    flecks keep a visible gap of stone between them instead of nearly touching, and the
+    radius range shrunk from 0.85..1.30 to 0.75..1.10 so a fleck cannot grow into a dense
+    multi-row block in the first place.
+    """
+    base, light, dark = (28, 28, 34), (92, 100, 116), (7, 7, 9)
+    stone = tile_stone(rng)
+
+    img = stone.copy()
+    px = img.load()
+    _ore_flecks(rng, px, base, light, dark)  # stream alignment only, discarded — see docstring above
+
+    img = stone.copy()
+    px = img.load()
+    r = random.Random(0x0C0A10FE)            # own stream — arbitrary, fixed, not the shared one
+    _ore_flecks(r, px, base, light, dark, min_sep=4.6, r_lo=0.75, r_span=0.35)
+
+    n = _count_ore_flecks(stone, img)
+    assert n >= 4, (
+        f"tile_coal_ore: only {n} separate fleck(s) survived — flecks fused into a mass "
+        f"instead of reading as scattered ore. Re-run to confirm (should not happen, since "
+        f"the seed is fixed) or loosen min_sep / shrink the radius above."
+    )
+    _assert_ore_compactness(stone, img, "coal")
+    return img
+
+
+def tile_iron_ore(rng):
+    """Iron ore — a pale buff/tan. Warmer than tile_stone's cool blue-grey speckle (its
+    reds and blues run close together, 94..122 apart by at most a few steps) so the flecks
+    read as a different material laid IN the rock rather than a lighter patch of the rock
+    itself. This was the one ore steve's second-pass note singled out as already working —
+    it is unchanged in palette, and now shares the same separated-fleck mechanism as the
+    other five instead of being the odd one out.
+    """
+    return _ore_tile(rng, "iron", base=(196, 176, 148), light=(226, 208, 182), dark=(150, 130, 102))
+
+
+def tile_gold_ore(rng):
+    """Gold ore — saturated yellow, the brightest and most saturated fleck colour on the
+    whole sheet. Gold's job in a cave is to be the one that unmistakably outshines its
+    stone, so unlike coal this is built to have the LEAST in common with tile_stone's
+    palette rather than the most.
+    """
+    return _ore_tile(rng, "gold", base=(230, 190, 46), light=(252, 224, 96), dark=(176, 136, 22))
+
+
+def tile_redstone_ore(rng):
+    """Redstone ore — bright crimson. Kept clear of the poppy's (204,48,44) and the apple
+    body's (176,32,40 and below): this sits redder and a touch brighter than either, and in
+    practice the three never sit side by side anyway — cross flower, full-cube fruit,
+    full-cube ore are three different silhouettes before colour is even a question.
+    """
+    return _ore_tile(rng, "redstone", base=(218, 40, 34), light=(248, 92, 78), dark=(150, 16, 18))
+
+
+def tile_lapis_ore(rng):
+    """Lapis ore — a deep, saturated blue with no green mixed in, clear of both the
+    bluebell's (72,88,196) and water's crest (56,112,172): this is darker than the bluebell
+    and far more saturated than the sea, so it never reads as a chip off either.
+    """
+    return _ore_tile(rng, "lapis", base=(38, 62, 172), light=(86, 116, 220), dark=(18, 32, 110))
+
+
+def tile_diamond_ore(rng):
+    """Diamond ore — pale cyan, pushed toward green rather than blue (its green channel
+    sits above its blue one throughout) so it stays clear of ice, which is plainly blue
+    (124..172, blue always the top channel) and of lapis right above it on this same list,
+    which is deep and saturated where this is pale and cool.
+    """
+    return _ore_tile(rng, "diamond", base=(140, 228, 214), light=(198, 250, 240), dark=(88, 176, 166))
+
+
 def tile_sentinel(_rng):
     """Not art — a bleed alarm.
 
@@ -1652,6 +1974,12 @@ PAINTERS = {
     "orchid": tile_orchid,
     "apple": tile_apple,
     "torch": tile_torch,
+    "coal_ore": tile_coal_ore,
+    "iron_ore": tile_iron_ore,
+    "gold_ore": tile_gold_ore,
+    "redstone_ore": tile_redstone_ore,
+    "lapis_ore": tile_lapis_ore,
+    "diamond_ore": tile_diamond_ore,
 }
 
 

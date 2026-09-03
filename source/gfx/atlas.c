@@ -9,10 +9,17 @@ static C3D_Tex s_tex;
 
 bool atlasInit(void)
 {
-	// vram = true. The atlas is a 16x256 strip at RGBA5551 (2 bytes/texel), so it costs
-	// 8 KB of the ~6 MB VRAM budget. It was 128x128 (32 KB) up to v1.5.1, 64x64 (8 KB)
+	// vram = true. The atlas is a 16x1024 strip at RGBA5551 (2 bytes/texel), so it costs
+	// 32 KB of the ~6 MB VRAM budget. It was 128x128 (32 KB) up to v1.5.1, 64x64 (8 KB)
 	// before TILE_PLANKS needed a tenth cell, and 256x256 RGBA8888 (256 KB) before step
 	// 9.3. All four figures are computed from the sheet, not measured on-device. The size
+	//
+	// 2026-09-02: the first sentence said 16x256 and 8 KB, and had been wrong by 4x since
+	// the sheet was made tall enough to hold 64 slots. Corrected against the constants that
+	// actually govern it: ATLAS_W_PX 16 and ATLAS_H_PX 1024 in world/atlas_uv.h:48-49, which
+	// give ATLAS_TILE_SLOTS 64 at atlas_uv.h:76. Worth knowing that the corrected figure
+	// collides with a number already in this comment: the v1.5.1 128x128 sheet ALSO cost
+	// 32 KB, so "32 KB" alone does not identify which sheet is being discussed. The size
 	// itself is not read from here — it comes out of the .t3x — but ATLAS_W_PX/ATLAS_H_PX
 	// in world/atlas_uv.h and uvScale in BOTH shaders/world.v.pica and
 	// shaders/world_dynamic.v.pica must match the PNG that tools/make_atlas.py writes.

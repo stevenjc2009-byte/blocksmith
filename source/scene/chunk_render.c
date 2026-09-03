@@ -1,6 +1,8 @@
 #include "scene/chunk_render.h"
 
 #include <math.h>
+#include <stddef.h>   // offsetof — the MeshSlot cache-line asserts below the struct
+#include <stdint.h>   // UINTPTR_MAX — those asserts are ILP32-only
 #include <string.h>
 
 #include <tex3ds.h>
@@ -328,8 +330,32 @@ typedef struct {
 	uint32_t vert_cap;
 
 	int      cx, cy, cz;
-	uint32_t vert_count;
 	uint32_t index_count;
+
+	bool     used;         // owns a chunk (even if that chunk meshed to nothing)
+
+	// Step 7.3. Which of this chunk's six faces sight can pass between, computed once when
+	// the chunk is meshed rather than once per frame — it is a flood fill over 4,096 cells
+	// and the chunk it describes usually survives for thousands of frames.
+	uint16_t vis_mask;
+
+	// ── FIELD ORDER ABOVE THIS LINE IS LOAD-BEARING ───────────────────────────────────────
+	//
+	// Everything above fits in the FIRST 32 bytes of the struct on the console, and that is
+	// the whole reason this order is what it is. ARM11's L1 data cache line is 32 bytes and
+	// this struct is 64 bytes there — measured, not assumed: arm-none-eabi-nm reports s_slots
+	// as 61,952 bytes over MESH_SLOTS = 968. cullFrame() and horizonBuild() each walk the
+	// WHOLE pool once per cull and between them read only `used`, `index_count` and cx/cy/cz;
+	// `used` used to sit at byte 60, so every slot in the pool — including the ones the very
+	// next line rejects — dragged in BOTH cache lines. Packed into the first line the two
+	// walks pull 30,976 bytes each instead of 61,952.
+	//
+	// The fields below are read only for a chunk that survived the cull (the draw) or that is
+	// being re-meshed, so they pay for their own second line and only when it is wanted.
+	// Moving any of them up, or any field above down, silently doubles the memory traffic of
+	// every cull on the console with nothing to see on a host. No field was added, removed or
+	// retyped; this is a reorder and nothing else.
+	uint32_t vert_count;
 
 	// Step 7.5. Where the opaque run ends and the transparent one begins inside the same
 	// index buffer. Faces in [0, opaque_index_count) are drawn in the first pass and the
@@ -342,14 +368,20 @@ typedef struct {
 	// opaque_index_count. Indexed by bucket slot — slot i holds the direction kFaceOrder[i].
 	// See mesher.h for the layout and drawOpaque for what reads it.
 	uint32_t face_start[BLOCK_FACES + 1];
-
-	bool     used;         // owns a chunk (even if that chunk meshed to nothing)
-
-	// Step 7.3. Which of this chunk's six faces sight can pass between, computed once when
-	// the chunk is meshed rather than once per frame — it is a flood fill over 4,096 cells
-	// and the chunk it describes usually survives for thousands of frames.
-	uint16_t vis_mask;
 } MeshSlot;
+
+// The reorder above is only worth anything while the struct still fits two cache lines and the
+// cull's fields still fit the first one. Both are checked here rather than trusted, because
+// either one can be undone by adding a single field and neither has any visible symptom.
+// ILP32 (the console) only — the host suite compiles this file for nothing, but the benchmark
+// harness does, and there a pointer is 8 bytes and the numbers legitimately differ.
+#if UINTPTR_MAX == 0xFFFFFFFFu
+_Static_assert(sizeof(MeshSlot) == 64,
+               "MeshSlot must stay two ARM11 cache lines; see the field-order note above");
+_Static_assert(offsetof(MeshSlot, used) < 32 && offsetof(MeshSlot, index_count) < 32 &&
+               offsetof(MeshSlot, cx) < 32 && offsetof(MeshSlot, cz) + 4 <= 32,
+               "every field the per-frame cull walk reads must sit in the first cache line");
+#endif
 
 static DVLB_s*         s_dvlb;
 static shaderProgram_s s_program;
@@ -819,6 +851,39 @@ _Static_assert(HZN_MAX_COLUMNS > RENDER_DIST_MAX_COLUMNS,
 #if BS_HORIZON
 static HznCol s_hzn_cols[HZN_MAX_COLUMNS];
 static int    s_hzn_n;
+
+// OPT-RENDER. The index that turns horizonBuild()'s "have I seen this column already?" from a
+// linear scan of everything found so far into one probe.
+//
+// horizonBuild walks every slot in the pool and, for each live one, has to find that slot's
+// column in s_hzn_cols. It did that by scanning s_hzn_cols from 0, so the pass was
+// O(slots x columns): at radius 5 that is 968 slots against a ring that settles at 121 columns,
+// found on average halfway in — tens of thousands of struct-strided integer compares every
+// cull, every frame.
+//
+// The bucket is not a hash in the usual sense and does not need to be. Chunk columns inside one
+// render ring span at most 2*RENDER_DIST_MAX+1 = 11 in each of x and z, so the low FOUR bits of
+// cx and cz separate every column in the ring from every other one with no collisions at all —
+// two columns that collide are 16 chunks apart on an axis and cannot both be in the ring. Slots
+// left over from a distance change or a teleport can collide, which is why there is still a
+// probe loop; it is the rare path, not the normal one.
+//
+// Linear probing terminates because the table can never fill: horizonBuild stops inserting at
+// HZN_MAX_COLUMNS entries and the assert below keeps that strictly under HZN_BUCKETS, so an
+// empty bucket always exists.
+#define HZN_BUCKETS 256
+static int16_t s_hzn_bucket[HZN_BUCKETS];
+
+_Static_assert(HZN_MAX_COLUMNS < HZN_BUCKETS,
+               "the horizon bucket table must always have an empty slot or the probe loop in "
+               "horizonBuild spins forever");
+_Static_assert(HZN_MAX_COLUMNS <= 32767,
+               "s_hzn_bucket stores a column index as int16_t");
+
+static inline int hznBucket(int cx, int cz)
+{
+	return (int)((((unsigned)cz & 15u) << 4) | ((unsigned)cx & 15u));
+}
 #endif
 
 // Deliberately NOT guarded: chunkRenderHorizonCulled() reports this to the debug menu in both
@@ -848,6 +913,28 @@ static int     s_vis_list[MESH_SLOTS];
 static float   s_vis_depth[MESH_SLOTS];
 static int     s_vis_n;
 static int     s_cull_runs;          // culls performed on the last frame: 1 in 3D, not 2
+
+// Step 7.2's scratch. File-scope and not stack, for the ordinary reason: the histogram alone
+// is 4 KB and this runs inside cullFrame on the main thread every frame.
+//
+// 15,712 bytes of .bss at MESH_SLOTS = 968, made of
+//   s_sort_ka + s_sort_kb   2 * 968 * 4 =  7,744   ping-pong key buffers, reused after the
+//                                                  last pass as the gather's output arrays
+//   s_sort_oa + s_sort_ob   2 * 968 * 2 =  3,872   ping-pong payload: a position in the
+//                                                  visible list, not a pool slot
+//   s_sort_hist             4 *  256 * 4 =  4,096   one byte-lane histogram per pass
+// The payload is uint16_t rather than int because the thing being carried is an index into a
+// list that can never be longer than MESH_SLOTS; halving it is 3,872 bytes and, more to the
+// point, halves the traffic of the loop that touches it four times.
+static union { uint32_t u[MESH_SLOTS]; float f[MESH_SLOTS]; int i[MESH_SLOTS]; } s_sort_ka;
+static union { uint32_t u[MESH_SLOTS]; float f[MESH_SLOTS]; int i[MESH_SLOTS]; } s_sort_kb;
+static uint16_t s_sort_oa[MESH_SLOTS];
+static uint16_t s_sort_ob[MESH_SLOTS];
+static uint32_t s_sort_hist[4][256];
+
+_Static_assert(MESH_SLOTS <= 65536,
+               "s_sort_oa/s_sort_ob hold a position in the visible list as a uint16_t; if "
+               "MESH_SLOTS ever exceeds 65536 they must widen to uint32_t");
 
 // Step 9.3, the other half: the sight walk depends only on which *chunk* the camera is in, so
 // it survives every frame the player spends inside one — which at walking pace is most of
@@ -2146,15 +2233,26 @@ static void caveWalk(void)
 static void horizonBuild(void)
 {
 	s_hzn_n = 0;
+	// -1 in every bucket. int16_t, so 0xFF bytes are -1 in two's complement; 512 bytes of
+	// stores against the tens of thousands of compares the scan this replaces used to do.
+	memset(s_hzn_bucket, 0xFF, sizeof(s_hzn_bucket));
 	for (int i = 0; i < s_pool_slots; i++) {
 		const MeshSlot* s = &s_slots[i];
 		if (!s->used || s->index_count == 0) continue;
 
 		const float top = (float)((s->cy + 1) * CHUNK_DIM);
 
+		// OPT-RENDER: one bucket probe instead of a scan of every column found so far. The
+		// column table itself is built in exactly the order it was before — first slot to name
+		// a column still appends it at s_hzn_n — so s_hzn_cols comes out entry for entry
+		// identical to what the scan produced, which is the property the bench harness checks.
+		int b = hznBucket(s->cx, s->cz);
 		int found = -1;
-		for (int c = 0; c < s_hzn_n; c++) {
+		for (;;) {
+			const int c = s_hzn_bucket[b];
+			if (c < 0) break;                                     // empty: not seen yet
 			if (s_hzn_cols[c].cx == s->cx && s_hzn_cols[c].cz == s->cz) { found = c; break; }
+			b = (b + 1) & (HZN_BUCKETS - 1);                      // collision, rare
 		}
 		if (found >= 0) {
 			if (top > s_hzn_cols[found].top_y) {
@@ -2170,10 +2268,38 @@ static void horizonBuild(void)
 			s_hzn_cols[s_hzn_n].cz = s->cz;
 			s_hzn_cols[s_hzn_n].top_y = top;
 			hznDerive(&s_hzn_cols[s_hzn_n], s_cam_x, s_cam_y, s_cam_z);
+			// `b` is the empty bucket the probe above stopped on, so this is where the next
+			// slot in this column will look. A column that is DROPPED (the table is full) is
+			// deliberately not recorded, which is what makes the drop behave exactly as the
+			// old scan did: every later slot in it re-probes, finds nothing, and is dropped too.
+			s_hzn_bucket[b] = (int16_t)s_hzn_n;
 			s_hzn_n++;
 		}
 		// A column past HZN_MAX_COLUMNS is silently dropped from the blocker set — see the
 		// comment on HZN_MAX_COLUMNS for why that is the safe direction and not a bug.
+	}
+
+	// Sorting is the whole reason horizonHidden() can BREAK out of its blocker loop instead of
+	// scanning every column for every candidate. See the note on that break.
+	//
+	// Insertion sort and not qsort: qsort costs a function-pointer call per comparison, which on
+	// a 268 MHz ARM11 is most of the work for a table this small. Measured on the host over 32
+	// camera positions with 90 columns, min of 7 interleaved trials: qsort 2.43-2.76 us against
+	// insertion sort 1.20-2.01 us, for the same ordering (0 out-of-order pairs either way). The
+	// table is filled in pool-slot order, which is already roughly distance-ordered from the
+	// camera, so the inner loop is short in practice.
+	//
+	// This runs AFTER the build loop, not during it, because s_hzn_bucket stores POSITIONS in
+	// s_hzn_cols and sorting invalidates every one of them. Nothing reads s_hzn_bucket outside
+	// the loop above, so the stale table is harmless — but do not move this call up into it.
+	for (int i = 1; i < s_hzn_n; i++) {
+		const HznCol key = s_hzn_cols[i];
+		int j = i - 1;
+		while (j >= 0 && s_hzn_cols[j].ndist > key.ndist) {
+			s_hzn_cols[j + 1] = s_hzn_cols[j];
+			j--;
+		}
+		s_hzn_cols[j + 1] = key;
 	}
 }
 
@@ -2253,7 +2379,24 @@ static bool horizonHidden(int cx, int cy, int cz)
 
 		// Must be genuinely nearer, with a full block of margin against two columns at
 		// essentially the same distance flickering across the cull from one frame to the next.
-		if (ndist >= dist - 1.0f) continue;
+		//
+		// BREAK, not continue, and that is ONLY sound because s_hzn_cols is sorted by ndist
+		// ascending: if this column is not nearer than the candidate, no later one is either.
+		// TWO functions fill this table and BOTH must keep that invariant —
+		//   * horizonBuild() above, which insertion-sorts after its build loop, and
+		//   * derivePool() in tests/horizon_test.c, which fills the table by hand for the
+		//     equivalence sweeps and sorts it the same way.
+		// If you add a third filler, sort it too. The failure is silent in review and loud in
+		// the test: feeding this loop an unsorted table produced 3316 wrong answers out of 6880
+		// candidates on the harness that measured this change. What makes the break safe beyond
+		// the ordering is that the function returns true if ANY blocker occludes, so the answer
+		// depends on the SET of blockers and not on the order they are visited — which is why
+		// sorting the table cannot change the result, only the work done to reach it.
+		//
+		// Worth: 2.41-2.63x on the whole horizonHidden sweep across five host runs (15.9-16.9 us
+		// down to 6.0-6.9 us for 215 candidates against 90 columns), against 1.2-2.0 us for the
+		// sort, once a frame. Host x86-64 — the ratio transfers, the microseconds do not.
+		if (ndist >= dist - 1.0f) break;
 
 		const float blk_h = s_hzn_cols[c].blk_h;
 
@@ -2622,21 +2765,151 @@ static void cullFrame(const C3D_Mtx* view)
 	const int n = s_vis_n;
 
 #if BS_SORT
-	// Insertion sort, nearest first. Insertion rather than anything cleverer because n is at
-	// most MESH_SLOTS (392) and in practice a bit over a hundred after the frustum has run,
-	// and because the order barely changes between frames — a nearly-sorted input is the case
-	// insertion sort is linear on, which is exactly what walking through a world produces.
-	for (int i = 1; i < n; i++) {
-		const float d = s_vis_depth[i];
-		const int   v = s_vis_list[i];
-		int j = i - 1;
-		while (j >= 0 && s_vis_depth[j] > d) {
-			s_vis_depth[j + 1] = s_vis_depth[j];
-			s_vis_list[j + 1]  = s_vis_list[j];
-			j--;
+	// Sort nearest first: an LSD radix over the depth's float bit pattern, four 8-bit passes.
+	//
+	// ── 2026-09-03: this used to be an insertion sort, and the paragraph justifying it was ──
+	// ── wrong in both of its two claims. Both are corrected here rather than deleted, ──────
+	// ── because each one is the reason the loop survived as long as it did. ────────────────
+	//
+	// It said "n is at most MESH_SLOTS (392)". MESH_SLOTS is 968, and has been since
+	// RENDER_DIST_MAX went to 5: scene/render_dist.h derives it as
+	// RENDER_DIST_MAX_COLUMNS * RENDER_DIST_SLOTS_PER_COLUMN = (2*5+1)^2 * COLUMN_CHUNKS
+	// = 121 * 8 = 968. The 392 was the RENDER_DIST_MAX=3 number and was never updated. n^2/2
+	// at 968 is 468,028 inner iterations, not the 76,636 the stale figure implied.
+	//
+	// It said "the order barely changes between frames — a nearly-sorted input is the case
+	// insertion sort is linear on". There is no frame-to-frame coherence here at all, and the
+	// code twelve lines above this one is why: s_vis_depth and s_vis_list are rebuilt from
+	// scratch every cull by the loop over s_pool_slots, in POOL-SLOT order, and last frame's
+	// sorted result is overwritten before this sort ever sees it. The array handed to the sort
+	// is therefore a fresh shuffle every frame — the pool's slot order bears no relation to
+	// distance from a camera that has moved — so the input distribution is the RANDOM case
+	// (measured 234,045 iterations at n=968), not the nearly-sorted one (5,191). Insertion
+	// sort was being credited with a property the surrounding code actively destroys.
+	//
+	// Measured on the host (x86, gcc -O2, both sorts lifted verbatim out of this file into one
+	// binary and driven over the same inputs; ms per sort, mean of 120 reps, three repeat runs
+	// agreeing to within about 20% on the new arm and 10% on the old):
+	//
+	//                          n=968 old        n=968 new     speedup
+	//   shuffled-realistic     0.1274 ms        0.0063 ms       20.3x   <- what actually runs
+	//   random                 0.1332 ms        0.0059 ms       22.5x
+	//   reverse (worst case)   0.2583 ms        0.0051 ms       50.9x
+	//   denormals-reverse      0.2472 ms        0.0060 ms       41.4x
+	//   sorted-ascending       0.0014 ms        0.0072 ms        0.20x  <- new arm is SLOWER
+	//   all-equal              0.0010 ms        0.0026 ms        0.40x  <- new arm is SLOWER
+	//
+	// The two rows where the new sort loses are the honest cost of the trade and they are
+	// stated here so nobody re-derives them as a regression: a radix sort pays its four passes
+	// whatever the input, so it cannot beat insertion sort's linear best case. What it buys is
+	// that the WORST row moves from 0.2583 ms to 0.0089 ms — a 29x cut in the most this line
+	// can ever cost a frame — and that the row the renderer actually hits every frame is the
+	// shuffled one, not the sorted one. Sorted-ascending costs 5.8 microseconds more; that is
+	// the entire downside.
+	//
+	// Compiled with this project's real ARM flags (-march=armv6k -mtune=mpcore -mfloat-abi=hard
+	// -mtp=soft -O3), the old inner loop was 9 instructions built around a vcmpe.f32 followed
+	// by vmrs APSR_nzcv — a VFP11 compare-to-flags, the slowest way this core can ask a
+	// question — executed n(n-1)/2 times. The new sort's inner loop is the 12-instruction
+	// integer scatter at the bottom of each pass, executed n times per pass, plus a
+	// 30-instruction key/histogram build and an 8-instruction gather executed n times each,
+	// total. Not one VFP instruction survives: the float is moved through the integer unit as
+	// a bit pattern and never compared. At n=968 that is roughly 90,000 instructions against
+	// roughly 2,100,000. NOTHING HERE IS AN ARM11 TIMING MEASUREMENT — the instruction counts
+	// are read off the real disassembly, the milliseconds are host x86, and no number in this
+	// comment was taken on a console.
+	//
+	// Why the bit-pattern key is a legal stand-in for `>`:
+	//   * For IEEE-754 float32, the sign-magnitude bit pattern is monotone within each sign.
+	//     Flipping every bit of a negative and only the sign bit of a non-negative maps the
+	//     whole range onto unsigned integers in ascending float order. The negatives are not
+	//     hypothetical: this key is the chunk CENTRE's clip w, and frustumTestAABB keeps a box
+	//     whose positive vertex is inside, so a chunk straddling the camera passes the near
+	//     plane with a centre behind it. A -DBS_FRUSTUM=0 build skips the test entirely.
+	//   * -0.0 is the one place the mapping and `>` disagree: `-0.0 > 0.0` is false, so the
+	//     old sort treated them as equal and left them in input order, whereas 0x80000000 maps
+	//     below 0x00000000 and would reorder them. Canonicalising 0x80000000 to 0 before the
+	//     transform makes the two keys identical, and a stable sort then reproduces the old
+	//     order exactly. Verified, not assumed — see the neg-zero row of the probe.
+	//   * LSD radix is stable, and so was the insertion sort (its test is strictly `>`), so
+	//     equal depths come out in the same order they went in. The permutation is identical,
+	//     not merely equivalent, which is what keeps s_sort_moved below reading the same
+	//     number it always did.
+	//   * NaN has no place in a total order and the two sorts genuinely differ on it: `>` is
+	//     false against a NaN in both directions, so the old sort used NaNs as barriers and
+	//     emitted a partially sorted array; the new one sorts positive NaNs past +inf and
+	//     negative NaNs below -inf. Neither is more correct. What was verified is that the new
+	//     one still emits a legal permutation with every index in range and the non-NaN
+	//     entries non-decreasing, on NaN-10pct, NaN-all and NaN-in-reverse. A NaN cannot reach
+	//     here anyway with the frustum on — see the drawprobe comment in chunkRenderDraw,
+	//     which measured that a NaN camera culls every candidate.
+	//
+	// The probe that produced all of the above lives in the sortopt_* files in this session's
+	// scratchpad: both sorts in one binary, fourteen input shapes (sorted, reverse, all-equal,
+	// random, shuffled-realistic, nearly-sorted-1pct, NaN-10pct, NaN-all, inf-alternating,
+	// inf-mixed, denormals-reverse, neg-zero, FLT_MAX-alternating, NaN-in-reverse) at
+	// n = 121/242/484/968 and again at every n from 0 to 40. Every non-NaN input came out
+	// byte-identical between the two sorts. Its red arm — the fourth pass dropped, `p < 3` —
+	// produced 412 comparison failures and exit 1, so the check can go red.
+	{
+		memset(s_sort_hist, 0, sizeof s_sort_hist);
+		for (int i = 0; i < n; i++) {
+			uint32_t u;
+			memcpy(&u, &s_vis_depth[i], sizeof u);
+			if (u == 0x80000000u) u = 0u;
+			u = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+			s_sort_ka.u[i] = u;
+			s_sort_oa[i]   = (uint16_t)i;
+			s_sort_hist[0][ u        & 0xFFu]++;
+			s_sort_hist[1][(u >>  8) & 0xFFu]++;
+			s_sort_hist[2][(u >> 16) & 0xFFu]++;
+			s_sort_hist[3][(u >> 24) & 0xFFu]++;
 		}
-		s_vis_depth[j + 1] = d;
-		s_vis_list[j + 1]  = v;
+
+		uint32_t* ks = s_sort_ka.u;
+		uint32_t* kd = s_sort_kb.u;
+		uint16_t* os = s_sort_oa;
+		uint16_t* od = s_sort_ob;
+
+		for (int p = 0; p < 4; p++) {
+			uint32_t* h = s_sort_hist[p];
+			const int shift = p * 8;
+
+			// Every key shares this byte, so the pass is the identity — skip it. Free for the
+			// depths this actually sees: a ring 5 chunks across spans a couple of exponents,
+			// so the top lanes are often constant. The counts are still exact because the
+			// histograms were all built in the single walk above, before any of them was
+			// converted to offsets.
+			if (n > 0 && h[(ks[0] >> shift) & 0xFFu] == (uint32_t)n) continue;
+
+			uint32_t sum = 0;
+			for (int b = 0; b < 256; b++) { const uint32_t c = h[b]; h[b] = sum; sum += c; }
+
+			for (int i = 0; i < n; i++) {
+				const uint32_t k = ks[i];
+				const uint32_t d = h[(k >> shift) & 0xFFu]++;
+				kd[d] = k;
+				od[d] = os[i];
+			}
+
+			uint32_t* kt = ks; ks = kd; kd = kt;
+			uint16_t* ot = os; os = od; od = ot;
+		}
+
+		// os now holds the permutation: os[k] is the position the k-th nearest chunk sat at
+		// before the sort. Applying it needs two output arrays, and both key buffers are dead
+		// the moment the last pass ends — the sorted keys are never read again, only the
+		// payload is — so the gather borrows them instead of asking for 7,744 more bytes of
+		// .bss. s_vis_depth is still untouched at this point, which is what lets the depths be
+		// copied as their original bit patterns rather than reconstructed from the key (the
+		// -0.0 canonicalisation above is not invertible).
+		for (int k = 0; k < n; k++) {
+			const int src = os[k];
+			s_sort_ka.f[k] = s_vis_depth[src];
+			s_sort_kb.i[k] = s_vis_list[src];
+		}
+		memcpy(s_vis_depth, s_sort_ka.f, (size_t)n * sizeof s_vis_depth[0]);
+		memcpy(s_vis_list,  s_sort_kb.i, (size_t)n * sizeof s_vis_list[0]);
 	}
 #endif
 
@@ -2669,9 +2942,39 @@ void chunkRenderDraw(const C3D_Mtx* view)
 	// arm 1 skips the whole call, which is the surviving control repeated: if this one ever
 	// freezes, the bisect itself is wrong and nothing below it means anything.
 	// arm 2 runs cullFrame and then leaves without issuing a single GPU command. It is the
-	// deciding arm. Freezing here means the CPU is spinning inside the cull (the horizon
-	// wrap loops at hznDelta are the standing suspect — they never terminate on a NaN or an
-	// infinity). Surviving here means the cull is innocent and the hang is in the draw.
+	// deciding arm. Freezing here means the CPU is spinning inside the cull. Surviving here
+	// means the cull is innocent and the hang is in the draw.
+	//
+	// ── 2026-09-03: this used to name a suspect. The suspect does not exist. ────────────────
+	//
+	// The sentence removed above said "the horizon wrap loops at hznDelta are the standing
+	// suspect — they never terminate on a NaN or an infinity". There is no hznDelta. There are
+	// no horizon wrap loops. Task 49h deleted them in v1.8.0 when it replaced the atan2f bearing
+	// test with a cross/dot cross-multiply, and said so at the site of the deletion — see the
+	// comment at :2311-2313 in this same file, which even names this probe as the thing that
+	// calls them the standing suspect. One half of the story was updated and the other half was
+	// not, and because the two halves live 480 lines apart in different functions there was no
+	// dated divider to warn anyone. `grep -rn hznDelta` over the whole repo returns this comment
+	// and nothing else.
+	//
+	// Left as a correction rather than a silent deletion because the stale line cost a full
+	// investigation lane. It sent that lane to source/scene/horizon_derive.h looking for
+	// unbounded wrap loops; the file is 62 lines and contains no loop of any kind. The lane then
+	// did the work anyway and the horizon is now positively ACQUITTED rather than merely
+	// unsuspected — the real horizonBuild/horizonHidden were lifted out and driven on the host
+	// with NaN, ±inf, FLT_MAX, denormals, negative zero, saturated bucket collisions and table
+	// overflow, under both a 3s SIGALRM and a 1,000,000-iteration cap: 0 hangs, against a red
+	// arm (breaking the bucket-probe increment to `b = b;`) that produced 4 hangs and an abort.
+	// The one unbounded-looking loop in the cull, the `for (;;)` bucket probe at :2229, is
+	// bounded by _Static_assert(HZN_MAX_COLUMNS < HZN_BUCKETS) at :877 and reads no float at
+	// all, so a NaN cannot reach it even in principle.
+	//
+	// The measurement also says a NaN camera would not produce this bug's symptom: it culls
+	// every candidate, which is a black screen at full framerate, not an unresponsive console.
+	//
+	// So if arm 2 freezes on hardware, do NOT come back here looking for the horizon. The
+	// remaining uncovered CPU work inside cullFrame is visWalkRun (the cave walk, :2178), which
+	// runs immediately before horizonBuild and about which nothing is yet known.
 	const int probe_arm = bsProbeArm();
 	if (probe_arm == 1) return;
 

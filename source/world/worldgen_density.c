@@ -1,9 +1,12 @@
 #include "world/worldgen_density.h"
 
+#include <string.h>
+
 #include "world/cave_carve.h"
 #include "world/chunk.h"
 #include "world/genversion.h"
 #include "world/noise.h"
+#include "world/ore_gen.h"
 #include "world/rng.h"
 #include "world/worldgen_scratch.h"
 
@@ -590,9 +593,11 @@ bool wgdColumn(const WorldGen* g, WorldGenScratch* s, World* w, int32_t cx, int3
 {
 	buildGrid(g, s, cx, cz);
 
-	for (int y = 0; y < WORLD_HEIGHT; y++)
-		for (int z = 0; z < CHUNK_DIM; z++)
-			s->solid[y][z] = 0;
+	// Tier-1 opt (lane OPT-WORLDGEN, 2026-09-02): s->solid is one contiguous
+	// WORLD_HEIGHT*CHUNK_DIM array of uint16_t; a nested loop writing 0 to every element is
+	// exactly what memset does, and 0 is 0 in every byte of a uint16_t so the all-zero fill is
+	// bit-identical either way.
+	memset(s->solid, 0, sizeof(s->solid));
 	interpolateColumn(s);
 
 	// Topmost solid per (x, z). Scanned down from the ceiling, which is the same convention
@@ -635,6 +640,17 @@ bool wgdColumn(const WorldGen* g, WorldGenScratch* s, World* w, int32_t cx, int3
 	// so this line changes nothing for LEGACY, DENSITY or BIOME worlds.
 	if (g->version >= GEN_VERSION_CAVES)
 		caveCarveBuildMask(g, s, cx, cz);
+
+	// v1.8.12. The ore-vein pre-pass (world/ore_gen.h): run once per column, before the fill
+	// loop below reads it, and ONLY for GEN_VERSION_ORES-and-above worlds — the same one-call-
+	// site version gate the cave pre-pass above uses. Because GEN_VERSION_ORES > GEN_VERSION_
+	// CAVES, an ore world still runs the cave pre-pass too (the `>=` above already covers it);
+	// this is purely additive on top. Every world below GEN_VERSION_ORES never calls
+	// oreGenBuildMask() and the mask is never read for it either (see the fill loop below), so
+	// this line changes nothing for LEGACY, DENSITY, BIOME or CAVES worlds — the version-gate
+	// requirement the task brief calls out by name.
+	if (g->version >= GEN_VERSION_ORES)
+		oreGenBuildMask(g, s, cx, cz);
 
 	// v1.8.3 Phase 2. The biome per (x, z), resolved once for the column and consumed by the
 	// surface pass below.
@@ -725,7 +741,9 @@ bool wgdColumn(const WorldGen* g, WorldGenScratch* s, World* w, int32_t cx, int3
 			continue;
 
 		bool any = false;
-		for (int i = 0; i < CHUNK_BLOCKS; i++) s->flat[i] = BLOCK_AIR;
+		// Tier-1 opt (lane OPT-WORLDGEN, 2026-09-02): BLOCK_AIR == 0, so this is the same
+		// memset conversion as worldgen.c's legacyColumn() AIR fill.
+		memset(s->flat, BLOCK_AIR, CHUNK_BLOCKS);
 
 		for (int ly = CHUNK_DIM - 1; ly >= 0; ly--) {
 			const int y = y0 + ly;
@@ -808,11 +826,26 @@ bool wgdColumn(const WorldGen* g, WorldGenScratch* s, World* w, int32_t cx, int3
 					// from the sea whatever it turns out to be.
 					if (under_line) sea[z][x] = false;
 
-					s->flat[chunkIndex(x, ly, z)] =
-						exposed[z][x]
-							? surfaceBlock(depth, s->top[z][x], s->slope[z][x],
-							               (BiomeId)biome[z][x])
-							: BLOCK_STONE;
+					BlockId block = exposed[z][x]
+						? surfaceBlock(depth, s->top[z][x], s->slope[z][x],
+						               (BiomeId)biome[z][x])
+						: BLOCK_STONE;
+
+					// v1.8.12. Ore veins (world/ore_gen.h). `block` here is either
+					// surfaceBlock()'s answer or BLOCK_STONE itself — the mask lookup only
+					// fires on the latter, so ore can never land on a surface block, and this
+					// branch is never reached at all for an air/carved-cave cell (those
+					// `continue`d above at the cave-carve check) or a sea cell (handled in its
+					// own branch above) — the "stone only" rule is structural here, not an
+					// extra runtime check on top of an otherwise-unconstrained write. Gated on
+					// GEN_VERSION_ORES so a CAVES-or-older world's fill is byte-for-byte
+					// unchanged: oreGenMaskGet() is not even called for it.
+					if (block == BLOCK_STONE && g->version >= GEN_VERSION_ORES) {
+						const BlockId ore = oreGenMaskGet(s, x, y, z);
+						if (ore != BLOCK_AIR) block = ore;
+					}
+
+					s->flat[chunkIndex(x, ly, z)] = block;
 					any = true;
 				}
 			}

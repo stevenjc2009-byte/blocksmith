@@ -38,10 +38,19 @@ void playerUpdate(Player* p, const World* w, float dt_ms)
 	// Walking is horizontal only, so the movement basis drops the pitch entirely: aiming
 	// at your feet should not make you walk into the floor. Same yaw convention as
 	// cameraView — forward at yaw 0 is -Z, and right is forward crossed with up.
-	const float fx = sinf(p->cam.yaw);
-	const float fz = -cosf(p->cam.yaw);
-	const float rx = cosf(p->cam.yaw);
-	const float rz = sinf(p->cam.yaw);
+	//
+	// 2026-09-03: this asked for sinf(yaw) and cosf(yaw) TWICE each — fx and rz are the same
+	// sine, and rx is the same cosine fz negates. Four transcendental calls where two do, and
+	// on an ARM11 with no fast libm those are not free. Folded to one of each; the negation is
+	// exact in IEEE, so the four values are bit-identical to what they were, not merely close.
+	// Small in absolute terms (this runs once a frame, not the ~5,800 times an atan2f removal
+	// once did), but it costs nothing and removes a duplicate that reads like an oversight.
+	const float s  = sinf(p->cam.yaw);
+	const float c  = cosf(p->cam.yaw);
+	const float fx = s;
+	const float fz = -c;
+	const float rx = c;
+	const float rz = s;
 
 	const u32 held = hidKeysHeld();
 	float ix = 0.0f, iz = 0.0f;

@@ -705,8 +705,79 @@ int main(void)
 	//
 	// Transcribed from the line the suite prints on its own ring, not from a standalone
 	// probe:  identity fresh=67c24ddd7a91454b reload=f03ef44657a3596d
-	CHECK(hash_fresh  == 0x67c24ddd7a91454bULL);
-	CHECK(hash_reload == 0xf03ef44657a3596dULL);
+	// ── WHY THEY MOVED A SIXTH TIME (2026-09-03) ─────────────────────────────────────
+	//
+	// They were 0x67c24ddd7a91454b / 0xf03ef44657a3596d. v1.8.12 adds GEN_VERSION_ORES: a
+	// six-kind ore-vein decorator (world/ore_gen.c) runs as a per-column pre-pass and
+	// replaces STONE with coal / iron / gold / redstone / lapis / diamond for
+	// genv >= GEN_VERSION_ORES. This ring generates at GEN_VERSION_NEWEST, which is now
+	// ORES, so it now contains ore. That is exactly what this pin exists to notice.
+	//
+	// Like the caves move above and unlike the four before it, "ZERO ground-to-ground
+	// transitions" is unavailable as an argument — an ore decorator's entire job is turning
+	// STONE into something else underground. But the census here can make a STRONGER claim
+	// than the cave one could, and does: every differing cell is STONE -> ore and there is
+	// no other transition in the ring at all.
+	//
+	// A/B over exactly this fixture — seed 1337, the same 81-column ring, all
+	// COLUMN_CHUNKS chunks, 2,654,208 cells. Arm A is this tree at GEN_VERSION_ORES; arm B
+	// is this SAME tree at GEN_VERSION_CAVES, which is the pre-change generator by
+	// construction rather than by reconstruction: worldgen_density.c gates both the
+	// oreGenBuildMask() pre-pass (:652) and the mask write site (:843) on
+	// `g->version >= GEN_VERSION_ORES`, so version 4 on this tree IS this tree with ore
+	// generation suppressed and nothing else altered.
+	//
+	//   * 24,312 cells differ, 0.9160% of the ring.
+	//   * SIX transitions, and no others whatsoever:
+	//       STONE -> COAL_ORE      9,802     STONE -> REDSTONE_ORE  3,207
+	//       STONE -> IRON_ORE      9,581     STONE -> LAPIS_ORE       382
+	//       STONE -> GOLD_ORE        932     STONE -> DIAMOND_ORE     408
+	//   * Cells whose SOURCE is not STONE: 0. Cells whose DEST is not one of the six ore
+	//     ids: 0. Cells with AIR on either side: 0. Chunks allocated in one arm and not the
+	//     other: 0. The ore pass replaces stone in place — it neither carves nor fills, so
+	//     no height, no density, no cave, no biome surface, no water and no tree moved.
+	//   * Y bands, against ore_gen.c's s_ore_table anchor bands. The measured range is the
+	//     range of STAMPED cells, which ore_gen.h:88-98 already documents may overshoot the
+	//     anchor band by up to (size_max - 1) because the vein walk steps in y the same way
+	//     it steps in x/z. Every ore is inside that bound, and no ore is remotely near it:
+	//       coal     y 0..91  (band 0..127, no overshoot; bound 16)
+	//       iron     y 0..65  (band 0..63,  over by 2;    bound  8)
+	//       gold     y 0..34  (band 0..31,  over by 3;    bound  8)
+	//       redstone y 0..18  (band 0..15,  over by 3;    bound  7)
+	//       lapis    y 0..31  (band 0..31,  no overshoot; bound  6)
+	//       diamond  y 0..16  (band 0..15,  over by 1;    bound  7)
+	//     Consistent with the 324-column measurement ore_gen.h:93-95 records (iron reaching
+	//     y=67 there against y=65 here, on a quarter as many columns).
+	//   * By 16-block band the differences are 8,781 / 5,085 / 4,552 / 4,513 / 1,310 / 71 /
+	//     0 / 0 from y 0 up — monotonically thinning with height and empty above y 91,
+	//     which is the shape a set of depth-banded ores has and is not the shape any
+	//     surface-level change could have.
+	//
+	// **The stronger half of the proof, and the reason no standalone probe was needed.**
+	// This same fixture built at GEN_VERSION_CAVES — the ONLY change being that one
+	// generator-version token — prints
+	//
+	//   identity  fresh=67c24ddd7a91454b  reload=f03ef44657a3596d
+	//   PASS 570 checks, 0 failed
+	//
+	// i.e. it reproduces, exactly, the two literals being replaced, and passes every other
+	// check in this file. So the whole of the move is the version bump and nothing else in
+	// the generator has drifted since the caves pin was set. That is also the evidence for
+	// the paragraph below: a world stamped LEGACY, DENSITY, BIOME or CAVES is not merely
+	// argued to be unaffected, it is MEASURED to still hash to the byte-identical value it
+	// hashed to before ore existed, so no existing save re-generates. Every world on a card
+	// today predates GEN_VERSION_ORES and keeps exactly the stone it has.
+	//
+	// The pin was also shown to still be able to go red: rebuilt against a scratchpad copy
+	// of ore_gen.c with one value changed in s_ore_table (coal size_min 8 -> 9, a real and
+	// small generator change) it printed a different pair — fresh=682ae08327d74599
+	// reload=b81734660d7877a3 — and both literals below failed. A pin that cannot fail is
+	// not a pin.
+	//
+	// Transcribed from the line the suite prints on its own ring, not from a standalone
+	// probe:  identity fresh=6af0ca16ef19e601 reload=b3df9b6b4f632e67
+	CHECK(hash_fresh  == 0x6af0ca16ef19e601ULL);
+	CHECK(hash_reload == 0xb3df9b6b4f632e67ULL);
 
 	regionCacheClose();
 	testRmTree(testDir());

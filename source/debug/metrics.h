@@ -113,6 +113,68 @@ void metricsSetWork(const MetricsWork* w);
 // Most recent per-frame figures, for callers that want to react to them.
 float metricsFrameMs(void);
 
+// ── v1.8.11 METRICS-VISIBLE: the CPU-vs-wait split, on a screen the player's build has ──
+//
+// docs/ROADMAP.md claims the main thread is "GPU-blocked for roughly 15.7 of every 16.71 ms"
+// (grep that phrase). That was measured in Azahar, which has no GPU cost model, and it decides
+// whether every CPU optimisation shipped this week is visible or invisible. Nothing in a CIA
+// could answer it: metricsDrawOverlay is compiled out under BS_BOTTOM_UI (see the block above
+// it), and BS_BOTTOM_UI defaults to 1.
+//
+// COLLECTION was never compiled out — only the drawing was. Everything above the
+// `#if !BS_BOTTOM_UI` in metrics.c runs in every build, including the CSV writer thread. So
+// these accessors do not re-arm anything; they read numbers the shipped build has been
+// keeping all along and had no way to display.
+//
+// THE ARITHMETIC, and why frame - sync is the honest CPU figure on THIS frame loop:
+//
+//   metricsFrameBegin()                                        top of the frame
+//   metricsSyncBegin(); gpuWaitPrevFrame(); metricsSyncEnd();
+//   ... sim, genFollow, both mesh drains, the draw ...
+//   metricsSubmitBegin(); C3D_FrameEnd(0); metricsSubmitEnd();
+//   metricsFrameEnd()
+//
+// Named by SYMBOL and not by line number on purpose: main.c is 6,000 lines and every lane that
+// touches it shifts the numbers, so a line reference here would be stale within the week and
+// this project has already lost an investigation to a comment naming something that had moved.
+// Every name above greps.
+//
+// gpuWaitPrevFrame() is, on the shipped path (its `#else`, i.e. not BS_GPU_TESTS),
+// C3D_FrameBegin(C3D_FRAME_SYNCDRAW) — the VBlank wait FOLLOWED by gxCmdQueueWait(-1); its own
+// header comment carries the disassembly that establishes this. It is therefore the ONLY place
+// in the frame where the main thread blocks on the GPU or on the display, and the later
+// C3D_FrameBegin(C3D_FRAME_SYNCDRAW) at the draw finds citro3d's inFrame flag already set and
+// early-returns without waiting. C3D_FrameEnd(0) hands the command list to GX and returns
+// without blocking.
+//
+// So: frame_ms - sync_ms is main-thread work, and sync_ms is main-thread waiting. That is the
+// split the ROADMAP question needs, and it is NOT what the old overlay's "cpu" row printed:
+// that row is C3D_GetProcessingTime(), which only covers citro3d's own FrameBegin..FrameEnd
+// window and so misses the simulation, the recentre and both mesh drains entirely.
+//
+// WHAT sync_ms LUMPS TOGETHER, stated because it changes how the number is read: waiting for
+// the VBlank because the frame finished early (healthy 60 fps headroom) and waiting for a GPU
+// that has not finished (GPU-bound) are both inside it, and this instrumentation cannot
+// separate them — SYNCDRAW does both in one call. The frame RATE separates them instead: a
+// large wait at 59.8 fps is headroom, a large wait below 60 fps is the GPU. Splitting them for
+// real would mean calling C3D_FrameSync() and C3D_FrameBegin(0) separately inside
+// gpuWaitPrevFrame(), which is a change to the hardware-freeze fix and is deliberately not
+// made here.
+//
+// Averaged over HISTORY_LEN frames (~0.67 s) rather than shown raw: a per-frame figure at 60 Hz
+// is a blur of digits, and the overlay this replaces rate-limited itself for the same reason.
+// Frame 0 is excluded — its delta is measured from metricsInit, not from a previous frame.
+float metricsCpuAvgMs(void);     // mean of (frame_ms - sync_ms): work, not waiting
+float metricsWaitAvgMs(void);    // mean of sync_ms: blocked on VBlank + GPU queue
+float metricsFrameAvgMs(void);   // mean of frame_ms: wall clock
+
+// The bottom-screen timing row's on/off flag, and the ONLY switch for it. Default false: this
+// is a debug option reached through pause -> Options -> Debug -> "Frame timing", not a feature
+// the game boots with. Nothing persists it, so it is off again after a reboot — same shape and
+// same reasoning as debug/biomeborder.h's toggle.
+bool metricsRowEnabled(void);
+void metricsRowSetEnabled(bool on);
+
 // Frames submitted since launch, as the denominator for the cumulative counters elsewhere:
 // step 9.3's cull and sight-walk runs only mean anything as a ratio against this.
 u32   metricsFrames(void);

@@ -1,5 +1,7 @@
 #include "world/worldgen.h"
 
+#include <string.h>
+
 #include "world/genversion.h"
 #include "world/noise.h"
 #include "world/rng.h"
@@ -1305,7 +1307,11 @@ static bool legacyColumn(const WorldGen* g, WorldGenScratch* s, World* w,
 		// does not have to think about depth at all — one constant governs both the
 		// layering (5 > 3, so it is all stone) and the carve.
 		if (y0 + CHUNK_DIM <= min_h - GEN_CAVE_MIN_DEPTH) {
-			for (int i = 0; i < CHUNK_BLOCKS; i++) s->gen_flat[i] = BLOCK_STONE;
+			// Tier-1 opt (lane OPT-WORLDGEN, 2026-09-02): a per-element assignment loop over
+			// CHUNK_BLOCKS bytes writing the same constant, replaced with memset. BLOCK_STONE
+			// is a uint8_t enum value (3), so memset's byte-fill is bit-identical to the loop
+			// it replaces -- not just for BLOCK_AIR's zero.
+			memset(s->gen_flat, BLOCK_STONE, CHUNK_BLOCKS);
 			for (int lz = 0; lz < CHUNK_DIM; lz++)
 				for (int lx = 0; lx < CHUNK_DIM; lx++)
 					for (int ly = 0; ly < CHUNK_DIM; ly++)
@@ -1317,7 +1323,9 @@ static bool legacyColumn(const WorldGen* g, WorldGenScratch* s, World* w,
 			continue;
 		}
 
-		for (int i = 0; i < CHUNK_BLOCKS; i++) s->gen_flat[i] = BLOCK_AIR;
+		// Tier-1 opt (lane OPT-WORLDGEN, 2026-09-02): same memset conversion as the STONE fill
+		// above; BLOCK_AIR == 0.
+		memset(s->gen_flat, BLOCK_AIR, CHUNK_BLOCKS);
 		for (int lz = 0; lz < CHUNK_DIM; lz++) {
 			for (int lx = 0; lx < CHUNK_DIM; lx++) {
 				const int32_t x = cx * CHUNK_DIM + lx, z = cz * CHUNK_DIM + lz;

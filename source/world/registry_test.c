@@ -57,7 +57,7 @@
 #define REGISTRY_DYN_LO_PIN     0x80  // first dynamic block id
 #define REGISTRY_DYN_HI_PIN     0xFD  // last one; 0xFE/0xFF stay reserved
 #define REGISTRY_DYN_ROWS_PIN   126   // 0xFD - 0x80 + 1, WRITTEN OUT, never computed
-#define REGISTRY_FULL_COUNT_PIN 154   // 28 core rows (air + twenty-seven) + 126 dyn rows
+#define REGISTRY_FULL_COUNT_PIN 160   // 34 core rows (air + thirty-three) + 126 dyn rows
 
 // Compile-time layer. These fire when the host suite builds, which is every
 // tools/run_host_tests.sh run; the 3DS build never compiles this file (see the __3DS__
@@ -183,7 +183,19 @@ static void checkPin(bool cond, long got, long want, const char *what, const cha
 // suite gained a call, for the same reason nothing else did in the twelve-row move above —
 // testRegistryCoreIdsStable and its kPhase3 table are both written against fixed id lists, and
 // the crc golden is still exactly one check regardless of what value it holds.
-#define REGISTRY_TEST_EXPECTED_CHECKS 118
+//
+// 118 -> 125 on 2026-09-02/03, v1.8.12 "Ores"'s six ore rows (ids 28..33). Counted off the
+// source first, same discipline as every entry above:
+//
+//   +6   coreHardnessIsDeclared()'s per-row loop runs six more iterations, one
+//        check(v->hardness != 0, v->name) each for coal/iron/gold/redstone/lapis/diamond.
+//   +1   the new ore hardness-ladder pin, the six-ore analogue of the snow/cactus/ice
+//        distinctness check just above it.
+//
+// 118 + 6 + 1 = 125. Nothing else in this suite gained a call: testRegistryCoreIdsStable and
+// its kPhase3 table are both written against fixed id lists, and the crc golden is still
+// exactly one check regardless of what value it holds (0x165E -> 0xE15E this time).
+#define REGISTRY_TEST_EXPECTED_CHECKS 125
 
 // Deliberately NOT routed through check(): this must not perturb the number it is testing,
 // so it bumps g_fails only. Reporting shape is check()'s, so a failure here reads the same
@@ -235,10 +247,11 @@ static void testRegistryRoundTrip(void)
 	// snow (0x0A), ice (0x0B), cactus (0x0C), dead bush (0x0D) and fern (0x0E), plus the
 	// twelve v1.8.8 adds — birch log/planks/leaves (0x0F..0x11), spruce log/planks/leaves
 	// (0x12..0x14), the tall-grass top (0x15), poppy/daisy/bluebell/orchid (0x16..0x19) and
-	// the apple (0x1A) — plus v1.8.10's torch (0x1B), the first light source. Every one of
-	// the last twenty is a core block and deliberately NOT an item — world/block.h records
-	// why BLOCK_COUNT stayed at 8 while the registry's row count moved to 28.
-	check(registryCount() == 28, "a fresh table defines exactly air + the twenty-seven core blocks");
+	// the apple (0x1A) — plus v1.8.10's torch (0x1B), the first light source, plus v1.8.12's
+	// six ores (0x1C..0x21): coal/iron/gold/redstone/lapis/diamond. Every one of the last
+	// twenty-six is a core block and deliberately NOT an item — world/block.h records why
+	// BLOCK_COUNT stayed at 8 while the registry's row count moved to 34.
+	check(registryCount() == 34, "a fresh table defines exactly air + the thirty-three core blocks");
 	check(registryFind("grass") == BLOCK_GRASS, "core rows are findable by name");
 
 	// The runtime half of the dyn-range pin. The two _Static_asserts at the top of this
@@ -309,7 +322,7 @@ static void testRegistryRoundTrip(void)
 	         kDynRangeWhy);
 	checkPin(registryCount() == REGISTRY_FULL_COUNT_PIN,
 	         (long)registryCount(), (long)REGISTRY_FULL_COUNT_PIN,
-	         "count reflects every defined row once the range is full: 28 core + 126 dyn",
+	         "count reflects every defined row once the range is full: 34 core + 126 dyn",
 	         kDynRangeWhy);
 }
 
@@ -576,8 +589,54 @@ static void testRegistryCrcStability(void)
 	// cannot name id 27 and would render every torch as an unlit hole.
 	// deps/blocksmith-server/game/bsgame_test.c's BS_REGISTRY_CORE_CRC16_GOLDEN and
 	// BS_REGISTRY_CORE_COUNT_GOLDEN move with this literal.
-	check(base == 0x165Eu,
-	      "core-only crc matches the pinned golden 0x165E");
+	//
+	// MOVED A FIFTH TIME 2026-09-02/03, 0x165E -> 0xE15E, by v1.8.12 "Ores"'s six ore rows
+	// (ids 28..33: coal/iron/gold/redstone/lapis/diamond). registryCount() moves 28 -> 34.
+	// No tool-tier gate in this version — every ore is breakable by hand, each with its own
+	// hardness (a six-step ladder, 60/70/80/85/90/100, pinned just below by
+	// coreHardnessIsDeclared() so it cannot be flattened to one value later).
+	//
+	// Measured the same way as every move above: a scratchpad probe
+	// (oreblocks_crc_probe.c) linking this tree's real world/registry.c and world/block.c,
+	// no test file linked so the golden is unreachable from the binary being measured.
+	// Printed:
+	//
+	//     count=34 crc=0xE15E
+	//     id=28 name=coal_ore     hardness= 60 flags=0x01 tex0=32
+	//     id=29 name=iron_ore     hardness= 70 flags=0x01 tex0=33
+	//     id=30 name=gold_ore     hardness= 85 flags=0x01 tex0=34
+	//     id=31 name=redstone_ore hardness= 90 flags=0x01 tex0=35
+	//     id=32 name=lapis_ore    hardness= 80 flags=0x01 tex0=36
+	//     id=33 name=diamond_ore  hardness=100 flags=0x01 tex0=37
+	//     zero-hardness-count=0
+	//
+	// and cross-checked by compiling the identical probe against
+	// deps/blocksmith-server/game/world/registry.c (block.h and registry.c copied byte-for-byte
+	// from this tree; `cmp` on all eleven mirrored files confirmed the other nine untouched and
+	// these two identical): count=34 crc=0xE15E, the same number from the other side.
+	//
+	// Corrected 2026-09-03: this parenthesis used to assert "there is no
+	// tools/sync-world-sources.sh in this repo despite this comment block's earlier entries
+	// assuming one." That was wrong, and the earlier entries were right. The script exists, at
+	// deps/blocksmith-server/tools/sync-world-sources.sh — i.e. under the SERVER repo, which is
+	// the root every comment citing a bare `tools/sync-world-sources.sh` is written relative to.
+	// It does not resolve from the CLIENT repo root, and that failure to resolve got recorded
+	// as the script not existing at all. It does exist and it works: run from
+	// deps/blocksmith-server it reported all eleven files `unchanged`, "game/world/ was already
+	// in sync", exit 0. It is self-locating (resolves off BASH_SOURCE, not cwd), its FILES=()
+	// array at line 46 is exactly the eleven mirrored files, and game/Makefile's
+	// `check-world-drift` target names it as the fix when the two trees diverge.
+	//
+	// Worth the space because the wrong version of this sentence is actively harmful: a reader
+	// who believes there is no sync tool hand-copies the mirror, which is precisely how eleven
+	// files that must stay byte-identical drift apart.
+	//
+	// SERVER SHIPS FIRST, same reason as every move above: a v1.8.11 client on a v1.8.12
+	// server cannot name ids 28..33 and would render every ore as an invisible hole.
+	// deps/blocksmith-server/game/bsgame_test.c's BS_REGISTRY_CORE_CRC16_GOLDEN and
+	// BS_REGISTRY_CORE_COUNT_GOLDEN move with this literal.
+	check(base == 0xE15Eu,
+	      "core-only crc matches the pinned golden 0xE15E");
 
 	// Content sensitivity: one extra def must move the crc, and re-init must
 	// put it back - proving the crc covers table content, not process state.
@@ -688,7 +747,7 @@ static void coreHardnessIsDeclared(void)
 	// the rule is green in a build where registryIsDefined() answers false for everything —
 	// a check that cannot go red proves nothing, and a `continue` is the easiest way to
 	// neutralise one by accident.
-	check(rows == 26, "and it ran over 26 rows: 28 core rows less air and less water");
+	check(rows == 32, "and it ran over 32 rows: 34 core rows less air and less water");
 
 	// A row must have its OWN number, not a neighbour's. The loop above is satisfied by a
 	// table where every hardness is 9, which is exactly the failure mode "make sure every
@@ -701,6 +760,21 @@ static void coreHardnessIsDeclared(void)
 	      && registryGet(BLOCK_SNOW)->hardness == 8
 	      && registryGet(BLOCK_ICE)->hardness == 10,
 	      "snow 8 < cactus 9 < ice 10: three neighbours, three break times");
+
+	// v1.8.12's six ores, pinned as a LADDER and not merely as six nonzero bytes, for the
+	// identical reason as the cactus/snow/ice trio just above. A flat value across all six
+	// (the design document's own first draft) is exactly the failure mode this function
+	// exists to catch: the per-row loop is satisfied by a table where every ore reads the
+	// same number, and six identical hardness bytes tell the player nothing about which ore
+	// is which. The ladder rises with depth and every step clears stone's 45.
+	check(registryGet(BLOCK_COAL_ORE)->hardness == 60
+	      && registryGet(BLOCK_IRON_ORE)->hardness == 70
+	      && registryGet(BLOCK_LAPIS_ORE)->hardness == 80
+	      && registryGet(BLOCK_GOLD_ORE)->hardness == 85
+	      && registryGet(BLOCK_REDSTONE_ORE)->hardness == 90
+	      && registryGet(BLOCK_DIAMOND_ORE)->hardness == 100,
+	      "ore hardness is a six-step ladder, coal 60 < iron 70 < lapis 80 < gold 85 < "
+	      "redstone 90 < diamond 100, every step above stone's 45");
 
 	// CONTROL. An id with no row still reads back as air, hardness 0, and that must NOT trip
 	// the rule above — the rule is about rows that exist. Green in every arm, including one

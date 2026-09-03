@@ -269,6 +269,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/world/worldgen.c \
 	source/world/worldgen_density.c \
 	source/world/cave_carve.c \
+	source/world/ore_gen.c \
 	source/world/genversion.c \
 	source/scene/render_dist.c \
 	source/world/world_test.c \
@@ -1260,6 +1261,13 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 # "error: comparison is always true due to limited range of data type [-Werror=type-limits]"
 # (ItemId is a uint8_t), GCC_EXIT=1. A sabotage that does not compile proves nothing. 254 is
 # inside the type and still admits both ends of the dynamic range.
+#
+# v1.9.0 added the five source/audio objects and -lm below. scene/interact.c now fires the
+# break and place cues (audioSfxPlayAtBlock) at the moment each edit is accepted, so this
+# binary does not LINK without them. Nothing in this stanza's own checks is about sound —
+# tests/audio_cue_test.c at the bottom of this file is where the cues are asserted — and
+# nothing here calls audioInit, so audio.c is unavailable and every cue is a silent no-op
+# exactly as the audio.h contract promises for a console with no DSP.
 gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	-I source \
 	source/world/world.c \
@@ -1274,9 +1282,15 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/app/input_map.c \
 	source/world/mining.c \
 	source/scene/interact.c \
+	source/audio/audio.c \
+	source/audio/audio_mixer.c \
+	source/audio/audio_pan.c \
+	source/audio/audio_bsnd.c \
+	source/audio/audio_sfx.c \
 	source/scene/interact_test.c \
 	tests/interact_stub.c \
 	tests/net_stub.c \
+	-lm \
 	-o "$BH/interact_test"
 
 "./$BH/interact_test"
@@ -1710,6 +1724,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/world/worldgen.c \
 	source/world/worldgen_density.c \
 	source/world/cave_carve.c \
+	source/world/ore_gen.c \
 	source/world/genversion.c \
 	tests/net_stub.c \
 	-lm \
@@ -3871,6 +3886,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/world/worldgen.c \
 	source/world/worldgen_density.c \
 	source/world/cave_carve.c \
+	source/world/ore_gen.c \
 	source/world/genversion.c \
 	tests/net_stub.c \
 	tests/worldgen_density_opt_test.c \
@@ -3979,6 +3995,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/world/worldgen.c \
 	source/world/worldgen_density.c \
 	source/world/cave_carve.c \
+	source/world/ore_gen.c \
 	source/world/genversion.c \
 	tests/net_stub.c \
 	tests/worldgen_mt_test.c \
@@ -4068,6 +4085,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/world/worldgen.c \
 	source/world/worldgen_density.c \
 	source/world/cave_carve.c \
+	source/world/ore_gen.c \
 	source/world/genversion.c \
 	source/app/lanes.c \
 	tests/net_stub.c \
@@ -4254,6 +4272,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/world/worldgen.c \
 	source/world/worldgen_density.c \
 	source/world/cave_carve.c \
+	source/world/ore_gen.c \
 	tests/scratch_tint_fill_test.c \
 	-lm \
 	-o "$BHTF/scratch_tint_fill_test"
@@ -4333,6 +4352,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/world/worldgen.c \
 	source/world/worldgen_density.c \
 	source/world/cave_carve.c \
+	source/world/ore_gen.c \
 	source/debug/biomeinfo.c \
 	source/debug/biomeinfo_test.c \
 	-lm \
@@ -4734,6 +4754,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/world/worldgen.c \
 	source/world/worldgen_density.c \
 	source/world/cave_carve.c \
+	source/world/ore_gen.c \
 	source/world/genversion.c \
 	tests/net_stub.c \
 	tests/cave_carve_test.c \
@@ -4743,3 +4764,395 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 "./$BHCC/cave_carve_test"
 
 rm -rf "$BHCC"
+
+# ── source/world/ore_gen_test.c — the v1.8.12 ore veins ────────────────────────────
+#
+# Same shape as the cave_carve_test stanza above: link the real generator, run the
+# standalone suite, let it print its own PASS/FAIL line. The ore mask is built by
+# source/world/ore_gen.c and consumed by worldgen_density.c at the block write site,
+# so both are linked for real and nothing here is stubbed but the network seam.
+#
+# This stanza was written by the ORE-GEN lane but could not be applied by it: the lane
+# was permission-blocked from editing this script, correctly flagged the conflict rather
+# than editing anyway, and handed over the exact text. Recording that because the more
+# useful half of it is the eight one-line link-line insertions ABOVE, which are invisible
+# here and are what actually took the suite from dark back to green -- worldgen_density.c
+# gained calls into a new translation unit and eight link lines did not gain the file.
+#
+# The three properties this suite is built to hold, and which were each demonstrated able
+# to go red by sabotaging the REAL generator (not the test), measured 2026-09-03:
+#
+#   1. ores replace STONE and nothing else  -- dropping `block == BLOCK_STONE` from the
+#      write-site guard gave FAIL 186577 checks, 2875 failed
+#   2. a vein is identical whichever chunk observes it -- removing the three memset clears
+#      in oreGenBuildMaskR gave FAIL 8593099 checks, 298 failed
+#   3. no ore exists below GEN_VERSION_ORES, so old saves keep their terrain -- sabotaging
+#      the write-site version check gave 19564 ore cells at GEN_VERSION_CAVES, FAIL 1
+#
+# Property 3 is worth a second look. Sabotaging the OTHER version guard (the one at the
+# mask build call site) stayed GREEN. That is not a hole -- it is the measurement telling
+# us that guard is defence in depth and the write-site check is the load-bearing one. An
+# arm that cannot go red proves nothing about the code, but it does prove something about
+# which line is actually holding the property up, which is worth more than a green tick.
+BHOG="build-host/run-$$-oregen"
+mkdir -p "$BHOG"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/chunk_codec.c \
+	source/world/crc32.c \
+	source/world/world.c \
+	source/world/scratch.c \
+	source/world/noise.c \
+	source/world/budget.c \
+	source/world/worldgen.c \
+	source/world/worldgen_density.c \
+	source/world/cave_carve.c \
+	source/world/ore_gen.c \
+	source/world/genversion.c \
+	tests/net_stub.c \
+	source/world/ore_gen_test.c \
+	-lm \
+	-o "$BHOG/ore_gen_test"
+
+"./$BHOG/ore_gen_test"
+
+rm -rf "$BHOG"
+
+# ── source/audio/audio_mixer_test.c — voice allocation, priority, stealing ────────────────
+#
+# The two suites named in the audio_cue_test.c comment below ("TWO host suites of its own")
+# were written for v1.8.9, committed, and never reached by this script — grepping this file
+# for either filename returned zero hits until this stanza and the one after it. 1,003 lines
+# across the pair had never been compiled, let alone run. This is the first of the two.
+#
+# Tests source/audio/audio_mixer.c's voice allocation/priority/stealing policy and
+# source/audio/audio.c's silent-fallback contract. Both are the REAL modules; only the
+# hardware is faked, through the AudioBackend seam in audio_backend.h, by a recorder that
+# remembers every backend call so the test can assert on the call sequence. app/hw.c is
+# linked for hwTestSetNew3ds/hwInit, which audio.c's pool-sizing test drives directly.
+#
+# Standalone build+run before wiring, 2026-09-03: compiled clean under the same
+# -std=c11 -Wall -Wextra -Werror flags as every other stanza here, "audio mixer self-test:
+# PASS  147 checks", exit 0. No sabotage was needed to find a failure — the suite was
+# simply never running.
+BHMX="build-host/run-$$-audiomixer"
+mkdir -p "$BHMX"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/app/hw.c \
+	source/audio/audio.c \
+	source/audio/audio_mixer.c \
+	source/audio/audio_pan.c \
+	source/audio/audio_bsnd.c \
+	source/audio/audio_mixer_test.c \
+	-lm \
+	-o "$BHMX/audio_mixer_test"
+
+"./$BHMX/audio_mixer_test"
+
+rm -rf "$BHMX"
+
+# ── source/audio/audio_bsnd_test.c — the BSND container parser and the pan curve ──────────
+#
+# The second of the two never-run suites described above. Tests source/audio/audio_bsnd.c
+# (the .bsnd container parser, including its CRC and the 32-bit frame-count overflow) and
+# source/audio/audio_pan.c (the constant-power pan curve and distance attenuation). Neither
+# module needs a fake of anything, which is the whole reason they were split out of the
+# loader and the mixer in the first place — this stanza links only the two of them.
+#
+# Standalone build+run before wiring, 2026-09-03: compiled clean, "audio format self-test:
+# PASS  251 checks", exit 0.
+BHBS="build-host/run-$$-audiobsnd"
+mkdir -p "$BHBS"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/audio/audio_bsnd.c \
+	source/audio/audio_pan.c \
+	source/audio/audio_bsnd_test.c \
+	-lm \
+	-o "$BHBS/audio_bsnd_test"
+
+"./$BHBS/audio_bsnd_test"
+
+rm -rf "$BHBS"
+
+# ── tests/audio_cue_test.c — the v1.9.0 sound CUES (does anything play a sound at all) ─────
+#
+# v1.8.9 shipped a complete audio subsystem — source/audio/audio.c, audio_mixer.c, audio_pan.c,
+# audio_bsnd.c, three .bsnd files in romfs/sfx/, and TWO host suites of its own — and the game
+# made no sound whatsoever, because nothing outside source/audio ever called it. Measured on the
+# whole tree before the fix:
+#
+#     grep -rn "audioPlay" source/ --include=*.c --include=*.h | grep -v "^source/audio/"
+#     source/main.c:3845:  // ... so every later audioPlay*             <- a COMMENT
+#     source/main.c:4881:  // ... ahead of any positional audioPlayAt   <- a COMMENT
+#
+# Two comments, zero calls. Every audio test passed the whole time, because each of them asks
+# "if a sound is played, is it played correctly" and none could ask "does anything play one".
+# That is the gap this stanza closes, and it is why every check here counts BACKEND CALLS
+# through the AudioBackend seam rather than inspecting state.
+#
+# The link is wide because the point is that the REAL code makes the call. scene/interact.c is
+# linked for real, so a break here is a genuine held break driven a tick at a time through the
+# genuine break-progress model against a genuine World, and the sound it makes travels through
+# the genuine mixer and panner and is carried by the genuine .bsnd files that ship. The only
+# thing faked is the DSP itself (a recording backend inside the test), and the only stubs are in
+# the LINK, never inside a module under test: tests/interact_stub.c for chunkRenderTouch
+# (citro3d), tests/net_stub.c for world.c's networldOnColumnLoad, and networldSendBlockEdit /
+# networldSessionActive inside audio_cue_test.c itself, copied from source/scene/interact_test.c
+# for the reason that stanza gives.
+#
+# app/hw.c is here for hwTestSetNew3ds: the sounds are loaded into the OLD 3DS pool (393,216
+# bytes), the smaller of the two, so "the three shipped sounds fit" is proved where it is
+# tightest. Nothing else in the link needs it.
+#
+# RED ARMS, measured 2026-09-03. 26 sabotages of the REAL shipping code (never of the test),
+# each applied, rebuilt, run, restored, and the restore confirmed by md5 — interact.c back to
+# 91c9a0356809c69be822993a52913c94, audio_sfx.c to b0c4cb9ab61d63999a91da2846402dc0, audio.c to
+# 0fe29e404708615b3edb88b55f1e5f87, audio_sfx.h to e0b34e77bd79a245a84758991d79e101, mining.c to
+# 5213b00a8ffbb448713dfd8f0577c6a0, and the three .bsnd files to their own. Green before every
+# arm and green again after the last one: "audio cue self-test: PASS  104 checks", exit 0.
+#
+# Every one of the 100 CHECK sites was seen RED by at least one arm — the run tracks the line
+# number of each failure and prints the ones no arm ever reddened, and that list came out empty.
+# Three of them only turned red once the TEST was fixed, and they are the reason that coverage
+# pass exists rather than a spot check: the standing-still walk and the teleport walk both put
+# the player 40+ blocks from a listener parked at the origin, past AUDIO_MAX_DIST, so audio.c
+# declined the voice and "no sound played" was green no matter what the cue did. The listener now
+# travels with the player in both, as it does on the console.
+#
+# The arms, and the first line each one turned red:
+#   A1  break cue deleted from breakComplete        -> L374 s_fake.plays == 1
+#   A2  place cue deleted from the place path       -> L468 s_fake.plays == 1
+#   A3  +0.5f block-centre offset removed           -> L380 |left - right| < 1e-6
+#   A4  stride gate removed (fires every frame)     -> L564 fired == 0   (28 red)
+#   A5  !on_ground guard removed                    -> L621 walk(..., false) == 0
+#   A6  SFX_FOOTSTEP_MAX_STEP teleport reject gone  -> L701 update(2000) == false
+#   A7  reset leaves the accumulator part-full      -> L608 fired == 2
+#   A8  fixed ids instead of captured               -> L306 unregistered slot is NONE
+#   A10 break completes on every frame of the hold  -> L362 silent_frames == need - 1
+#   A11 occupied-cell place refusal removed         -> L507 it.placed == 0
+#   A12 empty-hand place refusal removed            -> L488 it.placed == 0
+#   A13 BOTH distance gates removed in audio.c      -> L380 (one gate alone is not enough)
+#   A14 footstep gain raised to a break's 1.0       -> L594 energy0 < 0.95
+#   B1  audioLoad hands every sound the same id     -> L285 b != p
+#   B4  the break's server send always fails        -> L368 it.broke == 1
+#   B5  the place's server send always fails        -> L466 it.placed == 1
+#   B6  aiming-at-nothing early return removed      -> L437 it.broke == 0
+#   B7  positional cues play LOOPING                -> L376 looping == false
+#   B9  the forced no-DSP failure ignored           -> L785 audioInit() == false
+#   C1  every block breaks in one tick (mining.c)   -> L351 need > 1
+#   C2  the break leaves the block in the world     -> L369 worldGet == BLOCK_AIR
+#   C3  the place writes air, not the held block    -> L467 worldGet == BLOCK_STONE
+#   C6  first-update guard AND stride gate removed  -> L690 the seed update fires
+#   A9  block_break.bsnd zeroed                     -> L282 b != AUDIO_SOUND_NONE
+#   B2  all three .bsnd files made identical        -> L294 s_fc_break != s_fc_place
+#   B3  block_place/footstep .bsnd zeroed           -> L283 p != AUDIO_SOUND_NONE
+#
+# NOT recorded as an arm, for the reason the interact stanza's own note gives: "every block
+# breaks in one tick" was first written as a bare `return 1u;` in mining.c and gcc rejected the
+# file with -Werror=unused-variable, GCC_EXIT=1. A sabotage that does not compile proves nothing;
+# C1 is the same sabotage with the now-dead local voided.
+#
+# The three asset arms rewrite the .bsnd bytes IN PLACE (a zeroed header, which audio_bsnd.c
+# rejects) rather than moving the file aside, so that a console build running in another lane
+# during the ~30 s window still finds every file the Makefile expects.
+#
+# What this CANNOT prove, and no host binary can: that a noise comes out of the speakers, that
+# it is the RIGHT noise, or that it sits at a comfortable volume against the rest of the game.
+# Those are a console and an ear. What is provable here is that the call happens, exactly once,
+# for the right sound, at the right place — which is precisely the part that was missing.
+BHAC="build-host/run-$$-audiocue"
+mkdir -p "$BHAC"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/world.c \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/budget.c \
+	source/world/relightq.c \
+	source/world/mining.c \
+	source/app/options.c \
+	source/app/hw.c \
+	source/app/input_map.c \
+	source/scene/render_dist.c \
+	source/scene/interact.c \
+	source/audio/audio.c \
+	source/audio/audio_mixer.c \
+	source/audio/audio_pan.c \
+	source/audio/audio_bsnd.c \
+	source/audio/audio_sfx.c \
+	tests/interact_stub.c \
+	tests/net_stub.c \
+	tests/audio_cue_test.c \
+	-lm \
+	-o "$BHAC/audio_cue_test"
+
+"./$BHAC/audio_cue_test"
+
+rm -rf "$BHAC"
+
+# scene/craft_torch_e2e_test.c - the torch acquisition chain, end to end (v1.8.12).
+#
+# Why a binary of its own rather than a few more checks in an existing stanza: this is the only
+# suite in the file that links the CRAFT half and the PLACE half together. world/inventory_test.c
+# proves every row of CRAFT_RECIPES round-trips through craftMake() (it loops to RECIPE_COUNT, so
+# the torch recipe is covered generically the moment it exists), and scene/interact_test.c proves
+# a torch lights the world when placed - but it reaches that state by hand-setting
+# `it.holding = BLOCK_TORCH`, which is exactly the seam this file exists to distrust. Both of
+# those stay green for a build where nothing a player can actually DO produces a torch.
+#
+# That was not hypothetical. Until this version the torch was genuinely unobtainable: id defined
+# (world/block.h:170), registry row with luminance 14 (world/registry.c:544), break time pinned
+# (world/mining_test.c), save/load round-trip pinned (world/inventory_persist_test.c), placement
+# tested (scene/interact_test.c) - and no recipe, no drop, no generator placement anywhere. Five
+# suites, all green, all about a block no player could hold. RECIPE_COAL_ORE_TO_TORCH is the fix;
+# this stanza is what stops it silently coming undone.
+#
+# Link set is scene/interact_test.c's, plus world/inventory.c, world/crafting.c and world/crc32.c.
+# crc32.c is not optional and not obvious: world/crafting.h's inline crc32() calls crc32Update(),
+# so the first build attempt died at link with "undefined reference to `crc32Update'", GCC_EXIT=1,
+# before anything ran. Recorded because the next person adding a stanza that touches crafting.c
+# will hit it too. The five source/audio objects and -lm are here for the same reason the
+# interact stanza above gives: scene/interact.c fires the break/place cues, so this binary does
+# not link without them, and nothing here calls audioInit, so every cue is a silent no-op.
+#
+# Red arms (three, each on REAL shipping code, each restored and confirmed by md5):
+#   * crafting.c torch recipe output_item BLOCK_TORCH -> BLOCK_DIRT  -> FAIL 4/12, first
+#     "L127 inventoryCount(&inv, BLOCK_TORCH) == 4".
+#   * crafting.c torch recipe input_count 1 -> 2 (one coal ore in the bag) -> FAIL 7/12, first
+#     "L122 craftCanMake(&inv, RECIPE_COAL_ORE_TO_TORCH)".
+#   * scene/interact.c:480 worldSet(..., it->holding) hardcoded to BLOCK_STONE -> FAIL 1/12,
+#     "L150 worldGet(&s_world, TX, TY + 1, TZ) == BLOCK_TORCH".
+#
+# The third arm is the one worth reading. It reddened exactly ONE check - the terminal
+# worldGet() readback - while `CHECK(it.placed_id == BLOCK_TORCH)` at L147 stayed GREEN for a
+# build that had just put stone in the world, because interact.c:495 sets placed_id from
+# it->holding unconditionally rather than from what worldSet actually stored. So the Interact
+# struct's own bookkeeping is NOT evidence that a torch landed; only reading the world back is.
+# That is why this file ends with a worldGet() and not with a struct field.
+BHCT="build-host/run-$$-crafttorch"
+mkdir -p "$BHCT"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/world.c \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/budget.c \
+	source/world/relightq.c \
+	source/world/inventory.c \
+	source/world/crafting.c \
+	source/world/crc32.c \
+	source/app/options.c \
+	source/app/hw.c \
+	source/scene/render_dist.c \
+	source/app/input_map.c \
+	source/world/mining.c \
+	source/scene/interact.c \
+	source/audio/audio.c \
+	source/audio/audio_mixer.c \
+	source/audio/audio_pan.c \
+	source/audio/audio_bsnd.c \
+	source/audio/audio_sfx.c \
+	source/scene/craft_torch_e2e_test.c \
+	tests/interact_stub.c \
+	tests/net_stub.c \
+	-lm \
+	-o "$BHCT/craft_torch_e2e_test"
+
+"./$BHCT/craft_torch_e2e_test"
+
+rm -rf "$BHCT"
+
+# ── tests/metrics_timing_test.c — the v1.8.11 METRICS-VISIBLE CPU-vs-wait readout is LIVE ──
+#
+# Proves source/debug/metrics.c's metricsCpuAvgMs/metricsWaitAvgMs/metricsFrameAvgMs actually
+# read what their names claim, rather than a number that only looks plausible -- this project
+# has shipped exactly that before (main.c's own v1.8.10 note on a metricsSyncBegin readout
+# wired to nothing; grep metricsSyncBegin in main.c).
+#
+# METRICS-VISIBLE (the lane that added the readout) built and ran this proof as a throwaway
+# scratchpad harness only, and reported the gap itself: no permanent host test existed, because
+# this script was owned by another lane at the time. This stanza is that harness promoted into
+# the tree, unchanged in what it proves. tests/metrics_timing_test.c carries the full reasoning
+# (why arm 3 -- injecting the 5 ms INSIDE the sync bracket rather than outside it -- is the one
+# check that cannot be simplified away); this comment does not repeat it.
+#
+# WHY THIS STANZA IS SHAPED DIFFERENTLY FROM EVERY OTHER ONE IN THIS FILE: every other stanza
+# either links files with no <3ds.h> in them, or files that keep their libctru half behind an
+# `#ifdef __3DS__` seam (source/app/hw.c, source/gfx/weatherdraw.c). metrics.c has no such seam
+# -- metrics.h includes <3ds.h> unconditionally and metrics.c includes <citro3d.h> unconditionally
+# -- so it has never been linkable into any host binary before. tests/metrics_timing_stub/3ds.h
+# and tests/metrics_timing_stub/citro3d.h are new, minimal stand-in headers (named the same as
+# the real libctru/citro3d ones so `#include <3ds.h>` resolves to them via -I) that name only the
+# surface metrics.c and metrics.h actually reference. They do not replace or shadow anything in
+# deps/ or devkitPro's own include path -- devkitPro is never on this stanza's -I line at all.
+#
+# Standalone build+run before wiring, 2026-09-03, from a private script outside this file (this
+# project's own rule: a new stanza is proven green on its own before it can put every later
+# stanza at risk under this script's `set -e`):
+#
+#   CPU_TICKS_PER_MSEC = 268111.856
+#   ARM 1  baseline: 2.00 ms work, 14.71 ms wait
+#      cpu 2.000   wait 14.710   frame 16.710   (fps 59.84)
+#   ARM 2  +5.00 ms of WORK (outside the sync bracket)
+#      cpu 7.000   wait 14.710   frame 21.710   (fps 46.06)
+#   ARM 3  RED CONTROL: +5.00 ms of WAITING (inside the bracket)
+#      cpu 2.000   wait 19.710   frame 21.710   (fps 46.06)
+#   ARM 4  real clock, real 6 ms busy-wait + real 8 ms sleep, 80 frames
+#      cpu 6.004   wait 8.107   frame 14.111
+#   metrics timing self-test: PASS  15 checks
+#   harness exit=0
+#
+# RED ARM, measured 2026-09-03 against a SCRATCH COPY of source/debug/metrics.c (never this
+# tree's file) sabotaged with the exact bug this project has shipped before -- the line
+# `float work_ms = s_now.frame_ms - s_now.sync_ms;` changed to `float work_ms = s_now.frame_ms;`,
+# so "cpu" silently becomes the whole frame instead of frame-minus-wait:
+#
+#   ARM 1  baseline: 2.00 ms work, 14.71 ms wait
+#      cpu 16.710   wait 14.710   frame 16.710   (fps 59.84)
+#     FAIL L318: cpu: got 16.710, want 2.00 +/-0.01
+#   ARM 2  +5.00 ms of WORK (outside the sync bracket)
+#      cpu 21.710   wait 14.710   frame 21.710   (fps 46.06)
+#   ARM 3  RED CONTROL: +5.00 ms of WAITING (inside the bracket)
+#      cpu 21.710   wait 19.710   frame 21.710   (fps 46.06)
+#     FAIL L334: cpu must NOT move: got delta 5.000
+#   ARM 4  real clock, real 6 ms busy-wait + real 8 ms sleep, 80 frames
+#      cpu 14.094   wait 8.091   frame 14.094
+#     FAIL L360: cpu must track the 6 ms BURN, not the 8 ms sleep: got 14.094
+#     FAIL L362: cpu + wait must account for the frame: cpu+wait=22.185 frame=14.094
+#   metrics timing self-test: FAIL 4/15  L318 cpu: got 16.710, want 2.00 +/-0.01
+#   red harness exit=1  (nonzero = the check works)
+#
+# ARM 2 is the check that matters most about this evidence: it stayed entirely green under the
+# sabotage (no FAIL line appears under it above), because 5 ms landed outside the sync bracket
+# raises frame_ms by 5 ms whether "cpu" is computed correctly or is just frame_ms. Only ARM 3's
+# "cpu must NOT move" assertion catches the leak. md5 of source/debug/metrics.c was identical
+# before and after this sabotage run -- 3e94db02beef7edb4593c3a399a6f900 both times -- confirming
+# the scratch copy was sabotaged, never the tree file.
+#
+# The exit-code reader itself was proven with a deliberate `( exit 5 )` control in the same
+# standalone script, printed as "control=5" ahead of the compile above.
+BHMET="build-host/run-$$-metricstiming"
+mkdir -p "$BHMET"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I tests/metrics_timing_stub -I source \
+	source/debug/metrics.c \
+	tests/metrics_timing_test.c \
+	-lm \
+	-o "$BHMET/metrics_timing_test"
+
+"./$BHMET/metrics_timing_test"
+
+rm -rf "$BHMET"

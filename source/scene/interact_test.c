@@ -269,14 +269,21 @@ static void testTheCarryCeilingIsWhereItSays(void)
 	CHECK(inventoryCanHold((ItemId)BLOCK_FERN));         // 14
 
 	// The BOUNDARY, both sides of it, and it is now the edge of the DEFINED core table
-	// rather than a compile-time constant: id 27 is the last defined core row and id 28 is
-	// the first undefined one, now that v1.8.10's torch (id 27) has landed on top of v1.8.8's
-	// twelve per-biome rows (ids 15..26). registryCount() is read here rather than hard-coded
-	// so this pair keeps straddling the real edge if another core row ever lands on top of
-	// this one.
+	// rather than a compile-time constant: id 33 is the last defined core row and id 34 is
+	// the first undefined one, now that v1.8.12's six ores (ids 28..33) have landed on top of
+	// v1.8.10's torch (id 27), which landed on top of v1.8.8's twelve per-biome rows (ids
+	// 15..26). registryCount() is read here rather than hard-coded so this pair keeps
+	// straddling the real edge if another core row ever lands on top of this one.
+	//
+	// The NAMED constant on the right is the half that does NOT update itself, and it has now
+	// gone stale twice. It is deliberately not replaced by a bare 33: the point of naming the
+	// block is that the failure message says WHICH block the table now ends at, which is what
+	// tells the next reader whether a row was added on purpose or lost by accident. The price
+	// is that this line has to be edited whenever the table grows, and the noisy failure when
+	// nobody does is the thing being bought, not a defect in the check.
 	const ItemId last_defined  = (ItemId)(registryCount() - 1);
 	const ItemId first_beyond  = (ItemId)registryCount();
-	CHECK(last_defined == (ItemId)BLOCK_TORCH);          // premise: the table is 28 rows
+	CHECK(last_defined == (ItemId)BLOCK_DIAMOND_ORE);    // premise: the table is 34 rows
 	CHECK(inventoryCanHold(last_defined));
 	CHECK(!inventoryCanHold(first_beyond));
 
@@ -546,7 +553,12 @@ static void testEveryCoreBlockStillBreaks(void)
 	// The loop ran, and ran over both kinds. A `continue` that swallowed everything would
 	// otherwise leave this function green having made no assertion at all — the vault's
 	// "a check that could not fail proves nothing", written as two counters.
-	CHECK(targetable_seen == 26);   // 27 rows past air, less water
+	// v1.8.12: 26 -> 32. Thirty-three rows past air, less water. The six ores (ids 28..33) are
+	// all FULL_CUBE and all targetable, so they land entirely in this counter and none of them
+	// touches cross_seen, which is why that number does NOT move. Both figures below were read
+	// off a real run of this binary rather than worked out on paper: the arithmetic and the
+	// measurement agreed, but the measurement is what is quoted.
+	CHECK(targetable_seen == 32);   // 33 rows past air, less water
 	CHECK(cross_seen == 9);         // tall grass, dead bush, fern, tall grass top,
 	                                 // poppy, daisy, bluebell, orchid, torch
 }

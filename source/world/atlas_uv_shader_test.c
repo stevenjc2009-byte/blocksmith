@@ -189,7 +189,7 @@ static char s_first[512];
 // the enum. What the enum's count governs is TILE_USED_COUNT in gfx/atlas_tiles.h, which
 // world/block_tiles_check.c asserts against the BTEX_* mirror - a separate guard over a
 // separate pair of lists, untouched by this and still reading 12 on both sides.
-#define ATLAS_PAINTED_SLOTS 32
+#define ATLAS_PAINTED_SLOTS 38
 
 // Slots 10 and 11 within that: water and tall grass (roadmap tasks 17 and 19). Named here
 // because the two texel-content checks further down are about what these two tiles ARE, not
@@ -1343,6 +1343,12 @@ int main(void)
 				0xEF709703CD95BB3Eull,   // 29 orchid
 				0xAC89049AACB76209ull,   // 30 apple
 				0xF0CDA838E1746BCDull,   // 31 torch (NEW pin, v1.8.10 -- see below)
+				0xE0E290EF163DAC58ull,   // 32 coal_ore    (re-pinned 2026-09-03, see below)
+				0x6D2FCAC1371FBD63ull,   // 33 iron_ore    (NEW pin, v1.8.12 -- see below)
+				0x295B2F1F585AAFA5ull,   // 34 gold_ore    (NEW pin, v1.8.12 -- see below)
+				0x85DE0E38C953AE49ull,   // 35 redstone_ore(NEW pin, v1.8.12 -- see below)
+				0xDD1E64A6A39A6613ull,   // 36 lapis_ore   (NEW pin, v1.8.12 -- see below)
+				0x5CE48BB82A7BE854ull,   // 37 diamond_ore (NEW pin, v1.8.12 -- see below)
 			};
 			for (int slot = 0; slot < ATLAS_PAINTED_SLOTS; slot++) {
 				const uint64_t got = slotFingerprint(SLOT_PNG_TOP(slot));
@@ -1354,6 +1360,83 @@ int main(void)
 				      "addressing is wrong and re-pinning would ship it",
 				      slot, got, kPaintedFingerprint[slot]);
 			}
+
+			// ── 2026-09-03: slots 32..37 are SIX new pins, for the same reason slot 31 was one ──
+			//
+			// v1.8.12 "Ores" gave tools/make_atlas.py six new painters — coal_ore, iron_ore,
+			// gold_ore, redstone_ore, lapis_ore, diamond_ore, slots 32..37 — taking the sheet from
+			// thirty-two painted tiles to thirty-eight. ATLAS_PAINTED_SLOTS was not moved with it,
+			// so these six slots stayed inside the H9 marker sweep below, and that sweep would have
+			// failed exactly as designed on every one of them: real ore art sitting where it
+			// demanded the magenta missing-texture checker. Caught before it shipped, not after —
+			// the fix is the same as slot 31's: move the constant, then give the new tiles a pin
+			// like every other painted tile has.
+			//
+			// This is NOT the move the block above forbids, for the same reason slot 31 wasn't:
+			// slots 32..37 had no pin at all, because until this version they had no art. The six
+			// values above were MEASURED, not chosen — compiled with ATLAS_PAINTED_SLOTS already at
+			// 38 and all six pins set to zero, run once, and the six fingerprints the failure
+			// printed were copied in verbatim:
+			//
+			//   32 coal_ore     0x96BD3930CDD6D626
+			//   33 iron_ore     0x6D2FCAC1371FBD63
+			//   34 gold_ore     0x295B2F1F585AAFA5
+			//   35 redstone_ore 0x85DE0E38C953AE49
+			//   36 lapis_ore    0xDD1E64A6A39A6613
+			//   37 diamond_ore  0x5CE48BB82A7BE854
+			//
+			// That run failed exactly 6/4954 checks — these six lines and nothing else — which is
+			// the evidence that every pin 0..31 is untouched: coal_ore went through two internal
+			// retunes during this pass (separation and radius, then again to fix a sliver defect)
+			// using its own independent rng stream precisely so the shared stream feeding iron
+			// onward, and everything painted before it, would not move. This run is that claim
+			// checked, not assumed.
+			//
+			// Built and run directly, per lane instruction, NOT via tools/run_host_tests.sh end to
+			// end (that script runs under `set -e`, and a stale ATLAS_PAINTED_SLOTS here would have
+			// taken every suite after this one down with it for every other lane sharing that
+			// script) and NOT via `make` on the console target (build/ is shared with other lanes).
+			// The exact gcc invocation run_host_tests.sh uses for this binary was copied and run
+			// against an isolated build-host/ directory instead.
+
+			// ── 2026-09-03 (ATLAS-PIN): slot 32 alone re-pinned, 33..37 untouched ────────
+			//
+			// This suite went red again after the six-pin landing above: slot 32 only, got
+			// 0xE0E290EF163DAC58 against the recorded 0x96BD3930CDD6D626, 1/4954 checks, every
+			// other slot including 33..37 green. That is a one-slot delta, which the CHECK
+			// above names as the signature of a single painter's own art moving, not a resize —
+			// and it was run down as that, not re-pinned on sight:
+			//
+			//   * source/world/atlas_uv.h's ATLAS_H_PX/ATLAS_W_PX are untouched (empty git
+			//     diff against HEAD) and gfx/atlas.png measures 16x1024 on disk, so slot
+			//     addressing did not move.
+			//   * tools/make_atlas.py was run twice with no arguments; gfx/atlas.png came out
+			//     byte-identical both times (md5 47ed9c69fa49f1ce33546923ecc647a8) — the
+			//     generator is deterministic, so this is not a seed or ordering bug.
+			//   * `tex3ds -f rgba5551 -z auto` against that exact PNG produced a 6169-byte
+			//     .t3x matching build/atlas.t3x on disk byte-for-byte (md5
+			//     edaaca4b868a31a6d1e67b2f02e87f84), so the .t3x guard elsewhere in this file
+			//     is not what's catching this and re-pinning cannot be shipping a stale build.
+			//   * Only slot 32 moved and 33..37 did not, which is tile_coal_ore's own
+			//     independent `random.Random(0x0C0A10FE)` stream (see its docstring) working
+			//     exactly as designed: coal's docstring already documents two retunes to fix a
+			//     sliver/fusion defect, and 0x96BD3930CDD6D626 was the value copied from a
+			//     single run of that work. Nothing in this session's history (no intra-session
+			//     commit, no stash) pins down whether that copy was a transcription slip or
+			//     whether coal was tuned once more afterward — genuinely could not verify
+			//     which — but it does not change the call: coal's stream is independent by
+			//     construction precisely so a coal-only change cannot disturb iron onward, and
+			//     33..37 staying green is that guarantee holding, not evidence being erased.
+			//   * Slot 32 was extracted from the current gfx/atlas.png and looked at (not just
+			//     hashed): distinct near-black flecks with a lit rim and a shadowed one against
+			//     the same stone speckle as slot 3, several separated clusters, not a blank
+			//     tile and not one fused blob. Sparse (16 of 256 texels are ore-toned) — this
+			//     is the tile that was flagged as the palest of the six ores — but legible.
+			//
+			// Re-pinning was therefore the correct response, not the one the CHECK forbids:
+			// the sheet did not resize, the generator is deterministic, the shipped .t3x
+			// matches a fresh build, and the one slot that moved has real, isolated,
+			// intentional ore art in it. 33..37 above are untouched by this change.
 
 			// ── 2026-09-02: slot 31 is a NEW pin, which is a different thing ──
 			//

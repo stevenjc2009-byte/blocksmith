@@ -59,6 +59,41 @@ SHA-256 of the originals, all three confirmed identical to `Audio/<name>` in the
 Each file also carries `ARTIST=KenneyG` in its own Vorbis comment header, which identifies
 the author without reference to where the download came from.
 
+## Planned for v1.8.17 — licence-verified, not yet downloaded
+
+The sounds below have had their licence traced to the original upload page this session
+(not an aggregator) and are cleared to source under this project's CC0/CC-BY rule. **None
+of these files are in this directory yet** — no download has happened, per the file
+being a plan, not an install, until steve authorises pulling them in. Full sourcing
+reasoning, byte budget, and the ranked list these belong to are in
+`docs/research/audio-sourcing.md`.
+
+| Game sound | Original page | Uploader | Licence | Attribution required |
+|---|---|---|---|---|
+| Footstep — dirt/grass | https://opengameart.org/content/fantozzis-footsteps-grasssand-stone | Fantozzi (recorded); submitted by qubodup | CC0 | No |
+| Footstep — stone | https://opengameart.org/content/fantozzis-footsteps-grasssand-stone | Fantozzi (recorded); submitted by qubodup | CC0 | No |
+| Footstep — sand | https://opengameart.org/content/fantozzis-footsteps-grasssand-stone | Fantozzi (recorded); submitted by qubodup | CC0 | No |
+| Block break — dirt/grass | https://kenney.nl/assets/impact-sounds | Kenney | CC0 | No |
+| Block break — wood | https://kenney.nl/assets/impact-sounds | Kenney | CC0 | No |
+| Block break — sand | https://kenney.nl/assets/impact-sounds | Kenney | CC0 | No |
+| Block break — glass | https://freesound.org/people/Ruben_Uitenweerde/sounds/486166/ | Ruben_Uitenweerde | **CC BY 3.0** | **Yes** — "Glass breaking" by Ruben_Uitenweerde (Freesound.org, CC BY 3.0) |
+| Block place — stone | https://kenney.nl/assets/impact-sounds | Kenney | CC0 | No |
+| Block place — dirt/grass | https://kenney.nl/assets/impact-sounds | Kenney | CC0 | No |
+| Block place — sand | https://kenney.nl/assets/impact-sounds | Kenney | CC0 | No |
+| Player — hurt | https://freesound.org/people/MAJ061785/sounds/85553/ | MAJ061785 | **CC BY 3.0** | **Yes** — "male pain grunt" by MAJ061785 (Freesound.org, CC BY 3.0) |
+| Player — eat | https://opengameart.org/content/apple-bite | AntumDeluge | CC0 | No |
+| Door/chest — open | https://freesound.org/people/spookymodem/sounds/202092/ | spookymodem | CC0 | No |
+| Water — enter/splash | https://freesound.org/people/qubodup/sounds/210428/ | qubodup | CC0 | No |
+| Water — exit | https://freesound.org/people/speedygonzo/sounds/235725/ | speedygonzo | CC0 | No |
+
+**Not sourced — recommended for synthesis instead** (see `audio-sourcing.md` §4 for why):
+UI click/move, UI confirm/select, block place — glass.
+
+**Known gap, still open:** the Kenney Impact Sounds rows above and the Fantozzi footsteps
+rows are verified CC0 at the pack/author level; which individual file inside each archive
+maps to which game sound is not chosen yet — that requires opening the archive, which is
+the download step this pass does not take.
+
 ## Adding a sound
 
 1. Establish the licence **first**, from the source itself — the pack's own `License.txt`

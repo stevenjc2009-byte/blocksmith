@@ -302,7 +302,31 @@ static void drawHudFont(const UiStats* stats)
 		fontDrawf(6, y, 1, COL_TEXT_DIM, "%s",
 		          debugBiomeRow(bx, bz, biome, sizeof(biome)));
 	}
-	y += 14;
+	y += 12;
+
+	// v1.8.11 METRICS-VISIBLE. The CPU-vs-wait split, which is the one question docs/ROADMAP.md
+	// leaves open ("GPU-blocked for roughly 15.7 of every 16.71 ms") and which no shipped build
+	// could previously answer: the console overlay that used to print it is compiled out under
+	// BS_BOTTOM_UI, and BS_BOTTOM_UI is the default. See debug/metrics.h for the arithmetic and
+	// for why this is a different — and more complete — figure than that overlay's "cpu" row.
+	//
+	// Drawn HERE, on the live HUD, and not only on the debug menu's existing "Frame" INFO row,
+	// because that row is a PAUSED reading and cannot answer the question. The debug menu is
+	// modal over the pause menu, and main.c gates the simulation on its `paused` flag — grep
+	// `if (!paused)` there — so with it open there is no camera update, no player update, no
+	// column install and no mesh drain. Its CPU figure is the cost of a frame doing almost none
+	// of the work a real frame does. The world behind it still draws, so the GPU side stays
+	// representative, and that is exactly the combination that makes a paused reading look
+	// trustworthy.
+	//
+	// NULL when the toggle is off, so the row does not exist in a normal session. Same shape as
+	// `status` and `net` directly above.
+	if (stats->timing) {
+		fontDrawf(6, y, 1, COL_TEXT_DIM, "%s", stats->timing);
+		y += 12;
+	}
+
+	y += 2;
 	fontDraw(6, y, 1, COL_TEXT_DIM, "tap a hotbar slot to select it");
 }
 

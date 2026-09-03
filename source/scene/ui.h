@@ -110,6 +110,13 @@ typedef struct {
 	const char* net;      // e.g. "net s4 r91 y12 a12 q0 p1" — the multiplayer traffic counters
 	                       // from net/networld.h, built by main.c the same way as `status`.
 	                       // Same NULL rule: the line is simply omitted.
+
+	// v1.8.11 METRICS-VISIBLE. e.g. "cpu 2.1  wait 14.6  frame 16.7ms  60fps". NULL — and so
+	// no row at all — unless the debug menu's "Frame timing" toggle is on, which is how this
+	// stays a debug option rather than a permanent HUD line. main.c builds it from
+	// debug/metrics.h's averages for the same reason it builds `status`: this header must not
+	// grow a dependency on <3ds.h>, and every other number on this panel arrives the same way.
+	const char* timing;
 } UiStats;
 
 // What this frame's screen was, in case the caller wants to gate something on it — e.g.

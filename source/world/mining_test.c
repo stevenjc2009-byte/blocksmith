@@ -91,6 +91,17 @@ static void testCoreHardness(void)
 	// durability sink.
 	CHECK(blockHardnessTicks(BLOCK_TORCH) == 1, "torch is 1 tick (0.05 s)");
 
+	// v1.8.12 "Ores". Six more core rows, each with its own break time — a six-step ladder,
+	// not a flat value, for the identical reason the cactus/snow/ice trio below is pinned as
+	// three distinct numbers rather than three equal ones. No tool-tier gate in this version:
+	// these are the bare-hand tick counts, and there is no faster tier yet to divide them by.
+	CHECK(blockHardnessTicks(BLOCK_COAL_ORE)     ==  60, "coal ore is 60 ticks (3.00 s)");
+	CHECK(blockHardnessTicks(BLOCK_IRON_ORE)     ==  70, "iron ore is 70 ticks (3.50 s)");
+	CHECK(blockHardnessTicks(BLOCK_LAPIS_ORE)    ==  80, "lapis ore is 80 ticks (4.00 s)");
+	CHECK(blockHardnessTicks(BLOCK_GOLD_ORE)     ==  85, "gold ore is 85 ticks (4.25 s)");
+	CHECK(blockHardnessTicks(BLOCK_REDSTONE_ORE) ==  90, "redstone ore is 90 ticks (4.50 s)");
+	CHECK(blockHardnessTicks(BLOCK_DIAMOND_ORE)  == 100, "diamond ore is 100 ticks (5.00 s)");
+
 	// DISTINCTNESS, and this is the check the roadmap actually asked for: "every single new
 	// block breakable with its own durability". The three lines above could all read 9 and
 	// each `==` would still be a true statement about a table where the cactus had simply
@@ -125,7 +136,12 @@ static void testCoreHardness(void)
 	}
 	// The loop ran, and over the whole table rather than a prefix of it. Without this a
 	// `continue` that swallowed everything leaves the rule green having asserted nothing.
-	CHECK(targetable_rows == 26, "and there are 26: 28 core rows less air and less water");
+	//
+	// 26 -> 32 on 2026-09-02/03, v1.8.12 "Ores": six more targetable, non-liquid core rows
+	// (the ore blocks, ids 28..33), each declaring its own nonzero hardness — see
+	// world/registry_test.c's coreHardnessIsDeclared() for the identical count, read off the
+	// table directly rather than through blockHardnessTicks().
+	CHECK(targetable_rows == 32, "and there are 32: 34 core rows less air and less water");
 
 	// The view is derived from the def, so the two must agree. This is what goes red if
 	// refreshView() copies the wrong field, or copies it from the wrong row.

@@ -4,17 +4,16 @@ Every version Blocksmith has had, oldest first, followed by every version curren
 planned, in one continuous order. Released and planned are kept clearly apart with a
 line, and every entry states its own status. Full detail on everything already shipped
 is in `CHANGELOG.md`; full reasoning on everything not yet built is in `docs/ROADMAP.md`
-and, for the three versions that have a dedicated plan document, in
-`docs/plan-1.8.7-terrain.md` and `docs/plan-1.8.8-biome-identity.md`.
+and, for most versions from v1.8.7 onward, in that version's own `docs/plan-*.md`
+(for example `docs/plan-1.8.11-caves.md`); run `ls docs/plan-*.md` for the current set,
+which now covers nearly every version through v1.9.1.
 
-**Newest published version: 1.8.9** (confirmed via `gh release list` — `v1.8.9` is tagged
-`Latest`, released 2026-09-02). Everything from `v0.1.0` up to and including `v1.8.9` is
-released and published on GitHub. `source/version.h` in the working tree currently reads
-`1.8.10`, and `CHANGELOG.md` already carries a full, dated `## [1.8.10]` entry — but that
-version has not been committed, tagged, or published as a GitHub Release yet, so it is
-mid-release, not "planned" the way everything after it is. See its own entry below for
-exactly what that status means. Everything after `v1.8.10` is a plan, not a build; order,
-scope, and whether a given version ships at all can still change before it does.
+**Newest published version: 1.8.11** (released 2026-09-02; the `releases/latest` redirect
+that the in-app updater follows resolves to `v1.8.11`, and the published `.cia` was
+downloaded back and md5-matched against the built file). Everything from `v0.1.0` up to
+and including `v1.8.11` is released and published on GitHub. Everything after `v1.8.11`
+is a plan, not a build; order, scope, and whether a given version ships at all can still
+change before it does.
 
 A console note appears below **only** where an Old 3DS and a New 3DS genuinely differ —
 a different render-distance ceiling, extra RAM, a higher clock, an extra core, anything
@@ -471,26 +470,7 @@ fixed and still not diagnosed. Not run on real 3DS hardware.
 
 ---
 
-## Planned
-
-Everything from here down has not been published as a GitHub Release. v1.8.10 is the one
-exception to "not shipped" in this section — it is real, built, tested code sitting
-uncommitted in the working tree with a matching `CHANGELOG.md` entry, just not yet
-committed, tagged, or published; see its own entry for exactly what that means. Everything
-from v1.8.11 onward genuinely is a plan, not a build, and their scope, order, and even
-whether a given version ships at all can still change. Where a version has a dedicated
-research brief or plan document beyond `ROADMAP.md`'s own entry, that is named so the
-deeper detail can be found.
-
-### v1.8.10 — Light — built in the tree, not yet committed, tagged, or published
-
-**What this status means, plainly: this is not a plan.** `source/version.h` already reads
-`1.8.10`, `CHANGELOG.md` already carries a full dated `## [1.8.10]` entry, and
-`whatsnew1.8.10.txt` exists and passes its checker — but there is no `v1.8.10` git tag, no
-commit carrying this work yet (the working tree currently shows it as uncommitted changes),
-and no GitHub Release, so there is nothing on record yet that could be reverted to and
-nothing installable exists outside this machine. Treat everything below as real but not yet
-durable.
+### v1.8.10 — Light — released and published
 
 Torches, and a lighting model that finally behaves the way Minecraft's does — light
 spreading properly from one chunk into the next, sky light and torch light added together
@@ -534,7 +514,7 @@ is proven at the binary level — the compiled object now references the call th
 waits, no longer the one that doesn't — but it has not been confirmed on real hardware,
 because that needs a 3DS.
 
-### v1.8.11 — Caves — planned
+### v1.8.11 — Caves — released and published
 
 **Added.** Cave generation in the legacy-console-edition style — long connected tunnels
 and open ravines, not the isolated pockets a pure noise field tends to produce. Legacy
@@ -560,11 +540,17 @@ walked carver breaks that: a tunnel that starts in one chunk can carve blocks in
 neighbouring chunks, so generating one column correctly would need to know about tunnels
 that started elsewhere, and nothing can be persisted to make that cheaper — the loaded
 column ring already sits at 88.7% of the 12 MB budget at a New 3DS's own render-distance
-ceiling. The recommended first phase is retuning the existing noise field toward the
-legacy carver's connectivity and character (already measured at 99.2% of carved volume
-sitting in connected systems larger than 100 blocks) rather than building a true carver
-outright, with the carver kept as a later, optional phase if retuning does not read as
-close enough.
+ceiling. The recommendation written here before the build was to retune the existing noise field
+toward the legacy carver's connectivity and character (measured at 99.2% of carved volume
+sitting in connected systems larger than 100 blocks) rather than build a true carver
+outright. **What actually shipped went the other way:** `source/world/cave_carve.c` is a
+real walked carver, and the cross-chunk problem described above was solved by carving each
+column against a mask built over a neighbourhood radius rather than by persisting anything.
+It is gated behind `GEN_VERSION_CAVES`, so no existing save regenerates. Measured against
+the old generator the dominant transition is AIR → STONE at 118,083 of 122,295 differing
+cells — that is, the old noise sponge being largely filled back in, which is the intended
+direction. It carries 494 behaviour checks in `tests/cave_carve_test.c`. How it actually
+reads in play is a playtest and has not been done.
 
 *Not part of this version, on the evidence:* zombie/skeleton spawning depends on an
 entity/mob system that does not exist anywhere in the tree today — no entity, no AI, no
@@ -573,15 +559,93 @@ is scoped separately, in `docs/ROADMAP.md`'s own later versions.
 
 Full research, with sources and citations: `docs/research/caves-legacy-console.md`.
 
-### v1.8.12 — Ores — planned
+---
 
-**Added.** Ore generation on the legacy distribution — coal high and common, iron below
-it, gold, redstone, lapis and diamond in the deep, each in veins rather than singles.
-Tool tiers, so an ore means something to reach.
+### v1.8.12 — Ores — released and published
 
-`docs/ROADMAP.md`'s entry for this version is a short paragraph with no dedicated
-research brief behind it yet — treat the ore-tier ordering above as the settled part and
-exact vein sizes/depth bands as not yet specified.
+**Added.** Six ores on the legacy distribution, generated as veins inside stone and never
+into open air. The bands and rates as shipped, which are the settled numbers now rather than
+the "not yet specified" they were when this version was still a plan:
+
+| Ore | id | Y band | Distribution | Attempts per region | Vein size |
+|---|---|---|---|---|---|
+| Coal | 28 | 0–127 | uniform | 20 | 8–17 |
+| Iron | 29 | 0–63 | uniform | 20 | 5–9 |
+| Gold | 30 | 0–31 | uniform | 2 | 5–9 |
+| Redstone | 31 | 0–15 | uniform | 8 | 4–8 |
+| Lapis | 32 | 0–31 | triangular, peak ~16 | 1 | 4–7 |
+| Diamond | 33 | 0–15 | uniform | 1 | 4–8 |
+
+Hardness ladder, all six above plain stone's 45: coal 60, iron 70, lapis 80, gold 85,
+redstone 90, diamond 100. Every one is breakable by hand — that is a deliberate rule for
+every new block this project adds, not an oversight.
+
+**Not shipped, and worth saying plainly because the plan above promised it:** *tool tiers*.
+The line "tool tiers, so an ore means something to reach" was written when this was a plan
+and no tool-tier system exists in the tree. Ore is currently something you collect and, as
+of this version, craft one thing from. Making an ore *gate* anything needs tools, and tools
+are not scoped to a version yet.
+
+**Fixed.** The torch, added in v1.8.10, was unobtainable. It lit rooms correctly, had a
+break time, saved and loaded — and there was no recipe, no drop, and none placed in any
+world, so no player could ever hold one. v1.8.12 adds `RECIPE_COAL_ORE_TO_TORCH`: one coal
+ore to four torches. Five separate green host suites had missed it, because every one of
+them tested the torch's *behaviour* and none tested whether the item could be acquired.
+`source/scene/craft_torch_e2e_test.c` now links the real modules end to end — bag →
+`craftMake()` → `inventoryHeldItem()` → `interactEdit()` → real `World` → `worldGet()` — so
+the acquisition path itself is covered rather than assumed.
+
+*Save compatibility.* Ore is gated behind `GEN_VERSION_ORES` (5), so no existing world
+regenerates or changes. Measured against the previous generator on an identical fixture,
+24,312 of 2,654,208 cells differ (0.9160%); every single transition is `STONE → <ore>`,
+with zero non-stone sources, zero non-ore destinations and zero AIR on either side, and no
+difference at all in chunk allocation. The decisive control: the same fixture built at
+`GEN_VERSION_CAVES` reproduced the old world-identity hashes exactly, so 100% of the change
+is attributable to the version bump and none of it to a bug in the carver.
+
+**Changed.** The per-frame depth sort in `source/scene/chunk_render.c` was an insertion sort,
+and the comment justifying it was wrong in two load-bearing ways: it said n was "at most
+MESH_SLOTS (392)" when `RENDER_DIST_MAX_COLUMNS(121) × COLUMN_CHUNKS(8)` is **968**, and it
+said walking produced a nearly-sorted input when `s_vis_depth` is rebuilt from scratch in
+pool-slot order every cull with last frame's sorted result discarded — so the real input is
+shuffled, the *slowest* case, and it gets more shuffled the longer you walk as pool slots are
+recycled. That is a mechanism for frame rate degrading with distance walked, which is the shape
+of what was reported before the hardware freeze.
+
+Replaced with a four-pass LSD radix sort over the float bit pattern. Measured host-side at
+n=968: **20.3× on the shuffled input the renderer actually produces** (0.1274 → 0.0063 ms) and
+**29× on the worst case a frame can hit** (0.2583 → 0.0089 ms), with the complexity change
+visible in the sweep — old reverse-order goes 0.0041 → 0.0147 → 0.0615 → 0.2583 ms across
+n = 121/242/484/968 while the new one goes 0.0011 → 0.0015 → 0.0027 → 0.0051.
+
+Stated against the temptation to re-derive it as a regression: on already-sorted, all-equal and
+nearly-sorted inputs the radix sort is **slower**, because it pays four passes regardless of
+input. That penalty is at most **5.8 microseconds**. Both sorts are stable — the old one tests
+strictly `>` — so the permutation is byte-identical, not merely equivalent, for every non-NaN
+input at every n from 0 to 968. Cost: **+15,712 bytes .bss** and **+792 bytes .text**,
+confirmed by `arm-none-eabi-size` on the real translation unit. Two details that had to be
+checked rather than assumed: negative depths *are* reachable (a chunk straddling the camera
+passes the frustum test on its positive vertex while its centre is behind), and `-0.0` is the
+one value whose raw bit pattern disagrees with `>`, so it is canonicalised to `+0.0` before the
+key transform or stability would not reproduce the old order.
+
+*Also in this release, and the reason it matters more than its size:* a **Frame timing**
+row on the bottom-screen debug menu, reading `cpu / wait / frame / fps`. Blocksmith has
+measured these numbers since v1.2, but the only display for them lived inside
+`#if !BS_BOTTOM_UI` and therefore existed in no shipped build. This is the first release in
+which the question "is this game CPU-bound or GPU-bound on real hardware?" can be answered
+by looking at the console instead of at an emulator. The four CPU optimisations also in
+this release are all measured on a PC; whether any of them is *visible* depends on that
+answer, and that answer is now obtainable.
+
+---
+
+## Planned
+
+Everything from here down is a plan, not a build: none of it has been committed, tagged, or
+published as a GitHub Release, and scope, order, and even whether a given version ships at
+all can still change. Where a version has a dedicated research brief or plan document
+beyond `ROADMAP.md`'s own entry, that is named so the deeper detail can be found.
 
 ### v1.8.13 — Survival — planned
 

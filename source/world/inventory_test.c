@@ -89,7 +89,30 @@ static char s_first[160];
 // 226 -> 227 on 2026-09-02, v1.8.10 "Light"'s torch. Nothing in testTheBagTakesEveryDefinedBlock
 // changed shape — the per-row loop still runs one CHECK() per accepted id, now over
 // twenty-six instead of twenty-five, so the loop body alone is +1. 226 + 1 = 227.
-#define INVENTORY_TEST_EXPECTED_CHECKS 227
+//
+// 227 -> 233 on 2026-09-03, v1.8.12 "Ores": coal, iron, gold, redstone, lapis and diamond, ids
+// 28..33. Same shape again — six more accepted rows, six more times round the same loop body,
+// 227 + 6 = 233. The suite's own run said "6 check(s) were ADDED - expected 227, ran 233" before
+// this line moved, and that run is what 233 is taken from; the arithmetic above merely agrees
+// with it. Worth being explicit about which is which, because this pin is only worth having if
+// it is re-pinned to a number somebody OBSERVED. Re-pinning it to a number somebody expected is
+// how a pin that exists to catch vanished checks gets taught to ignore them.
+//
+// 233 -> 242 on 2026-09-03, v1.8.12's torch recipe (RECIPE_COAL_ORE_TO_TORCH, one coal ore ->
+// four torches). This one is a DIFFERENT SHAPE from every entry above it, and that is the only
+// reason it is worth its own paragraph: every previous move came from registry rows growing and
+// landed entirely in testTheBagTakesEveryDefinedBlock()'s per-row loop. This one comes from the
+// RECIPE table growing, and lands in two loops in a different test —
+// testEveryRecipeCrafts() at 5 CHECK()s per recipe and
+// testRecipeWithInsufficientInputsRefusesAndConsumesNothing() at 4 — so one recipe is +9, not
+// +1. 233 + 9 = 242.
+//
+// The number came from the run, not the sum: the pin printed "CHECK COUNT: 9 checks ADDED
+// (expected 233, ran 242) - re-pin to 242" and 242 is copied from that line. Same rule as the
+// entry above, and it matters more here, because the arithmetic for THIS delta depends on
+// knowing two loops exist rather than one. Somebody re-pinning from the sum alone would have
+// written 234 and quietly deleted eight real checks from the suite's expectations.
+#define INVENTORY_TEST_EXPECTED_CHECKS 242
 
 // Deliberately NOT routed through CHECK(): this must not perturb the number it is testing,
 // so it bumps s_fails only. It fills s_first (with both numbers, so the one-line summary is
@@ -244,7 +267,7 @@ static void testTheBagTakesEveryDefinedBlock(void)
 	// The loop ran, over the whole table rather than a prefix of it. Without this a
 	// definedness query answering false for everything leaves the rule green having asserted
 	// nothing at all.
-	CHECK(accepted == 26);            // 28 core rows less air and less water
+	CHECK(accepted == 32);            // 34 core rows less air and less water
 	CHECK(accepted > BLOCK_COUNT);    // and genuinely more than the old ceiling admitted
 
 	// THE BOUNDARY, both sides, derived rather than hard-coded: the last id with a row is
@@ -254,9 +277,21 @@ static void testTheBagTakesEveryDefinedBlock(void)
 	// core row and 27 had none. The torch (BLOCK_TORCH = 27) is now that last row, so the
 	// pair moves one further out, exactly as this comment's own "derived rather than
 	// hard-coded" framing anticipates whenever a core row is appended.
-	CHECK(inventoryCanHold((ItemId)BLOCK_TORCH));                 // 27, the last defined row
-	CHECK(!inventoryCanHold((ItemId)(BLOCK_TORCH + 1)));          // 28, no row
-	CHECK(!registryIsDefined((BlockId)(BLOCK_TORCH + 1)));        // ...and that is why
+	//
+	// v1.8.12: and again, to BLOCK_DIAMOND_ORE = 33, the last of the six ores (28..33). Which
+	// makes the "derived rather than hard-coded" claim in the paragraph above worth correcting
+	// rather than repeating: only the +1 is derived. The block on the LEFT is hard-coded and has
+	// now gone stale twice in three versions, both times silently until a suite run said so.
+	//
+	// It is still not replaced with registryCount() - 1, on purpose. A bare count would keep
+	// this pair straddling the real edge with no edits ever, but the failure message would then
+	// say a number instead of a name — and "the table now ends at diamond_ore" is what tells the
+	// next reader whether a row was ADDED deliberately or LOST by accident, which is the only
+	// question this check exists to answer. The recurring edit is the price of that message, not
+	// a defect in it.
+	CHECK(inventoryCanHold((ItemId)BLOCK_DIAMOND_ORE));           // 33, the last defined row
+	CHECK(!inventoryCanHold((ItemId)(BLOCK_DIAMOND_ORE + 1)));    // 34, no row
+	CHECK(!registryIsDefined((BlockId)(BLOCK_DIAMOND_ORE + 1)));  // ...and that is why
 
 	// The two exclusions that survive the widening, each for its own reason. Neither of them
 	// is about where the id sits.

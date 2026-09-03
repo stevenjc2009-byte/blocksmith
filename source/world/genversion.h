@@ -108,9 +108,24 @@
 // (world/cave_carve.h, called from world/worldgen_density.c's wgdColumn()).
 #define GEN_VERSION_CAVES    4u
 
+// v1.8.12: reserved for the ore-vein decorator (docs/plan-1.8.12-ores.md). A separate
+// version rather than an ungated post-pass, for the identical reason GEN_VERSION_CAVES is
+// separate from GEN_VERSION_BIOME just above: world/world_test.c pins twelve LEGACY terrain
+// fingerprints and twelve more at GEN_VERSION_BIOME, and says of them there is no acceptable
+// way to move those numbers other than deciding, deliberately and separately, to break
+// existing worlds. An ungated ore pass would move both tables, on every generator, for every
+// save in existence — the same door marked "the stamp is already correct" this file already
+// narrates the v1.8.3 regression walking through.
+//
+// This constant is landed by the ORE-BLOCKS lane so the ORE-BLOCKS<->worldgen call site can be
+// wired without moving twice; the worldgen lane that adds the actual decorator is what reaches
+// it — nothing in the world today generates at this version yet, so every pinned fingerprint
+// in world_test.c is untouched by this constant existing.
+#define GEN_VERSION_ORES     5u
+
 // The newest generator this build can produce. A stamp above this is a world from the
 // future and is refused — see genVersionResolve.
-#define GEN_VERSION_NEWEST   GEN_VERSION_CAVES
+#define GEN_VERSION_NEWEST   GEN_VERSION_ORES
 
 // What a new world made by this build gets stamped with.
 #define GEN_VERSION_FOR_NEW_WORLDS GEN_VERSION_NEWEST

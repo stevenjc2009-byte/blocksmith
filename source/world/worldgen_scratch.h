@@ -121,4 +121,19 @@ struct WorldGenScratch {
 	// worldgenIsCaveCached() for those worlds. Untouched, and never read, on any older
 	// version — see world/cave_carve.h's own file comment.                       4,096 B
 	uint16_t carve[WORLD_HEIGHT][CHUNK_DIM];
+
+	// ── world/ore_gen.c (v1.8.12) ───────────────────────────────────────────────────────
+	//
+	// The ore-vein pre-pass output: which cells of THIS column carry an ore, and which one —
+	// a 3-bit id (0 = none, 1..6 = an ore, world/ore_gen.c's s_ore_table order) stored as
+	// three bit-planes rather than one byte per cell, the same reasoning `carve` above already
+	// applies: WORLD_HEIGHT * CHUNK_DIM cells at one byte each would be 32,768 bytes for a
+	// buffer that is overwhelmingly zero, against 3 * 4,096 = 12,288 bytes for the three planes
+	// this needs. Built once per column by oreGenBuildMask(), for GEN_VERSION_ORES-and-above
+	// worlds only (world/genversion.h); consumed by wgdColumn()'s existing fill loop at the
+	// point it would otherwise commit to BLOCK_STONE. Untouched, and never read, on any older
+	// version — see world/ore_gen.h's own file comment.                    3 x 4,096 = 12,288 B
+	uint16_t ore_bit0[WORLD_HEIGHT][CHUNK_DIM];
+	uint16_t ore_bit1[WORLD_HEIGHT][CHUNK_DIM];
+	uint16_t ore_bit2[WORLD_HEIGHT][CHUNK_DIM];
 };

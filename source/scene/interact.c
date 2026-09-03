@@ -1,6 +1,7 @@
 #include "scene/interact.h"
 
 #include "app/input_map.h"
+#include "audio/audio_sfx.h"
 #include "net/networld.h"
 #include "world/block.h"
 #include "world/inventory.h"
@@ -242,6 +243,22 @@ static int breakComplete(Interact* it, World* w, int x, int y, int z, BlockId br
 		relightEdited(w, x >> 4, z >> 4);
 		queued += chunkRenderTouch(w, x, y, z);
 		it->broke++;
+		// v1.9.0 audio. The break cue, fired HERE rather than in main.c off a change in
+		// it->broke, and the difference is the whole of "exactly one sound per break".
+		//
+		// A break is a HOLD (task 50): breakProgress runs on every frame the button is down
+		// and this function is reached on exactly one of them, the frame the banked ticks
+		// meet break_need. So the statement above — it->broke++ — is already the game's own
+		// definition of "a break completed", it runs once, and the sound is one line beside
+		// it. Deriving the same instant in main.c would mean diffing a counter across the
+		// call, which is a second definition that can disagree with this one; and the two
+		// obvious near-misses, firing on interactBreakStage() (a STATE, true for the whole
+		// hold) or on it->broke_id (BLOCK_AIR for a plant, which still breaks), are both
+		// wrong in ways a reader has to know this file to see.
+		//
+		// Below sendEditOrRevert, so a break the server refused — which puts the block back
+		// and returns above this point — makes no noise for a block that is still there.
+		audioSfxPlayAtBlock(SFX_BLOCK_BREAK, AUDIO_PRIO_NORMAL, 1.0f, x, y, z);
 		// Left as BLOCK_AIR for a plant, which is exactly how main.c already spells "this
 		// break earned nothing" — it adds to the bag only when broke_id != BLOCK_AIR. So the
 		// plant is removed from the world, the edit goes to the server as an ordinary air
@@ -476,6 +493,12 @@ int interactEdit(Interact* it, World* w, const Body* body,
 			queued += chunkRenderTouch(w, t->px, t->py, t->pz);
 			it->placed++;
 			it->placed_id = it->holding;
+			// v1.9.0 audio, the break cue's twin — same instant, same reasoning. A place is
+			// edge-triggered (`fresh & key_place`) so one press can only reach here once, and
+			// this sits below sendEditOrRevert so a placement the server refused, and which has
+			// already been rolled back out of the world, is silent.
+			audioSfxPlayAtBlock(SFX_BLOCK_PLACE, AUDIO_PRIO_NORMAL, 1.0f,
+			                     t->px, t->py, t->pz);
 		} else {
 			it->refused++;
 		}

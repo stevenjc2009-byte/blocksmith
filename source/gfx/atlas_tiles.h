@@ -80,8 +80,22 @@ enum {
 	// v1.8.10 "Light", slot 31 — the first light source. docs/plan-1.8.10-light.md §2.3.
 	TILE_TORCH,           // 31 — BLOCK_SHAPE_CROSS
 
+	// v1.8.12 "Ores", slots 32..37. Same order as tools/make_atlas.py's TILES list and as
+	// world/block.h's BTEX_* mirror; world/block_tiles_check.c fails the build if the two
+	// enums disagree.
+	TILE_COAL_ORE,        // 32
+	TILE_IRON_ORE,        // 33
+	TILE_GOLD_ORE,        // 34
+	TILE_REDSTONE_ORE,    // 35
+	TILE_LAPIS_ORE,       // 36
+	TILE_DIAMOND_ORE,     // 37
+
 	// How many slots the list above NAMES. Not the sheet's capacity — that is
-	// ATLAS_TILE_COUNT (64) in world/atlas_uv.h, and these thirty-two are 0..31 of it.
+	// ATLAS_TILE_COUNT (64) in world/atlas_uv.h, and these thirty-eight are 0..37 of it.
+	// (This sentence said "thirty-two are 0..31" until 2026-09-03; it had been stale since
+	// v1.8.10 added the torch and was a version behind again by v1.8.12. The paragraph below
+	// carries the same figure and stayed correct, so the two disagreed in the same file —
+	// which is exactly how a reader ends up trusting the wrong one.)
 	//
 	// It exists to be counted against, not to be used as a bound: world/block_tiles_check.c
 	// asserts that the number of BTEX/TILE assert lines equals this number, which is what
@@ -89,10 +103,11 @@ enum {
 	// as BLOCK_FACES in world/block.h, which terminates the face enum for the same reason.
 	TILE_USED_COUNT,
 
-	// Thirty-two of ATLAS_TILE_COUNT (64) addressable slots used, 0..31 — twelve until
+	// Thirty-eight of ATLAS_TILE_COUNT (64) addressable slots used, 0..37 — twelve until
 	// v1.8.3 Phase 3 claimed 12..16 for snow, ice, cactus, dead bush and fern, seventeen
 	// until v1.8.8 claimed 17..30 for the birch and spruce materials, the tall grass top,
-	// the four flowers and the apple, and thirty-one until v1.8.10 claimed 31 for the torch.
+	// the four flowers and the apple, thirty-one until v1.8.10 claimed 31 for the torch,
+	// and thirty-two until v1.8.12 claimed 32..37 for the six ores.
 	//
 	// It was twelve of FIFTEEN until v1.8.2's task 13b. The old ceiling was not the sheet
 	// height: MeshVertex.v held an atlas pixel row, so a uint8_t capped the sheet at 256 px

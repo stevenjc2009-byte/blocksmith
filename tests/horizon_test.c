@@ -105,9 +105,29 @@ static float  s_cam_x, s_cam_y, s_cam_z;
 //
 // Whole-pool and re-run per candidate rather than incremental: correctness here, not speed, and
 // one call site that cannot be forgotten beats four fill sites that each have to remember.
+//
+// v1.8.8: it also SORTS the pool by ndist ascending, and that is not cosmetic. horizonHidden()
+// breaks out of its blocker loop at the first column that is not strictly nearer than the
+// candidate, which is only sound on a sorted table. The shipped horizonBuild() insertion-sorts
+// after its build loop; this file fills the table by hand, so it has to sort it too, or the
+// extracted function is being handed an input the renderer never produces. It is not a
+// theoretical hazard: measured on the harness that justified the break, an unsorted table gives
+// 3316 wrong answers out of 6880 candidates. Same insertion sort, same comparison, deliberately
+// — two ways to order the same table would be two things to keep in step. This is the one call
+// site that cannot be forgotten, which is exactly why the sort belongs in it.
 static void derivePool(void)
 {
 	for (int c = 0; c < s_hzn_n; c++) hznDerive(&s_hzn_cols[c], s_cam_x, s_cam_y, s_cam_z);
+
+	for (int i = 1; i < s_hzn_n; i++) {
+		const HznCol key = s_hzn_cols[i];
+		int j = i - 1;
+		while (j >= 0 && s_hzn_cols[j].ndist > key.ndist) {
+			s_hzn_cols[j + 1] = s_hzn_cols[j];
+			j--;
+		}
+		s_hzn_cols[j + 1] = key;
+	}
 }
 
 // The real thing. Generated at build time — see the file comment.

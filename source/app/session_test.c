@@ -155,17 +155,17 @@ static void testSinglePlayerQuitToTitleLeavesTheTableJoinable(void)
 	// nothing ever dirtied it.
 	CHECK(enterWorldWithRows(sp_rows, 1) == 1);
 	CHECK(registryFrozen());
-	// Twenty-eight core rows since v1.8.10 added the torch on top of v1.8.8's twelve
-	// per-biome timber and flora rows, v1.8.3 Phase 3's snow, ice, cactus, dead bush and
-	// fern, and tasks 17/19's water and tall grass, plus the one dynamic row this world
-	// registered. (The measured symptom quoted above was taken when there were eight core
-	// rows; the +1/+0 shape of it is what matters, not the base.)
-	CHECK(registryCount() == 29);
+	// Thirty-four core rows since v1.8.12 added six ore rows on top of v1.8.10's torch,
+	// v1.8.8's twelve per-biome timber and flora rows, v1.8.3 Phase 3's snow, ice, cactus,
+	// dead bush and fern, and tasks 17/19's water and tall grass, plus the one dynamic row
+	// this world registered. (The measured symptom quoted above was taken when there were
+	// eight core rows; the +1/+0 shape of it is what matters, not the base.)
+	CHECK(registryCount() == 35);
 
 	quitToTitleFromSinglePlayer();
 
 	CHECK(!registryFrozen());
-	CHECK(registryCount() == 28);
+	CHECK(registryCount() == 34);
 	CHECK(registryFind("sp_sidecar") == 0);
 
 	// The join. This is the batch the server sends and the client refused for the whole
@@ -174,7 +174,7 @@ static void testSinglePlayerQuitToTitleLeavesTheTableJoinable(void)
 	packOne(rec, REG_ID_DYN_LO, "srv_blk");
 	CHECK(registryRemoteApply(REG_ID_DYN_LO, rec, 1) == 1);
 	CHECK(registryFind("srv_blk") == REG_ID_DYN_LO);
-	CHECK(registryCount() == 29);
+	CHECK(registryCount() == 35);
 	// The row at that id is the SERVER's row and usable, not merely a row. Checking
 	// registryIsDefined(REG_ID_DYN_LO) alone would have passed against the broken tree —
 	// the single-player world's own row was sitting in that slot, defined and solid — and
@@ -204,7 +204,7 @@ static void testSinglePlayerIntoSinglePlayerGetsItsOwnTable(void)
 	CHECK(registryFind("b_thatch") == REG_ID_DYN_LO);
 	CHECK(registryFind("a_marble") == 0);
 	CHECK(registryFind("a_basalt") == 0);
-	CHECK(registryCount() == 29);
+	CHECK(registryCount() == 35);
 }
 
 // ── 3. every exit from a world lands in the same state ───────────────────────────────────
@@ -249,7 +249,11 @@ static void testEveryExitFromAWorldLandsInTheSameState(void)
 	// spot, same fix.
 	//
 	// 27 -> 28 on 2026-09-02: v1.8.10 appends the torch, core row 27. Same blind spot again.
-	CHECK(cold.count == 28 && !cold.frozen);
+	//
+	// 28 -> 34 on 2026-09-02/03: v1.8.12 "Ores" appends six ore rows, ids 28..33. Same blind
+	// spot again — this literal is `cold.count`, not `registryCount()`, so it was missed by
+	// the same kind of sweep that would only grep for the latter.
+	CHECK(cold.count == 34 && !cold.frozen);
 
 	// Both exits leave the NEXT FREE SLOT at REG_ID_DYN_LO too, which the three numbers
 	// above do not cover: registryRemoteApply() refuses any batch that does not start
@@ -285,7 +289,7 @@ static void testTheResetIsHarmlessWhenThereIsNothingToReset(void)
 	sessionBegin();
 	sessionBegin();
 	CHECK(tableStateEq(tableState(), before));
-	CHECK(registryCount() == 28);
+	CHECK(registryCount() == 34);
 }
 
 // ── 5. main.c really calls it ────────────────────────────────────────────────────────────

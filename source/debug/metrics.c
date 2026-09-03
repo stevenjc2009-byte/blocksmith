@@ -90,6 +90,30 @@ static Sample s_now;
 static float  s_history[HISTORY_LEN];
 static int    s_history_pos;
 
+// v1.8.11 METRICS-VISIBLE. A SECOND ring, deliberately not an extra column bolted onto
+// s_history above. Two reasons, both of which cost a bug somewhere else in this tree if
+// ignored: s_history is read by metricsSparkline, which only exists under `#if !BS_BOTTOM_UI`,
+// so widening it would tie a shipped-build readout to a debug-build-only consumer; and
+// s_history is appended on EVERY frame including frame 0, whose frame_ms is measured from
+// metricsInit rather than from a previous frame and is therefore not a frame time at all.
+// This ring skips frame 0 for the same reason s_worst_ms and s_late already do.
+//
+// 320 bytes of BSS and, per frame, two float stores plus a subtract and a compare. The means
+// are computed lazily in the accessors, so a build with the row switched off — which is every
+// build until someone opens the debug menu and turns it on — pays only the stores.
+static float  s_cpu_hist[HISTORY_LEN];    // frame_ms - sync_ms: main-thread WORK
+static float  s_wait_hist[HISTORY_LEN];   // sync_ms: main-thread WAITING
+// The wall clock kept as its OWN ring rather than derived as cpu+wait. The two would agree
+// exactly except on a frame where the clamp above fires, and deriving it would then quietly
+// report a frame time the console never had — the readout would still add up, which is what
+// would make it convincing. Costs 160 bytes and cannot lie.
+static float  s_wall_hist[HISTORY_LEN];
+static int    s_avg_pos;
+static int    s_avg_n;                    // samples in the three rings above, capped at LEN
+
+// The bottom-screen timing row's flag. See metrics.h. Off unless the debug menu turns it on.
+static bool   s_row_enabled;
+
 static float  s_worst_ms;      // worst frame since launch, or since metricsWorstReset
 static int    s_over_budget;   // frames past MISS_MS — a genuinely dropped frame
 // Frames past BUDGET_MS but not past MISS_MS. With vsync these are rare and mean the
@@ -274,6 +298,20 @@ void metricsFrameEnd(void)
 		if (s_now.frame_ms > s_worst_ms)  s_worst_ms = s_now.frame_ms;
 		if (s_now.frame_ms > MISS_MS)     s_over_budget++;
 		else if (s_now.frame_ms > BUDGET_MS) s_late++;
+
+		// v1.8.11 METRICS-VISIBLE. Both halves of the frame, split at the one place the main
+		// thread blocks. Clamped at zero rather than allowed negative: sync_ms is timed by a
+		// bracket strictly inside the frame_ms interval so the difference cannot legitimately
+		// go below zero, and a negative average would read as a bug in the game rather than in
+		// the instrument. See metrics.h for why frame - sync is the honest CPU figure here and
+		// C3D_GetProcessingTime() (s_now.cpu_ms, three lines up) is not.
+		float work_ms = s_now.frame_ms - s_now.sync_ms;
+		if (work_ms < 0.0f) work_ms = 0.0f;
+		s_cpu_hist[s_avg_pos]  = work_ms;
+		s_wait_hist[s_avg_pos] = s_now.sync_ms;
+		s_wall_hist[s_avg_pos] = s_now.frame_ms;
+		s_avg_pos = (s_avg_pos + 1) % HISTORY_LEN;
+		if (s_avg_n < HISTORY_LEN) s_avg_n++;
 	}
 
 	s_history[s_history_pos] = s_now.frame_ms;
@@ -441,6 +479,26 @@ void metricsSetStereo(bool on, float slider, size_t vram_free, size_t right_eye_
 }
 
 float metricsFrameMs(void)  { return s_now.frame_ms; }
+
+// v1.8.11 METRICS-VISIBLE. Lazy rather than accumulated: an incremental running sum would have
+// to be maintained on every frame whether or not anyone is looking, and it drifts — repeatedly
+// adding and subtracting floats accumulates rounding that a full re-sum does not. Forty adds,
+// once per frame, only while the row is on screen.
+static float meanOf(const float* h)
+{
+	if (s_avg_n <= 0) return 0.0f;
+
+	float sum = 0.0f;
+	for (int i = 0; i < s_avg_n; i++) sum += h[i];
+	return sum / (float)s_avg_n;
+}
+
+float metricsCpuAvgMs(void)   { return meanOf(s_cpu_hist);  }
+float metricsWaitAvgMs(void)  { return meanOf(s_wait_hist); }
+float metricsFrameAvgMs(void) { return meanOf(s_wall_hist); }
+
+bool metricsRowEnabled(void)          { return s_row_enabled; }
+void metricsRowSetEnabled(bool on)    { s_row_enabled = on;   }
 
 // Frames submitted since launch. Step 9.3 needs it as a denominator: "the cull ran 4,102
 // times" says nothing on its own, and "4,102 culls across 4,102 frames of a 3D build" is the

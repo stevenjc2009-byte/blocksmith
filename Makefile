@@ -236,7 +236,51 @@ PROTO_REPO	:=	https://github.com/stevenjc2009-byte/blocksmith-server.git
 # NOTE for whoever widens the client's wire span: v1.9.1's server-side half is what makes
 # that safe, but the client half is NOT done. world/inventory.h's inventoryItemOnWire()
 # still reads `item < BLOCK_COUNT`. See the dated block above that function.
-PROTO_COMMIT	:=	bce14b658edc1c4a5be648e154dd7169e0427a6d
+#
+# 2026-09-03, bce14b65 -> 32795b9a (blocksmith-server v1.9.3, a PUSHED tag). This one is NOT
+# the comment-only kind above it. The diff is 35 insertions and 1 deletion, and the single
+# deleted line is the one that matters:
+#
+#     -#define BS_RECIPE_COUNT      4u   /* mirrors RECIPE_COUNT (world/crafting.h) */
+#     +#define BS_RECIPE_COUNT      5u   /* mirrors RECIPE_COUNT (world/crafting.h) */
+#
+# The other 34 lines are the block comment explaining it. v1.8.12 adds a fifth recipe,
+# RECIPE_COAL_ORE_TO_TORCH -- one coal ore to four torches -- and bs_proto.h RESTATES the
+# recipe count for the wire. It is NOT one of the eleven files tools/sync-world-sources.sh
+# mirrors, so the sync ran completely clean (every one of the eleven `synced` or `unchanged`,
+# exit 0) and the server's host suite still went red at SUITE_EXIT=2:
+#
+#     validate.c:57:1: error: static assertion failed: "recipe count must track world/crafting.h"
+#
+# which is that assert doing exactly the job it exists for. Recorded because "the mirror script
+# said unchanged and exited 0" is NOT the same statement as "client and server agree" -- the
+# second time this tree has proved that, the first being the registry wire record size two
+# paragraphs up.
+#
+# Worth correcting one plausible-sounding reading of this constant before someone acts on it:
+# BS_RECIPE_COUNT does not gate anything at runtime. A whole-tree grep returns five lines and
+# exactly ONE that is code -- the assert. The runtime bound is the server's game/bsgame.c:1332,
+# `if (a < RECIPE_COUNT)`, using the MIRRORED constant out of world/crafting.h, which the sync
+# script does carry. So this line is a pin, not a gate. Its whole job is to fail the build when
+# the two drift, and that is what it just did.
+#
+# RELEASE ORDER, and unlike the 533aee1 paragraph above this one is NOT free. Read that
+# paragraph's rule first: a new C->S id is server-first ONLY because it would meet
+# handle_app_payload()'s `default: send_kick()`. This change adds no id, so nothing gets
+# kicked -- but bsgame.c's `if (a < RECIPE_COUNT)` has **no else**. A daemon still running
+# v1.9.2 was compiled with 4 baked in, so a v1.8.12 client on it can craft everything EXCEPT
+# the torch, and the request is dropped in silence: no refusal packet, nothing on screen, just
+# a recipe that does nothing when tapped. The one recipe this release is named for is the one
+# that fails, and it fails invisibly. Server v1.9.3 is therefore released and tagged BEFORE
+# this bump, not after it, and CT 105 has to be updated for multiplayer crafting to work.
+#
+# Verified rather than assumed, before bumping: `git ls-remote origin` shows both
+# refs/heads/v1.9.3 and refs/tags/v1.9.3 present on the remote, the tag dereferences to
+# 32795b9a, and 32795b9a:proto/bs_proto.h is blob 8303be83 -- the same blob the drift guard
+# was reporting on disk. A pin naming a commit that exists only locally would break a fresh
+# clone, which is the failure this check is meant to prevent, so it is checked here and not
+# taken on trust.
+PROTO_COMMIT	:=	32795b9aecc26517fb19e4f49ab55d8c487b4ccf
 PROTO		:=	deps/blocksmith-server
 
 .PHONY: deps

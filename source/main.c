@@ -27,6 +27,7 @@
 #include "app/debugmenu_ui.h"
 #include "app/hw.h"
 #include "audio/audio.h"
+#include "audio/audio_sfx.h"
 #include "app/input_map.h"
 #include "app/memprobe.h"
 #include "app/options.h"
@@ -1346,6 +1347,12 @@ static const char* bsDbgInfoPlayer(char* buf, int cap, void* ctx)
 static bool bsDbgGetBiomeBorders(void* ctx)          { (void)ctx; return biomeBorderEnabled(); }
 static void bsDbgSetBiomeBorders(void* ctx, bool on) { (void)ctx; biomeBorderSetEnabled(on); }
 
+// v1.8.11 METRICS-VISIBLE. Same two-wrapper shape as the biome-border pair above, and for the
+// same reason: the flag is a file static in debug/metrics.c with two accessors, so there is no
+// per-entry state to carry and no ctx to keep in step.
+static bool bsDbgGetFrameTiming(void* ctx)          { (void)ctx; return metricsRowEnabled(); }
+static void bsDbgSetFrameTiming(void* ctx, bool on) { (void)ctx; metricsRowSetEnabled(on); }
+
 // The menu's rows, registered once at boot. Weather and Dimension are the spec'd systems
 // that do not exist yet: registered unavailable so they show greyed and the menu visibly
 // reserves their place, and a later version flips available=true instead of redesigning.
@@ -1387,6 +1394,24 @@ static void bsDebugRegister(void)
 		e->available = true;
 		e->getBool   = bsDbgGetBiomeBorders;
 		e->setBool   = bsDbgSetBiomeBorders;
+	}
+
+	// v1.8.11 METRICS-VISIBLE. Switches the bottom-screen HUD's timing row on. A DEBUG_TOGGLE
+	// and nothing else, registered beside Biome borders because it is the same kind of thing:
+	// reachable only through pause -> Options -> Debug, no options.ini key, no hotkey, and off
+	// again after a reboot. That is the whole of "a debug option, not a regular game feature".
+	//
+	// The ROW it turns on is on the HUD and not in this menu on purpose — see the block comment
+	// at the row itself in scene/ui.c. This menu's own "Frame" INFO row further down is a
+	// PAUSED reading and always was; it is left exactly as it is rather than quietly repaired,
+	// because changing what an existing readout means is not this task's to decide.
+	e = debugMenuRegister();
+	if (e) {
+		e->name      = "Frame timing";
+		e->kind      = DEBUG_TOGGLE;
+		e->available = true;
+		e->getBool   = bsDbgGetFrameTiming;
+		e->setBool   = bsDbgSetFrameTiming;
 	}
 
 	// A "Minimap" toggle used to sit here, between Render distance and Weather. It went
@@ -2732,6 +2757,29 @@ static void drawBottomUi(bool ok, const char* status, const char* netline, const
 
 	if (!ok) return;   // nothing to draw with; the screen stays the clear colour
 
+	// v1.8.11 METRICS-VISIBLE. The frame-timing row, built only when the debug menu's "Frame
+	// timing" toggle is on and left NULL otherwise, so a normal session draws exactly the panel
+	// it drew before. Formatted here rather than in scene/ui.c because scene/ui.h must not gain
+	// a dependency on debug/metrics.h (and through it <3ds.h>), which is the same rule every
+	// other number on that panel already follows.
+	//
+	// Four figures and no more, because four is what fits and what the question needs:
+	//   cpu   — main-thread WORK, frame_ms minus the one blocking wait in the loop
+	//   wait  — blocked in gpuWaitPrevFrame(): VBlank plus the GPU command queue
+	//   frame — wall clock, so cpu + wait can be checked against it on screen
+	//   fps   — derived from `frame`, because "is this below 60" is half of the reading
+	// Derived from the averaged frame rather than metricsFrameMs(): an fps computed from the
+	// instantaneous frame and printed beside an averaged frame time would disagree with it on
+	// screen, and the two disagreeing is exactly what makes a readout untrustworthy.
+	char timing[64];
+	timing[0] = '\0';
+	if (metricsRowEnabled()) {
+		const float f = metricsFrameAvgMs();
+		snprintf(timing, sizeof timing, "cpu %.1f  wait %.1f  frame %.1f ms  %.0f fps",
+		         (double)metricsCpuAvgMs(), (double)metricsWaitAvgMs(), (double)f,
+		         (f > 0.0f) ? (double)(1000.0f / f) : 0.0);
+	}
+
 	const UiStats stats = {
 		.columns    = s_world.columns,
 		.chunks     = s_world.chunks,
@@ -2742,6 +2790,7 @@ static void drawBottomUi(bool ok, const char* status, const char* netline, const
 		.bytes_peak = (uint32_t)budgetPeak(),
 		.status     = status,
 		.net        = netline,
+		.timing     = timing[0] ? timing : NULL,
 	};
 
 	// atlasTexture() rather than atlasBind(): gfx/sprite.c tracks the bound texture itself so
@@ -3255,7 +3304,7 @@ static bool runTitleScreen(Options* opts, bool returning_from_server)
 
 #endif   // BS_TITLE
 
-// Deletes every diagnostic file this build can write, at boot, before anything can write one.
+// Clears every diagnostic file this build can write, at boot, before anything can write one.
 //
 // This exists because of a specific and expensive mistake. steve booted v1.2.0 twice — once
 // into multiplayer, once into single player — and both froze. The card came back with
@@ -3265,35 +3314,76 @@ static bool runTitleScreen(Options* opts, bool returning_from_server)
 // followed was aimed at an average of them.
 //
 // After this runs, any diagnostic file on the card is from the boot that just froze, full stop.
-// A boot that freezes writes files and cannot delete them; the next boot deletes them before
+// A boot that freezes writes files and cannot clear them; the next boot clears them before
 // writing its own. There is no third possibility and no way to be looking at last time's
 // evidence.
 //
-// drawprobe.txt is deliberately NOT deleted: it is the one file whose whole job is to survive a
+// drawprobe.txt is deliberately NOT cleared: it is the one file whose whole job is to survive a
 // boot, because a boot that hangs never writes its own survival line and the silence is what the
 // next boot reads. bootid.txt is written last, so a card with diagnostic files but no bootid.txt
 // means the fence itself failed and nothing on it should be trusted.
+//
+// ── 2026-09-03: this fence used to DELETE. It now renames to prev-*. ───────────────────────
+//
+// The invariant above is unchanged and is the whole reason this function exists, so read the
+// change as narrowly as it is meant: an un-prefixed diagnostic file still means "written by the
+// boot that just froze, full stop", because the fence still moves every one of them out of the
+// way before anything can write. Nothing that was true of a file called hang.txt yesterday is
+// less true of it today.
+//
+// What changed is what happens to the PREVIOUS boot's copy, and it changed because the old
+// answer — destroy it — cost us the only evidence of the only freeze we currently care about.
+// steve froze a real console at render distance 5 after walking one or two chunks from spawn.
+// hang.txt on his card is the single most informative artefact in this entire investigation, it
+// exists in exactly one copy, and until this edit the act of launching the game to reproduce the
+// bug was also the act of erasing the record of it. A diagnostic system whose first move on
+// startup is to destroy the diagnosis has a defect regardless of how well the deletion is
+// argued, and the argument for deletion was never about deletion: it was about AMBIGUITY, about
+// not being able to tell which boot a file came from. prev- answers that question outright, so
+// the fence keeps everything the reasoning above actually asked for and stops paying for it with
+// the evidence.
+//
+// One generation, not a rotation. prev-hang.txt is overwritten by the next boot in turn, so this
+// buys exactly one accidental relaunch, which is the failure mode that actually happens — the
+// console froze, you power-cycled it, you launched the game again before it occurred to you that
+// the card had anything on it. Keeping more would mean managing a ring on a user's SD card for a
+// benefit nobody has ever needed.
+//
+// The remove-then-rename order is not defensive noise: FAT rename() refuses an existing target,
+// so without the remove the second freeze in a row would silently keep the FIRST one's prev-
+// file and quietly discard the newer one — the exact ambiguity this fence exists to prevent,
+// reintroduced through the back door. The fallback to remove() on a failed rename preserves the
+// old behaviour rather than leaving a stale file lying around claiming to be this boot's.
+static void diagRetire(const char* live, const char* prev)
+{
+	remove(prev);
+	if (rename(live, prev) != 0)
+		remove(live);
+}
+
 static void diagFenceBoot(void)
 {
-	static const char* const kill[] = {
-		"sdmc:/blocksmith/hang.txt",
-		"sdmc:/blocksmith/postmortem.txt",
-		"sdmc:/blocksmith/gxprobe.txt",
-		"sdmc:/blocksmith/selftest.txt",
-		"sdmc:/blocksmith/cmdhang.bin",
-		"sdmc:/blocksmith/cmdprev.bin",
-		"sdmc:/blocksmith/bisect.bin",
-		"sdmc:/blocksmith/boot_timing.txt",
-		"sdmc:/blocksmith/bootid.txt",
+	static const char* const kill[][2] = {
+		{ "sdmc:/blocksmith/hang.txt",        "sdmc:/blocksmith/prev-hang.txt"        },
+		{ "sdmc:/blocksmith/postmortem.txt",  "sdmc:/blocksmith/prev-postmortem.txt"  },
+		{ "sdmc:/blocksmith/gxprobe.txt",     "sdmc:/blocksmith/prev-gxprobe.txt"     },
+		{ "sdmc:/blocksmith/selftest.txt",    "sdmc:/blocksmith/prev-selftest.txt"    },
+		{ "sdmc:/blocksmith/cmdhang.bin",     "sdmc:/blocksmith/prev-cmdhang.bin"     },
+		{ "sdmc:/blocksmith/cmdprev.bin",     "sdmc:/blocksmith/prev-cmdprev.bin"     },
+		{ "sdmc:/blocksmith/bisect.bin",      "sdmc:/blocksmith/prev-bisect.bin"      },
+		{ "sdmc:/blocksmith/boot_timing.txt", "sdmc:/blocksmith/prev-boot_timing.txt" },
+		{ "sdmc:/blocksmith/bootid.txt",      "sdmc:/blocksmith/prev-bootid.txt"      },
 	};
 	for (size_t i = 0; i < sizeof(kill) / sizeof(kill[0]); i++)
-		remove(kill[i]);
+		diagRetire(kill[i][0], kill[i][1]);
 
-	// The capture ring's numbered frames, same reasoning.
+	// The capture ring's numbered frames, same reasoning. Longest path built here is
+	// "sdmc:/blocksmith/prev-cmd7.bin" at 30 characters, so 64 is not a tight fit.
 	for (int k = 0; k < 8; k++) {
-		char p[64];
-		snprintf(p, sizeof p, "sdmc:/blocksmith/cmd%d.bin", k);
-		remove(p);
+		char live[64], prev[64];
+		snprintf(live, sizeof live, "sdmc:/blocksmith/cmd%d.bin", k);
+		snprintf(prev, sizeof prev, "sdmc:/blocksmith/prev-cmd%d.bin", k);
+		diagRetire(live, prev);
 	}
 
 	// hwInit() asked this at the top of main(); asking again here would be a second answer
@@ -3309,10 +3399,15 @@ static void diagFenceBoot(void)
 		"console   : %s\n"
 		"boot tick : %llu\n"
 		"\n"
-		"Every other diagnostic file in this folder was deleted immediately before this one\n"
-		"was written. So anything sitting beside it — hang.txt, postmortem.txt, gxprobe.txt,\n"
-		"cmd*.bin — was written by THIS boot and no other. drawprobe.txt is the exception and\n"
-		"is meant to span boots.\n",
+		"Every other diagnostic file in this folder was renamed to prev-<name> immediately\n"
+		"before this one was written. So anything sitting beside it WITHOUT that prefix —\n"
+		"hang.txt, postmortem.txt, gxprobe.txt, cmd*.bin — was written by THIS boot and no\n"
+		"other, and anything WITH it is from the boot before this one. drawprobe.txt is the\n"
+		"exception and is meant to span boots.\n"
+		"\n"
+		"If you are here because the console froze: the file you want is hang.txt if this boot\n"
+		"is the one that froze, or prev-hang.txt if you have already relaunched the game since.\n"
+		"Only one generation is kept, so relaunching a second time will discard it.\n",
 		BLOCKSMITH_VERSION_SET ? BLOCKSMITH_VERSION : "(unset)",
 		n3ds ? "New 3DS" : "Old 3DS",
 		(unsigned long long)svcGetSystemTick());
@@ -3772,10 +3867,17 @@ int main(void)
 	const bool ui_ok = spriteInit() && fontInit();
 
 	// Brought up in both builds on purpose, even though only a BS_BOTTOM_UI build draws
-	// with it. The batch claims a shader and 48 KB of linear memory, and a console build
+	// with it. The batch claims a shader and 96 KB of linear memory, and a console build
 	// that skipped that would be measuring a different memory profile from the one that
 	// ships — which is exactly the kind of difference that makes an Old 3DS headroom figure
 	// wrong. The cast is what keeps -Wunused-variable quiet in the console build.
+	//
+	// 2026-09-03: this said 48 KB. The real figure is 96 KB and has been since the batch was
+	// doubled — gfx/sprite.c:43 states the arithmetic (1024 * 4 * 24) and says in the same
+	// breath that it is "up from 48 KB", so this line was quoting the number the OTHER file
+	// had already retired. Corrected rather than deleted because the sentence exists to make
+	// an Old 3DS headroom figure trustworthy, and it was doing the exact opposite: understating
+	// the reservation by half, in the one comment a reader would go to for it.
 	(void)ui_ok;
 
 	// Step 8.7's updater, before the menu that offers it: the Options page greys its button out
@@ -3842,15 +3944,21 @@ int main(void)
 	}
 
 	// v1.8.9 audio. The saved volume, applied once opts is loaded; and the three sound effects,
-	// loaded by fixed id (1=block break, 2=block place, 3=footstep) so every later audioPlay*
-	// call can reference them without re-reading romfs. audioLoad mounts/unmounts romfs per call
-	// internally (see audio/audio.h and audio.c's own comment) and never disturbs updaterInit's
-	// mount if one happens to still be up, so this is safe regardless of call order against
-	// updaterInit() above.
+	// loaded once here so every later cue can reference them without re-reading romfs. audioLoad
+	// mounts/unmounts romfs per call internally (see audio/audio.h and audio.c's own comment) and
+	// never disturbs updaterInit's mount if one happens to still be up, so this is safe
+	// regardless of call order against updaterInit() above.
+	//
+	// v1.9.0: the returned ids are CAPTURED into audio/audio_sfx.h's slots instead of being
+	// discarded and assumed to be 1, 2, 3 in load order. The assumption was true and was not
+	// safe — audioLoad consumes no id when it fails, so a single missing or corrupt .bsnd
+	// renumbers everything behind it and blocks start breaking with the place sound, silently.
+	// audio_sfx.h states the whole argument. Registering is also what stops the reverse
+	// mistake: a fourth sound added to this block cannot renumber the three below it.
 	audioSetMasterVolume(opts.audio_volume);
-	audioLoad("romfs:/sfx/block_break.bsnd");
-	audioLoad("romfs:/sfx/block_place.bsnd");
-	audioLoad("romfs:/sfx/footstep.bsnd");
+	audioSfxRegister(SFX_BLOCK_BREAK, audioLoad("romfs:/sfx/block_break.bsnd"));
+	audioSfxRegister(SFX_BLOCK_PLACE, audioLoad("romfs:/sfx/block_place.bsnd"));
+	audioSfxRegister(SFX_FOOTSTEP,    audioLoad("romfs:/sfx/footstep.bsnd"));
 
 	// ── One session ─────────────────────────────────────────────────────────────────────
 	//
@@ -4451,6 +4559,17 @@ session_start:
 	// treats a NULL queue as "relight inline", which is only what the host tests want.
 	interactSetRelightQueue(&s_relightq);
 
+	// v1.9.0 audio. The footstep cadence, beside `it` because it has the same lifetime: one
+	// visit to one world. A break and a place each have an instant to hang a sound on inside
+	// scene/interact.c and are wired there; walking has none, so this accumulates horizontal
+	// travel and fires every SFX_FOOTSTEP_STRIDE blocks. Declared here rather than as a file
+	// static so the backward `goto` that starts a new session cannot carry the previous world's
+	// half-finished stride, or its last position, into the new one — a fresh session would
+	// otherwise see the spawn as one enormous step. (The teleport clamp in audio_sfx.c would
+	// discard that step anyway; this makes it not arise rather than rely on the guard.)
+	AudioFootsteps footsteps;
+	audioFootstepsReset(&footsteps);
+
 #ifdef BS_WATER_VIS_TEST
 	// VERIFICATION ONLY. Never defined by the Makefile, never in a release build — it exists
 	// so one claim can be looked at, and it is the only claim task 22b has that no host test
@@ -4976,7 +5095,19 @@ session_start:
 #if BS_FLY
 		if (!paused) cameraUpdate(&player.cam, metricsFrameMs());
 #else
-		if (!paused) playerUpdate(&player, &s_world, metricsFrameMs());
+		if (!paused) {
+			playerUpdate(&player, &s_world, metricsFrameMs());
+			// v1.9.0 audio. Straight after the step that moved the body, so the distance this
+			// banks is the distance the player actually travelled this frame and not last
+			// frame's. Inside the !paused gate for the same reason the step is: a paused world
+			// does not tick, and a player standing still in the menu must not be walking.
+			//
+			// Under the !BS_FLY branch only. The free-fly camera never touches player.body, so a
+			// BS_FLY build would call this with a body that never moves — no travel, no steps,
+			// and no footsteps is the right answer for a camera that is not a person walking.
+			audioFootstepsUpdate(&footsteps, player.body.x, player.body.y, player.body.z,
+			                      player.body.on_ground);
+		}
 #endif
 #if BS_WALK_STRESS
 		// Clear the startup frame's stall out of `worst` first, for the same reason

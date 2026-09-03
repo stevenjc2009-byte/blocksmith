@@ -1,376 +1,305 @@
-# Audio sourcing research — v1.8.17
+# Audio sourcing research — v1.8.17 "Sound"
 
-Scope: this document is a plan and a shortlist only. No audio files were downloaded, no
-`source/` file was touched, and no `make` was run during this pass. It answers three
-questions: what the 3DS audio hardware actually requires, what the real memory ceiling
-is, and where to get sound effects that are genuinely free to use.
+Scope: this document is a sourcing plan and licence audit only. No audio file was
+downloaded, no `assets/sfx_src/*.ogg` was added, no `source/` file was touched, and
+`tools/make_sounds.py` was read but not edited during this pass — that file belongs to
+another lane. It answers three questions: what audio system already exists (§1), how
+much room is left in it (§2), and which specific, licence-clean sounds should fill that
+room (§3–§5).
 
-Provenance is labelled on every claim: **measured** (read off a real console tonight, or
-computed arithmetic on a measured number), **read-from-header** (taken directly from a
-libctru header or bundled devkitPro example source file, quoted with file:line),
-**sourced-with-URL** (a web page fetched and read this session), **reasoned** (a
-conclusion drawn from the above, not itself measured or read), or **assumed** (stated
-without independent verification, flagged as such).
-
----
-
-## §1 — What the 3DS audio hardware requires
-
-**read-from-header.** Blocksmith's own source tree has no audio subsystem at all today.
-`grep -ri "ndsp|DSP|audio|sound"` across `source/` returns 17 hits, and every one of
-them is a false positive — English prose using the words "sound" (as in "a sound
-argument") or "unsound", never the DSP service. There is no `ndspInit`, no `ndsp/`
-include, no `.cdc` reference, nothing. Confirmed by reading the matched lines directly,
-not just the file list (`source/app/gputest.c:848`, `source/world/chunk.h:110`,
-`source/world/cavewalk_test.c:548-658`, `source/world/water.c:204`, etc. — all comment
-prose). This matches `docs/ROADMAP.md:371-375`, which schedules "a real audio system" for
-v1.8.17 and has not been touched yet.
-
-**read-from-header.** The audio hardware is driven through libctru's `ndsp` module,
-headers at `C:\devkitPro\libctru\include\3ds\ndsp\ndsp.h` and `...\ndsp\channel.h`:
-
-- `ndsp.h:9` — `#define NDSP_SAMPLE_RATE (SYSCLOCK_SOC / 512.0)`. This is the DSP
-  coprocessor's own fixed internal mixing rate (works out to ~32,728 Hz), not a rate the
-  game must encode its samples at.
-- `ndsp.h:95` — `Result ndspInit(void);`. It returns a `Result`, i.e. it is designed to
-  be checked and can fail. (Consequence for what happens on failure: §1 continued below.)
-- `channel.h:10-15` — three sample encodings: `NDSP_ENCODING_PCM8` (0), `PCM16` (1),
-  `ADPCM` (2, "DSPADPCM (GameCube format)").
-- `channel.h:25-33` — format flags combine channel count and encoding:
-  `NDSP_FORMAT_MONO_PCM8/PCM16/ADPCM` and `NDSP_FORMAT_STEREO_PCM8/PCM16`. There is no
-  stereo ADPCM flag defined — ADPCM is mono-only in this header.
-  `NDSP_CHANNELS(n)` masks to 2 bits, but only 1 and 2 have defined format constants.
-- `channel.h:56` — `void ndspChnReset(int id);` and every channel function's doc comment
-  says `id (0..23)` — 24 hardware mixer channels.
-  `channel.h:137` — `void ndspChnSetRate(int id, float rate);` — **each channel has its
-  own arbitrary sample rate**, resampled by the DSP's own interpolator
-  (`channel.h:41-46`: polyphase / linear / none) up or down to the fixed internal rate.
-  So source material does **not** need to be pre-resampled to one canonical rate; the
-  hardware does that per-channel.
-- `ndsp.h:57-75` — the wave buffer struct (`ndspWaveBuf`) holds a union of
-  `data_pcm8` / `data_pcm16` / `data_adpcm` / `data_vaddr` plus `nsamples`. The header
-  itself says nothing about *which* memory region the pointer must point into.
-
-**measured (read the actual bundled example source, not guessed).** That memory
-requirement is answered by devkitPro's own shipped example,
-`C:\devkitPro\examples\3ds\audio\streaming\source\main.c`:
-- Line 44: `u32 *audioBuffer = (u32*)linearAlloc(SAMPLESPERBUF*BYTESPERSAMPLE*2);` — the
-  sample buffer is allocated with `linearAlloc`, not `malloc`.
-- Line 25: `DSP_FlushDataCache(audioBuffer,size);` — called after writing samples and
-  before the buffer is handed to a channel.
-- Line 123: `linearFree(audioBuffer);` on teardown.
-
-**reasoned**, from the above: the DSP coprocessor reads wave buffer sample data by
-physical address (it is a separate chip from the ARM11, not something that shares the
-CPU's virtual-memory view), so the buffer has to be physically contiguous and
-cache-coherent — which is exactly what `linearAlloc`/`linearFree`/`DSP_FlushDataCache`
-exist to guarantee and `malloc` does not. **ndsp sample data must live in the linear
-heap, not the application heap.** This is the single most important constraint for
-sizing a sound set on this console, and it is why §2 below uses the linear-heap reading
-and not the much larger application-heap one.
-
-### The DSP firmware requirement — a mandatory error-handling case, not a hard blocker
-
-**sourced-with-URL**, cross-checked across `C:\devkitPro\examples\3ds\audio\README.md:3`
-(bundled locally, read directly) and community documentation (3dbrew/GBAtemp/GameBrew):
-
-> "Homebrew requires a copy of the DSP firmware to be present at sdmc:/3ds/dspfirm.cdc."
-
-Nintendo's DSP firmware binary is not distributable — it is copyrighted, dumped by each
-user from their own console (Luma3DS Rosalina menu → "Miscellaneous options" → "Dump DSP
-firmware", or historically the DSP1 homebrew title). Blocksmith's CIA cannot legally
-ship this file, and the devkitPro README says so.
-
-**On real hardware**, if `dspfirm.cdc` is absent, `ndspInit()` fails — consistent with it
-returning a checkable `Result` (`ndsp.h:95`). Community sources describe the practical
-symptom as "no sound", not a hard crash, provided the caller actually checks the
-`Result` and skips the rest of audio setup rather than assuming success and calling into
-an unready DSP service. **On Citra/Azahar** (HLE DSP), a bundled bug report
-(lovebrew/lovepotion#102) confirms a *zero-byte* placeholder file at that path is enough
-to satisfy the check — the emulator's HLE path doesn't parse the firmware, it only
-checks the file exists.
-
-**Consequence for Blocksmith, stated plainly since this is exactly the kind of thing
-that becomes a shipping blocker if mishandled:** this is not something to work around —
-every other 3DS homebrew game with sound has the same requirement, and the fix is
-entirely in how the code is written, not in anything that needs sourcing. `ndspInit()`'s
-`Result` must be checked at boot; on failure the game must set an `audioAvailable = false`
-flag and skip every subsequent `ndsp*` call for the rest of the session, rather than
-assume init succeeded. Handled that way, a player without a dumped `dspfirm.cdc` gets a
-silent game, not a crash. This belongs in whatever `audio_init()` gets written for
-v1.8.17 — flagged here, not built here, per this task's file-ownership boundary.
+Provenance is labelled on every claim: **measured** (a number read directly off a file,
+or computed arithmetic on one), **read-from-source** (quoted from a file in this repo,
+file:line), **verified-this-session** (a licence page fetched and read during this pass,
+independent of anything an earlier document claimed), and **reasoned** (a conclusion
+drawn from the above).
 
 ---
 
-## §2 — The memory ceiling
+## §0 — Correction: the previous version of this document was wrong
 
-**measured**, exactly as given — a live New 3DS reading taken from a running v1.8.6
-build:
+The version of this file this pass replaced opened with: *"Blocksmith's own source tree
+has no audio subsystem at all today"* and built its entire memory analysis, format
+recommendation and shortlist on that premise. **That premise is false as of this
+session.** A working ndsp audio backend is checked in, sounds already ship, and the
+format, sample rate and pool-sizing decisions that earlier draft treated as open
+questions have already been made and implemented. Likely explanation: a separate
+research pass (`docs/research/audio.md`, not owned by this lane) was written before
+the audio backend existed and correctly found nothing; the backend was built afterward;
+this file was never updated to match. It is updated now. Every §1 and §2 claim below was
+re-verified against the actual files this session, not carried over from either prior
+draft.
 
-| Reading | Bytes |
+---
+
+## §1 — What already exists (verified this session)
+
+**read-from-source.** The audio subsystem lives in `source/audio/`: `audio.c` (364
+lines), `audio.h` (207 lines), `audio_ndsp.c` (177 lines, the real libctru backend),
+`audio_bsnd.c`/`audio_bsnd.h` (the sound-container format), `audio_mixer.c`/`.h` (voice
+allocation), `audio_pan.c`/`.h` (positional panning), plus `audio_bsnd_test.c` (311
+lines) and `audio_mixer_test.c` (692 lines). 2,564 lines total, not zero.
+
+- `source/audio/audio.c:126` calls `mixerInit(&s_mixer, backend, AUDIO_VOICE_COUNT)`,
+  which drives `ndspInit()` through `audio_ndsp.c`'s real backend
+  (`extern const AudioBackend* audioNdspBackend(void);` at `audio.c:22`) on `__3DS__`
+  builds.
+- `source/audio/audio.h:9-17` states the contract: if `ndspInit()` fails (no dumped
+  `dspfirm.cdc`), `audioInit()` returns `false` and every play call becomes a safe no-op
+  — never a crash, never a per-frame check the caller has to remember. This is exercised
+  by test, not just described (`audio.h:19-20`).
+- `source/main.c:3851-3853` calls `audioLoad("romfs:/sfx/block_break.bsnd")`,
+  `block_place.bsnd`, and `footstep.bsnd` at boot. `source/main.c:4884-4885` calls
+  `audioSetListener(...)` and `audioUpdate()` once a frame.
+- **Gap found this session, worth flagging explicitly:** boot-loading and the per-frame
+  listener update are wired in, but no gameplay call site actually triggers a sound yet.
+  `grep -rn "audioPlayAt(\|audioPlay(\|audioPlayEx(" source/ --include=*.c` outside
+  `source/audio/` itself returns **zero hits**. Block break/place, footsteps, and
+  everything else in §3 below have no trigger call in the tree today. That wiring is
+  gameplay-code work (`source/main.c` and/or the world/scene files other lanes currently
+  own) — out of scope for this document and this lane, noted here only so it isn't
+  mistaken for already being done.
+
+**read-from-source — the shipped format.** `tools/make_sounds.py:1-24` documents the
+`BSND` container: the 3DS DSP plays raw PCM only, so `ffmpeg` decodes each source file
+once on a desktop machine into the exact format the console loads with a bulk read and
+zero per-sound decode work. `tools/make_sounds.py:44` (`TARGET_RATE = 22050`) and `:49`
+(`TARGET_CHANNELS = 1`) fix the format as **16-bit mono PCM at 22,050 Hz** — this is
+already decided, not a choice this document gets to make. `tools/make_sounds.py:58-60`
+gives the reasoning: 22,050 Hz is a clean 2:1 decimation from the 44.1 kHz sources are
+mastered at, and it is well above what the 3DS's speakers reproduce.
+
+**measured — the three shipped sounds.**
+
+```
+romfs/sfx/block_break.bsnd   41,368 bytes
+romfs/sfx/block_place.bsnd   34,380 bytes
+romfs/sfx/footstep.bsnd      11,992 bytes
+                             -------
+                             87,740 bytes on disk
+```
+
+Each `.bsnd` carries a 24-byte header (`tools/make_sounds.py:96`, `HEADER_BYTES = 24`),
+so pool bytes actually spent = 87,740 − (3 × 24) = **87,668 bytes**. This is not a figure
+computed for this document — it is asserted directly by the test suite:
+`source/audio/audio_mixer_test.c:653-654`, `CHECK(87668u < AUDIO_POOL_BYTES_OLD3DS)` and
+`CHECK(87668u < AUDIO_POOL_BYTES_NEW3DS)`. `assets/sfx_src/ATTRIBUTION.md:14-20`
+confirms provenance: all three are Kenney "Impact Sounds" (CC0), byte-verified by SHA-256
+against the pack zip (`ATTRIBUTION.md:51-56`).
+
+**read-from-source — the pool ceiling.** `source/audio/audio.h:68-69`:
+
+```c
+#define AUDIO_POOL_BYTES_NEW3DS 1048576u
+#define AUDIO_POOL_BYTES_OLD3DS  393216u
+```
+
+`source/audio/audio.c:127` picks between them with `hwIsNew3ds() ? ... : ...`, and
+`audio.c:129-134` takes the pool from the **linear** heap (`poolAlloc`), after `ndspInit`
+and before any sound loads — `audio.h:22-28` explains why linear and not the application
+heap: the DSP reads sample data by physical address, and linear is "the same pool the GPU
+draws vertices out of," i.e. it is in direct competition with render distance
+(`audio.h:46-67` gives the full measured-linear-heap context: 67,108,864 B total,
+~18,285,568 B free on a New 3DS at boot, chunk mesh arenas as the other big consumer).
+This is already documented in `audio.h` itself and was not re-derived here.
+
+**Arithmetic check, done independently this session, not copied from a comment:**
+393,216 ÷ (22,050 × 2) = 393,216 ÷ 44,100 = **8.9147… seconds** of 22,050 Hz 16-bit mono
+audio, total, for the entire Old 3DS pool. That confirms the task's stated figure. The
+three shipped sounds (87,668 B) already spend 87,668 ÷ 44,100 = **1.988 s** of that.
+
+**Remaining pool room for new sounds in v1.8.17:**
+
+| Console | Pool ceiling | Already spent | Remaining |
+|---|---:|---:|---:|
+| Old 3DS | 393,216 B | 87,668 B | **305,548 B** (6.928 s) |
+| New 3DS | 1,048,576 B | 87,668 B | **960,908 B** (21.789 s) |
+
+**The Old 3DS figure is the binding constraint for everything below** — the task's own
+framing, confirmed by measurement, not assumption.
+
+---
+
+## §2 — Ranked sound list and Old-3DS fit
+
+Ranked by gameplay value (how often it's heard × how much it's missed when absent), not
+by how easy each was to source. Durations are *target trimmed lengths for the game*, not
+the source recording's full length — `tools/make_sounds.py`'s pipeline decodes and
+resamples but does not itself trim, so trimming happens either during import prep or
+needs a small addition to that step; that decision belongs to whoever owns
+`tools/make_sounds.py`, flagged here rather than assumed. Bytes = duration × 22,050 × 2,
+i.e. 44,100 B/s — the format already fixed by §1, not a recommendation.
+
+### Tier 1 — Per-material break / place / footstep (the core verb of the game)
+
+| # | Sound | Status | Duration | Bytes | Running total |
+|---|---|---|---:|---:|---:|
+| — | Footstep — wood | **existing**, no new cost | 0.27s* | 0 | 0 |
+| — | Block break — stone | **existing**, no new cost | 0.94s* | 0 | 0 |
+| — | Block place — wood | **existing**, no new cost | 0.78s* | 0 | 0 |
+| 1 | Footstep — dirt/grass | new | 0.25s | 11,025 | 11,025 |
+| 2 | Footstep — stone | new | 0.25s | 11,025 | 22,050 |
+| 3 | Footstep — sand | new | 0.25s | 11,025 | 33,075 |
+| 4 | Block break — dirt/grass | new | 0.40s | 17,640 | 50,715 |
+| 5 | Block break — wood | new | 0.45s | 19,845 | 70,560 |
+| 6 | Block break — sand | new | 0.40s | 17,640 | 88,200 |
+| 7 | Block break — glass | new | 0.45s | 19,845 | 108,045 |
+| 8 | Block place — stone | new | 0.40s | 17,640 | 125,685 |
+| 9 | Block place — dirt/grass | new | 0.35s | 15,435 | 141,120 |
+| 10 | Block place — sand | new | 0.35s | 15,435 | 156,555 |
+
+*Existing durations computed from shipped pool bytes ÷ 44,100 B/s, for reference only —
+already paid for.
+
+### Tier 2 — Player feedback and UI
+
+| # | Sound | Duration | Bytes | Running total |
+|---|---|---:|---:|---:|
+| 11 | Player — hurt | 0.55s | 24,255 | 180,810 |
+| 12 | Player — eat | 0.18s† | 7,938 | 188,748 |
+| 13 | UI — click/move | 0.12s | 5,292 | 194,040 |
+| 14 | UI — confirm/select | 0.15s | 6,615 | 200,655 |
+
+†Source clip is itself only ~0.18s (see §4) — trimming further isn't possible, this row
+uses the source near-full.
+
+### Tier 3 — World interaction
+
+| # | Sound | Duration | Bytes | Running total |
+|---|---|---:|---:|---:|
+| 15 | Door/chest — open clunk | 0.40s | 17,640 | 218,295 |
+| 16 | Water — enter/splash | 0.55s | 24,255 | 242,550 |
+| 17 | Water — exit | 0.50s | 22,050 | 264,600 |
+
+**Total new bytes through Tier 3: 264,600 B.**
+**Old 3DS remaining budget: 305,548 B.**
+**Fits, with 40,948 B (10.4%) to spare** — a real margin, not a shave-to-the-byte fit.
+New 3DS remaining budget is 960,908 B; Tier 1–3 uses 27.5% of it, comfortable room to
+grow later.
+
+### Tier 4 — Environmental ambience (does NOT fit Old 3DS — see §3)
+
+| # | Sound | Duration | Bytes |
+|---|---|---:|---:|
+| 18 | Swimming stroke (one-shot, retriggered) | 0.40s | 17,640 |
+| 19 | Lava — sizzle tick (one-shot, retriggered) | 0.50s | 22,050 |
+| 20 | Ambient — cave drone (short seamless loop) | 2.50s | 110,250 |
+
+Tier 4 total: 149,940 B. Added to the Tier 1–3 total, that's 414,540 B — **114,992 B over
+the Old 3DS's entire remaining budget of 305,548 B**, before even considering that a
+usable ambient drone loop realistically wants to be longer than 2.5s to avoid sounding
+like a metronome, which would only widen the gap. There is no trim of Tier 4 that makes
+it fit next to Tier 1–3 on Old 3DS. It fits trivially on New 3DS (415K of 961K available,
+43%), which is exactly the trap: it would be easy to ship Tier 4 New-3DS-only and call
+v1.8.17 done.
+
+### Cut from this version — real gaps, not oversights
+
+- **Footstep — glass.** Walking on top of a placed glass block is a legal but rare
+  interaction. Dropped to save 11,025 B rather than forced in at the bottom of the
+  ranking.
+- **Block place — glass.** Same reasoning the previous draft of this document reached
+  independently (§7 of the prior version): placing glass doesn't shatter anything, so
+  the natural "glass" sound (breaking) doesn't fit the place action, and no dedicated
+  "soft glass clink" CC0/CC-BY recording was found this session either. See §4 for the
+  synthesis recommendation instead of leaving this empty.
+
+---
+
+## §3 — Should Tier 4 ship New-3DS-only? No — recommend deferring all of it instead
+
+`docs/ROADMAP.md:7-9` states the project's own standing rule in these words: **"Both
+consoles, always. Every version must work on an Old 3DS and a New 3DS. Where the two
+genuinely differ ... it is said explicitly. Where they do not, it is not mentioned,
+because 'works on both' is the baseline, not a feature."** Render distance is the one
+place that rule already accepts a console split (`source/scene/render_dist.h:167-168`,
+`RENDER_DIST_MAX_OLD 3` vs `RENDER_DIST_MAX_NEW 5`), and that split is a hardware
+constraint stated openly in the render-distance system itself, not something bolted on
+per-feature.
+
+Ambience is not in that category. Swimming, lava hazard cues and a cave drone are not
+edge-case content an Old 3DS player would expect to be missing — they're regular
+environmental feedback, and a player who never sees a change log would simply experience
+"the game plays quieter on Old 3DS," which is a worse outcome than "the game doesn't have
+this yet on either console." Recommend: **cut Tier 4 from v1.8.17 entirely, on both
+consoles**, and revisit it in a later version, either when a render-distance or
+linear-heap change (owned by the lanes currently in `chunk_render.c`/`worldgen*.c`)
+frees more Old 3DS headroom, or by redesigning cave ambience as a much shorter one-shot
+"stinger" triggered occasionally rather than a continuously resident loop, which is a
+design change outside this document's scope.
+
+---
+
+## §4 — Sourcing decisions, one row per sound
+
+Every licence below was fetched and read on the sound's own original page this session —
+not an aggregator's summary, and not carried over from the prior draft of this document
+without re-checking. Durations are the **source recording's own length**; the trimmed
+in-game length is the Tier table above.
+
+### Source (real recordings — verified this session)
+
+| Sound | Original page | Uploader | Licence | Source duration | Attribution needed |
+|---|---|---|---|---:|---|
+| Footstep — dirt/grass, stone, sand | https://opengameart.org/content/fantozzis-footsteps-grasssand-stone | Original recordist **Fantozzi**; submitted to OpenGameArt by **qubodup** | CC0 | pack of 12 single steps (per-file length not itemised — see gap below) | No |
+| Block break — glass | https://freesound.org/people/Ruben_Uitenweerde/sounds/486166/ | Ruben_Uitenweerde | **CC BY 3.0** | 2.147s | **Yes** — "Glass breaking" by Ruben_Uitenweerde (Freesound.org, CC BY 3.0) |
+| Player — hurt | https://freesound.org/people/MAJ061785/sounds/85553/ | MAJ061785 | **CC BY 3.0** | 1.800s | **Yes** — "male pain grunt" by MAJ061785 (Freesound.org, CC BY 3.0) |
+| Player — eat | https://opengameart.org/content/apple-bite | AntumDeluge | CC0 | ~0.18s (est. from 16.1 KB file at 44,100 Hz mono; page does not state duration directly) | No |
+| Door/chest — open clunk | https://freesound.org/people/spookymodem/sounds/202092/ | spookymodem | CC0 | 4.936s | No |
+| Water — enter/splash | https://freesound.org/people/qubodup/sounds/210428/ | qubodup | CC0 | 2.445s | No |
+| Water — exit | https://freesound.org/people/speedygonzo/sounds/235725/ | speedygonzo | CC0 | 35.424s (a long field recording; a single splash moment within it is the trim target) | No |
+| Block break/place — dirt/grass, sand, stone; break — wood | https://kenney.nl/assets/impact-sounds | Kenney (Kenney Vleugels) | CC0 | pack of 130 files (per-file length not itemised — see gap below) | No |
+
+**Rejected candidates, and why** (recorded so the same dead end isn't re-walked later):
+
+- "Open Treasure Chest 8 Bit.wav" (Mrthenoronha, Freesound) — Attribution-NonCommercial.
+  **Rejected**: non-commercial-only is on the not-acceptable list.
+- Audionautics "Lava loop.wav" (Freesound) — CC BY, tempting for Tier 4's lava sizzle,
+  but Tier 4 is deferred per §3, so no licence decision was needed on it this pass.
+- ZapSplat's lava sizzle — ZapSplat's terms require a free account and attribution
+  *to ZapSplat*, not a standard CC licence; provenance to an original recordist is
+  unclear from the aggregator page. Not pursued, consistent with the rule that an
+  aggregator's licence claim is not proof.
+
+### Pack-level gap, stated plainly
+
+Kenney's own asset pages (`impact-sounds`, confirmed CC0 again this session by re-fetching
+the page — see §1's provenance note that this is the *same pack* the three shipped sounds
+already come from) do not list individual filenames; that only becomes visible by
+downloading the zip, which this pass does not do. The same is true of the Fantozzi
+footsteps pack (OpenGameArt states "12 single steps," not which is which). **This means
+rows 4, 6, 8, and 9 of the Tier 1 table (dirt/grass and sand break/place, wood break) and
+rows 1–3 (dirt/grass/stone/sand footsteps) are licence-verified at the pack level but not
+yet matched to a specific filename inside the archive.** That match is a five-minute task
+once download is authorised, exactly as the prior draft of this document also found for
+its own pack-level rows — flagged rather than guessed at either time.
+
+### Synthesise instead (recommend building, not sourcing)
+
+| Sound | Why synthesis beats sourcing here |
 |---|---|
-| Linear heap, total | 67,108,864 |
-| Linear heap, free after boot at render distance 2 | 18,285,568 |
-| Chunk mesh pool alone, claimed from that linear heap | 46,948,352 |
-| Application heap, total | 60,977,152 |
-| Application heap, in use at boot | 253,032 |
+| UI — click/move, confirm/select | A single short tone or two-tone blip is trivial to generate and needs zero licence research, zero attribution bookkeeping, and hits an exact byte target (5,292 B / 6,615 B) instead of whatever a downloaded sample happens to be. This project already has working precedent for exactly this: the Home Menu banner chime is synthesised from sine partials and a noise burst by `tools/make_banner_audio.py` rather than sourced (per `README.md:96-98`, cited in the prior draft of this document and independently confirmed against `tools/make_banner_audio.py`'s own header comment this session). UI blips are the same category of sound. |
+| Block place — glass (the gap noted in §2) | No natural recording fits "set a pane of glass down gently" — the only glass-adjacent CC0/CC-BY sound found either session is the *breaking* sound, which is wrong for this action. A synthesised soft high-pitched clink is a better fit than force-reusing the break sound quietly, and costs nothing to licence. |
 
-Since §1 established ndsp sample data must be **linear**, the application heap's 60.7 MB
-(60,724,120 B free) is irrelevant to audio sizing — that memory is not reachable by the
-DSP coprocessor. The number that matters is the **18,285,568 B of free linear heap.**
-
-**reasoned — an arithmetic check that surfaced an inconsistency worth flagging rather
-than silently resolving:** `67,108,864 − 46,948,352 = 20,160,512`. The measured free
-figure is 18,285,568, a further 1,874,944 B short of that — plausible, since GPU command
-buffers, framebuffers and other `linearAlloc` users also compete for this heap and
-weren't itemised in the reading handed to this pass. But `docs/ROADMAP.md:45-46` states
-the mesh pool costs **9,199,616 bytes at radius 3** and **46,948,352 at radius 5** — the
-same 46,948,352 figure given here as "at render distance 2." Both citations can't be
-correct about which radius produced that pool size. This document uses the reading
-exactly as supplied rather than guessing which label is right; see §8.
-
-**assumed, not measured — Old 3DS.** No Old 3DS linear-heap reading was taken tonight.
-`docs/ROADMAP.md:46` gives the Old 3DS linear heap as 33,554,432 B total with a
-9,199,616 B pool at its own radius-3 ceiling. By the same subtraction logic and assuming
-similar ~1.87 MB of other linear overhead, Old 3DS free linear would be roughly
-22.5 MB — *more* headroom than the New 3DS reading above, because its smaller render
-distance more than offsets its smaller heap. This is arithmetic on an unmeasured
-assumption, not a hardware reading, and is flagged as such in §8.
-
-**The real ceiling for audio, stated plainly:** roughly **18.3 MB of free linear memory
-on a New 3DS at the measured boot state**, shared with everything else that wants
-physically-contiguous memory — not a dedicated audio budget, and one that shrinks as
-render distance or other linear-heap consumers grow. Audio needs to be a small, bounded
-slice of that, not treated as if 18 MB were available to spend.
+Implementing either of these means a new small synthesis script (not a change to
+`tools/make_sounds.py`'s decode pipeline, which is for pre-existing source files) or an
+extension someone with ownership of that file adds — not built in this pass, per the
+file-ownership boundary for this task.
 
 ---
 
-## §3 — Recommended format, sample rate, and reasoning
+## §5 — What could not be established with confidence
 
-**reasoned.** Recommendation: **16-bit mono PCM (`NDSP_FORMAT_MONO_PCM16`), 16,000 Hz**
-for the whole v1.8.17 set, decoded once at load and kept resident in linear memory (no
-ADPCM, no streaming) — for these reasons:
-
-- Per the task's own worked example, 16-bit mono at 22,050 Hz costs 44,100 B/s. At
-  16,000 Hz that's `16,000 × 2 = 32,000 B/s` — a 27% reduction with no perceptible loss
-  for short, percussive game SFX (footsteps, breaks, UI blips, mob calls) played through
-  a handheld's small stereo speakers or headphones. An 8 kHz Nyquist ceiling is well
-  above what any of these sounds need.
-- `channel.h:137` (`ndspChnSetRate`) means the hardware resamples per-channel anyway, so
-  16,000 Hz source material is not a compatibility risk — it plays back correctly
-  regardless of the DSP's fixed internal ~32,728 Hz mixing rate.
-- ADPCM would shrink the footprint further (roughly 4:1 over PCM16), but it is mono-only
-  (`channel.h:25-33` has no stereo ADPCM flag), needs per-sound coefficients set via
-  `ndspChnSetAdpcmCoefs` (`channel.h:171`), and needs an ADPCM encode step added to the
-  build pipeline that doesn't exist yet. Given the total set below comes in at under 10%
-  of measured headroom even as plain PCM16, that complexity buys nothing this version
-  and is not recommended for v1.8.17. Worth revisiting only if a future version's
-  render-distance increase eats further into the linear heap and a later ambience/mob
-  set no longer fits comfortably.
-- Mono, not stereo: half the bytes for effects that have no directional stereo image to
-  begin with (impacts, UI, mono field recordings as sourced below). `NDSP_FORMAT_STEREO_PCM16`
-  stays available for a later pass if positional audio becomes a design goal.
-
-**Total byte cost of the shortlist in §4, computed at this format:** see the table's
-running total — **1,762,016 B (≈1.68 MiB)**, against 18,285,568 B measured free linear
-(§2). That's **≈9.6% of measured headroom**, all sounds resident simultaneously,
-worst-case (no streaming, nothing ever unloaded). Even against the more conservative
-20,160,512 B pre-overhead figure from the same reading, it's still under 9%. There is
-substantial margin for the eating/hurt/mob variety a full survival game eventually wants,
-without touching ADPCM or streaming.
-
----
-
-## §4 — Sound shortlist
-
-Every entry below was checked on its own asset page this session (not the site's
-general licensing blurb) unless marked "pack-level only" — see the note under the table.
-Durations marked *(trim)* are the game's target clip length; the source recording is
-longer and would be cut down during import, not shipped whole. Bytes are computed at the
-§3 recommendation, 16-bit mono PCM @ 16,000 Hz = 32,000 B/s.
-
-| # | Sound | Source URL | Licence | Attribution required | Duration used | Bytes |
-|---|---|---|---|---|---|---|
-| 1 | Block break — stone | https://kenney.nl/assets/impact-sounds | CC0 (pack-level, 130 files) | No | 0.40s (trim) | 12,800 |
-| 2 | Block break — wood | https://kenney.nl/assets/impact-sounds | CC0 (pack-level, 130 files) | No | 0.40s (trim) | 12,800 |
-| 3 | Block break — dirt/grass | https://freesound.org/people/dr19/sounds/353907/ | CC0 | No | 0.40s (trim from 9.05s) | 12,800 |
-| 4 | Block break — sand | https://opengameart.org/content/fantozzis-footsteps-grasssand-stone | CC0 | No | 0.40s (trim; author notes sand sounds like grass) | 12,800 |
-| 5 | Block break — glass | https://freesound.org/people/Ruben_Uitenweerde/sounds/486166/ | CC BY 3.0 | Yes — "Glass breaking" by Ruben_Uitenweerde (Freesound.org, CC BY 3.0) | 0.40s (trim from 2.15s) | 12,800 |
-| 6 | Block break — leaves | https://freesound.org/people/giddster/sounds/437356/ | CC0 | No | 0.40s (trim from 7.96s) | 12,800 |
-| 7 | Block place — stone | https://kenney.nl/assets/impact-sounds | CC0 (pack-level) | No | 0.30s (trim) | 9,600 |
-| 8 | Block place — wood | https://kenney.nl/assets/impact-sounds | CC0 (pack-level) | No | 0.30s (trim) | 9,600 |
-| 9 | Block place — dirt/grass | https://freesound.org/people/dr19/sounds/353907/ | CC0 | No | 0.30s (softer trim, same source) | 9,600 |
-| 10 | Block place — sand | https://opengameart.org/content/fantozzis-footsteps-grasssand-stone | CC0 | No | 0.30s (trim) | 9,600 |
-| 11 | Block place — glass | *(gap — see §7)* | — | — | — | — |
-| 12 | Block place — leaves | https://freesound.org/people/giddster/sounds/437356/ | CC0 | No | 0.30s (trim) | 9,600 |
-| 13 | Footstep — stone | https://opengameart.org/content/fantozzis-footsteps-grasssand-stone | CC0 | No | 0.25s (trim) | 8,000 |
-| 14 | Footstep — wood | https://kenney.nl/assets/rpg-audio | CC0 (pack-level, tagged "footstep") | No | 0.25s (trim) | 8,000 |
-| 15 | Footstep — dirt/grass | https://opengameart.org/content/fantozzis-footsteps-grasssand-stone | CC0 | No | 0.25s (trim) | 8,000 |
-| 16 | Footstep — sand | https://opengameart.org/content/fantozzis-footsteps-grasssand-stone | CC0 | No | 0.25s (trim) | 8,000 |
-| 17 | Footstep — glass | *(gap — see §7)* | — | — | — | — |
-| 18 | Footstep — leaves | https://freesound.org/people/giddster/sounds/437356/ | CC0 | No | 0.25s (trim, lighter than the break clip) | 8,000 |
-| 19 | Water — enter/splash (also the splash-particle match) | https://freesound.org/people/qubodup/sounds/210428/ | CC0 | No | 1.00s (trim from 2.45s) | 32,000 |
-| 20 | Water — exit | https://freesound.org/people/speedygonzo/sounds/235725/ | CC0 | No | 1.00s (trim from 35.42s) | 32,000 |
-| 21 | Water — swimming/underwater loop | https://freesound.org/s/366159/ | CC0 (public domain) | No (crediting DCSFX optional) | 10.00s (trim from 4:00 loop) | 320,000 |
-| 22 | Player — hurt | https://freesound.org/people/MAJ061785/sounds/85553/ | CC BY 3.0 | Yes — "male pain grunt" by MAJ061785 (Freesound.org, CC BY 3.0) | 1.00s (trim from 1.80s) | 32,000 |
-| 23 | Player — fall damage | https://freesound.org/people/leonelmail/sounds/504626/ | CC0 | No | 1.63s (near-full, already short) | 52,256 |
-| 24 | Player — eat | https://opengameart.org/content/apple-bite | CC0 | No | 1.00s (already a short extracted clip) | 32,000 |
-| 25 | Ambient — cave/underground drone | https://freesound.org/people/Kinoton/sounds/421826/ | CC0 | No | 10.00s (trim from 4:16.85) | 320,000 |
-| 26 | Ambient — outdoor wind | https://freesound.org/people/felix.blume/sounds/217506/ | CC0 | No | 10.00s (trim from 3:32.32) | 320,000 |
-| 27 | UI — menu move | https://kenney.nl/assets/interface-sounds | CC0 (pack-level, 100 files) | No | 0.15s (trim) | 4,800 |
-| 28 | UI — menu select | https://kenney.nl/assets/interface-sounds | CC0 (pack-level) | No | 0.15s (trim) | 4,800 |
-| 29 | UI — inventory open | https://kenney.nl/assets/interface-sounds | CC0 (pack-level) | No | 0.20s (trim) | 6,400 |
-| 30 | UI — inventory close | https://kenney.nl/assets/interface-sounds | CC0 (pack-level) | No | 0.20s (trim) | 6,400 |
-| 31 | Mob — pig | https://freesound.org/people/felix.blume/sounds/158746/ | CC0 | No | 1.20s (trim from 2:02.81) | 38,400 |
-| 32 | Mob — cow | https://freesound.org/people/Bird_man/sounds/275154/ | CC0 | No | 1.20s (trim from 1.65s) | 38,400 |
-| 33 | Mob — chicken | https://freesound.org/people/Breviceps/sounds/456803/ | CC0 | No | 1.20s (trim from 14.95s; source is already 16kHz mono) | 38,400 |
-| 34 | Mob — sheep | https://freesound.org/people/zachrau/sounds/383144/ | CC0 | No | 1.20s (trim from 45.26s) | 38,400 |
-| 35 | Mob — zombie | https://freesound.org/people/robert18productions/sounds/634699/ | CC0 | No | 1.20s (trim one groan from 1:08.71 compilation) | 38,400 |
-| 36 | Mob — skeleton | https://freesound.org/people/spookymodem/sounds/202102/ | CC0 | No | 1.20s (trim from 5.46s "Rattling Bones") | 38,400 |
-| 37 | Furnace crackle | https://freesound.org/people/soundofsong/sounds/650574/ | CC0 | No | 5.03s (full file — already built as a loop) | 160,960 |
-| 38 | Craft / success chime | https://freesound.org/people/grunz/sounds/109662/ | CC BY 3.0 | Yes — "success.wav" by grunz (Freesound.org, CC BY 3.0) | 1.30s (full file, resampled from original 22,050Hz) | 41,600 |
-
-**Running total: 1,762,016 B (≈1.68 MiB), 36 of 38 rows filled** (row 11 and row 17 are
-open gaps, tracked in §7, and are not counted since nothing was sourced for them).
-
-**Pack-level note (rows 1, 2, 7, 8, 14, 27–30):** the Kenney packs (Impact Sounds,
-Interface Sounds, RPG Audio) were verified at the **pack** level — CC0 licence, file
-count, and download URL confirmed by fetching each asset page directly. The individual
-filename for "the wood impact" or "the menu-select click" inside each zip was **not**
-itemised, because doing that means downloading the archive, which this pass explicitly
-does not do. Picking the exact file per row is a five-minute task once download is
-authorised — flagged here rather than guessed.
-
----
-
-## §5 — Attribution block
-
-If this shortlist is adopted, the following would go in the repository (README or a
-dedicated `CREDITS.md`), covering every entry that legally requires it — CC0 entries are
-included too since the task said "he will credit" even where not legally required:
-
-```
-Sound effects
-
-CC0 / Public domain (no attribution required, credited anyway):
-- Kenney (kenney.nl) — Impact Sounds, Interface Sounds, RPG Audio packs
-- dr19, "Shovel_dirt.wav" (Freesound.org)
-- Fantozzi, "Fantozzi's Footsteps (Grass/Sand & Stone)" via qubodup (OpenGameArt.org,
-  originally Freesound.org)
-- giddster, "Rustling leaves" (Freesound.org)
-- qubodup, "Water Splash 1" (Freesound.org)
-- speedygonzo, "Water splash.wav" (Freesound.org)
-- DCSFX, "Underwater [Loop] AMB.wav" (Freesound.org)
-- leonelmail, "BODY FALL - V HVY - DIRT" (Freesound.org)
-- AntumDeluge, "Apple Bite" (OpenGameArt.org, extracted from Freesound.org)
-- Kinoton, "Dark Cave Drone" (Freesound.org)
-- felix.blume, "Wind blowing in a field in Texas, USA" and "A pig grunting, grumbling
-  and falling asleep (France, Limousin)" (Freesound.org)
-- Bird_man, "Moo.wav" (Freesound.org)
-- Breviceps, "Chicken clucking" (Freesound.org)
-- zachrau, "Sheep bleating" (Freesound.org)
-- robert18productions, "Zombie Sound Effects (Raw).wav" (Freesound.org)
-- spookymodem, "Rattling Bones.wav" (Freesound.org)
-- soundofsong, "fire crackling loop.wav" (Freesound.org)
-
-CC BY 3.0 (attribution required):
-- "Glass breaking" by Ruben_Uitenweerde (Freesound.org), CC BY 3.0
-- "male pain grunt" by MAJ061785 (Freesound.org), CC BY 3.0
-- "success.wav" by grunz (Freesound.org), CC BY 3.0
-
-Full licence text: https://creativecommons.org/publicdomain/zero/1.0/ and
-https://creativecommons.org/licenses/by/3.0/
-```
-
----
-
-## §6 — What the game would need built to play any of this
-
-**reasoned**, from §1's API survey — none of this exists in `source/` today:
-
-1. **`audio_init()` / `audio_shutdown()`** — calls `ndspInit()`, checks its `Result`,
-   sets a global `audioAvailable` flag on failure per §1, calls `ndspExit()` on shutdown.
-2. **A sample-loading path** — decode each shipped source file (likely OGG or WAV in
-   `romfs`, since the shortlist above arrives as WAV/FLAC/OGG from various sources) down
-   to raw 16-bit mono PCM @ 16,000 Hz at build or first-load time, into a `linearAlloc`'d
-   buffer, with `DSP_FlushDataCache` called once after decode. A decode step is needed
-   somewhere in the pipeline — devkitPro ships `libopus`/`libvorbisidec` examples
-   (`C:\devkitPro\examples\3ds\audio\ogg-vorbis-decoding\`,
-   `...\opus-decoding\`) that are the obvious starting point rather than writing a
-   decoder from scratch.
-3. **A channel/voice allocator** — 24 hardware channels (`channel.h`) is not infinite;
-   the game needs a small pool manager that picks a free channel per triggered sound,
-   sets format/rate/mix via `ndspChnSetFormat`/`ndspChnSetRate`/`ndspChnSetMix`, and
-   queues the wave buffer with `ndspChnWaveBufAdd`.
-4. **A trigger layer wired into existing systems** — block break/place needs to read the
-   material at the broken/placed block (the block ID already carries material identity
-   per `docs/ROADMAP.md`'s biome-block work) and pick the matching sample; footsteps need
-   a periodic trigger keyed to player movement and the block underfoot; water enter/exit
-   needs hooking into `world/water.c`'s existing state transitions; the splash-particle
-   match needs to sit next to whatever already spawns the v1.8.10 splash particles so the
-   two fire together.
-5. **A simple mixer/volume policy** — master volume, and probably a settings-menu volume
-   slider, since v1.8.19's UI rework is still two versions out and this needs *a* home
-   before then.
-6. **Looping ambience playback** — cave drone and wind need `ndspWaveBuf.looping = true`
-   (`ndsp.h:70`) and a trigger for when to start/stop them (underground vs. surface,
-   presumably keyed off the existing light/biome detection already used for v1.8.16's
-   monster spawn rules).
-7. **Build-side asset conversion tooling** — whatever produces the trimmed, resampled,
-   16kHz mono PCM files that ship in `romfs` from the longer source recordings in §4.
-   Nothing in `tools/` does this today; it would be a new script.
-
-None of this was written or touched in this pass — file ownership for this task is
-`docs/research/audio-sourcing.md` only.
-
----
-
-## §7 — Gaps
-
-- **Block place — glass** (table row 11). Shattering is the natural sound for glass
-  *breaking*, but placing a glass block doesn't shatter anything, and no dedicated
-  "gentle glass clink/set down" CC0 or CC-BY sound turned up in this pass's searches.
-  Real gap — recommend either sourcing a dedicated soft-glass-clink sample in a later
-  pass, or deliberately reusing a quieter trim of the same Ruben_Uitenweerde recording
-  (with attribution) as a placeholder, which is a design call for steve, not this pass.
-- **Footstep — glass** (table row 17). Same reasoning — walking on glass blocks isn't a
-  common Minecraft-family mechanic to begin with, so this may not be a real requirement;
-  flagged rather than assumed away.
-- **Footstep — wood**, and every **UI/Impact-pack row**, are pack-level CC0 verifications
-  only (§4's note) — the exact file within each Kenney zip was not picked out.
-- **Sand**, throughout, reuses the Fantozzi grass/sand pack on the original author's own
-  statement that "sand sounds like grass too" rather than a dedicated sand recording.
-  Acceptable as a first pass; a true sand-specific foley recording would be a nicer fit
-  later.
-
-No category was left completely empty — every one of the eight groups the task listed
-(breaks/places, footsteps, water, player, ambient, UI, mobs, furnace/craft) has at least
-a partial, licence-clean source. The two true gaps above are both single missing rows,
-not missing categories.
-
----
-
-## §8 — What could not be verified
-
-- **The render-distance/mesh-pool number mismatch flagged in §2.** The reading supplied
-  for this pass states 46,948,352 B claimed by the mesh pool "at render distance 2," but
-  `docs/ROADMAP.md:45-46` attributes that exact figure to **radius 5**, with radius 3
-  costing 9,199,616 B. Both cannot be describing the same boot. This document used the
-  reading exactly as supplied without resolving the discrepancy — that resolution needs
-  whoever took tonight's reading, not a guess from this pass.
-- **No Old 3DS linear-heap reading exists.** §2's Old 3DS figure (~22.5 MB free) is
-  arithmetic on ROADMAP.md's own paper numbers, not a console reading — labelled
-  "assumed" there, not "measured."
-- **Kenney pack contents were not itemised file-by-file** (§4's pack-level note) —
-  confirmed the licence and file count on each pack's own page, not which of the 130/100/
-  50 individual files best fits "wood impact" vs. "stone impact," etc.
-- **`ndspInit()`'s exact real-hardware failure mode** — every source agrees it fails
-  without `dspfirm.cdc`, but none of the sources fetched this session include the actual
-  `Result` error code it returns, because libctru's `ndsp` implementation is a
-  precompiled `.a` in this devkitPro install with no bundled source (`C:\devkitPro\libctru\source`
-  does not exist locally) — only the header and community reports were available, not
-  the implementation.
-- **No sound in this shortlist was downloaded, decoded, or listened to.** Every duration,
-  format and sample-rate figure in §4 comes from the asset page's own metadata, not from
-  opening the file. A pass that does download would be the point to confirm none of
-  these turn out to be mislabelled, silent, or clipped.
+- **Exact filenames inside the Kenney Impact Sounds zip and the Fantozzi footsteps
+  archive**, for the rows noted in §4's pack-level gap. The pack/author-level licence is
+  solid (CC0, verified on the pack's own page this session); the specific file is not
+  chosen yet because choosing it means downloading, which this pass does not do.
+- **Player — eat's exact duration.** OpenGameArt's page for "Apple Bite" states file
+  size (16.1 KB) and format (44,100 Hz mono) but not a duration figure; 0.18s is this
+  document's arithmetic from those two numbers, not a value read directly off the page.
+- **A specific splash moment inside the 35-second "Water splash.wav" exit recording.**
+  The licence (CC0) and uploader (speedygonzo) are solid; which few hundred milliseconds
+  of the 35s file to trim is a listening decision that needs the actual audio, not
+  something to guess from a licence page.
+- **Whether `tools/make_sounds.py`'s pipeline needs a trim step added**, or whether
+  trimming happens by hand-editing the source file before it enters `assets/sfx_src/`.
+  Both are workable; the choice belongs to whoever owns that script, not this document.
