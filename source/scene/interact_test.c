@@ -33,6 +33,9 @@
 // line — scene/interact.c calls it — so this is a header the suite was missing, not a new
 // dependency.
 #include "world/mining.h"
+// v1.8.16: the place path now consults itemIsPlaceable(), and the rule is pinned directly as
+// well as driven through interactEdit() — see the section above main().
+#include "world/placeable.h"
 #include "world/registry.h"
 
 static int  s_checks;
@@ -1689,6 +1692,210 @@ static void testPlacingATorchLightsUpTheWorldAndBreakingItDarkensItAgain(void)
 	CHECK(lightColumnsAttached() == 1);   // still one column — the v1.8.6 leak fix, not a leak
 }
 
+// ── v1.8.16: food is an ITEM, not a block ───────────────────────────────────────────────
+//
+// steve's ask, verbatim: "make the apple an item, not a block, similar to Minecraft."
+//
+// Every id in world/registry.c is today BOTH a block and an inventory item, so an apple in the
+// hotbar could be PLACED as a solid one-metre cube of apple. That is the whole defect. The fix
+// is world/placeable.c's itemIsPlaceable(), consulted at the ONE chokepoint every
+// player-initiated placement passes through — scene/interact.c's `it->holding == BLOCK_AIR`
+// refusal, the first arm of the only `fresh & key_place` branch in interactEdit().
+//
+// WHY THE REGISTRY ROW IS NOT TOUCHED, since that is the obvious move and it is wrong: the
+// apple has to stay SOLID/FULL_CUBE or world/block.h's blockDropsNothing() answers "yes" from
+// the SHAPE and breakComplete() hands the bag BLOCK_AIR — which would kill the apple supply
+// from leaves outright, the exact regression registry.c:495-500 already warns about in as many
+// words. A registry FLAG is equally unavailable: registry.h:37-43 spends bits 0-4 and bits 5-7
+// are REG_SHAPE_MASK, so a sixth flag trips the _Static_assert at registry.h:67-69, and
+// escaping that grows BlockDef past 27 bytes and changes both the DEFS packet and the
+// registry.bin format. A plain list outside the registry is what world/survival.c's
+// survivalFoodValue() already does for hunger values, and this is that same precedent.
+//
+// WHAT THE REFUSAL COSTS THE PLAYER: nothing. Refusing at that arm returns with placed_id left
+// at BLOCK_AIR, and placed_id is the ONLY channel source/main.c:6024 reads to decide whether to
+// charge the hotbar — so a refused food press consumes no item. That is asserted below rather
+// than argued: `placed_id == BLOCK_AIR` in every food case IS the "charged nothing" check at
+// this layer.
+//
+// The list here is written out INDEPENDENTLY of world/placeable.c's own table. Two copies of
+// the same array agreeing with each other proves nothing; two hand-written lists agreeing is a
+// real cross-check, and the sweep below covers the case where placeable.c grows an entry this
+// list never heard of.
+static const ItemId kFoodItems[] = {
+	BLOCK_APPLE,                                                                  // 26
+	BLOCK_RAW_PORKCHOP,    BLOCK_RAW_BEEF,    BLOCK_RAW_CHICKEN,    BLOCK_RAW_MUTTON,     // 34..37
+	BLOCK_COOKED_PORKCHOP, BLOCK_COOKED_BEEF, BLOCK_COOKED_CHICKEN, BLOCK_COOKED_MUTTON,  // 38..41
+};
+#define FOOD_ITEM_COUNT ((int)(sizeof kFoodItems / sizeof kFoodItems[0]))
+
+static bool isFoodItem(BlockId id)
+{
+	for (int i = 0; i < FOOD_ITEM_COUNT; i++)
+		if (kFoodItems[i] == id) return true;
+	return false;
+}
+
+// Hold `held`, aim at stone, press place once. Every food case below is this same press, so the
+// thing that differs between them is the id and nothing else.
+static void placeOnce(Interact* it, BlockId held)
+{
+	freshAimedAt(it, BLOCK_STONE);
+	it->holding = held;
+	const Body body = farAwayBody();
+	interactEdit(it, &s_world, &body, placeKey(), 0, 0);
+}
+
+// The rule itself, pinned directly rather than only through a press. The cases below drive the
+// real interactEdit() and are what actually prove the feature; this one exists so that a rule
+// which broke in a way the place path happened to mask still goes red, and so the two
+// deliberate answers at the edges are written down rather than left to be rediscovered.
+static void testThePlaceableRuleItself(void)
+{
+	registryInitCore();
+
+	for (int i = 0; i < FOOD_ITEM_COUNT; i++)
+		CHECK(!itemIsPlaceable(kFoodItems[i]));
+
+	// Ordinary blocks, one from each family the game has: plain terrain, a crafted block, a
+	// CROSS plant, the liquid, and the newest FULL_CUBE row. None of them is food and every one
+	// must stay placeable.
+	CHECK(itemIsPlaceable(BLOCK_STONE));
+	CHECK(itemIsPlaceable(BLOCK_DIRT));
+	CHECK(itemIsPlaceable(BLOCK_PLANKS));
+	CHECK(itemIsPlaceable(BLOCK_TORCH));
+	CHECK(itemIsPlaceable(BLOCK_WATER));
+	CHECK(itemIsPlaceable(BLOCK_CACTUS));
+	CHECK(itemIsPlaceable(BLOCK_LEAVES));
+
+	// BLOCK_AIR answers TRUE, deliberately. The rule is about food, and an empty hand is
+	// refused one step earlier by interactEdit's own `it->holding == BLOCK_AIR` arm, which is
+	// left exactly as it was — folding the empty-hand case in here would move a rule that has
+	// nothing to do with food and make testPlacingWithAnEmptyHandIsStillARefusal() pass for a
+	// different reason than it claims.
+	CHECK(itemIsPlaceable(BLOCK_AIR));
+
+	// A server-registered dynamic id has no local row and must stay placeable, which is what
+	// makes the list a DENYlist rather than an allowlist. An allowlist would refuse every modded
+	// server's blocks the day it shipped, and testADynamicBlockStillPlaces() above is the
+	// end-to-end half of this same claim.
+	CHECK(itemIsPlaceable((ItemId)REG_ID_DYN_LO));
+	CHECK(itemIsPlaceable((ItemId)REG_ID_DYN_HI));
+
+	// An id with no row at all. Undefined is not the same question as unplaceable, and this
+	// pins which answer it gets so a future reader does not have to guess.
+	CHECK(itemIsPlaceable((ItemId)(REG_ID_CORE_HI)));
+}
+
+// THE reported ask, as its own case. steve named the apple, so the apple gets an answer that
+// does not depend on reading a loop bound — the same reason testTheCactusBreaksAndDropsItself()
+// sits beside testEveryCoreBlockStillBreaks() rather than inside it.
+//
+// All six checks are red against the pre-fix client, where this press puts a cube of apple in
+// the world.
+static void testAnAppleCannotBePlacedAsABlock(void)
+{
+	Interact it;
+	placeOnce(&it, BLOCK_APPLE);
+
+	CHECK(worldGet(&s_world, TX, TY + 1, TZ) == BLOCK_AIR);   // the world did not change
+	CHECK(it.placed == 0);
+	CHECK(it.placed_id == BLOCK_AIR);      // main.c:6024's channel: the hotbar is charged nothing
+	CHECK(it.placed_valid == false);       // and no position is offered to a side-table cleanup
+	CHECK(it.refused == 1);                // counted as a refusal, this module's word for "nothing happened"
+	CHECK(s_edits_sent == 0);              // and nothing went to the server either
+}
+
+// The apple was never alone. A raw porkchop placeable as a solid cube is the identical
+// wrongness, so all nine food ids are covered — one press each, all six assertions each.
+static void testEveryFoodItemIsRefusedByThePlacePath(void)
+{
+	// Premise: the list above is not empty and every id in it really has a registry row, so a
+	// typo'd id cannot make this loop pass by refusing something that was never placeable.
+	CHECK(FOOD_ITEM_COUNT == 9);
+
+	for (int i = 0; i < FOOD_ITEM_COUNT; i++) {
+		const ItemId food = kFoodItems[i];
+
+		Interact it;
+		placeOnce(&it, food);
+
+		CHECK(registryIsDefined(food));
+		CHECK(worldGet(&s_world, TX, TY + 1, TZ) == BLOCK_AIR);
+		CHECK(it.placed == 0);
+		CHECK(it.placed_id == BLOCK_AIR);
+		CHECK(it.placed_valid == false);
+		CHECK(it.refused == 1);
+		CHECK(s_edits_sent == 0);
+	}
+}
+
+// Breaking is UNCHANGED, and this is the check that says so. The fix guards the place path and
+// only the place path: an apple must still be pickable out of a leaf (v1.8.8's whole feature)
+// and a meat must still be breakable back out of the world where worldgen or an older save left
+// one. A blanket "food ids are inert" would pass every case above this one and silently delete
+// the feature steve asked for in the version before this one.
+static void testFoodStillBreaksAndStillReachesTheBag(void)
+{
+	for (int i = 0; i < FOOD_ITEM_COUNT; i++) {
+		const ItemId food = kFoodItems[i];
+
+		Interact it;
+		freshAimedAt(&it, food);
+		const Body body = farAwayBody();
+
+		CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) > 0);
+		CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_AIR);
+		CHECK(it.broke_id == food);        // it goes in the bag, as itself
+		CHECK(it.refused == 0);
+		CHECK(s_edits_sent == 1);
+		CHECK(inventoryCanHold(food));     // and the bag still admits it
+	}
+}
+
+// The regression guard, over the WHOLE core id space rather than one hand-picked block, for the
+// same reason testEveryCoreBlockStillBreaks() walks the space instead of naming stone: the fix
+// is a predicate over ids, and a version of it that happened to refuse the apple and also
+// something else would pass every case above.
+//
+// The two counters are the vault's "a check that could not fail proves nothing", written down:
+// a predicate that refused everything, or refused nothing, moves one of them.
+static void testEveryNonFoodCoreBlockStillPlaces(void)
+{
+	CHECK(registryCount() > BLOCK_COUNT);   // premise, same as the break sweep's
+
+	int placed_ok    = 0;
+	int food_refused = 0;
+
+	for (BlockId id = BLOCK_GRASS; id <= REG_ID_CORE_HI; id++) {
+		if (!registryIsDefined(id)) continue;
+
+		Interact it;
+		placeOnce(&it, id);
+
+		if (isFoodItem(id)) {
+			food_refused++;
+			CHECK(worldGet(&s_world, TX, TY + 1, TZ) == BLOCK_AIR);
+			CHECK(it.placed == 0);
+			CHECK(it.refused == 1);
+			CHECK(s_edits_sent == 0);
+		} else {
+			placed_ok++;
+			CHECK(worldGet(&s_world, TX, TY + 1, TZ) == id);
+			CHECK(it.placed == 1);
+			CHECK(it.placed_id == id);
+			CHECK(it.refused == 0);
+			CHECK(s_edits_sent == 1);
+		}
+	}
+
+	// Both numbers read off a real run of this binary, never worked out on paper — the standing
+	// rule this file's break sweep states three times over. Seeded as -1 and -1 first, so the
+	// first run printed what they actually are.
+	CHECK(placed_ok    == 33);
+	CHECK(food_refused == 9);
+}
+
 int main(void)
 {
 	// v1.8.6: see the section comment above testABreakRelightsTheColumnItLeftBehind for why
@@ -1749,6 +1956,15 @@ int main(void)
 
 	// v1.8.10 "Light" — the torch, end to end through interactEdit().
 	testPlacingATorchLightsUpTheWorldAndBreakingItDarkensItAgain();
+
+	// v1.8.16 — food is an item, not a block. The reported instance first, then the rule, then
+	// the two halves that must NOT move: breaking food still works, and every other core block
+	// still places.
+	testThePlaceableRuleItself();
+	testAnAppleCannotBePlacedAsABlock();
+	testEveryFoodItemIsRefusedByThePlacePath();
+	testFoodStillBreaksAndStillReachesTheBag();
+	testEveryNonFoodCoreBlockStillPlaces();
 
 	if (s_fails == 0)
 		printf("interact self-test: PASS  %d checks\n", s_checks);

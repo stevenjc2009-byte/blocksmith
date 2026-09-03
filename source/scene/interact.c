@@ -7,6 +7,10 @@
 #include "world/inventory.h"
 #include "world/light.h"
 #include "world/mining.h"
+// v1.8.16: itemIsPlaceable() — the "food is an item, not a block" rule, consulted at the one
+// place chokepoint below. Header-only from this file's point of view; world/placeable.c is
+// added to the three host-test link lines that already link this file.
+#include "world/placeable.h"
 #include "world/rng.h"
 
 // ── the edit decision and the world write ───────────────────────────────────────────────
@@ -477,7 +481,34 @@ int interactEdit(Interact* it, World* w, const Body* body,
 		// `holding` was a constant BLOCK_STONE and this could not happen; now it comes from
 		// the inventory's selected hotbar slot, and an empty slot is the ordinary case.
 		// Placing BLOCK_AIR would otherwise read as a second, longer-ranged break.
-		if (it->holding == BLOCK_AIR) {
+		//
+		// v1.8.16 adds the second half: an item that is FOOD is refused here too. steve's ask,
+		// verbatim, was "make the apple an item, not a block, similar to Minecraft" — and until
+		// now an apple in the hotbar went down as a solid one-metre cube of apple, as did all
+		// eight cuts of meat. world/placeable.h owns that rule and explains at length why it is
+		// a list beside the registry rather than a registry flag or a change to the apple's row
+		// (both of which are closed off — the flag bits are spent, and a non-SOLID apple would
+		// stop dropping from leaves at all).
+		//
+		// WHY HERE, and not at any of the four refusals below it. This is the first arm of the
+		// only `fresh & key_place` branch in the client, so it is the single chokepoint every
+		// player-initiated placement passes through, and it sits ABOVE both the worldSet (:512)
+		// and the sendEditOrRevert (:517) — so a refused food never touches the world and never
+		// goes on the wire. It also leaves placed_id at BLOCK_AIR, which is the only channel
+		// main.c:6024 reads to decide whether to charge the hotbar, so the refusal costs the
+		// player nothing. Refusing further down would have to undo one or more of those.
+		//
+		// Counted as a refusal for the same reason every other arm here is: `refused` is this
+		// module's existing word for "the press did nothing" and is already on the debug overlay
+		// as `r`. This client has no toast or status line to say more (world/inventory.h says so
+		// outright), and eating the item is main.c's business, not this function's.
+		//
+		// SCOPE. This guards the player's own press. It does NOT guard the inbound remote-edit
+		// path (net/networld.c's editValid checks coordinates and the dynamic-id ceiling only,
+		// mirroring the server's own deps/blocksmith-server/game/validate.c), so a modified
+		// remote client can still put an apple cube in a shared world. That is a server-side
+		// change and is deliberately not made here.
+		if (it->holding == BLOCK_AIR || !itemIsPlaceable(it->holding)) {
 			it->refused++;
 			return queued;
 		}
