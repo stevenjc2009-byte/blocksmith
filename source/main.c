@@ -5920,6 +5920,20 @@ session_start:
 		// tried and measured, and it regressed the control arm from 117 blocks / 608 flow back
 		// to 1 block / 0 flow — i.e. it switched the water simulation off. Only the water-aware
 		// version is wanted.
+		// The phase marker sits AHEAD of the relight drain, not below it (moved v1.8.15). It
+		// used to sit under the drain, which left relightDrain running while the phase still
+		// read WD_PHASE_SIM — a phase whose declared scope is "player, camera, ring follow,
+		// aim, edit". A watchdog report naming SIM for a stall that actually happened in the
+		// relight queue would send the next investigation into the simulation code, and a
+		// wrong signpost costs more than a missing one: it spends the investigator's time
+		// before it spends their doubt.
+		//
+		// This is about where a report POINTS, not about whether a hang is possible here. The
+		// drain is bounded twice over — RELIGHT_MAX_COLUMNS caps the work and RELIGHT_BUDGET_MS
+		// caps the time — so it is not an indefinite-block risk the way a GPU wait is. The
+		// marker moved anyway, because the cost of moving it is one line and the cost of
+		// leaving it is a mislabelled report on the one occasion anybody ever reads one.
+		watchdogPhase(WD_PHASE_MESH);
 		const u64 t_relight = svcGetSystemTick();
 		relightDrain(&s_world, &s_relightq, RELIGHT_MAX_COLUMNS,
 		             (u64)(RELIGHT_BUDGET_MS * CPU_TICKS_PER_MSEC), relightNowTicks);
@@ -5929,7 +5943,6 @@ session_start:
 		// All of this frame's meshing, under one budget. Edits first: a broken block that
 		// takes two frames to disappear is felt, and a chunk of scenery that takes two
 		// frames to arrive at the edge of the render distance is not.
-		watchdogPhase(WD_PHASE_MESH);
 		const u64 t_work = svcGetSystemTick();
 		const int edit_built = chunkRenderDrainDirty(&s_world, DRAIN_BUDGET_MS,
 		                                             DRAIN_MAX_CHUNKS);

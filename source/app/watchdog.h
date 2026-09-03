@@ -50,7 +50,11 @@ typedef enum {
 	WD_PHASE_NET,        // netUpdate/networldUpdate
 	WD_PHASE_INSTALL,    // in-game: genInstallOne, which locks the worker
 	WD_PHASE_SIM,        // player, camera, ring follow, aim, edit
-	WD_PHASE_MESH,       // in-game: draining the dirty and stream queues
+	// Widened v1.8.15 to name the relight queue explicitly. main.c's relightDrain() ran under
+	// WD_PHASE_SIM until then, so a stall in it was reported against "player, camera, aim,
+	// edit" — the marker moved, and this comment moved with it, because a phase whose declared
+	// scope does not match where the marker actually sits is how the next reader gets misled.
+	WD_PHASE_MESH,       // in-game: draining the relight, dirty and stream queues
 	WD_PHASE_DRAW,       // C3D_FrameBegin .. C3D_FrameEnd
 	WD_PHASE_SAVE,       // the way out: dirty columns, inventory, worker stop
 	WD_PHASE_COUNT,
