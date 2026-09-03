@@ -309,15 +309,22 @@ static void planBuild(void)
 	s_ready = true;
 }
 
-// Exact floor division by a count known to be 1..4, without the libgcc
+// Exact floor division by a count known to be 1..5, without the libgcc
 // __aeabi_idivmod call the ARM11 would otherwise pay per corner per channel.
 // Sums never exceed 15*4 = 60, where (n * 171) >> 9 is exact for /3.
+//
+// v1.8.16 adds case 5 for crossCornerLight below, which counts one tap more than cornerLight
+// does. Sums there never exceed 15*5 = 75, and (n * 205) >> 10 is exact for /5 over 0..75: the
+// error against n/5 is n/5120, at most 0.0147 at n = 75, far short of the 0.2 gap between one
+// fifth and the next. Cases 1..4 are untouched, so every existing caller's arithmetic is
+// bit-for-bit what it was — see the pinned lit cube-only hash in tests/cross_light_test.c.
 static inline int avgByCnt(int sum, int cnt)
 {
 	switch (cnt) {
 	case 2:  return sum >> 1;
 	case 3:  return (sum * 171) >> 9;
 	case 4:  return sum >> 2;
+	case 5:  return (sum * 205) >> 10;
 	default: return sum;
 	}
 }
@@ -421,6 +428,66 @@ static inline uint8_t cornerLight(const MeshScratch* s, int si, const FacePlan* 
 {
 	const int taps[4] = { si + p->neighbour, si + c->ao1, si + c->ao2, si + c->aoc };
 	int ssum = 0, bsum = 0, cnt = 0;
+	for (int t = 0; t < 4; t++) {
+		if (s_cell_flags[taps[t]] & CELL_FLAG_OCCL) continue;
+		ssum += s->light[taps[t]] >> 4;
+		bsum += s->light[taps[t]] & 15;
+		cnt++;
+	}
+	return (uint8_t)((avgByCnt(ssum, cnt) << 4) | avgByCnt(bsum, cnt));
+}
+
+// ── v1.8.16: the same smooth light, for a quad that has no face ──────────────
+//
+// Smooth per-corner light for a BLOCK_SHAPE_CROSS vertex. Same average as cornerLight above,
+// over the same four outward taps, PLUS the cell's own light as an always-counted fifth.
+//
+// WHY THE OWN CELL IS IN HERE AND IS NOT ALLOWED TO BE SKIPPED. cornerLight leaves it out
+// because a cube face is a boundary: the face is lit by what is on the far side of it, and the
+// neighbour cell can never be occluding or the face would not have been emitted, so its count
+// is never zero. A cross has neither property. Its quads are a diagonal plane through the
+// MIDDLE of the cell, lit by the cell they stand in, and a torch stands on a floor — so all
+// four outward taps of one of its BOTTOM corners are occluding stone, cnt comes out 0, and
+// avgByCnt(0, 0) returns 0. Without this seed every torch in the game gets a black base, which
+// is a worse artefact than the flat lighting this replaces. tests/cross_light_test.c ARM 3 is
+// that check, and it is the one to run before "simplifying" this back into cornerLight.
+//
+// WHICH FOUR OUTWARD TAPS, i.e. the design question a diagonal quad raises. A cross vertex is
+// not on a face, but it IS on a real lattice corner of the cell — kCross below places all
+// sixteen vertices on the cell's own integer corners, because MeshVertex positions are whole
+// block units and cannot express anything else. The eight lattice corners of a cell are exactly
+// the four corners of its FACE_BOTTOM plus the four of its FACE_TOP, so the caller walks those
+// two FacePlans and this function is handed the very CornerPlan cornerAO/cornerLight would use
+// for a lid or a floor. No new table, no second copy of the corner geometry, and the vertical
+// half of the gradient — which is the half a torch shows most, since its own cell is the
+// brightest thing in the room — comes out of the existing machinery for free.
+//
+// The horizontal half comes out of it too: a top corner's ao1/ao2/aoc taps are the three cells
+// around that corner one step up, so the four top corners of one plant differ from each other
+// whenever the light around it does. That is what makes the two ends of one diagonal quad
+// disagree (tests/cross_light_test.c ARM 4), which is the whole visible effect.
+//
+// Rejected: gathering the four cells around each corner in the HORIZONTAL plane only. It is
+// the same tap count, and it makes the top and bottom of a plant identical by construction —
+// a torch would still be a flat sprite, only a differently flat one.
+// NOT inline, unlike cornerLight above, and the difference was measured rather than assumed.
+// The caller below invokes this eight times from one loop nest, which -O3 unrolls and inlines
+// eight copies of: arm-none-eabi-gcc with the Makefile's real flags (-O3 -march=armv6k, see
+// tools/run_host_tests.sh's cross_light_test stanza for the command) gave mesher.o .text
+// 13,856 B before this task, 16,984 B with it inlined, and 14,856 B with the call left as a
+// call — 2,128 bytes of a binary the Makefile itself calls code-size-constrained, for eight
+// branch-and-links per cross CELL on the chunk-rebuild path, not on the frame path. What they
+// cost: host benchmark meshing a chunk holding 256 plants, gcc -O3, 4,000 meshChunk() calls
+// per run, two runs each — inlined 0.0818 and 0.0845 ms/call, called 0.0862 and 0.0877 ms/call,
+// with a third inlined run at 0.0887. The spread within one arm is wider than the gap between
+// the arms, so the honest reading is "no difference this fixture can resolve", not a number.
+// If a future profile on real hardware disagrees, delete the attribute — nothing else changes.
+static __attribute__((noinline)) uint8_t crossCornerLight(const MeshScratch* s, int si,
+                                                          const FacePlan* p,
+                                                          const CornerPlan* c)
+{
+	const int taps[4] = { si + p->neighbour, si + c->ao1, si + c->ao2, si + c->aoc };
+	int ssum = s->light[si] >> 4, bsum = s->light[si] & 15, cnt = 1;
 	for (int t = 0; t < 4; t++) {
 		if (s_cell_flags[taps[t]] & CELL_FLAG_OCCL) continue;
 		ssum += s->light[taps[t]] >> 4;
@@ -770,9 +837,15 @@ static const CrossCorner kCross[2][4] = {
 #define CROSS_NRM  ((uint8_t)FACE_TOP)
 
 // AO is fixed at 3 (unoccluded) for the same reason the shape is not solid: an X is not
-// a wall, so there are no crevices at its corners to darken. Light, when the engine is
-// on, is the cell's own — a cross never occludes, so its cell always carries the light
-// that reaches it.
+// a wall, so there are no crevices at its corners to darken.
+//
+// v1.8.16: LIGHT is no longer the cell's own flat byte. It was, from v1.5.0 to v1.8.15, and
+// that made cross blocks the only geometry in the game still lit the blocky pre-smooth-lighting
+// way — most visible on the torch, which is itself the sharpest light gradient in the world.
+// Each of the eight distinct lattice corners a cross's sixteen vertices sit on now takes
+// crossCornerLight() (see its comment for the gather and why the cell's own light is a fifth,
+// always-counted tap), computed ONCE into the small table below and shared by both windings.
+//
 // v1.8.8: `tint` is the biome palette index, and for a cross it is the whole point — a grass
 // strand has to come out the same colour as the grass block it is standing on, or every plant
 // in a tinted biome reads as the wrong species. Both planes and both windings take it, so one
@@ -784,6 +857,31 @@ static void emitCross(MeshOut* o, const MeshScratch* s, int si, int lx, int ly, 
 	    o->index_count + 6 * CROSS_QUADS > o->index_cap) {
 		o->overflow = true;
 		return;
+	}
+
+	// The eight lattice corners of this cell, indexed [y][x][z] exactly as a CrossCorner spells
+	// its position. Eight crossCornerLight() calls per plant, not one per vertex: the two
+	// planes and the two windings between them write each corner twice over, and a corner's
+	// light is a property of the corner, not of the quad that happens to touch it. Filled from
+	// the FACE_BOTTOM and FACE_TOP plans, whose four corners each are precisely the cell's four
+	// lower and four upper lattice points — px/pz are read back out of the CornerPlan rather
+	// than assumed, so this cannot drift from the corner geometry the face path uses.
+	//
+	// Skipped entirely when the engine is off, which is the only state the Old 3DS build and
+	// every host suite that never calls lightEngineInit(true) ever sees: pad stays the literal
+	// 0 it has always been there and those meshes are byte-identical.
+	// Zero-initialised rather than filled on an else branch: the engine-off path then needs no
+	// code at all, and no compiler on either toolchain can decide the table is only
+	// conditionally written and warn about it under -Werror.
+	uint8_t clight[2][2][2] = {{{0}}};
+	if (lit) {
+		for (int vy = 0; vy < 2; vy++) {
+			const FacePlan* p = &s_plan[vy ? FACE_TOP : FACE_BOTTOM];
+			for (int i = 0; i < 4; i++) {
+				const CornerPlan* c = &p->corner[i];
+				clight[vy][c->px][c->pz] = crossCornerLight(s, si, p, c);
+			}
+		}
 	}
 
 	for (int plane = 0; plane < 2; plane++) {
@@ -802,7 +900,7 @@ static void emitCross(MeshOut* o, const MeshScratch* s, int si, int lx, int ly, 
 				v->v   = c->v_hi ? r->vslot1 : r->vslot0;
 				v->nrm = CROSS_NRM;
 				v->ao  = meshAoPack(3, tint);
-				v->pad = lit ? s->light[si] : 0;
+				v->pad = (int8_t)clight[c->y][c->x][c->z];
 			}
 
 			// The same six values per quad emitFace writes, in the same order — see the
