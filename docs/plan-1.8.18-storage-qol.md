@@ -753,3 +753,54 @@ does not belong in this section.
 - **`tools/make_atlas.py`** — `tile_chest_top()` and `tile_chest_front()` painter functions,
   procedurally generated per this project's own standing rule (`make_atlas.py:3-6`), appended to
   the `TILES` list in the same order as the `atlas_tiles.h` entries above.
+
+
+---
+
+## Dated correction: 2026-09-03 06:55
+
+A second planning pass (`plan-1.8.18-storage.md`, kept alongside this file as a second opinion)
+re-derived parts of this spec against a later tree and found three things worth carrying back
+here. This section is appended rather than edited into the body above, so the original reasoning
+stays readable and it is obvious what changed and when.
+
+**1. The multiplayer-sync argument in this document rests on a gap that has since been closed.**
+Sections 2.6, 3.4 and 8 argue from a wire item-id ceiling that no longer applies: it was closed
+in **v1.8.10 (2026-09-02)**, verified first-hand at `inventory.h:145-186` -- one day before that
+pass ran, and after this document was written. Anything here that concludes "the wire cannot
+carry this" needs re-deriving before it is acted on. This is the exact failure mode recorded as
+"a deferred decision keeps its premise and loses its evidence": the conclusion outlived the fact
+it rested on.
+
+**2. `KEY_B`: not a correction after all -- corroboration, plus a warning about the grep.**
+I first wrote this up as a finding. It is not one: **section 2.10 above (and its proposal at
+lines 581-586) already says `KEY_B` is unclaimed in the live 3D gameplay loop**, already
+proposes aiming at a chest and pressing B to open it, and already makes the argument that this
+keeps B meaning "leave/dismiss the current context". The second pass reached the same
+conclusion independently, from a different direction. That is worth having -- two passes
+agreeing is the strongest signal either document carries -- but it changes nothing here, and
+filing it as a fix would have misrepresented this document as having been wrong.
+
+What IS worth adding is **how it must be checked**, because the obvious grep gives a false
+negative. Grepping `KEY_B` in `scene/interact.c` and `main.c` returns 0 -- but so does
+`KEY_X`/`KEY_Y` in `interact.c`, because that file never names a raw key constant at all: it
+goes through `inputKey(ACTION_BREAK)` and `inputKey(ACTION_PLACE)`. A zero there means "this
+file uses the binding layer", **not** "this button is free". Only a whole-tree grep answers it:
+`KEY_B` appears at `app/debugmenu_ui.c:195,216`, `app/remap_ui.c:105,168`,
+`scene/pausemenu.c:143,151` and eight sites in `scene/title.c` -- every one a menu, title or
+overlay screen, none of them the gameplay loop.
+
+This is the recorded "grep the caller, not the primitive" trap, and it is worth the paragraph
+because the wrong grep here returns exactly the answer you were hoping for.
+
+**3. The break-cleanup hook this spec calls for now EXISTS.** That pass observed
+`it->broke_valid` / `broke_x/y/z` present in `scene/interact.h` but wired to nothing, and
+correctly reported it as unwired. That observation went stale within the hour: they are now
+consumed at `main.c:5869`, where `blockStateRemove` is called for every landed break. So the
+storage work does not need to build that plumbing -- it needs to *use* it.
+
+Unchanged by any of the above: both documents independently arrived at the same core
+architecture -- a **dedicated side table for chests rather than reusing `BlockStateTable`** --
+so that chests do not compete with furnaces and future stateful blocks for one 64-slot pool.
+Two passes reaching that conclusion from different directions is the strongest signal either
+document carries.
