@@ -114,8 +114,24 @@ three shipped sounds (87,668 B) already spend 87,668 ÷ 44,100 = **1.988 s** of 
 | Old 3DS | 393,216 B | 87,668 B | **305,548 B** (6.928 s) |
 | New 3DS | 1,048,576 B | 87,668 B | **960,908 B** (21.789 s) |
 
+> **⚠ CORRECTION [2026-09-03, v1.8.17→v1.8.19, lane SOUND-PLAN]** — the Old
+> 3DS row above is stale by 72,328 B. It was correct when this document was
+> written (three shipped sounds, 87,668 B spent). v1.8.17 lane SOUND-A has
+> since shipped six more `.bsnd` files (`hurt`, `death`, `eat`, `craft`,
+> `splash`, `ui_tap` — see `assets/sfx_src/ATTRIBUTION.md:62-80`), bringing
+> spend to **159,996 B** and Old-3DS headroom down to **233,220 B**.
+> Re-measured directly from `romfs/sfx/` (9 files, 160,212 B on disk minus
+> 9×24 B headers) and cross-checked against `source/audio/audio_sfx_test.c
+> :203-213`'s own `CHECK(total_pool == 159996u)` /
+> `CHECK(AUDIO_POOL_BYTES_OLD3DS - total_pool == 233220u)` on 2026-09-03.
+> Full detail: `docs/plan-1.8.19-sound.md` §2. The New 3DS row above is stale
+> by the same 72,328 B (spent 159,996 B, remaining 888,580 B) but is left
+> unedited here — out of this correction's authorised scope, which named
+> only the Old 3DS line.
+
 **The Old 3DS figure is the binding constraint for everything below** — the task's own
-framing, confirmed by measurement, not assumption.
+framing, confirmed by measurement, not assumption. **That constraint is now 233,220 B,
+not 305,548 B — see the correction above.**
 
 ---
 
