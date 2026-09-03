@@ -3,6 +3,11 @@
 // model — see this project's world/inventory.h and world/crafting.h for the rules this file
 // is a view onto and never re-implements.
 //
+// v1.8.15 FURNACE added a third screen on the same terms: an open furnace's input, fuel and
+// output slots plus two readouts, a view onto world/furnace.h's already-tested state machine.
+// This file does not tick a furnace, does not decide what smelts or what burns, and does not
+// know where a furnace's state is stored — it moves stacks in and out and draws two gauges.
+//
 // Same shape as scene/title.h, which this project already treats as the house style for a
 // scene-ish UI module: an opaque-ish state struct, one init, and one *UpdateDraw per frame
 // that takes a plain input struct and hands back what happened. Also like title.h, this
@@ -50,15 +55,30 @@
 
 #include <citro3d.h>   // C3D_Tex only — see the file comment above for why
 
+#include "world/furnace.h"     // FurnaceState — see uiUpdateDraw's `furnace` parameter
 #include "world/inventory.h"
 
-// Which of the two screens this frame is drawing. UI_SCR_HUD is the default: just the
+// Which of the three screens this frame is drawing. UI_SCR_HUD is the default: just the
 // hotbar (always visible, per inventory.h's own INV_HOTBAR_SLOTS comment) plus the engine
 // status text main.c already computes. UI_SCR_INVENTORY adds the main grid and the crafting
 // list, covering the rest of the screen — see ui.c's layout block for the exact pixels.
+//
+// v1.8.15 FURNACE. UI_SCR_FURNACE is an open furnace: its input, fuel and output slots, a
+// burn-time readout, a cook-progress readout, the hotbar (still, always) and the main grid
+// moved down to make room — see scene/ui_layout.h's furnace block for the pixels and for why
+// the grid moves on this screen only.
+//
+// ⚠ UI_SCR_FURNACE is only ever entered or drawn while uiUpdateDraw's `furnace` parameter is
+// non-NULL. A UiState left on this screen with no furnace handed in is not an error the
+// caller has to avoid — uiUpdateDraw corrects it to UI_SCR_INVENTORY on the spot, drops any
+// lifted stack, and draws the inventory overlay instead. That is the ONE place in this file
+// where a screen change takes effect on the same frame rather than the next one, and it is
+// deliberate: the alternative is a frame that draws a furnace panel out of a pointer it has
+// been told not to dereference.
 typedef enum {
 	UI_SCR_HUD,
 	UI_SCR_INVENTORY,
+	UI_SCR_FURNACE,
 } UiScreen;
 
 typedef struct {
@@ -72,6 +92,20 @@ typedef struct {
 // Zeroes `ui` and puts it on the HUD screen with nothing picked up. Call once, before the
 // first uiUpdateDraw.
 void uiInit(UiState* ui);
+
+// v1.8.15 FURNACE. Switches to UI_SCR_FURNACE and drops any lifted stack. This is what the
+// caller calls when the player interacts with a BLOCK_FURNACE in the world; from the next
+// uiUpdateDraw onward it must pass that furnace's unpacked FurnaceState as the `furnace`
+// parameter, and keep passing it until UiResult.furnace_open comes back false.
+//
+// A one-line function rather than "just set ui->screen yourself", even though UiState is a
+// plain struct the caller can write: this is the only screen with a PRECONDITION attached to
+// it (a live FurnaceState must accompany it), and a named entry point is where that
+// precondition can be stated once instead of in a comment the caller has to find. Setting
+// ui->screen directly still works and is still safe — uiUpdateDraw's NULL guard catches the
+// case where it was set without a furnace to go with it — it just does not read as a
+// contract.
+void uiOpenFurnace(UiState* ui);
 
 // One frame's touch point. See the file comment for why there is no keys_down here, unlike
 // TitleInput.
@@ -145,6 +179,17 @@ typedef struct {
 // was drawn this frame.
 typedef struct {
 	bool inventory_open;
+
+	// v1.8.15 FURNACE. True exactly when UI_SCR_FURNACE is what this frame drew — same
+	// "reflects the screen this frame actually drew" rule as inventory_open above, including
+	// the frame a tap opens or closes the panel on.
+	//
+	// The two are MUTUALLY EXCLUSIVE, never both true: they name two different screens, and
+	// a frame draws one screen. A caller gating world interaction on "is the player visibly
+	// managing storage" therefore wants `inventory_open || furnace_open`, not either alone —
+	// stated here because inventory_open's own comment describes exactly that use and was
+	// written when it was the only answer to it.
+	bool furnace_open;
 } UiResult;
 
 // One frame: advances `ui`, edits `inv` in place (slot moves, hotbar selection, crafting),
@@ -153,5 +198,20 @@ typedef struct {
 //
 // `block_icons` is the block atlas's C3D_Tex*, or NULL — see the file comment. `stats` may
 // be NULL — see UiStats above.
+//
+// ── `furnace` (v1.8.15 FURNACE) ────────────────────────────────────────────────────────
+//
+// NULL whenever no furnace is open, and a pointer to the caller's UNPACKED live FurnaceState
+// whenever one is. When it is NULL, UI_SCR_FURNACE is never entered and never drawn and this
+// pointer is never dereferenced — see UiScreen above for what happens if the screen is
+// somehow set anyway.
+//
+// When it is non-NULL, this function EDITS IT IN PLACE: moving a stack into the input or fuel
+// slot writes input_item/input_count or fuel_item/fuel_count, and taking the output clears
+// output_item/output_count. Nothing here touches fuel_ticks_left, cook_ticks or lit — those
+// belong to furnaceTick() and are only ever read here, to draw the two indicators. The caller
+// is expected to re-pack the state into world/blockstate.c's payload after the call; this
+// file has no knowledge of blockstate.c or of a position, the same boundary world/furnace.h's
+// own furnaceTick() comment sets out.
 UiResult uiUpdateDraw(UiState* ui, Inventory* inv, C3D_Tex* block_icons,
-                       const UiStats* stats, const UiInput* in);
+                       const UiStats* stats, const UiInput* in, FurnaceState* furnace);

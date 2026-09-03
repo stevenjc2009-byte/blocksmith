@@ -85,6 +85,23 @@ typedef struct {
 	bool    broke_valid;
 	int     broke_x, broke_y, broke_z;
 
+	// And WHERE a placement landed, the exact twin of the three fields above and added in the
+	// same version for the other half of the same job: a furnace that is mined must drop its
+	// state, and a furnace that is PLACED must acquire one, so main.c needs the cell in both
+	// directions.
+	//
+	// The asymmetry with the break side is worth stating, because it looks like an oversight
+	// and is not: the break path needed new fields because breakCancel() had already wiped the
+	// coordinates by the time the caller ran, whereas the place path simply never recorded
+	// them at all -- placed_id was the only thing anyone had asked for. Same remedy either way.
+	//
+	// placed_valid follows broke_valid's reasoning exactly. (0,0,0) is a placeable cell like
+	// any other, so no coordinate triple is free to mean "nothing happened", and testing
+	// placed_id != BLOCK_AIR instead would tie "did a placement land" to "was it a real block",
+	// which are the same question today only by accident.
+	bool    placed_valid;
+	int     placed_x, placed_y, placed_z;
+
 	// ── v1.8.1 task 50: a break takes time ──────────────────────────────────────────────
 	//
 	// Progress against ONE block, measured in simulation ticks rather than frames. Frames

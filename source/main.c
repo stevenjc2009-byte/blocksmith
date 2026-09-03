@@ -73,6 +73,7 @@
 #include "world/blockstate.h"
 #include "world/budget.h"
 #include "world/daynight.h"
+#include "world/furnace.h"
 #include "world/genrefuse.h"
 #include "world/genretry.h"
 #include "world/handbuilt.h"
@@ -2828,6 +2829,27 @@ static void survivalRespawn(Player* p, Survival* s, FallTrack* ft,
 
 static UiState s_ui;
 
+// v1.8.15 FURNACE. WHICH furnace the bottom-screen panel is currently showing, as a cell
+// address rather than as a FurnaceState. That distinction is the whole design of this wiring
+// and is worth stating, because holding the state here instead would be the obvious shape and
+// would be wrong.
+//
+// world/blockstate.c owns the only copy of every furnace's state. The per-tick loop below
+// advances all sixty-four of them — burning fuel, cooking, going dark — on the same table the
+// panel is editing. If this file kept its own FurnaceState across frames and wrote it back at
+// the end, every tick the panel was open would be undone: the player would watch a furnace
+// that never burns down, because the frame path would keep restoring the copy it took before
+// the ticks ran. So the panel's state is UNPACKED FRESH from the table immediately before
+// uiUpdateDraw and PACKED BACK immediately after, every frame, and nothing is carried between
+// them. The tick owns fuel_ticks_left/cook_ticks/lit, the panel owns the four item fields, and
+// neither can lose the other's writes because neither ever holds a stale copy.
+//
+// s_furnace_open rather than a sentinel coordinate, for blockstate.h's own reason: (0,0,0) is
+// an ordinary cell a player can build a furnace in, so no coordinate triple is free to mean
+// "no furnace open".
+static bool s_furnace_open;
+static int  s_furnace_x, s_furnace_y, s_furnace_z;
+
 // Step 8.2. The bottom screen's whole content: hotbar, inventory grid, crafting panel, and
 // the engine numbers step 8.3's screen carried.
 //
@@ -2896,10 +2918,50 @@ static void drawBottomUi(bool ok, const char* status, const char* netline, const
 		.hunger     = s_survival ? s_survival->hunger : 0,
 	};
 
+	// v1.8.15 FURNACE. Unpack the open furnace's state out of world/blockstate.c, hand the
+	// panel a pointer to it, and pack whatever the player did straight back. See s_furnace_open
+	// above for why nothing is carried between frames.
+	//
+	// The blockStateGet() failure branch is not defensive padding — it is the one case that
+	// actually happens. A furnace can stop existing while its panel is open: another player
+	// breaks it over the network, or the record is evicted. blockStateGet refuses on both "no
+	// record here" and "a record whose block_id is not BLOCK_FURNACE", so a cell that became a
+	// dirt block reads exactly like a cell that became nothing, and both close the panel rather
+	// than editing whatever happens to occupy the slot now.
+	//
+	// `fp` stays NULL in that case and ui.h's contract takes over: uiUpdateDraw corrects
+	// UI_SCR_FURNACE to UI_SCR_INVENTORY on the spot and drops any lifted stack, so the player
+	// is put back in their bag holding their items rather than looking at a panel for a block
+	// that is gone.
+	FurnaceState  fs;
+	FurnaceState* fp = NULL;
+	uint8_t       fpay[BLOCKSTATE_PAYLOAD_BYTES];
+
+	if (s_furnace_open) {
+		if (blockStateGet(&s_blockstate, s_furnace_x, s_furnace_y, s_furnace_z,
+		                   BLOCK_FURNACE, fpay)) {
+			furnaceStateUnpack(&fs, fpay);
+			fp = &fs;
+		} else {
+			s_furnace_open = false;
+		}
+	}
+
 	// atlasTexture() rather than atlasBind(): gfx/sprite.c tracks the bound texture itself so
 	// it can flush exactly once per switch, and binding behind its back would leave it certain
 	// it had not switched. See gfx/atlas.h.
-	uiUpdateDraw(&s_ui, &s_inv, atlasTexture(), &stats, in);
+	const UiResult ures = uiUpdateDraw(&s_ui, &s_inv, atlasTexture(), &stats, in, fp);
+
+	// Written back BEFORE the close is acted on, not after, and the order matters: the tap that
+	// closes the panel can be the same tap that took the cooked item out of the output slot, so
+	// packing only when the panel stayed open would silently eat the last withdrawal of every
+	// session. The write is guarded on `fp` and not on `ures.furnace_open` for that reason.
+	if (fp) {
+		furnaceStatePack(fp, fpay);
+		(void)blockStateSet(&s_blockstate, s_furnace_x, s_furnace_y, s_furnace_z,
+		                     BLOCK_FURNACE, fpay);
+	}
+	if (!ures.furnace_open) s_furnace_open = false;
 }
 
 #endif   // BS_BOTTOM_UI
@@ -5555,6 +5617,48 @@ session_start:
 			(void)entityTick(&s_entities, &s_world, tickClockCount(&s_tickclock),
 			                  player.body.x, player.body.z, animalThink, &animal_ctx);
 
+			// v1.8.15 "Furnace". Every lit furnace in the world advances one tick, here in the
+			// tick loop for the same reason water and entities are: world/furnace.h specifies
+			// fuel in TICKS (FURNACE_FUEL_TICKS_PLANKS 300 = 15 s at 20 TPS, LOG 1200 = 60 s),
+			// and burning those down per rendered frame would make a log last twice as long on
+			// a console holding 30 fps as on one at 60. That is the same argument the entity
+			// tick above and waterTick below are written from, and a furnace is the case where
+			// getting it wrong is most visible, because the player is standing still watching
+			// the flame while it happens.
+			//
+			// The loop walks s_blockstate.slots[] DIRECTLY rather than through an accessor,
+			// which is worth justifying because it is the only place in this file that reaches
+			// into another module's struct. blockstate.h exposes BlockStateTable fully and
+			// documents the property this depends on -- a slot whose block_id is BLOCK_AIR is
+			// free, because air can never own state -- so this is reading a published contract,
+			// not a private layout. The alternative was adding a blockStateIterate() to
+			// blockstate.h for a single caller; the struct is already public and the "zero is
+			// empty" rule is already the module's stated invariant, so a new function would
+			// have restated it rather than encapsulated it.
+			//
+			// BLOCKSTATE_SLOTS is 64, so this is a fixed 64-iteration scan whose cost does not
+			// depend on how many furnaces exist. That is the point: it cannot degrade as a
+			// world fills up, and 64 comparisons of a uint8_t at 20 TPS is not a budget worth
+			// managing. It is deliberately NOT decimated by distance the way entityTick is --
+			// a furnace the player walked away from must keep burning, or leaving the room to
+			// go mining would silently pause the smelt they left running, which is exactly the
+			// behaviour a player would report as "the furnace is broken".
+			//
+			// The pack-back is unconditional rather than gated on furnaceTick's return. That
+			// return reports whether anything OBSERVABLE changed (for a future re-mesh of the
+			// lit front face), not whether the state was touched: fuel_ticks_left counts down
+			// on a tick that changes nothing else, and skipping the write on a false return
+			// would silently discard that countdown and leave every furnace burning forever.
+			for (int fi = 0; fi < BLOCKSTATE_SLOTS; fi++) {
+				BlockStateEntry* e = &s_blockstate.slots[fi];
+				if (e->block_id != BLOCK_FURNACE) continue;
+
+				FurnaceState fs;
+				furnaceStateUnpack(&fs, e->data);
+				(void)furnaceTick(&fs);
+				furnaceStatePack(&fs, e->data);
+			}
+
 			// v1.8.9 weather. docs/plan-1.8.9-weather.md §7 asked for exactly this and named
 			// the shape: once per loaded column, decimated through world/tick.h rather than
 			// with a second scheduler invented here.
@@ -5788,6 +5892,42 @@ session_start:
 		// long-range break.
 		it.holding = inventoryHeldItem(&s_inv);
 
+		// v1.8.15 FURNACE. Aiming at a furnace and pressing PLACE opens its panel instead of
+		// putting a block down — Minecraft's "use" on an interactive block, and the reason no
+		// new binding was added for it. The 3DS has no spare face button here that would not
+		// cost something else: the pause menu owns SELECT, the debug menu and the bag own the
+		// rest, and interact.h's two actions are already remappable, so a third world action
+		// would have to appear in app/remap_ui.c and in every saved binding file.
+		//
+		// Overloading PLACE is safe precisely because the two cases are disjoint by their
+		// TARGET, not by a modifier the player has to remember: the ray either ends on a
+		// furnace or it does not. There is no gesture that means both.
+		//
+		// Not gated on the panel already being open, deliberately. Re-pressing on a DIFFERENT
+		// furnace retargets the panel to that one, which is what a player who walked to the next
+		// furnace expects; re-pressing on the same one is a harmless no-op. The alternative —
+		// refusing when a panel is open — would make the press fall through to the mask below as
+		// a placement, so the player would build a block onto the face of the furnace they were
+		// trying to look at, which is the one outcome nobody wants.
+		//
+		// interactAim() ran at the top of this block, so it.target is THIS frame's raycast and
+		// not the previous frame's; that matters because the whole decision hangs on it.
+		bool opened_furnace_this_frame = false;
+#if BS_BOTTOM_UI
+		if (!paused && (down & inputKey(ACTION_PLACE)) && it.target.hit &&
+		    worldGet(&s_world, it.target.x, it.target.y, it.target.z) == BLOCK_FURNACE) {
+			s_furnace_x = it.target.x;
+			s_furnace_y = it.target.y;
+			s_furnace_z = it.target.z;
+			s_furnace_open = true;
+			// uiOpenFurnace rather than writing s_ui.screen here: it also drops any stack the
+			// player had lifted in the bag, which a raw assignment would forget and which would
+			// leave that stack held over a panel whose slots it cannot legally go into.
+			uiOpenFurnace(&s_ui);
+			opened_furnace_this_frame = true;
+		}
+#endif
+
 		// v1.8.7. The masks are zeroed while the pause menu is open, and until now they were not.
 		// INTERACT_KEY_BREAK is KEY_X and INTERACT_KEY_PLACE is KEY_Y (scene/interact.h); the
 		// pause menu reads only the D-pad, A and B (scene/pausemenu.c), so X and Y fell straight
@@ -5807,8 +5947,12 @@ session_start:
 		// consumers between the eat check and this line and none of them should see a press
 		// disappear. interact.c:405 reads exactly inputKey(ACTION_PLACE), so this is the same
 		// bit it is about to test.
+		// v1.8.15 FURNACE: and the place bit is stripped on the frame that opened a furnace
+		// panel, for exactly the reason the eat mask above exists — one press must not both open
+		// the furnace and place a block against its face. Same mask, same line, same bit.
 		const u32 edit_down = (paused ? 0u : down)
 		                    & ~(ate_this_frame ? inputKey(ACTION_PLACE) : 0u)
+		                    & ~(opened_furnace_this_frame ? inputKey(ACTION_PLACE) : 0u)
 		// v1.8.14 animals: and the break bit is stripped on a frame the swing above consumed it,
 		// so one press cannot both damage an animal and start breaking the block behind it.
 		// interact.c reads keys_down for break in two places -- `fresh & key_break` becomes
@@ -5879,6 +6023,46 @@ session_start:
 		// server to remove a block it can see the player does not have.
 		if (it.placed_id != BLOCK_AIR)
 			invBridgeRemove(&s_inv, it.placed_id, 1);
+
+		// v1.8.15 "Furnace". A placed furnace acquires its own empty state, the exact mirror of
+		// the blockStateRemove above -- place claims a slot, break frees it.
+		//
+		// Gated on the block id and NOT run unconditionally, which is the opposite of the break
+		// path twenty lines up, and the asymmetry is deliberate rather than an inconsistency.
+		// Removing state for a cell that has none is free and idempotent, so the break side can
+		// afford to hold no opinion about which blocks are stateful. CREATING state is not free:
+		// BLOCKSTATE_SLOTS is 64, so calling blockStateCreate for every dirt block placed would
+		// fill the table within seconds of ordinary building and leave no room for a furnace.
+		// The table has to be told what deserves a slot; only the break side can afford not to
+		// care.
+		//
+		// The return is deliberately discarded. blockStateCreate answers false when the table is
+		// genuinely full -- 64 live records, none of them this cell -- and there is nothing
+		// useful to do about it here: the furnace block itself has already been placed into the
+		// world by interactEdit, and un-placing it underneath the player would be a stranger
+		// outcome than a furnace that refuses to hold fuel. A player who has 64 furnaces going
+		// at once has found the limit; the 65th behaves like decoration rather than crashing or
+		// silently eating what they put in it, because every read of an absent record is a clean
+		// "no state here" by blockstate.h's contract.
+		if (it.placed_valid && it.placed_id == BLOCK_FURNACE) {
+			if (blockStateCreate(&s_blockstate, it.placed_x, it.placed_y, it.placed_z,
+			                      BLOCK_FURNACE)) {
+				// blockStateCreate hands back an all-zero payload, and an all-zero FurnaceState
+				// is already the correct empty furnace -- every slot ITEM_NONE, no fuel, no
+				// progress, unlit. Packing furnaceStateInit's result over the top is therefore
+				// redundant TODAY. It is done anyway, because "zero happens to mean empty" is a
+				// property of furnace.h's current field layout and not a promise it makes; the
+				// day a field gains a non-zero resting value, this line is what keeps a freshly
+				// placed furnace correct, and its absence would be a bug nobody could see.
+				FurnaceState fs;
+				furnaceStateInit(&fs);
+
+				uint8_t payload[BLOCKSTATE_PAYLOAD_BYTES];
+				furnaceStatePack(&fs, payload);
+				(void)blockStateSet(&s_blockstate, it.placed_x, it.placed_y, it.placed_z,
+				                     BLOCK_FURNACE, payload);
+			}
+		}
 
 #if BS_EDIT_STRESS
 		// The 4.5 check: an edit on a chunk corner every frame, which dirties eight

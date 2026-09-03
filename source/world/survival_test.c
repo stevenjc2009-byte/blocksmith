@@ -529,6 +529,30 @@ static void testFoodTable(void)
 	CHECK(survivalFoodValue(BLOCK_RAW_CHICKEN) < survivalFoodValue(BLOCK_RAW_PORKCHOP));
 	CHECK(survivalFoodValue(BLOCK_RAW_MUTTON) < survivalFoodValue(BLOCK_RAW_BEEF));
 
+	/* v1.8.15 "Furnace". The four cooked cuts, typed from intent like the raw ones above.
+	 *
+	 * The four RELATIONS below matter more than the four values, and they are the whole
+	 * reason the furnace is worth building: each cooked cut must restore strictly more than
+	 * the raw one it came from. A furnace that lights, burns fuel and hands back something no
+	 * better than what went in is a version that has landed unreachable — it would pass every
+	 * test furnace.c owns, because none of those tests can see this table. These four lines
+	 * are the only place in the suite where "cooking is worth doing" is actually asserted. */
+	CHECK_I(survivalFoodValue(BLOCK_COOKED_PORKCHOP), 8);
+	CHECK_I(survivalFoodValue(BLOCK_COOKED_BEEF), 8);
+	CHECK_I(survivalFoodValue(BLOCK_COOKED_CHICKEN), 6);
+	CHECK_I(survivalFoodValue(BLOCK_COOKED_MUTTON), 6);
+	CHECK(survivalFoodValue(BLOCK_COOKED_PORKCHOP) > survivalFoodValue(BLOCK_RAW_PORKCHOP));
+	CHECK(survivalFoodValue(BLOCK_COOKED_BEEF)     > survivalFoodValue(BLOCK_RAW_BEEF));
+	CHECK(survivalFoodValue(BLOCK_COOKED_CHICKEN)  > survivalFoodValue(BLOCK_RAW_CHICKEN));
+	CHECK(survivalFoodValue(BLOCK_COOKED_MUTTON)   > survivalFoodValue(BLOCK_RAW_MUTTON));
+
+	/* And the ceiling, which is the constraint the numbers above were chosen against: no
+	 * single item may restore the whole bar. A cooked cut worth SURVIVAL_MAX_HUNGER would
+	 * make hunger decorative — eat once, never think about it again — so this goes red on a
+	 * generous re-balance rather than letting one land silently. */
+	CHECK(survivalFoodValue(BLOCK_COOKED_PORKCHOP) < SURVIVAL_MAX_HUNGER);
+	CHECK(survivalFoodValue(BLOCK_COOKED_BEEF) < SURVIVAL_MAX_HUNGER);
+
 	/* Everything else this build ships is not food. Spot-checked across the id space rather
 	 * than exhaustively, plus air and an undefined high id. */
 	CHECK_I(survivalFoodValue(BLOCK_AIR), 0);
@@ -543,11 +567,16 @@ static void testFoodTable(void)
 	 * 1 -> 5 on 2026-09-03, v1.8.14 "Animals": the apple plus the four raw meats. This is the
 	 * check that would catch a fifth meat row added by accident, or a cooked row landing a
 	 * version early, so it moves by exactly the number of rows added and never by "whatever
-	 * makes it pass". */
+	 * makes it pass".
+	 *
+	 * 5 -> 9 on 2026-09-03, v1.8.15 "Furnace": the four cooked cuts. Exactly four, which is
+	 * the point — the check above named them individually, and this one says there is nothing
+	 * ELSE now edible. A furnace recipe that accidentally routed some third block into the
+	 * food table would be invisible to every named check and visible only here. */
 	int food_ids = 0;
 	for (int id = 0; id <= 0xFF; id++)
 		if (survivalFoodValue((BlockId)id) != 0) food_ids++;
-	CHECK_I(food_ids, 5);
+	CHECK_I(food_ids, 9);
 }
 
 static void testEatingAnAppleConsumesExactlyOne(void)

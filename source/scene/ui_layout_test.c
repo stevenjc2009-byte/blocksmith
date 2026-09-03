@@ -32,6 +32,66 @@ static char s_first[160];
 		}                                                                        \
 	} while (0)
 
+// ── The check-count pin ────────────────────────────────────────────────────────────────
+//
+// Same mechanism, same wording and the same reason as world/furnace_test.c's and
+// world/blockstate_test.c's: a check that stops RUNNING does not fail, it silently ceases to
+// exist, and the suite's total drops instead of going red. This project has recorded cases of
+// exactly that (see tools/run_host_tests.sh's own notes on a whole 2,555-check stanza going
+// dark), so the count is pinned rather than watched by eye.
+//
+// Measured (2026-09-03): this file had NO pin before the v1.8.15 furnace panel landed, so the
+// number was not predicted. A placeholder 703 — the count named in ui_layout.h's own vitals
+// sabotage note, i.e. the count before the furnace tests were written — was seeded first, and
+// the first run with the furnace tests present reported
+// "CHECK COUNT: 4821 check(s) were ADDED - expected 703, ran 5524." and exited 1 with
+// "ui_layout self-test: FAIL 1/5524" — the pin the only failure, every furnace check green.
+//
+// It moved once more in the same session, and honestly rather than by re-seeding: the deposit
+// arithmetic was pulled out of scene/ui.c into ui_layout.c (uiMoveStackInto) so it could be
+// tested at all, and its seven tests reported
+// "CHECK COUNT: 766 check(s) were ADDED - expected 5524, ran 6290", again the only failure.
+// 6290 is what it actually counts.
+//
+// The total is far above the 703 this file ran before v1.8.15 because two of the new tests
+// SWEEP rather than tabulate — testFurnBarFillIsBoundedAndMonotonic walks three whole progress
+// ranges (1200, 200 and 1 ticks) at three checks a step, and testMoveStackIntoConservesUnits
+// walks every legal (source, destination) count pair. That is deliberate: a gauge correct at
+// eleven table values and wrong at the twelfth, and a stack move correct at every hand-picked
+// count and wrong at one in between, are exactly the defects a table cannot see.
+#define UI_LAYOUT_TEST_EXPECTED_CHECKS 6290
+
+static void checkCountPin(void)
+{
+	if (s_checks == UI_LAYOUT_TEST_EXPECTED_CHECKS)
+		return;
+
+	s_fails++;
+	if (s_checks < UI_LAYOUT_TEST_EXPECTED_CHECKS) {
+		printf("CHECK COUNT: %d check(s) WENT MISSING - expected %d, ran %d.\n"
+		       "  They did not fail. They never ran. Find them. Do NOT re-pin\n"
+		       "  UI_LAYOUT_TEST_EXPECTED_CHECKS to go green.\n",
+		       UI_LAYOUT_TEST_EXPECTED_CHECKS - s_checks,
+		       UI_LAYOUT_TEST_EXPECTED_CHECKS, s_checks);
+		if (!s_first[0])
+			snprintf(s_first, sizeof(s_first),
+			         "CHECK COUNT: %d checks MISSING (expected %d, ran %d) - see above",
+			         UI_LAYOUT_TEST_EXPECTED_CHECKS - s_checks,
+			         UI_LAYOUT_TEST_EXPECTED_CHECKS, s_checks);
+	} else {
+		printf("CHECK COUNT: %d check(s) were ADDED - expected %d, ran %d.\n"
+		       "  If you added them on purpose, set UI_LAYOUT_TEST_EXPECTED_CHECKS in\n"
+		       "  source/scene/ui_layout_test.c to %d.\n",
+		       s_checks - UI_LAYOUT_TEST_EXPECTED_CHECKS,
+		       UI_LAYOUT_TEST_EXPECTED_CHECKS, s_checks, s_checks);
+		if (!s_first[0])
+			snprintf(s_first, sizeof(s_first),
+			         "CHECK COUNT: %d checks ADDED (expected %d, ran %d) - re-pin to %d",
+			         s_checks - UI_LAYOUT_TEST_EXPECTED_CHECKS,
+			         UI_LAYOUT_TEST_EXPECTED_CHECKS, s_checks, s_checks);
+	}
+}
+
 static void centerOf(URect r, int* cx, int* cy)
 {
 	*cx = r.x + r.w / 2;
@@ -339,6 +399,531 @@ static void testPipsClearTheStatusRows(void)
 	}
 }
 
+// ── v1.8.15 FURNACE: the furnace panel's rects, hit tests and gauge arithmetic ──────────
+//
+// What these can check that a screenshot cannot, which is the whole reason the split exists:
+// that the three furnace cells resolve to the slot they are drawn as and to nothing else,
+// that the RELOCATED main grid on this screen and the inventory overlay's grid cannot both
+// claim the same point, that the two gauges are readouts and never swallow a tap meant for a
+// slot, and that furnBarFill()'s division is guarded on the exact inputs an idle furnace
+// produces. A capture proves the panel looks right in the state that happened to be on screen;
+// it cannot prove a furnace holding no fuel does not divide by zero, because that furnace
+// draws a perfectly ordinary empty bar right up until it crashes.
+
+// gfx/font.h's FONT_GLYPH_H, restated here as a literal rather than included: that header
+// pulls in <citro3d.h> and this binary is the one that must link without it (see this file's
+// own header comment). 7 is the value, and if it ever moves this constant is wrong in a way
+// no compiler will say — which is exactly why the checks below are written against a floor
+// well above it rather than against it.
+#define TEST_FONT_GLYPH_H 7
+
+// The smallest a touch target on this panel is allowed to be. Deliberately more than double
+// TEST_FONT_GLYPH_H: the task's constraint is "comfortably larger than the font", and a
+// target the height of its own label is not comfortable on a stylus panel — the existing
+// crafting rows are 18 px and ui_layout.h already flags 13 px as the point where a row stops
+// having usable clearance.
+#define TEST_MIN_TOUCH_H 16
+
+// The centre of each furnace cell resolves to that cell, and furnSlotRect() agrees with the
+// three named accessors for every index.
+static void testFurnaceSlotsRoundTrip(void)
+{
+	static const int all[] = { FURN_HIT_INPUT, FURN_HIT_FUEL, FURN_HIT_OUTPUT };
+
+	for (size_t k = 0; k < sizeof(all) / sizeof(all[0]); k++) {
+		const int which = all[k];
+		const URect r = furnSlotRect(which);
+
+		int cx, cy;
+		centerOf(r, &cx, &cy);
+		CHECK(hitFurnaceSlot(cx, cy) == which);
+
+		// Corners too, not just the centre: the first in-bounds pixel and the last.
+		CHECK(hitFurnaceSlot(r.x, r.y) == which);
+		CHECK(hitFurnaceSlot(r.x + r.w - 1, r.y + r.h - 1) == which);
+
+		// One pixel outside each edge is NOT this slot. It may be another slot (the cells are
+		// 16 px apart, so it is not) or nothing; what it must never be is this one.
+		CHECK(hitFurnaceSlot(r.x - 1, cy) != which);
+		CHECK(hitFurnaceSlot(r.x + r.w, cy) != which);
+		CHECK(hitFurnaceSlot(cx, r.y - 1) != which);
+		CHECK(hitFurnaceSlot(cx, r.y + r.h) != which);
+	}
+
+	// furnSlotRect() is the same rect as the named accessor, field for field. This is what
+	// stops the indexed form and the named form drifting apart — ui.c draws through the
+	// indexed one and hit-tests through the named ones.
+	const URect in_named = furnInputRect(),  in_idx  = furnSlotRect(FURN_HIT_INPUT);
+	const URect fu_named = furnFuelRect(),   fu_idx  = furnSlotRect(FURN_HIT_FUEL);
+	const URect ou_named = furnOutputRect(), ou_idx  = furnSlotRect(FURN_HIT_OUTPUT);
+
+	CHECK(in_named.x == in_idx.x && in_named.y == in_idx.y);
+	CHECK(in_named.w == in_idx.w && in_named.h == in_idx.h);
+	CHECK(fu_named.x == fu_idx.x && fu_named.y == fu_idx.y);
+	CHECK(fu_named.w == fu_idx.w && fu_named.h == fu_idx.h);
+	CHECK(ou_named.x == ou_idx.x && ou_named.y == ou_idx.y);
+	CHECK(ou_named.w == ou_idx.w && ou_named.h == ou_idx.h);
+}
+
+// An index outside the three is a zero rect that no point can be inside — the one answer that
+// cannot be mistaken for a real slot.
+static void testFurnaceSlotRectRejectsOutOfRangeIndex(void)
+{
+	static const int bad[] = { -1, -100, FURN_HIT_NONE, 3, 4, 99, 1000 };
+
+	for (size_t k = 0; k < sizeof(bad) / sizeof(bad[0]); k++) {
+		const URect r = furnSlotRect(bad[k]);
+		CHECK(r.w == 0);
+		CHECK(r.h == 0);
+
+		// And nothing lands in it, including its own origin.
+		CHECK(!ptInRect(r, r.x, r.y));
+		CHECK(!ptInRect(r, 0, 0));
+	}
+}
+
+// The three cells do not overlap each other, do not overlap the hotbar, and do not overlap the
+// relocated main grid. Three separate claims, because the panel is laid out by hand from
+// literal x/y constants and a typo in any one of them is invisible in a screenshot of a
+// furnace that happens to be empty.
+static void testFurnaceSlotsDoNotCollide(void)
+{
+	static const int all[] = { FURN_HIT_INPUT, FURN_HIT_FUEL, FURN_HIT_OUTPUT };
+
+	for (size_t a = 0; a < sizeof(all) / sizeof(all[0]); a++) {
+		const URect ra = furnSlotRect(all[a]);
+
+		for (size_t b = a + 1; b < sizeof(all) / sizeof(all[0]); b++)
+			CHECK(!rectsOverlap(ra, furnSlotRect(all[b])));
+
+		for (int s = 0; s < INV_HOTBAR_SLOTS; s++)
+			CHECK(!rectsOverlap(ra, hotbarSlotRect(s)));
+
+		for (int i = 0; i < INV_MAIN_SLOTS; i++)
+			CHECK(!rectsOverlap(ra, furnGridSlotRect(i)));
+
+		CHECK(!rectsOverlap(ra, furnCloseRect()));
+		CHECK(!rectsOverlap(ra, furnBurnRect()));
+		CHECK(!rectsOverlap(ra, furnArrowRect()));
+	}
+}
+
+// The bag, as drawn on the furnace screen: hotbar at its usual rects, main grid at
+// FURN_GRID_Y.
+static void testFurnaceInvSlotsRoundTrip(void)
+{
+	for (int i = 0; i < INV_HOTBAR_SLOTS; i++) {
+		int cx, cy;
+		centerOf(hotbarSlotRect(i), &cx, &cy);
+		CHECK(hitFurnaceInvSlot(cx, cy) == i);
+	}
+
+	for (int i = 0; i < INV_MAIN_SLOTS; i++) {
+		const URect r = furnGridSlotRect(i);
+		int cx, cy;
+		centerOf(r, &cx, &cy);
+
+		CHECK(hitFurnaceInvSlot(cx, cy) == INV_HOTBAR_SLOTS + i);
+		CHECK(hitFurnaceInvSlot(r.x, r.y) == INV_HOTBAR_SLOTS + i);
+		CHECK(hitFurnaceInvSlot(r.x + r.w - 1, r.y + r.h - 1) == INV_HOTBAR_SLOTS + i);
+	}
+
+	// The grid tiles the bottom of the panel exactly: 2 rows of 40 starting at 160 ends on
+	// SCR_H, with no dead strip under it and nothing clipped off it.
+	const URect last = furnGridSlotRect(INV_MAIN_SLOTS - 1);
+	CHECK(last.y + last.h == SCR_H);
+	CHECK(furnGridSlotRect(0).y == FURN_GRID_Y);
+
+	// Points off the panel resolve to nothing here, same contract hitInventorySlot has.
+	CHECK(hitFurnaceInvSlot(-1, 0) == -1);
+	CHECK(hitFurnaceInvSlot(0, -1) == -1);
+	CHECK(hitFurnaceInvSlot(SCR_W, 0) == -1);
+	CHECK(hitFurnaceInvSlot(0, SCR_H) == -1);
+	CHECK(hitFurnaceInvSlot(SCR_W + 50, SCR_H + 50) == -1);
+}
+
+// The two screens' grids are in different places, and neither screen's hit test may resolve a
+// point belonging to the other's grid. This is the check that goes red if somebody "unifies"
+// the two grids back into one function and forgets that only one of them moved.
+static void testTheTwoGridsAreDisjoint(void)
+{
+	for (int i = 0; i < INV_MAIN_SLOTS; i++) {
+		const URect furn = furnGridSlotRect(i);
+		const URect ovl  = gridSlotRect(i);
+
+		// Same column, different band.
+		CHECK(furn.x == ovl.x);
+		CHECK(furn.y != ovl.y);
+		CHECK(!rectsOverlap(furn, ovl));
+
+		int fcx, fcy, ocx, ocy;
+		centerOf(furn, &fcx, &fcy);
+		centerOf(ovl,  &ocx, &ocy);
+
+		// A point in the furnace screen's grid is not an inventory-overlay slot at all — with
+		// the overlay open OR closed. On the overlay screen that band is the crafting panel.
+		CHECK(hitInventorySlot(fcx, fcy, true)  == -1);
+		CHECK(hitInventorySlot(fcx, fcy, false) == -1);
+
+		// And a point in the overlay's grid is not a furnace-screen bag slot: on the furnace
+		// screen that band is the close bar, the three cells and the two gauges.
+		CHECK(hitFurnaceInvSlot(ocx, ocy) == -1);
+	}
+}
+
+// The burn bar and the cook arrow are READOUTS. A tap on either must fall through to nothing,
+// so a stylus that lands 2 px low of the fuel cell does not silently do something else.
+static void testFurnaceGaugesAreNotTouchTargets(void)
+{
+	const URect gauges[2] = { furnBurnRect(), furnArrowRect() };
+
+	for (int g = 0; g < 2; g++) {
+		const URect r = gauges[g];
+
+		int cx, cy;
+		centerOf(r, &cx, &cy);
+
+		CHECK(hitFurnaceSlot(cx, cy) == FURN_HIT_NONE);
+		CHECK(hitFurnaceInvSlot(cx, cy) == -1);
+		CHECK(!ptInRect(furnCloseRect(), cx, cy));
+
+		// Corners as well as the centre.
+		CHECK(hitFurnaceSlot(r.x, r.y) == FURN_HIT_NONE);
+		CHECK(hitFurnaceSlot(r.x + r.w - 1, r.y + r.h - 1) == FURN_HIT_NONE);
+		CHECK(hitFurnaceInvSlot(r.x, r.y) == -1);
+		CHECK(hitFurnaceInvSlot(r.x + r.w - 1, r.y + r.h - 1) == -1);
+
+		// On the panel, and clear of both the hotbar and the bag grid.
+		CHECK(r.x >= 0 && r.x + r.w <= SCR_W);
+		CHECK(r.y >= 0 && r.y + r.h <= SCR_H);
+		for (int s = 0; s < INV_HOTBAR_SLOTS; s++)
+			CHECK(!rectsOverlap(r, hotbarSlotRect(s)));
+		for (int i = 0; i < INV_MAIN_SLOTS; i++)
+			CHECK(!rectsOverlap(r, furnGridSlotRect(i)));
+	}
+
+	// The two gauges do not overlap each other either — they are 20 px apart vertically and
+	// 100 px apart horizontally, but both of those come from hand-written constants.
+	CHECK(!rectsOverlap(furnBurnRect(), furnArrowRect()));
+}
+
+// The whole panel fits the 320x240 budget, in the stacking order ui_layout.h's comment claims,
+// and every touch target on it clears the font by a comfortable margin.
+static void testFurnacePanelFitsAndIsTappable(void)
+{
+	const URect close = furnCloseRect();
+
+	// Close bar sits directly under the hotbar and above the slot row.
+	CHECK(close.y == HOTBAR_Y + HOTBAR_H);
+	CHECK(close.y + close.h <= FURN_ROW_Y);
+	CHECK(close.x == 0 && close.w == SCR_W);
+	CHECK(!rectsOverlap(close, hotbarSlotRect(0)));
+	CHECK(!rectsOverlap(close, hotbarSlotRect(INV_HOTBAR_SLOTS - 1)));
+
+	// Every touch target on this screen: the close bar, the three cells, the hotbar and the
+	// relocated grid. All on the panel, all comfortably taller than the font.
+	CHECK(close.h >= TEST_MIN_TOUCH_H);
+	CHECK(close.h > TEST_FONT_GLYPH_H);
+
+	for (int which = FURN_HIT_INPUT; which <= FURN_HIT_OUTPUT; which++) {
+		const URect r = furnSlotRect(which);
+		CHECK(r.x >= 0);
+		CHECK(r.x + r.w <= SCR_W);
+		CHECK(r.y >= 0);
+		CHECK(r.y + r.h <= SCR_H);
+		CHECK(r.h >= TEST_MIN_TOUCH_H);
+		CHECK(r.w >= TEST_MIN_TOUCH_H);
+		CHECK(r.y == FURN_ROW_Y);
+	}
+
+	for (int i = 0; i < INV_MAIN_SLOTS; i++) {
+		const URect r = furnGridSlotRect(i);
+		CHECK(r.x >= 0);
+		CHECK(r.x + r.w <= SCR_W);
+		CHECK(r.y >= FURN_GRID_Y);
+		CHECK(r.y + r.h <= SCR_H);
+		CHECK(r.h >= TEST_MIN_TOUCH_H);
+	}
+
+	// The hint text's LAST row must clear the grid. This is the constraint ui_layout.h's
+	// FURN_HINT_* comment states, checked rather than reread: it fails if a third hint row is
+	// added, if the step grows, or if the grid moves up.
+	const int hint_bottom = FURN_HINT_Y + (FURN_HINT_ROWS - 1) * FURN_HINT_STEP
+	                        + TEST_FONT_GLYPH_H;
+	CHECK(hint_bottom <= FURN_GRID_Y);
+	CHECK(FURN_HINT_Y >= FURN_BURN_Y + FURN_BURN_H);
+
+	// The panel's bands are in order, top to bottom, with no band starting above the one
+	// before it ends.
+	CHECK(FURN_CLOSE_Y >= HOTBAR_Y + HOTBAR_H);
+	CHECK(FURN_ROW_Y >= FURN_CLOSE_Y + FURN_CLOSE_H);
+	CHECK(FURN_BURN_Y >= FURN_ROW_Y + FURN_SLOT_PX);
+	CHECK(FURN_GRID_Y >= FURN_BURN_Y + FURN_BURN_H);
+	CHECK(FURN_GRID_Y + INV_MAIN_ROWS * SLOT_PX == SCR_H);
+}
+
+// ── furnBarFill: the one piece of this panel that can be arithmetically WRONG ────────────
+
+// A table of expected pixel widths, written out by hand rather than derived, so this is not
+// furnBarFill checked against a second copy of furnBarFill.
+static void testFurnBarFillScale(void)
+{
+	static const struct { int total, num, den, want; } cases[] = {
+		{ 80,   0, 200,  0 },   // idle: no progress
+		{ 80, 200, 200, 80 },   // complete
+		{ 80, 100, 200, 40 },   // exactly half
+		{ 80,  50, 200, 20 },
+		{ 80, 150, 200, 60 },
+		{ 80,   1, 200,  0 },   // floors to nothing — one tick in is not one pixel
+		{ 80, 199, 200, 79 },   // one tick short of full is NOT full
+		{ 40, 600, 1200, 20 },  // the burn bar at half a log
+		{ 40, 300, 1200, 10 },  // a full plank on the log scale: a quarter bar. See ui.c's
+		                        // note on why the burn gauge is absolute, not relative.
+		{ 40, 1200, 1200, 40 },
+		{ 40,    0, 1200,  0 },
+	};
+
+	for (size_t k = 0; k < sizeof(cases) / sizeof(cases[0]); k++)
+		CHECK(furnBarFill(cases[k].total, cases[k].num, cases[k].den) == cases[k].want);
+}
+
+// The guards. den == 0 is the one that matters most: it is the state of EVERY furnace that has
+// no fuel item and no valid input, which is what a freshly placed furnace looks like, and an
+// unguarded divide there is a crash on the most ordinary screen in the feature.
+static void testFurnBarFillGuardsTheDivision(void)
+{
+	static const int totals[] = { 0, 1, 12, 40, 80, 320 };
+
+	for (size_t k = 0; k < sizeof(totals) / sizeof(totals[0]); k++) {
+		const int t = totals[k];
+
+		CHECK(furnBarFill(t, 0, 0) == 0);        // idle furnace: no numerator, no denominator
+		CHECK(furnBarFill(t, 5, 0) == 0);        // progress with no scale to read it against
+		CHECK(furnBarFill(t, 5, -1) == 0);
+		CHECK(furnBarFill(t, 5, -1000) == 0);
+		CHECK(furnBarFill(t, -1, 200) == 0);     // negative progress reads empty, never full
+		CHECK(furnBarFill(t, -1000, 200) == 0);
+		CHECK(furnBarFill(t, 0, 200) == 0);
+	}
+
+	// A non-positive total is a bar with no pixels — never a negative width handed to
+	// spriteRect, which would draw a rect extending backwards from its own origin.
+	CHECK(furnBarFill(0, 100, 200) == 0);
+	CHECK(furnBarFill(-1, 100, 200) == 0);
+	CHECK(furnBarFill(-80, 200, 200) == 0);
+	CHECK(furnBarFill(0, 0, 0) == 0);
+}
+
+// Two properties over the whole real input range, which is what catches an edit that keeps
+// every table row above correct and still breaks in between: the result never leaves
+// [0, total], and it never goes DOWN as progress goes up.
+//
+// Swept at the two widths ui.c actually draws (FURN_BURN_W and FURN_ARROW_W) against the two
+// denominators it actually passes (a log's burn, and a recipe's 200-tick cook), plus values
+// past the denominator so the saturating end is covered too.
+static void testFurnBarFillIsBoundedAndMonotonic(void)
+{
+	static const struct { int total, den; } sweeps[] = {
+		{ FURN_BURN_W,  1200 },
+		{ FURN_ARROW_W,  200 },
+		{ FURN_ARROW_W,    1 },   // a one-tick recipe: every non-zero num saturates
+	};
+
+	for (size_t s = 0; s < sizeof(sweeps) / sizeof(sweeps[0]); s++) {
+		const int total = sweeps[s].total;
+		const int den   = sweeps[s].den;
+
+		int prev = 0;
+		for (int num = 0; num <= den + 5; num++) {
+			const int got = furnBarFill(total, num, den);
+
+			CHECK(got >= 0);
+			CHECK(got <= total);
+			CHECK(got >= prev);
+			prev = got;
+		}
+
+		// The far ends, stated separately so a sweep that silently ran zero iterations could
+		// not pass this function.
+		CHECK(furnBarFill(total, 0, den) == 0);
+		CHECK(furnBarFill(total, den, den) == total);
+		CHECK(furnBarFill(total, den + 10000, den) == total);
+	}
+}
+
+// ── uiMoveStackInto: the deposit arithmetic ─────────────────────────────────────────────
+//
+// The reason this function is in ui_layout.c at all (see its header comment): an off-by-one in
+// the room calculation duplicates or destroys items, and neither shows up in a screenshot of
+// a furnace. Every rule its header states gets a check here, and the two slots are inspected
+// AFTER every call — not just the return value — because a function that returns the right
+// number and writes the wrong fields is the failure this is actually guarding against.
+//
+// Two arbitrary distinct item ids, written as literals rather than as BLOCK_* names: this
+// binary links neither world/block.c nor world/registry.c (see tools/run_host_tests.sh's
+// stanza), and uiMoveStackInto treats an ItemId as an opaque integer it only ever compares
+// for equality. Using a real block id here would suggest it asks the registry something. It
+// does not.
+#define TEST_ITEM_A ((ItemId)17)
+#define TEST_ITEM_B ((ItemId)29)
+
+static void testMoveStackIntoEmptyDestination(void)
+{
+	InvSlot  src   = { TEST_ITEM_A, 5 };
+	ItemId   dst_i = ITEM_NONE;
+	uint8_t  dst_c = 0;
+
+	CHECK(uiMoveStackInto(&src, &dst_i, &dst_c) == 5);
+	CHECK(dst_i == TEST_ITEM_A);
+	CHECK(dst_c == 5);
+	CHECK(src.item == ITEM_NONE);   // emptied source normalises, never a stale id
+	CHECK(src.count == 0);
+}
+
+static void testMoveStackIntoMergesWithSameItem(void)
+{
+	InvSlot  src   = { TEST_ITEM_A, 5 };
+	ItemId   dst_i = TEST_ITEM_A;
+	uint8_t  dst_c = 3;
+
+	CHECK(uiMoveStackInto(&src, &dst_i, &dst_c) == 5);
+	CHECK(dst_i == TEST_ITEM_A);
+	CHECK(dst_c == 8);
+	CHECK(src.item == ITEM_NONE);
+	CHECK(src.count == 0);
+}
+
+// The partial move: the destination tops up to INV_STACK_MAX and the remainder stays exactly
+// where it was. Nothing is created and nothing is destroyed — the check that goes red on an
+// off-by-one in either direction is the conservation one at the end.
+static void testMoveStackIntoPartialLeavesTheRemainder(void)
+{
+	InvSlot  src   = { TEST_ITEM_A, 10 };
+	ItemId   dst_i = TEST_ITEM_A;
+	uint8_t  dst_c = INV_STACK_MAX - 4;
+
+	CHECK(uiMoveStackInto(&src, &dst_i, &dst_c) == 4);
+	CHECK(dst_i == TEST_ITEM_A);
+	CHECK(dst_c == INV_STACK_MAX);
+	CHECK(src.item == TEST_ITEM_A);   // NOT emptied — 6 are still there
+	CHECK(src.count == 6);
+	CHECK((int)dst_c + (int)src.count == INV_STACK_MAX - 4 + 10);   // conservation
+}
+
+// Exactly filling the destination is the boundary between the merge case and the partial case,
+// and it is the one an off-by-one lands on.
+static void testMoveStackIntoExactFit(void)
+{
+	InvSlot  src   = { TEST_ITEM_A, 4 };
+	ItemId   dst_i = TEST_ITEM_A;
+	uint8_t  dst_c = INV_STACK_MAX - 4;
+
+	CHECK(uiMoveStackInto(&src, &dst_i, &dst_c) == 4);
+	CHECK(dst_c == INV_STACK_MAX);
+	CHECK(src.item == ITEM_NONE);
+	CHECK(src.count == 0);
+
+	// One more unit than fits: the destination still lands exactly on the cap, never past it.
+	InvSlot  src2   = { TEST_ITEM_A, 5 };
+	ItemId   dst_i2 = TEST_ITEM_A;
+	uint8_t  dst_c2 = INV_STACK_MAX - 4;
+
+	CHECK(uiMoveStackInto(&src2, &dst_i2, &dst_c2) == 4);
+	CHECK(dst_c2 == INV_STACK_MAX);
+	CHECK(src2.item == TEST_ITEM_A);
+	CHECK(src2.count == 1);
+}
+
+// Every refusal, and the thing that makes a refusal a refusal: BOTH sides come back unchanged.
+static void testMoveStackIntoRefusals(void)
+{
+	// A full destination.
+	{
+		InvSlot  src   = { TEST_ITEM_A, 5 };
+		ItemId   dst_i = TEST_ITEM_A;
+		uint8_t  dst_c = INV_STACK_MAX;
+
+		CHECK(uiMoveStackInto(&src, &dst_i, &dst_c) == 0);
+		CHECK(dst_c == INV_STACK_MAX);
+		CHECK(src.item == TEST_ITEM_A);
+		CHECK(src.count == 5);
+	}
+
+	// A destination holding a DIFFERENT item: refused outright, never swapped.
+	{
+		InvSlot  src   = { TEST_ITEM_A, 5 };
+		ItemId   dst_i = TEST_ITEM_B;
+		uint8_t  dst_c = 2;
+
+		CHECK(uiMoveStackInto(&src, &dst_i, &dst_c) == 0);
+		CHECK(dst_i == TEST_ITEM_B);
+		CHECK(dst_c == 2);
+		CHECK(src.item == TEST_ITEM_A);
+		CHECK(src.count == 5);
+	}
+
+	// An empty source, both spellings of empty.
+	{
+		InvSlot  src   = { ITEM_NONE, 0 };
+		ItemId   dst_i = ITEM_NONE;
+		uint8_t  dst_c = 0;
+
+		CHECK(uiMoveStackInto(&src, &dst_i, &dst_c) == 0);
+		CHECK(dst_i == ITEM_NONE);
+		CHECK(dst_c == 0);
+	}
+	{
+		// A count of 0 with a live id is a state inventory.h says never happens; refusing it
+		// is what stops it becoming a free item if it ever does.
+		InvSlot  src   = { TEST_ITEM_A, 0 };
+		ItemId   dst_i = ITEM_NONE;
+		uint8_t  dst_c = 0;
+
+		CHECK(uiMoveStackInto(&src, &dst_i, &dst_c) == 0);
+		CHECK(dst_i == ITEM_NONE);
+		CHECK(dst_c == 0);
+		CHECK(src.item == TEST_ITEM_A);
+		CHECK(src.count == 0);
+	}
+}
+
+// The corrupt-payload case the header calls out: a destination reading ITEM_NONE with a
+// non-zero count holds NOTHING, so the stale number is overwritten rather than added to. Added
+// to, a stale 250 plus 10 would wrap a uint8_t to 4 and quietly delete 256 items.
+static void testMoveStackIntoIgnoresAStaleCountOnAnEmptyDestination(void)
+{
+	InvSlot  src   = { TEST_ITEM_A, 10 };
+	ItemId   dst_i = ITEM_NONE;
+	uint8_t  dst_c = 250;
+
+	CHECK(uiMoveStackInto(&src, &dst_i, &dst_c) == 10);
+	CHECK(dst_i == TEST_ITEM_A);
+	CHECK(dst_c == 10);        // overwritten, not 250 + 10
+	CHECK(src.item == ITEM_NONE);
+	CHECK(src.count == 0);
+}
+
+// A sweep over every (source count, destination count) pair a furnace slot can legally be in.
+// Three properties hold for all of them, and it is the third that a table of hand-picked cases
+// cannot establish: nothing is ever created and nothing is ever destroyed.
+static void testMoveStackIntoConservesUnits(void)
+{
+	for (int have = 1; have <= INV_STACK_MAX; have += 7) {
+		for (int held = 0; held <= INV_STACK_MAX; held += 9) {
+			InvSlot  src   = { TEST_ITEM_A, (uint8_t)have };
+			ItemId   dst_i = (held == 0) ? ITEM_NONE : TEST_ITEM_A;
+			uint8_t  dst_c = (uint8_t)held;
+
+			const uint8_t moved = uiMoveStackInto(&src, &dst_i, &dst_c);
+
+			CHECK((int)moved <= have);
+			CHECK((int)dst_c <= INV_STACK_MAX);
+			CHECK((int)dst_c + (int)src.count == have + held);
+			CHECK((src.count == 0) == (src.item == ITEM_NONE));
+		}
+	}
+}
+
 int main(void)
 {
 	testHotbarSlotsRoundTripBothScreens();
@@ -354,6 +939,29 @@ int main(void)
 	testPipFillRejectsOutOfRangeIndex();
 	testPipRectsTileTheStrip();
 	testPipsClearTheStatusRows();
+
+	testFurnaceSlotsRoundTrip();
+	testFurnaceSlotRectRejectsOutOfRangeIndex();
+	testFurnaceSlotsDoNotCollide();
+	testFurnaceInvSlotsRoundTrip();
+	testTheTwoGridsAreDisjoint();
+	testFurnaceGaugesAreNotTouchTargets();
+	testFurnacePanelFitsAndIsTappable();
+	testFurnBarFillScale();
+	testFurnBarFillGuardsTheDivision();
+	testFurnBarFillIsBoundedAndMonotonic();
+
+	testMoveStackIntoEmptyDestination();
+	testMoveStackIntoMergesWithSameItem();
+	testMoveStackIntoPartialLeavesTheRemainder();
+	testMoveStackIntoExactFit();
+	testMoveStackIntoRefusals();
+	testMoveStackIntoIgnoresAStaleCountOnAnEmptyDestination();
+	testMoveStackIntoConservesUnits();
+
+	// Last, so it counts everything above it. See its own comment for why the count is pinned
+	// at all rather than eyeballed.
+	checkCountPin();
 
 	if (s_fails == 0)
 		printf("ui_layout self-test: PASS  %d checks\n", s_checks);

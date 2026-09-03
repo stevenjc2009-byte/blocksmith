@@ -194,6 +194,26 @@ static const struct {
 	{ BLOCK_RAW_BEEF,     3 },
 	{ BLOCK_RAW_CHICKEN,  2 },
 	{ BLOCK_RAW_MUTTON,   2 },
+	// v1.8.15 "Furnace". Four more rows, and the headroom the entry above deliberately left
+	// is what they are spent on: each cooked cut restores strictly more than the raw one it
+	// came from, which is the entire reason a player would build a furnace and stand next to
+	// it rather than eat what the animal dropped. Without this the furnace still lights, still
+	// burns fuel and still produces a cooked block — and that block would feed nobody, so the
+	// whole version would land unreachable.
+	//
+	// The two-tier split carries straight over from raw, for the same reason it was right
+	// there: the big mammals are one trade and the smaller animals are another, and equal
+	// values inside a tier say so honestly. 3 -> 8 and 2 -> 6, so the multiplier is a little
+	// larger for the big cuts, which keeps the tiers from converging once cooked.
+	//
+	// The ceiling is what stops these going higher: SURVIVAL_MAX_HUNGER is 20, so 8 is already
+	// two-fifths of the bar from a single item. Anything much above that and a player who has
+	// cooked once never has to think about food again, which would make hunger decorative
+	// rather than a reason to keep animals in view.
+	{ BLOCK_COOKED_PORKCHOP, 8 },
+	{ BLOCK_COOKED_BEEF,     8 },
+	{ BLOCK_COOKED_CHICKEN,  6 },
+	{ BLOCK_COOKED_MUTTON,   6 },
 };
 
 uint8_t survivalFoodValue(BlockId id)

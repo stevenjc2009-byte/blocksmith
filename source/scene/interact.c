@@ -165,6 +165,8 @@ void interactInit(Interact* it)
 	// a finished one.
 	it->broke_valid = false;
 	it->broke_x = it->broke_y = it->broke_z = 0;
+	it->placed_valid = false;
+	it->placed_x = it->placed_y = it->placed_z = 0;
 
 	breakCancel(it);
 }
@@ -426,6 +428,7 @@ int interactEdit(Interact* it, World* w, const Body* body,
 	// invite a reader to trust (0,0,0) as "no break", which is exactly the sentinel this pair
 	// was designed to avoid.
 	it->broke_valid = false;
+	it->placed_valid = false;
 
 	// Step 8.4. The two verbs come from the player's bindings rather than the INTERACT_KEY_*
 	// constants directly. app/input_map.c answers with exactly those constants' values until
@@ -522,6 +525,14 @@ int interactEdit(Interact* it, World* w, const Body* body,
 			queued += chunkRenderTouch(w, t->px, t->py, t->pz);
 			it->placed++;
 			it->placed_id = it->holding;
+			// WHERE it landed, the break path's twin (see broke_valid above). Set here rather
+			// than at the top of the branch, so a placement worldSet accepted but
+			// sendEditOrRevert then rolled back reports nothing -- that early return leaves
+			// placed_valid false, exactly as it leaves placed_id at BLOCK_AIR.
+			it->placed_valid = true;
+			it->placed_x = t->px;
+			it->placed_y = t->py;
+			it->placed_z = t->pz;
 			// v1.9.0 audio, the break cue's twin — same instant, same reasoning. A place is
 			// edge-triggered (`fresh & key_place`) so one press can only reach here once, and
 			// this sits below sendEditOrRevert so a placement the server refused, and which has

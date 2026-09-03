@@ -12,6 +12,7 @@
 #include "scene/ui_layout.h"
 #include "world/block.h"
 #include "world/crafting.h"
+#include "world/furnace.h"   // furnaceRecipeForInput / furnaceIsFuel, for the accept rules
 
 // ── Interaction model: tap to pick up, tap again to drop ─────────────────────────────────
 //
@@ -88,6 +89,23 @@
 // off COL_BG rather than COL_BG itself, so a drained bar still reads as ten pips that are
 // empty instead of as a bar that has vanished; that is the difference between "you are at
 // zero" and "the HUD stopped drawing", and at 12x8 px it is the only thing telling them apart.
+// v1.8.15 FURNACE. The two indicator bars reuse COL_PIP_TRACK for their empty track, so an
+// empty burn bar and an empty pip read as the same kind of "this is a gauge and it is at
+// zero" rather than as two different absences — same argument the pip track's own comment
+// below makes, applied to a second gauge instead of restated for it.
+//
+// Burn is a fire colour and cook is a heat-of-the-metal colour, deliberately different hues
+// rather than one colour used twice: the two bars sit 20 px apart on the same panel and mean
+// opposite things (one is a resource draining, the other is progress filling), and at 12-14 px
+// tall the only cue that separates them at a glance is hue.
+#define COL_BURN        SPRITE_RGBA(255, 150, 52, 255)
+#define COL_COOK        SPRITE_RGBA(120, 210, 140, 255)
+// The border a furnace slot gets when the stack the player is currently carrying WOULD be
+// accepted there. Green rather than COL_PICKED's blue, because blue already means "this is the
+// slot you lifted from" everywhere else on this UI and reusing it here would put two meanings
+// on one colour on a screen showing both at once.
+#define COL_FURN_OK     SPRITE_RGBA(120, 220, 120, 255)
+
 #define COL_PIP_TRACK   SPRITE_RGBA(58, 48, 74, 255)
 #define COL_HEALTH      SPRITE_RGBA(226, 64, 64, 255)
 #define COL_HEALTH_HALF SPRITE_RGBA(236, 130, 112, 255)
@@ -166,6 +184,153 @@ static void handleCraftTap(Inventory* inv, int recipe_index)
 	// drawn, but calling it again costs nothing and means this function has no invisible
 	// precondition on draw order.
 	if (craftCanMake(inv, recipe_index)) invBridgeCraft(inv, recipe_index);
+}
+
+// ── Furnace transfers (v1.8.15 FURNACE) ────────────────────────────────────────────────
+//
+// ── The gesture, and why it is not the two-tap lift used everywhere else ────────────────
+//
+// Inventory-to-inventory moves on this UI are two taps: lift a slot, then tap where it goes
+// (see the file comment at the top). That model needs `ui->picked_slot`, which is an
+// inventory.h slot INDEX — and the three furnace slots are not inventory slots. They live in
+// a FurnaceState the caller owns, they are not part of `inv->slots[]`, and there is no index
+// that names one. So a symmetric "lift the furnace's input slot, then tap a bag slot" gesture
+// would need a second lifted-from-where field on UiState plus a rule for what happens when the
+// player closes the panel mid-lift, holding items that belong to neither container.
+//
+// Instead the furnace side is one tap, resolved by what the player is already carrying:
+//
+//   carrying a stack, tap INPUT or FUEL  -> deposit as much of it as the slot will take
+//   carrying nothing,  tap INPUT or FUEL -> withdraw the whole stack into the bag
+//   tap OUTPUT, either way               -> withdraw into the bag; a result slot is never a
+//                                            place to put things, so there is no ambiguity to
+//                                            resolve and no reason to make the player drop
+//                                            what they are carrying first
+//
+// Nothing is ever "in the air" between the two containers, so closing the panel at any moment
+// cannot lose an item — which is the failure mode the symmetric version would have had to
+// grow a rule for.
+//
+// ── What is reported to the server, and what is not ────────────────────────────────────
+//
+// This is the one place in this file where a mutation does NOT go through net/inv_bridge.h,
+// and the asymmetry is deliberate rather than an oversight, so it is worth being exact:
+//
+//   WITHDRAW uses invBridgeAdd(), like every other bag gain in this file. The bag really did
+//   gain the items; reporting it is what stops the server's next BS_APP_INV_STATE snapshot
+//   taking them straight back off the player.
+//
+//   DEPOSIT does the bag-side decrement DIRECTLY on inv->slots[], unreported. There is no
+//   slot-precise wrapper in inv_bridge.h to use — invBridgeRemove() is item-based and scans
+//   from slot 0 upward, so depositing the porkchops the player lifted out of slot 20 would
+//   visibly drain slot 0's porkchops instead. That is wrong in SINGLE PLAYER, which is the
+//   mode this game is actually played in, and it was rejected on exactly that ground.
+//
+// The honest summary of the multiplayer position: a furnace's contents live in
+// world/blockstate.c's side table, and NOTHING about that table is on the wire — there is no
+// BS_INV_OP for "into a furnace" and no packet carries a FurnaceState. So no reporting scheme
+// available here is actually correct, and the choice between them is only about which way the
+// error falls. Both halves above fall the same way: toward the player keeping their items
+// (a deposit springs back on the next snapshot, a withdrawal sticks) rather than losing them,
+// which is the right direction under an unreliable-UDP optimistic model — see inv_bridge.h's
+// own "apply locally now" reasoning. The furnace is a single-player feature until blockstate
+// is networked, and this comment is the record of what has to be revisited when it is.
+
+// Resolves a FURN_HIT_* index to the two fields of `fs` holding that slot's stack, so deposit
+// and withdraw below are written once against "a furnace slot" rather than three times against
+// input, fuel and output. False for FURN_HIT_NONE and for anything outside the three, leaving
+// both out-pointers untouched — the caller treats that as "nothing to do", the same answer a
+// tap on bare panel background gets.
+static bool furnSlotFields(FurnaceState* fs, int which, ItemId** out_item, uint8_t** out_count)
+{
+	switch (which) {
+	case FURN_HIT_INPUT:
+		*out_item = &fs->input_item;  *out_count = &fs->input_count;  return true;
+	case FURN_HIT_FUEL:
+		*out_item = &fs->fuel_item;   *out_count = &fs->fuel_count;   return true;
+	case FURN_HIT_OUTPUT:
+		*out_item = &fs->output_item; *out_count = &fs->output_count; return true;
+	default:
+		return false;
+	}
+}
+
+// Whether `item` is allowed in furnace slot `which` at all, ignoring what is already in that
+// slot. This is a GAME rule, not a safety one, and it is enforced rather than left permissive
+// on purpose.
+//
+// A Java furnace lets any item sit in its input slot and simply never smelts it. That was the
+// alternative and it was rejected: on a 320x240 panel with no tooltip and no error text, an
+// item sitting in the input slot doing nothing forever is indistinguishable from a furnace
+// that is broken, and the player's dirt is now somewhere they have to remember to go and get
+// it back from. Refusing the deposit outright means the stack stays visibly in their bag,
+// where they can see it, and the slot's border (drawn green when the carried stack WOULD be
+// accepted — see drawFurnacePanelFont) says which slot it does belong in before they tap.
+//
+// world/furnace.h owns both predicates. Nothing here re-lists which meats smelt or which
+// timber burns; adding a recipe or a fuel to that file makes it depositable here with no edit
+// to this one.
+static bool furnaceAccepts(int which, ItemId item)
+{
+	if (item == ITEM_NONE) return false;
+
+	switch (which) {
+	case FURN_HIT_INPUT:  return furnaceRecipeForInput(item) != NULL;
+	case FURN_HIT_FUEL:   return furnaceIsFuel(item, NULL);
+	// The output slot is where a smelt's RESULT appears. Nothing is ever put there by hand;
+	// see the gesture block above for why tapping it is unambiguously a withdrawal.
+	case FURN_HIT_OUTPUT: return false;
+	default:              return false;
+	}
+}
+
+// Moves as much of the lifted stack as fits into furnace slot `which`. A refusal — wrong slot
+// for this item, slot already holding something else, slot already full — leaves BOTH the bag
+// and the furnace exactly as they were AND leaves the stack lifted, so the player can carry it
+// somewhere it does fit rather than having to pick it up again.
+static void furnaceDeposit(UiState* ui, Inventory* inv, FurnaceState* fs, int which)
+{
+	InvSlot* src = &inv->slots[ui->picked_slot];
+	if (!furnaceAccepts(which, src->item)) return;
+
+	ItemId*  dst_item;
+	uint8_t* dst_count;
+	if (!furnSlotFields(fs, which, &dst_item, &dst_count)) return;
+
+	// The merge/refuse/cap arithmetic — including the "a furnace slot holding a different item
+	// is REFUSED, not swapped" rule — lives in scene/ui_layout.c so it can be host-tested; see
+	// uiMoveStackInto's header comment for every rule it applies and why it is not in this
+	// file. A swap would hand the player the burning fuel item out from under a lit furnace
+	// mid-tick with no gesture to undo it, which is why the refusal is the rule.
+	//
+	// It also does the BAG-side decrement, slot-precisely and unreported — see the "what is
+	// reported" block above for why this one transfer does not go through net/inv_bridge.h.
+	if (uiMoveStackInto(src, dst_item, dst_count) == 0) return;
+
+	ui->picked_slot = -1;
+}
+
+// Empties furnace slot `which` into the bag. Whatever the bag could not take stays in the
+// furnace — the count is set to what was left over, never cleared optimistically — so a full
+// inventory means the smelt output sits and waits rather than evaporating.
+static void furnaceWithdraw(Inventory* inv, FurnaceState* fs, int which)
+{
+	ItemId*  item;
+	uint8_t* count;
+	if (!furnSlotFields(fs, which, &item, &count)) return;
+	if (*item == ITEM_NONE || *count == 0) return;
+
+	uint8_t leftover = 0;
+	invBridgeAdd(inv, *item, *count, &leftover);
+
+	// INV_ADD_REFUSED leaves leftover == count and the inventory provably unchanged (see
+	// inventory.h), so this is the branch where nothing moved and nothing may be deducted.
+	// Written as >= rather than == so a future inventoryAdd that reported leftover oddly could
+	// only ever under-deduct, never hand the player free items.
+	if (leftover >= *count) return;
+
+	*count = leftover;
+	if (*count == 0) *item = ITEM_NONE;
 }
 
 // ── Icon UVs ───────────────────────────────────────────────────────────────────────────
@@ -441,6 +606,118 @@ static void drawCraftPanelFont(const Inventory* inv)
 	}
 }
 
+// ── Furnace panel (v1.8.15 FURNACE) ────────────────────────────────────────────────────
+
+// A furnace slot is an (item, count) pair exactly like an inventory slot, so it is drawn by
+// the same drawSlotIcon above rather than by a second copy of the background/border/icon/badge
+// code. Built as a VALUE here and not by casting a pointer into FurnaceState: the matching
+// fields are not adjacent in that struct and never will be (see world/furnace.h's packed
+// layout), so there is no cast that makes one look like the other, and there should not be.
+//
+// An ITEM_NONE slot is normalised to count 0, so a stale count left behind by a corrupt
+// blockstate payload cannot draw a count badge on a visibly empty cell.
+static InvSlot furnSlotView(ItemId item, uint8_t count)
+{
+	InvSlot s;
+	s.item  = item;
+	s.count = (item == ITEM_NONE) ? 0 : count;
+	return s;
+}
+
+// Track first, fill on top — the same shape drawPipRow uses, and for the same reason: an empty
+// gauge has to still read as a gauge at zero rather than as a gauge that stopped being drawn.
+static void drawFurnaceBar(URect r, int fill_px, uint32_t col)
+{
+	spriteRect((float)r.x, (float)r.y, (float)r.w, (float)r.h, COL_PIP_TRACK);
+	if (fill_px > 0)
+		spriteRect((float)r.x, (float)r.y, (float)fill_px, (float)r.h, col);
+}
+
+// ── What the two gauges actually measure ───────────────────────────────────────────────
+//
+// BURN is an ABSOLUTE scale: fuel_ticks_left out of FURNACE_FUEL_TICKS_LOG (1200 ticks, 60 s),
+// NOT out of the burn time of whatever fuel item is sitting in the slot.
+//
+// That is forced, not preferred. world/furnace.c consumes the fuel unit at IGNITION and clears
+// fuel_item to ITEM_NONE when that was the last one (see its step 1), so from the moment a
+// furnace lights on its final plank there is nothing left in the state to say what lit it.
+// FurnaceState has no field for the ignition duration and this lane does not own that file, so
+// a "fraction of the current fuel item" bar would have no denominator for exactly the case it
+// most needs one. Scaling everything against the longest fuel in the game instead is honest
+// about what it shows: a plank-fed furnace draws a quarter-length bar draining, and that IS
+// the true reading — a plank really does buy a quarter of what a log buys.
+//
+// COOK is a RELATIVE scale: cook_ticks out of the current input's recipe cook_ticks. With no
+// valid input there is no recipe and no denominator, so the bar reads empty. Worth being
+// explicit because it is visibly lossy in one real case: pulling the input out of a
+// half-smelted furnace PAUSES cook_ticks rather than discarding it (furnace.c's step 3), but
+// the bar has nothing to scale the paused value against and so shows nothing. The progress is
+// not lost, and it reappears the instant a valid input goes back in. Reading it off a
+// second denominator — the maximum cook_ticks across FURNACE_RECIPES — was rejected: every
+// recipe is 200 ticks today, so it would look right and would silently start lying the day a
+// recipe with a different duration is added, which is the shape of bug this codebase has
+// already been bitten by.
+static void drawFurnacePanelFont(const FurnaceState* fs, const Inventory* inv, int picked_slot,
+                                  C3D_Tex* icons)
+{
+	const URect cr = furnCloseRect();
+	spriteRect((float)cr.x, (float)cr.y, (float)cr.w, (float)cr.h, COL_PANEL_HI);
+	const char* label = "FURNACE - TAP TO CLOSE";
+	const int lw = fontTextWidth(label, 1);
+	fontDraw((float)cr.x + (cr.w - (float)lw) * 0.5f,
+	         (float)cr.y + (cr.h - FONT_GLYPH_H) * 0.5f, 1, COL_TEXT, label);
+
+	// What the player is carrying right now, so each slot can advertise whether it would take
+	// it. ITEM_NONE when nothing is lifted, which furnaceAccepts() already answers false for,
+	// so no slot lights up when there is nothing to put anywhere.
+	const ItemId carried = (picked_slot >= 0) ? inv->slots[picked_slot].item : ITEM_NONE;
+
+	for (int which = FURN_HIT_INPUT; which <= FURN_HIT_OUTPUT; which++) {
+		const URect r = furnSlotRect(which);
+
+		ItemId  item  = ITEM_NONE;
+		uint8_t count = 0;
+		switch (which) {
+		case FURN_HIT_INPUT:  item = fs->input_item;  count = fs->input_count;  break;
+		case FURN_HIT_FUEL:   item = fs->fuel_item;   count = fs->fuel_count;   break;
+		default:              item = fs->output_item; count = fs->output_count; break;
+		}
+
+		const InvSlot view = furnSlotView(item, count);
+		drawSlotIcon(PASS_FONT, r, &view, false, false, icons);
+
+		// The accept cue, drawn OVER drawSlotIcon's own background so it reads as a border on
+		// the finished cell. A full border rather than a top stripe, matching the picked-slot
+		// treatment: this is the other half of the same "where can this stack go" question,
+		// and answering half of it in a heavier weight than the other half would be worse than
+		// answering neither.
+		if (furnaceAccepts(which, carried)) {
+			spriteRect((float)r.x, (float)r.y, (float)r.w, 2, COL_FURN_OK);
+			spriteRect((float)r.x, (float)(r.y + r.h - 2), (float)r.w, 2, COL_FURN_OK);
+			spriteRect((float)r.x, (float)r.y, 2, (float)r.h, COL_FURN_OK);
+			spriteRect((float)(r.x + r.w - 2), (float)r.y, 2, (float)r.h, COL_FURN_OK);
+		}
+	}
+
+	// Burn: absolute, against the longest fuel in the game — see the block comment above.
+	const URect br = furnBurnRect();
+	drawFurnaceBar(br, furnBarFill(br.w, (int)fs->fuel_ticks_left, FURNACE_FUEL_TICKS_LOG),
+	               COL_BURN);
+
+	// Cook: relative to the current input's own recipe, empty when there is no recipe.
+	// furnBarFill() takes the den == 0 case itself, so there is no branch here and no way for
+	// an idle furnace to reach a division.
+	const FurnaceRecipe* recipe = furnaceRecipeForInput(fs->input_item);
+	const URect ar = furnArrowRect();
+	drawFurnaceBar(ar, furnBarFill(ar.w, (int)fs->cook_ticks,
+	                                recipe ? (int)recipe->cook_ticks : 0), COL_COOK);
+
+	fontDraw(6, (float)FURN_HINT_Y, 1, COL_TEXT_DIM,
+	         "IN raw meat   FUEL logs or planks");
+	fontDraw(6, (float)(FURN_HINT_Y + FURN_HINT_STEP), 1, COL_TEXT_DIM,
+	         "tap a bag slot, then a furnace slot");
+}
+
 // ── Entry points ───────────────────────────────────────────────────────────────────────
 
 void uiInit(UiState* ui)
@@ -450,8 +727,19 @@ void uiInit(UiState* ui)
 	ui->picked_slot = -1;
 }
 
+void uiOpenFurnace(UiState* ui)
+{
+	ui->screen = UI_SCR_FURNACE;
+	// Never carry a lift across a screen boundary — the same rule the OPEN INVENTORY toggle
+	// and the crafting close bar already follow in uiUpdateDraw, and it matters more here:
+	// picked_slot indexes inv->slots[], and the furnace screen draws a DIFFERENT set of those
+	// slots in different places, so a stale lift would highlight a cell the player never
+	// touched.
+	ui->picked_slot = -1;
+}
+
 UiResult uiUpdateDraw(UiState* ui, Inventory* inv, C3D_Tex* block_icons,
-                       const UiStats* stats, const UiInput* in)
+                       const UiStats* stats, const UiInput* in, FurnaceState* furnace)
 {
 	// Rising edge only, same as title.c's own `tap` — see title.h's TitleInput comment for
 	// why (KEY_TOUCH is never actually set by hidScanInput, so the caller derives
@@ -459,13 +747,54 @@ UiResult uiUpdateDraw(UiState* ui, Inventory* inv, C3D_Tex* block_icons,
 	const bool tap = in->touch_down && !ui->touch_prev;
 	ui->touch_prev = in->touch_down;
 
+	// v1.8.15 FURNACE. The one same-frame screen correction in this file, and the only one:
+	// UI_SCR_FURNACE with no FurnaceState behind it is a caller contract violation (ui.h says
+	// the two travel together), and every alternative to correcting it here is worse. Drawing
+	// the furnace panel would mean dereferencing the NULL this function was told not to touch;
+	// drawing nothing would leave the player on a dead screen with no close bar to tap and no
+	// way back. Falling back to the inventory overlay is the one outcome that is both safe and
+	// escapable, and it happens BEFORE the two flags below are read so the rest of this
+	// function never sees the inconsistent state at all.
+	if (ui->screen == UI_SCR_FURNACE && furnace == NULL) {
+		ui->screen = UI_SCR_INVENTORY;
+		ui->picked_slot = -1;
+	}
+
 	// Captured once and used for both the tap logic and the draw below, so a tap is always
 	// interpreted against the screen the player actually saw this frame — any screen switch
 	// a handler makes below (opening or closing the overlay) takes effect next frame, the
 	// same "change applies next frame" rule title.c's own ts->screen follows.
 	const bool overlay_open = (ui->screen == UI_SCR_INVENTORY);
+	const bool furnace_open = (ui->screen == UI_SCR_FURNACE);
 
-	if (tap) {
+	if (tap && furnace_open) {
+		const int tx = in->touch_x, ty = in->touch_y;
+
+		if (ptInRect(furnCloseRect(), tx, ty)) {
+			// Back to the inventory overlay rather than to the HUD: the player opened this
+			// panel to move things around, and the bag is where the rest of their things are.
+			// Closing all the way out to the world would make "put the leftovers away" a
+			// second trip through the OPEN INVENTORY toggle.
+			ui->screen = UI_SCR_INVENTORY;
+			ui->picked_slot = -1;
+		} else {
+			const int fslot = hitFurnaceSlot(tx, ty);
+			if (fslot != FURN_HIT_NONE) {
+				// The output slot is a withdrawal either way — see the gesture block above
+				// furnaceDeposit for why it needs no lifted/not-lifted branch.
+				if (fslot == FURN_HIT_OUTPUT || ui->picked_slot < 0)
+					furnaceWithdraw(inv, furnace, fslot);
+				else
+					furnaceDeposit(ui, inv, furnace, fslot);
+			} else {
+				// hitFurnaceInvSlot, not hitInventorySlot: the main grid is at FURN_GRID_Y on
+				// this screen. Same two-tap lift/drop as the inventory overlay from here on —
+				// the bag behaves identically whichever screen it is drawn on.
+				const int slot = hitFurnaceInvSlot(tx, ty);
+				if (slot >= 0) handleSlotTap(ui, inv, slot);
+			}
+		}
+	} else if (tap) {
 		const int tx = in->touch_x, ty = in->touch_y;
 
 		if (!overlay_open) {
@@ -499,17 +828,31 @@ UiResult uiUpdateDraw(UiState* ui, Inventory* inv, C3D_Tex* block_icons,
 	spriteBegin(SCR_W, SCR_H);
 
 	// ── Pass 1: font texture. Every panel, border, label and count badge on the screen,
-	// regardless of which of the two screens is showing — one texture, one flush, one draw
+	// regardless of which of the three screens is showing — one texture, one flush, one draw
 	// call, batched exactly the way gfx/sprite.h's own file comment describes a whole UI
 	// screen should be.
 	spriteTexture(fontTexture());
 	spriteRect(0, 0, SCR_W, SCR_H, COL_BG);
 
+	// The hotbar is the one strip drawn on every screen, at the same rects, always — the
+	// standing rule that the player must be able to see what they are holding. The furnace
+	// screen changed nothing about this loop, including the "in hand" accent, which stays
+	// visible on all three screens exactly as it already did on two: it answers "what is in
+	// your hand", which remains true and worth knowing while the player is loading a furnace,
+	// even though a tap on that same cell means pick-up rather than select while a storage
+	// screen is up.
 	for (int i = 0; i < INV_HOTBAR_SLOTS; i++)
 		drawSlotIcon(PASS_FONT, hotbarSlotRect(i), &inv->slots[i],
 		             inv->selected_hotbar == i, ui->picked_slot == i, block_icons);
 
-	if (overlay_open) {
+	if (furnace_open) {
+		for (int i = 0; i < INV_MAIN_SLOTS; i++) {
+			const int slot = INV_HOTBAR_SLOTS + i;
+			drawSlotIcon(PASS_FONT, furnGridSlotRect(i), &inv->slots[slot],
+			             false, ui->picked_slot == slot, block_icons);
+		}
+		drawFurnacePanelFont(furnace, inv, ui->picked_slot, block_icons);
+	} else if (overlay_open) {
 		for (int i = 0; i < INV_MAIN_SLOTS; i++) {
 			const int slot = INV_HOTBAR_SLOTS + i;
 			drawSlotIcon(PASS_FONT, gridSlotRect(i), &inv->slots[slot],
@@ -533,7 +876,28 @@ UiResult uiUpdateDraw(UiState* ui, Inventory* inv, C3D_Tex* block_icons,
 			drawSlotIcon(PASS_ATLAS, hotbarSlotRect(i), &inv->slots[i], false, false,
 			             block_icons);
 
-		if (overlay_open) {
+		if (furnace_open) {
+			for (int i = 0; i < INV_MAIN_SLOTS; i++) {
+				const int slot = INV_HOTBAR_SLOTS + i;
+				drawSlotIcon(PASS_ATLAS, furnGridSlotRect(i), &inv->slots[slot], false, false,
+				             block_icons);
+			}
+
+			// The three furnace cells, in the same pass as every other icon on the screen, so
+			// adding this panel costs no third draw call — the whole point of the two-pass
+			// split described above.
+			for (int which = FURN_HIT_INPUT; which <= FURN_HIT_OUTPUT; which++) {
+				ItemId  item  = ITEM_NONE;
+				uint8_t count = 0;
+				switch (which) {
+				case FURN_HIT_INPUT:  item = furnace->input_item;  count = furnace->input_count;  break;
+				case FURN_HIT_FUEL:   item = furnace->fuel_item;   count = furnace->fuel_count;   break;
+				default:              item = furnace->output_item; count = furnace->output_count; break;
+				}
+				const InvSlot view = furnSlotView(item, count);
+				drawSlotIcon(PASS_ATLAS, furnSlotRect(which), &view, false, false, block_icons);
+			}
+		} else if (overlay_open) {
 			for (int i = 0; i < INV_MAIN_SLOTS; i++) {
 				const int slot = INV_HOTBAR_SLOTS + i;
 				drawSlotIcon(PASS_ATLAS, gridSlotRect(i), &inv->slots[slot], false, false,
@@ -546,5 +910,6 @@ UiResult uiUpdateDraw(UiState* ui, Inventory* inv, C3D_Tex* block_icons,
 
 	UiResult out;
 	out.inventory_open = overlay_open;
+	out.furnace_open   = furnace_open;
 	return out;
 }
