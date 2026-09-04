@@ -235,6 +235,100 @@ bool lightEnabled(void)           { return s_enabled; }
 int    lightColumnsAttached(void) { return __atomic_load_n(&s_attached, __ATOMIC_RELAXED); }
 size_t lightBytesUsed(void)       { return (size_t)lightColumnsAttached() * sizeof(LightColumn); }
 
+// v1.8.18 optlight follow-up. Guards a single Column's OWN light buffer (col->light) against
+// two threads relighting the SAME column at once -- a different hazard from s_edit_queue_busy
+// above, which guards the shared WORKLIST the flood fill borrows, not the destination either
+// engine writes into. lightPropagateColumn and lightRelightColumnSweeps both do
+// `memset(lc, 0, sizeof(*lc))` and then many setNibble() read-modify-writes into lc->sky/blk
+// with no synchronisation of their own -- col->light was never given one, because no two
+// callers can resolve the same Column* today: every worker lane relights only its own private
+// ln->staging (app/worker.c:481-482) and the main thread relights only s_world (main.c,
+// scene/interact.c, world/relight_drain.c), and s_attached's comment above is the same argument
+// for why those two never collide. That is a property of today's call sites, not a guarantee
+// for tomorrow's, so this closes the hole rather than just documenting it.
+//
+// MEASURED, not assumed: reproduced with tests/light_race_test.c's ORIGINAL design -- same
+// World, same cx/cz, two threads racing the SAME column instead of two different ones -- at a
+// 2-of-200-digest-mismatch rate, and at the SAME rate against the pre-v1.8.18 light.c (swapped
+// in, run, restored), which is what proves this predates this task rather than being introduced
+// by it.
+//
+// Keyed by Column* -- unique per column within a World, stable for a call's whole duration,
+// since neither engine detaches its own column mid-call -- against a small FIXED table rather
+// than grown per-column, because the real worst case is small and bounded: two worker lanes
+// plus the main thread (app/worker.c's WORKER_LANE0/WORKER_LANE1) is three simultaneous
+// relights, ever.
+//
+// EXACT match, not a hash: a hashed single-slot-per-key version of this shipped first and was
+// caught by two DIFFERENT tests before it reached anyone else -- tests/light_snapshot_cas_test.c's
+// own ARM 2 (two distinct columns, one shared World) and tests/light_race_test.c's pre-existing
+// ARM 3 (three distinct columns across three distinct Worlds -- lane 0, lane 1, main) both
+// MEASURED nonzero refusals between columns that share nothing, because their Column* addresses
+// happened to hash to the same slot -- deterministically, not by chance: lane 1 refused 58 of 60
+// calls. A column-identity table must never refuse two columns that are not each other, so the
+// slot has to be found by comparing col itself against every entry, not by computing one.
+//
+// The scan is guarded by s_column_claim_busy, a SEPARATE claim from the one this function
+// grants: it protects the four-element table for the handful of loads/stores one claim or
+// release touches it with, not the relight itself. Spinning to acquire it is safe in a way
+// spinning on a relight would not be -- the critical section it guards is a fixed, tiny loop
+// with no call into anything that allocates, blocks, or takes milliseconds, so the longest any
+// caller ever waits is one other thread's own same-sized scan. That is a different claim from
+// s_edit_queue_busy's (held for a whole relight, hence never retried, per that claim's own
+// comment) rather than a departure from it -- the "no lock" constraint below is about LightLock
+// (app/*.h, unreachable from a directory with no <3ds.h>), not about a plain atomic word.
+#define LIGHT_COLUMN_CLAIM_SLOTS 4
+static Column* s_column_claim[LIGHT_COLUMN_CLAIM_SLOTS];
+static int     s_column_claim_busy;
+
+static void columnClaimTableLock(void)
+{
+	int idle = 0;
+	while (!__atomic_compare_exchange_n(&s_column_claim_busy, &idle, 1, false,
+	                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+		idle = 0;
+}
+
+static void columnClaimTableUnlock(void)
+{
+	__atomic_store_n(&s_column_claim_busy, 0, __ATOMIC_RELEASE);
+}
+
+// Claims col for the rest of this call. False means another thread already holds col ITSELF --
+// never a different column, see the comment above -- and the caller must treat that exactly
+// like any other refusal here (budget, queue overflow) and touch nothing in col->light. A full
+// table (more concurrent DIFFERENT columns than LIGHT_COLUMN_CLAIM_SLOTS, never observed at
+// today's two-lanes-plus-main ceiling) also refuses rather than overrun it. Every successful
+// claim must reach lightColumnClaimRelease on every path out, refusal paths included.
+static bool lightColumnClaimTry(Column* col)
+{
+	columnClaimTableLock();
+
+	bool already = false;
+	int free_slot = -1;
+	for (int i = 0; i < LIGHT_COLUMN_CLAIM_SLOTS; i++) {
+		if (s_column_claim[i] == col)              { already = true; break; }
+		if (free_slot < 0 && s_column_claim[i] == NULL) free_slot = i;
+	}
+
+	const bool claimed = !already && free_slot >= 0;
+	if (claimed) s_column_claim[free_slot] = col;
+
+	columnClaimTableUnlock();
+	return claimed;
+}
+
+static void lightColumnClaimRelease(Column* col)
+{
+	columnClaimTableLock();
+
+	for (int i = 0; i < LIGHT_COLUMN_CLAIM_SLOTS; i++) {
+		if (s_column_claim[i] == col) { s_column_claim[i] = NULL; break; }
+	}
+
+	columnClaimTableUnlock();
+}
+
 bool lightColumnAttach(Column* col)
 {
 	if (!col) return false;
@@ -316,18 +410,57 @@ uint8_t lightGetBlock(const Column* col, int lx, int y, int lz)
 
 // ── shared propagation inputs ────────────────────────────────────────────────
 
+// v1.8.18 CHK-FIX. Per-chunk cache of chunkGetForm()/chunkGet(c,0), filled ONCE per
+// lightPropagateColumn/lightRelightColumnSweeps call from the chunks[COLUMN_CHUNKS] array
+// each already resolves, and read by every opaqueAt() and heightMapFill() call that call
+// makes.
+//
+// WHY. chunkGet (world/chunk.c) is a real cross-translation-unit call -- this build has no
+// LTO (Makefile:58) -- and until this change opaqueAt paid one PER CELL it was asked about,
+// and heightMapFill paid one per y-level it stepped through, up to 32,768 for one column.
+// v1.8.10's luminance loop below already applies this exact idea to its own per-cell walk:
+// "a chunk in CHUNK_FORM_UNIFORM form is one id repeated 4096 times... reading it ONCE and
+// skipping the whole chunk... turns 4096 chunkGet calls into 1." That early-out was never
+// extended to opaqueAt or heightMapFill, which is what this table is for.
+//
+// chunkGetForm is declared in chunk.h (chunk.h:92) with no inline body -- it is defined in
+// chunk.c, so it is exactly as cross-TU as chunkGet itself. Checking it per cell would trade
+// one cross-TU call for two and make things worse, not better; this table pays it ONCE per
+// chunk (at most COLUMN_CHUNKS = 8 chunkGetForm calls plus 8 chunkGet(c,0) calls) instead.
+typedef struct {
+	bool    uniform[COLUMN_CHUNKS];
+	BlockId id[COLUMN_CHUNKS];   // valid only where uniform[cy] is true
+} ChunkUniformCache;
+
+static void chunkUniformCacheFill(ChunkUniformCache* cache, const Chunk* const chunks[COLUMN_CHUNKS])
+{
+	for (int cy = 0; cy < COLUMN_CHUNKS; cy++) {
+		const Chunk* c = chunks[cy];
+		cache->uniform[cy] = c && chunkGetForm(c) == CHUNK_FORM_UNIFORM;
+		if (cache->uniform[cy]) cache->id[cy] = chunkGet(c, 0);
+	}
+}
+
 // Opaque means "stops light": solid and not transparent, byte-for-byte the same
 // predicate the mesher's occlusion table is built from. Air passes; leaves pass.
 //
 // v1.8.17: the predicate itself is unchanged; it is read out of s_opaque (see the table's
 // comment above) instead of recomputed through a cross-TU blockInfo() call per cell.
 // BlockId is a uint8_t (world/block.h:15) so the index cannot leave the 256-entry table.
-static bool opaqueAt(const Chunk* const chunks[COLUMN_CHUNKS], int lx, int y, int lz)
+//
+// v1.8.18: the id itself now comes from `uni` when the cell's chunk is uniform -- see
+// ChunkUniformCache above -- instead of a chunkGet() call every time this is asked about one
+// more cell. Byte-identical answer: a uniform chunk holds the same id at every index, so
+// uni->id[cy] IS what chunkGet(c, chunkIndex(lx, y&15, lz)) would have returned here.
+static bool opaqueAt(const Chunk* const chunks[COLUMN_CHUNKS], const ChunkUniformCache* uni,
+                     int lx, int y, int lz)
 {
 	if (y < 0) return true;   // below the floor reads as solid, like worldGet
-	const Chunk* c = chunks[y >> 4];
+	const int cy = y >> 4;
+	const Chunk* c = chunks[cy];
 	if (!c) return false;     // absent chunk is air
-	return s_opaque[chunkGet(c, chunkIndex(lx, y & 15, lz))] != 0;
+	const BlockId id = uni->uniform[cy] ? uni->id[cy] : chunkGet(c, chunkIndex(lx, y & 15, lz));
+	return s_opaque[id] != 0;
 }
 
 // Highest non-air cell per (x,z), -1 when the strip is all air. Everything above
@@ -337,14 +470,31 @@ typedef struct {
 	int8_t top[CHUNK_DIM][CHUNK_DIM];
 } HeightMap;
 
-static void heightMapFill(HeightMap* hm, const Chunk* const chunks[COLUMN_CHUNKS])
+// v1.8.18 CHK-FIX: uni is ChunkUniformCache (see opaqueAt above). A uniform chunk answers the
+// same id at every cell, so its whole 16-level span is decided by the ONE cached id instead
+// of one chunkGet call per level it steps through -- BLOCK_AIR skips straight past the chunk
+// (every real caller enters a chunk at its top row, either from WORLD_HEIGHT-1 or from
+// exactly this skip one chunk up, so the jump always lands on the next chunk's own top row);
+// non-air breaks on the same y the original per-cell scan would have, since chunkGet would
+// have answered the identical id at every cell in a uniform chunk.
+static void heightMapFill(HeightMap* hm, const Chunk* const chunks[COLUMN_CHUNKS],
+                          const ChunkUniformCache* uni)
 {
 	for (int z = 0; z < CHUNK_DIM; z++) {
 		for (int x = 0; x < CHUNK_DIM; x++) {
 			int y = WORLD_HEIGHT - 1;
 			while (y >= 0) {
-				const Chunk* c = chunks[y >> 4];
-				if (c && chunkGet(c, chunkIndex(x, y & 15, z)) != BLOCK_AIR) break;
+				const int cy = y >> 4;
+				const Chunk* c = chunks[cy];
+				if (!c) { y--; continue; }
+
+				if (uni->uniform[cy]) {
+					if (uni->id[cy] != BLOCK_AIR) break;
+					y = cy * CHUNK_DIM - 1;
+					continue;
+				}
+
+				if (chunkGet(c, chunkIndex(x, y & 15, z)) != BLOCK_AIR) break;
 				y--;
 			}
 			hm->top[z][x] = (int8_t)y;
@@ -445,7 +595,7 @@ static uint16_t queuePop(LightQueue* q)
 // same level, every edge decrements by exactly one, so later offers can never
 // exceed an earlier one) and bounds the queue at one entry per cell.
 static void spread(uint8_t* chan, const Chunk* const chunks[COLUMN_CHUNKS],
-                   LightQueue* q, int* dropped)
+                   const ChunkUniformCache* uni, LightQueue* q, int* dropped)
 {
 	while (q->count > 0) {
 		const int ci = queuePop(q);
@@ -465,7 +615,7 @@ static void spread(uint8_t* chan, const Chunk* const chunks[COLUMN_CHUNKS],
 			// does not own.
 			if (nx < 0 || nx >= CHUNK_DIM || nz < 0 || nz >= CHUNK_DIM) continue;
 			if (ny < 0 || ny >= WORLD_HEIGHT) continue;
-			if (opaqueAt(chunks, nx, ny, nz)) continue;
+			if (opaqueAt(chunks, uni, nx, ny, nz)) continue;
 
 			const int nci = lightIndex(nx, ny, nz);
 			if (level - 1 <= lightNibble(chan, nci)) continue;
@@ -595,6 +745,7 @@ static int crossBorderCandidate(const World* w, int cx, int cz, int lx, int y, i
 // other refusal in this file goes through.
 static void seedCrossColumnSide(uint8_t* blk, const World* w,
                                 const Chunk* const chunks[COLUMN_CHUNKS],
+                                const ChunkUniformCache* uni,
                                 int cx, int cz, bool along_x, int edge,
                                 LightQueue* q, int* dropped)
 {
@@ -610,7 +761,7 @@ static void seedCrossColumnSide(uint8_t* blk, const World* w,
 		for (int p = 0; p < CHUNK_DIM; p++) {
 			const int lx = along_x ? edge : p;
 			const int lz = along_x ? p    : edge;
-			if (opaqueAt(chunks, lx, y, lz)) continue;
+			if (opaqueAt(chunks, uni, lx, y, lz)) continue;
 
 			const int their_lx = along_x ? their_edge : p;
 			const int their_lz = along_x ? p          : their_edge;
@@ -631,12 +782,13 @@ static void seedCrossColumnSide(uint8_t* blk, const World* w,
 // seedCrossColumnSide makes a repeat visit a no-op.
 static void seedCrossColumnBorder(uint8_t* blk, const World* w,
                                   const Chunk* const chunks[COLUMN_CHUNKS],
+                                  const ChunkUniformCache* uni,
                                   int cx, int cz, LightQueue* q, int* dropped)
 {
-	seedCrossColumnSide(blk, w, chunks, cx, cz, true,  0,             q, dropped);
-	seedCrossColumnSide(blk, w, chunks, cx, cz, true,  CHUNK_DIM - 1, q, dropped);
-	seedCrossColumnSide(blk, w, chunks, cx, cz, false, 0,             q, dropped);
-	seedCrossColumnSide(blk, w, chunks, cx, cz, false, CHUNK_DIM - 1, q, dropped);
+	seedCrossColumnSide(blk, w, chunks, uni, cx, cz, true,  0,             q, dropped);
+	seedCrossColumnSide(blk, w, chunks, uni, cx, cz, true,  CHUNK_DIM - 1, q, dropped);
+	seedCrossColumnSide(blk, w, chunks, uni, cx, cz, false, 0,             q, dropped);
+	seedCrossColumnSide(blk, w, chunks, uni, cx, cz, false, CHUNK_DIM - 1, q, dropped);
 }
 
 bool lightPropagateColumn(World* w, int cx, int cz, LightQueue* q)
@@ -647,6 +799,11 @@ bool lightPropagateColumn(World* w, int cx, int cz, LightQueue* q)
 	if (!col) return false;
 	if (!lightColumnAttach(col)) return false;
 
+	// v1.8.18 optlight follow-up: claims col's light buffer for this call's whole duration --
+	// see the comment above lightColumnClaimTry for the race this closes. Refusal is the same
+	// shape as every other degraded path here: touch nothing, tell the caller no.
+	if (!lightColumnClaimTry(col)) return false;
+
 	LightColumn* lc = (LightColumn*)col->light;
 	memset(lc, 0, sizeof(*lc));
 	int dropped = 0;   // BFS refusals this call; must stay zero (see the CAP note)
@@ -655,6 +812,11 @@ bool lightPropagateColumn(World* w, int cx, int cz, LightQueue* q)
 	const Chunk* chunks[COLUMN_CHUNKS];
 	for (int cy = 0; cy < COLUMN_CHUNKS; cy++)
 		chunks[cy] = worldChunk(w, cx, cy, cz);
+
+	// v1.8.18 CHK-FIX: see ChunkUniformCache's comment above opaqueAt. Filled once here and
+	// read by every opaqueAt()/heightMapFill() call this function and the ones it calls make.
+	ChunkUniformCache uni;
+	chunkUniformCacheFill(&uni, chunks);
 
 	// v1.8.17: HOISTED above the sky pass, and this is load-bearing rather than tidying.
 	// opaqueAt now reads s_opaque, which this call fills (see the table's comment), and the
@@ -665,7 +827,7 @@ bool lightPropagateColumn(World* w, int cx, int cz, LightQueue* q)
 	const bool lum_any = syncLuminance();
 
 	HeightMap hm;
-	heightMapFill(&hm, chunks);
+	heightMapFill(&hm, chunks, &uni);
 
 	// Sky seeds: every air cell above its strip's top holds 15 outright. Only the
 	// ones beside a possibly-shadowed column are enqueued — a seed whose four
@@ -694,14 +856,14 @@ bool lightPropagateColumn(World* w, int cx, int cz, LightQueue* q)
 				// edit in that column relit it. Only the lowest seed of a strip
 				// can have a non-opaque cell beneath it — everything higher has
 				// open sky below and would enqueue the entire sky if tested.
-				if (y == hm.top[z][x] + 1 && !opaqueAt(chunks, x, y - 1, z))
+				if (y == hm.top[z][x] + 1 && !opaqueAt(chunks, &uni, x, y - 1, z))
 					border = true;
 
 				if (border) queuePush(q, (uint16_t)lightIndex(x, y, z), &dropped);
 			}
 		}
 	}
-	spread(lc->sky, chunks, q, &dropped);
+	spread(lc->sky, chunks, &uni, q, &dropped);
 
 	// Block seeds: luminous cells. syncLuminance() refreshes the table from the
 	// registry and answers whether anything in it emits at all; before v1.8.10 no
@@ -743,11 +905,13 @@ bool lightPropagateColumn(World* w, int cx, int cz, LightQueue* q)
 			}
 		}
 		// v1.8.10 cross-column handoff -- see the comment above crossBorderCandidate.
-		seedCrossColumnBorder(lc->blk, w, chunks, cx, cz, q, &dropped);
-		spread(lc->blk, chunks, q, &dropped);
+		seedCrossColumnBorder(lc->blk, w, chunks, &uni, cx, cz, q, &dropped);
+		spread(lc->blk, chunks, &uni, q, &dropped);
 	}
 
-	return dropped == 0;
+	const bool ok = dropped == 0;
+	lightColumnClaimRelease(col);
+	return ok;
 }
 
 // ── engine 2: relaxation sweeps (reference implementation) ───────────────────
@@ -957,13 +1121,63 @@ void lightResetHandoffMaxDepthForTest(void)    { s_handoff_max_depth = LIGHT_HAN
 //   RETRACTION — removing the last torch happens in a column that WAS lit, so
 //                had_before is true, the memcmp below fires, and the ghost-value
 //                decay chain the second pass exists for is untouched.
-static bool relightColumnCoreDiff(World* w, int cx, int cz, bool* out_ok)
+// v1.8.18 STK-FIX. `snapshot` used to be a 16 KiB array ON THIS FUNCTION'S STACK
+// (uint8_t snapshot[LIGHT_COL_BYTES]), and that made this the largest stack frame in the
+// codebase: MEASURED (arm-none-eabi-objdump -d on the compiled object, before this change)
+// at 16,424 bytes, 99.76% of it this one array, sitting on the worker's 32,768-byte
+// WORKER_STACK_BYTES (app/worker.c:29) beneath workerMain's own locals -- worst measured
+// chain 17,104 B, 52% of the stack. This function runs on the main thread (the edit path,
+// via lightRelightColumn) AND on a worker lane (app/worker.c's BFS fallback at :481-482) --
+// concurrently, on a New 3DS with two lanes plus the main thread all potentially inside it at
+// once.
+//
+// A bare file-static in place of the stack array would be a data race: two threads relighting
+// two different columns at the same moment would clobber the SAME buffer mid-diff, and one of
+// them would compare its "before" against the wrong column's stored bytes -- silent light
+// corruption, not a crash, and not something the host suite's existing byte-for-byte diff
+// between the two engines would ever catch, because both engines would still agree with each
+// other while disagreeing with the truth.
+//
+// So this follows the file's own established idiom instead of inventing a second one -- see
+// s_edit_queue_busy above, which CAS-claims a single shared LightQueue and falls back to the
+// queue-free sweep engine on contention rather than waiting (no locks: watchdog.h:110). Here:
+// ONE static scratch buffer, claimed with the same strong CAS shape. The thread that wins
+// uses it for the whole snapshot-relight-diff span (relightColumnCoreDiffInto below) and
+// releases it on every exit path, via this wrapper. A thread that LOSES the race does not
+// wait and does not skip the diff -- it falls back to exactly what this function did before
+// this change, a stack-local snapshot (relightColumnCoreDiffStack below) -- so contention
+// costs the loser one 16 KiB frame on that ONE call, not a wrong answer and not a lock. That
+// fallback is CORRECT, not merely unlikely: it is byte-for-byte the pre-existing code path,
+// unmodified, just moved into its own function so its frame is not paid on the common
+// (uncontended) path.
+static uint8_t s_snapshot_scratch[LIGHT_COL_BYTES];
+static int     s_snapshot_busy;
+
+// How many calls have taken the stack-local fallback below because the shared scratch buffer
+// was already claimed -- the same observability idiom as s_sweep_fallbacks and s_handoff_capped
+// elsewhere in this file: a fallback that can never be shown to trigger is dead code wearing a
+// comment, not a proven-correct path. Exposed read-only via lightSnapshotFallbacks(); a test
+// forces it above 0 with lightClaimSnapshotScratchForTest() below rather than by racing real
+// threads and hoping for a scheduler-dependent hit.
+static int s_snapshot_fallbacks;
+
+// The actual snapshot-relight-diff logic, unchanged from what this function's body used to
+// be, now taking its 16 KiB scratch buffer from the caller instead of declaring it on its own
+// stack -- see the comment above the two statics for why callers hand it either the shared
+// static (the common case) or a stack array of their own (the contended fallback).
+//
+// noinline (v1.8.18 optlight follow-up, measured, not assumed): -O3 was inlining this body
+// into BOTH callers below instead of sharing one out-of-line copy -- 608 B standalone plus
+// 688 B and 640 B of duplicate inlined copies in relightColumnCoreDiff and
+// relightColumnCoreDiffStack, 1,936 B total for logic that was one 640 B function before this
+// task. Forcing a real call recovers most of that; see the coordinator's follow-up in the
+// lane report for the measured before/after.
+static bool __attribute__((noinline)) relightColumnCoreDiffInto(World* w, int cx, int cz, bool* out_ok, uint8_t* snapshot)
 {
 	Column* col = worldColumn(w, cx, cz);
 	const uint8_t* before = lightChannelBlock(col);
 	const bool had_before = (before != NULL);
-	uint8_t snapshot[LIGHT_COL_BYTES];
-	if (had_before) memcpy(snapshot, before, sizeof(snapshot));
+	if (had_before) memcpy(snapshot, before, LIGHT_COL_BYTES);
 
 	const bool ok = relightColumnCore(w, cx, cz);
 	if (out_ok) *out_ok = ok;
@@ -975,11 +1189,60 @@ static bool relightColumnCoreDiff(World* w, int cx, int cz, bool* out_ok)
 	if (!had_before) {
 		// Never been lit: hand off only if there is actually block light here to
 		// hand over. See the third-pass note above.
-		for (size_t i = 0; i < sizeof(snapshot); i++)
+		for (size_t i = 0; i < LIGHT_COL_BYTES; i++)
 			if (after[i]) return true;
 		return false;
 	}
-	return memcmp(snapshot, after, sizeof(snapshot)) != 0;
+	return memcmp(snapshot, after, LIGHT_COL_BYTES) != 0;
+}
+
+// The contended-fallback path: this function's own 16 KiB local array is ITS frame, not
+// relightColumnCoreDiff's -- see the statics' comment above for why the split exists and why
+// this is entered only when the shared static scratch buffer is already claimed.
+static bool relightColumnCoreDiffStack(World* w, int cx, int cz, bool* out_ok)
+{
+	uint8_t snapshot[LIGHT_COL_BYTES];
+	return relightColumnCoreDiffInto(w, cx, cz, out_ok, snapshot);
+}
+
+static bool relightColumnCoreDiff(World* w, int cx, int cz, bool* out_ok)
+{
+	// Strong CAS, same reasoning as s_edit_queue_busy above: there is no retry loop here to
+	// absorb a spurious failure, and this claim's failure path already does something
+	// correct, so a spurious failure would only cost one avoidable stack frame, never a
+	// wrong answer.
+	int idle = 0;
+	if (!__atomic_compare_exchange_n(&s_snapshot_busy, &idle, 1, false,
+	                                 __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+		__atomic_fetch_add(&s_snapshot_fallbacks, 1, __ATOMIC_RELAXED);
+		return relightColumnCoreDiffStack(w, cx, cz, out_ok);
+	}
+
+	const bool result = relightColumnCoreDiffInto(w, cx, cz, out_ok, s_snapshot_scratch);
+	__atomic_store_n(&s_snapshot_busy, 0, __ATOMIC_RELEASE);
+	return result;
+}
+
+int  lightSnapshotFallbacks(void) { return s_snapshot_fallbacks; }
+void lightResetSnapshotFallbacksForTest(void) { s_snapshot_fallbacks = 0; }
+
+// Test hooks that let a single-threaded test force relightColumnCoreDiff's CAS to lose without
+// racing a second real thread against the clock. Claiming here from test code and claiming from
+// relightColumnCoreDiff itself are the SAME CAS on the SAME static, so a test that holds the
+// claim and then calls into the public API (lightRelightColumn) deterministically drives the
+// stack-local fallback (relightColumnCoreDiffStack) and can check its answer is still correct --
+// proving the fallback is correct on purpose, not merely rare. Mirrors lightFailEditQueueForTest
+// and lightSetHandoffMaxDepthForTest above, which force their own file-static state the same way.
+bool lightClaimSnapshotScratchForTest(void)
+{
+	int idle = 0;
+	return __atomic_compare_exchange_n(&s_snapshot_busy, &idle, 1, false,
+	                                   __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+}
+
+void lightReleaseSnapshotScratchForTest(void)
+{
+	__atomic_store_n(&s_snapshot_busy, 0, __ATOMIC_RELEASE);
 }
 
 static void lightHandoffBorders(World* w, int cx, int cz, int depth)
@@ -1018,6 +1281,11 @@ bool lightRelightColumnSweeps(World* w, int cx, int cz)
 	if (!col) return false;
 	if (!lightColumnAttach(col)) return false;
 
+	// v1.8.18 optlight follow-up: same claim lightPropagateColumn takes, and for the same
+	// reason -- see the comment above lightColumnClaimTry. This engine writes the identical
+	// shared lc->sky/blk arrays, so it needs the identical guard.
+	if (!lightColumnClaimTry(col)) return false;
+
 	LightColumn* lc = (LightColumn*)col->light;
 	memset(lc, 0, sizeof(*lc));
 
@@ -1025,8 +1293,12 @@ bool lightRelightColumnSweeps(World* w, int cx, int cz)
 	for (int cy = 0; cy < COLUMN_CHUNKS; cy++)
 		chunks[cy] = worldChunk(w, cx, cy, cz);
 
+	// v1.8.18 CHK-FIX: see ChunkUniformCache's comment above opaqueAt.
+	ChunkUniformCache uni;
+	chunkUniformCacheFill(&uni, chunks);
+
 	HeightMap hm;
-	heightMapFill(&hm, chunks);
+	heightMapFill(&hm, chunks, &uni);
 
 	const bool lum_any = syncLuminance();
 
@@ -1039,7 +1311,7 @@ bool lightRelightColumnSweeps(World* w, int cx, int cz)
 				for (int x = 0; x < CHUNK_DIM; x++) {
 					const int ci = lightIndex(x, y, z);
 
-					if (opaqueAt(chunks, x, y, z)) {
+					if (opaqueAt(chunks, &uni, x, y, z)) {
 						// An opaque cell takes no light in — the BFS never offers
 						// one a level, so neither may the sweeps — but a luminous
 						// one still emits: store its level so neighbours can read
@@ -1115,6 +1387,7 @@ bool lightRelightColumnSweeps(World* w, int cx, int cz)
 		}
 	}
 
+	lightColumnClaimRelease(col);
 	return true;
 }
 

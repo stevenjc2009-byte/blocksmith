@@ -88,7 +88,8 @@ $(BUILD):
 $(BUILD)/networld_test: $(BUILD)/world.o $(BUILD)/block.o $(BUILD)/registry.o \
                          $(BUILD)/chunk.o $(BUILD)/budget.o $(BUILD)/mesher.o \
                          $(BUILD)/visgraph.o $(BUILD)/scratch.o \
-                         $(BUILD)/blockdiff.o $(BUILD)/networld.o $(BUILD)/networld_test.o
+                         $(BUILD)/blockdiff.o $(BUILD)/networld.o $(BUILD)/session.o \
+                         $(BUILD)/networld_test.o
 	$(CC) $^ -o $@
 
 $(BUILD)/world.o: ../world/world.c ../world/world.h networld.h | $(BUILD)
@@ -119,6 +120,19 @@ $(BUILD)/visgraph.o: ../world/visgraph.c ../world/visgraph.h | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/scratch.o: ../world/scratch.c ../world/scratch.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# v1.6.0 F2: joined tools/run_host_tests.sh's own link when
+# test_registry_join_after_a_single_player_quit_to_title() (added the same release) started
+# calling sessionBegin() directly instead of going through networldInit(). This Makefile's own
+# header comment says the link line is "the runner's own file list, kept in the same order, so
+# a divergence is visible by reading the two side by side" -- this object was the divergence:
+# the runner picked it up, this file did not, and `make -f Makefile.networld-test test` died
+# with "undefined reference to `sessionBegin'" rather than running a single check. Pure host
+# code, like world.c/chunk.c/budget.c above -- app/session.h's own header comment is what
+# confirms it was pulled out of main.c specifically so it could be linked outside a devkitARM
+# build.
+$(BUILD)/session.o: ../app/session.c ../app/session.h | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/blockdiff.o: blockdiff.c blockdiff.h | $(BUILD)

@@ -91,6 +91,20 @@ bool survivalTick(Survival* s);
 // tracked every frame rather than captured once.
 bool fallDamageUpdate(FallTrack* ft, Survival* s, const Body* body, const World* w);
 
+// The generic damage entry point — added v1.8.18 for hostile mobs, the first thing in this
+// project that hurts the player from outside its own survival clock. Returns true if this
+// damage JUST killed the player (health was non-zero and is now zero), the same "computed
+// honestly" contract survivalTick() documents above.
+//
+// Floors at 0 and CAN kill — matching fallDamageUpdate(), not survivalTick()'s starvation
+// floor of 1. Being eaten by a zombie should be able to finish a player off. This is
+// deliberately NOT plumbed into fallDamageUpdate() or survivalTick(): refactoring either
+// onto this entry point is tidy and is out of scope here — see
+// docs/plan-1.8.18-monsters.md §3.6, which is explicit that this file belongs to
+// plan-1.8.13-survival.md and that this version does not propose touching anything else
+// in it.
+bool survivalDamage(Survival* s, uint8_t amount);
+
 // How much hunger this item restores. 0 means "not food".
 //
 // A TABLE, not an if/else chain, and the reason is a dated one: v1.8.14 adds meat and v1.8.15

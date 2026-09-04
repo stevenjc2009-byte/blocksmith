@@ -72,7 +72,7 @@ REPO = Path(__file__).resolve().parent.parent
 HEADER = REPO / "source" / "scene" / "entitymodel.h"
 OUT_PNG = REPO / "gfx" / "animals.png"
 
-KIND_NAMES = ["pig", "cow", "chicken", "sheep"]
+KIND_NAMES = ["pig", "cow", "chicken", "sheep", "zombie", "skeleton"]
 
 # Loud, deliberately hideous, and never sampled if the UVs are right. An unpainted texel that
 # reached the console as black or as transparent would look like shading; magenta cannot.
@@ -122,6 +122,7 @@ def parse_header() -> tuple[dict, list[list[Box]]]:
             "EM_SHEET_H",
             "EM_QUADRANT_W",
             "EM_QUADRANT_H",
+            "EM_QUADRANT_COLS",
             "EM_TEXELS_PER_BLOCK",
             "EM_KINDS",
             "EM_BOXES_PER_KIND",
@@ -352,6 +353,12 @@ def cow_shader(box, face, p, s, t, rw, rh):
 
     cell, edge = voronoi3(p, 6.5, 4400)
     c = shade(hide, 4.0 * mottle(p, 202))
+    # Underside a shade darker, matching every other kind on this sheet: pig, chicken, sheep,
+    # zombie and skeleton all ground themselves with a darkened FACE_BOTTOM and the cow was
+    # the one kind missing it, which broke "consistent light direction across all kinds" —
+    # a cow lit from above with a belly the same tone as its back reads as flat, not round.
+    if face == FACE_BOTTOM:
+        c = shade(c, -20.0)
     if cell > 0.55:
         # A patch. Eroded near its own boundary so the blobs come out irregular instead of
         # tiling as visible cells: `edge` is small next to a neighbouring cell, and requiring
@@ -386,7 +393,10 @@ def cow_shader(box, face, p, s, t, rw, rh):
 
 def chicken_shader(box, face, p, s, t, rw, rh):
     cream = (241, 237, 221)
-    c = shade(cream, 4.0 * mottle(p, 505))
+    # v1.8.18 ANIMAL-ART: 4.0 left the body reading as a near-flat pale blob at gameplay size
+    # (the wing and tail cues below sat on top of it but were themselves too low-contrast to
+    # separate from it) — bumped to 6.0, matching the grain the other kinds already carry.
+    c = shade(cream, 6.0 * mottle(p, 505))
 
     if box.index == BODY:
         # Wing shading, as a 3D ellipsoid slab hugging each flank so the shoulder wraps onto
@@ -400,26 +410,56 @@ def chicken_shader(box, face, p, s, t, rw, rh):
             dy = (p[1] - 5.8) / 2.05
             dz = (p[2] - 0.1) / 3.5
             d = math.sqrt(dy * dy + dz * dz)
-            w = min(1.0, max(0.0, (1.0 - d) / 0.30))
+            # v1.8.19 ANIMAL-ART: the wing's face rect is only 8x5 texels (checked against
+            # face_rect() for the chicken's body-right/-left faces), and a 0.30-wide fade band
+            # in `d` covers most of an ellipse that small -- there was no texel left for an
+            # actual EDGE, only a gradient from body to wing and back, which is why a render
+            # crop of this face at 24x still read as a soft blob rather than a folded shape.
+            # Narrowed to 0.16 so the boundary resolves to 1-2 texels instead of 3-4: still a
+            # soft antialiased edge, not the hard rectangle the v1.8.18 note above rejected,
+            # just one that a 5-texel-tall face can actually render as an edge.
+            w = min(1.0, max(0.0, (1.0 - d) / 0.16))
             if w > 0.0:
-                # Darkening toward the rim is what gives the flat slab a rounded look.
-                wing = shade((214, 210, 205), 5.0 * mottle(p, 606) - 24.0 * d * d)
+                # v1.8.18 ANIMAL-ART: the wing base was (214,210,205) against a (241,237,221)
+                # body — an 11-point gap that vanished into the body's own mottle grain at
+                # gameplay size, so the wing read as a smudge rather than a folded shape.
+                # Dropped to a clearly darker, more saturated taupe and the rim shadow deepened
+                # to match, so the wing separates from the body before any detail is read.
+                #
+                # v1.8.19 ANIMAL-ART: -34.0*d*d on its own was a smooth vignette from the
+                # wing's centre to its rim, and on an 8x5-texel face that quadratic curve IS
+                # the whole wing -- there was no flat interior for it to read as a filled
+                # shape against, only gradient, which is the second half of why it looked like
+                # a smudge rather than a folded shape even after the edge above was sharpened.
+                # Split into a small flat interior term (-8.0, so the body of the wing reads
+                # as one shade) plus a distinct rim band in the outer ring (d > 0.72) that
+                # steps down hard rather than curving down -- a folded wing's trailing edge is
+                # where the primaries overlap and shadow, which is a LINE, not a gradient.
+                rim = -22.0 if d > 0.72 else 0.0
+                wing = shade((182, 173, 158), 5.0 * mottle(p, 606) - 8.0 * d * d + rim)
                 # Primaries: quills stacked up the trailing half of the wing, running fore-aft
                 # in 3D so both flanks get the same feathers rather than a mirrored rectangle,
                 # and only in the outer half so they fade out toward the shoulder. The period
                 # is deliberately ~2 texels: the first attempt used 1.75 and a narrow
                 # threshold, which put a 0.66-texel band on a 5-texel-tall body — below the
                 # texel grid, so it rendered as nothing at all.
+                # v1.8.19 ANIMAL-ART: at 8x5 texels the old q>0.2 threshold left at most one
+                # faint stripe inside the sharpened edge above, which read as a single scratch
+                # rather than stacked feathers. Widened to q>0.05 (more of the outer half gets
+                # a quill) and the contrast term raised 26.0->36.0 so the stripe(s) that do fit
+                # read as dark bars instead of a shade barely off the wing's own base colour.
                 if p[2] > -0.6 and d > 0.32:
                     q = math.sin(p[1] * 3.14 + 1.1)
-                    if q > 0.2:
-                        wing = shade(wing, -16.0 * (q - 0.2) / 0.8)
+                    if q > 0.05:
+                        wing = shade(wing, -36.0 * (q - 0.05) / 0.95)
                 c = mix(c, wing, w)
-        # Tail: the back-top corner lifts to a warmer, darker cream.
+        # Tail: the back-top corner lifts to a warmer, darker cream — deepened alongside the
+        # wing so the two shape cues read at the same strength instead of the tail vanishing
+        # once the wing became the more visible feature.
         if p[2] > 2.6 and p[1] > 6.6:
-            c = shade((214, 206, 182), 4.0 * mottle(p, 707))
+            c = shade((198, 186, 150), 6.0 * mottle(p, 707))
         if face == FACE_BOTTOM:
-            c = shade(c, -16.0)
+            c = shade(c, -20.0)
 
     if box.index == HEAD:
         # Comb: a red ridge down the centre of the top of the head.
@@ -494,7 +534,131 @@ def sheep_shader(box, face, p, s, t, rw, rh):
     return c
 
 
-SHADERS = [pig_shader, cow_shader, chicken_shader, sheep_shader]
+def zombie_shader(box, face, p, s, t, rw, rh):
+    """v1.8.18 MON-BUILD. Box order for both monsters is body(0), head(1), arm L/R(2,3),
+    leg L/R(4,5) -- see the kEmBoxes rows in entitymodel.h. The zombie's arms are pure
+    GEOMETRY reaching forward (py/pz place them stuck out in front of the body); nothing in
+    this shader moves or rotates anything, it only colours the boxes the header already
+    positioned that way.
+    """
+    # v1.8.18 ANIMAL-ART: the original three — skin (107,142,96), rot (58,74,49), shirt
+    # (72,69,56) — measured at near-identical luminance (~130, ~68, ~69) with rot and shirt
+    # eight points apart in the SAME dark olive-brown family, so the torn-shirt-over-flesh
+    # read collapsed into one undifferentiated muddy patch, exactly the "muddy mid-grey"
+    # this sheet is meant to avoid. Skin brightened toward a clearly sickly pale green so it
+    # separates from cloth at a glance; rot pushed more saturated and green rather than just
+    # darker, so decay reads as diseased flesh and not as a second shade of dirt; shirt pulled
+    # toward a neutral brown-grey with the green removed, so cloth and flesh are never the
+    # same hue family even before value is read.
+    skin = (150, 173, 122)
+    rot = (72, 100, 48)                         # a saturated, sickly green for decay patches
+    shirt = (58, 52, 42)                        # neutral, desaturated brown-grey cloth
+
+    cell, edge = voronoi3(p, 5.5, 5500)
+    c = shade(skin, 5.0 * mottle(p, 1010))
+
+    # Decay patches: the same eroded-Voronoi trick as the cow's hide markings, at a slightly
+    # coarser cell size than skin's original 4.5 so patches read as legible wounds rather than
+    # camouflage speckle at gameplay distance.
+    if cell > 0.58 and edge > 0.05:
+        c = shade(rot, 5.0 * mottle(p, 1011))
+
+    if box.index == BODY:
+        # A torn shirt over the front and sides; bare rotten flesh shows through the back and
+        # through a rip down the centre of the chest. The geometry has no separate cloth
+        # mesh, so the tear is carried entirely by colour.
+        torn = abs(p[0]) < 1.6 and p[2] < -0.5
+        if p[2] < 1.5 and not torn:
+            c = shade(shirt, 5.0 * mottle(p, 1012))
+        elif face == FACE_FRONT and abs(p[0]) < 2.5:
+            # Ribs, visible only through the tear on the front face -- a rib belongs to the
+            # face the wound opens onto, not to the whole body volume.
+            c = shade(rot, -20.0 if t % 2 == 0 else -4.0)
+        if face == FACE_BOTTOM:
+            c = shade(c, -20.0)
+
+    if box.index == HEAD:
+        if face == FACE_FRONT:
+            # Sunken eye sockets: wide black hollows rather than the animals' single bright
+            # eye texel -- a zombie's face reads by what is missing.
+            if t in (2, 3) and (1 <= s <= 2 or rw - 3 <= s <= rw - 2):
+                c = (16, 20, 13)
+            # A slack, torn-open jaw low on the face, with the odd broken tooth still in it.
+            if 5 <= t <= 6 and 2 <= s <= rw - 3:
+                c = (28, 24, 18)
+                if t == 5 and s % 2 == 0:
+                    c = (176, 168, 140)
+        if face == FACE_TOP:
+            # Hair, patchy rather than an even cap -- torn away in a few spots.
+            if (s * 3 + t * 5) % 7 != 0:
+                c = shade((37, 33, 25), 4.0 * mottle(p, 1013))
+
+    if box.index in (2, 3):
+        # Arms: grubby at the reaching hand -- the end farthest from the shoulder, i.e. the
+        # most negative z, since these boxes are positioned pointing forward out of the body.
+        if p[2] < -8.0:
+            c = mix(c, (54, 50, 40), 0.7)
+
+    if box.index in (4, 5) and p[1] < 1.6:
+        c = mix(c, (46, 43, 34), 0.75)          # grime at the ankle
+
+    return c
+
+
+def skeleton_shader(box, face, p, s, t, rw, rh):
+    """See zombie_shader's docstring for the shared box order. The skeleton's arms hang at
+    its sides (py/pz keep them in line with the body, not reaching forward like the
+    zombie's) purely as a geometry choice, so the two silhouettes read apart at a glance --
+    nothing here animates either one.
+    """
+    bone = (214, 209, 190)
+    shadow = (147, 140, 122)                    # gap-between-bone shadow, not a patch colour
+
+    c = shade(bone, 4.0 * mottle(p, 2020))
+
+    if box.index == BODY:
+        # Ribs: horizontal bone bars with a dark gap between them, wrapped around the whole
+        # ribcage rather than painted only on the front, because a ribcage is a cage.
+        if face in (FACE_FRONT, FACE_LEFT, FACE_RIGHT, FACE_BACK):
+            band = int(math.floor((p[1] - box.py) / 1.6)) % 2
+            if band == 0:
+                c = shade(shadow, 4.0 * mottle(p, 2021))
+        # The spine: a single darker column down the centre of the back.
+        if face == FACE_BACK and abs(p[0]) < 0.6:
+            c = shade(shadow, -6.0)
+        if face == FACE_BOTTOM:
+            c = shade(c, -16.0)
+
+    if box.index == HEAD:
+        if face == FACE_FRONT:
+            # Eye sockets: deep hollows, wider and darker than any living animal's eye texel.
+            if t in (2, 3) and (1 <= s <= 2 or rw - 3 <= s <= rw - 2):
+                c = (20, 18, 16)
+            # The nasal cavity: a small dark hollow between the sockets.
+            if t in (3, 4) and rw // 2 - 1 <= s <= rw // 2:
+                c = (34, 31, 27)
+            # A fixed, exposed row of teeth low on the face.
+            if t == rh - 2 and 1 <= s <= rw - 2:
+                c = shade(bone, -4.0) if s % 2 == 0 else shadow
+        if face == FACE_TOP:
+            # The cranial suture: a faint darker seam down the centre of the skull.
+            if s == rw // 2:
+                c = shade(c, -10.0)
+
+    if box.index in (2, 3, 4, 5):
+        # Long bones: a joint shadow at each end (the socket) and a slightly lighter shaft
+        # between them, so a bare limb reads as a bone and not a uniform grey rod. Both the
+        # arms and the legs are vertical bones on this kind, so one test in y covers both.
+        local_y = p[1] - box.py
+        if local_y < 1.2 or local_y > box.sy - 1.2:
+            c = shade(shadow, 3.0 * mottle(p, 2022))
+        else:
+            c = shade(c, 3.0)
+
+    return c
+
+
+SHADERS = [pig_shader, cow_shader, chicken_shader, sheep_shader, zombie_shader, skeleton_shader]
 
 
 # ---------------------------------------------------------------------------------------
@@ -543,8 +707,8 @@ def verify_sheet(path: Path, cfg, kinds) -> dict:
     problems: list[str] = []
 
     for k, boxes in enumerate(kinds):
-        qx = (k % 2) * cfg["EM_QUADRANT_W"]
-        qy = (k // 2) * cfg["EM_QUADRANT_H"]
+        qx = (k % cfg["EM_QUADRANT_COLS"]) * cfg["EM_QUADRANT_W"]
+        qy = (k // cfg["EM_QUADRANT_COLS"]) * cfg["EM_QUADRANT_H"]
         for box in boxes:
             nw, nh = box.net_size()
             if not (qx <= box.tox and box.tox + nw <= qx + cfg["EM_QUADRANT_W"]

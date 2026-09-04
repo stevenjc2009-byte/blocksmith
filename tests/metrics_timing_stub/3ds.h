@@ -63,4 +63,10 @@ s32    svcGetThreadPriority(s32* out, u32 handle);
 
 size_t linearSpaceFree(void);
 
+// svcSleepThread: real libctru signature is `void svcSleepThread(s64 ns)` (verified against
+// C:/devkitPro/libctru/include/3ds/svc.h). metricsFlush() is its only caller, and none of
+// this suite's four arms invoke metricsFlush() -- so, the same way __dsb() below is, this is
+// a no-op inline stub: host timing tests never actually sleep.
+static inline void svcSleepThread(s64 ns) { (void)ns; }
+
 static inline void __dsb(void) { __sync_synchronize(); }

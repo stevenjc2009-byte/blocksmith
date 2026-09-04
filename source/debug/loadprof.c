@@ -12,12 +12,15 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>   // time() — for loadprofWrite's unix_time_s column, both platforms
+
+#include "version.h"   // BLOCKSMITH_VERSION / BLOCKSMITH_VERSION_SET, for loadprofWrite's row
 
 #ifdef __3DS__
 #include <3ds.h>
-#else
-#include <time.h>
 #endif
+// clock_gettime/CLOCK_MONOTONIC (nowTicks' host arm) come from the unconditional <time.h>
+// above, which was added for loadprofWallSeconds — time() and clock_gettime() share a header.
 
 static LoadProfile s_p;
 
@@ -154,6 +157,17 @@ const char* loadprofStageName(LoadStage s)
 	return kStageName[s];
 }
 
+// The four stages loadprofSince's v1.8.8 comment describes as having two writers (the New 3DS's
+// second generator lane, plus the main thread's own bracket around the same call site). Their
+// ms is CPU time summed across up to three threads, not wall time, so it can legitimately run
+// past wall_ms — loadprofFormat uses this to withhold a "% of wall" figure that would otherwise
+// print a number over 100% and read as a bug.
+static int loadprofStageIsConcurrent(LoadStage s)
+{
+	return s == LOAD_STAGE_REGION_IO || s == LOAD_STAGE_DECODE ||
+	       s == LOAD_STAGE_GENERATE  || s == LOAD_STAGE_LIGHT;
+}
+
 static double ticksToMs(uint64_t t)
 {
 	return (double)t / (loadprofTicksPerUs() * 1000.0);
@@ -183,11 +197,21 @@ int loadprofFormat(char* buf, size_t cap)
 
 	for (int i = 0; i < LOAD_STAGE_COUNT && len + 400 < cap; i++) {
 		const double ms  = ticksToMs(s_p.ticks[i]);
-		const double pct = wall_ms > 0.0 ? ms * 100.0 / wall_ms : 0.0;
 		const double per = s_p.calls[i] ? ms * 1000.0 / (double)s_p.calls[i] : 0.0;
-		const int m = snprintf(buf + len, cap - len,
-		                       "  %-9s %9.3f ms %5.1f%% n=%-6lu %8.1f us/call\n",
-		                       kStageName[i], ms, pct, (unsigned long)s_p.calls[i], per);
+		int m;
+		if (loadprofStageIsConcurrent((LoadStage)i)) {
+			// No "% of wall" here — see loadprofStageIsConcurrent. A percentage that can read
+			// over 100% is worse than no percentage, so the column prints the literal "cpu"
+			// instead: ms and us/call are still real and still comparable to this stage's own
+			// history, just not to wall_ms.
+			m = snprintf(buf + len, cap - len, "  %-9s %9.3f ms %6s n=%-6lu %8.1f us/call\n",
+			            kStageName[i], ms, "cpu", (unsigned long)s_p.calls[i], per);
+		} else {
+			const double pct = wall_ms > 0.0 ? ms * 100.0 / wall_ms : 0.0;
+			m = snprintf(buf + len, cap - len,
+			            "  %-9s %9.3f ms %5.1f%% n=%-6lu %8.1f us/call\n",
+			            kStageName[i], ms, pct, (unsigned long)s_p.calls[i], per);
+		}
 		if (m <= 0) break;
 		const size_t room = cap - len - 1;
 		len += ((size_t)m < room) ? (size_t)m : room;
@@ -197,10 +221,13 @@ int loadprofFormat(char* buf, size_t cap)
 		// Wall minus the stages. On a vsynced loading screen this is the VBlank wait the
 		// present stage's own C3D_FrameBegin is blocked in, plus whatever the frame loop does
 		// outside every bracket; it is printed rather than hidden because a load that is
-		// frame-bound rather than work-bound is exactly the answer it gives.
-		const double other = wall_ms - ticksToMs(sum);
-		const int m = snprintf(buf + len, cap - len, "  %-9s %9.3f ms %5.1f%%\n", "other", other,
-		                       wall_ms > 0.0 ? other * 100.0 / wall_ms : 0.0);
+		// frame-bound rather than work-bound is exactly the answer it gives. Renamed from
+		// "other" to "unaccounted" to match the CSV column (loadprofWrite) — see loadprof.h for
+		// why this is expected to be NEGATIVE whenever a New 3DS's worker lanes overlap the
+		// main thread's own stages, and why that is correct rather than a broken timer.
+		const double unaccounted = wall_ms - ticksToMs(sum);
+		const int m = snprintf(buf + len, cap - len, "  %-9s %9.3f ms %5.1f%%\n", "unaccounted",
+		                       unaccounted, wall_ms > 0.0 ? unaccounted * 100.0 / wall_ms : 0.0);
 		if (m > 0) {
 			const size_t room = cap - len - 1;
 			len += ((size_t)m < room) ? (size_t)m : room;
@@ -210,6 +237,17 @@ int loadprofFormat(char* buf, size_t cap)
 	return (int)len;
 }
 
+// time(NULL)'s documented failure value, checked rather than assumed for the same reason
+// world/worldseed.c's worldSeedMint checks it: on a console with a dead or unset RTC, time()
+// answering -1 is a real state, not a hypothetical one. Reported as 0 — a wall-clock reading
+// of 0 (1970) is not otherwise reachable on either platform, so it reads unambiguously as "no
+// wall clock available" rather than as a bogus early timestamp that could be mistaken for one.
+static uint64_t loadprofWallSeconds(void)
+{
+	const time_t t = time(NULL);
+	return (t == (time_t)-1) ? 0 : (uint64_t)t;
+}
+
 void loadprofWrite(const char* path)
 {
 	if (!path || s_p.wall_ticks == 0) return;
@@ -217,6 +255,13 @@ void loadprofWrite(const char* path)
 	// Header only when the file is not there yet. Asked by opening for read rather than by
 	// looking at the append handle's offset, which is not portable enough to rely on for a
 	// diagnostic that has to be right the first time it runs on a card.
+	//
+	// This never has to reconcile with an OLDER header: LOADPROF_PATH itself carries the
+	// schema version (see loadprof.h), so a file this function finds already sitting at `path`
+	// was written by THIS schema or not at all — never by the pre-version/timestamp code, which
+	// wrote a different filename. There is deliberately no code here that inspects an existing
+	// file's header and decides what to do about a mismatch; see loadprof.h for why that
+	// approach (and rename()-based rotation) was rejected in favour of the filename split.
 	FILE* probe = fopen(path, "rb");
 	const int have = probe != NULL;
 	if (probe) fclose(probe);
@@ -225,16 +270,21 @@ void loadprofWrite(const char* path)
 	if (!f) return;
 
 	if (!have) {
-		fputs("world,reloaded,wall_ms,frames", f);
+		fputs("version,unix_time_s,world,reloaded,wall_ms,frames", f);
 		for (int i = 0; i < LOAD_STAGE_COUNT; i++)
 			fprintf(f, ",%s_ms,%s_n", kStageName[i], kStageName[i]);
-		fputs(",other_ms\n", f);
+		// unaccounted_ms, not other_ms: see loadprof.h for why this is expected to be
+		// negative under the parallel loader and is not a broken timer.
+		fputs(",unaccounted_ms\n", f);
 	}
 
 	uint64_t sum = 0;
 	for (int i = 0; i < LOAD_STAGE_COUNT; i++) sum += s_p.ticks[i];
 
-	fprintf(f, "%s,%d,%.3f,%lu", s_p.world[0] ? s_p.world : "?", s_p.reloaded,
+	fprintf(f, "%s,%lu,%s,%d,%.3f,%lu",
+	        BLOCKSMITH_VERSION_SET ? BLOCKSMITH_VERSION : "(unset)",
+	        (unsigned long)loadprofWallSeconds(),
+	        s_p.world[0] ? s_p.world : "?", s_p.reloaded,
 	        ticksToMs(s_p.wall_ticks), (unsigned long)s_p.frames);
 	for (int i = 0; i < LOAD_STAGE_COUNT; i++)
 		fprintf(f, ",%.3f,%lu", ticksToMs(s_p.ticks[i]), (unsigned long)s_p.calls[i]);

@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "audio/audio.h"
+#include "audio/audio_sfx.h"
 #include "gfx/atlas.h"
 #include "gfx/font.h"
 #include "gfx/item_icons.h"   // itemIconTile, for the drops that have real item art
@@ -207,7 +209,8 @@ static void handleCraftTap(Inventory* inv, int recipe_index)
 	// else can touch `inv` between the two, so the check can never disagree with what was
 	// drawn, but calling it again costs nothing and means this function has no invisible
 	// precondition on draw order.
-	if (craftCanMake(inv, recipe_index)) invBridgeCraft(inv, recipe_index);
+	if (craftCanMake(inv, recipe_index) && invBridgeCraft(inv, recipe_index))
+		audioPlay(audioSfxId(SFX_CRAFT), AUDIO_PRIO_NORMAL, 1.0f);
 }
 
 // ── Furnace transfers (v1.8.15 FURNACE) ────────────────────────────────────────────────
@@ -784,6 +787,7 @@ UiResult uiUpdateDraw(UiState* ui, Inventory* inv, C3D_Tex* block_icons,
 	// touch_down some other way, and a tap should still fire once per press regardless).
 	const bool tap = in->touch_down && !ui->touch_prev;
 	ui->touch_prev = in->touch_down;
+	if (tap) audioPlay(audioSfxId(SFX_UI_TAP), AUDIO_PRIO_UI, 1.0f);
 
 	// v1.8.15 FURNACE. The one same-frame screen correction in this file, and the only one:
 	// UI_SCR_FURNACE with no FurnaceState behind it is a caller contract violation (ui.h says

@@ -77,7 +77,27 @@
 // not a guess: the queue drains in well under a millisecond in every profile run taken on this
 // project, and the longest legitimate stall in the frame loop is a vblank tick at 16.71 ms. Two
 // seconds is 120 frames of slack.
-#define BS_GPU_WEDGE_NS (2000000000LL)
+//
+// UNITS. This is in ARM11 system TICKS, not nanoseconds, and the name says so because getting it
+// wrong cost this project real time. libctru's gx.h documents the parameter as
+// "@param timeout Optional timeout (in nanoseconds)". It is not. Disassembling gxqueue.o out of
+// libctru.a 2.7.0-1 shows gxCmdQueueWait computing its deadline as a plain 64-bit add against the
+// raw tick counter, with no scaling instruction anywhere in the function:
+//
+//   bl   svcGetSystemTick
+//   adds r5, r5, r0        ; deadline.lo = timeout.lo + tick.lo
+//   adc  r6, r3, r1        ; deadline.hi = timeout.hi + tick.hi + carry
+//
+// So a literal nanosecond count runs SYSCLOCK_ARM11 / 1e9 = 3.73x too long. This was not reasoned
+// out, it was measured: the old value of 2000000000 was nominally "2 seconds" and steve's own
+// postmortem.txt recorded that wait as "TIMEOUT 7476843 us" - 7.476843 s against 7.459573 s
+// predicted, 0.23% apart, the residual being the ~16.71 ms vblank granularity of the poll loop.
+//
+// Written as an exact tick count so the wait really is 2.000000000 s. The value is spelled out
+// rather than computed from SYSCLOCK_ARM11 so this header stays self-contained (it deliberately
+// includes only stdbool/stddef/stdint); gputest.c carries a _Static_assert tying the two together,
+// which goes red if libctru's clock constant ever changes underneath us.
+#define BS_GPU_WEDGE_TICKS (536223712LL)
 
 // ---------------------------------------------------------------------------------------------
 // A. Pre-flight. Runs once at boot, after graphics init and before the title screen, and writes

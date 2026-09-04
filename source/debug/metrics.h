@@ -29,6 +29,17 @@ void metricsInit(void);
 // Flushes any buffered CSV rows and closes the file.
 void metricsExit(void);
 
+// Drains any buffered CSV rows to the card RIGHT NOW, without waiting for the usual
+// CSV_WAKE_EVERY-frame batching or a clean shutdown. Safe to call from the main thread even
+// while the writer thread may still be alive and running -- see the implementation comment
+// in metrics.c for why that is not simply csvDrain() called early. Bounded: gives up rather
+// than blocking the caller if the writer thread does not answer in time.
+//
+// The one intended caller is gpuTestPostMortem() (app/gputest.c), at the moment a GPU wedge
+// is detected -- the console can freeze before CSV_WAKE_EVERY frames have ever been drawn,
+// which is exactly the case the normal batching cannot cover.
+void metricsFlush(void);
+
 // Call at the very top of the frame, before any work.
 void metricsFrameBegin(void);
 

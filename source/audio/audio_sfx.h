@@ -170,3 +170,27 @@ void audioFootstepsReset(AudioFootsteps* f);
 // The banked distance SURVIVES the jump rather than being cleared: a player who hops
 // mid-walk is still mid-stride when they land.
 bool audioFootstepsUpdate(AudioFootsteps* f, float x, float y, float z, bool on_ground);
+
+// ── Mob damage ────────────────────────────────────────────────────────────────────
+
+// v1.9.1 lane AUDIO. animalHurt() (entity/animal.h) is the one "a creature takes damage"
+// path in this tree today, called only from source/main.c's animal-attack branch, and
+// through v1.9.0 it played nothing at all — a hit and a kill were both silent. This is that
+// call's whole cue: SFX_DEATH if the hit killed, SFX_HURT otherwise, positional at the
+// animal's own body (not the player's), AUDIO_PRIO_HIGH — the same priority audio_mixer.h
+// names for "damage, mob attacks" and the same two slots main.c's own SFX-WIRE-MAIN pattern
+// already plays for the player's hurt/death.
+//
+// Reusing SFX_HURT/SFX_DEATH rather than adding a dedicated pair of mob slots is a scope
+// choice, not an oversight: AUDIO_POOL_BYTES_OLD3DS (audio.h) has 233,220 bytes of headroom
+// left after the nine sounds that ship today, so a new pair is affordable later, but adding
+// one is a MANIFEST/tools/make_sounds.py change this lane did not make. If a dedicated
+// animal sound is wanted, this is the one function whose body changes — every call site
+// stays exactly as it is.
+//
+// Pulled out as its own function, rather than left inline at the call site, specifically so
+// it is testable here on the host the way every other SFX helper in this file already is
+// (audioSfxPlayAtBlock, audioFootstepsUpdate) — main.c itself is <3ds.h> code the host
+// suite cannot compile, so the policy has to live on this side of the line to be provable
+// at all.
+AudioVoice audioSfxPlayMobDamage(bool killed, float x, float y, float z);

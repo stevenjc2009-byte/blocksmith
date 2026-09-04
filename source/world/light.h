@@ -211,3 +211,20 @@ void  lightSetSkyForTest(Column* col, int lx, int y, int lz, uint8_t level);
 // without the release the next init still has one and the hook appears to do nothing.
 void  lightFailEditQueueForTest(bool fail);
 void  lightResetSweepFallbacksForTest(void);
+
+// v1.8.18 optlight: relightColumnCoreDiff (light.c) used to declare its 16 KiB before/after
+// snapshot on its own stack -- the single largest frame in the codebase, on a 32 KiB worker
+// stack. It now claims a shared static scratch buffer with a CAS (same idiom as
+// s_edit_queue_busy) and only a thread that LOSES the race still pays a 16 KiB stack frame, in
+// its own function (relightColumnCoreDiffStack), which is exercised and correct rather than
+// merely reachable in theory.
+//
+// lightSnapshotFallbacks() counts how many calls actually took that fallback -- 0 in every real
+// single-threaded fixture, and expected to be nonzero only under genuine two-thread contention
+// or a test that forces it. lightClaimSnapshotScratchForTest()/lightReleaseSnapshotScratchForTest()
+// let a test force the loss deterministically: claim here, call the public API, see the
+// fallback's answer is still correct, then release. See tests/light_snapshot_cas_test.c.
+bool lightClaimSnapshotScratchForTest(void);
+void lightReleaseSnapshotScratchForTest(void);
+int  lightSnapshotFallbacks(void);
+void lightResetSnapshotFallbacksForTest(void);

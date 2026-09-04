@@ -37,6 +37,25 @@ bool fontInit(void)
 	if (!t3x) return false;
 	Tex3DS_TextureFree(t3x);
 
+	// vram=false means Tex3DSi_ImportCommon decompressed straight into s_tex.data, which is
+	// normal (cached) linear memory, not VRAM — and citro3d's own import path never flushes
+	// that write. Confirmed by disassembling citro3d's Tex3DSi_ImportCommon
+	// (C:\devkitPro\msys2\tmp\citro3d_dis.txt): the vram!=0 branch at offset 0x29c allocates a
+	// staging buffer, decompresses into it, calls GSPGPU_FlushDataCache on it, then
+	// C3D_TexLoadImage's the result into VRAM; the vram==0 branch at 0x240-0x284 decompresses
+	// directly into tex->data (`ldr r0, [sl]` at 0x260) and returns with no flush call on
+	// either exit path (bne 180 at 0x284, or the fp==0 tail at 0x39c/0x3a0). Without a flush,
+	// the GPU — a separate bus master reading physical RAM — can sample whatever was
+	// physically at this buffer before the decompress, not the glyph sheet just written,
+	// until those cache lines happen to be evicted for some other reason.
+	//
+	// C3D_TexFlush is citro3d's own answer to this: it checks whether tex->data's physical
+	// address falls in the VRAM range and no-ops if so (disassembly offsets 0x4-0x10, `bxcc lr`
+	// after the range compare), otherwise computes the same size Tex3DSi_ImportCommon would
+	// have and calls GSPGPU_FlushDataCache itself (ends `b GSPGPU_FlushDataCache` at 0x3c). So
+	// this is a no-op for a vram=true texture and exactly the missing flush for this one.
+	C3D_TexFlush(&s_tex);
+
 	// Nearest, like the atlas, and for the same reason with more force: a glyph is five
 	// pixels wide, so any filtering at all turns a stroke into a smear.
 	C3D_TexSetFilter(&s_tex, GPU_NEAREST, GPU_NEAREST);

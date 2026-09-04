@@ -362,12 +362,70 @@ void chunkRenderProfile(float* scratch_us, float* mesh_us, int* builds);
 int      chunkRenderRefusals(void);   // pool full, or a chunk too big for a slot
 size_t   chunkRenderBytes(void);      // linear memory the pool claimed
 
+// The draw guard's default lives HERE, in the header, rather than beside the guard's own code
+// in chunk_render.c — deliberately, and the reason is a bug that shipped.
+//
+// A `#define` is per translation unit. From v1.8.17, when the guard was turned on, the
+// `#ifndef BS_DRAW_GUARD / #define BS_DRAW_GUARD 1` block sat in chunk_render.c, so the guard
+// itself compiled and ran, but every OTHER .c file still saw the name as undefined. `#if` reads
+// an undefined macro as 0, so main.c's reporting block — the only caller of the eight accessors
+// below and the only writer of the watchdog's guard line — compiled out entirely, and
+// --gc-sections then dropped all eight functions from the link. Measured, not reasoned: the
+// shipped v1.8.17 blocksmith.elf contains neither "clean - every chunk draw issued this session
+// validated" nor "BAD DRAW code", and nm finds none of the symbols. So the guard ran, recorded
+// its verdict, and nothing on the console could read it — which is why steve's hang.txt has no
+// draw-guard line despite the flag being "on".
+//
+// In the header, every includer agrees on the value. app/watchdog.h does the same thing with
+// BS_DRAW_PROBE, for the same reason.
+#ifndef BS_DRAW_GUARD
+#define BS_DRAW_GUARD 1
+#endif
+
 #if BS_DRAW_GUARD
 // Step: the draw guard's findings, for whoever writes the report. See drawSane() in
 // chunk_render.c. Code 0 means every draw issued this session passed; 1 = the bound vertex
 // buffer was NULL or not the start of a pool slot, 2 = the index count was not whole
 // triangles, 3 = the run ran off the end of the shared index buffer, 4 = the run's indices
 // reached past the vertex buffer that was bound for it.
+//
+// v1.8.18 added three more, closing gaps a freeze-investigation lane found in the original
+// four: 5 = the run's `first` did not start on a QUAD boundary (only `count`'s multiple-of-3
+// was ever checked, so a run could begin mid-triangle and still pass every other check).
+// Tightened same version, lane IDX-HARDEN: the check is `first % 6u`, not `first % 3u`. Lane
+// FRZ-INDEX measured 51,740 draw runs against real generated terrain and found `first` a
+// multiple of 6 in every one, because world/mesher.c's only two geometry-emitting functions —
+// emitFace and emitCross — each write a whole quad's 4 vertices and 6 indices atomically (an
+// overflow check gates the write before either counter moves, so there is never a partial
+// quad), which makes `index_count` a multiple of 6 at all times and every face_start/
+// opaque_index_count boundary — the only values a real `first` is ever built from — a multiple
+// of 6 with it. A `first` that is 3-aligned but not 6-aligned starts mid-QUAD: it is still a
+// legal triangle boundary (code 2 would not catch it), but code 4's "read the run's last index
+// to get its maximum" assumption silently breaks, because the run no longer covers a whole
+// quad's worth of indices from its own base vertex. `% 3u` let that through; `% 6u` does not.
+// 6 = the run's `first`/`count` belong to a different slot than the one actually bound on the
+// GPU (drawSane takes the intended slot explicitly now and checks it against what slotBind
+// last set, rather than trusting the two always travel together); 7 = the tier ground-truth
+// tables boundVertCap() derives its answer from (s_tier_arena/s_tier_count) no longer match
+// the frozen copy taken at the end of a successful chunkRenderInit, i.e. something outside
+// this file corrupted them since boot. In every code's report line, `slot`/`verts` are always
+// the slot actually bound on the GPU (s_bound), not whichever slot the caller believed it was
+// drawing — for code 6 those two differ by definition, and it is what the GPU really has that
+// matters for the report.
+//
+// v1.8.18 added two more, in slotBind() rather than drawSane() — lane IDX-HARDEN task B,
+// hardening two citro3d failures disassembly of libcitro3d.a showed neither libctru nor this
+// file ever checked: 8 = C3D_GetBufInfo() returned NULL (the 3D context was inactive — calling
+// BufInfo_Init on that NULL would otherwise memset 148 bytes at address 4); 9 = BufInfo_Add()
+// failed (its 12-entry buffer table was full — and had already incremented bufCount before
+// returning that failure, so a failed Add still leaves the C3D_BufInfo dirtier than it found
+// it). Neither has been observed to fire in this codebase — this is hardening against citro3d's
+// contract, not a fix for anything measured wrong. Both leave `first`/`count`/`maxidx`/`cap` at
+// 0, since neither failure ever reaches the point of having a run to describe; `slot`/`verts`
+// still name the slot slotBind was asked to bind. Both also leave s_bound unchanged, so the
+// caller's next drawIndices() call independently refuses the draw as code 6 — these two codes
+// exist to name the real cause first, not to be the only thing standing between a bad bind and
+// the GPU.
 //
 // All read-only and all plain loads, so the watchdog thread can call them while the main
 // thread is wedged — it must never take a lock (see app/watchdog.h).
@@ -380,3 +438,38 @@ uint32_t  chunkRenderGuardMaxIdx(void);
 uint32_t  chunkRenderGuardCap(void);
 uintptr_t chunkRenderGuardVerts(void);
 #endif
+
+// v1.8.18, lane IDX-HARDEN task C. Closes the one open measurement two freeze-investigation
+// lanes could not settle by reading the code: C3D_DrawElements programs the GPU's index-buffer
+// register as an OFFSET from bufInfo.base_paddr, which BufInfo_Init sets unconditionally to
+// 0x18000000 (VRAM base) — so the value actually latched into GPUREG_INDEXBUFFER_CONFIG for a
+// draw starting at index `first` is phys(s_shared_indices) + 2*first - 0x18000000, and nobody
+// has measured phys(s_shared_indices) on real hardware, nor is the register's offset field width
+// documented anywhere in libctru. An overflow there reaches the GPU as a fetch from a bogus
+// physical address — inert while the state is merely programmed, lethal the moment a draw
+// actually reads it, which is exactly this bug's shape.
+//
+// Deliberately NOT gated behind BS_DRAW_GUARD: this is a one-time boot measurement, not a
+// per-draw check, and it has to stay available in every build so a build with the guard forced
+// off still gets it written to sdmc:/blocksmith/memprobe.txt.
+//
+// chunk_render.c is the only file that may call these — it owns s_shared_indices and
+// s_tier_arena[0..2], the only pointers osConvertVirtToPhys needs, and computes both halves
+// once, right after each linearAlloc succeeds in chunkRenderInit (see the comment on
+// s_indices_virt there). Plain loads afterward, same convention as the draw guard's read-only
+// accessors just above. `tier` is 0/1/2 for S/M/L; anything out of range, or a call before
+// chunkRenderInit has succeeded or after chunkRenderExit, reads 0 for both halves of a pair — a
+// real linearAlloc address on this console is never 0, so the caller can tell "not measured yet"
+// from a genuine reading without a separate bool, the same trick MEMPROBE_REL's caller-side
+// convention already relies on.
+//
+// main.c is meant to read these once, right after chunkRenderInit() returns true (which is also
+// where its own memProbeBootMark("chunkRenderInit") call already sits, immediately before its
+// memProbeBootFlush() — see main.c), format one line per pointer the same way memProbeBootFlush
+// formats its own region-summary tail, and append it into sdmc:/blocksmith/memprobe.txt: chunk
+// render owns the pointers here, main.c owns the SD write, exactly the same division step 9.2's
+// FS writes already use elsewhere in this project.
+uintptr_t chunkRenderIndexVirt(void);
+uint32_t  chunkRenderIndexPhys(void);
+uintptr_t chunkRenderTierVirt(int tier);
+uint32_t  chunkRenderTierPhys(int tier);

@@ -1,0 +1,20 @@
+# Release notes shown on the 3DS top screen before the update downloads.
+#
+# Two sections, both optional, one item per line. Plain English, no markdown: this is read
+# by a player on a 400 px screen, not by a developer. A leading "- " is optional.
+#
+# Long lines wrap on their own, so write a sentence rather than fighting the width.
+
+[fixes]
+A glyph could render garbage on real hardware. The font texture is now flushed after loading.
+Fixed a real race where two threads relighting the same area at once could corrupt its light.
+Fixed a stack overflow risk on the worker thread from an oversized buffer. No known crash yet.
+Chicken wings and tails are easier to make out now, and cows are shaded on their underside.
+The updater's error screen now shows free memory too, in case it is running out mid-check.
+
+[features]
+Zombies and skeletons. They spawn in the dark and in caves, and they can hurt and kill you.
+Torches keep them away and make them wander off if one gets close.
+Leaves take their biome's colour now, the same as grass and dirt.
+A biome border now fades between the two colours instead of stepping sharply between them.
+The freeze is not confirmed fixed. If it happens again, stage.txt on the card says more now.

@@ -304,7 +304,13 @@ static void applyCommonOptions(CURL* curl, const char* url)
 	// use the RomFs copy for some other reason.
 	struct curl_blob caBlob;
 	caBlob.data  = s_caBundleData;
-	caBlob.len   = s_caBundleLen;
+	// v1.8.19: s_caBundleLen includes updater.c's own trailing NUL, which probeCertBundle()
+	// needs separately but curl does not -- disassembly shows curl always does its own
+	// malloc(len+1)+memcpy(len)+append-NUL regardless of CURL_BLOB_NOCOPY, so passing the
+	// full length here copied one byte more than intended on every handshake. Correctness
+	// hygiene only -- not the CACERT_BADFILE root cause, which is the OOM-during-parse
+	// hypothesis tracked separately. s_caBundleLen itself is left unchanged.
+	caBlob.len   = s_caBundleLen - 1;
 	caBlob.flags = CURL_BLOB_NOCOPY;
 	curl_easy_setopt(curl, CURLOPT_CAINFO_BLOB, &caBlob);
 	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
@@ -360,7 +366,10 @@ static CURLcode performWithCertFallback(CURL* curl)
 	curl_easy_setopt(curl, CURLOPT_CAINFO, NULL);
 	struct curl_blob caBlob;
 	caBlob.data  = s_caBundleData;
-	caBlob.len   = s_caBundleLen;
+	// v1.8.19: see the matching comment in applyCommonOptions() -- s_caBundleLen includes
+	// the trailing NUL that probeCertBundle() needs but curl does not; correctness hygiene,
+	// not the CACERT_BADFILE root cause.
+	caBlob.len   = s_caBundleLen - 1;
 	caBlob.flags = CURL_BLOB_NOCOPY;
 	curl_easy_setopt(curl, CURLOPT_CAINFO_BLOB, &caBlob);
 	return retry;
@@ -620,8 +629,28 @@ static void runCheck(void)
 		// truncate, which an unbounded %s here cannot (-Wformat-truncation, fatal under this
 		// project's -Werror).
 		char reason[192];
-		snprintf(reason, sizeof(reason), "Could not reach GitHub: curl %d / ca parse %d / certs %d%s%.48s",
+		// v1.8.19: the separator before "ca parse" is a newline, not " / " -- the bottom
+		// screen is 320px wide, fontDraw never wraps except on '\n', and FONT_ADVANCE=6 at
+		// x=10 gives ~51 visible characters, so the discriminating "certs N" field was
+		// falling off the right edge on every single-line render of this string.
+		// v1.8.20, lane UPD-OOM. A fourth and fifth field: mallinfo().arena / .fordblks (total
+		// newlib heap arena size, and bytes free in it) captured at the INSTANT this failure
+		// string is built -- not at boot. UPD-OOM's host measurement of this exact
+		// romfs/cacert.pem against mbedTLS 2.28.8 (the version this portlib actually ships,
+		// confirmed via version.h -- the OOM hypothesis brief assumed 2.28.5) found
+		// mbedtls_x509_crt_parse() needs a peak of 325,613 bytes and retains 324,199 of them
+		// permanently in the chain -- both well above the ~259 KB the hypothesis estimated, and
+		// almost none of it transient. The only existing on-console evidence for free heap
+		// anywhere near this point in the process (memProbeBootFlush() in main.c) is captured
+		// exactly once, right after chunkRenderInit() -- three more heap claims
+		// (weatherDrawInit, spriteInit, fontInit) run between that snapshot and updaterInit()
+		// itself, and none of it reflects the moment that actually matters: whenever the player
+		// opens the updater screen and triggers a real request, arbitrarily far into a play
+		// session. Cast to unsigned long to match mallinfo()'s field type -- the same cast
+		// main.c's memProbeBootFlush() already uses for these identical two fields.
+		snprintf(reason, sizeof(reason), "Could not reach GitHub: curl %d\nca parse %d / certs %d\narena %lu free %lu%s%.48s",
 		         (int)result, s_caParseRet, s_caParseCount,
+		         (unsigned long)mallinfo().arena, (unsigned long)mallinfo().fordblks,
 		         s_curlError[0] ? " - " : "", s_curlError);
 		setMessage(reason);
 		s_state = UPDATE_FAILED;
@@ -737,13 +766,22 @@ static void runInstall(void)
 		if (sink.failed)
 			snprintf(reason, sizeof(reason), "The console stopped accepting the download.");
 		else if (result != CURLE_OK)
+		{
 			// See the matching comment in runCheck()'s CURLE_OK branch for what the three
-			// numbers mean -- curl code, probeCertBundle()'s boot-time mbedtls_x509_crt_parse()
-			// return, and the certificate count that parse produced -- and for why the
-			// errorbuffer text is capped with %.48s rather than %s.
-			snprintf(reason, sizeof(reason), "Download failed: curl %d / ca parse %d / certs %d%s%.48s",
+			// original numbers mean -- curl code, probeCertBundle()'s boot-time
+			// mbedtls_x509_crt_parse() return, and the certificate count that parse
+			// produced -- and for why the errorbuffer text is capped with %.48s rather
+			// than %s.
+			// v1.8.19: same newline-before-"ca parse" fix as runCheck()'s matching string --
+			// see the comment there for why the old " / " separator hid the certs count.
+			// v1.8.20, lane UPD-OOM. Same free-heap-at-failure addition as runCheck()'s
+			// matching string -- see the comment there for the measured numbers and why
+			// this reads mallinfo() here rather than trusting the boot-time snapshot.
+			snprintf(reason, sizeof(reason), "Download failed: curl %d\nca parse %d / certs %d\narena %lu free %lu%s%.48s",
 			         (int)result, s_caParseRet, s_caParseCount,
+			         (unsigned long)mallinfo().arena, (unsigned long)mallinfo().fordblks,
 			         s_curlError[0] ? " - " : "", s_curlError);
+		}
 		else
 			snprintf(reason, sizeof(reason), "Download failed with HTTP %ld.", status);
 

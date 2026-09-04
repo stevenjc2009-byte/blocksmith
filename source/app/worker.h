@@ -353,6 +353,11 @@ int workerLaneCore(int lane);
 // on hardware, and a claim that cannot go wrong in a way anyone would notice is not worth
 // much. Expect it to equal workerLaneCore(lane); the point is that now it can be checked.
 //
-// Cheap to read (one volatile load) but it is NOT free to call in a hot loop, and there is
+// Cheap to read (one atomic load) but it is NOT free to call in a hot loop, and there is
 // no reason to: the value is written once and never changes for the life of the thread.
+//
+// [2026-09-03 FRZ-AUDIT] Was "one volatile load" -- the backing field was `volatile s32`,
+// which suppresses the compiler's own caching but is not a cross-core barrier on ARM11. It is
+// now written with __ATOMIC_RELEASE and read here with __ATOMIC_ACQUIRE, the same DMB
+// (mcr p15,0,r3,c7,c10,5) documented above for LightLock/LightEvent. See app/worker.c.
 int workerLaneCoreRunning(int lane);

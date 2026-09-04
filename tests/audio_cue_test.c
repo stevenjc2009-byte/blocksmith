@@ -187,6 +187,10 @@ bool networldSessionActive(void) { return false; }
 #define SFX_DIR_BREAK  "romfs/sfx/block_break.bsnd"
 #define SFX_DIR_PLACE  "romfs/sfx/block_place.bsnd"
 #define SFX_DIR_STEP   "romfs/sfx/footstep.bsnd"
+// v1.9.1 lane AUDIO. Added for audioSfxPlayMobDamage's own tests below — the same two
+// files main.c's SFX-WIRE-MAIN pattern already loads for the player's own hurt/death.
+#define SFX_DIR_HURT   "romfs/sfx/hurt.bsnd"
+#define SFX_DIR_DEATH  "romfs/sfx/death.bsnd"
 
 // The frame_count field straight out of a .bsnd header (offset 12, u32 little-endian — see
 // audio/audio_bsnd.h's layout table). Read from the FILE rather than written down here, so
@@ -204,7 +208,26 @@ static uint32_t fileFrameCount(const char* path)
 	       ((uint32_t)h[14] << 16) | ((uint32_t)h[15] << 24);
 }
 
-static uint32_t s_fc_break, s_fc_place, s_fc_step;
+static uint32_t s_fc_break, s_fc_place, s_fc_step, s_fc_hurt, s_fc_death;
+
+// v1.9.1 lane AUDIO. HURT/DEATH are loaded from disk EXACTLY ONCE, here, rather than inside
+// registerTheShippedSounds() the way break/place/step are. That function is called four
+// times over the course of this suite (main(), testTheThreeShippedSoundsLoadAndGetDistinctIds,
+// testAnUnregisteredSlotIsSilentRatherThanWrong's recovery, and this lane's own
+// testMobDamageWithNoClipLoadedIsSilentNotWrong's recovery) and audioLoad() has no unload —
+// every call appends fresh bytes to the pool (audio.h: "There is no unload"). Three rounds of
+// break+place+step already used all but a sliver of the 393,216-byte Old 3DS pool budget
+// before this lane touched the file; measured by adding HURT/DEATH to that same repeated
+// call, death.bsnd's load failed on the third round with `avail` too small — readWhole's
+// overflow guard caught it and returned 0, so audioLoad correctly reported AUDIO_SOUND_NONE
+// rather than silently truncating, but the whole point of this suite is that DEATH should
+// actually be loaded and playable, and three redundant reloads were never load-bearing for
+// hurt/death the way they are for testAnUnregisteredSlotIsSilentRatherThanWrong's own break/
+// place recovery story. Loading once and re-registering the SAME id on every
+// registerTheShippedSounds() call sidesteps the pool cost entirely without changing what any
+// existing break/place/footstep test observes.
+static AudioSoundId s_hurt_id_once  = AUDIO_SOUND_NONE;
+static AudioSoundId s_death_id_once = AUDIO_SOUND_NONE;
 
 // Loads the three shipped sounds and records what audioLoad actually returned, which is what
 // source/main.c now does. Called again by the cases that need a clean slot table.
@@ -221,6 +244,22 @@ static void registerTheShippedSounds(void)
 	audioSfxRegister(SFX_BLOCK_BREAK, audioLoad(SFX_DIR_BREAK));
 	audioSfxRegister(SFX_BLOCK_PLACE, audioLoad(SFX_DIR_PLACE));
 	audioSfxRegister(SFX_FOOTSTEP,    audioLoad(SFX_DIR_STEP));
+	// v1.9.1 lane AUDIO. HURT/DEATH added so audioSfxPlayMobDamage's own tests below share
+	// this same fixture rather than hand-rolling a second one — every case downstream of
+	// this call already tolerates two extra registered slots it never touches.
+	//
+	// Loaded through s_hurt_id_once/s_death_id_once (see their own comment above) rather than
+	// a fresh audioLoad() on every call: this function runs four times over the suite, and a
+	// fresh load each time is the exact pool exhaustion that comment measures — death.bsnd
+	// failing to load on the third round with `avail` too small. AUDIO_SOUND_NONE (0) is a
+	// safe "not loaded yet" sentinel here because it is also audioLoad's own failure return,
+	// so a failed load is simply retried on the next call rather than being cached as broken.
+	if (s_hurt_id_once == AUDIO_SOUND_NONE)
+		s_hurt_id_once = audioLoad(SFX_DIR_HURT);
+	if (s_death_id_once == AUDIO_SOUND_NONE)
+		s_death_id_once = audioLoad(SFX_DIR_DEATH);
+	audioSfxRegister(SFX_HURT,  s_hurt_id_once);
+	audioSfxRegister(SFX_DEATH, s_death_id_once);
 }
 
 // ── the world fixture, the same shape source/scene/interact_test.c uses ──────────────────
@@ -814,11 +853,132 @@ static void testEveryCueIsSafeWithNoAudioAtAll(void)
 	audioTestForceInitFailure(false);
 }
 
+// ── 6. mob damage — audioSfxPlayMobDamage (v1.9.1 lane AUDIO) ────────────────────────────
+//
+// animalHurt() (entity/animal.h) is the only "a creature takes damage" path in this tree,
+// called from source/main.c's animal-attack branch, and through v1.9.0 it played nothing —
+// neither a hit nor a kill made any sound. audioSfxPlayMobDamage (audio/audio_sfx.h) is the
+// fix's whole policy: SFX_DEATH on a kill, SFX_HURT otherwise, positional at the animal, at
+// AUDIO_PRIO_HIGH. main.c itself cannot be linked into this host binary (it is <3ds.h> code
+// — see this file's own header comment on why it lives in tests/ instead of source/audio/),
+// so these checks are the only host-provable half of the fix; the main.c call site is a
+// hand-applied hunk this lane could not compile-verify itself (see the AUDIO lane's report).
+
+static void testMobDamagePicksHurtOnANonLethalHit(void)
+{
+	audioSetListener(0.0f, 0.0f, 0.0f, 0.0f);
+	fakeClearPlays();
+
+	const AudioVoice v = audioSfxPlayMobDamage(/*killed=*/false, 3.0f, 0.0f, 0.0f);
+
+	CHECK(v != AUDIO_VOICE_NONE);
+	CHECK(s_fake.plays == 1);
+	// The frame count is what tells hurt.bsnd apart from death.bsnd here — the same
+	// technique testABreakPlaysExactlyOneBreakSound uses to tell break from place.
+	CHECK(s_fake.play[0].frame_count == s_fc_hurt);
+	CHECK(s_fake.play[0].frame_count != s_fc_death);
+	CHECK(s_fake.play[0].looping == false);
+
+	frameTick();
+}
+
+static void testMobDamagePicksDeathOnAKill(void)
+{
+	audioSetListener(0.0f, 0.0f, 0.0f, 0.0f);
+	fakeClearPlays();
+
+	const AudioVoice v = audioSfxPlayMobDamage(/*killed=*/true, 3.0f, 0.0f, 0.0f);
+	printf("DEBUG death test: v=%u plays=%d fc=%u sfc_death=%u sfc_hurt=%u id_death=%u id_hurt=%u\n",
+	       v, s_fake.plays, s_fake.play[0].frame_count, s_fc_death, s_fc_hurt,
+	       audioSfxId(SFX_DEATH), audioSfxId(SFX_HURT));
+
+	CHECK(v != AUDIO_VOICE_NONE);
+	CHECK(s_fake.plays == 1);
+	CHECK(s_fake.play[0].frame_count == s_fc_death);
+	CHECK(s_fake.play[0].frame_count != s_fc_hurt);
+
+	frameTick();
+}
+
+// Positional at the ANIMAL, not the player — the whole reason main.c's hunk reads the
+// entity's own body position before calling animalHurt() rather than reusing player.body.x/z
+// the way the damage-TO-the-player call sites do. A listener at the origin facing -Z has its
+// right vector at +X (the same convention testABreakPlaysExactlyOneBreakSound documents), so
+// a cue off to +X must come out louder on the right than the left; centred, the two sides
+// would be within float noise of each other, which is exactly what a "played at the player
+// instead of the animal" regression would produce here (both are at the listener origin only
+// coincidentally in the two tests above, since 3.0f in the listener's forward axis is dead
+// centre — this test moves off-axis specifically to separate the two).
+static void testMobDamageIsPositionalAtTheAnimal(void)
+{
+	audioSetListener(0.0f, 0.0f, 0.0f, 0.0f);
+	fakeClearPlays();
+
+	CHECK(audioSfxPlayMobDamage(false, 4.0f, 0.0f, 0.0f) != AUDIO_VOICE_NONE);
+	CHECK(s_fake.plays == 1);
+	CHECK(s_fake.play[0].right > s_fake.play[0].left);
+
+	frameTick();
+}
+
+// The silent-fallback contract (audio.h) and the "no id maps to nothing" rule audio_sfx.h's
+// captured-id comment states — exercised here directly rather than only through
+// testEveryCueIsSafeWithNoAudioAtAll, because that test forces the WHOLE mixer down; this
+// proves the narrower claim that an unregistered slot alone (audio still up) is silent too.
+static void testMobDamageWithNoClipLoadedIsSilentNotWrong(void)
+{
+	audioSfxReset();   // every slot, including HURT/DEATH, back to AUDIO_SOUND_NONE
+	fakeClearPlays();
+
+	CHECK(audioSfxPlayMobDamage(false, 0.0f, 0.0f, 0.0f) == AUDIO_VOICE_NONE);
+	CHECK(audioSfxPlayMobDamage(true,  0.0f, 0.0f, 0.0f) == AUDIO_VOICE_NONE);
+	CHECK(s_fake.plays == 0);
+
+	registerTheShippedSounds();
+	frameTick();
+}
+
+// Priority selection, the half none of the checks above touch: AUDIO_PRIO_HIGH (3) must
+// outrank AUDIO_PRIO_NORMAL (2) — the mixer's own "victim_priority <= prio" stealing rule
+// (audio_mixer.h) — and must NOT outrank AUDIO_PRIO_UI (4), which the same header documents
+// as "never dropped". Filling all AUDIO_VOICE_COUNT voices at each priority in turn and
+// checking whether the mob-damage call can steal a voice is the only way to observe the
+// priority audioSfxPlayMobDamage actually requests, since AudioPlayParams.priority is not
+// otherwise readable from outside audio_mixer.c.
+static void testMobDamageOutranksNormalButNotUi(void)
+{
+	audioSetListener(0.0f, 0.0f, 0.0f, 0.0f);
+
+	// Fill every voice at NORMAL — below HIGH, so a HIGH call must steal the oldest one.
+	fakeClearPlays();
+	for (int i = 0; i < AUDIO_VOICE_COUNT; i++)
+		CHECK(audioPlay(audioSfxId(SFX_FOOTSTEP), AUDIO_PRIO_NORMAL, 1.0f) != AUDIO_VOICE_NONE);
+	CHECK(s_fake.plays == AUDIO_VOICE_COUNT);
+
+	CHECK(audioSfxPlayMobDamage(false, 0.0f, 0.0f, 0.0f) != AUDIO_VOICE_NONE);
+	CHECK(s_fake.plays == AUDIO_VOICE_COUNT + 1);   // the steal is a fresh backend play
+
+	frameTick();
+
+	// Fill every voice at UI — above HIGH, so a HIGH call must be refused outright.
+	fakeClearPlays();
+	for (int i = 0; i < AUDIO_VOICE_COUNT; i++)
+		CHECK(audioPlay(audioSfxId(SFX_FOOTSTEP), AUDIO_PRIO_UI, 1.0f) != AUDIO_VOICE_NONE);
+	CHECK(s_fake.plays == AUDIO_VOICE_COUNT);
+
+	CHECK(audioSfxPlayMobDamage(true, 0.0f, 0.0f, 0.0f) == AUDIO_VOICE_NONE);
+	CHECK(s_fake.plays == AUDIO_VOICE_COUNT);   // refused, not a steal — no new backend play
+
+	frameTick();
+}
+
 int main(void)
 {
 	s_fc_break = fileFrameCount(SFX_DIR_BREAK);
 	s_fc_place = fileFrameCount(SFX_DIR_PLACE);
 	s_fc_step  = fileFrameCount(SFX_DIR_STEP);
+	s_fc_hurt  = fileFrameCount(SFX_DIR_HURT);
+	s_fc_death = fileFrameCount(SFX_DIR_DEATH);
 
 	// The Old 3DS pool (393,216 bytes), which is the smaller of the two and therefore the one
 	// worth loading the real sounds into: if they fit here they fit everywhere.
@@ -853,6 +1013,19 @@ int main(void)
 	testATeleportIsDiscardedRatherThanBanked();
 	testResetForgetsThePreviousWorld();
 	testAFootstepFarFromTheListenerIsNotPlayed();
+
+	// v1.9.1 lane AUDIO. Run BEFORE testEveryCueIsSafeWithNoAudioAtAll(), not after: that test
+	// forces audioInit() to fail and never re-arms a real one afterwards (audioTestReset() +
+	// audioTestForceInitFailure(true) leaves audioAvailable() false for the rest of the
+	// process) -- it is written as the suite's final "no audio at all" state, not a state
+	// anything after it can assume gets undone. Running these five after it, the first attempt
+	// this lane made, made every one of them fail with audioAvailable() == false and nothing
+	// to do with audioSfxPlayMobDamage itself; moving them here, ahead of it, is the fix.
+	testMobDamagePicksHurtOnANonLethalHit();
+	testMobDamagePicksDeathOnAKill();
+	testMobDamageIsPositionalAtTheAnimal();
+	testMobDamageWithNoClipLoadedIsSilentNotWrong();
+	testMobDamageOutranksNormalButNotUi();
 
 	testEveryCueIsSafeWithNoAudioAtAll();
 

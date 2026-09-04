@@ -58,7 +58,11 @@
 #endif
 
 // Validates every chunk draw before it is issued, and refuses the ones that are not safe.
-// See drawSane() for what it checks and why those four things and not others.
+// See drawSane() for what it checks and why those things and not others (v1.8.18 added three:
+// a mid-quad start, a run paired with the wrong slot, and a corrupted tier table; lane
+// IDX-HARDEN then added two more in slotBind() itself, hardening two citro3d failures
+// disassembly found were never checked — see chunk_render.h's chunkRenderGuardCode() comment
+// for all nine codes).
 //
 // It is a diagnostic first: a console that freezes with this on has hang.txt say whether a
 // bad draw was ever seen, which is the difference between "the GPU was handed an address it
@@ -79,13 +83,26 @@
 // console. Fixed and turned on now, for the reason its own doc comment above already gives:
 // refusing one malformed draw costs a chunk's geometry for a frame; issuing it wedges the GPU
 // and kills the console. That trade is not close enough to leave off by default.
-#ifndef BS_DRAW_GUARD
-#define BS_DRAW_GUARD 1
-#endif
+//
+// The `#ifndef BS_DRAW_GUARD / #define BS_DRAW_GUARD 1` default used to sit right here, and
+// that was a second, independent bug that also shipped in v1.8.17: a #define is per translation
+// unit, so it turned the guard on in this file and nowhere else, and main.c's reporting block
+// never compiled in. The default now lives in scene/chunk_render.h, which this file includes
+// first, so every translation unit agrees. See the comment there for the measurement.
 
 // Deliberately corrupts one draw so the guard above can be seen going red. See drawIndices.
 #ifndef BS_DRAW_GUARD_REDTEST
 #define BS_DRAW_GUARD_REDTEST 0
+#endif
+
+// v1.8.18. Every red arm below exists to prove a drawSane() check can fail — with the guard
+// itself compiled out there is nothing for any of them to trip, and arm 7 corrupts a live
+// file-scope table and relies on the guard's own code path to put it back (see drawIndices).
+// Left to run anyway, that arm would leave the tier pool corrupted for the rest of the
+// session with nothing in the build to say so. Caught here, at compile time, instead of
+// found later as an unexplained pool corruption.
+#if BS_DRAW_GUARD_REDTEST && !BS_DRAW_GUARD
+#error "BS_DRAW_GUARD_REDTEST needs BS_DRAW_GUARD=1 - there is nothing for it to prove otherwise"
 #endif
 
 // Step 7.3, cave culling. -DBS_CAVECULL=0 skips the walk entirely and draws whatever the
@@ -527,6 +544,26 @@ static C3D_Mtx  s_mono_projection;
 // content.
 static uint16_t* s_shared_indices;
 
+// v1.8.18, lane IDX-HARDEN task C. The one open measurement two freeze-investigation lanes could
+// not close by reasoning: C3D_DrawElements programs the GPU's index-buffer register as an OFFSET
+// from bufInfo.base_paddr, which BufInfo_Init sets unconditionally to 0x18000000 (VRAM base) —
+// so the value actually latched into GPUREG_INDEXBUFFER_CONFIG is
+// phys(s_shared_indices) + 2*first - 0x18000000, and nobody has ever measured phys(s_shared_
+// indices) on real hardware, nor is the register's offset field width documented in libctru's
+// headers. If that computed offset overflows the field, the GPU fetches indices from a bogus
+// physical address and wedges — inert when configured, lethal when drawn, exactly this bug's
+// shape. Cached once, right after each linearAlloc succeeds in chunkRenderInit, and zeroed again
+// in chunkRenderExit — these are plain loads afterward, the same convention the draw guard's
+// s_guard_* fields already use, and the only file allowed to compute them: this is the file that
+// owns the pointers, and osConvertVirtToPhys needs the real pointer, not a copy of it. See the
+// chunkRenderIndexVirt/Phys and chunkRenderTierVirt/Phys accessors in chunk_render.h — main.c
+// reads these once, right after chunkRenderInit succeeds, and writes them into
+// sdmc:/blocksmith/memprobe.txt so the caveat above stops being unmeasured on steve's console.
+static uintptr_t s_indices_virt;
+static uint32_t  s_indices_phys;
+static uintptr_t s_tier_virt[3];
+static uint32_t  s_tier_phys[3];
+
 // Step 9.2c. Every slot used to reserve MESH_SLOT_VERTS (2048 faces, 64 KB) regardless of
 // what the chunk in it actually needed — the comment on slotFor below is what this step was
 // named for. Measured on the host (world/mesher.c and world/worldgen.c are <3ds.h>-free, so
@@ -774,6 +811,16 @@ static void poolTierSlots(int pool_slots, int out[3])
 static MeshVertex* s_tier_arena[3];
 static int         s_tier_start[3];
 static int         s_tier_count[3];
+
+#if BS_DRAW_GUARD
+// v1.8.18. A frozen copy of the two arrays above, taken once at the end of a successful
+// chunkRenderInit and never written again. drawSane's tierTablesGolden() compares the live
+// arrays against this before trusting boundVertCap's answer — see that function's comment for
+// why a corrupted-but-self-consistent s_tier_count could otherwise pass every existing check.
+static MeshVertex* s_tier_arena_golden[3];
+static int         s_tier_count_golden[3];
+static bool        s_tier_golden_set;
+#endif
 
 static MeshSlot s_slots[MESH_SLOTS];
 
@@ -1101,6 +1148,23 @@ static bool waterShimmerTexInit(void)
 	if (!t3x)
 		return false;
 	Tex3DS_TextureFree(t3x);
+
+	// vram=false, and that is the whole reason this line has to be here: citro3d's
+	// Tex3DSi_ImportCommon decompresses straight into s_shimmer_tex.data (ordinary cached
+	// linear memory) and only flushes on its vram=true path. Disassembled from citro3d's
+	// library: the vram!=0 branch at 0x29c calls GSPGPU_FlushDataCache before
+	// C3D_TexLoadImage, while the vram==0 branch decompresses into tex->data (`ldr r0, [sl]`
+	// at 0x260) and returns from both exits with no flush anywhere. Without this the texture's
+	// contents stay undefined until its cache lines happen to be evicted for some unrelated
+	// reason. gfx/font.c had the identical defect and the identical one-line fix.
+	//
+	// This is a texel-corruption bug, NOT the boot freeze: a bad texture sample cannot wedge
+	// the PICA200 command processor, and the command list itself is flushed correctly by
+	// citro3d's own C3D_FrameEnd. Symptom is wrong shimmer glints with SHADING turned on.
+	//
+	// C3D_TexFlush is citro3d's own helper and is a no-op for a VRAM address, so this stays
+	// correct for free if this texture ever moves to vram=true.
+	C3D_TexFlush(&s_shimmer_tex);
 
 	// GPU_LINEAR, same reasoning as the fog ramp and the opposite of the atlas: this is a
 	// continuous function sampled at 64 points per 8 blocks, not pixel art. GPU_NEAREST would
@@ -1542,6 +1606,10 @@ bool chunkRenderInit(int max_radius)
 	s_shared_indices = (uint16_t*)linearAlloc(index_bytes);
 	if (!s_shared_indices)
 		return false;
+	// v1.8.18, lane IDX-HARDEN task C. See the comment on s_indices_virt/s_indices_phys above
+	// for why this is measured here and not left as the unverified arithmetic it was.
+	s_indices_virt = (uintptr_t)s_shared_indices;
+	s_indices_phys = osConvertVirtToPhys(s_shared_indices);
 	for (int q = 0; q < MESH_SLOT_FACES; q++) {
 		const uint16_t v   = (uint16_t)(q * 4);
 		uint16_t*      idx = &s_shared_indices[q * 6];
@@ -1582,6 +1650,9 @@ bool chunkRenderInit(int max_radius)
 		if (!s_tier_arena[t])
 			return false;
 		s_bytes += bytes;
+		// v1.8.18, lane IDX-HARDEN task C — see s_indices_virt/s_indices_phys's comment.
+		s_tier_virt[t] = (uintptr_t)s_tier_arena[t];
+		s_tier_phys[t] = osConvertVirtToPhys(s_tier_arena[t]);
 
 		s_tier_start[t] = next_slot;
 		s_tier_count[t] = tier_slots[t];
@@ -1611,6 +1682,16 @@ bool chunkRenderInit(int max_radius)
 		return false;
 	if (s_bytes != meshPoolTotalBytes(s_pool_slots, MESH_SLOT_FACES, sizeof(MeshVertex)))
 		return false;
+
+#if BS_DRAW_GUARD
+	// v1.8.18. Freeze s_tier_arena/s_tier_count for tierTablesGolden() to check the draw guard
+	// against for the rest of the process's life. Taken here, after both integrity checks just
+	// above have passed, so a pool that failed to size correctly never becomes a golden copy of
+	// a wrong answer.
+	memcpy(s_tier_arena_golden, s_tier_arena, sizeof(s_tier_arena_golden));
+	memcpy(s_tier_count_golden, s_tier_count, sizeof(s_tier_count_golden));
+	s_tier_golden_set = true;
+#endif
 
 	if (!atlasInit())
 		return false;
@@ -1779,7 +1860,29 @@ void chunkRenderExit(void)
 	linearFree(s_shared_indices);
 	shaderProgramFree(&s_program);
 	DVLB_Free(s_dvlb);
+
+	// v1.8.18, lane IDX-HARDEN task C. The pointers above are now dangling; zero the cached
+	// addresses with them so chunkRenderIndexPhys/chunkRenderTierPhys read 0 rather than a freed
+	// buffer's stale physical address — see the accessors' comment in chunk_render.h for why 0
+	// is the deliberate "not measured" sentinel.
+	s_indices_virt = 0;
+	s_indices_phys = 0;
+	for (int t = 0; t < 3; t++) {
+		s_tier_virt[t] = 0;
+		s_tier_phys[t] = 0;
+	}
 }
+
+// v1.8.18, lane IDX-HARDEN task C. Plain loads of what chunkRenderInit cached — see the comment
+// on s_indices_virt/s_indices_phys, up by s_shared_indices's own declaration, for what these
+// close and why chunk_render.c has to be the one to compute them. tier is 0/1/2 for S/M/L;
+// anything else, or a call before chunkRenderInit succeeds / after chunkRenderExit, reads 0 for
+// both halves — a real linearAlloc address on this console is never 0, so a caller can tell
+// "not measured" apart from a genuine reading without a second flag.
+uintptr_t chunkRenderIndexVirt(void) { return s_indices_virt; }
+uint32_t  chunkRenderIndexPhys(void) { return s_indices_phys; }
+uintptr_t chunkRenderTierVirt(int tier) { return (tier >= 0 && tier < 3) ? s_tier_virt[tier] : 0; }
+uint32_t  chunkRenderTierPhys(int tier) { return (tier >= 0 && tier < 3) ? s_tier_phys[tier] : 0; }
 
 bool chunkRenderBuild(const World* w, int cx, int cy, int cz)
 {
@@ -1787,6 +1890,11 @@ bool chunkRenderBuild(const World* w, int cx, int cy, int cz)
 	// (main.c) calls this once per chunk it drains. See app/stage_probe.h; a no-op unless
 	// built with -DBS_STAGE_PROBE=1.
 	BS_STAGE_ONCE(BS_STAGE_ID_MESH_BUILD, "MESH_BUILD_FIRST");
+
+	// v1.8.18 MESH-SUBPHASE. Both of WD_PHASE_MESH's mesh drains (chunkRenderDrainDirty
+	// below, and main.c's genDrainMesh) call in here, so this one store covers both without
+	// needing a marker at either call site. See WdMeshStage in app/watchdog.h.
+	watchdogMeshStage(WD_MESH_BUILD_ENTER);
 
 	// Step 9.2c. Looked up before anything else and independent of size: whether this
 	// chunk already owns a slot decides both the empty-chunk path below and, in the
@@ -1960,8 +2068,21 @@ bool chunkRenderBuild(const World* w, int cx, int cy, int cz)
 		// reason alone. It was never the cause. The cause was the frame loop overwriting these
 		// same buffers while the previous frame's draw was still fetching from them, which
 		// v1.2.1 fixes in main.c. If anything, flushing sooner made that race land harder.
+		//
+		// v1.8.18 MESH-SUBPHASE. This is a synchronous IPC call into the GSP system module —
+		// the prime suspect for a hang.txt that reads `phase MESH, worker IDLE` while the same
+		// freeze's GX-queue postmortem shows the GPU command queue already wedged globally. If
+		// GSP is dead, this call is where the main thread would sit forever. Bracketed tightly
+		// (set immediately before, cleared immediately after) so a stall caught here can only
+		// mean this call, not the memcpy above it or anything below.
+		watchdogMeshStage(WD_MESH_GSP_FLUSH);
 		GSPGPU_FlushDataCache(s->verts, (size_t)out.vert_count * sizeof(MeshVertex));
 	}
+
+	// v1.8.18 MESH-SUBPHASE. Set unconditionally here, not only inside the branch above, so an
+	// all-air/no-geometry rebuild (which skips the flush entirely) still reports correctly:
+	// either way, everything from here to the return is slot metadata, not a GSP call.
+	watchdogMeshStage(WD_MESH_SLOT_INSTALL);
 
 	s->cx = cx; s->cy = cy; s->cz = cz;
 	s->vert_count  = out.vert_count;
@@ -2093,6 +2214,13 @@ int chunkRenderDrainDirty(const World* w, float budget_ms, int max_chunks)
 	for (int i = 0; i < s_pool_slots; i++) {
 		MeshSlot* s = &s_slots[i];
 		if (!dirtyqIsMarked(&s_dirty, i)) continue;
+
+		// v1.8.18 MESH-SUBPHASE. Set here, between chunks, so a report that lands in the gap
+		// between two builds — queue bookkeeping, the budget check below — reads as that gap
+		// rather than as a stale leftover from whichever WdMeshStage the previous chunk's
+		// build ended on. chunkRenderBuild overwrites it to WD_MESH_BUILD_ENTER on its own
+		// first line, so this is only ever visible for the (very short) time before that.
+		watchdogMeshStage(WD_MESH_DRAIN_ENTER);
 
 		// chunkRenderBuild may decide the chunk is now all-air and hand the slot back
 		// (s->used = false); either way the chunk this entry named has been dealt
@@ -2443,6 +2571,20 @@ static bool horizonHidden(int cx, int cy, int cz)
 // the bound buffer actually holds, and the two are deliberately separate calls (a chunk is up
 // to three opaque runs plus a transparent one, all sharing one bind).
 static const MeshSlot* s_bound;
+
+// The first draw that failed validation, kept verbatim so the report is evidence rather than a
+// summary. Written once and then left alone: the interesting one is the first, and a console
+// that is about to hang has no time to keep a history.
+//
+// Declared here, before slotBind() rather than after it (where drawSane() and the accessors
+// still live) because v1.8.18 lane IDX-HARDEN's codes 8/9 are latched from inside slotBind()
+// itself -- see the citro3d hardening comment there -- and C requires the declaration to
+// precede that use. The accessor function bodies below stay where they were; only the storage
+// had to move.
+static int      s_guard_code;       // 0 = nothing wrong has been seen
+static uint32_t s_guard_first, s_guard_count, s_guard_maxidx, s_guard_cap;
+static int      s_guard_slot, s_guard_hits;
+static uintptr_t s_guard_verts;
 #endif
 
 // v1.8.7. The modelview for a chunk sitting at (tx,ty,tz), without building the model matrix.
@@ -2494,22 +2636,54 @@ static void slotBind(const C3D_Mtx* view, const MeshSlot* s)
 	C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_uloc_modelview, &mv);
 
 	C3D_BufInfo* buf = C3D_GetBufInfo();
-	BufInfo_Init(buf);
-	BufInfo_Add(buf, s->verts, sizeof(MeshVertex), 2, 0x10);
 #if BS_DRAW_GUARD
+	// v1.8.18, lane IDX-HARDEN task B. Disassembly of libcitro3d.a found two failures neither
+	// libctru nor this file ever checked for: C3D_GetBufInfo() returns NULL when the 3D context
+	// is inactive, and BufInfo_Init(NULL) then unconditionally memsets 148 bytes starting at
+	// address 4 -- a wild write -- and separately, BufInfo_Add() returns -2 when its 12-entry
+	// table is already full, but increments bufCount BEFORE that check, so a failed Add still
+	// leaves the C3D_BufInfo one slot dirtier than it was. As far as lane FRZ-INDEX could tell,
+	// NEITHER can fire in this codebase today: this file calls BufInfo_Add exactly once per
+	// bind, well under the 12-slot table, and nothing found leaves the 3D context inactive here.
+	// This is hardening against citro3d's own contract, not a fix for anything measured wrong.
+	//
+	// Both refusals leave s_bound untouched rather than pointing it at `s`: the caller's very
+	// next drawIndices(s, ...) then finds s != s_bound and drawSane() refuses the draw as code
+	// 6, so geometry still never reaches the GPU off a bad bind even though this code path has
+	// no `first`/`count` of its own to report.
+	if (!buf) {
+		s_guard_hits++;
+		if (!s_guard_code) {
+			s_guard_code  = 8;   // C3D_GetBufInfo() returned NULL: context inactive
+			s_guard_first = s_guard_count = s_guard_maxidx = s_guard_cap = 0;
+			s_guard_slot  = (int)(s - s_slots);
+			s_guard_verts = (uintptr_t)s->verts;
+		}
+		return;
+	}
+#endif
+	BufInfo_Init(buf);
+	const int buf_add_rc = BufInfo_Add(buf, s->verts, sizeof(MeshVertex), 2, 0x10);
+#if BS_DRAW_GUARD
+	if (buf_add_rc != 0) {
+		s_guard_hits++;
+		if (!s_guard_code) {
+			s_guard_code  = 9;   // BufInfo_Add() failed (buffer table full)
+			s_guard_first = s_guard_count = s_guard_maxidx = s_guard_cap = 0;
+			s_guard_slot  = (int)(s - s_slots);
+			s_guard_verts = (uintptr_t)s->verts;
+		}
+		return;
+	}
 	s_bound = s;
+#else
+	(void)buf_add_rc;
 #endif
 }
 
 #if BS_DRAW_GUARD
-// The first draw that failed validation, kept verbatim so the report is evidence rather than a
-// summary. Written once and then left alone: the interesting one is the first, and a console
-// that is about to hang has no time to keep a history.
-static int      s_guard_code;       // 0 = nothing wrong has been seen
-static uint32_t s_guard_first, s_guard_count, s_guard_maxidx, s_guard_cap;
-static int      s_guard_slot, s_guard_hits;
-static uintptr_t s_guard_verts;
-
+// s_guard_code and its five companion fields are declared up by s_bound now, not here -- see
+// the comment there for why slotBind() needed them to move.
 int  chunkRenderGuardCode(void)   { return s_guard_code; }
 int  chunkRenderGuardHits(void)   { return s_guard_hits; }
 int  chunkRenderGuardSlot(void)   { return s_guard_slot; }
@@ -2539,27 +2713,74 @@ static uint32_t boundVertCap(const MeshSlot* s)
 	return 0;
 }
 
+// v1.8.18, freeze-investigation gap 4: boundVertCap() above has no way to tell a genuine
+// s_tier_arena/s_tier_count from a corrupted-but-internally-consistent one — it can only
+// compute an address range from whatever the two arrays currently hold, and a count grown
+// past the real allocation would make that range too WIDE, which is the dangerous direction:
+// it would make boundVertCap() report a bigger cap than the arena actually has, and every
+// later check in drawSane trusts that number completely. Nothing in this file legitimately
+// writes either array again after chunkRenderInit's snapshot, so any live value that no
+// longer matches its own boot-time copy is corruption by definition, from something else
+// entirely — a wild write elsewhere in a codebase with no MMU write-protection to catch it.
+//
+// Three pointer compares and three int compares, once per draw call. Nowhere near a vertex
+// walk, and unlike boundVertCap it cannot be fooled by a corruption that happens to still be
+// self-consistent, because it is not deriving an answer from the live tables — it is checking
+// the live tables against a copy corruption cannot have touched.
+static bool tierTablesGolden(void)
+{
+	if (!s_tier_golden_set) return false;
+	for (int t = 0; t < 3; t++) {
+		if (s_tier_arena[t] != s_tier_arena_golden[t]) return false;
+		if (s_tier_count[t] != s_tier_count_golden[t]) return false;
+	}
+	return true;
+}
+
 // Everything that has to be true for one C3D_DrawElements to be safe to issue. hang.txt proved
 // the CPU finishes the frame and the GPU then never signals, which is what a vertex fetch from
-// an address the GPU cannot read looks like from outside — so these are the four ways this
-// code could hand the GPU such an address.
+// an address the GPU cannot read looks like from outside — so these are the ways this code
+// could hand the GPU such an address, or hand it geometry that was never meant to pair with the
+// buffer bound for it.
 //
-// The last check is the one worth the trouble. Every slot in a tier holds exactly
-// kTierFaces[t]*4 vertices, but the index buffer is shared by every tier and runs to the
-// largest, so a run whose indices reach past its own tier's slot reads into the next slot —
-// and off the end of the arena entirely if the slot is the last one in it.
-static bool drawSane(uint32_t first, uint32_t count)
+// `s` is the slot the CALLER believes it is drawing — always the same slot it just handed to
+// slotBind, at every call site that exists today (v1.8.18: see drawIndices/drawRun/drawOpaque).
+// Checking it against s_bound rather than trusting it costs one pointer compare and forecloses
+// the whole class of bug for every call site that gets written after this one, not just the
+// ones that exist right now.
+//
+// Of the geometry checks, the one at code 4 is the one worth the trouble. Every slot in a tier
+// holds exactly kTierFaces[t]*4 vertices, but the index buffer is shared by every tier and runs
+// to the largest, so a run whose indices reach past its own tier's slot reads into the next slot
+// — and off the end of the arena entirely if the slot is the last one in it.
+static bool drawSane(const MeshSlot* s, uint32_t first, uint32_t count)
 {
-	const uint32_t cap = boundVertCap(s_bound);
 	int code = 0;
 	uint32_t maxidx = 0;
+	uint32_t cap = 0;
 
-	if (!cap)                                     code = 1;   // verts NULL / not a slot start
-	else if (count % 3u)                          code = 2;   // not whole triangles
-	else if (first + count > MESH_SLOT_INDICES)   code = 3;   // runs off the index buffer
+	if (!tierTablesGolden())                          code = 7;   // tier tables drifted since boot
+	else if (s != s_bound)                             code = 6;   // run's slot != what's bound
 	else {
-		maxidx = s_shared_indices[first + count - 1u];
-		if ((uint32_t)maxidx >= cap)              code = 4;   // reaches past the bound slot
+		cap = boundVertCap(s_bound);
+		if (!cap)                                      code = 1;   // verts NULL / not a slot start
+		// v1.8.18, lane IDX-HARDEN: `% 6u`, not `% 3u`. Every mesher emit path (emitFace,
+		// emitCross in world/mesher.c) writes a whole quad atomically -- 4 vertices, 6 indices,
+		// never fewer, and an overflow check gates the write before either counter moves, so
+		// there is never a partial quad -- which makes index_count, and every face_start/
+		// opaque_index_count boundary derived from it, a multiple of 6 at all times. Measured
+		// over 51,740 real draw runs against generated terrain (lane FRZ-INDEX): `first` was a
+		// multiple of 6 in every one. A `first` that is 3-aligned but not 6-aligned is still a
+		// legal triangle start (code 2 would pass it) but starts mid-QUAD, which silently
+		// breaks code 4's assumption below that the run's LAST index is its MAXIMUM index --
+		// that is only true when `first` lands on a quad's own base vertex.
+		else if (first % 6u)                           code = 5;   // run starts mid-quad
+		else if (count % 3u)                           code = 2;   // not whole triangles
+		else if (first + count > MESH_SLOT_INDICES)    code = 3;   // runs off the index buffer
+		else {
+			maxidx = s_shared_indices[first + count - 1u];
+			if ((uint32_t)maxidx >= cap)               code = 4;   // reaches past the bound slot
+		}
 	}
 
 	if (!code) return true;
@@ -2571,6 +2792,8 @@ static bool drawSane(uint32_t first, uint32_t count)
 		s_guard_count  = count;
 		s_guard_maxidx = maxidx;
 		s_guard_cap    = cap;
+		// Always the slot actually bound on the GPU, not the caller's `s` — for code 6 those
+		// two differ by definition, and it is what the GPU really has that the report needs.
 		s_guard_slot   = s_bound ? (int)(s_bound - s_slots) : -1;
 		s_guard_verts  = (uintptr_t)(s_bound ? s_bound->verts : NULL);
 	}
@@ -2581,9 +2804,17 @@ static bool drawSane(uint32_t first, uint32_t count)
 // One run out of the shared index buffer. `first` and `count` still come from the bound
 // slot's own face_start / opaque_index_count / index_count — only the storage they index
 // into is shared now, see s_shared_indices.
-static void drawIndices(uint32_t first, uint32_t count)
+//
+// v1.8.18: takes the slot explicitly. Every call site already had the right slot in scope —
+// this costs one argument to thread through, and it is what lets drawSane prove `s` is really
+// the slot slotBind last bound instead of trusting that every future call site will keep
+// getting that pairing right by convention. See drawSane's code 6.
+static void drawIndices(const MeshSlot* s, uint32_t first, uint32_t count)
 {
 	if (!count) return;
+	// Referenced only inside BS_DRAW_GUARD/BS_DRAW_GUARD_REDTEST below; the (void) keeps a
+	// build with the guard forced off from failing -Wextra's unused-parameter over it.
+	(void)s;
 #if BS_DRAW_GUARD_REDTEST
 	// The red arm for the guard, and nothing else uses it. A checker that has only ever been
 	// seen agreeing with the code it checks has not been tested — so this hands it one draw
@@ -2592,11 +2823,30 @@ static void drawIndices(uint32_t first, uint32_t count)
 	//
 	//   =3  a run that ends past the end of the shared index buffer
 	//   =4  a run whose indices reach past the vertex buffer bound for it
+	//   =5  a run that starts mid-triangle
+	//   =6  a run whose slot does not match what slotBind last bound
+	//   =7  a tier ground-truth table that no longer matches its boot-time value
 	{
 		static int seen = 0;
 		if (++seen == 300) {
 #if BS_DRAW_GUARD_REDTEST == 3
-			first = MESH_SLOT_INDICES - 3u; count = 6u;
+			// 6-aligned on purpose. This arm used to be (MESH_SLOT_INDICES - 3u, 6u), which
+			// stopped proving anything the moment code 5 tightened from `first % 3` to
+			// `first % 6`: a first of MESH_SLOT_INDICES-3 is no longer 6-aligned, so the
+			// guard refused it as code 5 and returned before it ever reached the code 3
+			// test this arm exists to fire. Same shape as before — a run that ends past the
+			// end of the shared index buffer — but with a first the alignment check accepts,
+			// so the refusal that comes back is genuinely code 3.
+			first = MESH_SLOT_INDICES - 6u; count = 12u;
+#elif BS_DRAW_GUARD_REDTEST == 4
+			first = 0u; count = MESH_SLOT_INDICES;
+#elif BS_DRAW_GUARD_REDTEST == 5
+			first += 1u;                 // no longer a multiple of 6: a mid-quad start
+#elif BS_DRAW_GUARD_REDTEST == 6
+			s = s + 1;                   // a real, different slot — never the one just bound
+#elif BS_DRAW_GUARD_REDTEST == 7
+			s_tier_count[0] += 1;        // corrupt live state; undone below before any other
+			                              // chunk this session can be drawn against it
 #else
 			first = 0u; count = MESH_SLOT_INDICES;
 #endif
@@ -2604,7 +2854,13 @@ static void drawIndices(uint32_t first, uint32_t count)
 	}
 #endif
 #if BS_DRAW_GUARD
-	if (!drawSane(first, count)) return;
+	const bool draw_ok = drawSane(s, first, count);
+#if BS_DRAW_GUARD_REDTEST == 7
+	// Put back immediately: this arm exists to prove tierTablesGolden() can see the drift, not
+	// to leave the pool corrupted for the rest of the session's real draws.
+	s_tier_count[0] = s_tier_count_golden[0];
+#endif
+	if (!draw_ok) return;
 #endif
 	C3D_DrawElements(GPU_TRIANGLES, (int)count, C3D_UNSIGNED_SHORT, s_shared_indices + first);
 	metricsCountDraw(count / 3);
@@ -2615,7 +2871,7 @@ static void drawRun(const C3D_Mtx* view, const MeshSlot* s, uint32_t first, uint
 {
 	if (!count) return;
 	slotBind(view, s);
-	drawIndices(first, count);
+	drawIndices(s, first, count);
 }
 
 // Step 9.2. The opaque half of one chunk, minus the face directions that cannot be looking at
@@ -2663,11 +2919,11 @@ static void drawOpaque(const C3D_Mtx* view, const MeshSlot* s)
 		if (!want[kFaceOrder[f]]) { f++; continue; }
 		int g = f;
 		while (g + 1 < BLOCK_FACES && want[kFaceOrder[g + 1]]) g++;
-		drawIndices(s->face_start[f], s->face_start[g + 1] - s->face_start[f]);
+		drawIndices(s, s->face_start[f], s->face_start[g + 1] - s->face_start[f]);
 		f = g + 1;
 	}
 #else
-	drawIndices(0, s->opaque_index_count);
+	drawIndices(s, 0, s->opaque_index_count);
 #endif
 }
 

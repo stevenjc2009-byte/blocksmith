@@ -86,7 +86,13 @@ typedef struct {
 	// immediately after threadCreate returns — before the new thread has necessarily run a
 	// single instruction. A measured field would still be -1 at that moment and the second
 	// lane would never start on any console.
-	volatile s32 core_run;
+	// FRZ-AUDIT defect 3 (2026-09-03). Was `volatile s32`. volatile suppresses the compiler's
+	// own caching of the value but is not a cross-core barrier on ARM11 -- it emits none. The
+	// write in workerMain and the read in workerLaneCoreRunning() now use explicit
+	// __ATOMIC_RELEASE / __ATOMIC_ACQUIRE, which do emit one (verified by disassembly: `mcr
+	// p15,0,r3,c7,c10,5`, the same ARM11 DMB documented above for LightLock/LightEvent).
+	// volatile was not doing anything useful here and is dropped rather than kept alongside.
+	s32 core_run;
 
 	// Worker-owned. The main thread only touches this while this lane's claim is held and
 	// the lane is parked, which is the whole handshake — see worker.h.
@@ -109,6 +115,11 @@ typedef struct {
 
 	// Per-lane so the two do not have to contend for one counter on the hot path. Read by
 	// workerBusyMs(), which sums them.
+	//
+	// FRZ-AUDIT defect 1 (2026-09-03). Written with a plain `+=` from the lane thread and
+	// summed with no lock from the main thread was a data race even though nothing currently
+	// branches on the result (main.c:3238's printf is the only reader). Both sides now go
+	// through __atomic_fetch_add / __atomic_load_n, __ATOMIC_RELAXED -- see the call sites.
 	u64        busy_ticks;
 } Lane;
 
@@ -358,7 +369,12 @@ static void workerMain(void* arg)
 	// answered from inside the thread being asked about. cia/blocksmith.rsf grants SVC 17
 	// (SystemCallAccess GetCurrentProcessorNumber), confirmed present in the shipped
 	// v1.8.16 exheader's system-call mask.
-	ln->core_run = svcGetProcessorID();
+	// FRZ-AUDIT defect 3. RELEASE, paired with the ACQUIRE load in workerLaneCoreRunning(). This
+	// is the first statement of workerMain, so there is nothing else on this thread yet that the
+	// barrier needs to publish alongside it -- but a plain store here previously gave a reader on
+	// another core (the watchdog, or main.c's debug overlay) no guarantee of ever seeing this
+	// value promptly, or at all, without one.
+	__atomic_store_n(&ln->core_run, svcGetProcessorID(), __ATOMIC_RELEASE);
 
 	// FRZ-PROBE. One marker per lane, at thread start, naming which lane index this is — so a
 	// freeze that happens before ANY worker lane got scheduled at all shows up as "no
@@ -414,7 +430,11 @@ static void workerMain(void* arg)
 		if (save_slot >= 0) {
 			const u64 ts = svcGetSystemTick();
 			workerWriteSave(save_slot);
-			ln->busy_ticks += svcGetSystemTick() - ts;
+			// FRZ-AUDIT defect 1. RELAXED: a statistical counter with no ordering relationship
+			// to anything else this thread or the reader does -- workerBusyMs() (main thread)
+			// only ever sums it for a printf diagnostic, nothing branches on it, and no other
+			// memory access needs to be ordered around it. A stronger order would buy nothing.
+			__atomic_fetch_add(&ln->busy_ticks, svcGetSystemTick() - ts, __ATOMIC_RELAXED);
 			continue;
 		}
 
@@ -479,7 +499,8 @@ static void workerMain(void* arg)
 		case JOB_NONE:
 			break;
 		}
-		ln->busy_ticks += svcGetSystemTick() - t0;
+		// FRZ-AUDIT defect 1 -- same reasoning as the save-slot write above.
+		__atomic_fetch_add(&ln->busy_ticks, svcGetSystemTick() - t0, __ATOMIC_RELAXED);
 
 		LightLock_Lock(&s_lock);
 		// Cannot fail: the ring has one slot per lane and a lane holds its claim until its
@@ -556,7 +577,17 @@ bool workerStart(const WorldGen* g)
 	s_save_head = s_save_tail = s_save_count = 0;
 	s_saved = s_save_failed = s_loaded = 0;
 	s_lanes = 0;
-	s_lane[0] = s_lane[1] = NULL;
+	// FRZ-AUDIT defect 2 (2026-09-03). s_lane[] is the watchdog thread's only lock-free window
+	// onto this file (watchdog.c's hang-report core map, via workerLaneCore()/
+	// workerLaneCoreRunning()), and watchdog.h:110 forbids that thread from ever taking a lock --
+	// so s_lock cannot guard this array. Every write to s_lane[] in this file is a RELEASE store
+	// instead, paired with the ACQUIRE loads in the two functions above. s_lanes is NOT part of
+	// this: grepping watchdog.c shows it never reads s_lanes (only workerLaneCore()/
+	// workerLaneCoreRunning(), which never touch s_lanes either), so it stays a plain int,
+	// touched only by the main thread that also owns workerStart/workerStop, with no reader to
+	// race against.
+	__atomic_store_n(&s_lane[0], (Lane*)NULL, __ATOMIC_RELEASE);
+	__atomic_store_n(&s_lane[1], (Lane*)NULL, __ATOMIC_RELEASE);
 
 	// Cleared with the rest, so the counters describe THIS world rather than every world
 	// entered since the app launched. Without this a second world would inherit the first
@@ -574,6 +605,23 @@ bool workerStart(const WorldGen* g)
 	s32 prio = 0x30;
 	svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
 	if (prio + 1 <= 0x3F) prio += 1;
+
+	// No floor against libctru's GSP interrupt-relay thread is needed here, and adding one
+	// was tried and reverted on 2026-09-04. Both halves of that were measured, so record
+	// them rather than let anyone re-derive the first half and stop there:
+	//
+	//   - gspEventThreadMain (created inside gspInit) runs at 0x1A/26 -- disassembled from
+	//     libctru.a's gspgpu.o, whose threadCreate call site loads r3 = #26.
+	//   - cia/blocksmith.rsf says `Priority: 16`, but makerom writes RSF + 0x20 into the
+	//     exheader. Reading the ARM11 Local Capabilities priority byte out of the packed
+	//     exheader of all 25 shipped .cia builds gives 0x30/48, never 16. (Container = the
+	//     'NCCH' magic minus 0x100; ExHeader at +0x200; ACI at ExHeader+0x200; priority at
+	//     ACI+0x0F. Plaintext because NCCH flags byte 7 is 0x05, NoCrypto.)
+	//
+	// So the shipped main thread has always run at 48 and this lane at 49 -- both numerically
+	// above 26, i.e. correctly LOWER priority than GSP. There is no inversion to guard.
+	// The rule this cost an hour to learn: a config value is an INPUT to a tool, not the
+	// value that ships. Read the artifact.
 
 	// Step 6.3. The second core is a request, not a guarantee: APT_SetAppCpuTimeLimit can
 	// fail (it is refused outright under some launch paths), and threadCreate on core 1
@@ -629,7 +677,7 @@ bool workerStart(const WorldGen* g)
 		up = workerLaneStart(&s_lane0, 0, cores[i], prio);
 	if (!up) return false;
 
-	s_lane[0] = &s_lane0;
+	__atomic_store_n(&s_lane[0], &s_lane0, __ATOMIC_RELEASE);  // FRZ-AUDIT defect 2, see above
 	s_lanes   = 1;
 
 	// ── v1.8.8: the second lane ───────────────────────────────────────────────────────
@@ -653,7 +701,7 @@ bool workerStart(const WorldGen* g)
 		if (ln) {
 			memset(ln, 0, sizeof(*ln));
 			if (workerLaneStart(ln, 1, WORKER_LANE1_CORE, prio)) {
-				s_lane[1] = ln;
+				__atomic_store_n(&s_lane[1], ln, __ATOMIC_RELEASE);  // FRZ-AUDIT defect 2
 				s_lanes   = 2;
 			} else {
 				free(ln);
@@ -670,14 +718,26 @@ int workerLanes(void) { return s_started ? s_lanes : 0; }
 
 int workerLaneCore(int lane)
 {
-	if (lane < 0 || lane >= WORKER_LANES_MAX || !s_lane[lane]) return -1;
-	return s_lane[lane]->core;
+	if (lane < 0 || lane >= WORKER_LANES_MAX) return -1;
+	// FRZ-AUDIT defect 2. ACQUIRE, paired with the RELEASE stores at every s_lane[] write site
+	// above. This is the watchdog thread's read (via the hang report's core map in watchdog.c)
+	// as well as main.c's debug overlay's -- only the former is forbidden a lock, so both get
+	// the lock-free treatment. NULL is a valid answer at any point in this array's lifetime, not
+	// just steady state. ->core needs no atomic access of its own: it is written on the main
+	// thread before the lane's pointer is published, so the ACQUIRE below is what makes that
+	// write visible here too (safe publication).
+	Lane* const ln = (Lane*)__atomic_load_n(&s_lane[lane], __ATOMIC_ACQUIRE);
+	return ln ? ln->core : -1;
 }
 
 int workerLaneCoreRunning(int lane)
 {
-	if (lane < 0 || lane >= WORKER_LANES_MAX || !s_lane[lane]) return -1;
-	return (int)s_lane[lane]->core_run;
+	if (lane < 0 || lane >= WORKER_LANES_MAX) return -1;
+	// FRZ-AUDIT defect 2, same reasoning as workerLaneCore() above.
+	Lane* const ln = (Lane*)__atomic_load_n(&s_lane[lane], __ATOMIC_ACQUIRE);
+	if (!ln) return -1;
+	// FRZ-AUDIT defect 3. ACQUIRE, paired with the RELEASE store in workerMain.
+	return (int)__atomic_load_n(&ln->core_run, __ATOMIC_ACQUIRE);
 }
 
 void workerStop(void)
@@ -714,8 +774,22 @@ void workerStop(void)
 
 	// Lane 0 is a static and stays; every lane above it was malloc'd by workerStart and goes
 	// back, so an Old 3DS session that never had one is byte-for-byte what it was in v1.8.7.
-	for (int i = 1; i < s_lanes; i++) free(s_lane[i]);
-	for (int i = 1; i < WORKER_LANES_MAX; i++) s_lane[i] = NULL;
+	//
+	// FRZ-AUDIT defect 2. NULL is published (RELEASE, paired with the ACQUIRE loads in
+	// workerLaneCore()/workerLaneCoreRunning()) BEFORE the lane is freed below, not after --
+	// freeing first would leave a window where a concurrent lock-free reader (the watchdog)
+	// could still be holding the old, now-dangling pointer. This narrows that window; it does
+	// not close it outright. A load that already returned the old pointer an instant before this
+	// store lands can still be preempted before it dereferences it, and closing that residual gap
+	// needs either a lock (forbidden -- watchdog.h:110) or a reclamation scheme (hazard pointers,
+	// RCU, or simply never freeing lane 1) bigger than an atomics-on-specific-fields pass. Left
+	// open on purpose -- see the deliverable note on defect 2. Not reachable today regardless:
+	// the only place in this function that can stall long enough to trip WD_TIMEOUT_MS is the
+	// threadJoin loop above, which runs to completion before any code below it, this included.
+	Lane* freed[WORKER_LANES_MAX] = {0};
+	for (int i = 1; i < s_lanes; i++) freed[i] = s_lane[i];
+	for (int i = 1; i < WORKER_LANES_MAX; i++) __atomic_store_n(&s_lane[i], (Lane*)NULL, __ATOMIC_RELEASE);
+	for (int i = 1; i < WORKER_LANES_MAX; i++) free(freed[i]);
 	s_lanes = 0;
 }
 
@@ -1106,7 +1180,13 @@ int workerReadyPeak(void)
 float workerBusyMs(void)
 {
 	u64 t = 0;
-	for (int i = 0; i < s_lanes; i++) t += s_lane[i]->busy_ticks;
+	// FRZ-AUDIT defect 1. RELAXED load, paired with the RELAXED fetch_add in workerMain -- see
+	// the comment there for why relaxed is enough. s_lanes and s_lane[i] themselves stay plain
+	// reads here: this function runs on the main thread only (main.c's debug overlay), the same
+	// thread that writes s_lanes and s_lane[] in workerStart/workerStop, so there is no
+	// cross-thread hazard on those two -- only busy_ticks crosses threads.
+	for (int i = 0; i < s_lanes; i++)
+		t += __atomic_load_n(&s_lane[i]->busy_ticks, __ATOMIC_RELAXED);
 	return (float)((double)t / CPU_TICKS_PER_MSEC);
 }
 

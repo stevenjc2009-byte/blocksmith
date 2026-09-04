@@ -110,6 +110,39 @@ void watchdogPhase(WdPhase p);
 // WD_PHASE_SAVE is being set around the save at all.
 WdPhase watchdogPhaseGet(void);
 
+// v1.8.18 MESH-SUBPHASE. Where inside WD_PHASE_MESH the main thread actually is.
+//
+// Two artifacts from a real freeze contradict each other unless something inside WD_PHASE_MESH
+// blocks forever: hang.txt said `phase MESH, worker IDLE`, and a GX-queue postmortem on that
+// same freeze said the GPU command queue was already wedged globally -- a fresh, unrelated
+// GX_MemoryFill queued AFTER the stuck ProcessCommandList also timed out. WD_PHASE_MESH is the
+// CPU-side mesh/relight drain, not a draw call, so the only way both reports are true is that
+// some call inside the drain blocks forever on a dead GSP. The prime suspect is
+// GSPGPU_FlushDataCache in chunkRenderBuild() (scene/chunk_render.c) -- a synchronous IPC call
+// into the GSP system module. This enum exists to prove or disprove that on the next freeze
+// instead of guessing again: it names the wait finer than the single word "MESH", which is what
+// both hardware reports were stuck with.
+//
+// Unconditional, not gated behind BS_DRAW_PROBE, for the same reason the N3D-CORE core map and
+// the draw-guard verdict were moved out from under it (see watchdog.c's reportBuild): this must
+// reach the hang report in a SHIPPED build, because that report is the only diagnostic that
+// survives BS_BOTTOM_UI compiling the console out. Cost is one volatile store per call site,
+// same contract as watchdogPhase/watchdogDrawStage -- no lock, no allocation, nothing the
+// watchdog thread depends on the wedged thread to cooperate with.
+typedef enum {
+	WD_MESH_IDLE = 0,     // not inside the WD_PHASE_MESH drain (value is stale/meaningless)
+	WD_MESH_RELIGHT,      // relightDrain() -- the relight queue, ahead of the two mesh drains
+	WD_MESH_DRAIN_ENTER,  // chunkRenderDrainDirty's loop, between chunks -- not yet in a build
+	WD_MESH_BUILD_ENTER,  // inside chunkRenderBuild(), before the GSP flush
+	WD_MESH_GSP_FLUSH,    // INSIDE GSPGPU_FlushDataCache -- the prime suspect
+	WD_MESH_SLOT_INSTALL, // after the flush, finishing the slot's metadata (cx/cy/cz, counts, vis_mask)
+	WD_MESH_STAGE_COUNT
+} WdMeshStage;
+
+// One store. Same contract as watchdogPhase: callable from any thread, never blocks, never
+// allocates, safe to call from code that may be seconds from wedging the console.
+void watchdogMeshStage(WdMeshStage stage);
+
 // Once per frame, from the frame loop. This is the signal the monitor watches: not the phase,
 // which a hung frame leaves pointing at the right place, but the count, which only a frame
 // that completed can move.

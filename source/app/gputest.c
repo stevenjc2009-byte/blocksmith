@@ -11,6 +11,7 @@
 
 #include "app/hw.h"
 #include "app/watchdog.h"
+#include "debug/metrics.h"
 #include "version.h"
 
 // citro3d's context is opaque outside the library, but __C3D_Context is a global symbol in the
@@ -22,11 +23,27 @@ extern u32 __C3D_Context[];
 #define SELFTEST_REL   "/blocksmith/selftest.txt"
 #define POSTMORTEM_REL "/blocksmith/postmortem.txt"
 #define BISECT_REL     "/blocksmith/bisect.bin"
+#define CMDHANG_REL    "/blocksmith/cmdhang.bin"
 
 // Every test waits this long before calling a submission wedged. Generous on purpose: a false
 // TIMEOUT would send the next round of work in the wrong direction, and the cost of being
 // generous is only ever paid on a test that was going to fail anyway.
-#define TEST_TIMEOUT_NS (2000000000LL)
+//
+// In ARM11 system TICKS, not nanoseconds - gxCmdQueueWait's timeout parameter is ticks despite
+// libctru documenting it as nanoseconds. See the measurement written up on BS_GPU_WEDGE_TICKS in
+// gputest.h; the short version is that the old literal 2000000000 waited 7.48 real seconds.
+#define TEST_TIMEOUT_TICKS (2LL * SYSCLOCK_ARM11)
+
+// Ties gputest.h's spelled-out literal to libctru's own clock constant. gputest.h cannot reference
+// SYSCLOCK_ARM11 itself without pulling in <3ds.h>, so the check lives here instead, where <3ds.h>
+// is already included. If a future libctru changes the clock, this goes red at compile time rather
+// than silently restoring the 3.73x-too-long wait.
+_Static_assert(BS_GPU_WEDGE_TICKS == 2LL * SYSCLOCK_ARM11,
+               "BS_GPU_WEDGE_TICKS is meant to be exactly two seconds of ARM11 ticks");
+
+// Ticks per millisecond, for turning either of the two timeouts above back into a number a human
+// reading the report can check. Integer division is fine at this scale: 536223712 / 268111 = 2000.
+#define TICKS_PER_MS (SYSCLOCK_ARM11 / 1000)
 
 // The largest command list this can hold a working copy of. The real one measured 0x2430 bytes on
 // both hardware and the emulator; 32 KB is over three times that, and a longer list is refused
@@ -102,7 +119,7 @@ static bool qEndT(u32* us, s64 timeout)
 
 static bool qEnd(u32* us)
 {
-	return qEndT(us, TEST_TIMEOUT_NS);
+	return qEndT(us, TEST_TIMEOUT_TICKS);
 }
 
 // Lets a queue that was deliberately abandoned mid-flight finish on its own terms.
@@ -565,7 +582,7 @@ void gpuTestPreflight(void)
 	          "console      : %s\n"
 	          "linear free  : %lu B\n"
 	          "vram free    : %lu B\n\n",
-	          BLOCKSMITH_VERSION, (long long)(TEST_TIMEOUT_NS / 1000000),
+	          BLOCKSMITH_VERSION, (long long)(TEST_TIMEOUT_TICKS / TICKS_PER_MS),
 	          n3ds ? "New 3DS" : "Old 3DS",
 	          (unsigned long)linearSpaceFree(), (unsigned long)vramSpaceFree());
 
@@ -905,7 +922,7 @@ static u32 s_fake_frame;
 
 bool gpuTestFrameWait(void)
 {
-	const bool ok = gxCmdQueueWait(C3D_QUEUE, BS_GPU_WEDGE_NS);
+	const bool ok = gxCmdQueueWait(C3D_QUEUE, BS_GPU_WEDGE_TICKS);
 #ifdef BS_GPU_FAKE_WEDGE
 	if (ok && ++s_fake_frame == (u32)(BS_GPU_FAKE_WEDGE)) return false;
 #endif
@@ -943,11 +960,95 @@ static size_t queueLines(size_t len, const char* label)
 	return len;
 }
 
+// ---------------------------------------------------------------------------------------------
+// The raw command-list dump. Unconditional -- no #if, no opt-in flag -- because this is the one
+// piece of evidence in the whole post-mortem that names the exact poisoned command, and no build
+// to date has ever written it: only the DECODED bisection result is written today, and that needs
+// the bisector to have run at all. It does not on steve's own console -- step 1 below (the
+// trivial fill) reports TIMEOUT there because the GPU is globally wedged, not merely poisoned by
+// one list, and on TIMEOUT gpuTestPostMortem() returns before step 2 ever copies the list into
+// s_hang or writes bisect.bin. So the shipped build has never once put the bytes of the list that
+// actually hung it onto the card.
+//
+// Called BEFORE step 1 is attempted, not after: step 1's trivial fill waits up to
+// BS_GPU_WEDGE_TICKS (2 s of ARM11 ticks; the recorded real-world wait was 7.48 s wall-clock, see
+// the unit note on BS_GPU_WEDGE_TICKS in gputest.h) and, being a submission to a GPU already
+// believed wedged, is a plausible way for a console already in trouble to die outright. Getting
+// the bytes onto the card first means a console that dies mid-probe still leaves them behind.
+//
+// Fail-safe: no allocation (a fixed static buffer below), one bounded synchronous SD write
+// through the same watchdogWriteFile() that postmortem.txt/bisect.bin/selftest.txt already use
+// unconditionally in every shipped build, and no retry. If the write fails -- full card, no card,
+// whatever -- it simply does not happen; nothing here loops or blocks beyond what that one write
+// already risks, which is the same risk this file already accepts for postmortem.txt itself.
+//
+// File layout (tools/decode_cmdhang.py reads exactly this, offsets and all):
+//   offset  0 (4)  magic        ASCII "CDH1"
+//   offset  4 (4)  hang_addr    u32 LE -- address the list was read from
+//   offset  8 (4)  hang_size    u32 LE -- byte length the GX queue entry recorded for the list
+//   offset 12 (4)  dumped_size  u32 LE -- bytes of raw list data appended after this header;
+//                                         <= hang_size and <= LIST_MAX. A longer list is
+//                                         truncated here, never silently -- this field says so.
+//   offset 16 (4)  frame        u32 LE -- the frame counter gpuTestPostMortem() was called with
+//   offset 20 (4)  q_cap        u32 LE -- GX queue capacity at the moment of the wedge
+//   offset 24 (4)  q_queued     u32 LE
+//   offset 28 (4)  q_submitted  u32 LE
+//   offset 32 (4)  q_completed  u32 LE -- all four zero if the queue could not be read safely
+//   offset 36 (36) version      ASCII, NUL-padded, BLOCKSMITH_VERSION
+//   offset 72 (dumped_size)     the raw command-list bytes, verbatim, starting at hang_addr
+#define CMDHANG_HDR_BYTES 72u
+static u8 s_cmdhang[CMDHANG_HDR_BYTES + LIST_MAX];
+
+static void cmdhangPutU32(u8* p, u32 v)
+{
+	p[0] = (u8)(v);
+	p[1] = (u8)(v >> 8);
+	p[2] = (u8)(v >> 16);
+	p[3] = (u8)(v >> 24);
+}
+
+static void dumpCmdHang(const u8* list, u32 addr, u32 size, u32 frame)
+{
+	// Nothing to name: the queue held no draw command (hang_src stayed NULL in the caller).
+	// Writing a header-only file here would look like evidence and be none, so this is the one
+	// case where "fail safe" means "write nothing" rather than "write what little there is".
+	if (!list || !size) return;
+
+	const gxCmdQueue_s* q = C3D_QUEUE;
+	const u32 dumped = size < LIST_MAX ? size : LIST_MAX;
+
+	memset(s_cmdhang, 0, CMDHANG_HDR_BYTES);
+	s_cmdhang[0] = 'C'; s_cmdhang[1] = 'D'; s_cmdhang[2] = 'H'; s_cmdhang[3] = '1';
+	cmdhangPutU32(s_cmdhang + 4,  addr);
+	cmdhangPutU32(s_cmdhang + 8,  size);
+	cmdhangPutU32(s_cmdhang + 12, dumped);
+	cmdhangPutU32(s_cmdhang + 16, frame);
+	if (q->entries && q->maxEntries && q->maxEntries <= 64) {
+		cmdhangPutU32(s_cmdhang + 20, q->maxEntries);
+		cmdhangPutU32(s_cmdhang + 24, q->numEntries);
+		cmdhangPutU32(s_cmdhang + 28, q->curEntry);
+		cmdhangPutU32(s_cmdhang + 32, q->lastEntry);
+	}
+	snprintf((char*)(s_cmdhang + 36), 36, "%s", BLOCKSMITH_VERSION);
+
+	memcpy(s_cmdhang + CMDHANG_HDR_BYTES, list, dumped);
+	watchdogWriteFile(CMDHANG_REL, s_cmdhang, CMDHANG_HDR_BYTES + dumped);
+}
+
 void gpuTestPostMortem(uint32_t frame)
 {
 	static bool done;
 	if (done) return;
 	done = true;
+
+	// FIX-METRICS, 2026-09-03. First thing, before anything else in this function can go
+	// wrong: get whatever frames.csv already has in RAM onto the card. frames.csv came back
+	// as 160 bytes -- the header and nothing else -- from both of steve's freeze reports,
+	// because metrics.c's writer thread only drains every CSV_WAKE_EVERY (64) frames or at a
+	// clean exit, and hang.txt measured only 29 frames drawn before this console froze. See
+	// metricsFlush()'s own comment in metrics.c for why this is safe to call from here, on the
+	// main thread, while metrics.c's writer thread may still be alive and running.
+	metricsFlush();
 
 	size_t len = 0;
 	len = app(s_post, sizeof(s_post), len,
@@ -959,7 +1060,7 @@ void gpuTestPostMortem(uint32_t frame)
 	          "frame        : %lu\n"
 	          "linear free  : %lu B\n"
 	          "vram free    : %lu B\n\n",
-	          BLOCKSMITH_VERSION, (long long)(BS_GPU_WEDGE_NS / 1000000),
+	          BLOCKSMITH_VERSION, (long long)(BS_GPU_WEDGE_TICKS / TICKS_PER_MS),
 	          (unsigned long)frame, (unsigned long)linearSpaceFree(),
 	          (unsigned long)vramSpaceFree());
 	len = queueLines(len, "queue at wedge");
@@ -996,6 +1097,10 @@ void gpuTestPostMortem(uint32_t frame)
 #endif
 	len = app(s_post, sizeof(s_post), len, "\nlist source  : %s\n", hang_from);
 	postFlush(len);
+
+	// The raw bytes, written before step 1 is attempted -- see dumpCmdHang()'s own comment above
+	// for why the order matters. Unconditional and silent on failure; see there for the rest.
+	dumpCmdHang(hang_src, hang_addr, hang_size, frame);
 
 	// -- Step 1. Is the GPU wedged, or is it only this list? ------------------------------------
 	//

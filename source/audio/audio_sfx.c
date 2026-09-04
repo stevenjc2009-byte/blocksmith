@@ -116,3 +116,14 @@ bool audioFootstepsUpdate(AudioFootsteps* f, float x, float y, float z, bool on_
 	audioPlayAt(audioSfxId(SFX_FOOTSTEP), AUDIO_PRIO_LOW, SFX_FOOTSTEP_GAIN, x, y, z);
 	return true;
 }
+
+// ── Mob damage ────────────────────────────────────────────────────────────────────
+
+AudioVoice audioSfxPlayMobDamage(bool killed, float x, float y, float z)
+{
+	// The slot choice is the whole policy this function exists to hold. audioSfxId of an
+	// unregistered slot is AUDIO_SOUND_NONE and audioPlayAt already refuses that (audio.c's
+	// sampleFor) -- nothing here has to special-case a missing clip.
+	const SfxSlot slot = killed ? SFX_DEATH : SFX_HURT;
+	return audioPlayAt(audioSfxId(slot), AUDIO_PRIO_HIGH, 1.0f, x, y, z);
+}

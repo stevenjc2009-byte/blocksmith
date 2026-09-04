@@ -422,3 +422,68 @@ Nothing under `source/`, `tests/`, or `tools/` was edited to produce this docume
   design work, not a wire-up.
 - **The server's own registry table and opcode handling** — matching updates,
   released before any client build carrying either (§7, §10 step 8).
+
+---
+
+## [2026-09-04 09:53] Corrections
+
+Found during a later verification pass (a SPEC-lane task to draft fresh 1.9.2/1.9.3
+specs, which discovered both already existed as this document and its 1.9.2 sibling).
+**Appended, not merged into the argument above — nothing above this heading was
+touched.** Same convention this document's own §7 already uses for a
+later-discovered fact.
+
+1. **§9's atlas figures are stale**, for the same reason as the redstone document's
+   own §6 — both were evidently written against an atlas that has since grown. §9
+   states "21 of 32 tile slots across the whole batch, 11 left over" and prices this
+   document's own six-tile ask against that 32-slot ceiling. The real atlas is
+   `ATLAS_W_PX` 16 × `ATLAS_H_PX` 1024 (`source/world/atlas_uv.h:48-49`
+   **[codebase]**), giving `ATLAS_TILE_SLOTS` = **64**
+   (`atlas_uv.h:76` **[codebase]**), of which `ATLAS_PAINTED_SLOTS` = 57 are painted
+   (`gfx/atlas_tiles.h` **[codebase]**: `TILE_USED_COUNT` = 48 block-face tiles plus
+   nine item-icon tiles at slots 48-56, `gfx/item_icons.h`), and slot 63 is
+   permanently reserved (`ATLAS_TILE_MISSING`, `atlas_uv.h:120` **[codebase]**).
+   That leaves **6** free tiles total, 57-62 — not 32, and not the 11-left-over this
+   document computes. The redstone document's own nine-tile ask (even after its
+   shared-texture reductions) already consumes most or all of those 6 slots by
+   itself; this document's additional six-tile ask for the fire and end dimensions
+   does **not** fit whatever the redstone document leaves behind, and the two
+   documents' tile budgets need to be re-priced together against the real 6-slot
+   ceiling, not assumed to coexist inside a 32-slot one that does not exist. This is
+   a real scope collision between the two documents in this batch, not a rounding
+   error.
+
+2. **A naming trap in the protocol header, worth flagging explicitly for whoever
+   designs the "way in" wire format (§7, §10 step 7).** `BS_CHUNK_DIM_SHIFT`, defined
+   in `deps/blocksmith-server/proto/bs_proto.h:419` **[codebase]**, is **chunk
+   size** — the shift that turns a block coordinate into a chunk coordinate — not
+   game "dimension" in the Nether/End sense this document uses that word for
+   throughout. Its own neighbouring comment (`bs_proto.h:418`) is unambiguous about
+   this once read closely, but the name alone reads exactly like the field this
+   document is designing around, and a skim while implementing §7's two new opcodes
+   could easily misattribute it as existing dimension-id plumbing that does not
+   actually exist. It doesn't: confirmed by direct read of `bs_proto.h:217-331`, the
+   `bs_app_msg` enum runs 0x01 through 0x0F with no dimension field anywhere in any
+   opcode's payload, and every chunk-addressing opcode (`CHUNK_SUB`, `CHUNK_DIFFS`,
+   `CHUNK_UNSUB`, `BLOCK_EDIT`, `WORLD_SYNC`) addresses a column as `(cx, cz)` only —
+   a two-axis key with no room for a third "which world" axis without widening the
+   payload. This matches and reinforces §7's own existing conclusion (two new
+   opcodes needed, `BS_APP_DIM_ENTER`/`BS_APP_DIM_SYNC`) rather than changing it —
+   recorded here because the mechanism by which a future reader might talk
+   themselves out of that conclusion (mistaking `BS_CHUNK_DIM_SHIFT` for prior art)
+   is real and worth naming directly.
+
+3. **Line-number citations in the body above are as of this document's own writing
+   date and were not re-verified in this pass**, except where corrected above. One
+   confirmed drift, found in passing: §0 cites `docs/ROADMAP.md:402-403` for the
+   version's one-line entry; as of 2026-09-04 that entry lives at
+   `docs/ROADMAP.md:470` ("## v1.9.3 — The other worlds"), with its "Added." line at
+   `:472` — roughly the same ~68-line shift the redstone document's sibling citation
+   shows, consistent with both documents predating the same `docs/ROADMAP.md`
+   renumbering pass. `docs/ROADMAP.md` is owned by another lane and was not
+   otherwise read for this correction. This document's own §7 `bs_proto.h` opcode
+   citations (`:217-331`) were independently re-verified during this pass and are
+   **still accurate** — no drift found there, stated for completeness rather than
+   left unaddressed. Re-grep every other citation before trusting it, the same
+   caution `plan-1.8.18-monsters.md` §2 states outright for a concurrently-edited
+   file.

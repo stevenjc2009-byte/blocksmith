@@ -1,0 +1,101 @@
+// The chest: passive item storage, no timer and no recipe of its own. v1.9.0 "Storage and
+// quality of life" — the block itself, not the crafting route into it (world/crafting.c's
+// own row is that, mirroring RECIPE_STONE_TO_FURNACE's reachability argument exactly).
+//
+// ── Where the state lives ──────────────────────────────────────────────────────────────
+//
+// The same table the furnace already uses (world/blockstate.h), not a second one. This is
+// "copy the furnace's shape" applied to the storage question specifically: blockstate.h is
+// already generalised to any stateful block keyed by (x, y, z), so a chest is one more block
+// id writing into the same 64-slot table rather than a table of its own. This file owns what
+// the 16 opaque bytes MEAN for a chest and nothing about where they are kept — the identical
+// split world/furnace.h documents for itself, for the identical reason.
+//
+// ── Why eight slots and not some other number ────────────────────────────────────────────
+//
+// BLOCKSTATE_PAYLOAD_BYTES is 16. A slot needs an ItemId (1 byte — ItemId IS BlockId, see
+// world/inventory.h) and a count (1 byte — INV_STACK_MAX is 99, fits a uint8_t), so one slot
+// costs exactly 2 bytes and 16 bytes hold exactly 8 of them with nothing left over and
+// nothing that would overflow the payload if a ninth were ever wanted. CHEST_SLOTS is
+// therefore not a balance number picked for gameplay reasons; it is what the existing
+// blockstate payload's own budget allows, the same way FURNACE_PAYLOAD_USED_BYTES (11) was
+// furnace.h's budget rather than a round number someone liked. It happens to equal
+// INV_HOTBAR_SLOTS (8) too — worth naming so a later reader does not go looking for a design
+// reason the two were made to match; they were not, they just both come out of an 8-bit
+// count field's natural size some other way.
+//
+// ── Why an array and not eight named fields ──────────────────────────────────────────────
+//
+// FurnaceState (world/furnace.h) names its three slots input/fuel/output because a furnace
+// enforces different rules per slot — only fuel accepts BLOCK_PLANKS, only input accepts a
+// smelting ingredient. A chest enforces no such rule: every slot accepts every item, and
+// nothing distinguishes slot 3 from slot 5 except which one the player tapped. Eight named
+// fields would invent a distinction the design does not have and would need a switch
+// anywhere the furnace gets one for free from having three different names; an array needs
+// only an index, which is what scene/ui.c's chest panel already has from a hit test.
+//
+// ── Why explicit pack/unpack and not a memcpy of the struct ────────────────────────────
+//
+// Identical reasoning to furnace.h's own header comment, restated rather than cross-
+// referenced because it is load-bearing here too: this codebase's ARM EABI build compiles
+// with -fshort-enums, which has already made a host sizeof() disagree with the console's
+// once (world/chunk.h's Chunk). blockStateGet/Set traffic only in
+// uint8_t[BLOCKSTATE_PAYLOAD_BYTES], never in a ChestState*, so chestStatePack/Unpack write
+// and read every slot by index at an explicit byte offset rather than trusting the compiler
+// to lay the struct out the same way on both targets.
+#pragma once
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "world/blockstate.h"
+#include "world/inventory.h"   // ItemId, INV_STACK_MAX
+
+// How many item slots a chest holds. See the file header for why this is 16 / 2 and not a
+// gameplay number.
+#define CHEST_SLOTS 8
+
+// One chest's live fields. NOT the wire/storage format — see chestStatePack/Unpack for that.
+// No x/y/z (blockstate.c already keys by position).
+typedef struct {
+	ItemId  item[CHEST_SLOTS];
+	uint8_t count[CHEST_SLOTS];
+} ChestState;
+
+// The struct's IN-MEMORY size is not the same question as the WIRE size below — see
+// furnace.h's identical assert for why both targets are checked rather than assumed. Every
+// field here is a fixed-width uint8_t-sized type with no enum in sight, so this holds with
+// room to spare (16 exactly, both arrays 8 bytes each with no padding), but it is asserted
+// rather than trusted because the struct's job is to fit the payload and nothing checks that
+// automatically if the struct ever grows a field.
+_Static_assert(sizeof(ChestState) <= BLOCKSTATE_PAYLOAD_BYTES,
+               "ChestState must fit inside blockstate.c's BLOCKSTATE_PAYLOAD_BYTES opaque "
+               "payload; it is never stored any other way");
+
+// The packed WIRE/storage layout, independent of the struct's in-memory layout above:
+//   [2*i]    slot i's item
+//   [2*i+1]  slot i's count
+// for i in 0..CHEST_SLOTS-1. Unlike furnace.c's 11-of-16 layout there is no reserved tail:
+// 8 slots at 2 bytes each is exactly 16, so every byte of the payload is spoken for and
+// chestStatePack has nothing left to zero.
+#define CHEST_PAYLOAD_USED_BYTES (CHEST_SLOTS * 2)   // 16
+_Static_assert(CHEST_PAYLOAD_USED_BYTES == BLOCKSTATE_PAYLOAD_BYTES,
+               "a chest slot is (item, count) = 2 bytes, and 8 of them is meant to use the "
+               "whole 16-byte payload with nothing reserved — if this ever goes false on "
+               "purpose, chestStatePack needs a zeroing pass for the newly-unused tail, the "
+               "same one furnaceStatePack already has");
+
+// Zeroes every slot to (ITEM_NONE, 0) — an empty chest. This is what blockStateCreate()
+// already hands back (an all-zero payload) unpacked, matching furnaceStateInit's own
+// comment: callers that place a chest by calling blockStateCreate() then immediately
+// packing a zeroed ChestState are being explicit about a fact that was already true.
+void chestStateInit(ChestState* cs);
+
+// Writes `cs` into all CHEST_PAYLOAD_USED_BYTES (== BLOCKSTATE_PAYLOAD_BYTES) of `out`.
+void chestStatePack(const ChestState* cs, uint8_t out[BLOCKSTATE_PAYLOAD_BYTES]);
+
+// The inverse: reads a ChestState back out of a BLOCKSTATE_PAYLOAD_BYTES buffer, as produced
+// by chestStatePack (or by blockStateCreate's zero-fill, which round-trips to an all-empty,
+// chestStateInit-equivalent ChestState — 0 unpacks to ITEM_NONE/0 for every slot since
+// ITEM_NONE is BLOCK_AIR is 0, the same fact furnace.h's own unpack comment relies on).
+void chestStateUnpack(ChestState* cs, const uint8_t in[BLOCKSTATE_PAYLOAD_BYTES]);

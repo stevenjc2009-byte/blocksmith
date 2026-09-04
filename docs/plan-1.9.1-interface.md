@@ -148,6 +148,16 @@ settled facts this document builds on directly:
   the reference's own taxonomy.
 - The existing bottom-screen budget: hotbar (`HOTBAR_Y=0`, 40px), main grid (`GRID_Y=40`, 80px),
   crafting panel (`CRAFT_Y=120`, 120px) (§4).
+- **Not stated explicitly by `ui-skin.md` but load-bearing for this version, worth stating once
+  here: a shipped Blocksmith CIA has no text console at all.** `BS_BOTTOM_UI` defaults to 1
+  (`source/gfx/screen.h:36-38`), and every diagnostic readout that depends on `!BS_BOTTOM_UI` —
+  `metricsDrawOverlay`, every plain `printf` — is compiled out of that build entirely
+  (`source/debug/metrics.c:470-472`, `source/app/watchdog.c:258-262`, both read directly, both
+  making the same point independently). Nothing in this version's design relies on a console —
+  every screen it touches or proposes already draws through `spriteQuad`/`fontDraw`, never
+  `printf` — but it is the reason this document treats "can the player read it" as a real GPU
+  drawing question with no fallback, not a nice-to-have: there is no text channel left to fall
+  back to if a drawn label is missed.
 - The proposed bar shape: d-pad left/right = category, up/down = list row, A = commit, B = back,
   touch = tap either axis directly (§5).
 - The block-list screen's reuse of the existing atlas/font with no new art (§6) — correct in its
@@ -305,6 +315,47 @@ so nobody has to.
 > resolve, since it is not caused by the stale block count this correction is scoped to fixing —
 > flagged for the owner, not fixed here.
 
+### 3.4 The atlas-slot cost of the category-bar icons — not costed anywhere until now
+
+`ui-skin.md` §9 proposes the one piece of genuinely new art this version needs — three (or two,
+per HIS CALL 3) small pictograms for Craft/Blocks/Inventory, drawn by a new
+`tools/make_ui_icons.py` — and costs it in **sprite quads** (§10, one icon quad each) but never
+in **atlas texture slots**, which is a different, harder-capped budget. Re-derived directly
+against `source/gfx/atlas_tiles.h` (read in full, not estimated):
+
+- The sheet is a fixed `16x1024` RGBA5551 strip, 64 addressable 16x16 slots, ids `0..63`
+  (`source/gfx/atlas.h:3-6`, `world/atlas_uv.h`'s `ATLAS_TILE_COUNT`).
+- `TILE_USED_COUNT` is **48** (`atlas_tiles.h:24-131`) — the block-face tile enum, ids `0..47`,
+  append-only, one slot per named `TILE_*`.
+- `ATLAS_PAINTED_SLOTS` is **57**, not 48 (`atlas_tiles.h:122-124, 141-155`) — nine slots above
+  `TILE_USED_COUNT` (`48..56`) are already claimed by v1.8.16's item icons (an apple, four raw
+  cuts, four cooked cuts, `source/gfx/item_icons.h`), painted but deliberately unnamed in the
+  block-face enum so a transparent item texel can never be sampled by the opaque terrain pass
+  (`atlas_tiles.h:141-152` explains why in full).
+- That leaves **six free slots, `57..62`** (`atlas_tiles.h:157-158`), plus slot `63`, which is
+  permanently reserved as `ATLAS_TILE_MISSING` (`world/atlas_uv.h`, `atlas_tiles.h:157,
+  168-177`) and cannot be claimed by anything.
+
+**So the category-bar icons cost 2 or 3 of the 6 remaining free slots (`57..62`)** — Craft,
+Blocks, and Inventory if HIS CALL 3 (§7) keeps Inventory as a real category; Craft and Blocks
+only if it does not. Either way this fits inside the sheet with no resize, and — because
+`ATLAS_TILE_COUNT=64` is the PICA200's own maximum texture dimension divided by the tile size
+(`atlas.h:6-7`, "1024 px is the PICA200's maximum texture dimension, so 64 is a permanent
+ceiling") — there is no larger sheet to grow into if a future version needs more than four
+free slots after this one spends two or three. **Worth flagging for the owner, not a blocker
+for this version:** after this version ships, `57..62` minus whatever this version claims is
+what remains for every future icon, cursor glyph, or HUD ornament this project ever adds; three
+icons (the worse case, if Inventory stays a category) leaves three slots, `60..62`, for
+everything after.
+
+`tools/make_ui_icons.py` would need to follow the two-step append-only discipline
+`atlas_tiles.h:13-21` states for every tile addition — paint the art first in its own commit,
+then name the slot — the same order `atlas_tiles.h:38-46`'s comment records for the v1.8.3
+Phase 3 tiles, and for the same reason: an unpainted named slot draws the magenta
+missing-texture marker on-screen, while an unnamed painted slot is simply never sampled until
+something names it. This document does not write that script; it only prices what it would
+cost.
+
 ---
 
 ## 4. Design — the bar, and the mockups
@@ -331,6 +382,26 @@ inventory/crafting overlay (`UI_SCR_HUD` vs `UI_SCR_INVENTORY`, `source/scene/ui
 opened and closed **by touch only** today — tapping `hudToggleRect()` (`y=40-72`,
 `ui_layout.h:58-59`) opens it, tapping `craftCloseRect()` closes it
 (`source/scene/ui.c:357-368`, read directly). **No button opens or closes it today at all.**
+
+> ⚠ CORRECTION [2026-09-04]: every line number in the paragraph above is stale. Re-read
+> directly against `HEAD` (`git show HEAD:source/scene/ui.c`, since `source/scene/ui.c` is
+> currently a dirty file under a different lane's edit and this document's own citations were
+> written against the committed tree, not that lane's in-progress one): `UI_SCR_HUD` is set at
+> `ui.c:764` (`uiInit`), `UI_SCR_INVENTORY` at `ui.c:797`, the `overlay_open` flag this whole
+> dispatch reads at `ui.c:805`. The actual touch dispatch is `uiUpdateDraw`, `ui.c:779-852`:
+> `hudToggleRect()`'s open branch is `ui.c:839-840`, `craftCloseRect()`'s close branch is
+> `ui.c:847-848` — not `352` and `357-368`, which sit inside an unrelated function
+> (`iconUv`'s atlas-UV comment block, three hundred-plus lines above the real logic). The
+> `y=40-72` figure itself is correct (`HUD_TOGGLE_Y=40`, `HUD_TOGGLE_H=32`,
+> `source/scene/ui_layout.h:80-81`, confirmed `40+32=72`) but its own citation
+> (`ui_layout.h:58-59`) is also stale — the real constants are at `ui_layout.h:80-81`, and the
+> two `URect`-returning functions themselves (`hudToggleRect`/`craftCloseRect`) are defined in
+> `source/scene/ui_layout.c:34-38` and `:22-27`, not in `ui.c` at all; `ui.c` only calls them.
+> This does not change anything this document concludes — the touch-only open/close gesture,
+> the y=40-72 band, and the "no button claims this today" finding are all still true — only the
+> file:line evidence pointing at them was wrong. Flagged rather than silently fixed, per this
+> project's own convention of correcting in place instead of rewriting history.
+
 Every other button is already spoken for: `KEY_SELECT` already toggles the pause menu
 (`main.c:4415`), `KEY_START` is already a quit/confirm key in several screens (`main.c:1733,
 3401, 4367`), and `KEY_A`/`KEY_X`/`KEY_Y` are Jump/Break/Place (§2.10 of the storage document).
@@ -366,6 +437,13 @@ y=240  +--------------------------------------------------------------+
 `RECIPE_COUNT=5` this is `(120-28)/5 = 18.4`, not the `23` `ui_layout.h`'s own comment states
 for `RECIPE_COUNT=4` — the constant self-adjusts by its own formula, per that file's comment,
 "so adding one costs no layout edit here"; **read in this codebase**, `ui_layout.h:51-56`.)
+
+> ⚠ CORRECTION [2026-09-04]: the line citation is stale — `CRAFT_ROW_H` is defined at
+> `source/scene/ui_layout.h:78` (`#define CRAFT_ROW_H ((CRAFT_H - CRAFT_CLOSE_H) /
+> RECIPE_COUNT) // (120-28)/5 = 18`), not `51-56`. The file's own comment already carries the
+> `RECIPE_COUNT=5` case, worded "18" (integer truncation) where this document's own arithmetic
+> gives `18.4` — the two are the same number, one truncated for the header comment's own
+> one-line style, the other left as a real quotient. No other part of this paragraph changes.
 
 > ⚠ CORRECTION [2026-09-03]: the `18.4` result is right, but "post-v1.8.18" is not why —
 > `RECIPE_COUNT` is already 5 today, before v1.8.18 or any chest lands (see §0's correction).
@@ -451,6 +529,54 @@ crafting-panel handlers (`scene/ui.c`) or to `blockListUiInput()`/`blockListBuil
 (`debug/blocklist.c`) depending on focus — a thin router, not a reimplementation of either
 screen's own logic. This keeps both of this version's constituent screens exactly as tested as
 they are today.
+
+### 4.5 Real, rendered mockups of §4.3's three ASCII layouts
+
+§4.3's three ASCII box diagrams are transcriptions of real pixel coordinates, not free
+sketches, so this pass rendered them as actual 320x240 PNGs rather than leaving them as text
+art — a box-drawing diagram is easy to misjudge the proportions of, and this project has an
+established finding that a plausible-looking, compiling change can still render as garbage on
+real hardware (`ui-skin.md`'s own "look at it, do not reason about it" standard for anything
+visual applies to a design mockup too, even a non-shipping one). Rendered with a small,
+deterministic, from-scratch Python script (no game asset, no borrowed font — a hand-rolled 3x5
+block font stands in for `gfx/font.c`'s real glyphs, since this is a design mockup, not an
+asset the game ships) under the scratchpad, not under `tools/`, since it produces no asset this
+version's own build depends on:
+
+- **Bar + Craft category** (§4.3's first diagram) — hotbar row, two-row main grid, the bar
+  strip with Craft focused, five craft rows below matching the corrected `RECIPE_COUNT=5`.
+  Looking at the rendered image: the bar reads as one continuous strip with a clearly
+  highlighted focused category, and the five recipe rows are legible at real 320-px width —
+  the layout does not look cramped at the real resolution, which an ASCII diagram cannot show
+  either way.
+- **Blocks category, full screen** (§4.3's second diagram) — re-rendered with the corrected
+  header (§3.3's correction: `"BLOCK LIST  43 blocks  page 1/3"`, not the stale `"28 blocks
+  page 1/2"` the original ASCII mockup still shows) and the real two-column, eight-row grid.
+  Looking at the rendered image: with no hotbar band reserved, the header and first sixteen
+  entries fill the screen edge to edge exactly as `blockListBuild()` would draw them — nothing
+  looks like it is missing a home.
+- **Inventory category** (§4.3's third diagram) — hotbar, grid, bar with Inventory focused, and
+  the empty region below the bar §4.3's own prose already flags as wasted space. Looking at the
+  rendered image, that emptiness is a real, visible problem, not just a description of one —
+  roughly 90 of the screen's 240 vertical pixels (`y=148..240`ish) render as dead space under
+  Inventory specifically, in a way the two other categories never show. This is the single
+  strongest visual argument, of the three mockups, for this document's own §4.3 proposal
+  (make Inventory the bar's default state rather than a third category) — seeing it costs
+  nothing an ASCII diagram would have made as obvious.
+
+All three colours were also checked against RGBA5551 (5/5/5/1-bit) quantisation, the format
+`gfx/atlas.t3s` actually builds to (`tools/make_atlas.py:28`, `"-f rgba5551 -z auto"`) — every
+one of the fifteen mockup palette colours (background, panel, focus highlight, two text
+weights, three icon stand-in colours, etc.) quantises to a distinct 5-bit value from every
+other; none of the tonal distinctions this mockup relies on (e.g. the focused-category
+highlight against the unfocused bar background, or the two text weights) collapse into each
+other at 5-bit depth. A visual side-by-side of the 8-bit and quantised renders looks
+unchanged at normal viewing size.
+
+These PNGs are scratchpad-only design mockups for review, not committed assets — they are not
+referenced by any file under `source/` or `tools/`, and this section exists so a later reader
+of this document knows they were produced and looked at, even though the files themselves do
+not travel with the repository.
 
 ---
 

@@ -327,6 +327,95 @@ static void testFallDamageHasNoFloor(void)
 	CHECK_I(dropAndGetHealth(64.0f, 42.0f, DRY_X, DRY_Z), 1);    /* drop 22, damage 19 */
 }
 
+/* ── 3b. survivalDamage() — v1.8.18's generic entry point for hostile mobs ─────────────
+ *
+ * The same "computed honestly" and "floors at 0, CAN kill" contract fall damage already
+ * carries (survival.h:94-106), reached from outside this file's own clock for the first
+ * time. Every check here is on the VALUE, mirroring testHurtCannotUnderflowHealth in
+ * entity/animal_test.c: `health -= damage` unclamped on a uint8_t is how a 2-hp hit for
+ * 4 becomes 254 and unkillable, and a check that only asked "is it dead" would not catch
+ * that the stored byte wrapped on the way there.
+ */
+static void testDamageBelowLethal(void)
+{
+	Survival s;
+	survivalInit(&s);
+	s.health = 20;
+
+	CHECK(!survivalDamage(&s, 6));
+	CHECK_I(s.health, 14);
+
+	/* A second, smaller hit stacks rather than resetting. */
+	CHECK(!survivalDamage(&s, 1));
+	CHECK_I(s.health, 13);
+}
+
+/* Damage equal to current health kills, and lands on exactly 0 — the >= vs > boundary,
+ * where the two operators disagree and a fencepost hides. */
+static void testDamageExactlyLethalLandsOnZero(void)
+{
+	Survival s;
+	survivalInit(&s);
+	s.health = 5;
+
+	CHECK(survivalDamage(&s, 5));
+	CHECK_I(s.health, 0);
+}
+
+/* Damage far past current health must clamp to 0, never wrap a uint8_t. 255 is the
+ * largest value the parameter carries at all. */
+static void testDamageCannotUnderflowHealth(void)
+{
+	Survival s;
+	survivalInit(&s);
+	s.health = 3;
+
+	CHECK(survivalDamage(&s, 255));
+	CHECK_I(s.health, 0);
+
+	/* The exact-boundary case again, one hp over. */
+	survivalInit(&s);
+	s.health = 4;
+	CHECK(survivalDamage(&s, 5));
+	CHECK_I(s.health, 0);
+}
+
+/* The "just died" edge fires exactly once, the same contract testDeathEdgeFiresOnce
+ * pins for fall damage — a caller hanging a death screen off the return value must not
+ * be told twice. */
+static void testDamageDeathEdgeFiresOnce(void)
+{
+	Survival s;
+	survivalInit(&s);
+	s.health = 4;
+
+	CHECK(survivalDamage(&s, 4));
+	CHECK_I(s.health, 0);
+
+	/* Hitting an already-dead player again reports nothing new. */
+	CHECK(!survivalDamage(&s, 4));
+	CHECK_I(s.health, 0);
+	CHECK(!survivalDamage(&s, 0));
+	CHECK_I(s.health, 0);
+}
+
+/* Zero damage is a defined no-op: health is unchanged and the call does not report a
+ * kill, even at 1 hp where a `>=` fencepost could floor it to 0 for free. */
+static void testDamageZeroIsANoop(void)
+{
+	Survival s;
+	survivalInit(&s);
+	s.health = 1;
+
+	CHECK(!survivalDamage(&s, 0));
+	CHECK_I(s.health, 1);
+}
+
+static void testDamageNullStoreIsRefused(void)
+{
+	CHECK(!survivalDamage(NULL, 5));
+}
+
 /* ── 4. the hunger clock ─────────────────────────────────────────────────────────────── */
 
 static void testHungerDrainsOnTheExactTick(void)
@@ -1073,6 +1162,13 @@ int main(void)
 	testTheSameFallOnLandIsLethal();
 	testDeathEdgeFiresOnce();
 	testFallDamageHasNoFloor();
+
+	testDamageBelowLethal();
+	testDamageExactlyLethalLandsOnZero();
+	testDamageCannotUnderflowHealth();
+	testDamageDeathEdgeFiresOnce();
+	testDamageZeroIsANoop();
+	testDamageNullStoreIsRefused();
 
 	testHungerDrainsOnTheExactTick();
 	testHungerFloorsAtZeroWithoutWrapping();

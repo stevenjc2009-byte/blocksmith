@@ -301,17 +301,18 @@ static void testShippedBranchRealWait(void)
 
 // ── 2. The wait precedes the mutators ────────────────────────────────────────────────────────
 
-#define GPUWAIT_CALL_NEEDLE   "gpuWaitPrevFrame();"
-#define GENFOLLOW_DEF_NEEDLE  "static void genFollow(float x, float z)"
-#define GENFOLLOW_CALL_NEEDLE "genFollow("
-#define GENDRAIN_DEF_NEEDLE   "static int genDrainMesh(float budget_ms, int max_chunks)"
-#define GENDRAIN_CALL_NEEDLE  "genDrainMesh("
-#define FIX_COMMENT_NEEDLE    "THE fix for the hardware freeze"
+#define GPUWAIT_CALL_NEEDLE     "gpuWaitPrevFrame();"
+#define GENFOLLOW_DEF_NEEDLE    "static void genFollow(float x, float z)"
+#define GENFOLLOW_CALL_NEEDLE   "genFollow("
+#define GENDRAIN_DEF_NEEDLE     "static int genDrainMesh(float budget_ms, int max_chunks)"
+#define GENDRAIN_CALL_NEEDLE    "genDrainMesh("
+#define CHUNKDRAIN_CALL_NEEDLE  "chunkRenderDrainDirty("
+#define FIX_COMMENT_NEEDLE      "THE fix for the hardware freeze"
 
 static void testWaitPrecedesMutators(void)
 {
-	puts("framesync guard: gpuWaitPrevFrame() runs before genFollow() and genDrainMesh() "
-	     "reassign/memcpy into mesh slots the GPU may still be reading");
+	puts("framesync guard: gpuWaitPrevFrame() runs before genFollow(), genDrainMesh(), and "
+	     "chunkRenderDrainDirty() reassign/memcpy into mesh slots the GPU may still be reading");
 
 	// `gpuWaitPrevFrame();` (a call, with empty parens) cannot match the definition's text
 	// `gpuWaitPrevFrame(void)`, so this needle is unambiguous by construction — unlike the two
@@ -357,6 +358,18 @@ static void testWaitPrecedesMutators(void)
 	CHECK(drain_call > 0,
 	      "found a genDrainMesh( call site distinct from its definition on L%d", drain_def);
 
+	// chunkRenderDrainDirty( has no definition in main.c to exclude — it's declared in
+	// chunk_render.h and defined in chunk_render.c — but it IS called many times during the
+	// loading screen (main.c ~L512-605), well above the main loop, for the same reason
+	// genDrainMesh's own loading-loop call (above) can never be mistaken for its main-loop
+	// call: the loading-loop calls are not the LAST occurrence in the file, so passing -1 (a
+	// line number no real match can equal) as the "exclude" argument and taking the last match
+	// lands unambiguously on the main loop's own call.
+	const int chunkdrain_call = lastLineWithExcluding(CHUNKDRAIN_CALL_NEEDLE, -1);
+	CHECK(chunkdrain_call > 0,
+	      "found a chunkRenderDrainDirty( call site (last occurrence in the file, expected to "
+	      "be the main loop's own call)");
+
 	if (follow_call > 0)
 		CHECK(wait_line < follow_call,
 		      "gpuWaitPrevFrame() (L%d) runs before genFollow()'s call (L%d) — genFollow "
@@ -368,6 +381,13 @@ static void testWaitPrecedesMutators(void)
 		      "gpuWaitPrevFrame() (L%d) runs before genDrainMesh()'s call (L%d) — that drain "
 		      "memcpy's freshly built geometry into vertex buffers the GPU may still be "
 		      "reading", wait_line, drain_call);
+
+	if (chunkdrain_call > 0)
+		CHECK(wait_line < chunkdrain_call,
+		      "gpuWaitPrevFrame() (L%d) runs before chunkRenderDrainDirty()'s call (L%d) — that "
+		      "drain reaches chunkRenderBuild() (chunk_render.c), which memcpy's freshly built "
+		      "geometry into vertex buffers the GPU may still be reading, exactly like "
+		      "genFollow and genDrainMesh", wait_line, chunkdrain_call);
 }
 
 // ── 3. Nothing emits GPU commands between the wait and the draw ─────────────────────────────

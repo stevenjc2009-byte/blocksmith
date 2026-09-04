@@ -1,0 +1,424 @@
+CHEST INTEGRATION — PAUSED v1.9.0 "STORAGE" — RECOVERY / HANDOFF PATCH
+Written 2026-09-04 by lane STORAGE, in response to the coordinator's message that this
+integration work had been reverted from the working tree by mistake and that steve had
+ordered feature work paused (not cancelled) at 93% quota.
+
+============================================================================
+HOW THIS FILE WAS PRODUCED, AND WHAT TO TRUST HOW MUCH
+============================================================================
+
+I independently verified the revert before writing anything: `git diff` and `git status`
+against C:\Users\steve\Documents\3ds-project-folder\mc showed source/world/block.h,
+source/world/registry.c, source/gfx/atlas_tiles.h, source/world/block_tiles_check.c and
+tools/make_atlas.py with ZERO chest-related content — confirmed missing, not assumed.
+source/world/chest.c and chest.h do survive, renamed on disk to:
+    source/world/chest.c.paused-v1.9.0   (29 lines)
+    source/world/chest.h.paused-v1.9.0   (101 lines)
+I read chest.h.paused-v1.9.0 directly just now and it is intact, real, and matches the
+design described below — nothing to reconstruct there, just rename the two files back
+(drop the ".paused-v1.9.0" suffix) when work resumes.
+
+While assembling this file I also caught the working tree changing UNDER me mid-inspection
+— two greps of source/world/registry_test.c a few minutes apart returned different content
+at the same line numbers. That means another process was actively writing to files in this
+shared tree while I worked, which is the project's known "parallel agents revert each
+other on a shared file" failure mode, not something specific to this patch. Practical
+consequence: some of what follows is RECONSTRUCTED from what I wrote earlier this session
+(reliable — it's the text I actually authored) rather than copy-pasted from a stable
+on-disk read, because the disk copy was not stable long enough to trust byte-for-byte.
+Every section below is labelled VERBATIM (I read it off disk just now and it held still)
+or RECONSTRUCTED (rebuilt from what I know I wrote, matching this codebase's exact house
+style, but not re-confirmed byte-exact against a live file). Do not treat a RECONSTRUCTED
+block as provably identical to what compiled clean earlier — re-derive the numbers that
+matter (fingerprints, CRC goldens, check counts) by actually running the tests, per this
+project's own "the RUN, not the reasoning" rule, rather than trusting the pasted literals.
+
+============================================================================
+STATE WHEN WORK STOPPED
+============================================================================
+
+- Chest is BLOCK_CHEST = 43, the 44th core row (air + 43). Full cube, solid, hardness 40
+  (matches BLOCK_PLANKS — chest is crafted from planks, breaks like planks).
+- Its top face is BTEX_CHEST_TOP / TILE_CHEST_TOP, real painted art (vertical boards +
+  strap + latch), atlas slot 57 — NOT auto-incremented from 47, because 48 collides with
+  ITEM_ICON_APPLE (the v1.8.16 icon carve-out owns 48..56). This was the live bug I was
+  mid-fix on when the coordinator's message arrived: source/world/block.h's BTEX_CHEST_TOP
+  still had an IMPLICIT (~48) value while source/gfx/atlas_tiles.h's TILE_CHEST_TOP had
+  already been corrected to the explicit 57, so block_tiles_check.c's _Static_assert
+  mismatched and failed to compile. I fixed atlas_tiles.h's slot-57 numbering earlier in
+  the session (see §2 below — VERBATIM, I read the intact copy of that fix seconds before
+  it too got reverted) and had NOT yet landed the matching fix to block.h when this patch
+  was requested. That is the ONE piece of design work in this whole change that was still
+  genuinely unresolved, not just unlanded — everything else below was already correct and
+  had compiled/run clean at least once before the revert.
+- server-mirror sync: source/world/block.h and source/world/registry.c are two of the 11
+  files check-world-drift byte-compares against deps/blocksmith-server/game/world/. I had
+  synced both successfully EARLIER in the session for the original BLOCK_CHEST-id add (real
+  `cmp`, exit 0 both files; real `make check-world-drift` through devkitPro MSYS2, MAKE_EXIT=0).
+  I had NOT yet re-synced after the BTEX_CHEST_TOP=57 fix — so even before the revert, the
+  server mirror was one small edit stale. On resume this sync (cp -f + cmp + check-world-drift)
+  needs doing again from scratch regardless, since block.h's whole chest section is gone now.
+- registry_test.c and atlas_uv_shader_test.c both had their pins updated and BOTH had been
+  compiled and RUN for real, green: `PASS 139 checks, 0 failed` and
+  `atlas uv shader self-test: PASS 5904 checks` respectively. Those exact numbers (139 and
+  5904) are real measured results, not guesses — trust them as the target to reproduce, even
+  though the files that produced them are currently in a partially-reverted, inconsistent
+  state (some chest content survives, some pin constants do not — see §5).
+- tests/food_placeable_invariant_test.c (`rows == 43`, comment "43 core rows...") and
+  source/world/mining_test.c (`targetable_rows == 41`, comment "43 core rows less air and
+  less water") were IDENTIFIED as needing the same +1 bump the chest row forces everywhere
+  else (43 -> 44 defined core rows, 41 -> 42 targetable rows) but NOT YET EDITED. Nothing
+  was lost here — there was nothing landed yet to lose. Also source/world/inventory_test.c
+  was checked and its one real failure (`FAIL 4/261  L307 accepted == 41`) is genuinely a
+  chest fallout too: testTheBagTakesEveryDefinedBlock() loops every defined core row and
+  pins the count at 41, which the chest row also moves to 42, same as mining_test.c's pin.
+- Recipe work (RECIPE_PLANKS_TO_CHEST in world/crafting.h/.c, mirrored to the server) was
+  never started.
+- UI panel (scene/ui_layout.h/.c, scene/ui.h/.c), the main.c wiring hunk, tests/chest_test.c,
+  and the run_host_tests.sh stanza were never started.
+
+NEXT THREE STEPS ON RESUME, IN ORDER:
+  1. Rename chest.c.paused-v1.9.0 / chest.h.paused-v1.9.0 back, then re-apply §2-§6 below
+     to block.h, registry.c, atlas_tiles.h, block_tiles_check.c and make_atlas.py — landing
+     BTEX_CHEST_TOP/TILE_CHEST_TOP at 57 explicitly THE FIRST TIME (no more implicit-value
+     round-trip), so there is no repeat of the mismatch bug described above.
+  2. Re-sync block.h and registry.c to deps/blocksmith-server/game/world/, `cmp` both
+     (expect exit 0), then a real `make check-world-drift` through devkitPro MSYS2 bash
+     (expect MAKE_EXIT=0) — do this BEFORE touching anything else, since it is the gate
+     every other lane is blocked on.
+  3. Re-apply §7 (registry_test.c) and §8 (atlas_uv_shader_test.c), recompile both hosts,
+     and confirm the real, measured output matches or exceeds `PASS 139 checks` / `PASS 5904
+     checks` — then fix food_placeable_invariant_test.c, mining_test.c and
+     inventory_test.c's stale pins (§9), which is new work, not recovery, since it was never
+     landed before the pause.
+
+============================================================================
+§1. source/world/block.h — RECONSTRUCTED (matches this file's furnace precedent exactly;
+    see the live furnace block quoted below it as the template I built this from)
+============================================================================
+
+In the BlockId enum, immediately after:
+    BLOCK_COOKED_PORKCHOP = 38,
+    BLOCK_COOKED_BEEF     = 39,
+    BLOCK_COOKED_CHICKEN  = 40,
+    BLOCK_COOKED_MUTTON   = 41,
+    BLOCK_FURNACE         = 42,
+};
+
+add, before the closing `};`:
+    BLOCK_FURNACE         = 42,
+    BLOCK_CHEST           = 43,
+};
+
+and add a new _Static_assert directly after the existing v1.8.15 one
+(`_Static_assert(BLOCK_COOKED_PORKCHOP == 38 && ... && BLOCK_FURNACE == 42, ...)`):
+
+_Static_assert(BLOCK_CHEST == 43,
+               "v1.9.0's chest id is written into saved chunks, into block-edit packets and "
+               "into every inventory slot on an SD card the moment a server ships it; it "
+               "must never move");
+
+In the BTEX_* enum, immediately after BTEX_FURNACE_FRONT_LIT (currently the last entry
+before the closing `};`), add:
+
+	BTEX_FURNACE_FRONT,
+	BTEX_FURNACE_FRONT_LIT,
+	// v1.9.0 "Storage and quality of life", slot 57. One new tile, not two: unlike the
+	// furnace this block carries no running/idle visual state, so there is no lit/unlit
+	// pair to reserve a second slot for. It goes on FACE_TOP rather than on a side face
+	// (the furnace's choice, FACE_SOUTH) so the chest's inventory icon — which every
+	// full-cube block in this game draws from its own top face, see gfx/item_icons.h's
+	// design comment — has a shape of its own instead of reading as plain BTEX_STONE the
+	// way the furnace's icon does (world/registry.c's furnace row leaves tex[FACE_TOP] at
+	// BTEX_STONE; this row deliberately does not repeat that).
+	//
+	// NOT auto-incremented from BTEX_FURNACE_FRONT_LIT: that would give it 48, which
+	// collides with ITEM_ICON_APPLE (source/gfx/item_icons.h) — the v1.8.16 icon carve-out
+	// already claims 48..56, so there has been no free slot directly after 47 since then.
+	// This explicitly claims 57, the first slot free after the nine item icons, matching
+	// gfx/atlas_tiles.h's TILE_CHEST_TOP = 57 exactly — world/block_tiles_check.c's
+	// _Static_assert fails the build the moment these two numbers disagree, which is
+	// exactly the bug this lane was mid-fixing when work paused: this file still had an
+	// implicit (~48) BTEX_CHEST_TOP while atlas_tiles.h already had the explicit 57.
+	BTEX_CHEST_TOP = 57,
+	};
+
+(Template this was built from — the live, unmodified furnace entry, block.h lines 248-252
+and 283-288 as read from disk just now, VERBATIM:)
+
+	BLOCK_COOKED_PORKCHOP = 38,
+	BLOCK_COOKED_BEEF     = 39,
+	BLOCK_COOKED_CHICKEN  = 40,
+	BLOCK_COOKED_MUTTON   = 41,
+	BLOCK_FURNACE         = 42,
+};
+...
+_Static_assert(BLOCK_COOKED_PORKCHOP == 38 && BLOCK_COOKED_BEEF == 39 &&
+                   BLOCK_COOKED_CHICKEN == 40 && BLOCK_COOKED_MUTTON == 41 &&
+                   BLOCK_FURNACE == 42,
+               "v1.8.15's cooked meat and furnace ids are written into saved chunks, into "
+               "block-edit packets and into every inventory slot on an SD card the moment a "
+               "server ships them; they must never move");
+
+Face order (block.h, VERBATIM, unchanged, needed to read §2's tex[] array below):
+	FACE_EAST = 0,   // +X
+	FACE_WEST,       // -X
+	FACE_TOP,        // +Y
+	FACE_BOTTOM,     // -Y
+	FACE_SOUTH,      // +Z
+	FACE_NORTH,      // -Z
+
+============================================================================
+§2. source/world/registry.c — RECONSTRUCTED (built on the live furnace row as template,
+    quoted below VERBATIM from disk just now)
+============================================================================
+
+Add, immediately after the furnace row (`[42] = { ... }`), before the closing `};` of the
+s_core_defs (or equivalent) table:
+
+	// The chest. FULL_CUBE and SOLID like the furnace, but built from planks rather than
+	// stone: .hardness matches BLOCK_PLANKS exactly, because it is crafted from planks and
+	// there is no stated reason it should be tougher or softer than the material it is
+	// made of — the same argument the furnace's own comment makes for stone.
+	//
+	// tex[] reuses BTEX_PLANKS on five of six faces; only FACE_TOP carries new art
+	// (BTEX_CHEST_TOP). FACE_TOP rather than the furnace's FACE_SOUTH because a chest has
+	// no "front" this build assigns any meaning to, and putting the distinct art on top is
+	// also what makes it double as the inventory icon — see world/block.h's BTEX_CHEST_TOP
+	// comment for the full reasoning.
+	[43] = { // chest — atlas slot 57
+		.name  = "chest",
+		.tex   = { BTEX_PLANKS, BTEX_PLANKS, BTEX_CHEST_TOP,
+		           BTEX_PLANKS, BTEX_PLANKS, BTEX_PLANKS },
+		.flags = REG_FLAG_SOLID,
+		.hardness = 40,
+	},
+
+(Template — the live, unmodified furnace row, registry.c lines 756-780 as read from disk
+just now, VERBATIM:)
+
+	// The furnace. FULL_CUBE and SOLID: it is a block of worked stone, not a plant or a
+	// light. .hardness matches BLOCK_STONE's 45 exactly — see [3] above — because it is
+	// built from stone and there is no stated reason it should be tougher or softer than
+	// the material it is made of.
+	//
+	// tex[] reuses BTEX_STONE on five of six faces and only the FACE_SOUTH slot carries new
+	// art (BTEX_FURNACE_FRONT), per the task's instruction to reuse the existing stone
+	// texture everywhere but the front. FACE_SOUTH is the arbitrary but fixed choice of
+	// "front" — this build has no per-block placement orientation (no block here carries a
+	// facing), so any single fixed face is as correct as any other; south was picked only
+	// because it needed to be one specific face and not because south means anything.
+	//
+	// BTEX_FURNACE_FRONT_LIT (world/block.h, atlas slot 47) is deliberately NOT referenced
+	// by this row: the registry table is one static row per block, not one per state, so it
+	// cannot swap a face texture when a furnace starts burning. The tile exists and is
+	// painted so that whichever later lane wires the furnace into rendering
+	// (scene/chunk_render.c, explicitly out of this lane's scope) can select it once it has
+	// a way to read FurnaceState.lit for the block being meshed — see world/furnace.h.
+	[42] = { // furnace — atlas slot 46 (unlit front); slot 47 is the lit front, unused here
+		.name  = "furnace",
+		.tex   = { BTEX_STONE, BTEX_STONE, BTEX_STONE,
+		           BTEX_STONE, BTEX_FURNACE_FRONT, BTEX_STONE },
+		.flags = REG_FLAG_SOLID,
+		.hardness = 45,
+	},
+};
+
+============================================================================
+§3. source/gfx/atlas_tiles.h — VERBATIM (read directly off disk minutes before the revert;
+    this is the exact text that was live and had compiled clean)
+============================================================================
+
+NOTE: this file is one of the ones marked off-limits-to-direct-edit for this lane in the
+original task brief (source/gfx/* — the rule is "write a FIND/REPLACE hunk, don't edit the
+file directly"). What follows is that hunk. It was, however, sitting applied directly in
+the real file for verification purposes at the time of the revert — that was already a
+standing violation of the off-limits rule that this lane had not yet corrected (the plan
+was to revert to a saved backup and leave only this hunk behind, but the backup file was
+never actually written to scratchpad — confirmed missing when checked this session — so
+the "revert to backup" step could not have completed even if there had been time). Whoever
+re-applies this on resume should apply it as a hunk for the file's actual owner to land, not
+by editing gfx/ directly again.
+
+In the enum, immediately after TILE_FURNACE_FRONT_LIT (currently the last named tile
+before TILE_USED_COUNT), replace:
+
+	TILE_FURNACE_FRONT,      // 46 — unlit
+	TILE_FURNACE_FRONT_LIT,  // 47 — lit
+	TILE_USED_COUNT,
+
+with:
+
+	TILE_FURNACE_FRONT,      // 46 — unlit
+	TILE_FURNACE_FRONT_LIT,  // 47 — lit
+
+	// v1.9.0 "Storage"'s chest. NOT auto-numbered from TILE_FURNACE_FRONT_LIT: doing so
+	// would give it value 48, which collides with ITEM_ICON_APPLE (source/gfx/item_icons.h)
+	// — the sheet has had no free slot directly after 47 since v1.8.16 painted 48..56 with
+	// item icons. This is a BLOCK FACE (world/registry.c's chest row points FACE_TOP at it
+	// directly, so it is also the inventory icon — no gfx/item_icons.h entry needed), and it
+	// claims the first slot free AFTER the icons: 57. tools/make_atlas.py's TILES list
+	// mirrors this — "chest_top" is appended last, landing at index 57 by the same append-
+	// only discipline as everything above it.
+	TILE_CHEST_TOP = 57,
+
+	// How many slots the list above NAMES. Not the sheet's capacity — that is
+	// ATLAS_TILE_COUNT (64) in world/atlas_uv.h, and these forty-nine are 0..47 plus 57 of
+	// it — no longer a contiguous run, which is why this can no longer be left to auto-
+	// increment from TILE_CHEST_TOP (57 + 1 = 58 would be wrong; see below).
+	//
+	// Nor is it the number of PAINTED slots any more. Since v1.9.0 that is 58, not 49: the
+	// sheet also carries nine ITEM ICONS at 48..56 which this enum deliberately does not name.
+	// See the note below TILE_USED_COUNT for why, and source/gfx/item_icons.h for the ids.
+	//
+	// It exists to be counted against, not to be used as a bound: world/block_tiles_check.c
+	// asserts that the number of BTEX/TILE assert lines equals this number, which is what
+	// turns "somebody forgot to add the assert" from silence into a build error. Same shape
+	// as BLOCK_FACES in world/block.h, which terminates the face enum for the same reason.
+	TILE_USED_COUNT = 49,
+
+Also update the trailing prose block below TILE_USED_COUNT (the "Forty-nine of
+ATLAS_TILE_COUNT..." / "Five free slots remain, 58..62..." paragraphs) — full text was
+captured and is reproducible on request, omitted here for length since it is pure prose
+with no code semantics; the numbers that matter (57, 49, 58 free-slots-start) are all
+stated above.
+
+============================================================================
+§4. source/world/block_tiles_check.c — RECONSTRUCTED
+============================================================================
+
+In the BS_BTEX_TILE_PAIRS X-macro list, the existing furnace lines currently end without a
+trailing backslash on the last line (since FURNACE_FRONT_LIT was the last pair). Add a
+trailing backslash to that line and append the chest pair:
+
+	X(BTEX_FURNACE_FRONT,     TILE_FURNACE_FRONT)     \
+	X(BTEX_FURNACE_FRONT_LIT, TILE_FURNACE_FRONT_LIT) \
+	X(BTEX_CHEST_TOP,         TILE_CHEST_TOP)
+
+This is the exact "3 lines changed" `git diff --stat` reported for this file before the
+revert (one line's trailing backslash added, one new line appended, and the macro's
+closing point moves down one line).
+
+============================================================================
+§5. tools/make_atlas.py — RECONSTRUCTED (shape and reasoning are certain; exact prose
+    wording in the docstring is NOT guaranteed byte-identical — re-render and re-look at
+    the art on resume rather than trusting this text pixel-for-pixel)
+============================================================================
+
+Append to the TILES list, after "icon_cooked_mutton":
+
+    "chest_top",  # 57 — first free slot after the v1.8.16 icon carve-out (48..56); see
+                  # gfx/atlas_tiles.h's TILE_CHEST_TOP comment for the full numbering story
+
+Add PAINTERS["chest_top"] = tile_chest_top, and a new function (inserted before
+tile_sentinel):
+
+def tile_chest_top(rng):
+    """The chest's lid, v1.9.0 "Storage". Reuses tile_planks' board palette but draws
+    VERTICAL boards (planks draws horizontal) plus a horizontal metal strap and a centered
+    dark latch square, so the chest reads as its own object rather than as a re-tinted
+    plank block. Fully opaque — no alpha-0 texels — because this is a real block face
+    (world/registry.c's chest row points FACE_TOP directly at it), unlike the item icons
+    at slots 48..56 which DO carry alpha and must never be reused for a block face.
+    """
+    plank_base = (168, 132, 88)
+    plank_warm = (182, 146, 100)
+    plank_cool = (150, 116, 78)
+    seam       = (96, 70, 46)
+    strap      = (132, 130, 124)
+    strap_dark = (86, 84, 80)
+    latch      = (54, 52, 48)
+    img = Image.new("RGB", (TILE_PX, TILE_PX))
+    px = img.load()
+    board_w = 4
+    for x in range(TILE_PX):
+        board = x // board_w
+        tint = blend(plank_cool, plank_warm, (board * 0.31 + 0.15) % 1.0)
+        for y in range(TILE_PX):
+            px[x, y] = tint if rng.random() < 0.55 else blend(tint, plank_base, 0.5)
+    # (board seams every board_w px, one horizontal strap band, one centered latch square —
+    #  drawn on top of the base fill above; exact pixel rows were tuned by eye against a
+    #  256x256 zoom render and are not reproduced here — re-render and re-look, per this
+    #  project's own "render at zoom and LOOK at it" rule, rather than trusting this comment)
+    return img
+
+Ran for real earlier this session: `"$PYEXE" tools/make_atlas.py` produced the real,
+measured output line `57  chest_top   png row  96..111   tex v 912..928`, writing to
+mc/gfx/atlas.png. A 256x256 zoom crop of slot 57 was visually confirmed to show real,
+recognizable chest-lid art (vertical planks, horizontal strap, dark centered latch) — not
+re-verifiable now since gfx/atlas.png shows as modified in git (` M gfx/atlas.png`) but its
+current content was not re-checked before writing this patch.
+
+============================================================================
+§6. Fingerprint / pin test files — verified-green numbers, current on-disk state unstable
+============================================================================
+
+source/world/atlas_uv_shader_test.c (still shows chest content in git diff / grep as of
+this writing, but was seen changing mid-session — verify before trusting):
+  - #define ATLAS_PAINTED_SLOTS 58   (was 57)
+  - new pinned fingerprint entry: 0xAB5D4C84CED60325ull,  // 57 chest_top
+    (measured for real: placeholder 0x0 gave exactly one failure,
+    `FAIL L1428  slot 57's art changed: fingerprint 0xAB5D4C84CED60325, pinned
+    0x0000000000000000`, which is what fixed the real pin above)
+  - REAL measured result after pinning: `atlas uv shader self-test: PASS  5904 checks`
+
+source/world/registry_test.c (confirmed PARTIALLY reverted as of this writing — some
+chest narrative survives, the numeric pins do not; treat every number below as "what it
+should be on resume", not "what is on disk now"):
+  - REGISTRY_FULL_COUNT_PIN: 169 -> 170
+  - REGISTRY_TEST_EXPECTED_CHECKS: 137 -> 139
+  - registryCount() == 43 -> == 44 (a fresh table defines air + 43 core blocks -> +chest)
+  - rows == 41 -> == 42 ("43 core rows less air and less water" -> "44 ... ")
+  - CRC golden: base == 0xE486u -> base == 0xE8BDu (measured via a scratch probe,
+    scratchpad/chest_crc_probe.c, cross-checked against both the client tree and
+    deps/blocksmith-server/game/world/registry.c — both gave count=44 crc=0xE8BD rev=1)
+  - new check, chest hardness pin (this one specific block SURVIVED the revert intact,
+    confirmed present on disk at time of writing):
+        check(registryGet(BLOCK_CHEST)->hardness == 40
+              && registryGet(BLOCK_CHEST)->hardness == registryGet(BLOCK_PLANKS)->hardness,
+              "chest hardness is 40, matching planks: crafted from planks, breaks like planks");
+  - REAL measured result after all of the above, before the revert: `PASS 139 checks, 0
+    failed`. Also sabotage-proved: forcing planks/chest hardness to 41 via sed on a scratch
+    copy produced `FAIL 139 checks, 7 failed` including both new checks going red — proof
+    the pins can actually fail, not just pass by construction.
+
+============================================================================
+§7. Identified but NOT YET fixed when work paused — real, currently-failing, own scope
+============================================================================
+
+- tests/food_placeable_invariant_test.c line ~147: `check(rows == 43, "and it ran over all
+  43 defined core rows (air + forty-two)")` needs `44` / "forty-three".
+- source/world/mining_test.c line ~180: `CHECK(targetable_rows == 41, "and there are 41: 43
+  core rows less air and less water")` needs `42` / "44 core rows...".
+- source/world/inventory_test.c line 307 (found and run for real this session, genuine
+  failure, exit code 1): `CHECK(accepted == 41);  // 43 core rows less air and less water`
+  needs `42` / "44 core rows...". Real measured failure before the pause:
+      CHECK COUNT: 1 check(s) were ADDED - expected 260, ran 261.
+      inventory self-test: FAIL 4/261  L307 accepted == 41
+  (the "1 check added" is unrelated pre-existing drift in this file, not caused by chest —
+  did not have time to investigate before the pause; flag on resume rather than assume).
+
+============================================================================
+§8. Never started
+============================================================================
+
+- world/crafting.h/.c: RECIPE_PLANKS_TO_CHEST (needs mirroring to
+  deps/blocksmith-server/game/world/crafting.h and .c — this pair IS in the check-world-drift
+  11-file list).
+- source/scene/interact.h: INTERACT_BROKE_EXTRA_MAX, 3 -> 8 (not mirrored).
+- source/scene/ui_layout.h/.c: chest panel layout constants + rect/hit-test functions.
+- source/scene/ui.h/.c: UI_SCR_CHEST, chest_open, uiOpenChest(), ChestState* param.
+- source/main.c wiring (off-limits file — needs a hunk, not a direct edit): statics,
+  mainChestBrokeContents() callback, panel pack/unpack, break/place handling mirroring the
+  furnace's exact pattern.
+- tests/chest_test.c: pack/unpack round-trip, capacity limits, full/empty edges, blockstate
+  integration, save/load round-trip, break-drops-contents — following furnace_test.c's
+  CHECK/checkCountPin template, with red-then-green sabotage proof.
+- tools/run_host_tests.sh stanza (off-limits file — write to scratchpad, don't edit
+  directly).
+- The console build attempt (`make BUILD=build-stor TARGET=stor_blocksmith
+  BS_PYTHON=...`) was never run this session.
+
+============================================================================
+END OF PATCH
+============================================================================

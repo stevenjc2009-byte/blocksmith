@@ -25,18 +25,49 @@
 #define ENT_KIND_COW      2
 #define ENT_KIND_CHICKEN  3
 #define ENT_KIND_SHEEP    4
-#define ENT_KIND_COUNT    5   /* one past the last animal kind */
+#define ENT_KIND_COUNT    5   /* one past the last ANIMAL kind — zombie/skeleton stay outside */
+#define ENT_KIND_ZOMBIE   5   /* reserved id, claimed by v1.8.18 MON-BUILD for the model only —
+                                  see the _Static_assert below and animal.h's own copy */
+#define ENT_KIND_SKELETON 6
 #endif
 
-// entitymodel.h's kEmBoxes is indexed 0..3 in the id order below, and nothing in this file
-// re-derives that mapping — kindFirst() is (kind - ENT_KIND_PIG). If a fifth animal is
-// appended, or the ids are ever renumbered, this is what stops the build instead of
-// silently drawing a sheep where a cow should be.
-_Static_assert(EM_KINDS == ENT_KIND_COUNT - ENT_KIND_PIG,
-               "entitymodel.h's EM_KINDS must equal the number of animal kind ids");
+// entitymodel.h's kEmBoxes is indexed 0..EM_KINDS-1 in the id order below, and nothing in this
+// file re-derives that mapping — kindFirst() is (kind - ENT_KIND_PIG). If a kind is appended,
+// or the ids are ever renumbered, this is what stops the build instead of silently drawing a
+// sheep where a cow should be.
+//
+// v1.8.18 MON-BUILD: this is now EM_KINDS wide, not ENT_KIND_COUNT - ENT_KIND_PIG. Those two
+// used to be the same number by construction (four animal ids, four models) but are not
+// anymore: ENT_KIND_COUNT is animal.h's "one past the last ANIMAL kind" and stays 5 on
+// purpose, so animalDef() keeps returning NULL for the zombie and skeleton — see animal.h's
+// reservation comment and docs/plan-1.8.18-monsters.md §3.1, which forbids widening it ("that
+// would mean animalDef() must return rows for 5/6/7, which breaks the pinned test that is
+// currently the only thing enforcing the kind reservation"). EM_KINDS is "one past the last
+// kind with a MODEL" instead, which is a real six now that the zombie and skeleton have boxes.
+// The second assert is the one that still ties EM_KINDS to the actual ids, so a renumber of
+// either range is still caught here rather than silently drawing the wrong model.
+_Static_assert(EM_KINDS == ENT_KIND_SKELETON - ENT_KIND_PIG + 1,
+               "entitymodel.h's EM_KINDS must equal the number of kinds with a model "
+               "(pig..skeleton), not the number of animal kind ids");
 _Static_assert(ENT_KIND_COW == ENT_KIND_PIG + 1 && ENT_KIND_CHICKEN == ENT_KIND_PIG + 2
-               && ENT_KIND_SHEEP == ENT_KIND_PIG + 3,
-               "kEmBoxes is in pig, cow, chicken, sheep order and is indexed by id offset");
+               && ENT_KIND_SHEEP == ENT_KIND_PIG + 3 && ENT_KIND_ZOMBIE == ENT_KIND_PIG + 4
+               && ENT_KIND_SKELETON == ENT_KIND_PIG + 5,
+               "kEmBoxes is in pig, cow, chicken, sheep, zombie, skeleton order and is "
+               "indexed by id offset");
+// The invariant the paragraph above depends on, spelled out so a future edit to either
+// constant trips it immediately rather than quietly reviving a wander-AI zombie: the model
+// range starts exactly where the animal range ends, so animalDef()'s "kind >= ENT_KIND_COUNT
+// -> NULL" bound still excludes every kind this file knows how to draw.
+_Static_assert(ENT_KIND_ZOMBIE >= ENT_KIND_COUNT,
+               "monster kinds must stay outside animal.h's animal range (ENT_KIND_COUNT) so "
+               "animalDef() keeps answering NULL for them — see plan-1.8.18-monsters.md §3.1");
+
+// One past the last kind this file can DRAW — deliberately not animal.h's ENT_KIND_COUNT (see
+// above). Used only by the world-entity draw loop below, which cares "does this kind have a
+// model", not "is this kind an animal"; those are different questions once monster kinds
+// exist. Local to this file because the model-vs-animal split is a rendering concern, not
+// something entitymodel.h or animal.h should have an opinion about.
+#define EM_KIND_COUNT (ENT_KIND_PIG + EM_KINDS)
 
 // ── the flat-colour fallback ─────────────────────────────────────────────────────────────
 //
@@ -49,10 +80,12 @@ _Static_assert(ENT_KIND_COW == ENT_KIND_PIG + 1 && ENT_KIND_CHICKEN == ENT_KIND_
 // failed texture obvious at a glance (flat, unshaded, plainly wrong) rather than to
 // impersonate the real art badly enough that nobody notices the sheet is missing.
 static const uint32_t kFlatColour[EM_KINDS] = {
-	/* pig     */ SPRITE_RGBA(223, 143, 156, 255),
-	/* cow     */ SPRITE_RGBA(236, 232, 222, 255),
-	/* chicken */ SPRITE_RGBA(241, 237, 221, 255),
-	/* sheep   */ SPRITE_RGBA(229, 225, 217, 255),
+	/* pig      */ SPRITE_RGBA(223, 143, 156, 255),
+	/* cow      */ SPRITE_RGBA(236, 232, 222, 255),
+	/* chicken  */ SPRITE_RGBA(241, 237, 221, 255),
+	/* sheep    */ SPRITE_RGBA(229, 225, 217, 255),
+	/* zombie   */ SPRITE_RGBA(107, 142, 96, 255),
+	/* skeleton */ SPRITE_RGBA(214, 209, 190, 255),
 };
 
 static DVLB_s*         s_dvlb;
@@ -194,8 +227,9 @@ bool entityModelInit(void)
 	// a stronger version of its reason: the animal pass binds its own shader and its own
 	// texture unit state anyway, the block sheet's slots are 16 px square and an animal net is
 	// 60 px wide, and folding this in would mean sampling two regions of one sheet from a
-	// shader that has one layout. 128x128 at RGBA5551 is 32,768 bytes of VRAM — computed from
-	// the sheet, not measured on-device.
+	// shader that has one layout. 256x128 at RGBA5551 is 65,536 bytes of VRAM (up from
+	// 32,768 at 128x128 before v1.8.18 MON-BUILD added the zombie and skeleton quadrants) —
+	// computed from the sheet, not measured on-device.
 	//
 	// vram = true, same as the world atlas and the crack sheet: texture reads out of VRAM are
 	// the cheap ones on this GPU.
@@ -393,8 +427,13 @@ void entityModelDraw(const C3D_Mtx* view, const EntityWorld* ew)
 		const Entity* e = entityGet(ew, i);
 		if (!e)
 			continue;
-		if (e->kind < ENT_KIND_PIG || e->kind >= ENT_KIND_COUNT)
-			continue;   // not an animal — v1.8.16's problem, not this file's
+		if (e->kind < ENT_KIND_PIG || e->kind >= EM_KIND_COUNT)
+			continue;   // no model for this kind. Deliberately EM_KIND_COUNT, not animal.h's
+			            // ENT_KIND_COUNT — this file draws anything it has a box table for
+			            // (pig..skeleton), whether or not animal.h's animal-only range
+			            // considers it an animal. Spawning, AI and combat for the zombie and
+			            // skeleton are the entity-logic lane's — this file just stops being
+			            // blind to them once they exist in the world.
 
 		const float dx = e->body.x - cam_x;
 		const float dz = e->body.z - cam_z;

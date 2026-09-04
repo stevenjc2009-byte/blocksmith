@@ -158,6 +158,24 @@ bool fallDamageUpdate(FallTrack* ft, Survival* s, const Body* body, const World*
 	return s->health == 0;
 }
 
+// ── generic damage ─────────────────────────────────────────────────────────────────────
+//
+// v1.8.18. The three lines are deliberately the same shape as fallDamageUpdate()'s tail
+// above — "capture before, floor-and-can-kill, report honestly" — because that is already
+// the right contract for damage a monster deals; there was no reason to invent a second one.
+bool survivalDamage(Survival* s, uint8_t amount)
+{
+	if (!s) return false;
+
+	const uint8_t before = s->health;
+	if (before == 0) return false;   // already dead; do not re-report
+
+	// CAN kill — floors at 0, not at 1. The opposite of starvation, same as fall damage.
+	s->health = (amount >= before) ? 0 : (uint8_t)(before - amount);
+
+	return s->health == 0;
+}
+
 // ── food ───────────────────────────────────────────────────────────────────────────────
 
 // The whole food table. v1.8.14's meat and v1.8.15's cooked meat are one row each and touch

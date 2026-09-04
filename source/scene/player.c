@@ -3,6 +3,8 @@
 #include <math.h>
 
 #include "app/input_map.h"
+#include "audio/audio.h"
+#include "audio/audio_sfx.h"
 #include "gfx/particles.h"
 
 // The largest tick the physics is ever handed, in seconds. Nothing in a steady frame
@@ -133,8 +135,11 @@ void playerUpdate(Player* p, const World* w, float dt_ms)
 	// below the waterline, so the splash spawned underwater instead of at the plane it was
 	// supposed to mark. waterSurfaceY walks up from the feet to find that plane -- see its
 	// own comment above.
-	if (prev_wet == BODY_DRY && wet != BODY_DRY)
+	if (prev_wet == BODY_DRY && wet != BODY_DRY) {
 		particlesSpawnSplash(p->body.x, waterSurfaceY(w, &p->body), p->body.z, p->body.vy);
+		audioPlayAt(audioSfxId(SFX_SPLASH), AUDIO_PRIO_NORMAL, 1.0f,
+		            p->body.x, waterSurfaceY(w, &p->body), p->body.z);
+	}
 
 	// v1.8.17 WATER-FX task 2 -- the exit splash. The exact mirror of the entry check above:
 	// prev_wet is last frame's (stale-by-one-move) answer and `wet` is this frame's fresh one
@@ -159,8 +164,11 @@ void playerUpdate(Player* p, const World* w, float dt_ms)
 	// waterSurfaceY here is close to a no-op (the feet are already at or above the plane the
 	// instant this fires -- see its own comment), which is exactly right: this is not a
 	// second search, it is the same one function agreeing with itself at a different moment.
-	if (prev_wet == BODY_SURFACE && wet == BODY_DRY)
+	if (prev_wet == BODY_SURFACE && wet == BODY_DRY) {
 		particlesSpawnSplash(p->body.x, waterSurfaceY(w, &p->body), p->body.z, p->body.vy);
+		audioPlayAt(audioSfxId(SFX_SPLASH), AUDIO_PRIO_NORMAL, 1.0f,
+		            p->body.x, waterSurfaceY(w, &p->body), p->body.z);
+	}
 
 	// Step 8.4. The four directions come from the player's bindings rather than from KEY_DUP
 	// and friends directly. app/input_map.c answers with exactly those defaults until an

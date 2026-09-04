@@ -14,6 +14,20 @@ Two rules run through the whole ladder:
 
 ---
 
+> **[2026-09-04 11:20] Feature work is PAUSED, not cancelled.** steve reached 93% of his
+> usage quota and directed the remaining budget at the v1.8.17 boot freeze, so that a
+> functional build can ship. Every feature stopped mid-flight — chests and storage, the
+> multiplayer sync audit, tool tiers, coal-as-fuel — is recorded with its exact state and
+> its next concrete step in **[PAUSED-WORK.md](PAUSED-WORK.md)**. Read that file first
+> when work resumes after the quota reset; it exists so nothing has to be re-derived.
+>
+> Also recorded there: three measured documentation defects not yet corrected (including
+> one in this file's own v1.8.18 entry, which still claims cave-gated monster spawning
+> that no code implements), and the atlas-slot ceiling — only slots 57–62 remain, while
+> the redstone and dimensions plans together ask for fifteen.
+
+---
+
 ## v1.8.4 — New 3DS ✅ released
 
 **Added.** The 804 MHz clock and the L2 cache are asked for at boot. The title's

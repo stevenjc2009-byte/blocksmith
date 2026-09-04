@@ -1113,7 +1113,12 @@ static TitleResult drawUpdate(TitleState* ts, const TitleInput* in, bool tap)
 		const char* msg = updaterMessage();
 		if (msg[0] != '\0') {
 			fontDraw(10, y, 1, (st == UPDATE_FAILED) ? COL_WARN : COL_TEXT, msg);
-			y += FONT_LINE;
+			// v1.8.19: updaterMessage() can now come back multi-line (see updater.c's
+			// runCheck()/runInstall() failure strings) -- advance by however many lines
+			// fontDraw actually drew, not a flat one, or the widgets below overlap it.
+			int lines = 1;
+			for (const char* p = msg; *p; p++) if (*p == '\n') lines++;
+			y += FONT_LINE * lines;
 		}
 
 		const int pct = updaterProgress();

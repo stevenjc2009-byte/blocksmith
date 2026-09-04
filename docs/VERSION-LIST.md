@@ -8,12 +8,20 @@ and, for most versions from v1.8.7 onward, in that version's own `docs/plan-*.md
 (for example `docs/plan-1.8.11-caves.md`); run `ls docs/plan-*.md` for the current set,
 which now covers nearly every version through v1.9.1.
 
-**Newest published version: 1.8.16** (released 2026-09-03; the `releases/latest` redirect
-was followed and resolves to `v1.8.16`, and the published `blocksmith1.8.16.cia` was
-downloaded and md5-matched against the built artefact at `07937de620b5b1d7701b2b1567fb417e` —
-1,360,832 bytes, `cmp` reporting byte-identical).
-Everything from `v0.1.0` up to and including `v1.8.16` is released and published on GitHub.
-Everything after `v1.8.16` is a plan, not a build; order, scope, and whether a given version
+**Newest published version: 1.8.17** (released 2026-09-03; tag `v1.8.17`, `whatsnew1.8.17.txt`
+and `CHANGELOG.md`'s `[1.8.17]` entry all agree, and steve has installed and run it on his own
+console). Unlike the v1.8.16 line below, the `releases/latest` redirect has **not** been
+re-followed for v1.8.17 and the published `.cia` has **not** been downloaded and md5-matched
+against the built artefact — say so rather than implying a verification that was not done.
+
+The previous entry, kept because its verification really was performed: **1.8.16** (released
+2026-09-03; the `releases/latest` redirect was followed and resolved to `v1.8.16`, and the
+published `blocksmith1.8.16.cia` was downloaded and md5-matched against the built artefact at
+`07937de620b5b1d7701b2b1567fb417e` — 1,360,832 bytes, `cmp` reporting byte-identical).
+
+Everything from `v0.1.0` up to and including `v1.8.17` is released and published on GitHub.
+`v1.8.18` is the branch currently checked out and is a build in progress, not a release.
+Everything after `v1.8.18` is a plan, not a build; order, scope, and whether a given version
 ships at all can still change before it does.
 
 That parenthetical is deliberately about the *redirect* and not about the GitHub API. The
@@ -542,10 +550,34 @@ into further tunnels, which is what produces a branching network rather than a l
 corridor. Ravines reuse the same walked-path machinery with different tuning — far less
 drift, roughly straight, about ten times rarer, no branching.
 
-**Added.** Lava pools below a fixed floor of y=10 (this threshold needs no rescaling for
-Blocksmith's world — the classic era it comes from was already 128 blocks tall with sea
-level one block off from Blocksmith's own), and underground water via a straightforward
-flood-to-water-table rule reusing the fluid simulation that already exists.
+**[2026-09-04] Correction — ravines did NOT ship in v1.8.11.** The paragraph above
+describes the ravine tuning as though it were built. It was not. `grep -rin "ravine"
+source/` returns only comments: `world/cave_carve.h:23`, `world/visgraph.h:26`, and
+`world/worldgen.h:204`. No carver ever emits one. The walked-tunnel description above is
+accurate and did ship; the ravine sentence is design intent that was never implemented.
+
+**[2026-09-04] Correction — lava pools and underground water did NOT ship either.** The
+paragraph that stood here claimed both were added in v1.8.11. Neither exists.
+`source/world/cave_carve.h:22-26` says so in its own words, verbatim: *"**Out of scope,
+deliberately (build order step 8 and later, not implemented here).** Lava, ravines, water,
+and the determinism/two-lane suite coverage that would normally close out this feature per
+the plan's own step 11. Lava needs a new BLOCK_LAVA id, which moves the registry CRC and
+forces a coordinated server release."* `grep -rn "BLOCK_LAVA" source/` matches only that
+comment — there is no such block id (red control: `BLOCK_WATER` returns 4 hits in
+`world/block.h`, so the grep is not blind). `CHANGELOG.md`'s own `[1.8.11]` entry, which is
+the authoritative per-release record, never mentioned any of the three.
+
+The original text is preserved below, struck through, so the design intent is not lost:
+
+> ~~**Added.** Lava pools below a fixed floor of y=10 (this threshold needs no rescaling for
+> Blocksmith's world — the classic era it comes from was already 128 blocks tall with sea
+> level one block off from Blocksmith's own), and underground water via a straightforward
+> flood-to-water-table rule reusing the fluid simulation that already exists.~~
+
+Lava is the expensive one of the three: it needs a new `BLOCK_LAVA` id, and because
+`world/block.h` and `world/registry.c` are byte-mirrored into the server repo and gated by
+`check-world-drift`, adding it forces a coordinated client **and** server release. That is
+why it was deferred, and it remains deferred.
 
 *A real architectural note, not a console difference:* Blocksmith's current cave
 generator (`worldgenIsCave()`) is a pure noise field, answerable from one block's own
@@ -806,15 +838,23 @@ published as a GitHub Release, and scope, order, and even whether a given versio
 all can still change. Where a version has a dedicated research brief or plan document
 beyond `ROADMAP.md`'s own entry, that is named so the deeper detail can be found.
 
-### v1.8.17 — New 3DS, and the freeze — in release prep, not yet published
+### v1.8.17 — New 3DS, and the freeze — released and published
 
-**Landed on the `v1.8.17` branch, not yet tagged, built, or published.** A New 3DS froze
-solid — HOME included — the instant a new world was created on v1.8.16, and this version
-exists first and foremost to put a build with the freeze review's findings in front of that
-console, because nothing about them can be confirmed any other way. Two real bugs were found
-in the process and are fixed below; neither is proven to be *the* freeze. This entry will be
-revised once real hardware has actually run this build — see `CHANGELOG.md`'s `[1.8.17]` entry
-for the full detail behind every line here.
+**Tagged `v1.8.17`, built, published, and installed and run by steve on his own console.**
+A New 3DS froze solid — HOME included — the instant a new world was created on v1.8.16, and
+this version existed first and foremost to put a build with the freeze review's findings in
+front of that console, because nothing about them could be confirmed any other way. Two real
+bugs were found in the process and are fixed below; neither was proven to be *the* freeze.
+
+**The freeze is NOT fixed, and this entry is the revision that was promised above.** steve
+installed v1.8.17 and it froze **identically to v1.8.16** — same way, same time, same point in
+the boot. The three fixes below are all genuine defects and all stay; none of them was the
+cause. Do not read this section as "the freeze was addressed in v1.8.17" — it was not, and the
+commit that claimed to fix it is disproven by a real hardware run. See `CHANGELOG.md`'s
+`[1.8.17]` entry for the full detail behind every line here.
+
+What v1.8.17 *did* buy was evidence: it added the boot stage probe, and all fourteen of its
+markers fired on the freezing console, which is how the search was narrowed afterwards.
 
 **Fixed — a chunk-draw safety guard was dead code, and silently unbuildable, from v1.8.5
 through v1.8.16.** It referenced a variable name the v1.8.5 pool-sizing rewrite deleted;
@@ -864,13 +904,30 @@ materials list v1.8.8 otherwise completed.
 built once per mesh rather than read cell by cell. Output is unchanged; the shipped code
 measures slightly smaller as well as doing less work per cell.
 
-### v1.8.18 — Monsters — planned
+### v1.8.18 — Monsters — in progress, not released
+
+**This is the branch currently checked out**, with work in the tree that is not committed.
+It is not tagged, not built for release, and not published.
 
 **Added.** Zombies and skeletons, spawning in the dark and in caves, on the light and
 space rules that make a torch worth placing.
 
-`docs/ROADMAP.md` gives this version one short paragraph; nothing beyond it has been
-researched or specified yet. Depends on v1.8.14's entity system existing first.
+The line above is no longer just a plan: `source/entity/monster.c` and
+`source/entity/monster.h` exist and carry the behaviour — zombie detect-and-chase with a
+melee cooldown, skeleton windup / line-of-sight re-check / fire / cooldown, a shared
+idle-wander machinery re-derived from `animal.c`'s, a flat 2 Hz torch despawn check, and
+`monsterSpawnTick()` gating itself to once every 40 ticks with three fixed candidates and
+no retry. `entityThinkDispatch()` routes each pool slot to `animalThink()` or
+`monsterThink()` by kind, deliberately in ONE pass — a second `entityTick()` call per
+family would double-step every animal's physics, which would read as a movement bug and
+not as a wiring bug. `docs/plan-1.8.18-monsters.md` carries the full specification, and is
+the file that superseded `docs/ROADMAP.md`'s one short paragraph.
+
+It also carries a large amount of work that is not "monsters" at all, because the boot
+freeze took priority over the roadmap: the mesh sub-phase markers in the watchdog report,
+the updater's free-heap diagnostic, the third mutator added to the frame-sync ordering
+guard, and several measured-but-negative freeze investigations. See `CHANGELOG.md` and the
+code-vault log for those; this entry stays about the feature.
 
 ### v1.8.19 — Sound — planned
 

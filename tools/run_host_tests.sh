@@ -1001,6 +1001,28 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 "./$BH/battery_test"
 
+# ── diag_retire: does a boot's fence actually keep one previous freeze's evidence? ─────────
+#
+# source/app/diag_retire.c holds diagRetire(), moved out of main.c on 2026-09-04 because
+# main.c's first #include is <3ds.h> and can never be compiled on the host as a whole. The
+# REAL file is linked in here, same reason as the battery_test stanza above: a hand-copied
+# twin of the retirement logic would pass no matter what diag_retire.c did.
+#
+# Fixes the bug where remove(prev) ran unconditionally, every boot, before checking whether
+# `live` existed — so a boot that did not freeze destroyed the previous freeze's evidence to
+# make room for nothing. Cost steve's v1.8.16 hang.txt / postmortem.txt for real; only
+# prev-bootid.txt survived to v1.8.17. Sabotaged and measured: reverting diag_retire.c to the
+# pre-fix body (remove(prev) with no existence probe) fails 2 of 15 checks, first
+# "L116 fileExists(prev)" — the boot-1-freeze/boot-2-clean/boot-3-clean scenario loses the
+# evidence at boot 3 exactly as steve's card did. Restored, 15/15 pass.
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/app/diag_retire.c \
+	tests/diag_retire_test.c \
+	-o "$BH/diag_retire_test"
+
+"./$BH/diag_retire_test"
+
 # v1.8.4: hw.c's console-model policy -- the worker core ladder and the cached New 3DS
 # flag. Own binary, own main(), and the REAL source/app/hw.c is in the link for exactly
 # the reason the battery comment above records: hw.c's libctru half (APT_CheckNew3DS,
@@ -4625,6 +4647,64 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 rm -rf "$BHWXD"
 
+# weather_test.c -- world/weather.c, the weather MODEL (the stanza above is the RENDERING half).
+# Covers weatherAt()'s biome-species mapping, the desert-is-rarer precipitation roll,
+# weatherNextSurfaceBlock()'s accumulation/melt table including the explicit "never a second
+# layer" cases, and weatherTickColumn()'s full-column sweep.
+#
+# WHY THIS WAS ADDED (2026-09-04): tests/weather_test.c was never compiled or linked by this
+# script. It has been running exactly ZERO times on every build since it landed in v1.8.9 on
+# 2026-09-02 -- the "a test can exist and never run" trap. The only "weather" hits in this file
+# were weatherdraw_test.c above, which never calls weatherAt() at all (its own comment says so),
+# so the 46 checks that actually prove "biome-aware rain and snow" and "snow capped at one
+# block" were unenforced. A regression in weather.c -- someone allowing a second snow layer --
+# would have gone completely undetected.
+#
+# Link list copied from the scratch_tint_fill_test.c stanza (the nearest existing "World +
+# WorldGen on the host" stanza) rather than reconstructed. weather.c calls worldgenBiomeAt/
+# worldgenHeight, worldGet/worldSet, and rngMix/rngHash3 (world/rng.h is header-only).
+# world/light.c is deliberately NOT listed: world/world.c:16 does #include "world/light.c"
+# itself (unity build), so listing it separately gives "multiple definition".
+# tests/net_stub.c is required because world.c's worldSet() calls networldOnColumnLoad()
+# unconditionally and source/net is not host-portable.
+#
+# -lm: weather.c calls no libm function directly, but world/worldgen.c and
+# world/worldgen_density.c pull in the sinf/cosf/sqrtf family transitively. MEASURED: the link
+# fails with "undefined reference to `sqrtf'" without it.
+#
+# NOTE ON SHAPE: the stanza this was adapted from ended with `WX_EXIT=$?` and `exit "$WX_EXIT"`,
+# which is correct for running it standalone but would have been wrong here -- an `exit` inside
+# this script terminates the WHOLE suite at this line, reporting success while silently skipping
+# every later stanza. No other stanza in this file uses a bare `exit`. Under `set -e` (line 224)
+# a failing test binary aborts the run on its own, which is the behaviour we want.
+BHWX="build-host/run-$$-weather"
+mkdir -p "$BHWX"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	tests/net_stub.c \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/budget.c \
+	source/world/world.c \
+	source/world/scratch.c \
+	source/world/noise.c \
+	source/world/genversion.c \
+	source/world/crc32.c \
+	source/world/worldgen.c \
+	source/world/worldgen_density.c \
+	source/world/cave_carve.c \
+	source/world/ore_gen.c \
+	source/world/weather.c \
+	tests/weather_test.c \
+	-lm \
+	-o "$BHWX/weather_test"
+
+"./$BHWX/weather_test"
+
+rm -rf "$BHWX"
+
 # framesync_guard_test.c -- pins main.c's gpuWaitPrevFrame(), THE fix for the hardware freeze
 # steve's New 3DS hit at render distance 5. Parses source/main.c as text (like
 # world/water_alpha_test.c parses scene/chunk_render.c) rather than linking it -- main.c
@@ -5275,12 +5355,22 @@ rm -rf "$BHCT"
 #
 # The exit-code reader itself was proven with a deliberate `( exit 5 )` control in the same
 # standalone script, printed as "control=5" ahead of the compile above.
+#
+# source/app/diag_retire.c joins the link line as of v1.8.18: metricsInit() now calls
+# diagRetire(CSV_PATH, CSV_PATH_PREV) before its truncating fopen, so the previous boot's
+# frames.csv is rotated to prev-frames.csv instead of being destroyed. That is main.c's own
+# already-proven boot-fence mechanism rather than a second hand-rolled one, and it lives in
+# metricsInit rather than in diagFenceBoot's table because metricsInit (main.c:4158) runs
+# BEFORE diagFenceBoot (main.c:4287) -- a table entry alone would rotate a file that had
+# already been truncated. Linking the real diag_retire.c, not a stub, matches the
+# diag_retire_test stanza above and keeps both stanzas testing the same code.
 BHMET="build-host/run-$$-metricstiming"
 mkdir -p "$BHMET"
 
 gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	-I tests/metrics_timing_stub -I source \
 	source/debug/metrics.c \
+	source/app/diag_retire.c \
 	tests/metrics_timing_test.c \
 	-lm \
 	-o "$BHMET/metrics_timing_test"
@@ -5838,9 +5928,10 @@ rm -rf "$BHFPI"
 # worst observed case max 25, at frame 13. PARTICLES_MAX is 512, so the headroom is not in
 # question.
 #
-# Needs a citro3d stub because player.c reaches the GPU through it. tests/player_water_stub/
-# holds a minimal 3ds.h, citro3d.h and citro3d_stub.c -- a stub, not a reimplementation of
-# any player logic: the real source/scene/player.c is linked and exercised.
+# Needs a citro3d stub because player.c reaches the GPU through it, and an audio stub because
+# its splash handling now plays a cue. tests/player_water_stub/ holds a minimal 3ds.h,
+# citro3d.h, citro3d_stub.c and audio_stub.c -- stubs, not a reimplementation of any player
+# logic: the real source/scene/player.c is linked and exercised.
 BHPLAYERWATER="build-host/run-$$-player-water"
 mkdir -p "$BHPLAYERWATER"
 
@@ -5848,6 +5939,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	-I tests/player_water_stub -I source \
 	tests/net_stub.c \
 	tests/player_water_stub/citro3d_stub.c \
+	tests/player_water_stub/audio_stub.c \
 	source/world/block.c source/world/registry.c source/world/chunk.c \
 	source/world/chunk_codec.c source/world/crc32.c source/world/region.c \
 	source/world/world.c source/world/scratch.c source/world/mesher.c \
@@ -5945,3 +6037,392 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address -fno-omit-frame-poi
 "./$BHMWB/mesher_write_bounds_test"
 
 rm -rf "$BHMWB"
+
+# ========================================================================================
+# FIX-LOADPROF, 2026-09-04 -- load.csv schema (version/timestamp columns, header safety)
+# ========================================================================================
+#
+# source/debug/loadprof.{c,h} added two columns to load.csv's row -- `version`
+# (BLOCKSMITH_VERSION) and `unix_time_s` (time(NULL), 0 on a dead/unset RTC) -- and renamed
+# `other_ms` to `unaccounted_ms`. steve's SD card already carries a nine-row load.csv written
+# by every build back to v1.7.1, with none of that, and it is live evidence in an open freeze
+# investigation (FREEZE-EVIDENCE-1817.md), so a build that started appending the wider row to
+# that SAME file would leave a header that no longer matches the rows under it -- silent
+# corruption of the evidence. The fix is that LOADPROF_PATH itself now names "load2.csv", not
+# "load.csv": old builds only ever open the old name, this build and every build after it only
+# ever open the new one, so the two files structurally cannot collide and steve's existing
+# load.csv is never opened by this or any later build. See loadprof.h's file comment for the
+# two alternatives that were rejected (in-place header rewrite, rename()-based rotation) and
+# why.
+#
+# tests/loadprof_csv_test.c is the host check for that: a fresh file gets the new header and a
+# self-consistent 29-field row (version first, a plausible unix_time_s second); three writes to
+# the same path stay one header plus three rows, all 29 fields; LOADPROF_PATH is asserted to be
+# neither empty nor, specifically, the legacy "sdmc:/blocksmith/load.csv" string; and a
+# constructed legacy-shaped file (the exact 27-column header from FREEZE-EVIDENCE-1817.md's
+# load.csv, plus one legacy row) has loadprofWrite() pointed at it directly -- not at
+# LOADPROF_PATH -- to demonstrate, on purpose, that the row it appends there WOULD mismatch the
+# legacy header (27 fields vs 29). That demonstration is not a claim that loadprofWrite guards
+# against this -- it deliberately does not, see loadprof.h -- it is what makes the LOADPROF_PATH
+# check the load-bearing one rather than a decorative one.
+#
+# PASS 30 checks, RUN_EXIT=0, confirmed on this host before wiring.
+#
+# PROVEN ABLE TO GO RED: built this same test file against source/debug/loadprof.{c,h} as they
+# stood immediately before this task (preserved verbatim, not reconstructed, in
+# scratchpad/fixlp_orig/ during the session that made this change) -- FAIL 30 checks, 10 failed,
+# RUN_EXIT=1, first failure "L162 lens[0] >= 20 && strncmp(lines[0], "version,unix_time_s,", 20)
+# == 0". The ten failures split exactly as expected: the header/row shape checks (no version or
+# unix_time_s column, other_ms instead of unaccounted_ms, 27 fields not 29), the LOADPROF_PATH
+# checks (old code's LOADPROF_PATH IS the legacy "sdmc:/blocksmith/load.csv" string), and the
+# legacy-file demonstration's own checks flipping the other way -- the OLD code's row, appended
+# to the legacy header, has 27 fields and DOES match it, because that IS the code that produced
+# that shape. Re-linked against the real, current loadprof.c immediately after: PASS 30 checks,
+# RUN_EXIT=0 again.
+#
+# tests/ is exempt from the console SOURCES glob -- see the mesher_write_bounds_test stanza
+# above for the Makefile:26/806 citation; the same fact applies here unchanged.
+BHLC="build-host/run-$$-loadprofcsv"
+mkdir -p "$BHLC"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/debug/loadprof.c \
+	tests/loadprof_csv_test.c \
+	-o "$BHLC/loadprof_csv_test"
+
+"./$BHLC/loadprof_csv_test"
+
+rm -rf "$BHLC"
+
+# ========================================================================================
+# GUARD-HARDEN, 2026-09-04 -- chunk_render.c's draw guard: boundVertCap/tierTablesGolden/drawSane
+# ========================================================================================
+#
+# v1.8.17 shipped chunk_render.c's draw guard defaulting on for the first time, and the
+# 2026-09-03 freeze evidence brief (scratchpad FREEZE-EVIDENCE-1817.md) shows steve's console
+# froze again at the exact same point regardless. v1.8.18 closes three gaps drawSane()
+# structurally could not previously catch (a run starting mid-triangle, a run whose first/count
+# belong to a slot other than the one actually bound on the GPU, and the two ground-truth
+# tables boundVertCap() derives its answer from being trusted with no check that they still
+# match their boot-time values) -- tests/drawguard_test.c is the proof those three, and the
+# four pre-existing codes, can actually fire.
+#
+# chunk_render.c includes <3ds.h> and <citro3d.h> and cannot be compiled on the host at all, so
+# MeshSlot, TIER_S/M/L_FACES + kTierFaces[3], boundVertCap(), tierTablesGolden() and drawSane()
+# are lifted OUT of the real file with awk -- same reasoning as cavewalk_extract.inc above and
+# meshdrop_extract.inc a few thousand lines up: a hand-copied twin would pass no matter what
+# chunk_render.c did, and this project has already paid for that mistake twice.
+#
+# chunk_render.c is being actively edited by another lane while this stanza runs, so every
+# extraction below carries its own #error guard, same pattern as cavewalk_extract.inc and
+# meshdrop's ChunkRefuseReason/function extracts: an anchor that stops matching does not
+# silently emit an empty .inc that then fails with some unrelated "implicit declaration"
+# error deep in drawguard_test.c -- it fails the compile at the .inc itself, naming exactly
+# which extraction lost its anchor.
+BHDG="build-host/run-$$-drawguard"
+mkdir -p "$BHDG"
+
+SRC_DG="source/scene/chunk_render.c"
+
+awk '
+/^typedef struct \{$/ { inf=1 }
+inf { print; if ($0 == "} MeshSlot;") { saw=1; inf=0 } }
+END { if (!saw) print "#error \"meshslot_extract.inc did not carry MeshSlot out of source/scene/chunk_render.c\"" }
+' "$SRC_DG" > "$BHDG/meshslot_extract.inc"
+
+awk '
+/^#define TIER_S_FACES  / { print; sawS=1 }
+/^#define TIER_M_FACES  / { print; sawM=1 }
+/^#define TIER_L_FACES  / { print; sawL=1 }
+/^static const int kTierFaces\[3\]/ { print; sawK=1 }
+END {
+	if (sawS && sawM && sawL && sawK) ; else
+		print "#error \"tierfaces_extract.inc did not carry TIER_*_FACES/kTierFaces out of source/scene/chunk_render.c\""
+}
+' "$SRC_DG" > "$BHDG/tierfaces_extract.inc"
+
+awk '
+/^static uint32_t boundVertCap\(const MeshSlot\* s\)$/ { inf=1; saw=1 }
+inf { print; if ($0 == "}") inf=0 }
+END { if (!saw) print "#error \"boundvertcap_extract.inc did not carry boundVertCap() out of source/scene/chunk_render.c\"" }
+' "$SRC_DG" > "$BHDG/boundvertcap_extract.inc"
+
+awk '
+/^static bool tierTablesGolden\(void\)$/ { inf=1; saw=1 }
+inf { print; if ($0 == "}") inf=0 }
+END { if (!saw) print "#error \"tiergolden_extract.inc did not carry tierTablesGolden() out of source/scene/chunk_render.c\"" }
+' "$SRC_DG" > "$BHDG/tiergolden_extract.inc"
+
+awk '
+/^static bool drawSane\(const MeshSlot\* s, uint32_t first, uint32_t count\)$/ { inf=1; saw=1 }
+inf { print; if ($0 == "}") inf=0 }
+END { if (!saw) print "#error \"drawsane_extract.inc did not carry drawSane() out of source/scene/chunk_render.c\"" }
+' "$SRC_DG" > "$BHDG/drawsane_extract.inc"
+
+for f in meshslot tierfaces boundvertcap tiergolden drawsane; do
+	n=$(wc -l < "$BHDG/${f}_extract.inc")
+	if [ "$n" -lt 3 ]; then
+		echo "EXTRACTION FAILED: $f only captured $n lines - anchor did not match" >&2
+		exit 2
+	fi
+done
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source -I "$BHDG" \
+	tests/drawguard_test.c \
+	-o "$BHDG/drawguard_test"
+
+"./$BHDG/drawguard_test"
+
+rm -rf "$BHDG"
+
+# ── tests/grass_stack_test.c — GRASS-STACK lane: "two grasses stacked from different
+# biomes" report ──────────────────────────────────────────────────────────────────────────
+#
+# steve's bug report, verbatim: "two grasses stacked on top of each other from different
+# biomes -- get rid of that". This test walks REAL generated terrain -- 21 x 21 chunks
+# (441 columns) around the origin, 5 seeds, GEN_VERSION_NEWEST -- and asks, for every
+# (x, z) column, whether two plant-type blocks (tall grass, tall-grass-top, cactus, dead
+# bush, fern, poppy, daisy, bluebell, orchid) ever occupy vertically adjacent cells (y and
+# y+1) other than the two SANCTIONED multi-cell writes: the v1.8.8 tall-grass clump
+# (TALL_GRASS / TALL_GRASS_TOP) and the 1-2 block desert cactus (CACTUS / CACTUS), both of
+# which are a single call site writing both cells together after cellsClear() confirms both
+# are air.
+#
+# RED ARM, MEASURED 2026-09-04 by the GRASS-STACK lane. The test's OWN first draft did not
+# model the legitimate 2-tall cactus as sanctioned, and flagged CACTUS-over-CACTUS as a
+# "stack" -- a test bug, not a game bug. That first run:
+#   "FAIL tests/grass_stack_test.c:147  total_stacks == 0"
+#   "FAILED (1/6 checks, 108 stacked pairs found across 5 seeds)"
+#   -- every reported pair was "id 12 over id 12" (BLOCK_CACTUS over BLOCK_CACTUS), the
+#   intended 2-block cactus write, not two different biomes' props colliding.
+#
+# After exempting BLOCK_CACTUS-over-BLOCK_CACTUS as sanctioned (worldgen.c:1160-1168 writes
+# it as one multi-cell op, exactly like the tall-grass clump), the SAME 5 seeds over the SAME
+# 2,205 columns found ZERO unsanctioned vertically-adjacent plant pairs:
+#   "PASS (6/6 checks, 0 stacked pairs found across 5 seeds)"
+#
+# **What this proves and what it does not.** It proves worldgenScatter()'s and
+# worldgenFlora()'s air/occupancy guards (worldgen.c:1031 and cellsClear(), worldgen.c:1081)
+# hold under real, biome-diverse generated terrain -- not just under code-reading -- so
+# same-column double-placement between the two passes is NOT the cause of what steve saw.
+# It does NOT rule out a cross-lane race (two generator lanes decorating the same column
+# concurrently -- see worldgen_mt_test.c/lanes_test.c for the existing machinery around
+# that) or a purely visual/rendering effect at a biome boundary (chunk_render.c, out of
+# this lane's ownership) -- see the GRASS-STACK lane's report for what remains open.
+BHGS="build-host/run-$$-grassstack"
+mkdir -p "$BHGS"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/chunk_codec.c \
+	source/world/crc32.c \
+	source/world/world.c \
+	source/world/scratch.c \
+	source/world/noise.c \
+	source/world/budget.c \
+	source/world/worldgen.c \
+	source/world/worldgen_density.c \
+	source/world/cave_carve.c \
+	source/world/ore_gen.c \
+	source/world/genversion.c \
+	tests/net_stub.c \
+	tests/grass_stack_test.c \
+	-lm \
+	-o "$BHGS/grass_stack_test"
+
+"./$BHGS/grass_stack_test"
+
+rm -rf "$BHGS"
+
+#---------------------------------------------------------------------------------------
+# tests/mesher_celldrop_test.c -- OPT-MESHER task A. Proves the packed cellDrop()
+# representation (world/mesher.c: the water "drop" value folded into bits 3..5 of
+# s_cell_flags, replacing the separate 5,832-byte s_cell_drop[SCRATCH_BLOCKS] array) is
+# equivalent to what it replaced -- decode gating (s_any_drop), and a full 8 (drop
+# 0..7) x 8 (every SOLID/OCCL/DRAW combination) x 4 (scratch indices spanning the array:
+# first cell, second cell, the middle, the last cell) round trip through the REAL,
+# compiled cellDrop(), via three test-only hooks world/mesher.c exports under
+# BS_CELLDROP_TEST_HOOKS (bsTestCellDrop / bsTestGetCellFlags / bsTestSetCellFlags /
+# bsTestSetAnyDrop) -- same "compiled out of every build but the probe" convention as
+# BS_MESH_MERGE_PROBE already in that file, so the shipped build and every other host
+# suite pay nothing for this. See the test file's own header comment for the full case.
+#
+# Same file list and same ASan flags as the tests/mesher_write_bounds_test.c stanza
+# above (world.c, block.c, registry.c, chunk.c, budget.c, scratch.c, mesher.c,
+# net_stub.c), plus -DBS_CELLDROP_TEST_HOOKS to compile in the three hooks. -I
+# deps/libhydrogen and -I deps/blocksmith-server added defensively (matching the
+# console INCLUDES line) though the write-bounds stanza's own comment above notes
+# mesher.c does not actually need them on this link path -- harmless either way, both
+# paths link and run clean with them present.
+#
+# PASS 514 checks, RUN_EXIT=0, confirmed on this host: 2 checks in the s_any_drop
+# gating arm, plus 4 indices x 8 drops x 8 flag combos x 2 checks (cellDrop() value +
+# flag-bits-preserved) = 512 in the full round-trip arm.
+#
+# PROVEN ABLE TO GO RED without ever opening the real source/world/mesher.c for
+# writing -- md5 0aa451c0f83beaa924416e2f31fc4e9b before and after (this is the
+# OPT-MESHER task A md5, not the pre-task-A one this file's other mesher stanzas may
+# still cite). Built instead against a SCRATCH COPY with CELL_DROP_SHIFT sabotaged from
+# 3 to 2 (world/mesher.c's own "one bit shifted wrong" case: bit 2 then does double
+# duty as CELL_FLAG_DRAW and as the low bit of the packed drop value), same flags,
+# same file list but the sabotaged copy standing in for mesher.c:
+#   FAIL  L87  cellDrop() returned 11 with s_any_drop true for a byte packed with
+#     drop=5 -- expected 5
+#   FAIL  L114  si=0 flagbits=0x4 drop=0: cellDrop() returned 1, expected 0 -- the
+#     drop bits and the SOLID/OCCL/DRAW bits are bleeding into each other
+#   [...238 more FAIL lines, one per corrupted combination...]
+#   mesher celldrop self-test: FAILED - 241 of 514 checks
+#   RUN_EXIT=1
+# Re-linked against the real, untouched mesher.c immediately after: PASS 514 checks,
+# RUN_EXIT=0 again -- the green above is the confirmed-restored state, not an
+# assumption.
+#
+# APPENDED at the end, same append-only-under-set--e reasoning as the write-bounds
+# stanza immediately above.
+BHCD="build-host/run-$$-mesherselldrop"
+mkdir -p "$BHCD"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g -fsanitize=address -fno-omit-frame-pointer \
+	-DBS_CELLDROP_TEST_HOOKS \
+	-I source \
+	-I deps/libhydrogen \
+	-I deps/blocksmith-server \
+	source/world/world.c \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/budget.c \
+	source/world/scratch.c \
+	source/world/mesher.c \
+	tests/net_stub.c \
+	tests/mesher_celldrop_test.c \
+	-lm \
+	-o "$BHCD/mesher_celldrop_test"
+
+"./$BHCD/mesher_celldrop_test"
+
+rm -rf "$BHCD"
+
+# ─────────────────────────────────────────────────────────────────────────────────────
+# HANDOFF NOTE (lane OPT-LIGHT, v1.8.18): I do not own tools/run_host_tests.sh, so I am not
+# editing it myself. This is the stanza to APPEND immediately after the existing
+# tests/light_race_test.c stanza (the block ending "rm -rf "$BHLR"" just above the
+# "tests/worldgen_density_opt_test.c" comment, around line 3895 of the current file) --
+# append is the one edit shape that cannot drop another session's work, same reasoning every
+# other stanza in this file already gives for why it is appended rather than merged in.
+# ─────────────────────────────────────────────────────────────────────────────────────
+
+# tests/light_snapshot_cas_test.c -- world/light.c's s_snapshot_busy CAS claim (v1.8.18
+# optlight task A). Appended, like every stanza in this file, because an append is the one
+# edit shape that cannot drop another session's work.
+#
+# relightColumnCoreDiff used to declare its 16 KiB before/after snapshot on its own stack --
+# the single largest frame in the codebase, on app/worker.c's 32 KiB WORKER_STACK_BYTES
+# worker stack, beneath workerMain's own locals. It now claims a shared static scratch buffer
+# with the same CAS idiom as s_edit_queue_busy above, and only a thread that LOSES the race
+# still pays a 16 KiB frame, in its own function (relightColumnCoreDiffStack) so the common
+# (uncontended) path pays nothing.
+#
+# WHAT IT COVERS. ARM 1 forces the loss on purpose, single-threaded, via light.h's
+# lightClaimSnapshotScratchForTest()/lightReleaseSnapshotScratchForTest() test hooks -- the
+# same CAS the real code claims, claimed from test code instead of a second thread -- and
+# checks the fallback's answer against a reference digest computed with the claim free, so the
+# fallback is proven CORRECT on a specific call, not merely "probably exercised somewhere".
+# ARM 2 relights two DIFFERENT columns (ARM2_COLUMN_B_CX=10, same separation and same
+# lightHandoffBorders reasoning as light_race_test.c's ARM 2 above) from two real threads and
+# checks light.c's own lightSnapshotFallbacks() counter actually moved off zero under real
+# contention, not just the forced ARM 1 case -- 45-64/400 calls took the fallback across
+# several runs on the host that built this -- while both threads' digests stay correct.
+#
+# WHY NOT ONE COLUMN FROM BOTH THREADS (maximum CAS contention). Tried first, during
+# development: found real digest mismatches, 2/200 on each thread. Reproduced those SAME
+# mismatches at the SAME rate on light.c with none of this task's changes applied -- so that
+# hazard is relightColumnCore's own column-write path racing against itself when two threads
+# target ONE column at once, pre-existing, and unrelated to the snapshot CAS this file is
+# actually testing. Flagged to the coordinator as a separate, out-of-scope finding rather than
+# fixed here or worked around by weakening this test.
+BHLSC="build-host/run-$$-lightsnapcas"
+mkdir -p "$BHLSC"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/world.c \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/chunk.c \
+	source/world/budget.c \
+	source/world/scratch.c \
+	tests/net_stub.c \
+	tests/light_snapshot_cas_test.c \
+	-pthread \
+	-o "$BHLSC/light_snapshot_cas_test"
+
+"./$BHLSC/light_snapshot_cas_test"
+
+rm -rf "$BHLSC"
+
+# entity/monster_test.c -- the monster layer (entity/monster.c, v1.8.18): zombie chase and
+# melee, skeleton windup/line-of-sight/cooldown, the shared idle-wander machinery, the 2 Hz
+# torch despawn in both directions, entityThinkDispatch's routing by kind, and the spawn
+# rule's distance band. 126 checks.
+#
+# monster_test.c lives under tests/, NOT under source/, and that is deliberate: Makefile:26
+# globs every .c under source/ into the CONSOLE build, so a _test.c placed there breaks the
+# console link unless it is guarded with #ifndef __3DS__. tests/ is exempt from that glob,
+# which is why every new suite from v1.8.18 onward goes there instead.
+#
+# ****************************************************************************************
+# DO NOT ADD source/world/light.c TO THIS LINK LINE.
+# source/world/world.c does `#include "world/light.c"` (unity-build style, world.c:16), so
+# light.c is ALREADY inside world.c's translation unit. Listing it separately produces
+# "multiple definition" for every symbol light.c defines. monster.c does call lightGetSky()
+# and lightGetBlock(), and those resolve through world.c's unity-included copy.
+# raycast.c is NOT unity-included anywhere and so DOES have to appear below.
+# ****************************************************************************************
+#
+# Why the rest of the link set is what it is:
+#   - tests/net_stub.c: the same stub every other host stanza links. entity.c and world.c
+#     pull in networking symbols this suite never exercises but must still resolve.
+#   - worldgen.c + worldgen_density.c + noise.c + cave_carve.c + ore_gen.c are NOT optional.
+#     Linking entityThinkDispatch() pulls in animal.c (the dispatcher's other branch), and
+#     animal.c calls the real terrain generator for its own spawn logic. Established
+#     empirically -- the first link attempt without them failed with undefined references
+#     naming worldgen symbols -- not assumed.
+#   - raycast.c: skeletonHasLineOfSight() calls worldRaycast() directly.
+#
+# The private run dir uses $$ (the shell's PID), matching BH="build-host/run-$$" at line 241
+# and every other stanza in this file. It must NOT be a fixed string: two suites running at
+# once would then share a directory and overwrite each other's binaries.
+BHMO="build-host/run-$$-monster"
+mkdir -p "$BHMO"
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+    -I source \
+    tests/net_stub.c \
+    source/world/block.c \
+    source/world/registry.c \
+    source/world/chunk.c \
+    source/world/chunk_codec.c \
+    source/world/crc32.c \
+    source/world/world.c \
+    source/world/physics.c \
+    source/world/budget.c \
+    source/world/tick.c \
+    source/world/worldgen.c \
+    source/world/worldgen_density.c \
+    source/world/noise.c \
+    source/world/cave_carve.c \
+    source/world/ore_gen.c \
+    source/world/raycast.c \
+    source/entity/entity.c \
+    source/entity/animal.c \
+    source/entity/monster.c \
+    tests/monster_test.c \
+    -lm \
+    -o "$BHMO/monster_test"
+"./$BHMO/monster_test"
+rm -rf "$BHMO"

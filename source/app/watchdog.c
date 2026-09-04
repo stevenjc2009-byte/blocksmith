@@ -35,6 +35,13 @@ extern u32 __C3D_Context[];
 #include "app/worker.h"
 #include "version.h"
 
+// For BS_DRAW_GUARD and the chunkRenderGuard* accessors the draw-guard verdict below reads.
+// The default now lives in this header (see the comment on it in scene/chunk_render.h) so
+// every includer agrees on the value; a .c file that never includes it would silently see
+// BS_DRAW_GUARD as undefined/0 and drop the verdict from the report again, one file over from
+// the bug that header comment describes. Header-only: nothing here is called from this file.
+#include "scene/chunk_render.h"
+
 // Alongside the crash dump and the save data (app/crash.c, main.c's saveWorldDir()). Two
 // spellings for the same reason crash.c needs two: the write goes through the raw FS calls,
 // which take archive-relative paths, while the "has one been left behind" check on the next
@@ -100,16 +107,45 @@ extern u32 __C3D_Context[];
 //   base + core map + NUL ...... 1156 bytes   -> truncated by 388 at the old cap
 //
 // So the core map would have been cut off almost in its entirety and the readout would have
-// shipped showing nothing, which is the failure workerSaveWaits() already had once. 1280 is
-// the next size up that fits with room to spare; the cost is 512 bytes of .bss on a static
-// buffer, paid once, never on the stack, and not on any hot path.
+// shipped showing nothing, which is the failure workerSaveWaits() already had once. 1280 was
+// picked as the next size up that fit with room to spare, leaving 124 bytes of headroom.
+//
+// That headroom is what the draw-guard line below (see the #if BS_DRAW_GUARD block near the
+// end of reportBuild) would have quietly eaten. Re-measured with the same method
+// (scratchpad/fixwd_reportlen.py, worst-case field widths, s32 fields sized to their full
+// -2147483648..4294967295 range rather than the small values they hold in practice):
+//
+//   base + core map + NUL ...... 1194 bytes   (stricter than the 1156 above; kept for margin)
+//   draw guard line ............  176 bytes   -> capped by main.c's `static char guard[160]`,
+//                                                so the %s substitution can never exceed 159
+//                                                printable chars regardless of the numbers in it
+//   base + core map + guard + NUL 1370 bytes  -> already past the 1280 cap on its own
+//
+// So moving the draw-guard line out from under BS_DRAW_PROBE without also raising this cap
+// would have reproduced the exact bug being fixed here, one buffer over: snprintf would clamp
+// silently and hang.txt would come back with no draw-guard verdict again. Raised to 1536, the
+// next size up that clears 1370 with room to spare (166 bytes) rather than shaving it thin
+// again; cost is another 256 bytes of .bss on the same static buffer, paid once.
 //
 // Worth knowing for the next person adding a line: at 768 this report had 21 bytes of
-// headroom, so ANY new line would have vanished silently. It now has 124.
+// headroom; at 1280 it had at most 86 by this stricter method. At 1536 it had 166.
+//
+// v1.8.18 MESH-SUBPHASE added a "mesh stage" field to the base snprintf plus a 3-line
+// explanatory paragraph. Measured with the same method as the two bumps above
+// (scratchpad/meshsub_reportlen.py, worst-case field width — the longest of the six
+// WdMeshStage names, "chunkRenderBuild, after the flush, installing slot metadata"):
+//
+//   field line + paragraph ..... 317 bytes
+//   base + core map (measured above, 1194) + guard line (capped 176) + this .... 1687 bytes
+//
+// 1687 is already past the old 1536 cap on its own — the same failure this comment block
+// already describes twice, one field over. Raised to 1792, the next size up that clears
+// 1687 with room to spare (105 bytes, by the same script) rather than shaving it thin again;
+// cost is another 256 bytes of .bss on the same static buffer, paid once.
 #if BS_DRAW_PROBE
 #define WD_REPORT_MAX 4096
 #else
-#define WD_REPORT_MAX 1280
+#define WD_REPORT_MAX 1792
 #endif
 
 static volatile u32  s_phase;
@@ -118,6 +154,11 @@ static volatile s32  s_columns;
 static volatile s32  s_meshes;
 static volatile s32  s_queued;
 static volatile bool s_worker_busy;
+
+// v1.8.18 MESH-SUBPHASE. Where inside WD_PHASE_MESH the main thread actually is; see the enum's
+// comment in watchdog.h for why this exists. Unconditional (not behind BS_DRAW_PROBE) — it has
+// to reach a shipped hang.txt.
+static volatile s32  s_mesh_stage = WD_MESH_IDLE;
 
 // The draw guard's verdict, already formatted by the main thread into a buffer it owns and
 // keeps alive for the rest of the process. A pointer and not a copy because this thread must
@@ -272,6 +313,22 @@ static const char* const s_phase_name[WD_PHASE_COUNT] = {
 static const char* phaseName(u32 p)
 {
 	return (p < WD_PHASE_COUNT) ? s_phase_name[p] : "?";
+}
+
+// v1.8.18 MESH-SUBPHASE. Indexed by WdMeshStage; see its comment in watchdog.h.
+static const char* const s_mesh_stage_name[WD_MESH_STAGE_COUNT] = {
+	[WD_MESH_IDLE]         = "not in the mesh/relight drain",
+	[WD_MESH_RELIGHT]      = "relightDrain (relight queue)",
+	[WD_MESH_DRAIN_ENTER]  = "drain loop, between chunks",
+	[WD_MESH_BUILD_ENTER]  = "chunkRenderBuild, before GSPGPU_FlushDataCache",
+	[WD_MESH_GSP_FLUSH]    = "INSIDE GSPGPU_FlushDataCache (GSP IPC - prime suspect)",
+	[WD_MESH_SLOT_INSTALL] = "chunkRenderBuild, after the flush, installing slot metadata",
+};
+
+static const char* meshStageName(s32 s)
+{
+	if (s < 0 || s >= WD_MESH_STAGE_COUNT || !s_mesh_stage_name[s]) return "(none recorded)";
+	return s_mesh_stage_name[s];
 }
 
 // Writes s_report to sdmc:/blocksmith/hang.txt through the raw FS calls rather than stdio,
@@ -659,6 +716,7 @@ static void reportBuild(u32 phase, u32 frames, u32 stuck_ms, bool slow)
 		"\n"
 		"version      : %s\n"
 		"phase        : %s\n"
+		"mesh stage   : %s\n"
 		"frames drawn : %lu\n"
 		"stalled for  : %lu ms\n"
 		"columns in   : %ld\n"
@@ -667,7 +725,10 @@ static void reportBuild(u32 phase, u32 frames, u32 stuck_ms, bool slow)
 		"worker       : %s\n"
 		"\n"
 		"'phase' is the last place the main thread reported being, listed in\n"
-		"source/app/watchdog.h. That name is the answer this file exists to give.\n",
+		"source/app/watchdog.h. That name is the answer this file exists to give.\n"
+		"'mesh stage' is only meaningful while phase reads MESH: it is where inside that\n"
+		"phase's drain the thread is, not just that it is somewhere in it. See WdMeshStage\n"
+		"in watchdog.h — WD_MESH_GSP_FLUSH is the prime suspect for a MESH/IDLE stall.\n",
 		slow
 			? "The main thread KEPT completing frames, but took seconds over each of them for\n"
 			  "long enough to count as a hang. It is a DEATH SPIRAL, not a deadlock: frames were\n"
@@ -676,6 +737,7 @@ static void reportBuild(u32 phase, u32 frames, u32 stuck_ms, bool slow)
 			  "which is what makes the HOME button stop responding as well.\n",
 		BLOCKSMITH_VERSION_SET ? BLOCKSMITH_VERSION : "(unset)",
 		phaseName(phase),
+		meshStageName(s_mesh_stage),
 		(unsigned long)frames,
 		(unsigned long)stuck_ms,
 		(long)s_columns, (long)s_meshes, (long)s_queued,
@@ -783,11 +845,19 @@ static void reportBuild(u32 phase, u32 frames, u32 stuck_ms, bool slow)
 
 	len = gxAppend(s_report, sizeof(s_report), len, "STUCK ON");
 	len = cmdDump(s_report, sizeof(s_report), len);
+#endif
 
+#if BS_DRAW_GUARD
 	// The draw guard's verdict. Printed even when nothing was wrong, because "no bad draw was
 	// ever issued" is the more useful half of the answer: it says the commands the GPU was
 	// handed were well formed and it stopped for some other reason, which is a different bug
 	// from the one being hunted.
+	//
+	// Moved out from under BS_DRAW_PROBE (default 0, never set by the Makefile) to its own gate
+	// on BS_DRAW_GUARD (default 1, see scene/chunk_render.h) so this line reaches a shipped
+	// build instead of only the draw-bisect build. s_guard_line and its writer,
+	// watchdogGuardLine(), are unconditional -- see the comment above s_guard_line's
+	// declaration -- so nothing else here needed to move.
 	const char* g = s_guard_line;
 	if (g) {
 		const int gm = snprintf(s_report + len, sizeof(s_report) - len,
@@ -894,6 +964,10 @@ bool watchdogStart(void)
 	s32 prio = 0x30;
 	svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
 	prio += 2;
+	// A floor against libctru's GSP event thread (0x1A/26) was added here on 2026-09-04 and
+	// reverted the same day: the premise was that the main thread ships at cia/blocksmith.rsf's
+	// `Priority: 16`, but makerom writes RSF + 0x20, so it has always shipped at 0x30/48 and
+	// this thread at 50 -- already correctly below GSP. See app/worker.c for the measurement.
 	if (prio > 0x3F) prio = 0x3F;
 
 	// Core 1 first, then core 0, exactly as worker.c does and for a sharper reason here: the
@@ -944,6 +1018,12 @@ void watchdogStop(void)
 void watchdogPhase(WdPhase p)
 {
 	s_phase = (u32)p;
+}
+
+// v1.8.18 MESH-SUBPHASE.
+void watchdogMeshStage(WdMeshStage stage)
+{
+	s_mesh_stage = (s32)stage;
 }
 
 WdPhase watchdogPhaseGet(void)

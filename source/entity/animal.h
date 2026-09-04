@@ -35,17 +35,33 @@
 // ENT_NONE is 0 and means "free slot" -- entity.c's whole free-list story rests on it, so
 // animals start at 1.
 //
-// 5, 6 and 7 are RESERVED for v1.8.16's zombie, skeleton and arrow, which
-// docs/plan-1.8.16-monsters.md already assigns. They are left as a hole on purpose: a fifth
-// animal taking one of them would force that version to renumber a value that by then is
-// baked into save data and (eventually) into a wire record. animalDef() returns NULL for
-// them and animal_test.c pins that, so the reservation is enforced rather than commented.
+// 5, 6 and 7 are RESERVED for the zombie, skeleton and arrow -- originally v1.8.16's,
+// reassigned to v1.8.18 by docs/plan-1.8.18-monsters.md (which supersedes the 1.8.16 plan;
+// read that document for the rest of this version's design). They are left as a hole on
+// purpose: an animal taking one of them would force that version to renumber a value that by
+// then is baked into save data and (eventually) into a wire record. animalDef() returns NULL
+// for them and animal_test.c pins that, so the reservation is enforced rather than commented.
+//
+// v1.8.18 MON-BUILD claims 5 and 6 as NAMED ids so scene/entitymodel.h has something to give a
+// box table to -- ENT_KIND_ZOMBIE and ENT_KIND_SKELETON exist below for that reason and ONLY
+// that reason. ENT_KIND_COUNT is deliberately NOT raised to follow them: it is "one past the
+// last ANIMAL kind", not "one past the last entity kind with a model", and those are different
+// counts now that a kind can have a model without being an animal. Raising it would make
+// animalDef(ENT_KIND_ZOMBIE) start returning a row instead of NULL, which is exactly the bug
+// docs/plan-1.8.18-monsters.md §3.1 and Phase 2 name by name: "the moment animalDef(5) starts
+// returning a row, animalThink() will start running wander AI on a zombie." animal_test.c's
+// existing pin (ENT_KIND_COUNT == 5, animalDef(5/6/7) == NULL) is intentionally left for the
+// entity-logic lane to grow their own kind table against -- this file adds no rows to kDefs,
+// no case to animalDef(), and touches no test.
 #define ENT_KIND_PIG      1
 #define ENT_KIND_COW      2
 #define ENT_KIND_CHICKEN  3
 #define ENT_KIND_SHEEP    4
-/* 5 = zombie, 6 = skeleton, 7 = arrow -- reserved for v1.8.16, do not reuse */
-#define ENT_KIND_COUNT    5   /* one past the last ANIMAL kind */
+#define ENT_KIND_ZOMBIE   5   /* model exists (scene/entitymodel.h); NOT an AnimalDef row */
+#define ENT_KIND_SKELETON 6   /* model exists (scene/entitymodel.h); NOT an AnimalDef row */
+/* 7 = arrow -- still reserved, still unclaimed; §3.5 of the monsters plan decides if it ever
+   is one */
+#define ENT_KIND_COUNT    5   /* one past the last ANIMAL kind. Deliberately NOT 7: see above */
 
 // ---------------------------------------------------------------------------------------
 // AI states, stored in Entity.ai_state

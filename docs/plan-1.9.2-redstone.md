@@ -447,3 +447,113 @@ Nothing under `source/`, `tests/`, or `tools/` was edited to produce this docume
   the ores document's own build-order step 6.
 - **The server's own registry table** — matching fifteen-row update, released before
   any client build carrying these rows (§8).
+
+---
+
+## [2026-09-04 09:53] Corrections
+
+Found during a later verification pass (a SPEC-lane task to draft fresh 1.9.2/1.9.3
+specs, which discovered both already existed as this document and its 1.9.3 sibling).
+**Appended, not merged into the argument above — nothing above this heading was
+touched.** Same convention this document's own sibling already uses for a
+later-discovered fact (`plan-1.9.3-dimensions.md`'s dated correction in its §7).
+
+1. **§2's "no per-block metadata of any kind" is incomplete, and this is the
+   important one.** `source/world/blockstate.h` exists: a fixed-size side table,
+   keyed by absolute block position, `BLOCKSTATE_SLOTS` = 64 slots of
+   `BLOCKSTATE_PAYLOAD_BYTES` = 16 opaque bytes each (`blockstate.h:144,155,169-177`
+   **[codebase]**), already shipped and already in production use — the furnace's
+   fuel/input/output/cook-progress state lives in it, and `main.c`'s tick loop walks
+   `s_blockstate.slots[]` directly for `BLOCK_FURNACE` every simulation tick
+   (`main.c:5992-6000` **[codebase]**). It costs a small fixed allocation — roughly
+   64 × (13 + 16) ≈ 1,856 bytes — entirely outside `WORLD_BUDGET_BYTES`, by the same
+   reasoning `entity.h`'s `EntityWorld` is exempted (stated in `blockstate.h`'s own
+   header comment). §2's binary framing — a 16 KB/chunk palette array (correctly
+   shown not to fit) versus encoding every state as a distinct `BlockId` — skips this
+   third, cheap, already-proven path.
+
+   This does **not** rescue wire. 64 slots shared across every present and future
+   stateful block (furnaces today; chests and signs floated as "unbuilt, unplanned"
+   in the table's own header) is nowhere near enough for a circuit — a single
+   15-cell dust run alone would claim close to a quarter of the whole table — so
+   §2's conclusion that wire needs a cheaper mechanism than per-cell storage still
+   stands, and this correction does not touch it. What it does change is the
+   door/piston-facing question specifically (§3.5's "gives up real per-instance
+   facing," and the matching §11 HIS CALL item): a facing byte is available *today*,
+   in a table that already exists and is already tested, for the cost of one
+   `BlockStateEntry` per placed door or piston — not a new subsystem, not a budget
+   fight against `WORLD_BUDGET_BYTES`. Whether spending a share of a 64-slot pool
+   that has to be split with every future stateful block is worth it is a real
+   tradeoff, worth putting to the owner — but it is a tradeoff between competing
+   demands on an existing small resource, not "possible vs. structurally
+   impossible" as §2 currently frames it.
+
+2. **§6's registry-row count is stale.** It states "38 of 128 core `BlockId` slots
+   used." Counted directly from `source/world/registry.c`'s `kCoreDefs[REG_ID_DYN_LO]`
+   on 2026-09-04: **43** rows are defined, ids 0 (`BLOCK_AIR`) through 42 (furnace).
+   Free core headroom is **85** slots (128 − 43), not the ~90 implied by "38 used" or
+   the round 100 §6's own table states outright. This document's 15-row ask still
+   fits either way — the correction moves the margin, not the conclusion. Also worth
+   recording: `BLOCK_REDSTONE_ORE` = 31 already exists (`registry.c:604-610`,
+   `block.h:193` **[codebase]**) and currently drops itself when mined, because there
+   is no separate item registry — `ItemId` **is** `BlockId`, stated outright in
+   `registry.c`'s own comment at `registry.c:562-564` **[codebase]**. §1's "wired
+   with dust along the ground" implies a distinct placed *item* rather than the raw
+   ore block, but §6's block/tile table does not appear to price a conversion row
+   for it. `world/crafting.c`'s existing `output_item`/`output_count` fields
+   (`crafting.c:38-43` **[codebase]**) — the same mechanism that turns a raw
+   porkchop into a cooked one — already support exactly that conversion; it is not
+   new machinery, but it is a row this document's own count does not obviously
+   include.
+
+3. **§6's atlas figures are stale.** They reference "the 32-slot ceiling"
+   throughout, and the running tally caps out assuming it. The atlas is
+   `ATLAS_W_PX` 16 × `ATLAS_H_PX` 1024 (`source/world/atlas_uv.h:48-49`
+   **[codebase]**), giving `ATLAS_TILE_SLOTS` = **64**, not 32
+   (`atlas_uv.h:76` **[codebase]**). Painted: `ATLAS_PAINTED_SLOTS` = 57
+   (`gfx/atlas_tiles.h`, cross-checked against `TILE_USED_COUNT` = 48 block-face
+   tiles plus nine item-icon tiles at slots 48-56, `gfx/item_icons.h`
+   **[codebase]**). Slot 63 is permanently reserved (`ATLAS_TILE_MISSING`,
+   `atlas_uv.h:120` **[codebase]**). That leaves **6** free tiles, 57-62 — not the
+   17-of-32 this document's own running tally states ("9 used, leaving 17 for the
+   dimensions document"). §6's own 9-tile ask for this version alone **does not fit**
+   the real 6-tile ceiling as costed; the shared-texture moves §6 already reaches
+   for (piston's six facings sharing 2 tiles via per-face `tex[BLOCK_FACES]`, door's
+   two states sharing 1) reduce the true count below 9, but the document should be
+   re-priced against 6 free tiles, not 17, and the dimensions document's own tile ask
+   layered on top needs the same correction before assuming headroom that is not
+   there.
+
+4. **A stronger in-tree precedent for wire propagation exists than anything §4
+   cites.** `source/world/water.h` already ships a queue-driven, budget-capped,
+   sparse-map propagation system of the same shape this feature needs: absence
+   from the map means "source" (an ocean costs zero bytes, `water.h:55-58`
+   **[codebase]**), a live map entry means "flow, recompute from neighbours"
+   (`WATER_MAP_SLOTS` = 2048, `water.h:137` **[codebase]**), work is examined only
+   when a cell or its neighbour just changed rather than rescanned every tick
+   (`water.h:111-114` **[codebase]**), it is capped at a fixed per-tick budget
+   (`WATER_TICK_BUDGET` = 64, `water.h:151` **[codebase]**), and it is *proven*, not
+   assumed, order-independent and terminating — a host test hashes the settled world
+   after the same pour at three different per-tick budgets and after disturbing two
+   sources in both orders, requiring byte-identical results (`water.h:105-107`
+   **[codebase]**). It is also, tellingly, **not persisted across a column unload**:
+   flow cells are dropped before a column reaches the save worker and the block
+   reverts to reading as a source (`water.h:61-64`, `waterDropColumn()`
+   **[codebase]**). §4's event-driven flood fill reaches a similar destination on
+   its own reasoning, but citing water.h directly would have supplied a tested
+   termination/order-independence argument in place of the "reasoned, not measured"
+   bound §4 currently carries, and would have surfaced §7's persistence answer
+   (state lives in the `BlockId`, so nothing is ever dropped) as a real design
+   choice made *against* this project's own existing precedent for exactly this
+   class of problem — worth stating as a deliberate divergence, not a default.
+
+5. **Line-number citations in the body above are as of this document's own writing
+   date and were not re-verified in this pass**, except where corrected above. One
+   confirmed drift, found in passing: this document's §0 cites
+   `docs/ROADMAP.md:396` for the version's one-line entry; as of 2026-09-04 that
+   entry lives at `docs/ROADMAP.md:464` ("## v1.9.2 — Redstone"), with its "Added."
+   line at `:466` — roughly a 68-line shift, consistent with a renumbering pass this
+   document predates. `docs/ROADMAP.md` is owned by another lane and was not
+   otherwise read for this correction. Re-grep before trusting any other line number
+   in the body above, the same caution `plan-1.8.18-monsters.md` §2 states outright
+   for its own citations of a concurrently-edited file.

@@ -407,9 +407,27 @@ exists to defeat a `.d`-file stem collision.
   not a power of two**, the two dimensions checked independently.
   `atlas_uv_shader_test.c:987-988` asserts it for the block atlas in as many words. **A
   128×192 sheet — six quadrants, the obvious minimal growth — is illegal and would be
-  rejected at runtime.** The real step is **128×128 → 128×256**: eight quadrants, four
-  animals, two monsters, **two spare**, at 128 × 256 × 2 = **65,536 bytes**, i.e.
+  rejected at runtime.** The real step is **128×128 → 256×128**: eight quadrants, four
+  animals, two monsters, **two spare**, at 256 × 128 × 2 = **65,536 bytes**, i.e.
   **+32,768 bytes of VRAM over today**.
+  >
+  > **[2026-09-04 correction, ANIMAL-ART]** This subsection originally said the grown sheet
+  > is **128×256** — width 128, height 256, i.e. **2 columns × 4 rows** of 64×64 quadrants.
+  > That is not what shipped. MON-BUILD's actual layout, read directly out of
+  > `source/scene/entitymodel.h:57-73`, is the **transpose**: `#define EM_SHEET_W 256` /
+  > `#define EM_SHEET_H 128`, `#define EM_QUADRANT_COLS 4`, with the header's own comment
+  > stating it outright — *"256x128 RGBA5551 = 65,536 bytes of VRAM, a 4x2 grid of 64x64
+  > quadrants (EM_QUADRANT_COLS wide, 2 tall)"* (`entitymodel.h:57-58`). `entitymodel.h:166-172`
+  > confirms the same thing from the quadrant table: `(k % EM_QUADRANT_COLS, k / EM_QUADRANT_COLS)`
+  > with `EM_QUADRANT_COLS = 4`, and `tools/make_animals.py` parses `EM_SHEET_W`/`EM_SHEET_H`
+  > out of that same header rather than restating them, so the shipped PNG is 256×128 too —
+  > `python tools/make_animals.py` reports `256x128 RGBA`. Both orientations are legal powers
+  > of two and both total 65,536 bytes, which is why nothing caught the mismatch until it was
+  > checked directly against the header. **The code is authoritative here — it is already
+  > built and tested (`entitymodel` self-test, `animal_test`) against its own 256×128/4-column
+  > layout — so this correction fixes the prose, not the code.** Every other "128×256" in this
+  > document (§4's numbers table, §7, §8's risk table, §9 item 3) means the same **256×128,
+  > 4×2** layout and should be read that way; they are not re-typed individually.
 - Two new `skin_*()` painters in `make_animals.py`. `plan-entities.md:849-852` already
   sketches how a zombie and a skeleton should look in this style, and that sketch survives
   even though its sheet layout does not.
@@ -546,7 +564,7 @@ small box, velocity toward the player, `ai_timer` as a TTL, gravity and block co
 free via the embedded `Body`, despawn on timer or on `bodyStep()` reporting it stopped. That
 argument is **correct about the entity layer and incomplete about everything else.** An arrow
 still needs: a seventh box-model kind and a seventh sheet quadrant (§2.6 — the sheet grows to
-128×256 either way, so this consumes one of the two spares), a hit test against the player
+256×128 either way, so this consumes one of the two spares), a hit test against the player
 each tick, and — the part nobody has costed — **it occupies a slot in the same 24-slot pool**,
 so a fight adds transient entities exactly when the pool is most contested.
 
@@ -618,7 +636,7 @@ kind reservation.
 | Monster sub-cap | 8 Old / 16 New | Mine, derived: `ENTITY_CAP_OLD 24 − ANIMAL_CAP_OLD 16 = 8`, and `48 − 32 = 16`. These are exactly the slots `animal.h:70-73` already holds back. Naming them makes the reservation symmetric and assertable. |
 | AI states | IDLE, WANDER, CHASE; no FLEE | `[reasoned]` — `[research-given]` confirms neither classic zombie nor skeleton flees. |
 | Monster drops | none — **his call**, §10.3 | Proposal. This is a release-shape decision, not flavour: a drop forces a registry row and a server release (§2.5). |
-| Entity sheet after growth | 128×256 RGBA5551 = 65,536 B | `[read]` + `[reasoned]` — 8 quadrants at the existing 64×64 convention, from a measured 128×128/32,768 B today. **Power of two is mandatory**, so 128×192 is not an option. |
+| Entity sheet after growth | 256×128 RGBA5551 = 65,536 B | `[read]` + `[reasoned]` — 8 quadrants (4 cols × 2 rows) at the existing 64×64 convention, from a measured 128×128/32,768 B today. **Power of two is mandatory**, so 128×192 is not an option. See §2.6's 2026-09-04 correction: this row originally said 128×256, transposed from what shipped. |
 | Free block-atlas slots | **6** (57..62); 63 permanently reserved | `[measured]` `ATLAS_PAINTED_SLOTS = 57`, `ATLAS_TILE_SLOTS = 64`, `ATLAS_TILE_MISSING = 63`. Relevant only if monsters drop items. |
 
 ---
@@ -757,7 +775,7 @@ is a 268 MHz ARM11 with **no L2 cache**. Everything below is about that machine;
 
 **What actually costs something:**
 
-1. **VRAM: +32,768 bytes**, growing the entity sheet 128×128 → 128×256 (§2.6). Small against
+1. **VRAM: +32,768 bytes**, growing the entity sheet 128×128 → 256×128 (§2.6). Small against
    6 MB, but note `plan-entities.md` §11.2's standing gap — **nobody has ever summed total
    VRAM in use** across the block atlas, crack atlas, font, fog ramp, entity sheet and render
    targets. VRAM exhaustion on this hardware surfaces as a texture silently rendering as
@@ -807,7 +825,7 @@ anything clever — the same instruction `plan-entities.md` gives for `ENTITY_CA
 | The spawner scatters random candidates across the loaded ring and quietly costs milliseconds on an Old 3DS through cache misses into the 16 KB light arrays. | Cluster candidates within one column/chunk (§7). Costs nothing, needs no new storage, and must be written down as a reason in the code — otherwise a later tidy-up "simplifies" it back into a random scatter. |
 | `entitymodel.c`'s box table and the kind enum drift apart, and a zombie renders as a sheep or as nothing. | Do nothing — the `_Static_assert`s already there are the trip-wire, and criterion A.5 requires them to still tie the two together afterwards. If a phase can leave them untouched, that is the signal something is wrong. |
 | `animalDef()` is widened to cover kinds 5-7 as the "obvious" way to share the table, and `animalThink()` silently starts running wander AI on a zombie. | The existing pinned test (`animal_test.c:254-256`) is the guard, and criterion A.4 requires it to pass **unchanged**. Use a dispatcher (§3.7), never a widened animal table. |
-| The entity sheet is grown to 128×192 — the obvious minimal step — and `C3D_TexInitWithParams` rejects it at runtime for not being a power of two. | Grow to 128×256 (§2.6). The constraint is recorded at `atlas_uv.h:15-21`, disassembled out of citro3d; it is not folklore. Two spare quadrants are a side benefit, not the reason. |
+| The entity sheet is grown to 128×192 — the obvious minimal step — and `C3D_TexInitWithParams` rejects it at runtime for not being a power of two. | Grow to 256×128 (§2.6). The constraint is recorded at `atlas_uv.h:15-21`, disassembled out of citro3d; it is not folklore. Two spare quadrants are a side benefit, not the reason. |
 | The texture lands wrong and reads as bad art rather than as an error — the PICA200 failure mode this project has already paid for. | Phase 6's probe: render the sheet at UV 0..1 and look at it **before** trusting any model UV, with a one-quadrant offset as the red arm. |
 | Monster drops are added late, "while we're in here", and the registry CRC moves without a server release — which the protocol cannot enforce, so a mismatched pair connects happily and degrades near-invisibly. | Keep drops out of the build until §10.3 is answered. If the answer is yes, drops become their own phase with the server release shipped first or simultaneously, exactly as v1.8.1 and v1.8.15 already required. |
 | No i-frames plus two zombies in a corridor equals an instant death the player never understands. | A short per-**player** hit cooldown (not per-monster) is a handful of lines and can be added in Phase 4 if the playtest says so. Flagged as §10.2 rather than pre-emptively built. |

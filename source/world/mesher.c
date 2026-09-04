@@ -150,6 +150,28 @@ typedef struct {
 #define CELL_FLAG_SOLID  ((uint8_t)(1u << 0))   // fills its cell: AO and occlusion read this
 #define CELL_FLAG_OCCL   ((uint8_t)(1u << 1))   // solid and opaque: hides the face behind it
 #define CELL_FLAG_DRAW   ((uint8_t)(1u << 2))   // emits geometry at all
+// ── OPT-MESHER task A: the drop value folded into this same byte's spare bits ────
+//
+// Bits 3..5 carry the 0..7 value that used to live in its own uint8_t[SCRATCH_BLOCKS] array
+// (s_cell_drop, 5,832 bytes of .bss) — see cellDrop() below for the read side and dropBuild()
+// for the write side. Three bits is exact, not generous: water_alpha_test.c already static-
+// asserts WATER_SURFACE_DROP < (1 << 3) as the premise for the OUTPUT vertex's own 3-bit drop
+// field (mesher.h's MESH_NRM_FACE_BITS neighbourhood), and dropBuild's own arithmetic —
+// nat = SCRATCH_WATER_STEPS - lvl, SCRATCH_WATER_STEPS being 8 — never produces a value
+// outside 0..7 either. Bits 6..7 stay free.
+//
+// Placed above DRAW rather than at bit 0 so CELL_DRAW_WORD below — one bit wide per byte lane
+// — stays exactly as correct as it was before this table grew a fourth field: emitCollect's
+// four-at-a-time word scan only ever tests bit 2 of each byte, so a nonzero drop packed into
+// the high bits of a water cell's byte can neither turn a real "these four cells draw
+// nothing" word falsely non-zero nor mask a real drawable cell out of it.
+//
+// Same technique v1.8.6 used to fold SOLID/OCCL/DRAW into one byte in the first place — see
+// that comment block above for the reasoning this repeats rather than invents: one packed
+// answer read once instead of two separate byte loads for two questions decided together.
+#define CELL_DROP_SHIFT  3
+#define CELL_DROP_BITS   3
+#define CELL_DROP_MASK   ((uint8_t)(((1u << CELL_DROP_BITS) - 1) << CELL_DROP_SHIFT))
 // The DRAW bit, replicated into all four byte lanes of a uint32_t — 0x01010101 times the bit
 // value rather than the literal 0x04040404, so the constant stays correct if the bit position
 // above ever moves. Byte-lane replication does not care about host endianness: byte i of the
@@ -157,26 +179,43 @@ typedef struct {
 #define CELL_DRAW_WORD   ((uint32_t)CELL_FLAG_DRAW * 0x01010101u)
 static uint8_t  s_cell_flags[SCRATCH_BLOCKS];
 
-// v1.8.0 task 22b. How far below its cell's top a flowing water surface sits, in eighths of a
-// block, per scratch cell. 0 is a full cube, which is every block in the game except a flowing
-// water cell — so the table is built only when the scratch actually carries flow levels, and
-// s_any_drop gates every read of it so a stale table from a previous chunk can never be read.
+// v1.8.0 task 22b, repacked by OPT-MESHER task A. How far below its cell's top a flowing water
+// surface sits, in eighths of a block, per scratch cell — 0 is a full cube, which is every
+// block in the game except a flowing water cell. s_any_drop gates every read so a stale value
+// from a previous chunk can never be read: meshChunk() rebuilds every cell's s_cell_flags byte
+// from s_cell_flag_of (a per-BlockId table that never sets bits 3..5) immediately before
+// dropBuild() runs, so a cell dropBuild never visits already reads back drop bits of 0 whether
+// or not this chunk has any water in it — s_any_drop exists only so cellDrop() can skip the
+// shift-and-mask on every one of the ~5,800 cells in a chunk that has no water at all.
 //
-// A table and not a call into world/water.c, for two reasons that are both structural. The
-// mesher is linked into six host binaries and the simulation into one, so a direct call would
-// drag the whole of water.c into all of them; and meshChunk() is handed a scratch, not a chunk
-// coordinate, so it could not name the cells to ask about even if it wanted to. The levels
-// arrive the same way the light does — copied into the scratch by the owner of that data, once,
-// before the mesh runs. See world/scratch.h's water band.
-static uint8_t  s_cell_drop[SCRATCH_BLOCKS];
+// A per-cell answer folded into the flags byte and not a call into world/water.c, for two
+// reasons that are both structural. The mesher is linked into six host binaries and the
+// simulation into one, so a direct call would drag the whole of water.c into all of them; and
+// meshChunk() is handed a scratch, not a chunk coordinate, so it could not name the cells to
+// ask about even if it wanted to. The levels arrive the same way the light does — copied into
+// the scratch by the owner of that data, once, before the mesh runs. See world/scratch.h's
+// water band.
 static bool     s_any_drop;
 
-// Every read of the drop table goes through here. When no cell in the scratch is flowing, the
-// table is not rebuilt at all and this answers 0 without touching it.
+// Every read of the drop bits goes through here. When no cell in the scratch is flowing, the
+// bits are not even read and this answers 0 unconditionally.
 static inline uint8_t cellDrop(int si)
 {
-	return s_any_drop ? s_cell_drop[si] : 0;
+	return s_any_drop ? (uint8_t)(s_cell_flags[si] >> CELL_DROP_SHIFT) : 0;
 }
+
+// OPT-MESHER task A test hooks. Exposes cellDrop() and the packed byte it now reads so a host
+// test can drive the real accessor across its full 0..7 drop range and every SOLID/OCCL/DRAW
+// combination directly, instead of re-deriving the packing by hand — see
+// tests/mesher_celldrop_test.c. Same convention as BS_MESH_MERGE_PROBE above: compiled out of
+// every build but the one host test binary that defines this macro, so the shipped build and
+// every other host suite pay nothing for it.
+#ifdef BS_CELLDROP_TEST_HOOKS
+uint8_t bsTestCellDrop(int si) { return cellDrop(si); }
+uint8_t bsTestGetCellFlags(int si) { return s_cell_flags[si]; }
+void bsTestSetCellFlags(int si, uint8_t flags) { s_cell_flags[si] = flags; }
+void bsTestSetAnyDrop(bool any) { s_any_drop = any; }
+#endif
 
 static FacePlan s_plan[BLOCK_FACES];
 
@@ -402,9 +441,6 @@ static inline uint8_t cornerAO(int si, const CornerPlan* c)
 // texcoord varying, i.e. redrawing the block. The half-grass/half-dirt tile is to be kept
 // exactly as it is, so its sides stay untinted and only its lid takes the biome's colour.
 //
-// LEAVES ARE NOT IN THIS LIST even though Minecraft tints them. Nobody asked for it; adding
-// BLOCK_LEAVES here is a one-line change if it is ever wanted.
-//
 // BLOCK_DIRT (v1.8.17) is tinted on ALL SIX faces, and that is not the same restriction grass
 // needed. world/registry.c gives dirt BTEX_DIRT on every face -- one uniform texture, not shared
 // with any other block's crust the way BTEX_GRASS_SIDE is -- so there is no half-tile to protect
@@ -414,6 +450,14 @@ static inline uint8_t cornerAO(int si, const CornerPlan* c)
 // faceTint()/scratchColumnOf() below -- so this colours every dirt face at every depth in a
 // tinted column, including underground walls, and that is a consequence of the existing per-
 // column design rather than a new kind of read.
+//
+// LEAVES (v1.8.18): BLOCK_LEAVES, BLOCK_BIRCH_LEAVES and BLOCK_SPRUCE_LEAVES take the DIRT
+// restriction, not the grass one -- all six faces. world/registry.c gives each of the three one
+// uniform texture (BTEX_LEAVES / BTEX_BIRCH_LEAVES / BTEX_SPRUCE_LEAVES) on every face, never
+// shared with any other block's crust the way BTEX_GRASS_SIDE is, so there is no half-tile to
+// protect here either. This was the line this comment used to say was a one-line change "if it
+// is ever wanted" -- steve asked for grass, leaves and foliage to read as their biome by colour,
+// so it is wanted now.
 //
 // BLOCK_TALL_GRASS_TOP was MISSING here from v1.8.8 until v1.8.16, and the way it failed is
 // worth keeping. The two-block clump is one plant written as two stacked cross blocks
@@ -434,7 +478,10 @@ static bool blockFaceTintable(BlockId id, int face)
 	case BLOCK_DIRT:
 	case BLOCK_TALL_GRASS:
 	case BLOCK_TALL_GRASS_TOP:
-	case BLOCK_FERN:       return true;
+	case BLOCK_FERN:
+	case BLOCK_LEAVES:
+	case BLOCK_BIRCH_LEAVES:
+	case BLOCK_SPRUCE_LEAVES: return true;
 	default:               return false;
 	}
 }
@@ -455,10 +502,115 @@ static inline int scratchColumnOf(int si)
 // The `tint_any` half is what makes this free for every caller that predates the feature —
 // scratchFill clears the band and leaves the flag false, so a host suite or a console build
 // with no biome source wired in never reads the band at all. See MeshScratch in scratch.h.
+// ── v1.8.18 biome tint: border blend ─────────────────────────────────────────
+//
+// A hard biome edge reads as a bug -- steve asked for the border to fade the way Minecraft's
+// does. Minecraft gets that by averaging actual RGB over a neighbourhood; this mesher cannot,
+// structurally, do the same thing. The tint a vertex carries is a 3-bit PALETTE INDEX packed
+// into the spare bits of the ao byte (world/mesher.h's meshAoPack) -- zero bytes per vertex,
+// resolved to colour only in the shader's 8-row palette -- and averaging two indices is not
+// averaging their colours (index 2 and index 5 do not sit "between" each other; the row between
+// them is whatever biome happens to be numbered 3 or 4). Storing a real blended colour instead
+// would mean a float (or even a byte) triple per vertex, which is exactly the cost v1.8.8 built
+// this scheme to avoid, and it would still need the shader and the vertex format to change --
+// scene/chunk_render.c and the two .pica files, none of which this task owns.
+//
+// So the border blends the only way a fixed 8-row palette can: ordered (Bayer) dithering, the
+// decades-old trick every limited-palette system has used to fake a gradient with the colours
+// it actually has. tintBlendBuild walks the tint band once per chunk and, only in the one- or
+// two-column strip where a column's own tint disagrees with an orthogonal neighbour's, mixes in
+// the neighbour's tint on a fraction of those columns -- chosen by a fixed 4x4 threshold matrix,
+// not randomly, so two overlapping meshes of the same world data always dither identically.
+// Columns with all four neighbours agreeing (the overwhelming majority of any biome's interior)
+// take the fast path straight through unchanged.
+//
+// Cost: one extra O(18x18) = 324-column pass over data the band already holds -- four array
+// reads and a table lookup per column, no extra noise or generator calls -- gated by
+// s->tint_any exactly like dropBuild is gated by s_any_drop, so a scratch with no biome source
+// (every host suite that predates this, and the console before a WorldGen is wired in) pays
+// nothing. Measured against BUDGET_MS: see this task's report for the arm-none-eabi-size delta;
+// this pass was not profiled on hardware, only reasoned about from its O(324) shape relative to
+// the ~5,800-cell walks meshChunk already does per chunk.
+//
+// Classic 4x4 ordered-dither matrix -- public domain, decades older than this project, not
+// borrowed from any game's assets or tables. Values 0..15; used below as a per-column
+// threshold. Every column of this particular arrangement carries exactly two values under 8 and
+// two at or above it, which is what keeps the dither from silently vanishing on a border that
+// happens to run along a single fixed row or column of the matrix.
+static const uint8_t s_bayer4[4][4] = {
+	{  0,  8,  2, 10 },
+	{ 12,  4, 14,  6 },
+	{  3, 11,  1,  9 },
+	{ 15,  7, 13,  5 },
+};
+
+// The blended band faceTint() actually reads. Filled fresh by tintBlendBuild() every chunk that
+// carries a tint at all; a stale copy from a previous chunk can never be read because faceTint()
+// never looks at it unless s->tint_any is true for THIS chunk -- same convention as
+// s_cell_drop/cellDrop above.
+static uint8_t s_tint_blend[SCRATCH_DIM * SCRATCH_DIM];
+
+static void tintBlendBuild(const MeshScratch* s)
+{
+	// The outer ring (sx/sz 0 and SCRATCH_DIM-1) is the one-block halo copied in from
+	// neighbouring chunks purely for AO/light/occlusion reads -- meshChunk() never emits a face
+	// whose OWN column sits there, so it never needs a blended answer and is left raw.
+	for (int sz = 1; sz < SCRATCH_DIM - 1; sz++) {
+		for (int sx = 1; sx < SCRATCH_DIM - 1; sx++) {
+			const int     col = scratchColumn(sx, sz);
+			const uint8_t own = s->tint[col];
+
+			// MESH_TINT_NONE means "no biome data here", not a biome in its own right, so an
+			// untinted column is never dithered INTO a colour. In real play this branch is
+			// theoretical: scratchFillTint's callback (world/scene/chunk_render.c's
+			// genColumnTint) resolves every column of a filled band from the same noise field,
+			// so a chunk with tint_any true has a real 1..MESH_TINT_ROWS-1 row in EVERY column,
+			// never a mix of real rows and bare zero. It matters here only because this
+			// project's own host fixtures (biome_tint_test.c) tint a single column and leave
+			// the rest at the struct's zero-init, and that must not read as "a biome called
+			// zero surrounds this block on every side."
+			if (own == MESH_TINT_NONE) {
+				s_tint_blend[col] = MESH_TINT_NONE;
+				continue;
+			}
+
+			// Four orthogonal taps, not the full eight-neighbour ring: cheaper, and on the flat
+			// open ground a biome border mostly runs across, a diagonal neighbour never differs
+			// from `own` without an orthogonal one differing too. A MESH_TINT_NONE tap is
+			// skipped for the same reason `own` is handled above -- it is "no data", not a
+			// bordering biome, and must not pull a real tint back down to the identity.
+			const uint8_t nbr[4] = {
+				s->tint[scratchColumn(sx,     sz - 1)],
+				s->tint[scratchColumn(sx,     sz + 1)],
+				s->tint[scratchColumn(sx - 1, sz    )],
+				s->tint[scratchColumn(sx + 1, sz    )],
+			};
+
+			int     diff  = 0;
+			uint8_t other = own;
+			for (int n = 0; n < 4; n++)
+				if (nbr[n] != own && nbr[n] != MESH_TINT_NONE) { diff++; other = nbr[n]; }
+
+			if (diff == 0) {
+				s_tint_blend[col] = own;   // deep interior: no border within one tap, no dither
+				continue;
+			}
+
+			// The switch level grows with how many of the four taps disagree, and clears the
+			// matrix's own ceiling (16) once all four do -- a column surrounded on every side by
+			// the other biome always takes it outright, so the dither only ever softens the
+			// narrow band right at an edge and never strands a lone column in the wrong colour.
+			const int     level     = diff * 4 + 2;
+			const uint8_t threshold = s_bayer4[sz & 3][sx & 3];
+			s_tint_blend[col] = (threshold < level) ? other : own;
+		}
+	}
+}
+
 static inline uint8_t faceTint(const MeshScratch* s, int si, bool tintable)
 {
 	if (!tintable || !s->tint_any) return MESH_TINT_NONE;
-	return (uint8_t)(s->tint[scratchColumnOf(si)] & MESH_TINT_MASK);
+	return (uint8_t)(s_tint_blend[scratchColumnOf(si)] & MESH_TINT_MASK);
 }
 
 // Smooth per-corner light: average the four cells touching this corner from outside the
@@ -699,7 +851,7 @@ static inline bool sameMaterialCovers(const MeshScratch* s, int ni, uint8_t id, 
 	if (!(s_cell_flags[ni] & CELL_FLAG_DRAW) || s->blocks[ni] != id) return false;
 	if (!s_any_drop) return true;
 	if (face == FACE_TOP || face == FACE_BOTTOM) return true;
-	return s_cell_drop[ni] <= drop;
+	return cellDrop(ni) <= drop;
 }
 
 static inline bool mergeCandidate(const MeshScratch* s, int nb, int face, uint8_t id,
@@ -1353,7 +1505,12 @@ static void dropBuild(const MeshScratch* s)
 	s_any_drop = false;
 	if (!s->water_any && !s->has_water) return;
 
-	memset(s_cell_drop, 0, sizeof s_cell_drop);
+	// OPT-MESHER task A: no separate clear needed here any more. meshChunk() rebuilds every
+	// cell's s_cell_flags byte from s_cell_flag_of (a per-BlockId table that never sets bits
+	// 3..5 — see that table's own comment) immediately before calling this function, so every
+	// cell's drop bits are already 0 on entry. The 5,832-byte memset this file used to pay on
+	// every chunk meshed with any water in it — water or not, cell by cell — was clearing bits
+	// that the per-chunk rebuild had already cleared.
 
 	const int above = SCRATCH_DIM * SCRATCH_DIM;
 	for (int i = 0; i < SCRATCH_BLOCKS - above; i++) {
@@ -1370,8 +1527,15 @@ static void dropBuild(const MeshScratch* s)
 
 		const uint8_t lvl = s->water[i];
 		const uint8_t nat = lvl ? (uint8_t)(SCRATCH_WATER_STEPS - lvl) : 0u;
+		const uint8_t drop = nat > WATER_SURFACE_DROP ? nat : (uint8_t)WATER_SURFACE_DROP;
 
-		s_cell_drop[i] = nat > WATER_SURFACE_DROP ? nat : (uint8_t)WATER_SURFACE_DROP;
+		// Bits 0..2 (SOLID/OCCL/DRAW) were just set for this exact cell by meshChunk()'s
+		// per-id rebuild, a few lines above the dropBuild() call, and must survive untouched
+		// here — water is SOLID+OCCL+DRAW like any other full cube in today's registry, but
+		// masking rather than overwriting preserves that by construction, not by coincidence
+		// of what is solid today. Bits 6..7 are unused and read back 0.
+		s_cell_flags[i] = (uint8_t)((s_cell_flags[i] & (uint8_t)~CELL_DROP_MASK) |
+		                             (uint8_t)(drop << CELL_DROP_SHIFT));
 		s_any_drop = true;
 	}
 }
@@ -1403,6 +1567,11 @@ void meshChunk(MeshOut* out, const MeshScratch* s)
 	// v1.8.0 task 22b. How tall each water cell is drawn. One branch and nothing else for a
 	// scratch with no flowing water in it, which is every chunk until a player digs into a sea.
 	dropBuild(s);
+
+	// v1.8.18. The dithered border blend faceTint() reads — see tintBlendBuild's own comment.
+	// One branch and nothing else for a scratch with no biome tint in it at all, the same gate
+	// dropBuild uses above.
+	if (s->tint_any) tintBlendBuild(s);
 
 	// Which cells emit at all, and which half of the frame each belongs to. One sweep for both.
 	emitCollect(s);

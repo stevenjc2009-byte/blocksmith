@@ -25,6 +25,7 @@
 #include "app/crash.h"
 #include "app/debugmenu.h"
 #include "app/debugmenu_ui.h"
+#include "app/diag_retire.h"
 #include "app/hw.h"
 #include "audio/audio.h"
 #include "audio/audio_sfx.h"
@@ -47,6 +48,7 @@
 #include "debug/metrics.h"
 #include "entity/animal.h"
 #include "entity/entity.h"
+#include "entity/monster.h"
 #include "gfx/atlas.h"
 #include "gfx/font.h"
 #include "gfx/particles.h"
@@ -3647,62 +3649,11 @@ static bool runTitleScreen(Options* opts, bool returning_from_server)
 
 #endif   // BS_TITLE
 
-// Clears every diagnostic file this build can write, at boot, before anything can write one.
-//
-// This exists because of a specific and expensive mistake. steve booted v1.2.0 twice — once
-// into multiplayer, once into single player — and both froze. The card came back with
-// postmortem.txt saying "frame 2, GPU wedged" and hang.txt saying "340 frames drawn, phase
-// DRAW". Both stamped 1.2.0. Both cannot describe the same freeze, and nothing on the card said
-// which boot either came from, so two separate failures were read as one and the fix that
-// followed was aimed at an average of them.
-//
-// After this runs, any diagnostic file on the card is from the boot that just froze, full stop.
-// A boot that freezes writes files and cannot clear them; the next boot clears them before
-// writing its own. There is no third possibility and no way to be looking at last time's
-// evidence.
-//
-// drawprobe.txt is deliberately NOT cleared: it is the one file whose whole job is to survive a
-// boot, because a boot that hangs never writes its own survival line and the silence is what the
-// next boot reads. bootid.txt is written last, so a card with diagnostic files but no bootid.txt
-// means the fence itself failed and nothing on it should be trusted.
-//
-// ── 2026-09-03: this fence used to DELETE. It now renames to prev-*. ───────────────────────
-//
-// The invariant above is unchanged and is the whole reason this function exists, so read the
-// change as narrowly as it is meant: an un-prefixed diagnostic file still means "written by the
-// boot that just froze, full stop", because the fence still moves every one of them out of the
-// way before anything can write. Nothing that was true of a file called hang.txt yesterday is
-// less true of it today.
-//
-// What changed is what happens to the PREVIOUS boot's copy, and it changed because the old
-// answer — destroy it — cost us the only evidence of the only freeze we currently care about.
-// steve froze a real console at render distance 5 after walking one or two chunks from spawn.
-// hang.txt on his card is the single most informative artefact in this entire investigation, it
-// exists in exactly one copy, and until this edit the act of launching the game to reproduce the
-// bug was also the act of erasing the record of it. A diagnostic system whose first move on
-// startup is to destroy the diagnosis has a defect regardless of how well the deletion is
-// argued, and the argument for deletion was never about deletion: it was about AMBIGUITY, about
-// not being able to tell which boot a file came from. prev- answers that question outright, so
-// the fence keeps everything the reasoning above actually asked for and stops paying for it with
-// the evidence.
-//
-// One generation, not a rotation. prev-hang.txt is overwritten by the next boot in turn, so this
-// buys exactly one accidental relaunch, which is the failure mode that actually happens — the
-// console froze, you power-cycled it, you launched the game again before it occurred to you that
-// the card had anything on it. Keeping more would mean managing a ring on a user's SD card for a
-// benefit nobody has ever needed.
-//
-// The remove-then-rename order is not defensive noise: FAT rename() refuses an existing target,
-// so without the remove the second freeze in a row would silently keep the FIRST one's prev-
-// file and quietly discard the newer one — the exact ambiguity this fence exists to prevent,
-// reintroduced through the back door. The fallback to remove() on a failed rename preserves the
-// old behaviour rather than leaving a stale file lying around claiming to be this boot's.
-static void diagRetire(const char* live, const char* prev)
-{
-	remove(prev);
-	if (rename(live, prev) != 0)
-		remove(live);
-}
+// diagRetire() now lives in app/diag_retire.h/.c — see there for the full incident history
+// (why the fence renames rather than deletes, and why retirement is conditional on this boot
+// having anything to retire). Moved out on 2026-09-04 so tests/diag_retire_test.c can link the
+// real function directly instead of a hand-copied twin: main.c pulls in <3ds.h> at its very
+// first #include and can never be compiled as a whole on the host.
 
 static void diagFenceBoot(void)
 {
@@ -3742,15 +3693,18 @@ static void diagFenceBoot(void)
 		"console   : %s\n"
 		"boot tick : %llu\n"
 		"\n"
-		"Every other diagnostic file in this folder was renamed to prev-<name> immediately\n"
-		"before this one was written. So anything sitting beside it WITHOUT that prefix —\n"
-		"hang.txt, postmortem.txt, gxprobe.txt, cmd*.bin — was written by THIS boot and no\n"
-		"other, and anything WITH it is from the boot before this one. drawprobe.txt is the\n"
-		"exception and is meant to span boots.\n"
+		"Every other diagnostic file in this folder was retired to prev-<name> immediately\n"
+		"before this one was written, but only if this boot actually had one to retire — a\n"
+		"boot that produced nothing new leaves prev-<name> exactly as it was. So anything\n"
+		"sitting beside it WITHOUT that prefix — hang.txt, postmortem.txt, gxprobe.txt,\n"
+		"cmd*.bin — was written by THIS boot and no other, and anything WITH it is from the\n"
+		"most recent boot that actually wrote one, however many clean boots came after it.\n"
+		"drawprobe.txt is the exception and is meant to span boots.\n"
 		"\n"
 		"If you are here because the console froze: the file you want is hang.txt if this boot\n"
-		"is the one that froze, or prev-hang.txt if you have already relaunched the game since.\n"
-		"Only one generation is kept, so relaunching a second time will discard it.\n",
+		"is the one that froze, or prev-hang.txt if you have already relaunched since. Clean\n"
+		"relaunches do NOT discard prev-hang.txt any more — it is only replaced once another\n"
+		"freeze writes a new hang.txt and you relaunch again after that.\n",
 		BLOCKSMITH_VERSION_SET ? BLOCKSMITH_VERSION : "(unset)",
 		n3ds ? "New 3DS" : "Old 3DS",
 		(unsigned long long)svcGetSystemTick());
@@ -3780,11 +3734,28 @@ static void diagFenceBoot(void)
 static void gpuWaitPrevFrame(void)
 {
 #if BS_GPU_TESTS
-	// Bounded (BS_GPU_WEDGE_NS) and self-reporting: if the queue really has stopped, this
+	// Bounded (BS_GPU_WEDGE_TICKS) and self-reporting: if the queue really has stopped, this
 	// gives up rather than hanging the console, and writes sdmc:/blocksmith/postmortem.txt.
+	//
+	// FIXED 2026-09-04: gpu_dead added. Without it, this call paid a fresh bounded wait EVERY
+	// FRAME once the GPU wedged — gxCmdQueueWait can only return false by burning its whole
+	// timeout, so a wedged GPU turned every subsequent frame into another multi-second stall.
+	// That is exactly the failure the draw block's own gpu_dead guard further down was written
+	// to prevent ("a frozen console becoming one that merely runs at a small fraction of a frame
+	// per second"), and that guard was never mirrored up here — so the thing its comment says
+	// was fixed was still happening, at this call site, in every shipped build.
+	//
+	// Skipping the wait once dead is safe. The race this function exists to prevent is the GPU
+	// still READING mesh slots that this frame's CPU work is about to overwrite; once the GPU is
+	// proven to be executing nothing at all, there is no reader to race.
 	static u32 wait_frame;
+	static bool gpu_dead;
+	if (gpu_dead) return;
 	wait_frame++;
-	if (!gpuTestFrameWait()) gpuTestPostMortem(wait_frame);
+	if (!gpuTestFrameWait()) {
+		gpuTestPostMortem(wait_frame);
+		gpu_dead = true;
+	}
 #else
 	// CORRECTED v1.8.10. This was C3D_FrameSync(), on the strength of c3d/renderqueue.h's
 	// one-line doc comment "Waits for the GPU to finish rendering." That comment is misleading
@@ -3867,6 +3838,50 @@ static void onRemoteEdit(void* userdata, int x, int y, int z)
 	// furnace pays its contents into the inventory -- so a stale record was a duplication
 	// route, not merely stale data.
 	blockStateRemove(&s_blockstate, x, y, z);
+
+	// v1.8.18. The place half of the mirror above, and the reason net/networld_test.c's
+	// "a remote place of a furnace makes the block AND its blockstate record" stanza was
+	// red: the remove above has always been here, but nothing ever CREATED a record on
+	// this path. A furnace placed by another player therefore existed as a block and
+	// nothing else -- blockStateGet on it answered false forever, so it held no fuel, no
+	// input, no progress, and no amount of interacting with it could change that. The
+	// local place path in the main loop has done this since v1.8.15; only the remote path
+	// was missed.
+	//
+	// The block is read back out of the world rather than passed in because this hook's
+	// signature deliberately carries only a coordinate -- net/networld.h's NetworldEditFn
+	// reports WHICH CELL changed and leaves what that means to the owner of the tables,
+	// which is this file. worldGet is the same question the mesher asks about the same
+	// cell one line below, so it is already warm.
+	//
+	// Gated on BLOCK_FURNACE, unlike the remove above, and the asymmetry is the same one
+	// the local path spells out at length: removing state costs nothing and is idempotent,
+	// so the break side can afford to hold no opinion about which blocks are stateful.
+	// Creating is not free -- BLOCKSTATE_SLOTS is 64, and creating a record for every
+	// remote dirt block would fill the table in seconds of somebody else building and
+	// leave no slot for a real furnace.
+	//
+	// The return is discarded for the same reason it is discarded locally: a full table
+	// means 64 live records, and the furnace block itself has already landed in the world
+	// via net/networld.c's worldSet. Un-placing another player's block underneath them
+	// would be a far stranger outcome than a furnace that will not hold fuel, and every
+	// read of an absent record is a clean "no state here" by world/blockstate.h's contract.
+	if (worldGet(&s_world, x, y, z) == BLOCK_FURNACE) {
+		if (blockStateCreate(&s_blockstate, x, y, z, BLOCK_FURNACE)) {
+			// Packing a zeroed FurnaceState over blockStateCreate's own zero-fill is
+			// redundant today and done anyway, for the reason the local path gives: "zero
+			// happens to mean empty" is a property of world/furnace.h's current field
+			// layout, not a promise it makes. The day a field gains a non-zero resting
+			// value, this is what keeps a remotely placed furnace correct.
+			FurnaceState fs;
+			furnaceStateInit(&fs);
+
+			uint8_t payload[BLOCKSTATE_PAYLOAD_BYTES];
+			furnaceStatePack(&fs, payload);
+			(void)blockStateSet(&s_blockstate, x, y, z, BLOCK_FURNACE, payload);
+		}
+	}
+
 	// v1.5.0: remote edits relight before remeshing, same as scene/interact.c does for
 	// local break/place — otherwise another player's torch-adjacent or shade-casting
 	// change lands with stale light until the column happens to regenerate.
@@ -4046,9 +4061,16 @@ static void memProbeBootMark(const char* name)
 // osGetMemRegion* is libctru and memprobe.c is deliberately free of <3ds.h>.
 #define MEMPROBE_REGION_TAIL 512
 
+// v1.8.18, lane IDX-HARDEN task C. A second tail, appended after the region summary, for the
+// index-buffer/tier-arena physical addresses chunk_render.c now measures at boot — see
+// chunkRenderIndexVirt/Phys and chunkRenderTierVirt/Phys in scene/chunk_render.h for what this
+// closes. Same reasoning as MEMPROBE_REGION_TAIL just above: chunk_render.c owns the pointers
+// and osConvertVirtToPhys, main.c owns the SD write, and neither wants the other's dependency.
+#define MEMPROBE_CHUNK_TAIL 512
+
 static void memProbeBootFlush(void)
 {
-	static char report[MEMPROBE_REPORT_MAX + MEMPROBE_REGION_TAIL];
+	static char report[MEMPROBE_REPORT_MAX + MEMPROBE_REGION_TAIL + MEMPROBE_CHUNK_TAIL];
 	const int len = memProbeFormat(&s_memprobe, report, MEMPROBE_REPORT_MAX);
 	if (len <= 0) {
 		static const char kFailed[] = "boot memory probe: memProbeFormat refused\n";
@@ -4105,7 +4127,39 @@ static void memProbeBootFlush(void)
 	const size_t total = (n > 0 && n < MEMPROBE_REGION_TAIL)
 	                   ? (size_t)len + (size_t)n
 	                   : (size_t)len;
-	watchdogWriteFile(MEMPROBE_REL, report, total);
+
+	// v1.8.18, lane IDX-HARDEN task C. chunkRenderInit() already succeeded by the time this
+	// function is ever reached — main() returns 1 above (the "shader/atlas/pool init FAILED"
+	// screen) before memProbeBootMark("chunkRenderInit")/memProbeBootFlush() are ever called —
+	// so these four accessors are always real boot-time readings here, never the "not measured"
+	// 0 they return before init or after chunkRenderExit.
+	//
+	// idx0_off is GPUREG_INDEXBUFFER_CONFIG's own offset field at first=0 — phys(s_shared_
+	// indices) - 0x18000000, VRAM base, which is what BufInfo_Init always sets base_paddr to —
+	// computed here rather than left for whoever reads memprobe.txt to subtract by hand, because
+	// that number is the entire reason this probe exists: C3D_DrawElements adds 2*first to it
+	// for every real draw, and if THIS value already sits near the top of whatever field width
+	// the register actually has, some in-range `first` later in the session pushes it over.
+	const uint32_t idx_phys = chunkRenderIndexPhys();
+	const uint32_t idx0_off = idx_phys - 0x18000000u;
+
+	const int n2 = snprintf(report + total, MEMPROBE_CHUNK_TAIL,
+	                        "chunk render buffers (lane IDX-HARDEN task C)\n"
+	                        "  index buf    virt 0x%08lx phys 0x%08lx  offset@first=0 0x%08lx\n"
+	                        "  tier S arena virt 0x%08lx phys 0x%08lx\n"
+	                        "  tier M arena virt 0x%08lx phys 0x%08lx\n"
+	                        "  tier L arena virt 0x%08lx phys 0x%08lx\n",
+	                        (unsigned long)chunkRenderIndexVirt(), (unsigned long)idx_phys,
+	                        (unsigned long)idx0_off,
+	                        (unsigned long)chunkRenderTierVirt(0), (unsigned long)chunkRenderTierPhys(0),
+	                        (unsigned long)chunkRenderTierVirt(1), (unsigned long)chunkRenderTierPhys(1),
+	                        (unsigned long)chunkRenderTierVirt(2), (unsigned long)chunkRenderTierPhys(2));
+
+	// Same "short tail beats a mangled one" rule as the region summary just above — if this
+	// block did not fit, the file still ends with a complete, honest region summary rather than
+	// a truncated address block.
+	const size_t total2 = (n2 > 0 && n2 < MEMPROBE_CHUNK_TAIL) ? total + (size_t)n2 : total;
+	watchdogWriteFile(MEMPROBE_REL, report, total2);
 }
 
 int main(void)
@@ -4277,7 +4331,14 @@ int main(void)
 	// comment for what happens if it does not. The return value is deliberately not checked
 	// here: a console that cannot bring up am:net or the RomFs still plays the game, and
 	// updaterAvailable() is how the menu finds out.
+	//
+	// v1.8.19: bracketed with the same boot-heap probe as chunkRenderInit above, so
+	// memprobe.txt records free heap either side of probeCertBundle()'s mbedtls_x509_crt_parse()
+	// call inside updaterInit() -- the one live untested hypothesis for the CACERT_BADFILE
+	// reports is OOM during that parse (121 certs / 188,900 bytes of PEM).
+	memProbeBootMark("preUpdaterInit");
 	updaterInit(true);
+	memProbeBootMark("postUpdaterInit");
 
 	// v1.4.0: sleep preserver (APT hook) and battery telemetry (PTMU), both process-wide for
 	// the whole life of the app, so they sit here with the other boot-time services rather
@@ -4346,6 +4407,12 @@ int main(void)
 	audioSfxRegister(SFX_BLOCK_BREAK, audioLoad("romfs:/sfx/block_break.bsnd"));
 	audioSfxRegister(SFX_BLOCK_PLACE, audioLoad("romfs:/sfx/block_place.bsnd"));
 	audioSfxRegister(SFX_FOOTSTEP,    audioLoad("romfs:/sfx/footstep.bsnd"));
+	audioSfxRegister(SFX_HURT,        audioLoad("romfs:/sfx/hurt.bsnd"));
+	audioSfxRegister(SFX_DEATH,       audioLoad("romfs:/sfx/death.bsnd"));
+	audioSfxRegister(SFX_EAT,         audioLoad("romfs:/sfx/eat.bsnd"));
+	audioSfxRegister(SFX_CRAFT,       audioLoad("romfs:/sfx/craft.bsnd"));
+	audioSfxRegister(SFX_SPLASH,      audioLoad("romfs:/sfx/splash.bsnd"));
+	audioSfxRegister(SFX_UI_TAP,      audioLoad("romfs:/sfx/ui_tap.bsnd"));
 
 	// ── One session ─────────────────────────────────────────────────────────────────────
 	//
@@ -5546,8 +5613,12 @@ session_start:
 
 		if (!paused) {
 			const uint32_t eat_key = inputKey(ACTION_EAT);
-			if (eat_key && (down & eat_key))
+			if (eat_key && (down & eat_key)) {
 				ate_this_frame = survivalEat(&survival, &s_inv, s_inv.selected_hotbar);
+				// v1.9.0 SFX-WIRE-MAIN. Gated on the return, not the press, so a refusal
+				// (full hunger, non-food slot) stays silent same as the hunger bar does.
+				if (ate_this_frame) audioPlay(audioSfxId(SFX_EAT), AUDIO_PRIO_NORMAL, 1.0f);
+			}
 		}
 
 #if BS_WORLD_GEN
@@ -5654,9 +5725,21 @@ session_start:
 			// Inside the !paused gate with the step it reads, so a paused world cannot land a
 			// player who is not moving. Under !BS_FLY only, for the reason audioFootsteps is:
 			// the free-fly camera never touches player.body, so there is no fall to score.
+			// v1.9.0 SFX-WIRE-MAIN. health_before captured ahead of the call because
+			// fallDamageUpdate() itself only returns death, not whether it merely hurt —
+			// world/survival.h's health field is the only way to tell those apart.
+			// audioPlay, not audioPlayAt: audio_sfx.h has no explicit call for HURT/DEATH the
+			// way it does for CRAFT, but CRAFT's own reasoning applies just as well here —
+			// being hurt or dying is about the player, not a point in the world.
+			const uint8_t health_before_fall = survival.health;
 			if (fallDamageUpdate(&falltrack, &survival, &player.body, &s_world)) {
+				audioPlay(audioSfxId(SFX_DEATH), AUDIO_PRIO_HIGH, 1.0f);
 				survivalRespawn(&player, &survival, &falltrack,
 				                (float)spawn_x + 0.5f, (float)spawn_y, (float)spawn_z + 0.5f);
+			} else if (survival.health < health_before_fall) {
+				// Once per damage event, not scaled by points lost — a multi-point fall gets
+				// one stinger, not a burst of them stacking against the mixer.
+				audioPlay(audioSfxId(SFX_HURT), AUDIO_PRIO_HIGH, 1.0f);
 			}
 		}
 #endif
@@ -5815,9 +5898,15 @@ session_start:
 			// day a lethal tick effect lands — poison, drowning, lava — the handling is already
 			// here and the change stays inside survival.c rather than needing a new call site
 			// found in this file.
+			// v1.9.0 SFX-WIRE-MAIN. Same health_before/else-if pattern as the fall-damage
+			// hook above, and for the same reason: survivalTick() itself only returns death.
+			const uint8_t health_before_tick = survival.health;
 			if (survivalTick(&survival)) {
+				audioPlay(audioSfxId(SFX_DEATH), AUDIO_PRIO_HIGH, 1.0f);
 				survivalRespawn(&player, &survival, &falltrack,
 				                (float)spawn_x + 0.5f, (float)spawn_y, (float)spawn_z + 0.5f);
+			} else if (survival.health < health_before_tick) {
+				audioPlay(audioSfxId(SFX_HURT), AUDIO_PRIO_HIGH, 1.0f);
 			}
 
 			(void)waterTick(&s_water, &s_world, WATER_TICK_BUDGET, onWaterChange, NULL);
@@ -5846,9 +5935,71 @@ session_start:
 			// today -- and is passed anyway rather than NULL, so the day a rule wants the
 			// heightmap or the biome it is a change inside animal.c and not a new argument
 			// every lane has to agree to.
+			// v1.8.18 MOB-SPAWN. animalThink alone can no longer be the think hook once the
+			// pool can hold zombies and skeletons too -- entityThinkDispatch()
+			// (entity/monster.h) is the one function that knows how to route a slot to
+			// animalThink() or monsterThink() by kind, so it replaces animalThink() here and
+			// takes an EntityDispatchCtx (both context structs bundled) instead of a bare
+			// AnimalCtx. The AnimalCtx half is unchanged -- same &s_gen, same &s_animal_rng,
+			// and every word of the reasoning above about why `gen` is passed despite being
+			// unread today still applies to it.
+			//
+			// The one-hook alternative -- keep calling animalThink() here and add a SECOND
+			// entityTick()-style pass for monsters -- was considered and rejected. entityTick()
+			// reaps despawned slots and steps bodies for the WHOLE pool in one pass
+			// (entity.c), so calling it twice would double-step every animal's physics the
+			// moment a zombie existed, breaking animal movement in a way that would look like
+			// a movement bug and not like a wiring bug.
+			//
+			// MonsterCtx's player_x/z/eye_y feed detection, chase and skeleton line-of-sight
+			// on the same tick entityTick() is about to run think() with. The eye height is
+			// `player.body.y + PLAYER_EYE`, which is exactly what line 5728 above computes for
+			// player.cam.y -- the same existing number, not a new one, and written out the
+			// same way rather than reading cam.y so that this does not silently depend on the
+			// camera having already been moved this frame.
+			//
+			// player_damage is an OUT field -- monster.h documents it as "accumulated by
+			// think(), read by the caller after entityTick() returns" -- zeroed here every
+			// tick and read back immediately below.
 			AnimalCtx animal_ctx = { &s_gen, &s_animal_rng };
+			EntityDispatchCtx entity_ctx;
+			entity_ctx.animal  = animal_ctx;
+			entity_ctx.monster = (MonsterCtx){
+				&s_animal_rng, tickClockCount(&s_tickclock),
+				player.body.x, player.body.z, player.body.y + PLAYER_EYE,
+				0
+			};
 			(void)entityTick(&s_entities, &s_world, tickClockCount(&s_tickclock),
-			                  player.body.x, player.body.z, animalThink, &animal_ctx);
+			                  player.body.x, player.body.z, entityThinkDispatch, &entity_ctx);
+
+			// v1.8.18 MOB-SPAWN. Same health_before/SFX_HURT/SFX_DEATH/survivalRespawn shape
+			// as the fall-damage hook and the survivalTick() starvation hook above -- both
+			// already establish that pattern for a reason (survivalDamage() returns only
+			// death, not whether it merely hurt), and mob damage is the same contract, not a
+			// new one. Guarded on player_damage != 0 so a tick with nothing to report never
+			// captures health_before or touches audio for no reason.
+			if (entity_ctx.monster.player_damage != 0) {
+				const uint8_t health_before_mob = survival.health;
+				if (survivalDamage(&survival, entity_ctx.monster.player_damage)) {
+					audioPlay(audioSfxId(SFX_DEATH), AUDIO_PRIO_HIGH, 1.0f);
+					survivalRespawn(&player, &survival, &falltrack,
+					                (float)spawn_x + 0.5f, (float)spawn_y, (float)spawn_z + 0.5f);
+				} else if (survival.health < health_before_mob) {
+					audioPlay(audioSfxId(SFX_HURT), AUDIO_PRIO_HIGH, 1.0f);
+				}
+			}
+
+			// v1.8.18 MOB-SPAWN. Unconditional every tick, matching this loop's own
+			// established convention (see the furnace tick immediately below, and waterTick()
+			// above it): every 20 TPS subsystem here gates its own period internally rather
+			// than being called conditionally from this site, and monsterSpawnTick() is no
+			// exception -- its own `tick % MONSTER_SPAWN_PERIOD_TICKS != 0` gate
+			// (entity/monster.c) is what limits it to once every 40 ticks (2 s). It reuses
+			// s_animal_rng rather than opening a second stream, the same way
+			// animalSpawnForColumn() already shares it: a second Rng would be one more thing
+			// to seed, save and carry for no observed benefit.
+			(void)monsterSpawnTick(&s_entities, &s_world, tickClockCount(&s_tickclock),
+			                       player.body.x, player.body.y, player.body.z, &s_animal_rng);
 
 			// v1.8.15 "Furnace". Every lit furnace in the world advances one tick, here in the
 			// tick loop for the same reason water and entities are: world/furnace.h specifies
@@ -6006,6 +6157,10 @@ session_start:
 				// input was consumed — a refusal for any reason must leave the place path its
 				// press rather than swallowing it into nothing.
 				ate_this_frame = survivalEat(&survival, &s_inv, s_inv.selected_hotbar);
+				// v1.9.0 SFX-WIRE-MAIN. Same gate as the dedicated-key eat path above; the two
+				// sites share ate_this_frame and are mutually exclusive by construction (this
+				// one is guarded !ate_this_frame), so at most one SFX_EAT fires per frame.
+				if (ate_this_frame) audioPlay(audioSfxId(SFX_EAT), AUDIO_PRIO_NORMAL, 1.0f);
 			}
 		}
 
@@ -6408,6 +6563,12 @@ session_start:
 		// marker moved anyway, because the cost of moving it is one line and the cost of
 		// leaving it is a mislabelled report on the one occasion anybody ever reads one.
 		watchdogPhase(WD_PHASE_MESH);
+		// v1.8.18 MESH-SUBPHASE. relightDrain is the one piece of WD_PHASE_MESH's work that
+		// chunk_render.c cannot mark itself (it lives outside that file), so it is set here,
+		// at the only call site. Cleared implicitly: chunkRenderBuild sets WD_MESH_BUILD_ENTER
+		// on its own first line, so this value is only ever visible while relightDrain is
+		// actually running, never stale into the drains that follow it in the same phase.
+		watchdogMeshStage(WD_MESH_RELIGHT);
 		const u64 t_relight = svcGetSystemTick();
 		relightDrain(&s_world, &s_relightq, RELIGHT_MAX_COLUMNS,
 		             (u64)(RELIGHT_BUDGET_MS * CPU_TICKS_PER_MSEC), relightNowTicks);

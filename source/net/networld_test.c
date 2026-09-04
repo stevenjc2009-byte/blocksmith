@@ -1681,6 +1681,94 @@ static void test_remote_break_of_a_stateful_block_clears_its_state(void)
     free(src);
 }
 
+/* ---- a remote PLACE of a stateful block must create its per-position state --------------- */
+/* The other half of test_remote_break_of_a_stateful_block_clears_its_state above. main.c's
+ * LOCAL place path (the `if (it.placed_valid && it.placed_id == BLOCK_FURNACE)` block) claims
+ * a blockstate slot the moment a furnace lands, so the block is usable the instant it exists.
+ * The REMOTE path had no equivalent: onRemoteEdit() unconditionally removes whatever record
+ * stood at the cell (the fix above), but nothing ever recreates one for a furnace another
+ * player just placed. The furnace exists as a block -- worldGet() answers BLOCK_FURNACE -- but
+ * blockStateGet() on it answers false forever, because no blockStateCreate() call is reachable
+ * from this path. Interacting with such a furnace has nothing to read or write.
+ *
+ * This is not a missing capability in net/networld.c: net/networld.h's own header comment on
+ * NetworldEditFn already promises "the block is already readable with worldGet() by the time
+ * the hook runs" -- true today, unchanged by this test -- so onRemoteEdit() already has every
+ * fact it needs (s_world, x, y, z) to look the new block up and act on it. The gap is entirely
+ * that main.c's onRemoteEdit() never does. Same split as the test above: the behavioural half
+ * proves networld.c hands the hook a coordinate whose block is already readable; the
+ * source-text half proves the table's owner (main.c) acts on it for a furnace. */
+static void test_remote_place_of_a_furnace_creates_its_state(void)
+{
+    puts("a remote place of a furnace makes the block AND its blockstate record");
+
+    World w;
+    worldInit(&w);
+    networldInit();
+    networldSetWorld(&w);
+    hookReset();
+    networldSetEditHook(hookRecord, &hook_userdata_marker);
+
+    worldColumnCreate(&w, 0, 0);   /* column (0,0): x,z in 0..15 */
+    check(worldGet(&w, 4, 20, 8) == BLOCK_AIR, "fixture: nothing stands at (4,20,8) yet");
+
+    uint8_t msg[BS_BLOCK_EDIT_BYTES];
+    buildBlockEdit(msg, 4, 20, 8, BLOCK_FURNACE);
+    networldApplyPayload(msg, sizeof msg);
+
+    check(worldGet(&w, 4, 20, 8) == BLOCK_FURNACE, "the remote place landed the furnace block");
+    check(hook_count == 1 && hook_log[0].x == 4 && hook_log[0].y == 20 && hook_log[0].z == 8,
+          "the edit hook carried the placed cell's own coordinate to the table's owner, with "
+          "the block already readable via worldGet() -- net/networld.h's own promise");
+
+    networldSetEditHook(NULL, NULL);
+
+    /* Run from the repository root, the same working directory app/session_test.c and the
+     * break-side test above both read source/main.c out of. */
+    char *src = readWholeSourceFile("source/main.c");
+    check(src != NULL, "source/main.c could be read");
+    if (src == NULL) {
+        printf("  (source/main.c could not be read from this working directory)\n");
+        return;
+    }
+
+    check(strstr(src, "it.placed_id == BLOCK_FURNACE") != NULL,
+          "control: the LOCAL place path still gates on BLOCK_FURNACE, so this search shape "
+          "finds hits");
+    check(strstr(src,
+                 "blockStateCreate(&s_blockstate, it.placed_x, it.placed_y, it.placed_z") != NULL,
+          "control: the LOCAL place path still creates a record, confirming the control string "
+          "above is not stale");
+
+    const char *fn = strstr(src, "static void onRemoteEdit(");
+    check(fn != NULL, "main.c still has the remote-edit hook this test is about");
+    if (fn != NULL) {
+        /* Body only, same delimiting technique as the break-side test above: every statement in
+         * onRemoteEdit is a call or an unbraced if, so the first line-initial closing brace
+         * after its signature is its own. */
+        const char *end = strstr(fn, "\n}");
+        check(end != NULL, "the hook's body is delimited");
+        if (end != NULL) {
+            const size_t body_len = (size_t)(end - fn);
+            char *body = (char *)malloc(body_len + 1);
+            check(body != NULL, "the body could be copied out for searching");
+            if (body != NULL) {
+                memcpy(body, fn, body_len);
+                body[body_len] = '\0';
+                check(strstr(body, "BLOCK_FURNACE") != NULL,
+                      "THE DEFECT: the REMOTE place path never even names BLOCK_FURNACE, so it "
+                      "cannot be gating a create on it the way the local path does");
+                check(strstr(body, "blockStateCreate(") != NULL,
+                      "THE DEFECT: the REMOTE place path never calls blockStateCreate() at all "
+                      "-- a remotely placed furnace gets no state, ever");
+                free(body);
+            }
+        }
+    }
+
+    free(src);
+}
+
 static void test_edit_hook_silent_while_the_edit_is_only_queued(void)
 {
     puts("a queued remote edit does not notify until it actually reaches the world");
@@ -3739,6 +3827,7 @@ int main(void)
     test_the_session_generator_resolves_and_refuses();
     test_edit_hook_fires_for_an_applied_edit();
     test_remote_break_of_a_stateful_block_clears_its_state();
+    test_remote_place_of_a_furnace_creates_its_state();
     test_edit_hook_silent_while_the_edit_is_only_queued();
     test_edit_hook_fires_per_entry_of_a_sync_batch();
     test_edit_hook_is_cleared_by_init_and_optional();
@@ -3815,8 +3904,15 @@ int main(void)
      * body delimited, the body copied out, and the two that are the point of the file: the
      * remote path removes a record, and removes it for the coordinate it was handed).
      * Nothing removed. */
-    check(g_checks == 429,
-          "check-count guard: every check in this suite actually ran (429 before this line)");
+    /* 429 -> 440, same rule. test_remote_place_of_a_furnace_creates_its_state adds 11: 3
+     * behavioural (the air fixture, the landed furnace block, the hook's coordinate) and 8
+     * source-text (main.c readable, the local place path's own BLOCK_FURNACE gate as a control,
+     * the local path's own blockStateCreate call as a second control, onRemoteEdit found, its
+     * body delimited, the body copied out, and the two that are the point of the file: the
+     * remote path never names BLOCK_FURNACE and never calls blockStateCreate at all).
+     * Nothing removed. */
+    check(g_checks == 440,
+          "check-count guard: every check in this suite actually ran (440 before this line)");
 
     printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;

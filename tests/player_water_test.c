@@ -543,12 +543,250 @@ static void testLiveParticleCountsUnderRealScenarios(void)
 	}
 }
 
+// ── WATER-FEEL lane verification (2026-09) ──────────────────────────────────────────────────
+//
+// The coordinator re-raised two behaviours steve asked for: "hold A to bob out of water" and
+// "water bobbing back, but much calmer, Minecraft-style". Both already exist -- the
+// hold-to-rise rule in world/physics.c's bodyJump (v1.8.2/v1.8.4/v1.8.16) and the calm camera
+// swell in bodySurfaceBob (v1.8.3) -- and world/world_test.c already pins both to tight
+// numeric bounds (down to a thousandth of a block) by calling bodyJump/bodyStep/bodySurfaceBob
+// directly. What nothing exercises before the four tests below is the same behaviour reached
+// through the REAL input path: this file's own hidKeysHeld()/hidKeysDown() driving the real,
+// linked scene/player.c, exactly the way app/input_map.c's inputKey(ACTION_JUMP) resolves KEY_A
+// on an actual console. world_test.c's testPlayerWiresSwimming cannot do this -- its own header
+// comment says it only greps player.c as text. These four prove the WIRING, not just the
+// arithmetic, and report the real numbers rather than a description of code that did not
+// change.
+//
+// No tuning constant in world/physics.c or physics.h was touched to write these. physics.h is
+// outside this lane's three-file ownership (source/scene/player.c, source/world/physics.c,
+// this file), and world_test.c's testSurfaceSwim/testSwimOutOfWater/testSurfaceBob pin the
+// CURRENT constants to bounds this lane cannot safely move without reddening a suite it also
+// does not own and cannot fix -- exactly the "silently reverts another lane's work" failure
+// mode the lane split exists to prevent. See this lane's final report for the full reasoning.
+
+// ── ASK1: "hold A to bob out of water" ──────────────────────────────────────────────────────
+//
+// Minecraft's rule, and physics.c's bodyJump header comment states it as the target: BODY_
+// SUBMERGED pulls vy towards PLAYER_SWIM_UP_SPEED (3.0) while held, BODY_SURFACE holds it at
+// PLAYER_SURFACE_RISE (0.0) once there. This drives a body starting well under the surface
+// with the jump button held every frame -- a real button never reports "down" without also
+// reporting "held" the same frame, so g_keys_down only fires on frame 0, exactly as
+// testExitSplashFiresExactlyOnce's own header comment already establishes for this file.
+static void testHoldJumpSwimsUpAndSurfacesReal(void)
+{
+	World w;
+	buildWorld(&w);
+	particlesInit();
+
+	Player p;
+	// Feet at y=1.0: eye is 1.0 + PLAYER_EYE (1.62) = 2.62, well under the WATER_DEPTH=5
+	// plane -- BODY_SUBMERGED on the very first bodyWetUpdate, not BODY_SURFACE by accident.
+	playerInit(&p, 0.3f, 1.0f, 0.3f, 0.0f, 0.0f);
+	p.body.vy = 0.0f;
+
+	float peak_vy_submerged = -1000.0f;
+	bool  reached_surface = false;
+	int   surface_frame = -1;
+	int   resubmerge_after_surface = 0;
+
+	for (int frame = 0; frame < 180; frame++) {   // 3s at 60fps -- ample for a 4-block climb at 3 blocks/s
+		g_keys_held = KEY_A;
+		g_keys_down = (frame == 0) ? KEY_A : 0;
+
+		const BodyWet before = p.body.wet;
+		playerUpdate(&p, &w, 16.0f);
+		const BodyWet after = p.body.wet;
+
+		if (frame == 0) CHECK(after == BODY_SUBMERGED);   // the fixture: genuinely starts under
+
+		if (after == BODY_SUBMERGED && p.body.vy > peak_vy_submerged)
+			peak_vy_submerged = p.body.vy;
+
+		if (!reached_surface && after == BODY_SURFACE) {
+			reached_surface = true;
+			surface_frame = frame;
+		}
+		if (reached_surface && before == BODY_SURFACE && after == BODY_SUBMERGED)
+			resubmerge_after_surface++;
+	}
+
+	printf("  MEASURED hold-A climb (real input path): peak_vy_submerged=%.4f surface_frame=%d "
+	       "final_wet=%d final_eye_y=%.4f\n", (double)peak_vy_submerged, surface_frame,
+	       (int)p.body.wet, (double)(p.body.y + PLAYER_EYE));
+
+	CHECK(peak_vy_submerged > 2.5f);         // "swim steadily upward" -- close to the 3.0 target
+	CHECK(reached_surface);                  // "and you surface"
+	CHECK(resubmerge_after_surface == 0);    // holds there -- not thrown out and back under
+	CHECK(p.body.wet == BODY_SURFACE);       // still floating at the end
+	CHECK(p.body.y + PLAYER_EYE > (float)WATER_DEPTH);   // head clear of the water plane
+}
+
+// The negative control ASK1 needs: releasing (never pressing) the button must NOT produce the
+// same rise, or the test above would be proving nothing about the BUTTON. Started higher in
+// the column than the test above (y=3.0, not y=1.0) so a full second of undriven sinking at
+// PLAYER_WATER_TERMINAL (-1.5 blocks/s) cannot run the body out through the bottom of the
+// WATER_DEPTH=5 column before the run ends -- this fixture has no floor (buildWorld's own
+// header comment: "a WATER_DEPTH-deep... water pool sitting on nothing"), so falling out the
+// bottom would go BODY_DRY and the "never surfaced" check below would pass for the wrong
+// reason (dry, not held down) rather than the right one.
+static void testReleaseJumpDoesNotSustainRise(void)
+{
+	World w;
+	buildWorld(&w);
+	particlesInit();
+
+	Player p;
+	playerInit(&p, 0.3f, 3.0f, 0.3f, 0.0f, 0.0f);
+	p.body.vy = 0.0f;
+
+	bool ever_surfaced = false;
+
+	for (int frame = 0; frame < 60; frame++) {   // 1s
+		inputNeutral();   // no button at all
+		playerUpdate(&p, &w, 16.0f);
+		if (p.body.wet == BODY_SURFACE) ever_surfaced = true;
+	}
+
+	printf("  MEASURED no-input sink (real input path): final_wet=%d final_vy=%.4f final_y=%.4f\n",
+	       (int)p.body.wet, (double)p.body.vy, (double)p.body.y);
+
+	CHECK(!ever_surfaced);      // never rose to the surface without the button
+	CHECK(p.body.wet != BODY_DRY);   // and did not fall out the bottom of the fixture either --
+	                                   // this is a sink-rate control, not a free-fall one
+	CHECK(p.body.vy <= -1.0f);   // sinking under PLAYER_WATER_GRAVITY, not rising
+}
+
+// ── ASK2: "water bobbing back, but much calmer, Minecraft-style" ───────────────────────────
+//
+// v1.8.3's own header comment (world/physics.h) already answers this by name: the swell taken
+// out in v1.8.2 measured 0.223 blocks at 4.4 Hz (the body physically oscillating -- a limit
+// cycle, not a cosmetic effect); what replaced it is PLAYER_SURFACE_BOB (0.055 blocks) at
+// PLAYER_SURFACE_BOB_RATE (0.35 Hz), applied to the CAMERA only, after physics has already
+// settled. world_test.c's testSurfaceBob already proves bodySurfaceBob() in isolation stays
+// inside those bounds; this test proves the same thing through playerUpdate()'s real camera
+// assignment (`p->cam.y = p->body.y + PLAYER_EYE + bob`) with the real physics settling
+// underneath it, which is the one thing an isolated unit test of bodySurfaceBob cannot show.
+static void testCameraBobIsCalmAndNeverDipsUnderwaterReal(void)
+{
+	World w;
+	buildWorld(&w);
+	particlesInit();
+
+	Player p;
+	// Open water, far from BANK_X (20) -- nothing here can trip the shore climb.
+	playerInit(&p, 0.3f, 1.0f, 0.3f, 0.0f, 0.0f);
+	p.body.vy = 0.0f;
+
+	// Settle first. The same reasoning testSurfaceSwim (world_test.c) samples from frame 200 of
+	// 600: the climb itself is not the swell, and sampling through it would fold the climb's
+	// own transient into the bob measurement.
+	for (int frame = 0; frame < 180; frame++) {
+		g_keys_held = KEY_A;
+		g_keys_down = (frame == 0) ? KEY_A : 0;
+		playerUpdate(&p, &w, 16.0f);
+	}
+	CHECK(p.body.wet == BODY_SURFACE);   // the fixture actually settled at the waterline
+
+	float hi = -1000.0f, lo = 1000.0f, min_cam_y = 1000.0f;
+	int  crossings = 0;
+	bool prev_sign_pos = false, have_prev = false;
+
+	for (int frame = 0; frame < 600; frame++) {   // 10s at 60fps -- 3.5 cycles at 0.35 Hz
+		g_keys_held = KEY_A;
+		g_keys_down = 0;
+		playerUpdate(&p, &w, 16.0f);
+
+		const float off = p.cam.y - (p.body.y + PLAYER_EYE);
+		if (off > hi) hi = off;
+		if (off < lo) lo = off;
+		if (p.cam.y < min_cam_y) min_cam_y = p.cam.y;
+
+		const bool sign_pos = off >= 0.0f;
+		if (have_prev && sign_pos != prev_sign_pos) crossings++;
+		prev_sign_pos = sign_pos;
+		have_prev = true;
+	}
+
+	const double period_s  = (crossings > 0) ? (2.0 * 10.0 / (double)crossings) : 0.0;
+	const double approx_hz = (period_s > 0.0) ? 1.0 / period_s : 0.0;
+
+	printf("  MEASURED camera bob (real input+physics path): hi=%.5f lo=%.5f crossings=%d "
+	       "approx_hz=%.4f min_cam_y=%.4f water_plane=%.1f (removed judder was 0.223 blocks @ "
+	       "4.4Hz -- physics.h's own v1.8.2 measurement, not remeasured here)\n",
+	       (double)hi, (double)lo, crossings, approx_hz, (double)min_cam_y, (double)WATER_DEPTH);
+
+	CHECK(hi <= PLAYER_SURFACE_BOB + 0.001f);      // never exceeds the designed 5.5cm ceiling
+	CHECK(lo >= -PLAYER_SURFACE_BOB - 0.001f);
+	CHECK(hi > PLAYER_SURFACE_BOB * 0.5f);         // and it actually swells -- not flattened to 0
+	CHECK(min_cam_y > (float)WATER_DEPTH);         // never strobes the water plane through the camera
+	CHECK(approx_hz < 1.0f);                       // an order of magnitude calmer than the 4.4Hz judder
+}
+
+// Supporting measurement for ASK2's "peak vertical velocity on entry" criterion. bodyStep's own
+// header comment claims the clamp is instantaneous ("a body arriving at -60 is snapped to the
+// water terminal on this very tick, before it moves"); this drives a real fall through the real
+// playerUpdate() at -30 blocks/s (same forced-entry-speed technique as
+// testEntrySplashSpawnsAtWaterPlaneNotFeet, for the same reason: a natural fall's impact speed
+// is not otherwise controlled) and reads the actual vy the frame it goes wet.
+static void testWaterEntryVelocityClampsInstantly(void)
+{
+	World w;
+	buildWorld(&w);
+	particlesInit();
+
+	Player p;
+	playerInit(&p, 0.3f, (float)WATER_DEPTH + 0.05f, 0.3f, 0.0f, 0.0f);
+	p.body.vy = -30.0f;
+	inputNeutral();
+
+	float vy_entry_frame = 0.0f;
+	int   entry_frame = -1;
+	bool  found = false;
+
+	for (int frame = 0; frame < 60 && !found; frame++) {
+		const BodyWet before = p.body.wet;
+		playerUpdate(&p, &w, 16.0f);
+		const BodyWet after = p.body.wet;
+
+		if (before == BODY_DRY && after != BODY_DRY) {
+			found = true;
+			entry_frame = frame;
+			vy_entry_frame = p.body.vy;
+		}
+	}
+	CHECK(found);
+
+	// A further half second with no input: confirm it settles at the terminal and does not
+	// bounce -- no sign flip, no reading past the terminal in either direction.
+	float prev_vy = p.body.vy;
+	bool  oscillated = false;
+	for (int frame = 0; frame < 30; frame++) {
+		playerUpdate(&p, &w, 16.0f);
+		if ((p.body.vy - prev_vy) > 0.01f) oscillated = true;   // a bounce back upward
+		prev_vy = p.body.vy;
+	}
+
+	printf("  MEASURED water-entry vy (real input path): impact_vy=-30.0000 "
+	       "vy_on_entry_frame(%d)=%.4f PLAYER_WATER_TERMINAL=-1.5000 post-entry oscillated=%d\n",
+	       entry_frame, (double)vy_entry_frame, (int)oscillated);
+
+	// -1.5 (PLAYER_WATER_TERMINAL), not eased into over several frames -- so entry has nothing
+	// left over for the camera bob to have to damp out.
+	CHECK(vy_entry_frame > -1.501f && vy_entry_frame < -1.499f);
+	CHECK(!oscillated);
+}
+
 int main(void)
 {
 	testEntrySplashSpawnsAtWaterPlaneNotFeet();
 	testExitSplashFiresExactlyOnce();
 	testWakeRateAcrossFrameTimeSweep();
 	testLiveParticleCountsUnderRealScenarios();
+	testHoldJumpSwimsUpAndSurfacesReal();
+	testReleaseJumpDoesNotSustainRise();
+	testCameraBobIsCalmAndNeverDipsUnderwaterReal();
+	testWaterEntryVelocityClampsInstantly();
 
 	printf("player water self-test: %s %d checks\n", fails ? "FAIL" : "PASS", checks);
 	return fails ? 1 : 0;

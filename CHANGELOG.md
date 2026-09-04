@@ -4,6 +4,137 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.8.18] - 2026-09-04
+
+`docs/ROADMAP.md` calls this version "Monsters," and it is — zombies and skeletons exist in
+the world now, in the dark and in caves, and they can kill you. But most of what actually
+landed in this tree did not come from that roadmap line: the boot freeze that survived
+v1.8.17 took priority over it for most of this work, and a real, measured light-engine race
+condition and a 16 KiB stack-overflow risk turned up and got fixed along the way, neither one
+asked for by the monsters plan. Both are described honestly below rather than folded into one
+undifferentiated list.
+
+The freeze itself is still not fixed. v1.8.17 shipped four unproven fixes for it and none of
+them has been confirmed on real hardware, because it has not frozen again since. This build
+adds one more diagnostic on top of that: the hang report now names not just that the main
+thread was stuck in mesh-building, but which of six sub-stages inside it it actually reached
+— on the chance the next freeze report is specific enough to finally answer the question the
+last one could not.
+
+### Added
+
+- **Zombies and skeletons.** Spawn in the dark and in caves, on the light and space rules that
+  make a torch worth placing (a flat 2 Hz despawn check clears one that wanders back into
+  torchlight). A zombie detects and chases the player and attacks with a melee cooldown; a
+  skeleton winds up, re-checks line of sight, fires and cools down. Both share an idle-wander
+  machinery re-derived from the animal system rather than duplicated from it, and both are
+  dispatched from the same single per-slot tick pass animals already use, deliberately, so a
+  second pass never double-steps an animal's physics. `monsterSpawnTick()` gates itself to
+  once every 40 ticks with three fixed candidates and no retry, so a slow tick never queues up
+  a backlog of spawns. Damage from a monster now reaches the player through the same health
+  hook fall damage and starvation already use — health can hit zero and respawn you, exactly
+  like walking off a cliff can. `docs/plan-1.8.18-monsters.md` carries the full specification.
+
+- **Leaves take their biome's colour**, closing the gap v1.8.17's dirt tinting left open — oak,
+  birch and spruce leaves now read as their biome the same way grass and dirt already do, on
+  all six faces of the block rather than the split top/side rule grass uses, because a leaf
+  block, like dirt, carries one uniform texture with no crust to protect.
+
+- **A biome border fades instead of stepping.** The one- or two-column strip either side of a
+  biome edge now dithers between the two colours with a fixed 4x4 ordered (Bayer) pattern
+  instead of changing all at once, because the tint on a vertex is a 3-bit palette index, not a
+  real colour, and there is no way to average two indices into a third. The deep interior of
+  every biome is unaffected and takes the same fast, undithered path it always did.
+
+- **The hang report now names which of six sub-stages inside mesh-building the main thread
+  reached**, not just that it was somewhere in "MESH." Added because two artefacts from a real
+  freeze contradict each other unless something inside that phase blocks forever: a hang
+  report that said "MESH, worker idle," and a GPU postmortem from the same freeze showing the
+  whole command queue already wedged before that. The leading suspect is a synchronous GSP
+  cache-flush call inside chunk mesh upload; this build can now say directly whether that is
+  where a future freeze actually stops. Unconditional in a shipped build, not gated behind a
+  diagnostic flag, because the hang report is the only diagnostic that survives a build with no
+  on-screen console.
+
+### Fixed
+
+- **A glyph texture could render garbage on real hardware.** The font atlas decompresses
+  straight into ordinary cached memory, and citro3d's own import path never flushes that write
+  — confirmed by disassembling citro3d itself. Without the flush, the GPU, a separate bus
+  master, could sample whatever physically occupied that memory before the glyph sheet was
+  written, until those cache lines happened to be evicted for an unrelated reason. One
+  `C3D_TexFlush` call closes it; it is a no-op on the block atlas texture, which lives in VRAM
+  and was never affected.
+
+- **A real, measured race in the lighting engine**, present before this task and not
+  introduced by it: two threads relighting the same world column at once could both write the
+  same light buffer with no synchronisation, silently corrupting light instead of crashing —
+  reproduced directly at a 2-of-200-digest-mismatch rate with a dedicated test, and reproduced
+  at the same rate against the pre-v1.8.18 code with that test swapped in, which is what proves
+  it predates this release rather than being introduced by it. A column is now claimed by
+  whichever thread starts relighting it first; a losing thread waits for nothing and falls back
+  to a private buffer of its own instead of touching the shared one.
+
+- **The largest stack frame in the codebase, on a worker thread that shares its stack with two
+  lanes and the main thread's own call chain.** A 16 KiB relight snapshot buffer that used to
+  live on the stack — measured at 99.76% of a 16,424-byte frame, over half of the worker's
+  entire 32 KiB stack in the worst measured call chain — now lives in a claimed shared buffer
+  instead, with the same stack-local fallback preserved for the rare case two threads want it
+  at once.
+
+- **Meshing a column paid a real, cross-file function call per cell (or per height level) even
+  when a whole 16-block chunk was one uniform block.** A per-chunk cache now answers "is this
+  chunk uniform, and if so what block" once per chunk instead of once per cell, extending the
+  same early-out v1.8.10 already used for the block's own light level to two call sites that
+  had never gotten it.
+
+- **The draw guard's verdict now reaches every shipped hang report, not only a special
+  diagnostic build.** It used to sit behind the same flag as the full draw-command dump, which
+  the Makefile never sets in a release build; moved to its own always-on flag so "no bad draw
+  was ever issued" — or the opposite — is something a real player's hang report can actually
+  say.
+
+- **The frame-sync ordering guard now also covers the newest chunk-render drain.** The test
+  that proves the GPU-wait always runs before anything that overwrites a mesh slot the GPU may
+  still be reading previously checked two call sites; it now checks a third,
+  `chunkRenderDrainDirty()`, added since the guard was last extended.
+
+- **Three data races in the worker-lane bookkeeping the watchdog reads without a lock**, found
+  in a deliberate audit rather than from a symptom: which core a lane is running on, its
+  busy-time counter, and the pointer that publishes a lane's existence at all were all read and
+  written with no memory-ordering guarantee between cores. All three now go through explicit
+  atomics with the ordering each one actually needs — release/acquire for anything the watchdog
+  or the debug overlay reads from another thread, relaxed for the busy-time counter nothing
+  branches on.
+
+- **Chicken art.** The wing's fade band covered almost the entire wing on its actual 8x5-texel
+  face, leaving no room for a real edge; narrowed so the boundary resolves to one or two texels
+  instead of three or four. The wing's base colour was 11 points from the body's own and
+  vanished into its grain at gameplay size; deepened and re-contrasted, and the tail deepened
+  to match so it does not disappear now that the wing reads more clearly. The cow's underside
+  is darkened like every other animal's now — it was the one kind still missing that cue.
+
+### Notes
+
+A thread-priority floor against libctru's GSP interrupt-relay thread was added and then
+reverted the same day, after being measured rather than assumed: the GSP thread runs at
+priority 26, and every shipped `.cia`'s exheader — read directly out of all 25 released builds,
+not out of the `.rsf` source, which claims a different number the build tool does not actually
+use — sets this game's main thread to 48 and its worker lane to 49. Both numbers are already
+correctly below GSP's priority (a higher number is lower priority on this console), so there
+was no inversion to guard against. Recorded here so nobody re-derives half of this and stops.
+
+The updater's failure messages now include the newlib heap's total arena size and its free
+byte count at the moment a certificate or download failure is reported, alongside a formatting
+fix so the certificate-count field no longer falls off the right edge of the bottom screen.
+Neither change is the fix for the underlying certificate-load error v1.8.17 shipped instruments
+for; both are aimed at telling "ran out of memory" apart from every other explanation, the next
+time it happens.
+
+`source/app/stage_probe.h`'s per-stage freeze diagnostic, switched on by default since v1.8.17,
+is still on. It has not been switched back off, because the freeze it exists to help diagnose
+is still not confirmed fixed on real hardware.
+
 ## [1.8.17] - 2026-09-03
 
 This release exists because a New 3DS froze solid — HOME included — the instant you created a

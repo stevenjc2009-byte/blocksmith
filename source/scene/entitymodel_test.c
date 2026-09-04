@@ -35,7 +35,9 @@ static int s_failed;
 		}                                                                     \
 	} while (0)
 
-static const char* kKindName[EM_KINDS] = { "pig", "cow", "chicken", "sheep" };
+static const char* kKindName[EM_KINDS] = {
+	"pig", "cow", "chicken", "sheep", "zombie", "skeleton"
+};
 static const char* kFaceName[6] = { "top", "bottom", "right", "front", "left", "back" };
 
 // ── the unwrap is actually a NET ─────────────────────────────────────────────────────────
@@ -210,11 +212,11 @@ static void testVFlipDirection(void)
 static void testUVsInQuadrant(void)
 {
 	for (int k = 0; k < EM_KINDS; k++) {
-		const float qx0 = (float)((k % 2) * EM_QUADRANT_W) / EM_SHEET_W;
+		const float qx0 = (float)((k % EM_QUADRANT_COLS) * EM_QUADRANT_W) / EM_SHEET_W;
 		const float qx1 = qx0 + (float)EM_QUADRANT_W / EM_SHEET_W;
-		// Row of quadrants k/2 counted from the TOP of the sheet, so in v it is measured
-		// from 1 downwards.
-		const float qv1 = 1.0f - (float)((k / 2) * EM_QUADRANT_H) / EM_SHEET_H;
+		// Row of quadrants k/EM_QUADRANT_COLS counted from the TOP of the sheet, so in v it
+		// is measured from 1 downwards.
+		const float qv1 = 1.0f - (float)((k / EM_QUADRANT_COLS) * EM_QUADRANT_H) / EM_SHEET_H;
 		const float qv0 = qv1 - (float)EM_QUADRANT_H / EM_SHEET_H;
 
 		EmVertex* v = (EmVertex*)malloc(sizeof(EmVertex) * EM_VERTS_PER_KIND);

@@ -10,10 +10,39 @@
 // metricsDrawOverlay below.
 #include "gfx/screen.h"
 
+// OPT-METRICS, Task B. diagRetire() is main.c's own boot-fence mechanism (see
+// app/diag_retire.h for the incident it was built to fix): it moves an existing file aside to
+// prev-<name> before this boot can write a fresh one, so evidence from the boot that just
+// froze survives the very next launch. Reused here rather than a second mechanism invented
+// for frames.csv -- see the metricsInit() comment below for why the fence in main.c
+// (diagFenceBoot(), main.c:3657) cannot cover this file itself.
+#include "app/diag_retire.h"
+
 #define CSV_PATH        "sdmc:/blocksmith/frames.csv"
+#define CSV_PATH_PREV   "sdmc:/blocksmith/prev-frames.csv"
 #define CSV_DIR         "sdmc:/blocksmith"
-#define CSV_RING        1024  // samples the writer thread can fall behind by
-#define CSV_WAKE_EVERY  64    // rows between wake-ups, to keep syscalls off most frames
+// OPT-METRICS Task A, v1.8.18: dropped from 1024 to 256, verified against the real struct
+// size rather than assumed -- sizeof(Sample) is 68 bytes (10 u32/float fields at 4 bytes each
+// plus MetricsWork's 28 bytes, no padding: every member up to the trailing two u16 is 4-byte
+// aligned and 28 is already a multiple of 4), matching the 68-byte figure the ring comment
+// below has always quoted. So s_ring alone goes from 1024*68 = 69,632 bytes of .bss to
+// 256*68 = 17,408, a 52,224-byte cut confirmed with arm-none-eabi-size on the compiled
+// object (see the OPT-METRICS report), not just this arithmetic.
+//
+// 256 still leaves 4x headroom over CSV_WAKE_EVERY (64) -- the interval the writer thread
+// normally drains at -- and the s_ring comment further down measured a real full drain at
+// ~26 ms for 256 rows, far under both one frame's 16.71 ms budget and metricsFlush()'s 250 ms
+// bound, so even a completely full ring drains without the writer falling permanently behind.
+// It also comfortably covers the case metricsFlush() exists for: hang.txt measured 29 frames
+// drawn before a real GPU wedge, well inside 256.
+#define CSV_RING        256   // samples the writer thread can fall behind by
+// Rows between wake-ups, to keep syscalls off most frames. NOT lowered by the wedge-time
+// flush added below (metricsFlush(), called from gpuTestPostMortem()): that call covers the
+// "console froze before CSV_WAKE_EVERY frames ever drew" case for free, at zero cost on every
+// frame that never wedges, so shrinking this constant would only buy back syscalls on frames
+// that were never the problem. See the s_ring comment further down for the 26 ms/256-row
+// measurement this value is still weighed against.
+#define CSV_WAKE_EVERY  64
 #define HISTORY_LEN     40    // sparkline width, in frames
 #define OVERLAY_EVERY   15    // frames between console redraws (~4 Hz at 60 fps)
 
@@ -80,6 +109,16 @@ static size_t s_right_eye_bytes;
 static Thread       s_writer;
 static LightEvent   s_writer_wake;
 static volatile bool s_writer_stop;
+
+// The wedge-time flush handshake between metricsFlush() (called from the MAIN thread, at the
+// moment gpuTestPostMortem() decides the GPU is wedged) and csvWriterThread (a separate
+// thread that is not stopped by a GPU wedge and may be anywhere in its loop when the flush is
+// requested). Neither flag is ever touched by csvDrain() itself, so a flush request can never
+// become a second consumer of the ring: s_head stays producer-(main-thread)-only and s_tail
+// stays writer-thread-only on every path, including this one. See metricsFlush() below for
+// the reasoning this exists to satisfy.
+static volatile bool s_flush_pending;   // set by metricsFlush(), cleared by the writer thread
+static volatile bool s_flush_done;      // set by the writer thread once it has honoured it
 
 static u64    s_last_tick;
 static u64    s_sync_tick;
@@ -184,13 +223,44 @@ static void csvWriterThread(void* arg)
 
 		const bool stopping = s_writer_stop;
 		csvDrain();
+
+		// Answer a pending metricsFlush() request, if there is one. Checked AFTER csvDrain()
+		// so the drain the flush asked for has actually happened by the time the caller sees
+		// s_flush_done -- and checked on every wake, not only ones metricsFlush() itself
+		// caused, so a flush requested while this thread was already mid-drain from an
+		// unrelated signal still gets answered on the very next loop iteration rather than
+		// missed. Only this thread ever sets s_flush_done, matching s_tail's rule above.
+		if (s_flush_pending) {
+			s_flush_pending = false;
+			__dsb();          // the drain above is visible before the caller sees s_flush_done
+			s_flush_done = true;
+		}
 		if (stopping) break;
 	}
 }
 
+// OPT-METRICS, Task B. frames.csv used to be destroyed on the very next boot: fopen(CSV_PATH,
+// "w") below truncates unconditionally, and main.c's diagFenceBoot() -- which retires the
+// other nine diagnostic files to prev-<name> before anything can write a fresh one -- runs
+// too LATE to save this one. Measured, not assumed: metricsInit() is called at main.c:4158,
+// and diagFenceBoot() does not run until main.c:4287, well after this function has already
+// opened (and truncated) CSV_PATH. Adding "frames.csv" to diagFenceBoot()'s table alone would
+// not fix this without also moving one of those two call sites in main.c, which this lane does
+// not own -- see the OPT-METRICS report for the exact hunk, offered for main.c's owner rather
+// than applied here.
+//
+// The fix that needs no main.c change at all: retire CSV_PATH here, ourselves, before the
+// fopen -- using main.c's own diagRetire() (app/diag_retire.h) rather than inventing a second
+// rotation mechanism for one more file. Same probe-then-rename-with-remove-fallback the other
+// nine diagnostic files already trust, so this adds no new risk beyond what the project has
+// already accepted -- rename() itself is still an UNVERIFIED property of libctru's sdmc
+// devoptab on real hardware (world/region.h:125-126), which is exactly why diagRetire() falls
+// back to remove() on a failed rename rather than leaving two copies claiming to be current.
 void metricsInit(void)
 {
 	mkdir(CSV_DIR, 0777);   // harmless if it already exists
+
+	diagRetire(CSV_PATH, CSV_PATH_PREV);
 
 	s_csv = fopen(CSV_PATH, "w");
 	if (s_csv) {
@@ -208,10 +278,14 @@ void metricsInit(void)
 	// where all the idle time on this console lives.
 	s32 prio = 0x30;
 	svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+	prio += 1;
+	// A floor against libctru's GSP event thread (0x1A/26) was added here on 2026-09-04 and
+	// reverted the same day -- the main thread ships at 0x30/48, not at cia/blocksmith.rsf's
+	// `Priority: 16`, because makerom writes RSF + 0x20. See app/worker.c for the measurement.
 	// 32 KB, not the 8 KB a "just formats text" thread looks like it needs: newlib's
 	// float formatting plus an FS IPC round trip is deep, and a stack overflow here
 	// would corrupt the heap and crash at a random frame instead of failing loudly.
-	s_writer = threadCreate(csvWriterThread, NULL, 32 * 1024, prio + 1, 0, false);
+	s_writer = threadCreate(csvWriterThread, NULL, 32 * 1024, prio, 0, false);
 
 	s_last_tick = svcGetSystemTick();
 }
@@ -232,6 +306,62 @@ void metricsExit(void)
 		fclose(s_csv);
 		s_csv = NULL;
 	}
+}
+
+// See metrics.h for the contract. This exists because frames.csv came back as 160 bytes --
+// the header and nothing else -- from BOTH of steve's freeze reports: the ring only ever
+// drains every CSV_WAKE_EVERY (64) frames or at metricsExit(), and a frozen console reaches
+// neither. hang.txt measured 29 frames drawn. 29 < 64, and a frozen console never exits
+// cleanly, so not one row ever left RAM.
+//
+// THE REENTRANCY TRAP THIS AVOIDS, worth stating plainly because getting it wrong turns a
+// diagnostic into a crash inside the crash handler:
+//
+// The writer thread is the sole CONSUMER of an SPSC ring -- s_head is producer-(frame-loop)-
+// only, s_tail is writer-thread-only, both documented at their declaration above. A GPU wedge
+// does not stop the writer thread: nothing about csvDrain(), fwrite or fflush depends on the
+// GPU, so at the instant gpuTestPostMortem() calls this, the writer could be idle in
+// LightEvent_Wait, mid-csvDrain(), mid-fwrite, or mid-fflush. Calling csvDrain() directly from
+// here, on the main thread, would make the main thread a SECOND consumer of the same ring: two
+// threads writing s_tail without a lock (which can make it move backwards or skip entries and
+// corrupt the ring, not just lose rows) and two threads potentially calling fwrite/fflush on
+// the same FILE* at once -- newlib's own stdio locks are exactly why watchdog.c never touches
+// stdio at all (see its fileWrite() comment), and this file has no reason to be safer than
+// that one.
+//
+// So this does not drain the ring itself. It hands the writer thread a request and a
+// completion flag and waits, BOUNDED, for the writer to answer on its own -- s_tail is still
+// written ONLY by the writer thread, on every path, including this one.
+//
+// The bound is 250 x 1 ms = 250 ms. The s_ring comment above measured a real drain at ~26 ms
+// for 256 rows; frame 29's ring holds at most 28 rows (fewer than CSV_WAKE_EVERY, or this
+// path would not be needed), so the honest cost here is a small fraction of that one
+// measurement, and 250 ms leaves roughly an order of magnitude of margin over it. If the
+// writer thread does not answer inside that bound -- most plausibly because it is stuck
+// inside fwrite/fflush against a card that has stopped responding -- this gives up rather
+// than blocking the main thread indefinitely: the main thread still has to return from
+// gpuTestPostMortem() and keep servicing aptMainLoop() so HOME keeps answering, and a flush
+// that failed to land is only the same silence this function exists to close, while a flush
+// that hangs the post-mortem would be strictly worse than that silence.
+void metricsFlush(void)
+{
+	if (!s_writer) {
+		// No writer thread exists -- threadCreate failed at boot, or metricsExit() already
+		// stopped and freed it. metricsFrameEnd() below falls back to draining inline in
+		// exactly this situation, and for the same reason it is safe here: with no writer
+		// thread there is no second consumer to race, so this thread is already the ring's
+		// only consumer.
+		csvDrain();
+		return;
+	}
+
+	s_flush_done = false;
+	__dsb();
+	s_flush_pending = true;
+	LightEvent_Signal(&s_writer_wake);
+
+	for (int i = 0; i < 250 && !s_flush_done; i++)
+		svcSleepThread(1000000LL);   // 1 ms
 }
 
 void metricsFrameBegin(void)

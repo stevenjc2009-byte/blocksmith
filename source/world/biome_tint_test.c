@@ -427,6 +427,40 @@ static void testDirtTintedOnAllFaces(void)
 	      "alike (%d of %u vertices carried row 5)", dirt_tinted, g_out.vert_count);
 }
 
+// v1.8.18: leaves take the DIRT restriction, not the grass one -- all six faces, closed for the
+// same reason dirt was at v1.8.17. world/registry.c gives all three leaf blocks one uniform
+// texture per block (never shared with anything else's crust the way BTEX_GRASS_SIDE is), so
+// there is no half-tile for a partial restriction to protect. mesher.c's blockFaceTintable used
+// to say "nobody asked for it" about leaves; steve's ask for this task named grass, leaves and
+// foliage together, so this closes that gap the same way testDirtTintedOnAllFaces closed dirt's.
+static void testLeavesTintedOnAllFaces(void)
+{
+	puts("\n-- leaves: the dirt-style all-six-faces rule, closed at v1.8.18 --");
+
+	const BlockId leaves[3] = {
+		(BlockId)BLOCK_LEAVES, (BlockId)BLOCK_BIRCH_LEAVES, (BlockId)BLOCK_SPRUCE_LEAVES
+	};
+	const char* names[3] = { "oak leaves", "birch leaves", "spruce leaves" };
+
+	for (int i = 0; i < 3; i++) {
+		msReset();
+		msSet(4, 0, 4, leaves[i]);
+		msTint(4, 4, 6);   // jungle — 0.62/1.00/0.44, not the identity
+		runMesh();
+
+		int seen = 0, tinted = 0;
+		for (int k = 0; k < quadCount(); k++) {
+			const Quad q = quadAt(k);
+			seen++;
+			if (q.tint == 6) tinted++;
+		}
+		CHECK(seen == 6, "%s: the lone block emits all six faces (%d)", names[i], seen);
+		CHECK(tinted == seen,
+		      "%s: every face carries the column's biome row (%d of %d)",
+		      names[i], tinted, seen);
+	}
+}
+
 static void testStrandMatchesGroundBeneath(void)
 {
 	puts("\n-- a grass strand is the colour of the grass it stands on --");
@@ -535,6 +569,17 @@ static uint8_t wantTint(int axis, int at, int lx, int lz)
 	return (uint8_t)(c < at ? 2 : 5);   // taiga | desert — two rows that are not each other
 }
 
+// v1.8.18: whether (lx, lz) sits in the one-column band world/mesher.c's tintBlendBuild is
+// allowed to dither. Its four-orthogonal-neighbour check only ever sees the OTHER side of a
+// split from the two columns immediately touching it — column `at-2`'s neighbours are `at-3`
+// and `at-1`, both still on its own side, so it never disagrees with any of them and takes the
+// fast, undithered path. Only `at-1` and `at` ever have a neighbour one step across the line.
+static bool inBlendBand(int axis, int at, int lx, int lz)
+{
+	const int c = (axis == 0) ? lx : lz;
+	return c == at - 1 || c == at;
+}
+
 // Meshes a flat grass plain cut in half by a biome border and asserts that EVERY cell under
 // EVERY emitted quad is entitled to the colour that quad was given.
 //
@@ -560,8 +605,19 @@ static int borderMismatches(int axis, int at, int* merged_quads, int* widest)
 		if (cells > *widest) *widest = cells;
 
 		for (int z = q.z0; z <= q.z1; z++)
-			for (int x = q.x0; x <= q.x1; x++)
-				if (q.tint != wantTint(axis, at, x, z)) bad++;
+			for (int x = q.x0; x <= q.x1; x++) {
+				// v1.8.18: the one-column band tintBlendBuild dithers is allowed to show EITHER
+				// of the two biomes either side of the split — testBiomeBorderBlends below
+				// asserts the dither is not a no-op. Everywhere else the match must still be
+				// exact, which is the actual smear this test exists to catch: the old bug could
+				// paint a run up to fifteen cells the wrong colour, far past this one-column
+				// band, so it is still caught in full by the `else` branch here.
+				if (inBlendBand(axis, at, x, z)) {
+					if (q.tint != 2 && q.tint != 5) bad++;   // taiga | desert, this fixture's pair
+				} else if (q.tint != wantTint(axis, at, x, z)) {
+					bad++;
+				}
+			}
 	}
 	return bad;
 }
@@ -582,6 +638,70 @@ static void testBiomeBorderIsExact(void)
 		      names[axis], bad);
 		printf("         (%s: %d merged quads, widest covers %d cells)\n",
 		       names[axis], merged, widest);
+	}
+}
+
+// ── 4a2. THE BLEND ────────────────────────────────────────────────────────────
+//
+// v1.8.18: steve asked for the border itself to fade rather than step, Minecraft-style.
+// world/mesher.c cannot average real colour (see tintBlendBuild's own comment for why: the
+// vertex only ever carries a 3-bit palette INDEX, and averaging two indices is not averaging
+// two colours), so it dithers instead — a one-column-wide band on each side of the split mixes
+// in the other biome's tint on a fraction of its columns. This test is the one that would catch
+// the dither being wired up but doing nothing: it asserts the border strip actually shows BOTH
+// colours, not a clean either/or step that merely moved.
+static void testBiomeBorderBlends(void)
+{
+	puts("\n-- THE BLEND: the border strip mixes both biomes instead of stepping --");
+
+	const char* names[2] = { "blend along x", "blend along z" };
+	for (int axis = 0; axis < 2; axis++) {
+		buildGrassPlain();
+		for (int lz = -1; lz <= CHUNK_DIM; lz++)
+			for (int lx = -1; lx <= CHUNK_DIM; lx++)
+				msTint(lx, lz, wantTint(axis, 8, lx, lz));
+		runMesh();
+
+		// Tracked per BAND COLUMN (at-1 and at), not pooled across both. Pooling would pass for
+		// a plain hard step too -- column at-1 always taiga, column at always desert is exactly
+		// what "no dither at all" looks like, and the two columns combined would still show
+		// both colours. Only checking EACH column individually along its own length proves the
+		// dither actually mixes rather than just relabelling which side of the step is which.
+		bool saw_taiga[2] = { false, false }, saw_desert[2] = { false, false };
+		bool band_touched = false;
+		int  outside_bad  = 0;
+
+		for (int k = 0; k < quadCount(); k++) {
+			const Quad q = quadAt(k);
+			if (q.face != FACE_TOP) continue;   // no plants in this fixture, so these are all grass
+
+			for (int z = q.z0; z <= q.z1; z++)
+				for (int x = q.x0; x <= q.x1; x++) {
+					const int c = (axis == 0) ? x : z;
+					if (c == 8 - 1 || c == 8) {
+						band_touched = true;
+						const int slot = (c == 8) ? 1 : 0;
+						if (q.tint == 2) saw_taiga[slot]  = true;
+						if (q.tint == 5) saw_desert[slot] = true;
+					} else if (q.tint != wantTint(axis, 8, x, z)) {
+						outside_bad++;
+					}
+				}
+		}
+
+		CHECK(band_touched, "%s: the border strip was actually meshed", names[axis]);
+		for (int slot = 0; slot < 2; slot++) {
+			const int col = 8 - 1 + slot;
+			CHECK(saw_taiga[slot] && saw_desert[slot],
+			      "%s: band column %d shows BOTH biomes along its own length, not a single "
+			      "colour (taiga seen=%d, desert seen=%d) — one colour here means this column "
+			      "is a relabelled step, not a dither",
+			      names[axis], col, (int)saw_taiga[slot], (int)saw_desert[slot]);
+		}
+		CHECK(outside_bad == 0,
+		      "%s: every cell OUTSIDE the one-column blend band still matches its own biome "
+		      "exactly (%d did not) — the dither must not leak past the border it softens",
+		      names[axis], outside_bad);
 	}
 }
 
@@ -627,8 +747,16 @@ static int dirtBorderMismatches(int axis, int at, int* merged_quads, int* widest
 		if (cells > *widest) *widest = cells;
 
 		for (int z = q.z0; z <= q.z1; z++)
-			for (int x = q.x0; x <= q.x1; x++)
-				if (q.tint != wantTint(axis, at, x, z)) bad++;
+			for (int x = q.x0; x <= q.x1; x++) {
+				// v1.8.18: same one-column dither tolerance borderMismatches applies above —
+				// dirt runs the tint through the identical faceTint()/tintBlendBuild() path, so
+				// its border strip is entitled to the same either-biome allowance.
+				if (inBlendBand(axis, at, x, z)) {
+					if (q.tint != 2 && q.tint != 5) bad++;   // taiga | desert, this fixture's pair
+				} else if (q.tint != wantTint(axis, at, x, z)) {
+					bad++;
+				}
+			}
 	}
 	return bad;
 }
@@ -950,9 +1078,11 @@ int main(void)
 	testUntintedIsUnchanged();
 	testGrassTopTintedSidesAreNot();
 	testDirtTintedOnAllFaces();
+	testLeavesTintedOnAllFaces();
 	testStrandMatchesGroundBeneath();
 	testTwoBlockClumpIsOneColour();
 	testBiomeBorderIsExact();
+	testBiomeBorderBlends();
 	testDirtBiomeBorderIsExact();
 	testMergingActuallyHappens();
 	testUntintableRunsStillMerge();

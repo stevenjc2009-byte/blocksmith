@@ -54,18 +54,40 @@
 
 // ── sheet geometry ────────────────────────────────────────────────────────────────────────
 //
-// 128x128 RGBA5551 = 32,768 bytes of VRAM, four 64x64 quadrants, one animal per quadrant.
+// v1.8.18 MON-BUILD: 256x128 RGBA5551 = 65,536 bytes of VRAM, a 4x2 grid of 64x64 quadrants
+// (EM_QUADRANT_COLS wide, 2 tall) — up from 128x128 = 32,768 B / 2x2. Not 128x192: citro3d's
+// C3D_TexInitWithParams (checked at atlas_uv.h:15-21 and asserted for the block atlas at
+// atlas_uv_shader_test.c:987-988) rejects any texture dimension outside 8..1024 OR not a power
+// of two, each axis independently, and 192 is not a power of two. Not exactly six quadrants
+// either: the next monster after this pair hits the same wall, and eight quadrants costs the
+// same VRAM as the smallest legal size up from six would anyway. Six of the eight are used
+// (pig, cow, chicken, sheep, zombie, skeleton); the last two (col 2, col 3 of row 1) are spare.
 // Sized from the nets rather than picked: the cow's body box is 12x10x18 texels, whose
 // unwrapped net is 2*(12+18) = 60 wide, and 60 does not fit in 32. tools/make_animals.py
 // re-derives this from the table and fails if any net leaves its quadrant.
-#define EM_SHEET_W            128
+#define EM_SHEET_W            256
 #define EM_SHEET_H            128
 #define EM_QUADRANT_W          64
 #define EM_QUADRANT_H          64
+#define EM_QUADRANT_COLS        4    // sheet is EM_QUADRANT_COLS quadrants wide; a kind's
+                                     // cell is (k % EM_QUADRANT_COLS, k / EM_QUADRANT_COLS).
+                                     // ONE named constant so this ratio is not restated as a
+                                     // bare "4" (or worse, a stale "2") anywhere else — see
+                                     // tools/make_animals.py's verify_sheet() and
+                                     // scene/entitymodel_test.c's testUVsInQuadrant(), which
+                                     // both key off it instead of a literal.
 #define EM_TEXELS_PER_BLOCK    16
 
-#define EM_KINDS               4    // pig, cow, chicken, sheep — asserted against
-                                    // ENT_KIND_COUNT in entitymodel.c, which owns that link
+#define EM_KINDS               6    // pig, cow, chicken, sheep, zombie, skeleton — asserted
+                                    // against the ENT_KIND_* ids in entitymodel.c, which owns
+                                    // that link. NOT the same number as animal.h's
+                                    // ENT_KIND_COUNT: that constant is "one past the last
+                                    // ANIMAL kind" (stays 5, so animalDef() keeps returning
+                                    // NULL for the zombie and skeleton — see animal.h and
+                                    // docs/plan-1.8.18-monsters.md §3.1/Phase 2). This is "one
+                                    // past the last kind with a MODEL", which is a different
+                                    // count and entitymodel.c is where the two are tied
+                                    // together deliberately, not restated by accident.
 #define EM_BOXES_PER_KIND      6
 #define EM_FACES_PER_BOX       6
 #define EM_VERTS_PER_FACE      6    // two triangles, no index buffer
@@ -131,7 +153,29 @@ typedef struct {
 // NOT boxes: they are painted onto the front face of the head, which is what the design asks
 // for ("a distinct snout panel on the head front") and costs no geometry.
 //
-// Quadrants: pig (0,0), cow (64,0), chicken (0,64), sheep (64,64).
+// The zombie and skeleton are humanoid: body, head, two arms, two legs — the SAME six-box
+// budget a quadruped spends on body/head/one-shared-leg-net, just distributed differently.
+// Neither animates (nothing in this file does — see the header comment). A zombie's arms held
+// out in front is GEOMETRY, not a runtime pose: its arm boxes are short in y and long in z,
+// planted flush against the torso's front face and reaching forward, so the "held out" look is
+// baked into the box table exactly once and costs the same one draw call every other kind
+// costs. The skeleton is narrower everywhere except the skull (kept animal-head-sized) for a
+// leaner silhouette; the rest of the "reads as bone" work is the shader's, in
+// tools/make_animals.py — see zombie_shader/skeleton_shader there.
+//
+// Quadrants, (k % EM_QUADRANT_COLS, k / EM_QUADRANT_COLS) * (EM_QUADRANT_W, EM_QUADRANT_H):
+// pig (0,0), cow (64,0), chicken (128,0), sheep (192,0), zombie (0,64), skeleton (64,64).
+// Columns 2 and 3 of row 1 — (128,64) and (192,64) — are the two spare quadrants noted above.
+//
+// v1.8.18 MON-BUILD: chicken and sheep MOVED here, from (0,64)/(64,64) to (128,0)/(192,0) —
+// a flat +128 tox / -64 toy shift on every one of their rows, nothing else. That is a
+// consequence of EM_QUADRANT_COLS going from 2 to 4: k=2 and k=3 fall in row 0 now, not row 1,
+// under the same (k % COLS, k / COLS) formula this table has always used. Their MODEL geometry
+// (px/py/pz/sx/sy/sz) is untouched — only which sheet pixels their unwrap lands on moved, and
+// tools/make_animals.py re-paints them at the new location from the same shader, so the art is
+// pixel-identical, just relocated. See tools/make_animals.py's module docstring for the other
+// half of this: verify_sheet() computes quadrants with the same formula from the same
+// EM_QUADRANT_COLS, parsed out of this header rather than restated.
 static const EmBox kEmBoxes[EM_KINDS][EM_BOXES_PER_KIND] = {
 	// ── pig — 10x8x16 body, 14 texels tall overall (0.875 blocks) ───────────────────────
 	{
@@ -152,22 +196,53 @@ static const EmBox kEmBoxes[EM_KINDS][EM_BOXES_PER_KIND] = {
 		{  2,  0,   4,   4, 10,  4,  92, 28 },   // leg back-right
 	},
 	// ── chicken — 12 texels tall (0.75 blocks), two legs plus beak and wattle ───────────
+	// v1.8.18 MON-BUILD: tox +128, toy -64 from the pre-256-wide sheet — see the table's own
+	// header comment above. Geometry (columns 1-6) unchanged.
 	{
-		{ -3,  3,  -4,   6,  5,  8,   0, 64 },   // body    net 28x13
-		{ -2,  8,  -6,   4,  4,  4,   0, 77 },   // head    net 16x8
-		{ -2,  0,  -1,   2,  3,  2,  16, 77 },   // leg left         net 8x5, shared
-		{  0,  0,  -1,   2,  3,  2,  16, 77 },   // leg right
-		{ -1,  9,  -8,   2,  2,  2,  24, 77 },   // beak    net 8x4
-		{ -1,  7,  -7,   2,  2,  1,  32, 77 },   // wattle  net 6x3
+		{ -3,  3,  -4,   6,  5,  8, 128,  0 },   // body    net 28x13
+		{ -2,  8,  -6,   4,  4,  4, 128, 13 },   // head    net 16x8
+		{ -2,  0,  -1,   2,  3,  2, 144, 13 },   // leg left         net 8x5, shared
+		{  0,  0,  -1,   2,  3,  2, 144, 13 },   // leg right
+		{ -1,  9,  -8,   2,  2,  2, 152, 13 },   // beak    net 8x4
+		{ -1,  7,  -7,   2,  2,  1, 160, 13 },   // wattle  net 6x3
 	},
 	// ── sheep — 12x9x16 woolly body, 18 texels tall (1.125 blocks) ──────────────────────
+	// v1.8.18 MON-BUILD: tox +128, toy -64 from the pre-256-wide sheet — see the table's own
+	// header comment above. Geometry (columns 1-6) unchanged.
 	{
-		{ -6,  9,  -8,  12,  9, 16,  64, 64 },   // body    net 56x25
-		{ -4, 10, -13,   8,  7,  5,  64, 89 },   // head    net 26x12
-		{ -5,  0,  -7,   4,  9,  4,  90, 89 },   // leg front-left   net 16x13, shared
-		{  1,  0,  -7,   4,  9,  4,  90, 89 },   // leg front-right
-		{ -5,  0,   3,   4,  9,  4,  90, 89 },   // leg back-left
-		{  1,  0,   3,   4,  9,  4,  90, 89 },   // leg back-right
+		{ -6,  9,  -8,  12,  9, 16, 192,  0 },   // body    net 56x25
+		{ -4, 10, -13,   8,  7,  5, 192, 25 },   // head    net 26x12
+		{ -5,  0,  -7,   4,  9,  4, 218, 25 },   // leg front-left   net 16x13, shared
+		{  1,  0,  -7,   4,  9,  4, 218, 25 },   // leg front-right
+		{ -5,  0,   3,   4,  9,  4, 218, 25 },   // leg back-left
+		{  1,  0,   3,   4,  9,  4, 218, 25 },   // leg back-right
+	},
+	// ── zombie — humanoid, 32 texels tall (2.0 blocks), arms held out in front ──────────
+	// v1.8.18 MON-BUILD: new. Body 8x12x4, head an 8-cube sitting flush on top of it, legs
+	// 4x12x4 sharing one net (matching the quadrupeds' shared-leg convention), arms 4x4x8 —
+	// short in y, long in z — planted against the body's front face (z=-2) and reaching to
+	// z=-10, which is the "held out in front" silhouette as pure geometry, no runtime pose.
+	{
+		{ -4, 12,  -2,   8, 12,  4,  32, 64 },   // body    net 24x16
+		{ -4, 24,  -4,   8,  8,  8,   0, 64 },   // head    net 32x16
+		{ -8, 18, -10,   4,  4,  8,   0, 80 },   // arm left         net 24x12, shared
+		{  4, 18, -10,   4,  4,  8,   0, 80 },   // arm right
+		{ -4,  0,  -2,   4, 12,  4,  24, 80 },   // leg left         net 16x16, shared
+		{  0,  0,  -2,   4, 12,  4,  24, 80 },   // leg right
+	},
+	// ── skeleton — humanoid, 31 texels tall (~1.94 blocks), lean everywhere but the skull ──
+	// v1.8.18 MON-BUILD: new. Body 6x12x4 and legs 3x12x4 (narrower than the zombie's for a
+	// bonier silhouette), head kept a full 6x7x6 so the skull still reads at 16 texels to the
+	// block, arms 3x12x4 hanging flush at the torso's sides rather than reaching forward —
+	// the zombie's forward reach is deliberately NOT repeated here, so the two silhouettes
+	// read apart at a glance before either shader runs.
+	{
+		{ -3, 12,  -2,   6, 12,  4,  88, 64 },   // body    net 20x16
+		{ -3, 24,  -3,   6,  7,  6,  64, 64 },   // head    net 24x13
+		{ -6, 12,  -2,   3, 12,  4,  64, 80 },   // arm left         net 14x16, shared
+		{  3, 12,  -2,   3, 12,  4,  64, 80 },   // arm right
+		{ -3,  0,  -2,   3, 12,  4,  78, 80 },   // leg left         net 14x16, shared
+		{  0,  0,  -2,   3, 12,  4,  78, 80 },   // leg right
 	},
 };
 

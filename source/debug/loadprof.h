@@ -51,11 +51,26 @@
 // are `__atomic_fetch_add` RELAXED instead — see the comment at that line for why a plain `+=`
 // on a uint64_t is not merely a lost count on a 32-bit part but a torn value. Still no locks.
 //
-// The remainder — wall minus the sum of the stages — is real and is reported as `other`. On a
-// vsynced loading screen most of it is the wait for VBlank inside the present stage's own
-// C3D_FrameBegin, which is why `frames` is recorded beside it: a load that is frame-bound
-// rather than work-bound shows up as frames * 16.71 ms accounting for the total, and no
-// amount of making the stages faster will move it.
+// The remainder — wall minus the sum of the stages — is real and is reported as
+// `unaccounted` (the CSV column is `unaccounted_ms`, renamed from `other_ms`; see below for
+// why). On a vsynced loading screen most of it is the wait for VBlank inside the present
+// stage's own C3D_FrameBegin, which is why `frames` is recorded beside it: a load that is
+// frame-bound rather than work-bound shows up as frames * 16.71 ms accounting for the total,
+// and no amount of making the stages faster will move it.
+//
+// ── Why unaccounted_ms is negative on every row so far, and why that is correct ───────
+//
+// region_io, decode, generate and light are `+=`'d from up to THREE threads at once — the
+// main thread's own stages plus both New 3DS worker lanes — so their ms is CPU time summed
+// across those threads, not wall time. On a New 3DS the sum of all eleven stages can
+// therefore legitimately exceed wall_ms, which makes `unaccounted_ms = wall_ms - sum`
+// negative. That is not a bug in the instrument and not evidence of a double-counted timer:
+// it is real thread overlap being reported honestly. Each stage's own total is still correct
+// and comparable to the other stages — only comparing the SUM of all eleven against wall
+// time is the mistake, and only unaccounted_ms and the "% of wall" figure below (see
+// loadprofFormat) are affected. Do not read a negative unaccounted_ms as a broken timer, and
+// do not read the four concurrent stages' ms as "time the main thread was blocked" — read
+// them as CPU-seconds spent, full stop.
 //
 // ── Cost when nothing is loading ───────────────────────────────────────────────────────
 //
@@ -85,7 +100,33 @@ typedef enum {
 
 // Where the console writes the row. Beside frames.csv, in the directory metricsInit already
 // makes, so nothing here has to mkdir anything.
-#define LOADPROF_PATH "sdmc:/blocksmith/load.csv"
+//
+// ── Why "load2.csv" and not "load.csv" (2026-09) ──────────────────────────────────────
+//
+// The row this writes grew two columns — `version` (BLOCKSMITH_VERSION, so a row can be
+// attributed to a build) and `unix_time_s` (so two rows can be ordered across boots; see
+// loadprofWrite) — and loadprofWrite only writes a header when the target file does not
+// exist yet (append-only, next paragraph). A build with the wider row appending to an
+// EXISTING load.csv would therefore leave a file whose header still names the OLD, narrower
+// set of columns while every row appended after it carries two fields the header never
+// promised. On steve's card that file is live evidence in an open freeze investigation, so
+// that silent mismatch is not acceptable.
+//
+// Two fixes were rejected. Detecting the old header and rewriting it in place still leaves
+// every OLD row under a NEW header — the same mismatch, just moved earlier in the file.
+// Detecting it and rotating the old file aside needs rename() on the sdmc devoptab, which
+// world/region.h:125-126 already documents as an unverified property of real hardware —
+// using it here risks exactly the file this change exists to protect, for no gain over the
+// option below.
+//
+// So the schema version is part of the FILENAME. Old builds only ever open "load.csv"; this
+// build and every build after it only ever open "load2.csv". The two paths cannot collide,
+// and the guarantee holds even if rename() does not work on this card, because rename() is
+// never called: an old load.csv is left exactly as it is, forever, and load2.csv starts
+// clean with a header that matches every row under it from the first line. Next time this
+// schema changes, bump the number again rather than teaching loadprofWrite to parse a header
+// it did not just write.
+#define LOADPROF_PATH "sdmc:/blocksmith/load2.csv"
 
 // Appended, never truncated: the interesting comparison is one world entry against the next,
 // and a file that is rewritten every boot can only ever hold the last one.
@@ -142,14 +183,26 @@ const LoadProfile* loadprofGet(void);
 // Short lowercase stage name, as it appears in the CSV header and the human block.
 const char* loadprofStageName(LoadStage s);
 
-// Human-readable multi-line block: one line per stage with total ms, call count, percentage of
-// wall, and per-call microseconds, then `other` and the total. Returns the length written.
-// Never writes more than `cap` bytes including the terminator.
+// Human-readable multi-line block: one line per stage with total ms, call count, then either
+// percentage of wall or, for the four stages a worker lane can also write (region_io, decode,
+// generate, light), the literal "cpu" in that column instead of a percentage — see the file
+// comment above for why a wall-time percentage would be misleading there (it can read over
+// 100%) rather than merely uninteresting. Then per-call microseconds, then `unaccounted` and
+// the total. Returns the length written. Never writes more than `cap` bytes including the
+// terminator.
 int loadprofFormat(char* buf, size_t cap);
 
 // Appends one CSV row to `path`, writing the header first if the file is not there yet. Does
 // nothing when the profiler never ran. Errors are ignored on purpose: a card that will not take
 // a diagnostic row must not be able to stop a world loading.
+//
+// The row carries `version` (BLOCKSMITH_VERSION at build time, or "(unset)" — same rule
+// app/watchdog.c's hang report already uses) and `unix_time_s` (wall-clock seconds since the
+// epoch from time(NULL), or 0 when time() fails, which world/worldseed.c's worldSeedMint
+// already treats as the honest signature of a dead or unset RTC). Both exist so a row can be
+// attributed to a build and ordered against another row from a different boot — a tick count
+// alone cannot do either, because it resets to a small number every power-on and carries no
+// build identity.
 void loadprofWrite(const char* path);
 
 // Zeroes everything without arming. Only the host harness needs this — the game arms with
