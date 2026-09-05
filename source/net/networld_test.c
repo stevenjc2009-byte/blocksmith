@@ -1496,6 +1496,36 @@ static void test_the_session_generator_resolves_and_refuses(void)
           "and so is a declared DENSITY: the test is what this build KNOWS, not which "
           "generator Phase 4's server happens to declare");
 
+    /* Row 2b: the rest of what this build knows, and the TOP of the range in particular.
+     *
+     * Row 2 stops at DENSITY, which was the whole of the range when Phase 4 shipped. The
+     * generator has grown three versions since — BIOME, CAVES, ORES (world/genversion.h) —
+     * and until this row nothing asserted that any of them survives the trip. The gap is not
+     * theoretical: a server declaring ORES is the reason this row was written, and if
+     * genVersionKnown()'s ceiling ever regressed to DENSITY, every check above would stay
+     * green while every client refused that server at the join screen. Row 3 would not catch
+     * it either — it probes NEWEST + 1, which is refused correctly in both worlds.
+     *
+     * The NEWEST identity check at the end is what keeps this row honest as the enum grows.
+     * It is not decoration: append a sixth generator and it goes red, which forces whoever
+     * appended it to extend this row rather than leave the newest generator — the one a
+     * server will actually declare — as the only one nothing here tests. */
+    out = 0xDEADBEEFu;
+    check(genVersionForSessionResolve(true, GEN_VERSION_BIOME, &out) == GENVER_OK
+              && out == GEN_VERSION_BIOME,
+          "a declared BIOME is accepted and used verbatim");
+    out = 0xDEADBEEFu;
+    check(genVersionForSessionResolve(true, GEN_VERSION_CAVES, &out) == GENVER_OK
+              && out == GEN_VERSION_CAVES,
+          "and so is a declared CAVES");
+    out = 0xDEADBEEFu;
+    check(genVersionForSessionResolve(true, GEN_VERSION_ORES, &out) == GENVER_OK
+              && out == GEN_VERSION_ORES,
+          "and so is a declared ORES, which is the generator a current server declares");
+    check(GEN_VERSION_ORES == GEN_VERSION_NEWEST,
+          "and ORES is still the newest this build has, so the check above is testing the top "
+          "of the range and not a value the enum has since overtaken");
+
     /* Row 3: a generator this build cannot produce. */
     out = 0xDEADBEEFu;
     const GenVersionStatus st =
@@ -3911,8 +3941,13 @@ int main(void)
      * body delimited, the body copied out, and the two that are the point of the file: the
      * remote path never names BLOCK_FURNACE and never calls blockStateCreate at all).
      * Nothing removed. */
-    check(g_checks == 440,
-          "check-count guard: every check in this suite actually ran (440 before this line)");
+    /* 440 -> 444, same rule. Row 2b inside
+     * test_the_session_generator_resolves_and_refuses adds 4: three that a declared BIOME,
+     * CAVES and ORES each resolve to themselves, and one that ORES is still
+     * GEN_VERSION_NEWEST, so the ORES check is known to be sitting at the top of the range
+     * rather than somewhere in the middle of it. Nothing removed. */
+    check(g_checks == 444,
+          "check-count guard: every check in this suite actually ran (444 before this line)");
 
     printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;

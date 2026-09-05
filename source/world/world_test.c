@@ -8043,6 +8043,85 @@ static void testWorldgenLegacyByteIdentity(void)
 	}
 }
 
+// ── v1.8.19: the CAVES and ORES generators get fingerprints too ───────────────────────
+//
+// Until this function existed, GEN_VERSION_CAVES (4) and GEN_VERSION_ORES (5) were the only
+// generators in the enum with no per-column pin anywhere in this file — grep it: nothing
+// outside the GEN_VERSION_NEWEST == GEN_VERSION_ORES contract assertion ever built a column
+// at either one. ore_gen_test.c counts ore cells and debug/loadprof_test.c pins a
+// whole-world hash, but neither is a per-column byte-identity pin of the kind the LEGACY and
+// BIOME tables are, and neither would localise a change to a column.
+//
+// That gap stops being academic the moment a SERVER declares a generator above 1. Terrain is
+// never transmitted (proto/bs_proto.h's BS_APP_WORLD_GEN) — every client builds the landscape
+// itself from the seed — so two clients agreeing on the NUMBER 5 while their two builds
+// disagree about what 5 draws is the "one player's floor is another player's sky" failure,
+// arriving silently and with no refusal anywhere, because both ends believe they agree.
+// These pins are what makes such a change fail here instead of on someone's console.
+//
+// genTestHashColumn(), the STRICT hasher that strips nothing, rather than
+// genTestHashColumnTerrain(), which the BIOME table uses and which blanks water and the flora
+// a later pass writes into air. That choice is the point: the BIOME table is asking "did the
+// ground move", where blanking decoration is right, and this one is asking "will two clients
+// draw the same blocks", where every differing cell is a desync and there is nothing it would
+// be correct to ignore.
+//
+// The four columns are the same ones the LEGACY and BIOME tables use, and the reason to
+// re-check that choice here is written at length above testWorldgenLegacySandyWideSweep():
+// under the sabotage those twelve pins are meant to catch, ELEVEN OF THE TWELVE CANNOT GO
+// RED, because the columns were picked for tidiness and nobody checked what terrain they land
+// on. So this set was measured before it was pinned, over all twelve columns and a further
+// twenty-four: the biome->caves hash moves in 36 of 36, and the caves->ores hash moves in 36
+// of 36. Caves and ore veins are dense enough to touch every column, which the legacy sand
+// rule was not. The two inequality checks per row below keep that honest — they are the red
+// control, and they fail if a pass ever silently stops running.
+static void testWorldgenCavesAndOresByteIdentity(void)
+{
+	static const struct {
+		uint32_t seed;
+		int32_t  cx, cz;
+		uint32_t caves, ores;
+	} pinned[] = {
+		{1337u,   0,  0, 0xfcd496bbu, 0xd715deacu},
+		{1337u,   1,  0, 0x457393e5u, 0x4cfc59d1u},
+		{1337u,  -1, -1, 0xf6f3e524u, 0x7f6b64b7u},
+		{1337u,   7, -3, 0x83adcea8u, 0xdcd18b00u},
+		{4242u,   0,  0, 0xc2c61fe1u, 0x63eb50cbu},
+		{4242u,   1,  0, 0x01d78b38u, 0x0280dabau},
+		{4242u,  -1, -1, 0x633fda96u, 0xed6465bfu},
+		{4242u,   7, -3, 0x972b26dbu, 0x0b2ecfc5u},
+		{90210u,  0,  0, 0x4e4efc9fu, 0x1719dd55u},
+		{90210u,  1,  0, 0xe63d0517u, 0x9c84bfb2u},
+		{90210u, -1, -1, 0x152a3442u, 0x1bd94cd2u},
+		{90210u,  7, -3, 0x21d1142du, 0x3707f5b3u},
+	};
+
+	for (size_t i = 0; i < sizeof(pinned) / sizeof(pinned[0]); i++) {
+		uint32_t h[3];
+		const uint32_t versions[3] = {
+			GEN_VERSION_BIOME, GEN_VERSION_CAVES, GEN_VERSION_ORES
+		};
+
+		for (int v = 0; v < 3; v++) {
+			WorldGen g;
+			CHECK_QUIET(worldgenInit(&g, pinned[i].seed, versions[v]));
+			worldInit(&s_world);
+			CHECK_QUIET(worldgenColumn(&g, &s_wgs, &s_world, pinned[i].cx, pinned[i].cz));
+			h[v] = genTestHashColumn(&s_world, pinned[i].cx, pinned[i].cz);
+			worldExit(&s_world);
+		}
+
+		CHECK_QUIET(h[1] == pinned[i].caves);
+		CHECK_QUIET(h[2] == pinned[i].ores);
+
+		// The red control, per column. Without these the two pins above would still pass
+		// if the cave carver and the ore decorator both quietly stopped running and every
+		// version generated identical terrain — three equal hashes match three equal pins.
+		CHECK_QUIET(h[0] != h[1]);
+		CHECK_QUIET(h[1] != h[2]);
+	}
+}
+
 // ── v1.8.3 Phase 2: the legacy sand rule, swept where the answer can actually move ────
 //
 // **This is the gate for the version dispatch inside worldgenIsSandy(), and
@@ -12242,6 +12321,7 @@ int worldTestRun(char* summary, size_t cap, int* checks_out)
 	testWorldgenCaves();
 	testWorldgenMemoryProjection();
 	testWorldgenLegacyByteIdentity();
+	testWorldgenCavesAndOresByteIdentity();
 	testWorldgenLegacySandyWideSweep();
 	testWorldgenBiomes();
 	testGenVersionContract();

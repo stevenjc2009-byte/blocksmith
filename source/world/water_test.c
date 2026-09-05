@@ -1807,6 +1807,111 @@ static void testPadAndShaft(void)
 	      "water runs off the pad rim and falls: the column just outside it is wet");
 }
 
+// ── The multiplayer question ─────────────────────────────────────────────────────────
+//
+// v1.8.19. Whether a SERVER may declare a generator newer than the oldest one — the
+// decision proto/bs_proto.h's BS_APP_WORLD_GEN has been holding at 1 since it was added.
+// Its comment gives one reason and only one: the newer generators place water, water
+// LEVEL lives in this file's sparse side map, that map is on no wire and in no region
+// file, and so two clients "would generate the same lakes and then simulate their own
+// flow out of them, with nothing reconciling the two".
+//
+// The half of the mechanism that comment does not account for is that nothing HAS to
+// reconcile them, because neither client is holding state the other must be told about.
+// Flow is a pure function of the blocks, and the blocks are already reconciled: generated
+// terrain is identical on both by construction, and every player edit is a server-stored
+// diff that reaches each client through worldSet — net/networld.c's applyDrained, called
+// from main.c's genInstallOne the instant a column finishes streaming in and before it is
+// meshed. worldSet fires world.c's edit hook, main.c's onWorldEdit sits on it, and that
+// calls waterNotify. So a client that was somewhere else when a dam broke re-derives the
+// flood from the diff that broke it, the moment it walks into range.
+//
+// The three arms arrive at the same world by genuinely different routes:
+//
+//   present  - had the column loaded and watched the flood happen.
+//   rejoined - watched it, then LOST it. waterDropColumn strips every flow cell when a
+//              column unloads (see its header for why), the generator puts the intact dam
+//              back, and the server's diff breaks it again. This is the reload path, and
+//              it is the one the proto comment is really worried about.
+//   no_diff  - the same reload with the diff withheld. Its state MUST differ, or the two
+//              hashes above agreed for the trivial reason that nothing was compared.
+static void buildDamFixture(void)
+{
+	// The edit hook is DEAD for the whole fixture, and that is the experiment rather than
+	// a convenience. Generated terrain reaches the world through worldSetChunkAll
+	// (app/worker.c's install), which does not fire the hook — testEditHook above pins
+	// that at zero firings — so a generated lake queues nothing and every one of its cells
+	// is a SOURCE under the absence-means-source rule at the top of water.h. A fixture
+	// built with the hook live would be a player pouring the reservoir by hand, which is a
+	// different world and the wrong question.
+	resetWorld();
+	buildFloor();
+	fillBox(0, 0, 64, 66, -13, 13, BLOCK_STONE);    // the dam, running north to south
+	fillBox(-10, -1, 64, 65, -6, 6, BLOCK_WATER);   // the reservoir held behind it
+	worldSetEditHook(wiredEditHook, NULL);
+}
+
+// Drops all four columns the fixture spans (x and z of -13..13 are chunks -1 and 0), and
+// then puts the generated dam back hook-silent, exactly as a bulk install does. The hook
+// stays LIVE across the drop on purpose: main.c calls waterDropColumn with the hook
+// installed and water.c's `dropping` flag is what stops it queueing, so turning the hook
+// off here would be testing a console that does not exist.
+static void unloadAndStreamBackIn(void)
+{
+	for (int cx = -1; cx <= 0; cx++)
+		for (int cz = -1; cz <= 0; cz++)
+			(void)waterDropColumn(&g_sim, &g_world, cx, cz);
+
+	worldSetEditHook(NULL, NULL);
+	fillBox(0, 0, 64, 66, -13, 13, BLOCK_STONE);
+	worldSetEditHook(wiredEditHook, NULL);
+}
+
+static void testJoinedClientConvergesOnFlood(void)
+{
+	const int DX = 0, DY = 64, DZ = 0;   // the one block of the dam that the player breaks
+
+	// ── present ──
+	buildDamFixture();
+	const int lake = countBlocks(-10, -1, 64, 65, -6, 6, BLOCK_WATER);
+	(void)worldSet(&g_world, DX, DY, DZ, BLOCK_AIR);
+	(void)waterSettle(&g_sim, &g_world, 20000, NULL, NULL);
+	const int      flood     = waterFlowCells(&g_sim);
+	const uint64_t h_present = hashBox(-13, 13, 60, 70, -13, 13);
+
+	CHECK(lake == 260, "control: the fixture really is holding a reservoir behind the dam");
+	CHECK(flood > 0, "control: breaking the dam really does flood, so there is a state to compare");
+
+	// ── rejoined ──
+	buildDamFixture();
+	(void)worldSet(&g_world, DX, DY, DZ, BLOCK_AIR);
+	(void)waterSettle(&g_sim, &g_world, 20000, NULL, NULL);
+	unloadAndStreamBackIn();
+	(void)worldSet(&g_world, DX, DY, DZ, BLOCK_AIR);   // the server's diff, replayed
+	(void)waterSettle(&g_sim, &g_world, 20000, NULL, NULL);
+	const uint64_t h_rejoined  = hashBox(-13, 13, 60, 70, -13, 13);
+	const uint32_t rejoin_full = waterMapFull(&g_sim);
+
+	// ── no_diff, the red control ──
+	buildDamFixture();
+	(void)worldSet(&g_world, DX, DY, DZ, BLOCK_AIR);
+	(void)waterSettle(&g_sim, &g_world, 20000, NULL, NULL);
+	unloadAndStreamBackIn();
+	(void)waterSettle(&g_sim, &g_world, 20000, NULL, NULL);
+	const uint64_t h_no_diff = hashBox(-13, 13, 60, 70, -13, 13);
+
+	printf("         present %016llx  rejoined %016llx  no_diff %016llx\n",
+	       (unsigned long long)h_present, (unsigned long long)h_rejoined,
+	       (unsigned long long)h_no_diff);
+
+	CHECK(h_rejoined == h_present,
+	      "a client that lost the column and replayed the server's diff lands on the identical world");
+	CHECK(h_no_diff != h_present,
+	      "red control: withhold the diff and the world differs, so the hashes above compared something");
+	CHECK(rejoin_full == 0,
+	      "control: no flow cell was refused a map slot, so neither arm was silently truncated");
+}
+
 int main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
@@ -1835,13 +1940,21 @@ int main(void)
 	testSunkenBasin();
 	testPadAndShaft();
 	testTickCost();
+	testJoinedClientConvergesOnFlood();
 
 	worldExit(&g_world);
 
 	// v1.8.3. The suite counts itself, and no other suite in this project does — which is exactly
 	// how a 326 -> 318 deletion once passed as "0 failed" here. A red arm whose TOTAL dropped is
 	// deleting checks, not failing them, and nothing in the PASS line below can tell the two
-	// apart on its own. 219 is every check above this one; this check is the 220th.
+	// apart on its own. 224 is every check above this one; this check is the 225th.
+	//
+	// v1.8.19: 219 -> 224. All five are testJoinedClientConvergesOnFlood, new below
+	// testTickCost: the convergence claim itself, the red control that withholds the
+	// server's diff so the claim cannot pass on two empty worlds, and three controls
+	// pinning that the reservoir exists, that breaking the dam actually floods, and that
+	// no flow cell was refused a map slot. It is the probe the decision to let a server
+	// declare a generator above LEGACY rests on — see its header.
 	//
 	// v1.8.3: 203 -> 219. All sixteen are testNoOrphanedDedupKeys, new below
 	// testOverflowKeepsTheNewest: four arms — a pour stopped mid-flight, the eviction path, a
@@ -1869,7 +1982,7 @@ int main(void)
 	// catch. When a check is legitimately added or removed, this number is edited by hand, on
 	// purpose, in the same commit — that edit IS the review.
 	const int counted = g_checks;
-	CHECK(counted == 219, "the suite ran all 219 of its checks: none was deleted or skipped");
+	CHECK(counted == 224, "the suite ran all 224 of its checks: none was deleted or skipped");
 
 	printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);
 	if (g_fails) printf("FAILED - %d of %d checks\n", g_fails, g_checks);
