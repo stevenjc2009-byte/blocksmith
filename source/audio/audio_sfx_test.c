@@ -17,6 +17,14 @@
 //
 // Reuses audio_bsnd_test.c's CHECK macro shape and audio_mixer_test.c's "read the real
 // shipped file" pattern rather than inventing a third convention.
+//
+// v1.8.19 "per-material sound" grew the table again, nine slots to twenty-one, and grew
+// kShipped the same way: twelve more real files, same two questions asked of the whole set
+// (does every file parse as valid BSND, does the total still fit the Old 3DS pool). The
+// resolvers that pick WHICH of the twelve to play for a given SfxMaterial, and their
+// generic-slot fallback when a per-material clip is missing, are audio_material_test.c's
+// job, not this file's — this suite only proves the table holds what it is told and the
+// files on disk are what they claim to be.
 #ifndef __3DS__
 
 #include <stdio.h>
@@ -68,7 +76,48 @@ static void testRegisterAndQueryEveryNewSlot(void)
 	CHECK(audioSfxId(SFX_SPLASH)      == 18);
 	CHECK(audioSfxId(SFX_UI_TAP)      == 19);
 
-	CHECK(SFX_SLOT_COUNT == 9);
+	audioSfxReset();
+}
+
+// v1.8.19 "per-material sound" — the twelve slots audio_material.h's four materials times
+// three events (footstep/break/place) added. Its own test, rather than folded into the
+// function above, because that one is named for what it already proved ("every NEW slot" as
+// of v1.8.17) and these twelve are a second, later addition on top of it; audio_sfx_test.c's
+// own three-and-nine history is the reason a slot table's growth gets a fresh test per lane
+// rather than an ever-growing single one nobody re-reads in full.
+static void testRegisterAndQueryEveryMaterialSlot(void)
+{
+	audioSfxReset();
+
+	audioSfxRegister(SFX_FOOTSTEP_STONE, 21);
+	audioSfxRegister(SFX_FOOTSTEP_WOOD,  22);
+	audioSfxRegister(SFX_FOOTSTEP_DIRT,  23);
+	audioSfxRegister(SFX_FOOTSTEP_GRASS, 24);
+	audioSfxRegister(SFX_BREAK_STONE,    25);
+	audioSfxRegister(SFX_BREAK_WOOD,     26);
+	audioSfxRegister(SFX_BREAK_DIRT,     27);
+	audioSfxRegister(SFX_BREAK_GRASS,    28);
+	audioSfxRegister(SFX_PLACE_STONE,    29);
+	audioSfxRegister(SFX_PLACE_WOOD,     30);
+	audioSfxRegister(SFX_PLACE_DIRT,     31);
+	audioSfxRegister(SFX_PLACE_GRASS,    32);
+
+	CHECK(audioSfxId(SFX_FOOTSTEP_STONE) == 21);
+	CHECK(audioSfxId(SFX_FOOTSTEP_WOOD)  == 22);
+	CHECK(audioSfxId(SFX_FOOTSTEP_DIRT)  == 23);
+	CHECK(audioSfxId(SFX_FOOTSTEP_GRASS) == 24);
+	CHECK(audioSfxId(SFX_BREAK_STONE)    == 25);
+	CHECK(audioSfxId(SFX_BREAK_WOOD)     == 26);
+	CHECK(audioSfxId(SFX_BREAK_DIRT)     == 27);
+	CHECK(audioSfxId(SFX_BREAK_GRASS)    == 28);
+	CHECK(audioSfxId(SFX_PLACE_STONE)    == 29);
+	CHECK(audioSfxId(SFX_PLACE_WOOD)     == 30);
+	CHECK(audioSfxId(SFX_PLACE_DIRT)     == 31);
+	CHECK(audioSfxId(SFX_PLACE_GRASS)    == 32);
+
+	// The number this whole file's slot-table tests turn on: three original slots, six
+	// v1.8.17 slots, twelve v1.8.19 slots.
+	CHECK(SFX_SLOT_COUNT == 21);
 
 	audioSfxReset();
 }
@@ -87,9 +136,9 @@ static void testResetClearsAllNineSlots(void)
 		CHECK(audioSfxId((SfxSlot)i) == AUDIO_SOUND_NONE);
 }
 
-// A slot outside 0..8 must be ignored rather than write past s_slots — the bigger table
-// makes this MORE important to re-check, not less, since a future ninth-slot-sized off-
-// by-one would corrupt whichever slot sits at index SFX_SLOT_COUNT.
+// A slot outside 0..SFX_SLOT_COUNT-1 must be ignored rather than write past s_slots — the
+// bigger table makes this MORE important to re-check, not less, since a future off-by-one
+// at the new ceiling would corrupt whichever slot sits at index SFX_SLOT_COUNT.
 static void testOutOfRangeSlotIsIgnored(void)
 {
 	audioSfxReset();
@@ -151,15 +200,90 @@ static const ShippedSfx kShipped[] = {
 	{ "romfs/sfx/craft.bsnd",        9704 },
 	{ "romfs/sfx/splash.bsnd",      13232 },
 	{ "romfs/sfx/ui_tap.bsnd",       3968 },
+	// v1.8.19 "per-material sound" — NINE more, not twelve, and the three that are missing
+	// are deliberate. See kFallbackOnly below for which and why.
+	{ "romfs/sfx/footstep_stone.bsnd", 6176 },
+	{ "romfs/sfx/footstep_dirt.bsnd",  7056 },
+	{ "romfs/sfx/footstep_grass.bsnd", 6616 },
+	{ "romfs/sfx/break_wood.bsnd",    12348 },
+	{ "romfs/sfx/break_dirt.bsnd",    11468 },
+	{ "romfs/sfx/break_grass.bsnd",   10584 },
+	{ "romfs/sfx/place_stone.bsnd",    8820 },
+	{ "romfs/sfx/place_dirt.bsnd",     8820 },
+	{ "romfs/sfx/place_grass.bsnd",    7940 },
 };
 #define SHIPPED_COUNT (sizeof(kShipped) / sizeof(kShipped[0]))
 
-// SFX_SLOT_COUNT (audio_sfx.h) and SHIPPED_COUNT (this file's own table) must agree, or one
-// of the two lists drifted from the other without either side noticing — the exact "a slot
-// with no clip behind it" gap the task asked this suite to close.
+// ── The three slots that deliberately ship no file ─────────────────────────────────────
+//
+// The three pre-1.8.19 generic clips are each already a specific material, because of what
+// was recorded (assets/sfx_src/ATTRIBUTION.md): the generic footstep is a WOOD footstep, the
+// generic break is a STONE impact, the generic place is a plank, so WOOD. A dedicated
+// footstep_wood / break_stone / place_wood would have been a byte-identical second copy of a
+// file already in romfs — 87,668 bytes of a 393,216-byte Old 3DS pool spent storing three
+// sounds twice — so those three are not built and main.c does not register them. The
+// resolvers' fallback lands on exactly the clip a dedicated slot would have held.
+//
+// That is only safe while the generic clips REMAIN those materials, and nothing about a .bsnd
+// file says what it is a recording of. So the assumption is pinned from both ends below,
+// because it is the kind that fails silently and is noticed by ear on a console nobody is
+// holding.
+typedef struct {
+	SfxMaterial mat;
+	SfxSlot     expect_generic;
+	const char* absent_path;
+} FallbackOnly;
+
+static const FallbackOnly kFallbackOnly[] = {
+	{ SFX_MAT_WOOD,  SFX_FOOTSTEP,    "romfs/sfx/footstep_wood.bsnd" },
+	{ SFX_MAT_STONE, SFX_BLOCK_BREAK, "romfs/sfx/break_stone.bsnd"   },
+	{ SFX_MAT_WOOD,  SFX_BLOCK_PLACE, "romfs/sfx/place_wood.bsnd"    },
+};
+#define FALLBACK_ONLY_COUNT (sizeof(kFallbackOnly) / sizeof(kFallbackOnly[0]))
+
+// SFX_SLOT_COUNT (audio_sfx.h) and this file's own table must still account for every slot —
+// but the identity is no longer one file per slot. It is one file per slot EXCEPT the three
+// above, and writing the three into the equation is what stops a future lane "fixing" the
+// mismatch by quietly deleting a row from either list.
 static void testShippedFileCountMatchesSlotCount(void)
 {
-	CHECK((int)SHIPPED_COUNT == SFX_SLOT_COUNT);
+	CHECK((int)(SHIPPED_COUNT + FALLBACK_ONLY_COUNT) == SFX_SLOT_COUNT);
+}
+
+// Half one: the three files really are absent. If someone regenerates the manifest with the
+// twelve rows restored, the duplication comes back and this goes red — an assertion about
+// bytes on disk, which is the thing that actually costs pool space.
+static void testFallbackOnlyFilesAreNotShipped(void)
+{
+	for (size_t i = 0; i < FALLBACK_ONLY_COUNT; i++) {
+		FILE* f = fopen(kFallbackOnly[i].absent_path, "rb");
+		CHECK(f == NULL);
+		if (f) fclose(f);
+	}
+}
+
+// Half two: with those slots unregistered, each resolver answers the GENERIC slot — the one
+// holding the recording of that material. This is the half that goes red if someone registers
+// a per-material slot without adding its file, or renumbers the enum.
+//
+// audioSfxReset() first, so this cannot pass on state another test left behind.
+static void testFallbackOnlyMaterialsResolveToGenericSlots(void)
+{
+	audioSfxReset();
+
+	CHECK(audioSfxFootstepSlot(kFallbackOnly[0].mat) == kFallbackOnly[0].expect_generic);
+	CHECK(audioSfxBreakSlot(kFallbackOnly[1].mat)    == kFallbackOnly[1].expect_generic);
+	CHECK(audioSfxPlaceSlot(kFallbackOnly[2].mat)    == kFallbackOnly[2].expect_generic);
+
+	// The control that stops the three above passing for the wrong reason: a material whose
+	// own slot IS shipped must NOT fall back once that slot is registered. Without this, a
+	// resolver that ignored its argument and always answered the generic slot would satisfy
+	// every check above.
+	audioSfxRegister(SFX_FOOTSTEP_DIRT, 1);
+	CHECK(audioSfxFootstepSlot(SFX_MAT_DIRT) == SFX_FOOTSTEP_DIRT);
+	CHECK(audioSfxFootstepSlot(SFX_MAT_DIRT) != SFX_FOOTSTEP);
+
+	audioSfxReset();
 }
 
 static void testEveryShippedFileParsesAsValidBsnd(void)
@@ -202,26 +326,29 @@ static void testEveryShippedFileParsesAsValidBsnd(void)
 	// sound pushes this over, this is where it goes red, on a PC, in under a second —
 	// exactly the property audio_mixer_test.c's testShippedSetFitsOldConsole already gives
 	// the three-sound set, extended here to cover what this lane added.
-	CHECK(total_pool == 159996u);
+	CHECK(total_pool == 239824u);
 	CHECK(total_pool < AUDIO_POOL_BYTES_OLD3DS);
 	CHECK(total_pool < AUDIO_POOL_BYTES_NEW3DS);
 
 	// Not a tautology: this is the ACTUAL remaining headroom after this lane's additions,
 	// printed into the failure message space via CHECK's own line/expression capture if it
-	// ever goes red, so a future lane adding a tenth sound can see how much room is left
-	// without re-deriving it.
-	CHECK(AUDIO_POOL_BYTES_OLD3DS - total_pool == 233220u);
+	// ever goes red, so a future lane adding a twenty-second sound can see how much room is
+	// left without re-deriving it.
+	CHECK(AUDIO_POOL_BYTES_OLD3DS - total_pool == 153392u);
 }
 
 int main(void)
 {
 	testRegisterAndQueryEveryNewSlot();
+	testRegisterAndQueryEveryMaterialSlot();
 	testResetClearsAllNineSlots();
 	testOutOfRangeSlotIsIgnored();
 	testPlayAtBlockSafeWithNoAudioForEveryNewSlot();
 
 	testShippedFileCountMatchesSlotCount();
 	testEveryShippedFileParsesAsValidBsnd();
+	testFallbackOnlyFilesAreNotShipped();
+	testFallbackOnlyMaterialsResolveToGenericSlots();
 
 	if (s_fails == 0)
 		printf("audio sfx self-test: PASS  %d checks\n", s_checks);

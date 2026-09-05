@@ -32,6 +32,7 @@
 #include <stdbool.h>
 
 #include "audio/audio.h"
+#include "audio/audio_material.h"
 
 // The nine sounds tools/make_sounds.py packs into romfs:/sfx/. Slots, not ids — the id is
 // whatever audioLoad returned for the file registered into this slot, and an unregistered
@@ -80,8 +81,59 @@ typedef enum {
 	// Non-positional, AUDIO_PRIO_UI — "never dropped, never positional" (audio_mixer.h).
 	SFX_UI_TAP      = 8,
 
-	SFX_SLOT_COUNT  = 9,
+	// ── v1.8.19 "per-material sound": four materials × three events ────────────────────
+	//
+	// tools/make_sounds.py's asset lane packs these twelve as
+	// romfs:/sfx/footstep_stone.bsnd, footstep_wood, footstep_dirt, footstep_grass,
+	// break_stone, break_wood, break_dirt, break_grass, place_stone, place_wood,
+	// place_dirt, place_grass — this file only names the slots main.c registers them
+	// into; it does not know or care what synthesised them.
+	//
+	// The three original slots above (SFX_BLOCK_BREAK, SFX_BLOCK_PLACE, SFX_FOOTSTEP)
+	// are NOT removed and NOT redundant with these: they are what SFX_MAT_GENERIC plays,
+	// and what every one of the twelve below falls back to when its own clip was never
+	// registered — audioSfxFootstepSlot()/audioSfxBreakSlot()/audioSfxPlaceSlot() below
+	// are the resolvers that make that fallback happen, and no call site is expected to
+	// reach for one of these twelve names directly; it asks a resolver for a SfxMaterial
+	// instead and gets back whichever slot — material-specific or generic — should
+	// actually play.
+	SFX_FOOTSTEP_STONE,
+	SFX_FOOTSTEP_WOOD,
+	SFX_FOOTSTEP_DIRT,
+	SFX_FOOTSTEP_GRASS,
+	SFX_BREAK_STONE,
+	SFX_BREAK_WOOD,
+	SFX_BREAK_DIRT,
+	SFX_BREAK_GRASS,
+	SFX_PLACE_STONE,
+	SFX_PLACE_WOOD,
+	SFX_PLACE_DIRT,
+	SFX_PLACE_GRASS,
+
+	SFX_SLOT_COUNT  = 21,
 } SfxSlot;
+
+// ── Per-material resolution (v1.8.19) ───────────────────────────────────────────────
+//
+// Each of these asks "given what actually got REGISTERED, which slot should a footstep /
+// break / place on `mat` actually play" — a harder question than "which slot names this
+// material", because audioSfxRegister() can and does hold AUDIO_SOUND_NONE for a slot
+// whose clip never made it in (a file this lane's asset pipeline has not shipped yet, or a
+// load that failed — see this file's own opening comment on why a captured id beats an
+// assumed one). If the per-material slot's id is AUDIO_SOUND_NONE, the answer falls back
+// to the pre-1.8.19 generic slot, so a build missing footstep_stone.bsnd degrades to the
+// ordinary footstep sound rather than to silence.
+//
+// The fallback is a real branch these functions perform, not something audioSfxPlayAtBlock
+// does for you: that function only knows "play this slot or refuse", never "try this slot,
+// then that one" — see this file's own header comment on why audioPlayAt refusing
+// AUDIO_SOUND_NONE is not the same thing as a policy fallback.
+//
+// SFX_MAT_GENERIC always resolves to the generic slot outright — there is no
+// "SFX_FOOTSTEP_GENERIC" to register, the pre-1.8.19 slot already IS that row.
+SfxSlot audioSfxFootstepSlot(SfxMaterial mat);
+SfxSlot audioSfxBreakSlot(SfxMaterial mat);
+SfxSlot audioSfxPlaceSlot(SfxMaterial mat);
 
 // Records the id audioLoad() returned. Call once per sound at boot. A slot outside the
 // enum is ignored rather than written past the table, and AUDIO_SOUND_NONE is a legal
@@ -161,6 +213,17 @@ void audioFootstepsReset(AudioFootsteps* f);
 // One frame of walking. `x`, `y`, `z` is the body's position with y at the FEET (the
 // convention world/physics.h's Body uses), and `on_ground` is Body::on_ground.
 //
+// `under` is the BlockId of the cell the player is actually standing ON — not the cell
+// their feet occupy (that one is normally air; the body rests on TOP of it), the caller's
+// job, not this function's, to read out of the world before calling. v1.8.19 adds this
+// parameter so a step can sound like what it landed on: sfxMaterialOfBlock(under) picks the
+// material and audioSfxFootstepSlot() resolves it to a slot, with the pre-1.8.19 generic
+// footstep as the fallback exactly as it always was (see audio_sfx.h's resolver comment).
+// Read even on a frame that will not fire a step (see "at most one step per call" below) —
+// cheap, and reading it only sometimes would make this function's cost depend on the
+// caller's stride state, which is one more thing a caller would have to reason about for no
+// benefit.
+//
 // Returns true on the frame a footstep was played, which is what the host suite counts.
 // At most one step per call: the per-call distance is capped by SFX_FOOTSTEP_MAX_STEP, so
 // the accumulator can never hold two strides' worth after one subtraction.
@@ -169,7 +232,8 @@ void audioFootstepsReset(AudioFootsteps* f);
 // contribute its arc to the next step and landing does not discharge a fall as footsteps.
 // The banked distance SURVIVES the jump rather than being cleared: a player who hops
 // mid-walk is still mid-stride when they land.
-bool audioFootstepsUpdate(AudioFootsteps* f, float x, float y, float z, bool on_ground);
+bool audioFootstepsUpdate(AudioFootsteps* f, float x, float y, float z, bool on_ground,
+                          BlockId under);   // block underfoot, not the (usually air) feet cell
 
 // ── Mob damage ────────────────────────────────────────────────────────────────────
 

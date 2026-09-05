@@ -4435,6 +4435,47 @@ int main(void)
 	audioSfxRegister(SFX_SPLASH,      audioLoad("romfs:/sfx/splash.bsnd"));
 	audioSfxRegister(SFX_UI_TAP,      audioLoad("romfs:/sfx/ui_tap.bsnd"));
 
+	// v1.8.19 "per-material sound". Twelve more clips, same registration shape as the nine
+	// above and the same reason: a captured id, not an assumed one, so a missing or corrupt
+	// file among these twelve degrades that ONE material/event pair rather than silently
+	// renumbering its neighbours. Nothing below has to special-case a load failure — an
+	// unregistered or failed slot reads back AUDIO_SOUND_NONE, and audio_sfx.h's three
+	// resolvers (audioSfxFootstepSlot/audioSfxBreakSlot/audioSfxPlaceSlot) already fall back
+	// to the generic slot above whenever that happens, so a build missing, say,
+	// break_wood.bsnd just plays the ordinary block-break sound for wood instead of nothing.
+	// THREE OF THE TWELVE ARE DELIBERATELY ABSENT, and this is the reason.
+	//
+	// The three generic clips registered above are not neutral placeholders — each one IS a
+	// specific material, because of where its recording came from. assets/sfx_src/ATTRIBUTION.md
+	// has the provenance: the generic footstep is Kenney's footstep_wood_000.ogg, which is a
+	// WOOD footstep; the generic break is impactMining_000.ogg, which is a STONE impact; the
+	// generic place is impactPlank_medium_000.ogg, which is a plank, so WOOD.
+	//
+	// Shipping footstep_wood.bsnd, break_stone.bsnd and place_wood.bsnd would therefore put a
+	// byte-identical second copy of each of those three recordings in romfs — verified identical
+	// by md5, not assumed — costing 87,740 bytes of a 393,216-byte Old 3DS audio pool to store
+	// three sounds twice. That is 22% of the pool for nothing.
+	//
+	// So they are not built and not registered, and the resolvers' fallback does the work: with
+	// no SFX_FOOTSTEP_WOOD registered, audioSfxFootstepSlot(SFX_MAT_WOOD) answers SFX_FOOTSTEP,
+	// which is the wood recording. The fallback is not a degradation here — it lands on exactly
+	// the clip a dedicated slot would have held.
+	//
+	// The hazard this creates is real and is pinned rather than hoped away: if someone later
+	// replaces the generic footstep with something that is not wood, wood footsteps silently
+	// become wrong. audio_sfx_test.c asserts these three fallbacks resolve to the generic slots
+	// AND that the three duplicate files are absent from romfs, so that change goes red here
+	// rather than being noticed by ear on a console nobody is holding.
+	audioSfxRegister(SFX_FOOTSTEP_STONE, audioLoad("romfs:/sfx/footstep_stone.bsnd"));
+	audioSfxRegister(SFX_FOOTSTEP_DIRT,  audioLoad("romfs:/sfx/footstep_dirt.bsnd"));
+	audioSfxRegister(SFX_FOOTSTEP_GRASS, audioLoad("romfs:/sfx/footstep_grass.bsnd"));
+	audioSfxRegister(SFX_BREAK_WOOD,     audioLoad("romfs:/sfx/break_wood.bsnd"));
+	audioSfxRegister(SFX_BREAK_DIRT,     audioLoad("romfs:/sfx/break_dirt.bsnd"));
+	audioSfxRegister(SFX_BREAK_GRASS,    audioLoad("romfs:/sfx/break_grass.bsnd"));
+	audioSfxRegister(SFX_PLACE_STONE,    audioLoad("romfs:/sfx/place_stone.bsnd"));
+	audioSfxRegister(SFX_PLACE_DIRT,     audioLoad("romfs:/sfx/place_dirt.bsnd"));
+	audioSfxRegister(SFX_PLACE_GRASS,    audioLoad("romfs:/sfx/place_grass.bsnd"));
+
 	// ── One session ─────────────────────────────────────────────────────────────────────
 	//
 	// Everything from here to the `goto` at the bottom of main() is one visit to one world:
@@ -5733,8 +5774,21 @@ session_start:
 			// Under the !BS_FLY branch only. The free-fly camera never touches player.body, so a
 			// BS_FLY build would call this with a body that never moves — no travel, no steps,
 			// and no footsteps is the right answer for a camera that is not a person walking.
+			//
+			// v1.8.19. The block underfoot, read here rather than inside audioFootstepsUpdate,
+			// because that function is host-tested (source/audio/audio_sfx_test.c and
+			// tests/audio_cue_test.c) against a World it never has to link a mesher or a
+			// renderer to reach, and reading the world stays this call site's job the same way
+			// it already is for fallDamageUpdate's bodySubmerged() a few lines below. `y - 1`,
+			// not `y`: player.body.y is the FEET, per world/physics.h's Body convention (see
+			// audio_sfx.h's own doc comment on audioFootstepsUpdate), and the feet sit on TOP of
+			// the block that supports them — the cell at y itself is normally air, which is
+			// where the player's own body occupies space, not what they are standing on.
 			audioFootstepsUpdate(&footsteps, player.body.x, player.body.y, player.body.z,
-			                      player.body.on_ground);
+			                      player.body.on_ground,
+			                      worldGet(&s_world, (int)floorf(player.body.x),
+			                               (int)floorf(player.body.y) - 1,
+			                               (int)floorf(player.body.z)));
 
 			// v1.8.13 SURV-WIRE. IMMEDIATELY after the step that moved the body, and this
 			// placement is forced rather than tidy: world/survival.h says on_ground is set by
@@ -6254,12 +6308,41 @@ session_start:
 			const u32 break_key = inputKey(ACTION_BREAK);
 			if (break_key && (down & break_key)) {
 				uint8_t drop_item = 0, drop_count = 0;
-				// The return is whether this hit KILLED it, and it is dropped: the drop
-				// out-parameters already say so (animal.h writes 0 to both on a survivor), and
-				// there is nothing else here that treats a kill differently from a hit.
-				(void)animalHurt(&s_entities, animal_slot, ANIMAL_FIST_DAMAGE,
-				                 player.body.x, player.body.z, &drop_item, &drop_count);
+
+				// v1.8.19 sound. The return is whether this hit KILLED it. It used to be
+				// discarded with a (void) cast, under a comment claiming there was "nothing else
+				// here that treats a kill differently from a hit". There is now:
+				// audio_sfx.h's audioSfxPlayMobDamage() picks SFX_DEATH over SFX_HURT on exactly
+				// this bool.
+				//
+				// The drop out-parameters cannot stand in for it. animal.h writes 0 to both on a
+				// survivor AND on a killed row that drops nothing, so a drop of 0 does not mean
+				// "still alive" -- inferring the kill from the drop would play the hurt cue on
+				// every meatless kill.
+				//
+				// Why the capture is the whole fix: audioSfxPlayMobDamage() has existed, been
+				// documented and been host-tested since the v1.9.1 audio lane, but this line is
+				// its ONLY call site in the tree, and this line threw away the one argument it
+				// needs. The function was unreachable -- every animal hit and every animal death
+				// in the shipped game was silent, which is not what its header says it does.
+				const bool killed = animalHurt(&s_entities, animal_slot, ANIMAL_FIST_DAMAGE,
+				                               player.body.x, player.body.z,
+				                               &drop_item, &drop_count);
 				hit_animal_this_frame = true;
+
+				// Positional at the ANIMAL, which is the one thing the helper's contract insists
+				// on ("at the animal's own body (not the player's)"). y is the box CENTRE and not
+				// body.y, because physics.h:199 documents body.y as the FEET, and a cue emitted at
+				// ground level sits under the creature the player is looking at.
+				//
+				// Read out of the slot AFTER the hit rather than cached before it: animalHurt()
+				// can only change health, ai_state and ai_timer -- never position -- so the two
+				// reads are the same coordinates and a copy would only be a second thing to keep
+				// in step. The slot is still valid either way; a killed animal is despawned by the
+				// creature lane's own tick, not inside animalHurt().
+				const Entity* hurt = &s_entities.e[animal_slot];
+				audioSfxPlayMobDamage(killed, hurt->body.x,
+				                      hurt->body.y + hurt->body.height * 0.5f, hurt->body.z);
 
 				// The drop goes STRAIGHT INTO THE BAG. There is no ground-item entity anywhere
 				// in this codebase -- a broken block goes to the inventory, which is what the

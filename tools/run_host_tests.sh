@@ -1301,6 +1301,11 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 # tests/audio_cue_test.c at the bottom of this file is where the cues are asserted — and
 # nothing here calls audioInit, so audio.c is unavailable and every cue is a silent no-op
 # exactly as the audio.h contract promises for a console with no DSP.
+#
+# v1.8.19 added source/audio/audio_material.c to that same link. interact.c's break and
+# place call sites now resolve a per-material slot via sfxMaterialOfBlock() before handing
+# it to audioSfxPlayAtBlock, so the symbol has to be linked for the same reason the five
+# audio objects above already are — the call is unconditional, not behind __3DS__.
 gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	-I source \
 	source/world/world.c \
@@ -1321,6 +1326,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/audio/audio_pan.c \
 	source/audio/audio_bsnd.c \
 	source/audio/audio_sfx.c \
+	source/audio/audio_material.c \
 	source/scene/interact_test.c \
 	tests/interact_stub.c \
 	tests/net_stub.c \
@@ -5092,6 +5098,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/audio/audio.c \
 	source/audio/audio_mixer.c \
 	source/audio/audio_sfx.c \
+	source/audio/audio_material.c \
 	source/audio/audio_bsnd.c \
 	source/audio/audio_pan.c \
 	source/app/hw.c \
@@ -5102,6 +5109,44 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 "./$BHASX/audio_sfx_test"
 
 rm -rf "$BHASX"
+
+# ── source/audio/audio_material_test.c — the v1.8.19 block-to-material map + resolvers ────
+#
+# source/audio/audio_material.c is new: one pure function, sfxMaterialOfBlock(), switching
+# on world/block.h's frozen ids. It has to be a NEW binary and not more checks folded into
+# audio_sfx_test.c above, for the reason this file's own top comment now gives: that suite
+# proves the SLOT TABLE (register/query/reset/out-of-range, and the shipped .bsnd set), and
+# deliberately says nothing about which material a block maps to or which slot a material
+# resolves to. Those are this file's two questions, matching audio_material_test.c's own
+# top comment.
+#
+# Same link set as the audio_sfx stanza just above, plus audio_material.c itself — the
+# three resolvers under test (audioSfxFootstepSlot/audioSfxBreakSlot/audioSfxPlaceSlot) live
+# in audio_sfx.c, not audio_material.c, so both are needed; audio.c/audio_mixer.c/
+# audio_bsnd.c/audio_pan.c/app/hw.c are pulled in the same way and for the same reason the
+# audio_sfx stanza's own comment explains (audio_sfx.c's audioPlayAt call pulls in the
+# mixer, which pulls in the rest of the chain) even though this suite never calls
+# audioPlayAt itself — the link is of the WHOLE translation unit, not of the one function a
+# test happens to call.
+BHASM="build-host/run-$$-audiomaterial"
+mkdir -p "$BHASM"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/audio/audio.c \
+	source/audio/audio_mixer.c \
+	source/audio/audio_sfx.c \
+	source/audio/audio_material.c \
+	source/audio/audio_bsnd.c \
+	source/audio/audio_pan.c \
+	source/app/hw.c \
+	source/audio/audio_material_test.c \
+	-lm \
+	-o "$BHASM/audio_material_test"
+
+"./$BHASM/audio_material_test"
+
+rm -rf "$BHASM"
 
 # ── tests/audio_cue_test.c — the v1.9.0 sound CUES (does anything play a sound at all) ─────
 #
@@ -5127,6 +5172,10 @@ rm -rf "$BHASX"
 # the LINK, never inside a module under test: tests/interact_stub.c for chunkRenderTouch
 # (citro3d), tests/net_stub.c for world.c's networldOnColumnLoad, and networldSendBlockEdit /
 # networldSessionActive inside audio_cue_test.c itself, copied from source/scene/interact_test.c
+#
+# v1.8.19 added source/audio/audio_material.c to the link below, for the same reason the
+# interact_test stanza's own note gives: interact.c's break/place cues now resolve a
+# per-material slot through sfxMaterialOfBlock() before playing, unconditionally.
 # for the reason that stanza gives.
 #
 # app/hw.c is here for hwTestSetNew3ds: the sounds are loaded into the OLD 3DS pool (393,216
@@ -5212,6 +5261,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/audio/audio_pan.c \
 	source/audio/audio_bsnd.c \
 	source/audio/audio_sfx.c \
+	source/audio/audio_material.c \
 	tests/interact_stub.c \
 	tests/net_stub.c \
 	tests/audio_cue_test.c \
@@ -5246,6 +5296,9 @@ rm -rf "$BHAC"
 # will hit it too. The five source/audio objects and -lm are here for the same reason the
 # interact stanza above gives: scene/interact.c fires the break/place cues, so this binary does
 # not link without them, and nothing here calls audioInit, so every cue is a silent no-op.
+# v1.8.19 adds source/audio/audio_material.c to that set for the same reason it was added to
+# the interact_test and audio_cue_test stanzas: interact.c's cues now resolve a per-material
+# slot before they play.
 #
 # Red arms (three, each on REAL shipping code, each restored and confirmed by md5):
 #   * crafting.c torch recipe output_item BLOCK_TORCH -> BLOCK_DIRT  -> FAIL 4/12, first
@@ -5287,6 +5340,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/audio/audio_pan.c \
 	source/audio/audio_bsnd.c \
 	source/audio/audio_sfx.c \
+	source/audio/audio_material.c \
 	source/scene/craft_torch_e2e_test.c \
 	tests/interact_stub.c \
 	tests/net_stub.c \

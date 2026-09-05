@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Synthesises source WAVs for the six new v1.8.17 gameplay cues (lane SOUND-A).
+"""Synthesises source WAVs for the six new v1.8.17 gameplay cues (lane SOUND-A), plus the
+nine per-material footstep/break/place cues added for v1.8.19 ("footsteps that know what
+you are walking on, block breaking and placing per material" — STONE/WOOD/DIRT/GRASS).
+The v1.8.19 additions are Sounds 7-15 below, after the original six; everything in this
+docstring about no downloads, no numpy, and byte-identical re-runs applies to them equally.
 
 Nothing here is sampled, recorded, downloaded or lifted from another game — the same rule
 tools/make_banner_audio.py and tools/make_atlas.py already follow, and for the same reason:
@@ -21,7 +25,7 @@ Deterministic by construction: every noise burst comes from the integer LCG belo
 per sound from a fixed constant, never from Python's `random`. A re-run byte-diffs identical.
 
 Usage:
-    python tools/make_sfx_synth.py            # writes all six WAVs into assets/sfx_src/
+    python tools/make_sfx_synth.py            # writes all fifteen WAVs into assets/sfx_src/
 """
 
 from __future__ import annotations
@@ -260,6 +264,261 @@ def make_ui_tap() -> list[float]:
     return buf
 
 
+# ── v1.8.19 lane: per-material footstep / break / place ─────────────────────────────
+#
+# Four materials — STONE, WOOD, DIRT, GRASS — three actions each. Three of the twelve
+# outputs (footstep_wood, break_stone, place_wood) reuse the existing Kenney recordings
+# unchanged rather than being synthesised here, because a real recording beats a synthetic
+# one when it already is the right material; see tools/make_sounds.py's MANIFEST for those
+# three. The nine functions below cover the rest. Each material gets one consistent
+# spectral idea reused across its footstep/break/place variants (a lowpass cutoff and a
+# tonal register for stone/wood/dirt, a highpass-only noise-burst pattern for grass), so
+# that e.g. every dirt sound is recognisably dirt regardless of which action triggered it.
+
+
+# ── Sound 7: footstep — stone ────────────────────────────────────────────────────────
+#
+# Stone gives almost nothing back to a footfall to absorb it, so the noise burst keeps
+# nearly its whole spectrum (lowpass at 7000 Hz, barely a filter at all) and the tonal
+# partial sits high (1800 Hz) and dies fast (tau 0.02s) — a "tick", not a "thud". 0.14s:
+# the shortest of the twelve new sounds, because stone returns its energy immediately
+# instead of ringing or absorbing it.
+def make_footstep_stone() -> list[float]:
+    dur_s = 0.14
+    n = int(round(dur_s * RATE))
+    buf = [0.0] * n
+    noise = lcg_noise(0x46535354)  # 'FSST'
+
+    env = env_exp_decay(n, tau_s=0.020, attack_s=0.001)
+    for i in range(n):
+        t = i / RATE
+        buf[i] += 0.30 * env[i] * math.sin(2.0 * math.pi * 1800.0 * t)
+
+    raw = [next(noise) for _ in range(n)]
+    shaped = lowpass(raw, 7000.0)
+    mix_into(buf, 0, [0.55 * s * e for s, e in zip(shaped, env)])
+
+    return buf
+
+
+# ── Sound 8: footstep — dirt ─────────────────────────────────────────────────────────
+#
+# The opposite of stone: dirt swallows almost everything above its lowest partials, so the
+# lowpass sits at 500 Hz (nearly everything above that is gone) and the "tone" is a soft
+# 90 Hz thump rather than a click — there is no bright transient to speak of. Slightly
+# longer than stone's click (0.16s, tau 0.035s) because a muffled sound that is also
+# instantaneous just reads as quiet, not dull; it needs a beat more time to read as soft.
+def make_footstep_dirt() -> list[float]:
+    dur_s = 0.16
+    n = int(round(dur_s * RATE))
+    buf = [0.0] * n
+    noise = lcg_noise(0x46534454)  # 'FSDT'
+
+    env = env_exp_decay(n, tau_s=0.035, attack_s=0.003)
+    for i in range(n):
+        t = i / RATE
+        buf[i] += 0.30 * env[i] * math.sin(2.0 * math.pi * 90.0 * t)
+
+    raw = [next(noise) for _ in range(n)]
+    shaped = lowpass(raw, 500.0)
+    mix_into(buf, 0, [0.75 * s * e for s, e in zip(shaped, env)])
+
+    return buf
+
+
+# ── Sound 9: footstep — grass ────────────────────────────────────────────────────────
+#
+# No tonal partial at all — grass has no resonant body to ring, only blades brushing past
+# each other — so this is built the way make_eat() builds "bite, bite": two short
+# highpassed noise bursts rather than one continuous one, because the gap between them is
+# what reads as separate blades rather than a single soft impact. 0.15s, and quieter than
+# the other two footsteps (gain 0.5/0.35) since grass is the softest surface underfoot.
+def make_footstep_grass() -> list[float]:
+    dur_s = 0.15
+    n = int(round(dur_s * RATE))
+    buf = [0.0] * n
+    noise = lcg_noise(0x46534752)  # 'FSGR'
+
+    burst_n = int(round(0.05 * RATE))
+    starts = [0, int(round(0.07 * RATE))]
+    gains = [0.5, 0.35]
+    for start, gain in zip(starts, gains):
+        raw = [next(noise) for _ in range(burst_n)]
+        shaped = highpass(raw, 3000.0)
+        benv = env_exp_decay(burst_n, tau_s=0.015, attack_s=0.002)
+        mix_into(buf, start, [gain * s * e for s, e in zip(shaped, benv)])
+
+    return buf
+
+
+# ── Sound 10: break — wood ───────────────────────────────────────────────────────────
+#
+# A hollow knock — 350 Hz fundamental plus a weaker 700 Hz overtone, the "bock" a wooden
+# plank gives back rather than the pure sine a struck string would — followed by three
+# short lowpassed noise ticks standing in for splinters coming apart, spaced 60ms apart so
+# they read as separate pieces breaking rather than one crack. Busiest and longest of the
+# wood/dirt/grass break trio (0.28s): breaking should read as more eventful than placing
+# or walking.
+def make_break_wood() -> list[float]:
+    dur_s = 0.28
+    n = int(round(dur_s * RATE))
+    buf = [0.0] * n
+    noise = lcg_noise(0x42525744)  # 'BRWD'
+
+    env = env_exp_decay(n, tau_s=0.09, attack_s=0.003)
+    for i in range(n):
+        t = i / RATE
+        tone = (0.6 * math.sin(2.0 * math.pi * 350.0 * t)
+                + 0.25 * math.sin(2.0 * math.pi * 700.0 * t))
+        buf[i] += 0.35 * env[i] * tone
+
+    tick_n = int(round(0.035 * RATE))
+    starts = [0, int(round(0.06 * RATE)), int(round(0.12 * RATE))]
+    gains = [0.6, 0.45, 0.3]
+    for start, gain in zip(starts, gains):
+        raw = [next(noise) for _ in range(tick_n)]
+        shaped = lowpass(raw, 2500.0)
+        tenv = env_exp_decay(tick_n, tau_s=0.02, attack_s=0.001)
+        mix_into(buf, start, [gain * s * e for s, e in zip(shaped, tenv)])
+
+    return buf
+
+
+# ── Sound 11: break — dirt ───────────────────────────────────────────────────────────
+#
+# Two heavily lowpassed noise clods (450 Hz cutoff — the same "nothing above the low end
+# survives" idea as footstep_dirt) landing 70ms apart under a soft 80 Hz thump, rather than
+# one continuous burst, so a dirt block reads as crumbling into clods instead of thudding
+# once. 0.26s: busier than the footstep but with the same dull, cutoff-limited character
+# throughout, so it is still unmistakably dirt.
+def make_break_dirt() -> list[float]:
+    dur_s = 0.26
+    n = int(round(dur_s * RATE))
+    buf = [0.0] * n
+    noise = lcg_noise(0x42524454)  # 'BRDT'
+
+    env = env_exp_decay(n, tau_s=0.09, attack_s=0.004)
+    for i in range(n):
+        t = i / RATE
+        buf[i] += 0.30 * env[i] * math.sin(2.0 * math.pi * 80.0 * t)
+
+    clod_n = int(round(0.10 * RATE))
+    starts = [0, int(round(0.07 * RATE))]
+    gains = [0.8, 0.55]
+    for start, gain in zip(starts, gains):
+        raw = [next(noise) for _ in range(clod_n)]
+        shaped = lowpass(raw, 450.0)
+        cenv = env_exp_decay(clod_n, tau_s=0.05, attack_s=0.003)
+        mix_into(buf, start, [gain * s * e for s, e in zip(shaped, cenv)])
+
+    return buf
+
+
+# ── Sound 12: break — grass ──────────────────────────────────────────────────────────
+#
+# Four short highpassed bursts rather than make_footstep_grass()'s two — breaking should
+# read as busier than walking, and grass has no tonal body to add weight with, so the only
+# way to make it read as more eventful than a footstep is more bursts, not louder or lower
+# ones. No sine partial anywhere in this sound, same as the footstep. 0.24s: the shortest
+# of the three synthesised breaks, because grass is the lightest material in the set.
+def make_break_grass() -> list[float]:
+    dur_s = 0.24
+    n = int(round(dur_s * RATE))
+    buf = [0.0] * n
+    noise = lcg_noise(0x42524752)  # 'BRGR'
+
+    burst_n = int(round(0.05 * RATE))
+    starts = [0, int(round(0.045 * RATE)), int(round(0.10 * RATE)), int(round(0.16 * RATE))]
+    gains = [0.65, 0.55, 0.45, 0.35]
+    for start, gain in zip(starts, gains):
+        raw = [next(noise) for _ in range(burst_n)]
+        shaped = highpass(raw, 2800.0)
+        benv = env_exp_decay(burst_n, tau_s=0.015, attack_s=0.002)
+        mix_into(buf, start, [gain * s * e for s, e in zip(shaped, benv)])
+
+    return buf
+
+
+# ── Sound 13: place — stone ──────────────────────────────────────────────────────────
+#
+# The same bright click as footstep_stone (1800 Hz partial, 7000 Hz noise lowpass) struck
+# twice rather than once — the second, quieter strike 50ms later stands in for the block
+# seating into the grid, the same "note, then a second note" shape make_craft() uses for
+# its two-note ding. Footsteps only strike once; placing strikes and then settles. 0.20s,
+# between the footstep (0.14s) and the reused stone break in duration.
+def make_place_stone() -> list[float]:
+    dur_s = 0.20
+    n = int(round(dur_s * RATE))
+    buf = [0.0] * n
+    noise = lcg_noise(0x504c5354)  # 'PLST'
+
+    # (onset_s, tone_gain, noise_gain) — the second strike is the first at 60% level.
+    strikes = ((0.00, 0.30, 0.55), (0.05, 0.18, 0.33))
+    tick_n = int(round(0.055 * RATE))
+    for onset_s, tone_gain, noise_gain in strikes:
+        start = int(round(onset_s * RATE))
+        length_n = min(tick_n, n - start)
+        env = env_exp_decay(length_n, tau_s=0.02, attack_s=0.001)
+        tone = [tone_gain * env[i] * math.sin(2.0 * math.pi * 1800.0 * (i / RATE))
+                for i in range(length_n)]
+        mix_into(buf, start, tone)
+
+        raw = [next(noise) for _ in range(length_n)]
+        shaped = lowpass(raw, 7000.0)
+        mix_into(buf, start, [noise_gain * s * e for s, e in zip(shaped, env)])
+
+    return buf
+
+
+# ── Sound 14: place — dirt ───────────────────────────────────────────────────────────
+#
+# A single muffled thud, the same ~450-500 Hz-cutoff family as footstep_dirt and
+# break_dirt, but one strike rather than two or three: dirt does not "seat" the way
+# stone's flat faces do, it just sits where it lands. 0.20s, matching place_stone's
+# duration so the two read as the same gameplay event at a different material rather than
+# a different-length event.
+def make_place_dirt() -> list[float]:
+    dur_s = 0.20
+    n = int(round(dur_s * RATE))
+    buf = [0.0] * n
+    noise = lcg_noise(0x504c4454)  # 'PLDT'
+
+    env = env_exp_decay(n, tau_s=0.06, attack_s=0.004)
+    for i in range(n):
+        t = i / RATE
+        buf[i] += 0.30 * env[i] * math.sin(2.0 * math.pi * 85.0 * t)
+
+    raw = [next(noise) for _ in range(n)]
+    shaped = lowpass(raw, 480.0)
+    mix_into(buf, 0, [0.70 * s * e for s, e in zip(shaped, env)])
+
+    return buf
+
+
+# ── Sound 15: place — grass ──────────────────────────────────────────────────────────
+#
+# Two highpassed brush bursts, the same no-tonal-content family as the other two grass
+# sounds, spaced a little further apart than footstep_grass's (80ms vs 70ms) and a touch
+# louder, so placing reads as slightly more deliberate than a single step without adding
+# anything grass does not actually have — no resonant body, no bass thump. 0.18s.
+def make_place_grass() -> list[float]:
+    dur_s = 0.18
+    n = int(round(dur_s * RATE))
+    buf = [0.0] * n
+    noise = lcg_noise(0x504c4752)  # 'PLGR'
+
+    burst_n = int(round(0.055 * RATE))
+    starts = [0, int(round(0.08 * RATE))]
+    gains = [0.6, 0.45]
+    for start, gain in zip(starts, gains):
+        raw = [next(noise) for _ in range(burst_n)]
+        shaped = highpass(raw, 3000.0)
+        benv = env_exp_decay(burst_n, tau_s=0.018, attack_s=0.002)
+        mix_into(buf, start, [gain * s * e for s, e in zip(shaped, benv)])
+
+    return buf
+
+
 # ── Master / write / report ──────────────────────────────────────────────────────────
 
 def master(buf: list[float]) -> list[float]:
@@ -329,6 +588,19 @@ GENERATORS = [
     ("craft_synth.wav", make_craft),
     ("splash_synth.wav", make_splash),
     ("ui_tap_synth.wav", make_ui_tap),
+
+    # v1.8.19 lane: per-material footstep / break / place. footstep_wood, break_stone and
+    # place_wood are NOT here — they reuse existing Kenney recordings verbatim, see
+    # tools/make_sounds.py's MANIFEST.
+    ("footstep_stone_synth.wav", make_footstep_stone),
+    ("footstep_dirt_synth.wav", make_footstep_dirt),
+    ("footstep_grass_synth.wav", make_footstep_grass),
+    ("break_wood_synth.wav", make_break_wood),
+    ("break_dirt_synth.wav", make_break_dirt),
+    ("break_grass_synth.wav", make_break_grass),
+    ("place_stone_synth.wav", make_place_stone),
+    ("place_dirt_synth.wav", make_place_dirt),
+    ("place_grass_synth.wav", make_place_grass),
 ]
 
 

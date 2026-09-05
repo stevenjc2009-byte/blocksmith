@@ -567,9 +567,9 @@ static void testAPlaceIntoAnOccupiedCellIsSilent(void)
 static int walkFrom(AudioFootsteps* f, float x0, int steps, float dx, bool on_ground)
 {
 	int fired = 0;
-	audioFootstepsUpdate(f, x0, 0.0f, 0.0f, on_ground);
+	audioFootstepsUpdate(f, x0, 0.0f, 0.0f, on_ground, BLOCK_AIR);
 	for (int i = 0; i < steps; i++) {
-		if (audioFootstepsUpdate(f, x0 + (float)(i + 1) * dx, 0.0f, 0.0f, on_ground))
+		if (audioFootstepsUpdate(f, x0 + (float)(i + 1) * dx, 0.0f, 0.0f, on_ground, BLOCK_AIR))
 			fired++;
 		frameTick();
 	}
@@ -597,7 +597,7 @@ static void testStandingStillNeverPlaysAFootstep(void)
 
 	int fired = 0;
 	for (int i = 0; i < 600; i++) {
-		if (audioFootstepsUpdate(&f, 12.0f, 40.0f, 7.0f, true)) fired++;
+		if (audioFootstepsUpdate(&f, 12.0f, 40.0f, 7.0f, true, BLOCK_AIR)) fired++;
 		frameTick();
 	}
 	CHECK(fired == 0);
@@ -666,7 +666,7 @@ static void testAirborneTravelPlaysNothingAndBanksNothing(void)
 	fakeClearPlays();
 	int fired = 0;
 	for (int i = 0; i < 5; i++) {
-		if (audioFootstepsUpdate(&f, 10.0f, 0.0f, 0.0f, true)) fired++;
+		if (audioFootstepsUpdate(&f, 10.0f, 0.0f, 0.0f, true, BLOCK_AIR)) fired++;
 		frameTick();
 	}
 	CHECK(fired == 0);
@@ -682,20 +682,20 @@ static void testAJumpDoesNotResetTheStrideInProgress(void)
 
 	// 1.5 blocks on the ground: no step yet, three quarters of a stride banked.
 	int fired = 0;
-	audioFootstepsUpdate(&f, 0.0f, 0.0f, 0.0f, true);          // seed
+	audioFootstepsUpdate(&f, 0.0f, 0.0f, 0.0f, true, BLOCK_AIR);          // seed
 	for (int i = 0; i < 12; i++)
-		if (audioFootstepsUpdate(&f, (float)(i + 1) * 0.125f, 0.0f, 0.0f, true)) fired++;
+		if (audioFootstepsUpdate(&f, (float)(i + 1) * 0.125f, 0.0f, 0.0f, true, BLOCK_AIR)) fired++;
 	CHECK(fired == 0);
 
 	// A block and a half through the air, banking nothing.
 	for (int i = 0; i < 12; i++)
-		audioFootstepsUpdate(&f, 1.5f + (float)(i + 1) * 0.125f, 0.0f, 0.0f, false);
+		audioFootstepsUpdate(&f, 1.5f + (float)(i + 1) * 0.125f, 0.0f, 0.0f, false, BLOCK_AIR);
 	CHECK(s_fake.plays == 0);
 
 	// Half a block back on the ground completes the stride that was in progress before the
 	// jump. If landing had cleared the accumulator this would still be silent.
 	for (int i = 0; i < 4; i++)
-		if (audioFootstepsUpdate(&f, 3.0f + (float)(i + 1) * 0.125f, 0.0f, 0.0f, true))
+		if (audioFootstepsUpdate(&f, 3.0f + (float)(i + 1) * 0.125f, 0.0f, 0.0f, true, BLOCK_AIR))
 			fired++;
 	CHECK(fired == 1);
 	CHECK(s_fake.plays == 1);
@@ -712,7 +712,7 @@ static void testVerticalMovementAloneIsNotAStride(void)
 	// changes by fifty blocks, x and z do not move. A stride is horizontal travel.
 	int fired = 0;
 	for (int i = 0; i < 100; i++) {
-		if (audioFootstepsUpdate(&f, 3.0f, (float)i * 0.5f, 9.0f, true)) fired++;
+		if (audioFootstepsUpdate(&f, 3.0f, (float)i * 0.5f, 9.0f, true, BLOCK_AIR)) fired++;
 		frameTick();
 	}
 	CHECK(fired == 0);
@@ -726,7 +726,7 @@ static void testATeleportIsDiscardedRatherThanBanked(void)
 	fakeClearPlays();
 	audioSetListener(0.0f, 0.0f, 0.0f, 0.0f);
 
-	CHECK(audioFootstepsUpdate(&f, 0.0f, 0.0f, 0.0f, true) == false);   // seed
+	CHECK(audioFootstepsUpdate(&f, 0.0f, 0.0f, 0.0f, true, BLOCK_AIR) == false);   // seed
 
 	// The listener travels with the player — main.c sets it from the same body every frame —
 	// so it arrives with them. It is moved BEFORE the teleport rather than after, and that is
@@ -737,21 +737,21 @@ static void testATeleportIsDiscardedRatherThanBanked(void)
 
 	// A respawn across the world in one update. Two thousand blocks is a thousand strides if
 	// it is banked, and exactly nothing if it is recognised for what it is.
-	CHECK(audioFootstepsUpdate(&f, 2000.0f, 0.0f, 0.0f, true) == false);
+	CHECK(audioFootstepsUpdate(&f, 2000.0f, 0.0f, 0.0f, true, BLOCK_AIR) == false);
 	CHECK(s_fake.plays == 0);
 
 	// The banked distance is cleared with it, so the next stride starts from zero: 1.875
 	// blocks of real walking is still not a step...
 	int fired = 0;
 	for (int i = 0; i < 15; i++)
-		if (audioFootstepsUpdate(&f, 2000.0f + (float)(i + 1) * 0.125f, 0.0f, 0.0f, true))
+		if (audioFootstepsUpdate(&f, 2000.0f + (float)(i + 1) * 0.125f, 0.0f, 0.0f, true, BLOCK_AIR))
 			fired++;
 	CHECK(fired == 0);
 	CHECK(s_fake.plays == 0);
 
 	// ...and reaching 2.0 is.
 	for (int i = 15; i < 16; i++)
-		if (audioFootstepsUpdate(&f, 2000.0f + (float)(i + 1) * 0.125f, 0.0f, 0.0f, true))
+		if (audioFootstepsUpdate(&f, 2000.0f + (float)(i + 1) * 0.125f, 0.0f, 0.0f, true, BLOCK_AIR))
 			fired++;
 	CHECK(fired == 1);
 	CHECK(s_fake.plays == 1);
@@ -765,9 +765,9 @@ static void testResetForgetsThePreviousWorld(void)
 	audioSetListener(0.0f, 0.0f, 0.0f, 0.0f);
 
 	// Nearly a full stride banked at x = 1.875.
-	audioFootstepsUpdate(&f, 0.0f, 0.0f, 0.0f, true);          // seed
+	audioFootstepsUpdate(&f, 0.0f, 0.0f, 0.0f, true, BLOCK_AIR);          // seed
 	for (int i = 0; i < 15; i++)
-		audioFootstepsUpdate(&f, (float)(i + 1) * 0.125f, 0.0f, 0.0f, true);
+		audioFootstepsUpdate(&f, (float)(i + 1) * 0.125f, 0.0f, 0.0f, true, BLOCK_AIR);
 	CHECK(s_fake.plays == 0);
 
 	// A new session. The walk CONTINUES from where it was rather than jumping across the
@@ -777,7 +777,7 @@ static void testResetForgetsThePreviousWorld(void)
 	// 0.125-block walking step, so the ONLY thing that can stop the banked 1.875 from finishing
 	// a stride is audioFootstepsReset having cleared it.
 	audioFootstepsReset(&f);
-	CHECK(audioFootstepsUpdate(&f, 1.875f, 0.0f, 0.0f, true) == false);
+	CHECK(audioFootstepsUpdate(&f, 1.875f, 0.0f, 0.0f, true, BLOCK_AIR) == false);
 	CHECK(s_fake.plays == 0);
 
 	// A further 1.875 blocks: a full stride's worth counting from the reset, and two strides'
@@ -785,14 +785,14 @@ static void testResetForgetsThePreviousWorld(void)
 	// exists.
 	int fired = 0;
 	for (int i = 0; i < 15; i++)
-		if (audioFootstepsUpdate(&f, 1.875f + (float)(i + 1) * 0.125f, 0.0f, 0.0f, true))
+		if (audioFootstepsUpdate(&f, 1.875f + (float)(i + 1) * 0.125f, 0.0f, 0.0f, true, BLOCK_AIR))
 			fired++;
 	CHECK(fired == 0);
 	CHECK(s_fake.plays == 0);
 
 	// ...and the step lands on the stride boundary measured from the reset, not from before it.
 	for (int i = 15; i < 16; i++)
-		if (audioFootstepsUpdate(&f, 1.875f + (float)(i + 1) * 0.125f, 0.0f, 0.0f, true))
+		if (audioFootstepsUpdate(&f, 1.875f + (float)(i + 1) * 0.125f, 0.0f, 0.0f, true, BLOCK_AIR))
 			fired++;
 	CHECK(fired == 1);
 	CHECK(s_fake.plays == 1);

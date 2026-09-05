@@ -73,6 +73,41 @@ MANIFEST = [
     ("craft", "craft_synth.wav", ENC_PCM16),
     ("splash", "splash_synth.wav", ENC_PCM16),
     ("ui_tap", "ui_tap_synth.wav", ENC_PCM16),
+
+    # v1.8.19 lane: per-material footstep/break/place ("footsteps that know what you are
+    # walking on, block breaking and placing per material") — STONE, WOOD, DIRT, GRASS,
+    # three actions each. That is twelve pairs, but only NINE rows, and the three missing
+    # ones are the point of this comment.
+    #
+    # The three generic rows above are not neutral defaults. Each is already a specific
+    # material, because of where its recording came from: "footstep" is Kenney's
+    # footstep_wood_000.ogg (wood), "block_break" is impactMining_000.ogg (stone), and
+    # "block_place" is impactPlank_medium_000.ogg (a plank, so wood).
+    #
+    # So footstep_wood, break_stone and place_wood would each have been a byte-identical
+    # second copy of a file already shipping — md5-verified identical, not assumed — for
+    # 87,740 bytes of a 393,216-byte Old 3DS audio pool. They are not built. main.c does not
+    # register those three slots, and audio_sfx.c's resolvers fall back to the generic slot,
+    # which holds exactly the recording a dedicated slot would have held.
+    #
+    # If a generic clip is ever replaced by one that is NOT that material, its material's
+    # dedicated row has to be added back here. audio_sfx_test.c asserts both halves of that —
+    # the fallbacks resolve to the generic slots, and these three files are absent from romfs —
+    # so the change goes red rather than being noticed by ear.
+    #
+    # The nine source WAVs come from tools/make_sfx_synth.py; see
+    # assets/sfx_src/ATTRIBUTION.md for the full per-file breakdown and provenance.
+    ("footstep_stone", "footstep_stone_synth.wav", ENC_PCM16),
+    ("footstep_dirt", "footstep_dirt_synth.wav", ENC_PCM16),
+    ("footstep_grass", "footstep_grass_synth.wav", ENC_PCM16),
+
+    ("break_wood", "break_wood_synth.wav", ENC_PCM16),
+    ("break_dirt", "break_dirt_synth.wav", ENC_PCM16),
+    ("break_grass", "break_grass_synth.wav", ENC_PCM16),
+
+    ("place_stone", "place_stone_synth.wav", ENC_PCM16),
+    ("place_dirt", "place_dirt_synth.wav", ENC_PCM16),
+    ("place_grass", "place_grass_synth.wav", ENC_PCM16),
 ]
 
 

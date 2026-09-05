@@ -1,6 +1,7 @@
 #include "scene/interact.h"
 
 #include "app/input_map.h"
+#include "audio/audio_material.h"
 #include "audio/audio_sfx.h"
 #include "net/networld.h"
 #include "world/block.h"
@@ -285,7 +286,15 @@ static int breakComplete(Interact* it, World* w, int x, int y, int z, BlockId br
 		//
 		// Below sendEditOrRevert, so a break the server refused — which puts the block back
 		// and returns above this point — makes no noise for a block that is still there.
-		audioSfxPlayAtBlock(SFX_BLOCK_BREAK, AUDIO_PRIO_NORMAL, 1.0f, x, y, z);
+		//
+		// v1.8.19. The slot is resolved from `broken` — the block that WAS here, read at the
+		// top of this function before worldSet overwrote the cell — not from `it->broke_id`,
+		// which a few lines below is deliberately forced to BLOCK_AIR for a plant (see the
+		// comment there on why the drop and the sound are two different questions with the
+		// same source block: a broken plant gives you nothing to carry but still sounded like
+		// grass on the way out).
+		audioSfxPlayAtBlock(audioSfxBreakSlot(sfxMaterialOfBlock(broken)),
+		                     AUDIO_PRIO_NORMAL, 1.0f, x, y, z);
 		// Left as BLOCK_AIR for a plant, which is exactly how main.c already spells "this
 		// break earned nothing" — it adds to the bag only when broke_id != BLOCK_AIR. So the
 		// plant is removed from the world, the edit goes to the server as an ordinary air
@@ -607,8 +616,13 @@ int interactEdit(Interact* it, World* w, const Body* body,
 			// edge-triggered (`fresh & key_place`) so one press can only reach here once, and
 			// this sits below sendEditOrRevert so a placement the server refused, and which has
 			// already been rolled back out of the world, is silent.
-			audioSfxPlayAtBlock(SFX_BLOCK_PLACE, AUDIO_PRIO_NORMAL, 1.0f,
-			                     t->px, t->py, t->pz);
+			//
+			// v1.8.19. Resolved from `it->holding` — what got placed — and not from
+			// `place_was`, which is what the cell held BEFORE this write and is, in the
+			// ordinary case, air. A placed block should sound like itself going down, not like
+			// whatever it replaced.
+			audioSfxPlayAtBlock(audioSfxPlaceSlot(sfxMaterialOfBlock(it->holding)),
+			                     AUDIO_PRIO_NORMAL, 1.0f, t->px, t->py, t->pz);
 		} else {
 			it->refused++;
 		}

@@ -46,6 +46,58 @@ void audioSfxReset(void)
 		s_slots[i] = AUDIO_SOUND_NONE;
 }
 
+// ── Per-material resolution (v1.8.19) ───────────────────────────────────────────────
+//
+// One shared implementation behind the three resolvers audio_sfx.h declares — the four
+// arguments after `generic` are literally which slot names each material for THIS event
+// (footstep, break or place), and the fallback logic is identical across all three, so it
+// is written once here rather than three times with the names changed.
+//
+// `mat == SFX_MAT_GENERIC` returns `generic` outright rather than falling into the
+// unregistered-slot check below: there is no "generic material slot" distinct from the
+// pre-1.8.19 slot to register in the first place, so asking audioSfxId() about one would be
+// asking about a slot that was never meant to exist.
+static SfxSlot materialSlot(SfxMaterial mat, SfxSlot generic,
+                             SfxSlot stone, SfxSlot wood, SfxSlot dirt, SfxSlot grass)
+{
+	SfxSlot chosen;
+	switch (mat) {
+	case SFX_MAT_STONE: chosen = stone; break;
+	case SFX_MAT_WOOD:  chosen = wood;  break;
+	case SFX_MAT_DIRT:  chosen = dirt;  break;
+	case SFX_MAT_GRASS: chosen = grass; break;
+	case SFX_MAT_GENERIC:
+	default:
+		return generic;
+	}
+
+	// The fallback: an unregistered or failed-load slot is AUDIO_SOUND_NONE (this file's
+	// own contract, see audioSfxRegister above), and that is the one condition this
+	// function exists to catch before audioSfxPlayAtBlock ever sees the slot it returns.
+	return (audioSfxId(chosen) == AUDIO_SOUND_NONE) ? generic : chosen;
+}
+
+SfxSlot audioSfxFootstepSlot(SfxMaterial mat)
+{
+	return materialSlot(mat, SFX_FOOTSTEP,
+	                     SFX_FOOTSTEP_STONE, SFX_FOOTSTEP_WOOD,
+	                     SFX_FOOTSTEP_DIRT, SFX_FOOTSTEP_GRASS);
+}
+
+SfxSlot audioSfxBreakSlot(SfxMaterial mat)
+{
+	return materialSlot(mat, SFX_BLOCK_BREAK,
+	                     SFX_BREAK_STONE, SFX_BREAK_WOOD,
+	                     SFX_BREAK_DIRT, SFX_BREAK_GRASS);
+}
+
+SfxSlot audioSfxPlaceSlot(SfxMaterial mat)
+{
+	return materialSlot(mat, SFX_BLOCK_PLACE,
+	                     SFX_PLACE_STONE, SFX_PLACE_WOOD,
+	                     SFX_PLACE_DIRT, SFX_PLACE_GRASS);
+}
+
 AudioVoice audioSfxPlayAtBlock(SfxSlot slot, AudioPriority prio, float gain,
                                int bx, int by, int bz)
 {
@@ -70,7 +122,8 @@ void audioFootstepsReset(AudioFootsteps* f)
 	f->banked   = 0.0f;
 }
 
-bool audioFootstepsUpdate(AudioFootsteps* f, float x, float y, float z, bool on_ground)
+bool audioFootstepsUpdate(AudioFootsteps* f, float x, float y, float z, bool on_ground,
+                          BlockId under)
 {
 	if (!f) return false;
 
@@ -108,12 +161,20 @@ bool audioFootstepsUpdate(AudioFootsteps* f, float x, float y, float z, bool on_
 	// cadence does not drift with the frame rate.
 	f->banked -= SFX_FOOTSTEP_STRIDE;
 
+	// v1.8.19. `under` is what the caller says this step landed on; sfxMaterialOfBlock()
+	// (audio_material.h) buckets it into one of four materials plus the GENERIC fallback,
+	// and audioSfxFootstepSlot() (this file) resolves that material to whichever slot
+	// should actually play — the material-specific one if its clip was registered, the
+	// pre-1.8.19 SFX_FOOTSTEP slot otherwise. Both are pure lookups; nothing here needs to
+	// know why either answer came out the way it did.
+	const SfxSlot slot = audioSfxFootstepSlot(sfxMaterialOfBlock(under));
+
 	// Positional at the feet, not a non-positional audioPlay. The player's own footstep is
 	// at distance zero from the listener, so this is centred at full gain either way today
 	// — but a remote player's footsteps, when there are any, are the same cue at a different
 	// place, and a cue that is only correct for the local walker would have to be rewritten
 	// rather than called. AUDIO_PRIO_LOW is what audio_mixer.h names footsteps as.
-	audioPlayAt(audioSfxId(SFX_FOOTSTEP), AUDIO_PRIO_LOW, SFX_FOOTSTEP_GAIN, x, y, z);
+	audioPlayAt(audioSfxId(slot), AUDIO_PRIO_LOW, SFX_FOOTSTEP_GAIN, x, y, z);
 	return true;
 }
 
