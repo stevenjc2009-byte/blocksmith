@@ -324,6 +324,33 @@ bool networldWorldSeed(uint32_t* out);
 // whether it can be honoured is genVersionForSessionResolve()'s job, and refusing is main.c's.
 bool networldServerGenVersion(uint32_t* out);
 
+// v1.8.20. The server's authoritative day/night counter, if one has arrived SINCE THE LAST
+// CALL (BS_APP_TIME_SYNC, proto/bs_proto.h, 0x10, one uint64 LE, sent on join and then once a
+// second). True means *out now holds it and the pending flag has been cleared.
+//
+// This is the one accessor in this header that is NOT a question you may ask repeatedly and
+// get the same answer to. networldWorldSeed() and networldServerGenVersion() above latch: they
+// mean "the server has told us, ever". This one consumes: it means "the server has told us
+// again". Hence Take, not Get.
+//
+// That difference is load-bearing, not stylistic. The client advances its own clock every tick
+// (world/daynight.h's dayNightAdvance) and the server corrects it once a second. If this
+// latched, a caller polling every frame would re-pin the clock ~60 times a second to a value up
+// to a second old, and time would visibly stop between packets — a worse failure than no sync
+// at all, because a stopped clock still looks like a working feature until somebody waits for
+// sunrise and it never comes.
+//
+// False is not an error, and is the normal answer on the great majority of frames: no packet
+// has landed since the last call. It is also the permanent answer in single player, where there
+// is no session, and after netDisconnect(), which clears the flag — so a caller that simply
+// does nothing on false is correct everywhere, including in the world the player owns and which
+// no server is entitled to move.
+//
+// The WHOLE counter travels, not a time of day, so day number and moon phase agree across the
+// room as well as the light level. Apply it with dayNightSet(); no interpolation is needed at
+// one second, because a correction of a few ticks moves dayLevel by less than a thousandth.
+bool networldTakeTimeSync(uint64_t* out);
+
 // ---- block registry sync (v1.6.0) ---------------------------------------------------------
 //
 // True when this client's block table provably agrees with the server's, and "provably" is meant

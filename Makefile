@@ -371,7 +371,45 @@ PROTO_REPO	:=	https://github.com/stevenjc2009-byte/blocksmith-server.git
 # dereferences to 2c822a09 (an annotated tag, and only a TAG is deployable), and
 # 2c822a09:proto/bs_proto.h is blob d6f597df -- byte-identical to what `git hash-object
 # proto/bs_proto.h` reports on disk.
-PROTO_COMMIT	:=	2c822a0961e27966f754372b37e80147073a3701
+#
+# v1.8.20 -> 84b1400d4920b3c23feccaf9936aae12cbc4e255, server v1.9.8, which adds
+# BS_APP_TIME_SYNC (0x10, S->C only, one uint64 LE) so time of day is server-authoritative.
+# The wire change is purely ADDITIVE and one-directional, so the usual lockstep does not
+# apply in both directions: an old client against a new server ignores 0x10 at
+# net/networld.c's `default: break;`, and a new client against an old server simply never
+# receives one and keeps running its own clock. What is NOT safe, and must never be added,
+# is the reverse direction -- the server's handle_app_payload ends in send_kick(), so a new
+# client-to-server opcode would disconnect every player on an older server.
+#
+# Verified the same three ways as every entry above, and one further way that no entry above
+# needed. The three: `git ls-remote origin` shows refs/heads/v1.9.8 and refs/tags/v1.9.8 both
+# present on the remote; refs/tags/v1.9.8^{} dereferences to 84b1400d (an annotated tag, and
+# only a TAG is deployable); and 84b1400d:proto/bs_proto.h is blob bd50364e -- byte-identical
+# to what `git hash-object proto/bs_proto.h` reports on disk.
+#
+# The fourth was added because this pin was, for a while, exactly the thing the three checks
+# above cannot catch. It was first written against af993644, a commit that existed only in
+# the local deps/ clone: every one of the three checks reads that same local clone, so all
+# three passed while a fresh clone running `make deps` could not have fetched the commit at
+# all. So the pin is now also verified by actually taking one -- `git clone --branch v1.9.8
+# --depth 1` from the remote into a scratch directory, whose HEAD is 84b1400d, whose VERSION
+# reads 1.9.8, and whose proto/bs_proto.h compares byte-identical to the one on disk. If this
+# pin is ever moved again, take the clone; local hashes agreeing with each other proves only
+# that the local clone is self-consistent.
+#
+# af993644 does not exist on the remote and never will. It was amended into 84b1400d before
+# anything was pushed, because it had shipped VERSION still reading 1.9.7 on a commit
+# labelled v1.9.8 -- not cosmetic, since tools/bs-update reads that file as CURRENT_VERSION
+# and checks out refs/tags/v${CURRENT_VERSION} from it, so a v1.9.8 server would have
+# identified itself as v1.9.7 to its own updater. Every release commit before it bumps
+# VERSION; that one did not.
+#
+# The commit also landed on branch v1.9.7 while being labelled v1.9.8, which would have
+# pushed the v1.9.7 branch one commit past its own v1.9.7 tag. It now has its own v1.9.8
+# branch, and refs/heads/v1.9.7 was moved back to 2c822a09 so that branch, tag and remote
+# agree again.
+
+PROTO_COMMIT	:=	84b1400d4920b3c23feccaf9936aae12cbc4e255
 PROTO		:=	deps/blocksmith-server
 
 .PHONY: deps

@@ -439,6 +439,24 @@ static bool     s_have_world_seed;
 static uint16_t s_world_gen;
 static bool     s_have_world_gen;
 
+// BS_APP_TIME_SYNC (v1.8.20): the server's authoritative day/night counter, and whether one
+// has arrived that main.c has not applied yet.
+//
+// Two variables rather than one, and the flag is CONSUMED rather than latched — which is the
+// one place this differs from every other accessor in this file. s_have_world_gen means "the
+// server has told us, ever"; s_have_time_sync means "the server has told us since the last
+// time anyone asked". The distinction is not cosmetic: main.c advances its own clock every
+// tick and only re-pins it when a packet lands, so a latched flag would make it re-pin every
+// frame to the value from up to a second ago, and the clock would stop moving between
+// packets. That is a worse failure than no sync at all, because it looks like it works.
+//
+// uint64 all the way through, with no widening or narrowing anywhere: it is a uint64 in
+// world/daynight.h, a uint64 on the wire (see BS_TIME_SYNC_BYTES), and a uint64 here. The
+// whole counter travels, not a time-of-day, so day number and moon phase agree across the
+// room as well as the light level — daynight.h:354-355 asks for exactly that.
+static uint64_t s_time_sync_ticks;
+static bool     s_have_time_sync;
+
 // Traffic counters — see networld.h for what each one distinguishes. Plain ints, main thread
 // only, reset by networldInit(): they are a diagnostic readout, not part of any protocol.
 static int s_sent_edits;
@@ -569,6 +587,29 @@ static void applyWorldGen(const uint8_t* msg, size_t len)
 
 	s_world_gen      = bs_get_u16(msg + 1);
 	s_have_world_gen = true;
+}
+
+// BS_APP_TIME_SYNC (v1.8.20): the server's day/night counter. Exactly BS_TIME_SYNC_BYTES or
+// dropped whole — the same "reject on length, never half-parse" posture applyWorldInfo() and
+// applyWorldGen() take, and for the same reason: a half-parsed counter is still a number, and
+// a number is something this client would act on. Here that would mean setting the world to a
+// wrong day at a wrong hour, which reads as a game bug rather than as a bad packet.
+//
+// No validation of the VALUE, deliberately. Every uint64 is a legitimate counter: it is a tick
+// count with no upper bound short of the type's own, world/daynight.h's arithmetic is modular
+// over it, and there is no "impossible" time of day. Inventing a plausibility range here would
+// only add a way for a long-lived server to be refused by a client that thought it knew better.
+//
+// This message is server-to-client ONLY. daynight.h:347-351 is explicit about why the reverse
+// must never be added: this client's dispatch below ends in `default: break;` and ignores what
+// it does not know, but the server's handle_app_payload ends in send_kick(), so a new
+// client-to-server opcode would disconnect every player on an older server.
+static void applyTimeSync(const uint8_t* msg, size_t len)
+{
+	if (len != BS_TIME_SYNC_BYTES) return;
+
+	s_time_sync_ticks = bs_get_u64(msg + 1);
+	s_have_time_sync  = true;
 }
 
 // BS_APP_INV_STATE: the whole inventory, authoritative, exactly BS_INV_STATE_BYTES or dropped
@@ -984,6 +1025,7 @@ void networldApplyPayload(const uint8_t* payload, size_t len)
 	case BS_APP_POS_UPDATE:  applyPosUpdate(payload, len);  break;
 	case BS_APP_WORLD_INFO:  applyWorldInfo(payload, len);  break;
 	case BS_APP_WORLD_GEN:   applyWorldGen(payload, len);   break;
+	case BS_APP_TIME_SYNC:   applyTimeSync(payload, len);   break;
 	case BS_APP_CHUNK_DIFFS: applyChunkDiffs(payload, len); break;
 	case BS_APP_INV_STATE:   applyInvState(payload, len);   break;
 	case BS_APP_PLAYER_STATE: applyPlayerState(payload, len); break;
@@ -1121,6 +1163,14 @@ void networldInit(void)
 	// reached by a route that has nothing to do with the wire.
 	s_world_gen         = 0;
 	s_have_world_gen    = false;
+	// v1.8.20, cleared here for the same reason and by the same route: netDisconnect() reaches
+	// this function, so a counter left over from the last server would otherwise be handed to
+	// main.c during the NEXT session — and worse, during single-player, where there is no server
+	// to correct it. A stale pin would drag the player's own saved world to whatever o'clock the
+	// last server happened to be at. Clearing the flag is what makes "nobody has told us the
+	// time" the resting state, which is the state single-player must always be in.
+	s_time_sync_ticks   = 0;
+	s_have_time_sync    = false;
 	s_sent_edits        = 0;
 	s_recv_msgs         = 0;
 	s_sync_entries      = 0;
@@ -1323,6 +1373,17 @@ bool networldServerGenVersion(uint32_t* out)
 {
 	if (!s_have_world_gen) return false;
 	if (out) *out = (uint32_t)s_world_gen;
+	return true;
+}
+
+// See networld.h. Consumes the pending sync rather than reporting it, which is why this is
+// networldTake... and not networldTimeSync() — the naming is the warning that calling it twice
+// answers differently, unlike every other accessor here.
+bool networldTakeTimeSync(uint64_t* out)
+{
+	if (!s_have_time_sync) return false;
+	if (out) *out = s_time_sync_ticks;
+	s_have_time_sync = false;
 	return true;
 }
 

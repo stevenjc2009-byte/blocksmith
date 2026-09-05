@@ -1327,6 +1327,147 @@ static void test_world_gen_carries_the_servers_generator(void)
           "and gone in the next: a second join does not inherit the first server's generator");
 }
 
+/* ------------------------------------------- the server's clock (v1.8.20) -----------------
+ *
+ * BS_APP_TIME_SYNC, 0x10, one uint64 LE, sent on join and then once a second. The design was
+ * written down in world/daynight.h:338-365 long before it was built, and this suite pins the
+ * parts of it that live in this module: the length posture, the byte order, the full width,
+ * and the one behaviour that is unlike everything else in this file — the accessor CONSUMES.
+ *
+ * Why consuming is the property worth a test rather than a comment: the client advances its
+ * own clock every tick and the server corrects it once a second. A latching accessor would let
+ * main.c re-pin the clock every frame to a value up to a second old, and time would stop
+ * moving between packets. That bug cannot be seen in a screenshot, it cannot be seen in a
+ * frame time, and it looks exactly like a working feature right up until somebody waits for a
+ * sunrise that never arrives. So the difference between "told us, ever" and "told us again" is
+ * asserted here, both ways round, rather than trusted to the name.
+ */
+static void test_time_sync_carries_the_servers_clock(void)
+{
+    puts("BS_APP_TIME_SYNC hands the server's day/night counter to the client, once per packet");
+
+    networldInit();
+
+    /* Poisoned with a value no counter under test will produce, for the same reason the seed
+     * and generator cases above poison theirs: 0 is a legitimate counter (it is midnight of day
+     * zero), so "nothing said" cannot be encoded as a value. */
+    uint64_t t = 0xDEADBEEFCAFEF00DULL;
+    check(!networldTakeTimeSync(&t), "no time is claimed before the server sends one");
+    check(t == 0xDEADBEEFCAFEF00DULL, "a false return does not write the out-parameter");
+
+    uint8_t ts[BS_TIME_SYNC_BYTES];
+    ts[0] = BS_APP_TIME_SYNC;
+    bs_put_u64(ts + 1, 123456u);
+    networldApplyPayload(ts, sizeof ts);
+    check(networldTakeTimeSync(&t), "the counter is available once TIME_SYNC arrives");
+    check(t == 123456u, "and it is the exact value the server sent");
+
+    /* THE DEFINING PROPERTY. One packet, one delivery. Everything else in this module latches;
+     * this must not, and a reader who assumed it did would write a clock that never moves. */
+    t = 0xDEADBEEFCAFEF00DULL;
+    check(!networldTakeTimeSync(&t),
+          "a second take with no new packet answers false: the pending flag was CONSUMED");
+    check(t == 0xDEADBEEFCAFEF00DULL, "and that false leaves the out-parameter alone too");
+
+    /* ...and consuming must not latch it OFF either, which is the mirror-image bug and just as
+     * silent: the clock would sync exactly once, on join, and then drift for the rest of the
+     * session. A second packet has to re-arm it. */
+    bs_put_u64(ts + 1, 999u);
+    networldApplyPayload(ts, sizeof ts);
+    check(networldTakeTimeSync(&t) && t == 999u,
+          "a later packet re-arms it: consuming does not disable the feature for the session");
+
+    /* Full width, and this is not ceremony. The counter is uint64 in world/daynight.h, uint64
+     * on the wire and uint64 here, and at 20 ticks a second a 32-bit counter would wrap after
+     * about six and a half years of server uptime -- far enough away to never be found by
+     * playing, close enough to be real. A value with bits set ABOVE bit 31 and a distinct low
+     * half goes red the moment anyone narrows this to uint32 anywhere along the path. */
+    networldInit();
+    bs_put_u64(ts + 1, 0x0000BEEF12345678ULL);
+    networldApplyPayload(ts, sizeof ts);
+    check(networldTakeTimeSync(&t) && t == 0x0000BEEF12345678ULL,
+          "the counter survives at full 64-bit width, high half intact");
+
+    /* Byte order, asserted against literal bytes rather than through bs_put_u64 -- a round trip
+     * through the matching putter and getter agrees with itself whichever order it uses, so it
+     * can only catch a decoder that disagrees with ITSELF, never one that disagrees with the
+     * server. All eight bytes distinct, so any permutation gives a different answer. */
+    networldInit();
+    ts[0] = BS_APP_TIME_SYNC;
+    ts[1] = 0x08; ts[2] = 0x07; ts[3] = 0x06; ts[4] = 0x05;
+    ts[5] = 0x04; ts[6] = 0x03; ts[7] = 0x02; ts[8] = 0x01;
+    networldApplyPayload(ts, sizeof ts);
+    check(networldTakeTimeSync(&t) && t == 0x0102030405060708ULL,
+          "the eight payload bytes are read little-endian, low byte first");
+
+    /* 0 is a real counter -- midnight of day zero, which every fresh world starts at -- and has
+     * to arrive AS 0 rather than being mistaken here for silence. The bool/out-parameter pair
+     * exists precisely so those two are not the same thing. */
+    networldInit();
+    bs_put_u64(ts + 1, 0u);
+    networldApplyPayload(ts, sizeof ts);
+    t = 0xDEADBEEFCAFEF00DULL;
+    check(networldTakeTimeSync(&t) && t == 0u, "a counter of 0 is a time, not silence");
+
+    networldInit();
+    bs_put_u64(ts + 1, 7u);
+    networldApplyPayload(ts, sizeof ts);
+    check(networldTakeTimeSync(NULL), "and the out-parameter is optional");
+    check(!networldTakeTimeSync(NULL), "a NULL take consumes exactly like a non-NULL one");
+
+    /* Short: malformed, dropped whole, same posture as every other decoder in this module. */
+    networldInit();
+    uint8_t truncated_ts[BS_TIME_SYNC_BYTES - 1];
+    truncated_ts[0] = BS_APP_TIME_SYNC;
+    memset(truncated_ts + 1, 0xFF, sizeof truncated_ts - 1);
+    networldApplyPayload(truncated_ts, sizeof truncated_ts);
+    check(!networldTakeTimeSync(NULL), "a short TIME_SYNC is dropped, not misparsed");
+
+    /* Long, which is the case that protects the NEXT protocol change. Half-parsing a widened
+     * record would set the world's clock from the first eight bytes of a message whose meaning
+     * this build does not know -- worse than ignoring it, because ignoring it leaves the local
+     * clock running correctly and half-parsing moves it somewhere invented. */
+    networldInit();
+    uint8_t widened_ts[BS_TIME_SYNC_BYTES + 1];
+    widened_ts[0] = BS_APP_TIME_SYNC;
+    bs_put_u64(widened_ts + 1, 4242u);
+    widened_ts[BS_TIME_SYNC_BYTES] = 0x7F;
+    networldApplyPayload(widened_ts, sizeof widened_ts);
+    check(!networldTakeTimeSync(NULL),
+          "a LONGER TIME_SYNC is dropped whole rather than half-parsed for its first eight bytes");
+
+    /* Per-session, and this arm guards single player specifically. networldInit() is reached by
+     * netDisconnect(), so a counter left pending from a server would otherwise be handed to the
+     * next session -- including the one with no server in it, where it would drag the player's
+     * own saved world to whatever o'clock that server happened to be at. */
+    networldInit();
+    bs_put_u64(ts + 1, 55555u);
+    networldApplyPayload(ts, sizeof ts);
+    networldInit();
+    check(!networldTakeTimeSync(NULL),
+          "a pending counter does not survive into the next session, or into single player");
+
+    /* An unsolicited TIME_SYNC with no join ahead of it is still just data: recorded, not
+     * judged, exactly like WORLD_GEN beside it. This module's job ends at "the server said N";
+     * nothing here is a gate and nothing here refuses a world. */
+    networldInit();
+    bs_put_u64(ts + 1, 61u);
+    networldApplyPayload(ts, sizeof ts);
+    check(networldTakeTimeSync(&t) && t == 61u,
+          "an unsolicited TIME_SYNC is recorded rather than treated as an error");
+
+    /* Control: the dispatch really is keyed on the type byte, and 0x10 really is the one that
+     * reaches this decoder. Without this, every check above would pass just as happily if
+     * applyTimeSync were wired to the wrong case -- or to none, with some other handler
+     * incidentally setting the flag. */
+    networldInit();
+    ts[0] = (uint8_t)(BS_APP_TIME_SYNC + 1u);
+    bs_put_u64(ts + 1, 77u);
+    networldApplyPayload(ts, sizeof ts);
+    check(!networldTakeTimeSync(NULL),
+          "a neighbouring type byte does not reach the clock decoder");
+}
+
 /* The entry gate's fourth term, against the clock. scene/title_nav_test.c checks that
  * titleMpNav() honours the bool; this checks that the bool is TRUE when it should be and,
  * more importantly, that every arm of it is BOUNDED — a gate on a packet a pre-v1.8.3 server
@@ -4121,6 +4262,7 @@ int main(void)
     test_setworld_keeps_diffs_until_terrain_exists();
     test_world_info_carries_the_servers_seed();
     test_world_gen_carries_the_servers_generator();
+    test_time_sync_carries_the_servers_clock();
     test_gen_gate_holds_entry_until_the_generator_is_known();
     test_an_unhandled_app_type_changes_nothing();
     test_the_session_generator_resolves_and_refuses();
@@ -4232,8 +4374,19 @@ int main(void)
      * copied out, the two controls that the live path and the staging-world guard are still
      * there, and the one that is the point of the file: the two guards ANDed into one condition).
      * Nothing removed. */
-    check(g_checks == 470,
-          "check-count guard: every check in this suite actually ran (470 before this line)");
+    /* 470 -> 487, same rule. test_time_sync_carries_the_servers_clock adds 17: nothing claimed
+     * before a packet and the out-parameter left alone, the value arriving and being exact, the
+     * two that are the point of the test (a second take answers false because the flag was
+     * consumed, and that false leaves the out-parameter alone), the re-arm proving consuming
+     * does not disable the feature for the session, the full 64-bit width with its high half
+     * intact, the little-endian byte order against literal bytes, a counter of 0 being a time
+     * rather than silence, the optional out-parameter and that a NULL take consumes too, short
+     * and long both dropped whole, the pending counter not surviving into the next session or
+     * into single player, an unsolicited packet being recorded rather than refused, and the
+     * control that a neighbouring type byte does not reach the clock decoder. Nothing
+     * removed. */
+    check(g_checks == 487,
+          "check-count guard: every check in this suite actually ran (487 before this line)");
 
     printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;

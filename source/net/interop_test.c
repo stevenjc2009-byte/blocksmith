@@ -135,11 +135,18 @@ static void check(bool cond, const char *what)
  *
  * 77 on 2026-09-02: v1.8.7 added scenario 10 (the registry fingerprint verdict, against the
  * real daemon), which makes 11 checks. Recomputed as 66 + 11 by counting the check() calls
- * added, not read off the run.
+ * added, not read off the run. (That scenario is now numbered 11 - see the next entry.)
+ *
+ * 89 on 2026-09-05: v1.9.8 added a new scenario 10 (BS_APP_TIME_SYNC across the real process
+ * boundary: the unprompted JOIN-time packet AND the first unprompted periodic one, each checked
+ * for length, canonical wire bytes, and the real client's own decode against bytes this test
+ * read off the wire itself), which makes 12 checks, and renumbered the registry fingerprint
+ * scenario above from 10 to 11 without changing what it does. Recomputed as 77 + 12 by counting
+ * the check() calls added, not read off the run.
  *
  * Legitimately adding or removing a check means editing this by hand. The suite going red until
  * you do is deliberate friction, not an accident. */
-#define INTEROP_TEST_EXPECTED_CHECKS 77
+#define INTEROP_TEST_EXPECTED_CHECKS 89
 
 /* Deliberately NOT routed through check(): it must not perturb the number it is testing, so it
  * bumps g_fails only and leaves g_checks alone. Reporting shape is check()'s, so a failure here
@@ -394,6 +401,20 @@ static void buildCanonicalWorldGen(uint8_t *out /* BS_WORLD_GEN_BYTES */, uint16
     bs_put_u16(out + BS_APP_HDR_BYTES, gen);
 }
 
+/* v1.9.8, and the same posture again for BS_APP_TIME_SYNC: written from bs_proto.h's
+ * BS_TIME_SYNC_BYTES/BS_APP_HDR_BYTES macros and bs_put_u64 alone, never copied from bsgame.c's
+ * send_time_sync() or networld.c's applyTimeSync(). `ticks` is the value the scenario itself
+ * reads off the wire — unlike scenario 9's INTEROP_SEEDED_WORLD_GEN, bsgame.c's day_time_ticks
+ * has no state-dir file this test can pre-seed to a value neither side could have guessed; it
+ * free-runs from 0 the instant the daemon boots. So this builder only arbitrates the WIRE SHAPE
+ * (type byte, then a little-endian u64 immediately behind it) — VALUE agreement is what the
+ * scenario's own raw-bytes-vs-decode comparison proves instead. */
+static void buildCanonicalTimeSync(uint8_t *out /* BS_TIME_SYNC_BYTES */, uint64_t ticks)
+{
+    out[0] = BS_APP_TIME_SYNC;
+    bs_put_u64(out + BS_APP_HDR_BYTES, ticks);
+}
+
 /* ------------------------------------------------------------------------------ fake transport
  * Link-time test double for net/bsnet_transport.h, same seam networld_test.c uses (bsnet_
  * transport.c is real Noise XX over a real UDP socket, none of it host-portable). UNLIKE
@@ -463,6 +484,23 @@ static void captureGenReset(void)
 {
     g_captured_gen_count = 0;
     g_join_order_count   = 0;
+}
+
+/* v1.9.8. The same again for BS_APP_TIME_SYNC — see this file's header comment on why a raw
+ * capture is kept alongside the real client's own decode (networldTakeTimeSync()) rather than
+ * trusting either alone: one proves the wire bytes are right, the other proves networld.c's own
+ * parse of those bytes is right, the same split scenario 5's g_captured_inv/g_last_inv_state
+ * pair draws for BS_APP_INV_STATE. Sized for more than one packet, unlike g_captured_inv, because
+ * the scenario below must tell the join-time TIME_SYNC and the first periodic one apart to prove
+ * the periodic broadcast is real and not a one-shot that merely looks like one. */
+#define TIME_CAPTURE_MAX 4
+static uint8_t g_captured_time[TIME_CAPTURE_MAX][BS_MAX_PAYLOAD];
+static size_t  g_captured_time_len[TIME_CAPTURE_MAX];
+static int     g_captured_time_count;
+
+static void captureTimeReset(void)
+{
+    g_captured_time_count = 0;
 }
 
 /* Registered once per scenario via networldSetInvHook() (networldInit() clears any previous
@@ -551,6 +589,17 @@ int netTransportRecv(uint8_t *out, size_t cap)
         g_captured_gen_len[g_captured_gen_count] = plen;
         g_captured_gen_count++;
     }
+    /* v1.9.8. Same again for BS_APP_TIME_SYNC. Every OTHER packet type — including the unrelated
+     * one-time BS_APP_WORLD_SYNC dump BS_CHUNK_LEGACY_GRACE_MS after a JOIN that never sends
+     * CHUNK_SUB, which this scenario's client never does — still reaches networldApplyPayload()
+     * below exactly as always and is simply not written into this array, never a reason for this
+     * function to stop early or fail: it captures the type it wants and lets pumpUntilTimeCaptured()
+     * keep polling past anything else that happens to be on the wire. */
+    if (plen > 0 && out[0] == BS_APP_TIME_SYNC && g_captured_time_count < TIME_CAPTURE_MAX) {
+        memcpy(g_captured_time[g_captured_time_count], out, plen);
+        g_captured_time_len[g_captured_time_count] = plen;
+        g_captured_time_count++;
+    }
     /* Unconditional and type-blind: what the Phase 4 scenario asks of it is the SEQUENCE, so
      * filtering to the types that scenario cares about would let a packet slipped in between
      * them go unrecorded and the sequence still read as adjacent. */
@@ -600,6 +649,17 @@ static void pumpUntilGenCaptured(int want, unsigned timeout_ms)
 {
     uint64_t deadline = now_ms() + timeout_ms;
     while (g_captured_gen_count < want && now_ms() < deadline) {
+        networldUpdate();
+        msleep(5);
+    }
+    networldUpdate();   /* one last drain in case something landed right at the deadline */
+}
+
+/* v1.9.8, and the same again for BS_APP_TIME_SYNC. */
+static void pumpUntilTimeCaptured(int want, unsigned timeout_ms)
+{
+    uint64_t deadline = now_ms() + timeout_ms;
+    while (g_captured_time_count < want && now_ms() < deadline) {
         networldUpdate();
         msleep(5);
     }
@@ -1132,6 +1192,124 @@ static void test_world_gen_declared_at_join(void)
 }
 
 /* ----------------------------------------------------------------------------- scenario 10 --
+ * v1.9.8. BS_APP_TIME_SYNC, from the real bsgame daemon, decoded by the real net/networld.c, in
+ * one measurement — the same shape as scenario 9's WORLD_GEN case, and for the identical reason:
+ * networld_test.c already proves the client's OWN decode of a hand-built TIME_SYNC packet, and
+ * bsgame_test.c already proves the real daemon sends one at join and once a second thereafter,
+ * reading the reply back with its own hand-rolled parser. Neither can see the two programs
+ * disagree with EACH OTHER about the wire shape, which is the failure mode this file exists to
+ * catch.
+ *
+ * BS_APP_TIME_SYNC has no analogue of scenario 9's INTEROP_SEEDED_WORLD_GEN: day_time_ticks
+ * (bsgame.c) starts at 0 and free-runs from the instant the daemon boots — there is no state-dir
+ * file this scenario can pre-seed to a value neither side could have guessed. So the VALUE
+ * agreement this scenario proves is not "the client got the constant this test planted" (scenario
+ * 9's proof) but "the client's decode agrees with the bytes this test independently read off the
+ * SAME wire" (bs_get_u64 applied to the captured payload, never handed to networld.c) — the check
+ * that cannot pass by both sides being wrong about an offset the same way.
+ *
+ * Two packets, not one: BS_APP_TIME_SYNC is the one message in this file that keeps arriving
+ * after JOIN (bsgame.c's tick(), once a second — see BS_TIME_SYNC_BYTES's own comment in
+ * bs_proto.h), so a scenario that only checked the join-time copy could not tell a real periodic
+ * broadcast apart from a one-shot that merely happens to look like one. The second capture, and
+ * the strictly-greater tick count against the first, is what proves the clock is actually
+ * ticking on the far side of a real process boundary and not just the join value replayed.
+ *
+ * No World is created and networldSetWorld() is never called, the same omission scenario 9 makes
+ * and for the same reason: nothing about a day/night counter needs a column loaded to prove
+ * itself. The WORLD_SYNC dump BS_CHUNK_LEGACY_GRACE_MS after this JOIN (this client never sends a
+ * CHUNK_SUB) is not something this scenario dodges — netTransportRecv() above records every
+ * packet type-blindly into the join-order log and only the type-matched arrays besides, so that
+ * unrelated packet landing between the two TIME_SYNCs is simply not the one either pump below is
+ * waiting for, never a reason for either to fail. */
+
+static void test_time_sync_at_join_and_periodic(void)
+{
+    puts("real interop: JOIN alone gets the real client a BS_APP_TIME_SYNC from the real server, "
+         "and a second, unprompted one arrives roughly a second later");
+
+    const uint32_t client = 0xC1E00016u;
+
+    networldInit();
+    g_client_sid = client;
+    captureReset();
+    captureInvReset();
+    captureGenReset();
+    captureTimeReset();
+
+    send_join(client, "timeclient1");   /* the ONLY thing this scenario does before pumping */
+
+    pumpUntilTimeCaptured(1, 1000);
+    check(g_captured_time_count == 1,
+          "exactly one BS_APP_TIME_SYNC arrived after JOIN, unprompted — the client asked for "
+          "nothing and there is no request message it could have asked with");
+
+    uint64_t first_wire_ticks = 0;
+    if (g_captured_time_count == 1) {
+        check(g_captured_time_len[0] == BS_TIME_SYNC_BYTES,
+              "it is exactly BS_TIME_SYNC_BYTES (9) long, so networld.c's strict-equality length "
+              "check accepts it rather than dropping it whole");
+
+        first_wire_ticks = bs_get_u64(g_captured_time[0] + BS_APP_HDR_BYTES);
+
+        uint8_t canon[BS_TIME_SYNC_BYTES];
+        buildCanonicalTimeSync(canon, first_wire_ticks);
+        check(memcmp(g_captured_time[0], canon, BS_TIME_SYNC_BYTES) == 0,
+              "and byte-identical to the canonical encoding built from bs_proto.h's macros alone "
+              "(type byte, then the tick count little-endian immediately behind it), neither "
+              "side's encoder used as the reference");
+    }
+
+    /* The client's OWN decode, which is the half a raw byte capture cannot speak for — and the
+     * check this scenario exists for: the decoded value must equal the u64 this test read off
+     * the wire itself, above, not a value copied from either side's implementation. */
+    uint64_t decoded = 0xDEADBEEFDEADBEEFull;
+    check(networldTakeTimeSync(&decoded),
+          "the real networld.c accepted it: applyTimeSync() parsed the packet and armed the "
+          "pending flag networldTakeTimeSync() answers true from");
+    check(decoded == first_wire_ticks,
+          "and the decoded value equals the u64 this test read out of the raw wire bytes itself, "
+          "so this cannot pass by both sides being wrong about the offset in the same way");
+
+    /* Consumed, not latched (networld.h's own comment on networldTakeTimeSync(): "not a question
+     * you may ask repeatedly and get the same answer to"). Nothing new has arrived yet, so a
+     * second call right now must answer false. */
+    uint64_t stale = 0xDEADBEEFDEADBEEFull;
+    check(!networldTakeTimeSync(&stale),
+          "a second call with no new packet in between answers false — the pending flag was "
+          "consumed by the call above, not latched");
+
+    /* ---- the periodic broadcast: unprompted, roughly a second later. ---- */
+    pumpUntilTimeCaptured(2, 1500);
+    check(g_captured_time_count == 2,
+          "a second, unprompted BS_APP_TIME_SYNC arrived roughly a second later, proving the "
+          "periodic broadcast (bsgame.c's tick(), once a second) is real and not just a "
+          "join-time one-shot");
+
+    if (g_captured_time_count == 2) {
+        check(g_captured_time_len[1] == BS_TIME_SYNC_BYTES,
+              "the periodic packet is also exactly BS_TIME_SYNC_BYTES (9) long");
+
+        uint64_t second_wire_ticks = bs_get_u64(g_captured_time[1] + BS_APP_HDR_BYTES);
+        check(second_wire_ticks > first_wire_ticks,
+              "and its tick count is strictly greater than the join-time packet's, so this is "
+              "the real day/night clock advancing on the far side of a real process boundary, "
+              "not the join value replayed");
+
+        uint8_t canon2[BS_TIME_SYNC_BYTES];
+        buildCanonicalTimeSync(canon2, second_wire_ticks);
+        check(memcmp(g_captured_time[1], canon2, BS_TIME_SYNC_BYTES) == 0,
+              "the periodic packet is also byte-identical to the canonical encoding");
+
+        uint64_t decoded2 = 0xDEADBEEFDEADBEEFull;
+        check(networldTakeTimeSync(&decoded2),
+              "the real client's own decode picked up the periodic packet too");
+        check(decoded2 == second_wire_ticks,
+              "and again agrees with the raw wire bytes this test read independently");
+    }
+}
+
+/* ----------------------------------------------------------------------------- scenario 11 --
  * The v1.8.7 verdict, against the real daemon rather than a scripted INFO packet.
  *
  * networld_test.c proves the DECISION; this proves the SITUATION is reachable. Everything in the
@@ -1263,6 +1441,7 @@ int main(void)
     test_inv_pickup_roundtrip_reflected_in_snapshot();
 
     test_world_gen_declared_at_join();
+    test_time_sync_at_join_and_periodic();
 
     /* Last: the only scenario that deliberately leaves the client's registry wrong, and the
      * only one that spends ~3 s of real wall clock waiting for a real deadline. */

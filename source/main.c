@@ -5955,6 +5955,25 @@ session_start:
 		// comment. paused already zeroed ticks_now above, so the guard here is redundant with
 		// dayNightAdvance's own n<=0 no-op but kept for symmetry with the loop it sits beside.
 		if (ticks_now > 0) dayNightAdvance(&s_daynight, ticks_now);
+
+		// v1.8.20 BS_APP_TIME_SYNC. The server's counter overrides the local advance above, so
+		// everyone in a session sees the same hour, the same day number and the same moon phase.
+		//
+		// AFTER the advance, not before: the packet is the newer information, so applying it
+		// second means this frame ends on the server's answer rather than on the server's answer
+		// plus a frame of local drift. The order matters for one frame in sixty, which is exactly
+		// the resolution at which nothing else here is sloppy.
+		//
+		// Unconditional on session state, because networldTakeTimeSync() already IS the session
+		// test: it can only answer true if a packet arrived, it is cleared by netDisconnect(),
+		// and it never answers true in single player. Adding a networldSessionActive() guard here
+		// would be a second copy of that condition which could later disagree with the first.
+		//
+		// Take, not Get -- it consumes. Calling it once per frame and doing nothing on false is
+		// the intended shape; see networld.h, where the reason a latching version would silently
+		// freeze the clock is written out in full.
+		uint64_t server_ticks = 0;
+		if (networldTakeTimeSync(&server_ticks)) dayNightSet(&s_daynight, server_ticks);
 		//
 		// Not separately timed into the CSV row below: MetricsWork lives in app/metrics.h,
 		// which this task does not own, and the cost is bounded by construction and measured
