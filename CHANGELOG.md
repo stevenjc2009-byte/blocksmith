@@ -4,6 +4,99 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.8.20] - 2026-09-05
+
+Not a roadmap version. `docs/ROADMAP.md` goes v1.8.19 "Sound" straight to v1.9.0 "Storage and
+quality of life", and this build is inserted between them because the multiplayer audit that
+followed v1.8.19 found the day/night clock was never synchronised at all. Every client ran its
+own counter from its own join time, so two players in the same world could be hours apart —
+one at noon, one at midnight, standing next to each other. That is not a subtle desync; it
+changes the light level, the mob spawning window, the moon phase and the weather, and it was
+never reported because nobody had two consoles on one server long enough to notice.
+
+The fix is one new opcode and about 280 bytes of client code. It is small enough that holding
+it for v1.9.0 would have been the wrong call, and additive enough on the wire that it does not
+force the usual lockstep client-and-server release.
+
+Nothing in this version has run on a console. The v1.8.17 boot freeze is still unfixed, so
+every claim below is a host measurement, a host suite result or a clean devkitARM build.
+
+### Added
+
+- **A server-authoritative day/night clock.** The server broadcasts its own tick counter as
+  `BS_APP_TIME_SYNC` (`proto/bs_proto.h`, opcode `0x10`, payload one `uint64` little-endian,
+  `BS_TIME_SYNC_BYTES` = 9), once when a player joins and then once a second thereafter. The
+  client pins its own clock to it in `source/main.c` immediately after its local advance.
+
+  The **whole counter** travels, not a time-of-day. That is deliberate and it is what
+  `source/world/daynight.h:354-355` asked for when the design was written down: sending only
+  the hour would sync the light level while leaving the day number and the moon phase
+  disagreeing, which is a subtler version of the same bug.
+
+  No interpolation. At one packet a second the drift between packets is one second of a
+  20-minute day cycle, which is below what the sky gradient resolves.
+
+- **Weather now agrees across the room, at no wire cost.** `weatherAt()`
+  (`source/world/weather.h:230-243`) is a pure function of `(seed, tick, x, z)`; its only
+  randomness is `rngHash3()`, a positional hash rather than a stream, so it has no state to
+  drift. The seed already synchronised via `BS_APP_WORLD_INFO`. Once the tick agrees, the
+  weather agrees. This was verified by reading the function rather than assumed from the
+  name, and it is the reason no second opcode was added for it.
+
+- **The date survives a server restart.** The server persists the counter to `day_time.txt`
+  in its `--state-dir`, plain decimal, alongside the existing `world_seed.txt` and
+  `world_gen.txt`. Loaded at startup, saved once a second, flushed on clean shutdown. Without
+  this a restart would silently rewind every connected player's world to dawn.
+
+### Changed
+
+- **`PROTO_COMMIT` bumped** (`Makefile:374`) to server v1.9.8. The wire change is purely
+  additive and **one-directional**, so the usual lockstep does not apply in both directions:
+  an old client against a new server ignores `0x10` at `networld.c`'s `default: break;`, and
+  a new client against an old server simply never receives one and keeps running its own
+  clock. What is **not** safe, and must never be added, is the reverse direction — the
+  server's `handle_app_payload` ends in `send_kick()`, so a new *client-to-server* opcode
+  would disconnect every player on an older server. `BS_PROTO_VERSION` stays at 1.
+
+### Notes on the implementation
+
+- **`networldTakeTimeSync()` consumes rather than latches**, and is the only accessor in
+  `source/net/networld.h` that answers differently when called twice. Hence `Take`, not `Get`.
+  A latched flag would have made `main.c` re-pin the clock every frame to a value up to a
+  second old, and time would visibly stop between packets — a *worse* failure than no sync at
+  all, because a stopped clock still looks like a working feature until somebody waits for
+  sunrise and it never comes.
+
+- **The pending counter is cleared on disconnect.** `netDisconnect()` reaches the reset path,
+  so a counter left over from the last server cannot be handed to `main.c` during the next
+  session — and in particular cannot drag a single-player world to whatever o'clock some
+  server happened to be at.
+
+### Verified
+
+- Server suite `PASS 337 checks, 0 failed` (307 before). Red/green proved by commenting out
+  the `broadcast_except(...)` in `tick()`: `FAIL 336 checks, 1 failed`, exit 2, with exactly
+  `a second TIME_SYNC arrives roughly a second later, unprompted` failing — so the check goes
+  red for its own reason and not for a build error.
+
+- Client host suite `PASS 488 checks, 0 failed`, `SUITE_EXIT=0`, with the check-count guard
+  raised 470 → 487. The 17 new checks include a **control**: a neighbouring type byte
+  (`BS_APP_TIME_SYNC + 1`) must not reach the clock decoder, so the test cannot pass by
+  accident on a decoder that accepts anything.
+
+- Clean devkitARM build, 0 warnings and 0 errors, all four drift guards passing —
+  `check-proto-drift` against the new pin, and all eleven mirrored world files still
+  byte-identical. `blocksmith.3dsx` 1,826,756 → 1,828,616 bytes, **+1,860** — of which the
+  time-sync code is **+280** and the rest is this release's own notes baked into
+  `source/app/version_history_data.c` for the in-app history browser (1,555 bytes of text
+  plus its table row). The +280 was measured before the notes were written, which is why an
+  earlier draft of this entry quoted it as the whole figure.
+
+### Not verified
+
+- **Nothing has run on a console.** Two players in one world seeing the same sunset is the
+  claim, and it has only been demonstrated between a host test process and a host daemon.
+
 ## [1.8.19] - 2026-09-05
 
 `docs/ROADMAP.md` calls this version "Sound", and asks for footsteps that know what you are

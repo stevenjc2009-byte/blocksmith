@@ -469,13 +469,36 @@ monsters because caves are dark, which is the same rule working, not a second on
 
 ---
 
-## v1.8.19 — Sound
+## v1.8.19 — Sound ✅ released
 
 **Added.** A real audio system — footsteps that know what you are walking on, block
 breaking and placing per material, animals, water, ambience. Effects sourced under
 licences that permit any use, credited in the repository.
 
 ---
+
+**Delivered, with two departures from the line above.** The effects were **not** sourced —
+no new recordings exist on this machine and none were fetched. The nine new clips are
+synthesized by generators in `tools/make_sfx_synth.py`. And **ambience was not delivered**:
+the mixer supports looping and nothing uses it, because a looping ambient bed needs a
+trigger-event design decision (what starts it, what stops it, how it ducks under effects)
+that was not part of this version's brief. It is the one item of this line still open.
+
+---
+
+## v1.8.20 — Time, unplanned ✅ released
+
+**Not a roadmap version.** Inserted between v1.8.19 and v1.9.0 by the multiplayer audit that
+followed "Sound", which found the day/night clock had never been synchronised: every client
+ran its own counter from its own join time, so two players in one world could be hours apart.
+
+**Added.** `BS_APP_TIME_SYNC` (`0x10`, server-to-client only, one `uint64` little-endian),
+sent on join and once a second after. Weather rode along free, because `weatherAt()` is a
+pure function of the tick and the seed and both were already agreed. The server persists the
+counter so a restart does not rewind everyone to dawn.
+
+This entry exists so a later reader does not go looking for a plan item that explains the
+version. There was none; the bug explains it.
 
 ## v1.9.0 — Storage and quality of life
 

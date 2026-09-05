@@ -1,0 +1,25 @@
+# Release notes shown on the 3DS top screen before the update downloads.
+#
+# Two sections, both optional, one item per line. Plain English, no markdown: this is read
+# by a player on a 400 px screen, not by a developer. A leading "- " is optional.
+#
+# Keep every item under 95 characters. Wrapping onto a second display line is automatic and
+# fine, but the ITEM cap bites first and is a different number: app/whatsnew.h's
+# WHATSNEW_ITEM_CHARS is 96 bytes INCLUDING the terminator, so a 96th character is cut, its
+# last three replaced with "...", and the whole file flagged truncated.
+# app/version_history_test.c re-parses every baked note, so the cut fails the build rather
+# than reaching a player.
+
+[fixes]
+Everyone on a server now sees the same time of day. Join at dusk and you arrive at dusk.
+Before this, each player ran their own clock from the moment they joined.
+Weather matches too, because it follows the clock. Same rain, same snow, same place.
+The moon is in the same phase for everyone, and the day number matches as well.
+
+[features]
+The server keeps the date across a restart, so a night does not reset to morning.
+This needs the new server. Against an older one the game just keeps its own clock.
+The freeze on startup is still not fixed, and this build does not claim to fix it.
+If it happens, look in the blocksmith folder on your SD card for two files it leaves.
+stage.txt says how far the game got. cmdhang.bin says what the graphics chip was doing.
+Either of those two files is worth far more than a description of what you saw.
