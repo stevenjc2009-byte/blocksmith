@@ -904,10 +904,30 @@ materials list v1.8.8 otherwise completed.
 built once per mesh rather than read cell by cell. Output is unchanged; the shipped code
 measures slightly smaller as well as doing less work per cell.
 
-### v1.8.18 — Monsters — in progress, not released
+### v1.8.18 — Monsters — released and published
 
-**This is the branch currently checked out**, with work in the tree that is not committed.
-It is not tagged, not built for release, and not published.
+Released 2026-09-05. Commit `63e6ed7`, annotated tag object `b54ebc4`, asset
+`blocksmith1.8.18.cia` 1,373,120 bytes, md5 `58936147016c43db92670bbbc8396725`. Verified
+by downloading the asset back through the same `releases/latest` redirect the in-game
+updater follows and comparing it byte-for-byte against the local build (`cmp` exit 0),
+with a red control against a different file returning 1 to prove the comparison could
+have failed.
+
+Named "Monsters" on the roadmap, and zombies and skeletons did land — but most of this
+release is the boot freeze. Nineteen hypothesis classes have now been eliminated with
+real measurement, static analysis is exhausted, and every remaining lead needs the actual
+GPU command list that wedged the console. So this build captures it: `gputest.c` writes
+`sdmc:/blocksmith/cmdhang.bin` unconditionally, with no flag to forget to set.
+
+Also fixed here: a furnace placed by a remote player never got a blockstate, so it could
+never hold a smelt — the removal half of that path had always existed and nothing ever
+created.
+
+Feature work (chests, the multiplayer sync audit, tool tiers, coal-as-fuel) was paused
+rather than cancelled, at steve's direction, so the remaining quota could go at the
+freeze. See [PAUSED-WORK.md](PAUSED-WORK.md).
+
+**Not verified:** nothing in this release has run on real hardware.
 
 **Added.** Zombies and skeletons, spawning in the dark and in caves, on the light and
 space rules that make a torch worth placing.
