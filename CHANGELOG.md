@@ -4,6 +4,131 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.8.19] - 2026-09-05
+
+`docs/ROADMAP.md` calls this version "Sound", and asks for footsteps that know what you are
+walking on, breaking and placing per material, animal sounds, water and ambience. Most of the
+audio system it describes already existed — a mixer with eight voices, priorities and voice
+stealing, positional playback, a `BSND` container and nine shipped effects, all of it added
+across earlier versions. So the honest summary of this version is not "sound was added". It is
+that the sound system got the content it was built for, and that one part of it turned out
+never to have been connected at all.
+
+Also here, and not from the roadmap line: a measured multiplayer bug where a rejoining player's
+own water could vanish, and the three documentation defects the version-list audit found and
+recorded but never fixed. One of those three could not be settled by reading and had to be
+re-measured.
+
+Nothing in this version has run on a console. The v1.8.17 boot freeze is still unfixed and no
+v1.8.x build has been seen on real hardware, so every claim below is a host measurement or a
+clean devkitARM build, and none of them is a playtest.
+
+### Added
+
+- **Per-material footsteps, breaking and placing.** Stone, wood, dirt and grass each sound
+  like themselves. The mapping from block to material is a pure function,
+  `sfxMaterialOfBlock()` in the new `source/audio/audio_material.c`, and it is deliberately
+  **not** a field on the block registry: `world/block.h`, `world/registry.h` and
+  `world/registry.c` are byte-mirrored into the server repository and guarded by
+  `check-world-drift`, so adding a field there would have forced a coordinated client and
+  server release for a client-only audio feature. Keeping the table on the audio side costs
+  nothing and keeps the mirror clean, which was verified rather than assumed — all eleven
+  mirrored files still compare byte-identical.
+
+- **Nine new sound effects, none of them downloaded.** No new source recordings exist on this
+  machine and none were fetched. The nine are synthesized by new generators in
+  `tools/make_sfx_synth.py`, built from the lowpass, highpass, envelope and seeded-noise
+  primitives it already had. Stone is a bright, fast-decaying click; wood a hollow two-tone
+  knock with splinter ticks; dirt a low thump with no high content; grass pure highpassed
+  noise bursts with no tonal content at all.
+
+- **Twelve material and event pairs, but only nine files.** The three pre-existing generic
+  clips are each already a specific material, because of what was recorded: the generic
+  footstep is Kenney's `footstep_wood_000.ogg`, a wood footstep; the generic break is
+  `impactMining_000.ogg`, a stone impact; the generic place is `impactPlank_medium_000.ogg`, a
+  plank. Building `footstep_wood`, `break_stone` and `place_wood` would have put a
+  byte-identical second copy of each in romfs — confirmed identical by md5, not assumed —
+  costing **87,668 bytes of a 393,216-byte Old 3DS audio pool to store three sounds twice**.
+  They are not built and not registered. The resolvers fall back to the generic slot, which
+  holds exactly the recording a dedicated slot would have held. The audio pool comes to
+  **239,824 bytes against the Old 3DS ceiling of 393,216, leaving 153,392 free** — where
+  shipping all twelve would have left 65,724.
+
+  That trade is only safe while the generic clips remain those materials, and nothing about a
+  `.bsnd` file says what it is a recording of. So it is pinned from both ends in
+  `audio_sfx_test.c`: the three files must be absent from romfs, and the three resolvers must
+  answer the generic slot, with a control asserting that a material whose own slot IS
+  registered does not fall back — without which a resolver that ignored its argument entirely
+  would have satisfied every other check.
+
+### Fixed
+
+- **Animal hits and deaths were completely silent, and had been since the feature was
+  written.** `audioSfxPlayMobDamage()` in `source/audio/audio_sfx.c` was implemented,
+  documented at length and covered by host tests. Its only call site in the entire tree is
+  `source/main.c`'s animal-attack branch, and that line discarded `animalHurt()`'s return with
+  a `(void)` cast — the return being precisely the "did this kill it" bool the function needs
+  to choose between the death and hurt cue. The function was unreachable. The cast is now a
+  capture and the cue plays, positional at the animal's own body rather than the player's.
+
+  The old comment justifying the cast said there was "nothing else here that treats a kill
+  differently from a hit", and pointed at the drop out-parameters as already carrying that
+  information. They do not: `animalHurt()` writes zero to both for a survivor **and** for a
+  kill that drops nothing, so inferring the kill from the drop would have played the wrong cue
+  on every meatless kill.
+
+- **A rejoining player's own water could vanish.** A rejoin's stored block diffs all land in
+  the single frame their column installs, and every one of them fires the world edit hook,
+  which pushes seven cells into a 1024-entry ring that evicts its oldest entry when full. The
+  player's own placements are the oldest things in it. Measured against a model of `main.c`'s
+  frame order: **47 of 60 placements lost, 78.3%**. Fixed with a narrow filter — during a
+  replay only, a write with no water within a Manhattan radius of 2 skips the notify — which
+  leaves a water source arriving *as* a diff still spreading normally. Blanket suppression
+  during the drain was measured and rejected: it fixes the local player completely and moves
+  the bug onto the remote one. Ring evictions across the reproduction go from **30,126 to 0**.
+
+- **Three documentation defects, one of which had to be re-measured.** `docs/VERSION-LIST.md`
+  said region compaction was one of v1.7.1's four measured performance fixes and later found
+  unwired; it was a fifth item, claimed there and not wired until v1.8.2, and now reads that
+  way. `docs/ROADMAP.md` said monsters spawn "in the dark and in caves"; `monsterSpawnTick()`
+  gates on darkness alone and never calls `worldgenIsCave()`, so caves fill with monsters
+  because caves are dark, which is the same rule and not a second one.
+
+  The third was the radix sort's worst case, quoted as "29x, 0.2583 to 0.0089 ms" in both
+  `VERSION-LIST.md` and `source/scene/chunk_render.c`. **It contradicted the measurement table
+  four lines above it in that same comment**, which said 0.0051 ms and 50.9x, and
+  `VERSION-LIST.md` printed 0.0051 two lines below its own 0.0089. Neither number could be
+  confirmed by reading and the harness that produced either had been thrown away, so both
+  sorts were lifted out again — the insertion sort recovered from commit `f8c4dc22`, which
+  removed it — into a new `tools/sortbench.c`. Three runs put the worst-case new arm at
+  0.0062 / 0.0065 / 0.0061 ms against an old arm of 0.2825 / 0.2756 / 0.2781, nowhere near
+  0.0089. The table was right and the prose was wrong; both copies now say 0.0051 ms and
+  50.9x. `tools/sortbench.c` stays in the tree so the figure cannot be lost a third time.
+
+### Changed
+
+- `audioFootstepsUpdate()` takes the block underfoot, so it can resolve a material per step.
+- `.gitignore` globs `build-*/` instead of listing build directories one at a time. The list
+  had already fallen behind: `source/world/Makefile.inventory-persist-test` writes
+  `build-inventory-persist/`, which never got an entry, so a 69 KB host binary sat untracked
+  long enough that nobody could remember what it was.
+
+### Known and not fixed
+
+- **The boot freeze.** Static analysis is exhausted and nineteen hypothesis classes have been
+  eliminated. The next step needs `sdmc:/blocksmith/cmdhang.bin` off a console that has
+  actually frozen. `BS_STAGE_PROBE` stays on at `source/app/stage_probe.h:41` for that reason
+  — turning it off before the freeze is understood would discard the evidence trail.
+- **Ambience loops** — rain, snow and cave sound — are the one part of the roadmap's Sound
+  line not delivered. The mixer already supports looping voices and nothing uses one. It was
+  left out because it has no discrete trigger event yet, which is a design question rather
+  than a missing file.
+- **Mobs, time of day and weather still do not sync in multiplayer.** The audit that found
+  this was re-run and its findings are recorded in `docs/PAUSED-WORK.md` rather than lost a
+  second time. Time of day is the cheapest of the three by a wide margin and is already fully
+  specified in `source/world/daynight.h` down to the opcode number, and weather rides on it
+  for free once the tick is shared.
+
 ## [1.8.18] - 2026-09-04
 
 `docs/ROADMAP.md` calls this version "Monsters," and it is — zombies and skeletons exist in
