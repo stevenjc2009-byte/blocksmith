@@ -341,7 +341,37 @@ PROTO_REPO	:=	https://github.com/stevenjc2009-byte/blocksmith-server.git
 # deployable), and 11caee37:proto/bs_proto.h is blob 5a9886c2 -- byte-identical to what
 # `git hash-object proto/bs_proto.h` reports on disk. A pin naming a commit that exists only
 # locally would break a fresh clone, which is the failure this check exists to prevent.
-PROTO_COMMIT	:=	11caee37f8b1bf7ea3e9b0d3534c47b90e48cd8d
+#
+# BUMPED 2026-09-05, 11caee37 -> 2c822a09 (server v1.9.7). A THIRD shape, and worth naming
+# because it is neither of the two above: proto/bs_proto.h changed, but not one opcode, id,
+# flag, length or struct moved with it. blob 5a9886c2 -> d6f597df, and the whole delta is one
+# comment on BS_APP_WORLD_GEN. So this bump unbreaks a build the way the v1.9.6 entry did,
+# while costing an old client exactly nothing the way the v1.9.4 entry did.
+#
+#   WHAT MOVED: the paragraph that said declaring a generator above 1 needs water on the wire
+#   first. Measured this session and withdrawn -- the observation it rests on is right and is
+#   kept, but water cannot reach this wire at all. On this side, water writes blocks only
+#   through worldSet; worldSet's edit hook does exactly one thing with them (a local
+#   waterNotify) and is not a sender; networldSendBlockEdit has exactly one non-test caller,
+#   scene/interact.c's own break/place; and source/world/water_test.c links water.c WITHOUT
+#   net/networld.c and builds, so a send from water.c would be an undefined symbol. What two
+#   clients can disagree about is flow, not the world.
+#
+#   The server change behind it is real, though it is not on the wire: a state-dir with no
+#   block_diffs.bin now mints generator 5 rather than 1, and --world-gen refuses to contradict
+#   a stored value on a state-dir that has edits unless --world-gen-force says so.
+#
+#   RELEASE ORDER still ran server-first, and here that is a formality rather than a
+#   correctness argument: with no wire constant moving, neither ordering can desync anything.
+#   It was done anyway so the pin never names a commit a fresh clone cannot fetch, which is
+#   the failure check-proto-drift exists to prevent.
+#
+# Verified the same three ways as every entry above, before bumping: `git ls-remote origin`
+# shows refs/heads/v1.9.7 and refs/tags/v1.9.7 both present on the remote, refs/tags/v1.9.7^{}
+# dereferences to 2c822a09 (an annotated tag, and only a TAG is deployable), and
+# 2c822a09:proto/bs_proto.h is blob d6f597df -- byte-identical to what `git hash-object
+# proto/bs_proto.h` reports on disk.
+PROTO_COMMIT	:=	2c822a0961e27966f754372b37e80147073a3701
 PROTO		:=	deps/blocksmith-server
 
 .PHONY: deps
