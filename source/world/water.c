@@ -310,6 +310,34 @@ uint8_t waterLevelAt(const WaterSim* s, const World* w, int x, int y, int z)
 	return levelOfKey(s, w, x, y, z);
 }
 
+// See water.h for what this is for and what it costs. The implementation is the whole rule.
+//
+// levelOfKey and not worldGet, deliberately: a flow cell is water that lives in the flow map and
+// may or may not have a block under it yet, and a filter that could not see flow would skip a
+// notify beside an advancing front -- which is exactly the case the whole predicate exists to
+// keep. levelOfKey is what waterLevelAt is, so this asks the same question the simulation does.
+//
+// The bounds test is on y only. x and z have no bounds in this world, and worldGet answers air
+// for anything unloaded (world.h), so a ball that reaches into an unloaded column reads as no
+// water there -- which is right: nothing this simulation is tracking is in a column it has not
+// got. y is clamped because a key below 0 or above WORLD_HEIGHT is not a cell at all.
+bool waterReplaySkippable(const WaterSim* s, const World* w, int x, int y, int z)
+{
+	for (int dy = -WATER_REPLAY_RADIUS; dy <= WATER_REPLAY_RADIUS; dy++) {
+		const int cy = y + dy;
+		if (cy < 0 || cy >= WORLD_HEIGHT) continue;
+
+		const int rem_y = WATER_REPLAY_RADIUS - (dy < 0 ? -dy : dy);
+		for (int dx = -rem_y; dx <= rem_y; dx++) {
+			const int rem_x = rem_y - (dx < 0 ? -dx : dx);
+			for (int dz = -rem_x; dz <= rem_x; dz++) {
+				if (levelOfKey(s, w, x + dx, cy, z + dz) != 0) return false;
+			}
+		}
+	}
+	return true;
+}
+
 // What the water at (x, y, z) contributes to its four side neighbours, or 0 for "nothing".
 //
 // One rule does all the work, and it was arrived at by running the thing, not by reading it:
@@ -571,9 +599,24 @@ void waterFillScratch(const WaterSim* s, MeshScratch* ms, int cx, int cy, int cz
 // flow cells). Cost, measured: 25 worldGet calls per drained diff, 245000 for a 9800-diff rejoin,
 // spread over the 49 frames the columns install on. NOT measured on hardware.
 //
-// It is not done here because it is not this file's to do: the flag belongs beside the drain and
-// the skip belongs in main.c's onWorldEdit, and net/networld.c is owned elsewhere. Recorded, with
-// the numbers, so that whoever owns it does not have to re-derive them.
+// DONE, v1.8.19, in the three pieces this paragraph used to say it needed and no more. The
+// PREDICATE is waterReplaySkippable() in this file, above waterNotify, unit-tested by
+// world/water_test.c's testReplaySkippable. The FLAG is networldReplayingDiffs(), set around the
+// blockdiffDrain call in net/networld.c's networldOnColumnLoad. The COMPOSITION is one line in
+// source/main.c's onWorldEdit, pinned by reading main.c's own source text so it cannot quietly
+// become two statements -- which is what blanket suppression looks like once it is wearing these
+// two names.
+//
+// Measured 2026-09-05 by net/networld_test.c, which is now the only binary in the repository that
+// links this file and net/blockdiff.c together; that link line was widened for exactly this. The
+// fixture is the one described above, 49 columns x 200 diffs: 30126 ring evictions before the
+// filter and 0 after it, with the player's own source spreading to the same 112 flow cells / 113
+// blocks it does with no replay at all, and a source that arrives AS a replayed diff still
+// reaching those same 112 and 113 rather than the 1 that blanket suppression leaves it at. Three
+// red arms, each restored and md5-verified: the predicate forced false reproduces the defect (3
+// checks red), forced true reproduces blanket suppression (3 checks red, and a DIFFERENT 3), and
+// splitting main.c's condition into two statements reddens the source-text pin alone. STILL not
+// measured on hardware.
 void waterNotify(WaterSim* s, int x, int y, int z)
 {
 	if (s->dropping) return;   // see WaterSim.dropping in water.h

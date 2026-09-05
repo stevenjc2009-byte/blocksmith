@@ -3983,6 +3983,27 @@ static void onWorldEdit(void* ud, const World* w, int x, int y, int z, BlockId p
 	// live worker thread while world.c's statics are being written.
 	if (w != &s_world) return;
 
+	// v1.8.19. The second filter, and the one that keeps a rejoin from throwing away the
+	// player's own work.
+	//
+	// A rejoining client's columns are unloaded, so every stored diff for them is queued and
+	// then landed by net/networld.c's blockdiffDrain when the column installs — uncapped, one
+	// column's whole backlog inside one frame, every write arriving here because applyDrained
+	// writes the live world itself. Measured 2026-08-30 with main.c's frame order modelled
+	// exactly: 49 columns x 200 diffs is 9800 firings and 68600 pushes against a ring of 1024,
+	// which sits at its cap on 33 of 60 frames. A water source the PLAYER places on any of
+	// frames 0..46 is evicted before it is ever examined and settles to one wet cell instead of
+	// 113. 47 of 60 placements lost, 78.3%.
+	//
+	// Suppressing every notify during the drain fixes that completely and breaks the other end:
+	// water that arrives AS a diff spreads to 1 block instead of 117, which moves the bug from
+	// the local player onto the remote one. So the filter is narrow rather than blanket — skip
+	// only when there is no water within the radius a notify can reach. Both halves have to be
+	// true to skip, and the order matters for cost as well as for meaning:
+	// networldReplayingDiffs() is one bool read, so a live edit pays that and nothing else, and
+	// is never filtered.
+	if (networldReplayingDiffs() && waterReplaySkippable(&s_water, &s_world, x, y, z)) return;
+
 	waterNotify(&s_water, x, y, z);
 }
 

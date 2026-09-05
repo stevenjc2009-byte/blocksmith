@@ -926,7 +926,18 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g 	-I source 	source/net/blockdiff.c 	so
 # networldRegistryWaiting(). The scenario's own three control checks — the sidecar row landing,
 # genStart()'s freeze, and the FETCH going out — stay GREEN in that arm, which is what says the
 # five discriminate rather than the fixture merely collapsing.
-gcc -std=c11 -Wall -Wextra -Werror -O1 -g -DBS_CLIENT_HAS_METERS=1	-I source -I deps/blocksmith-server 	source/world/world.c 	source/world/block.c 	source/world/registry.c 	source/world/chunk.c 	source/world/budget.c 	source/net/blockdiff.c 	source/net/networld.c 	source/world/mesher.c 	source/world/visgraph.c 	source/world/scratch.c 	source/app/session.c 	source/net/networld_test.c 	-o "$BH/networld_test"
+#
+# v1.8.19 added source/world/water.c to this link, and it is the only suite in this script that
+# has both it and source/net/blockdiff.c. That was the problem: the diff-replay overflow this
+# suite now measures — a column's whole backlog landing in one uncapped drain and evicting the
+# player's own placement out of the water ring — lives exactly in the seam between the two, and
+# no binary existed that could see both ends of it. water_test.c links water.c without any of
+# net/, and blockdiff_test.c links blockdiff.c on its own, so each half stayed green while the
+# pair was broken. The real networldOnColumnLoad -> real blockdiffDrain -> real applyDrained ->
+# real worldSet -> real waterNotify chain runs here now, with only the world edit hook standing
+# in for main.c's — and that hook body is itself pinned against main.c by source text, so the
+# stand-in cannot drift away from the thing it stands in for.
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g -DBS_CLIENT_HAS_METERS=1	-I source -I deps/blocksmith-server 	source/world/world.c 	source/world/block.c 	source/world/registry.c 	source/world/chunk.c 	source/world/budget.c 	source/net/blockdiff.c 	source/net/networld.c 	source/world/mesher.c 	source/world/visgraph.c 	source/world/scratch.c 	source/world/water.c 	source/app/session.c 	source/net/networld_test.c 	-o "$BH/networld_test"
 
 "./$BH/networld_test"
 

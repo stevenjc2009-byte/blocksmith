@@ -1189,6 +1189,24 @@ static void applyDrained(void* userdata, int x, int y, int z, BlockId id)
 	notifyEdit(x, y, z);
 }
 
+// True only while blockdiffDrain() below is walking a column's backlog, so a world edit hook can
+// tell a REPLAYED write from a live one. See networldReplayingDiffs() in net/networld.h for what
+// this is for, and world/water.h's waterReplaySkippable() for who asks.
+//
+// Set around the drain and nowhere else, and that is a measured scope rather than a cautious one.
+// The rejoin cost this exists to cut is entirely the drain's: a rejoining client's columns are
+// unloaded, so applyOrQueue() sends their diffs to pendingRecord() and it is this call that later
+// lands all of them, uncapped, one column's whole backlog inside one frame. applyOrQueue()'s
+// other branch — a diff for a column that IS already loaded — writes through worldSet directly
+// and never comes here. That branch was NOT measured, so it is deliberately not covered: it is
+// rare at rejoin (it needs a diff for a column the client has already streamed in) and widening
+// an unmeasured path is how a fix for one thing becomes a regression in another.
+//
+// Not reentrant and does not need to be. blockdiffDrain() is a plain walk with no callback into
+// networld, applyDrained() calls only worldSet and notifyEdit, and networldOnColumnLoad() is
+// called from main.c's column install on the main thread. A bool, not a counter, for that reason.
+static bool s_replaying_diffs;
+
 void networldOnColumnLoad(World* w, int cx, int cz)
 {
 	if (!s_world || w != s_world) return;
@@ -1199,7 +1217,14 @@ void networldOnColumnLoad(World* w, int cx, int cz)
 	// hand the single-player boot back the exact cost being reclaimed, on the first column.
 	if (!s_pending) return;
 
+	s_replaying_diffs = true;
 	blockdiffDrain(s_pending, cx, cz, applyDrained, s_world);
+	s_replaying_diffs = false;
+}
+
+bool networldReplayingDiffs(void)
+{
+	return s_replaying_diffs;
 }
 
 bool networldSendBlockEdit(int x, int y, int z, uint8_t block)

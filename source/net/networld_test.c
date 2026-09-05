@@ -37,6 +37,7 @@
 #include "world/mesher.h"
 #include "world/registry.h"
 #include "world/scratch.h"
+#include "world/water.h"
 #include "world/world.h"
 
 #include <stdlib.h>
@@ -3813,6 +3814,274 @@ static void test_mesher_tables_after_register(void)
     free(out.indices);
 }
 
+/* ------------------------------------------- rejoin replay vs. the water simulation ------- */
+/* v1.8.19. The three scenarios below are the only place in the repository where net/blockdiff.c
+ * and world/water.c are linked into the same binary, which is what this file's link line in
+ * tools/run_host_tests.sh was widened for. Nothing else can reproduce the defect: the drain that
+ * causes it lives in networld.c and the ring it overruns lives in water.c, and until now no test
+ * could see both ends of that at once.
+ *
+ * What is being reproduced, in one sentence: a rejoining client's stored diffs all land inside
+ * the frame their column installs, every one of them fires world.c's edit hook, and the seven
+ * cells each firing offers to water.c's 1024-entry ring evict whatever the player put there
+ * first. Measured 2026-08-30 against a model of main.c's frame order: 47 of 60 player placements
+ * lost, 78.3%.
+ *
+ * The three arms are deliberately in tension, because the obvious fix passes one and fails
+ * another. Blanket suppression during the drain passes the first arm perfectly (0 evicted) and
+ * destroys the second (replayed water spreads to 1 block instead of 113). A per-column drain
+ * budget passes the second and fails the first. Only a filter that asks whether there is water
+ * nearby passes both, which is why the production code is one. */
+
+#define REPLAY_COL_X0    2     /* replay columns cx 2..8, cz 0..6: 7 x 7 = the measured 49 */
+#define REPLAY_COL_Z0    0
+#define REPLAY_COL_SPAN  7
+#define REPLAY_PER_COL   200   /* the measured per-column backlog */
+#define REPLAY_DIFFS     (REPLAY_COL_SPAN * REPLAY_COL_SPAN * REPLAY_PER_COL)   /* 9800 */
+
+static WaterSim    g_replay_sim;
+static const World *g_replay_world;
+
+/* The stand-in for source/main.c's onWorldEdit (main.c:3941), and it is a copy of it down to the
+ * order of the two guards. That copy is not taken on trust:
+ * test_mainc_edit_hook_filters_only_replayed_writes() below reads main.c's own source text and
+ * fails if the composition here stops matching the game's. Without that pin this hook would be
+ * hand-written logic proving itself, which is the defect water_test.c's wiredEditHook header
+ * describes at length. */
+static void replayEditHook(void *ud, const World *w, int x, int y, int z, BlockId prev, BlockId now)
+{
+    (void)ud; (void)prev; (void)now;
+    if (w != g_replay_world) return;
+    if (networldReplayingDiffs() && waterReplaySkippable(&g_replay_sim, w, x, y, z)) return;
+    waterNotify(&g_replay_sim, x, y, z);
+}
+
+/* water_test.c's buildFloor, in this file's idiom: a 27x27 stone slab at y 60..63 centred on the
+ * origin, air above it. Deliberately the same fixture, so the outcome numbers below (113 blocks,
+ * 112 flow cells) are the same literals testFlatPour() pins, and a disagreement between the two
+ * files is a real disagreement and not two different experiments. */
+static void replayBuildFloor(World *w)
+{
+    for (int y = 60; y <= 63; y++)
+        for (int z = -13; z <= 13; z++)
+            for (int x = -13; x <= 13; x++)
+                (void)worldSet(w, x, y, z, BLOCK_STONE);
+}
+
+/* Wide enough for both pours: arm one's is at the origin and reaches x,z -7..7, arm two's is at
+ * (8,64,8) inside column (0,0) and reaches 1..15. A box that clipped either would report a low
+ * count as a pass-shaped number, so it covers both with room to spare. */
+static int replayCountWater(const World *w)
+{
+    int n = 0;
+    for (int y = 60; y <= 70; y++)
+        for (int z = -13; z <= 17; z++)
+            for (int x = -13; x <= 17; x++)
+                if (worldGet(w, x, y, z) == BLOCK_WATER) n++;
+    return n;
+}
+
+/* Arms the hook, lays the floor, then settles so the ring is empty. Every fixture cell fires the
+ * hook exactly as it does on the console, so the slab alone offers 2916 candidates to a ring of
+ * 1024 -- that saturation is the fixture's, not the burst's, and it has to be drained away
+ * before the burst starts or the measurement below is of the wrong thing. */
+static void replayArmAndFloor(World *w)
+{
+    worldInit(w);
+    networldInit();
+    networldSetWorld(w);
+
+    waterInit(&g_replay_sim);
+    g_replay_world = w;
+    worldSetEditHook(replayEditHook, NULL);
+
+    replayBuildFloor(w);
+    (void)waterSettle(&g_replay_sim, w, 20000, NULL, NULL);
+}
+
+/* world.c's s_edit_fn is a file static that outlives every World (world.c:217), so a hook left
+ * armed here fires during the NEXT scenario's fixture, against a sim that scenario never meant to
+ * disturb. Every arm below ends with this. */
+static void replayDisarm(World *w)
+{
+    worldSetEditHook(NULL, NULL);
+    g_replay_world = NULL;
+    worldExit(w);
+    networldInit();
+}
+
+static void test_a_rejoin_replay_keeps_the_players_own_water(void)
+{
+    puts("a rejoin's diff replay no longer evicts the water the player placed himself");
+
+    World w;
+    replayArmAndFloor(&w);
+    check(waterPending(&g_replay_sim) == 0 && waterFlowCells(&g_replay_sim) == 0,
+          "fixture: the floor is down and the ring is drained, so nothing below is the floor's");
+
+    /* 49 unloaded columns, 200 diffs each. Every one of them is queued rather than applied --
+     * networld.c refuses to create a phantom column -- which is precisely the rejoin case. */
+    for (int cz = REPLAY_COL_Z0; cz < REPLAY_COL_Z0 + REPLAY_COL_SPAN; cz++)
+        for (int cx = REPLAY_COL_X0; cx < REPLAY_COL_X0 + REPLAY_COL_SPAN; cx++)
+            for (int i = 0; i < REPLAY_PER_COL; i++) {
+                uint8_t msg[BS_BLOCK_EDIT_BYTES];
+                buildBlockEdit(msg, cx * 16 + (i % 16), 64, cz * 16 + (i / 16), BLOCK_STONE);
+                networldApplyPayload(msg, sizeof msg);
+            }
+    check(networldPendingCount() == REPLAY_DIFFS, "all 9800 stored diffs are queued, not applied");
+    check(worldGet(&w, REPLAY_COL_X0 * 16, 64, REPLAY_COL_Z0 * 16) == BLOCK_AIR,
+          "control: none of them has reached the world yet");
+
+    /* The player builds while his columns are still streaming in. This is a LIVE edit, so the
+     * flag is false and it is never filtered. */
+    check(worldSet(&w, 0, 64, 0, BLOCK_WATER), "the player places a water source at (0,64,0)");
+    check(waterPending(&g_replay_sim) == 7,
+          "the edit hook queued his source and its six neighbours, exactly as testFlatPour pins");
+
+    const uint32_t lost_before = waterQueueFull(&g_replay_sim);
+
+    /* The install burst. worldColumnCreate is the streamer's path (it does not go through
+     * worldSet and so fires no hook of its own); networldOnColumnLoad is what main.c calls
+     * immediately after it, at main.c:1940. */
+    for (int cz = REPLAY_COL_Z0; cz < REPLAY_COL_Z0 + REPLAY_COL_SPAN; cz++)
+        for (int cx = REPLAY_COL_X0; cx < REPLAY_COL_X0 + REPLAY_COL_SPAN; cx++) {
+            worldColumnCreate(&w, cx, cz);
+            networldOnColumnLoad(&w, cx, cz);
+        }
+
+    const uint32_t lost = waterQueueFull(&g_replay_sim) - lost_before;
+    printf("         replay of %d diffs: %u ring evictions, %d pending of %d\n",
+           REPLAY_DIFFS, lost, waterPending(&g_replay_sim), (int)WATERQ_CAP);
+
+    check(networldPendingCount() == 0, "the burst drained every one of them");
+    check(worldGet(&w, REPLAY_COL_X0 * 16, 64, REPLAY_COL_Z0 * 16) == BLOCK_STONE,
+          "control: the replayed diffs really did land, so the run had work to filter");
+
+    /* The measurement, stated as the thing that actually goes wrong. Before the filter this was
+     * 68600 pushes against a ring of 1024 and the player's seven were the oldest entries in it. */
+    check(lost == 0, "the replay evicted nothing from the water ring");
+
+    (void)waterSettle(&g_replay_sim, &w, 20000, NULL, NULL);
+    check(waterFlowCells(&g_replay_sim) == 112,
+          "his source still spreads to 112 flow cells, not the 0 an eviction leaves");
+    check(replayCountWater(&w) == 113, "113 water blocks in the world: the source and its 112");
+
+    replayDisarm(&w);
+}
+
+static void test_a_replayed_water_diff_still_spreads(void)
+{
+    puts("water that arrives AS a replayed diff still spreads -- the filter is not a blanket");
+
+    /* This arm is the one blanket suppression fails, and it fails it silently: suppressing every
+     * notify during the drain leaves a remote player's pour as a single wet cell with no flow at
+     * all, in a build where the first arm above reports a perfect 0 evicted. Measured 2026-08-30:
+     * 117 blocks and 608 flow cells with the notify, 1 block and 0 flow without it. */
+
+    World w;
+    worldInit(&w);
+    networldInit();
+    networldSetWorld(&w);
+    waterInit(&g_replay_sim);
+    g_replay_world = &w;
+    worldSetEditHook(replayEditHook, NULL);
+
+    /* Queued FIRST, while column (0,0) does not exist yet -- that is what makes it a replay
+     * rather than a live remote edit. Everything about this column is then installed the way the
+     * streamer installs one, and NOT with worldSet: world.c:245-250 auto-drains the pending store
+     * the moment a worldSet creates a column, so a floor laid with worldSet would land this diff
+     * part-way through its own fixture and then let the remaining 2900-odd fixture cells evict the
+     * notify it queued. That cost a red arm on 2026-09-05 which read as the production filter
+     * suppressing a replayed pour; it was the fixture draining itself early. The bulk path fires
+     * no edit hook at all (world.h:101-104) and does not drain, so the drain below is the only
+     * one in this scenario -- which is also exactly main.c's order at main.c:1890-1940. */
+    uint8_t msg[BS_BLOCK_EDIT_BYTES];
+    buildBlockEdit(msg, 8, 64, 8, BLOCK_WATER);
+    networldApplyPayload(msg, sizeof msg);
+    check(networldPendingCount() == 1, "the remote pour is queued against an unloaded column");
+    check(worldGet(&w, 8, 64, 8) == BLOCK_AIR, "control: it has not been applied yet");
+
+    /* Chunk (0,3,0) is world y 48..63; stone in its top four layers is the same y 60..63 slab
+     * arm one pours onto. The pour is at (8,64,8), so its radius of 7 stays inside x,z 1..15 and
+     * never needs a neighbouring column. */
+    {
+        static BlockId in[CHUNK_BLOCKS];
+        for (int i = 0; i < CHUNK_BLOCKS; i++) in[i] = BLOCK_AIR;
+        for (int y = 12; y < 16; y++)
+            for (int z = 0; z < 16; z++)
+                for (int x = 0; x < 16; x++)
+                    in[chunkIndex(x, y, z)] = BLOCK_STONE;
+        check(worldSetChunkAll(&w, 0, 3, 0, in), "the streamer installs the column's floor chunk");
+    }
+    check(networldPendingCount() == 1 && waterPending(&g_replay_sim) == 0,
+          "fixture: the bulk install fired no edit hook and drained nothing");
+
+    networldOnColumnLoad(&w, 0, 0);
+
+    check(worldGet(&w, 8, 64, 8) == BLOCK_WATER, "the replayed source landed in the world");
+    check(waterPending(&g_replay_sim) == 7,
+          "and was NOT filtered: it queued its own seven cells, because it is itself the water");
+
+    (void)waterSettle(&g_replay_sim, &w, 20000, NULL, NULL);
+    check(waterFlowCells(&g_replay_sim) == 112, "it spreads to the same 112 flow cells");
+    check(replayCountWater(&w) == 113, "and the same 113 water blocks");
+
+    replayDisarm(&w);
+}
+
+static void test_mainc_edit_hook_filters_only_replayed_writes(void)
+{
+    puts("source/main.c's onWorldEdit composes the two guards the hook above copies");
+
+    /* The behavioural arms above run replayEditHook, not main.c's onWorldEdit -- main.c is the
+     * console binary and has no host build. So they prove the FILTER works and prove nothing
+     * about whether the game installs it. This is the half that does, using app/session_test.c's
+     * technique of reading main.c's own source text. Run from the repository root. */
+    char *src = readWholeSourceFile("source/main.c");
+    check(src != NULL, "source/main.c could be read");
+    if (src == NULL) {
+        printf("  (source/main.c could not be read from this working directory)\n");
+        return;
+    }
+
+    check(strstr(src, "#include \"world/water.h\"") != NULL,
+          "control: main.c owns the water simulation at all");
+
+    const char *fn = strstr(src, "static void onWorldEdit(");
+    check(fn != NULL, "main.c still has the world edit hook this test is about");
+    if (fn != NULL) {
+        /* Body only. The function's statements are tab-indented, so the first line-initial
+         * closing brace after the signature is its own. */
+        const char *end = strstr(fn, "\n}");
+        check(end != NULL, "the hook's body is delimited");
+        if (end != NULL) {
+            const size_t body_len = (size_t)(end - fn);
+            char *body = (char *)malloc(body_len + 1);
+            check(body != NULL, "the body could be copied out for searching");
+            if (body != NULL) {
+                memcpy(body, fn, body_len);
+                body[body_len] = '\0';
+
+                check(strstr(body, "waterNotify(&s_water, x, y, z);") != NULL,
+                      "control: the live path still reaches waterNotify at all");
+                check(strstr(body, "if (w != &s_world) return;") != NULL,
+                      "control: the staging-world guard is still the first filter");
+
+                /* One condition, not two statements. Two separate early returns would be a
+                 * blanket suppression wearing the same identifiers, and would pass a pair of
+                 * strstr checks that only asked whether both names appeared. */
+                check(strstr(body,
+                             "if (networldReplayingDiffs() && waterReplaySkippable("
+                             "&s_water, &s_world, x, y, z)) return;") != NULL,
+                      "the replay filter is the two guards ANDed, applied to the edited cell");
+
+                free(body);
+            }
+        }
+    }
+    free(src);
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -3891,6 +4160,10 @@ int main(void)
     test_registry_agreement_and_silence_are_never_refused();
     test_mesher_tables_after_register();
 
+    test_a_rejoin_replay_keeps_the_players_own_water();
+    test_a_replayed_water_diff_still_spreads();
+    test_mainc_edit_hook_filters_only_replayed_writes();
+
     /* ---- check-count guard -----------------------------------------------------------------
      * This suite counts failures, and until 2026-08-25 that was ALL it counted. A suite that
      * only counts failures cannot notice checks that never ran. Any sabotage which shortens a
@@ -3946,8 +4219,21 @@ int main(void)
      * CAVES and ORES each resolve to themselves, and one that ORES is still
      * GEN_VERSION_NEWEST, so the ORES check is known to be sitting at the top of the range
      * rather than somewhere in the middle of it. Nothing removed. */
-    check(g_checks == 444,
-          "check-count guard: every check in this suite actually ran (444 before this line)");
+    /* 444 -> 470, same rule. The three rejoin-replay arms add 26:
+     * test_a_rejoin_replay_keeps_the_players_own_water adds 10 (the drained fixture, the 9800
+     * queued, the control that none had landed, the player's placement, its seven queued cells,
+     * the drain emptying the store, the control that the diffs really landed, the eviction count
+     * itself, and the two outcome numbers 112 and 113);
+     * test_a_replayed_water_diff_still_spreads adds 8 (queued not applied, the control that it
+     * had not landed, the streamer's bulk floor install, the control that that install neither
+     * fired a hook nor drained, the landed source, its seven queued cells, and the same two
+     * outcome numbers); and test_mainc_edit_hook_filters_only_replayed_writes adds 8 (main.c
+     * readable, the water.h include as a control, onWorldEdit found, its body delimited, the body
+     * copied out, the two controls that the live path and the staging-world guard are still
+     * there, and the one that is the point of the file: the two guards ANDed into one condition).
+     * Nothing removed. */
+    check(g_checks == 470,
+          "check-count guard: every check in this suite actually ran (470 before this line)");
 
     printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;

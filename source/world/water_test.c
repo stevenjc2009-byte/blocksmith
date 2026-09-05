@@ -1912,6 +1912,63 @@ static void testJoinedClientConvergesOnFlood(void)
 	      "control: no flow cell was refused a map slot, so neither arm was silently truncated");
 }
 
+// v1.8.19. waterReplaySkippable's own rule, on its own, away from the thing it is for.
+//
+// The predicate is CONSUMED by source/main.c's onWorldEdit and reproduced end-to-end in
+// net/networld_test.c's three rejoin-replay arms, which are the only place blockdiff.c and this
+// file are linked into one binary. Those arms prove the OUTCOME -- the player's pour survives a
+// 9800-diff replay, and a replayed pour still spreads. They do not pin the rule: both of them
+// stay green against a radius of 4, or 12, or a predicate that happens to answer correctly for
+// the two distances they exercise. This probe is the rule itself, so that the radius cannot drift
+// without something going red, and so that the "levelOfKey and not worldGet" decision in water.c
+// has a test that names it.
+static void testReplaySkippable(void)
+{
+	puts("water: the replay filter skips only cells with no water inside a Manhattan ball of 2");
+
+	// Arm 1: the geometry, against a single hand-placed source and an otherwise empty world.
+	// The hook stays NULL here on purpose -- this arm asks what the predicate answers, not what
+	// the simulation does with the answer, and a live hook would queue candidates nothing in
+	// this arm ever drains.
+	resetWorld();
+
+	CHECK(waterReplaySkippable(&g_sim, &g_world, 0, 64, 0),
+	      "control: in a world with no water at all, every cell is skippable");
+
+	CHECK(worldSet(&g_world, 0, 64, 0, BLOCK_WATER), "one source block is placed at (0,64,0)");
+
+	CHECK(!waterReplaySkippable(&g_sim, &g_world, 0, 64, 0),
+	      "the source's own cell is never skippable");
+	CHECK(!waterReplaySkippable(&g_sim, &g_world, 1, 64, 0), "nor is a neighbour at distance 1");
+	CHECK(!waterReplaySkippable(&g_sim, &g_world, 2, 64, 0), "nor one at distance 2 along x");
+	CHECK(!waterReplaySkippable(&g_sim, &g_world, 1, 65, 0),
+	      "nor one at distance 2 reached diagonally, so the ball is Manhattan and not a box");
+	CHECK(!waterReplaySkippable(&g_sim, &g_world, 0, 66, 0), "nor one at distance 2 straight up");
+
+	CHECK(waterReplaySkippable(&g_sim, &g_world, 3, 64, 0), "distance 3 along x is skippable");
+	CHECK(waterReplaySkippable(&g_sim, &g_world, 2, 65, 0), "so is distance 3 reached diagonally");
+	CHECK(waterReplaySkippable(&g_sim, &g_world, 0, 67, 0), "so is distance 3 straight up");
+	CHECK(waterReplaySkippable(&g_sim, &g_world, 50, 64, 50),
+	      "and so is a cell in a column that was never loaded, which reads as air");
+
+	// Arm 2: against real simulated water rather than a hand-placed block, because the cells the
+	// filter has to protect are flow cells the simulation owns and not sources the player set.
+	resetWorldWired();
+	buildFloor();
+	wiredBuildDone("floor", 8156, 1024);
+
+	CHECK(worldSet(&g_world, 0, 64, 0, BLOCK_WATER), "the pour's source is placed");
+	(void)waterSettle(&g_sim, &g_world, 2000, NULL, NULL);
+	CHECK(waterFlowCells(&g_sim) == 112,
+	      "control: the pour really is there -- 112 flow cells out to radius 7, as testFlatPour pins");
+
+	// The flood's edge on the +x axis is (7,64,0).
+	CHECK(!waterReplaySkippable(&g_sim, &g_world, 9, 64, 0),
+	      "a cell two from the flood's edge is not skippable: a notify there could still matter");
+	CHECK(waterReplaySkippable(&g_sim, &g_world, 10, 64, 0),
+	      "a cell three from it is, which is what makes a 9800-diff replay nearly free");
+}
+
 int main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
@@ -1941,6 +1998,7 @@ int main(void)
 	testPadAndShaft();
 	testTickCost();
 	testJoinedClientConvergesOnFlood();
+	testReplaySkippable();
 
 	worldExit(&g_world);
 
@@ -1981,8 +2039,13 @@ int main(void)
 	// the file computes would move with the file, which is the whole failure mode it exists to
 	// catch. When a check is legitimately added or removed, this number is edited by hand, on
 	// purpose, in the same commit — that edit IS the review.
+	// v1.8.19: 224 -> 242. All eighteen are testReplaySkippable, new at the end: eleven in its
+	// geometry arm (the dry-world control, the source placement, and the nine distances either
+	// side of the radius) and seven in its simulated-water arm (wiredBuildDone's three-check
+	// burst pin, the pour's source, the 112-flow-cell control, and the two distances measured
+	// from the flood's edge).
 	const int counted = g_checks;
-	CHECK(counted == 224, "the suite ran all 224 of its checks: none was deleted or skipped");
+	CHECK(counted == 242, "the suite ran all 242 of its checks: none was deleted or skipped");
 
 	printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);
 	if (g_fails) printf("FAILED - %d of %d checks\n", g_fails, g_checks);

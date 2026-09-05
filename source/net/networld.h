@@ -437,6 +437,23 @@ bool networldGenWaiting(void);
 int networldPendingCount(void);
 int networldPendingRefusals(void);
 
+// True only while a column's queued diffs are being replayed into the world — that is, only
+// inside networldOnColumnLoad()'s blockdiffDrain(), for the duration of the writes it makes.
+// False everywhere else, including during a live remote edit, during the bulk world sync, and
+// at every instant no column is installing.
+//
+// What false does NOT mean: it does not mean the write is the local player's. A remote player's
+// live edit arrives with this false, because it is not a replay — it is one write, in the frame
+// it happened, and it costs the simulation nothing to hear about.
+//
+// It exists for exactly one caller. main.c's world edit hook uses it to decide whether a write
+// may be run past world/water.h's waterReplaySkippable() before it notifies the water
+// simulation. A replay lands a whole column's backlog in one uncapped burst — 9800 diffs
+// measured — which is enough to evict the player's own placement out of the water queue before
+// it is ever examined; 47 of 60 lost, measured 2026-08-30. A live edit is one write and is never
+// filtered. See water.h for the full measurement and for why blanket suppression is wrong.
+bool networldReplayingDiffs(void);
+
 // Lifetime traffic counters, since the last networldInit(). These exist because the failure
 // they were added to diagnose is completely silent: a client can be Connected, dig a hole, and
 // have the edit never reach anyone, with nothing on screen different from the working case.

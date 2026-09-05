@@ -276,6 +276,39 @@ int waterSettle(WaterSim* s, World* w, int max_ticks, WaterChangeFn on_change, v
 // Level at a cell: 0 for no water, 1..7 for a flow cell, WATER_LEVEL_SOURCE for a source.
 uint8_t waterLevelAt(const WaterSim* s, const World* w, int x, int y, int z);
 
+// Radius, in cells, of the ball waterReplaySkippable() below searches. 2, and it is not a
+// tunable: it is exactly how far one waterNotify can reach. waterNotify pushes the written
+// cell and its six neighbours, and examining any one of those reads ITS own neighbours, so
+// nothing more than two cells away can be affected by the notify being made or skipped.
+// Raising it costs cells and buys nothing; lowering it starts dropping notifies that matter.
+#define WATER_REPLAY_RADIUS 2
+
+// True when a write at (x, y, z) that arrived as a REPLAYED SERVER DIFF can have its
+// waterNotify skipped without changing what the simulation ends up doing.
+//
+// Read the name literally: "skippable" is a claim about a replay, not about writes in general.
+// The caller must already know it is inside a diff replay -- net/networld.h's
+// networldReplayingDiffs() is how main.c knows -- because for a live edit the answer is always
+// no. Nothing in here checks that, and it cannot: this file has no idea where a write came from.
+//
+// The rule is one line: skip when there is no water within Manhattan distance
+// WATER_REPLAY_RADIUS of the cell. That is the whole influence radius of a notify, so a skipped
+// notify provably had nothing to tell the simulation.
+//
+// WHY this exists, and why it is not simply "skip every notify during a replay". Both were
+// measured on 2026-08-30 and the numbers are in water.c beside waterNotify. In short: a rejoin
+// drains a column's entire diff backlog inside one frame, uncapped, and 9800 diffs become 68600
+// pushes against a ring of WATERQ_CAP. The ring sits at its cap for 33 of 60 frames and the
+// player's OWN water placement is evicted before it is ever examined -- 47 of 60 placements
+// lost, 78.3%. Blanket suppression fixes that completely and then breaks the other end: water
+// that arrives AS a diff spreads to 1 block instead of 117, moving the bug from the local player
+// onto the remote one. This predicate was the only arm that measured clean on both.
+//
+// Cost: the Manhattan ball of radius 2 in three dimensions is 25 cells, so 25 waterLevelAt
+// calls per drained diff, 245,000 for a 9800-diff rejoin, spread over the frames those columns
+// install on. Paid ONLY on the replay path -- a live edit never reaches here.
+bool waterReplaySkippable(const WaterSim* s, const World* w, int x, int y, int z);
+
 // v1.8.0 task 22b. Copies the flow levels covering chunk (cx, cy, cz) and its one-block skirt
 // into `ms`'s water band, and sets ms->water_any when it wrote anything. Call it straight after
 // scratchFill, which clears the flag.
