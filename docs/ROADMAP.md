@@ -21,10 +21,24 @@ Two rules run through the whole ladder:
 > its next concrete step in **[PAUSED-WORK.md](PAUSED-WORK.md)**. Read that file first
 > when work resumes after the quota reset; it exists so nothing has to be re-derived.
 >
-> Also recorded there: three measured documentation defects not yet corrected (including
-> one in this file's own v1.8.18 entry, which still claims cave-gated monster spawning
-> that no code implements), and the atlas-slot ceiling — only slots 57–62 remain, while
-> the redstone and dimensions plans together ask for fifteen.
+> **[2026-09-05] The three measured documentation defects recorded there are now fixed.**
+> The v1.8.18 entry below no longer claims cave-gated monster spawning — `monsterSpawnTick()`
+> gates on darkness alone and caves qualify because they are dark. `docs/VERSION-LIST.md`'s
+> v1.7.1 entry now says plainly that region compaction was claimed there but not wired until
+> v1.8.2. And the radix-sort figure that read "29× / 0.0089 ms" in both `VERSION-LIST.md` and
+> `source/scene/chunk_render.c` was settled by re-running the benchmark rather than by picking
+> a number: it is 50.9× / 0.0051 ms, and `tools/sortbench.c` now exists so it cannot rot again.
+>
+> **Still open, and still steve's call: the atlas-slot ceiling.** Only slots 57–62 remain (six),
+> while the redstone and dimensions plans together ask for fifteen. Enlarging the sheet was
+> costed on 2026-09-05 and is **not** the cheap escape it looks like: `ATLAS_H_PX` is already
+> 1024, which `source/world/atlas_uv.h:15-21` documents as the PICA200's hard per-dimension
+> maximum, and the width is pinned to one tile because the greedy mesher relies on `GPU_REPEAT`
+> having a period of exactly one tile. The two real options are a second atlas bound to the one
+> free texture unit (+32 KiB VRAM, mesher and shader surgery, spends the last unit), or halving
+> `TILE_PX` to 8 (free, but every one of the 57 existing tiles must be redrawn at half
+> resolution and may read as mush at 400×240). Nothing should spend those six slots until this
+> is decided.
 
 ---
 
@@ -46,7 +60,7 @@ so a New 3DS got exactly what an Old 3DS got. The two questions are now separate
 
 ---
 
-## v1.8.5 — Render distance
+## v1.8.5 — Render distance ✅ released
 
 **This is the version that answers "how far can I see".**
 
@@ -114,7 +128,7 @@ shipping build by exactly nothing. **The 1.02 MB above is the whole of the real 
 
 ---
 
-## v1.8.6 — Speed
+## v1.8.6 — Speed ✅ released
 
 **Rewritten 2026-09-01, from measurement.** This entry used to list eight optimisations.
 Five of them were wrong, and they were wrong in a way that would have spent the whole
@@ -216,7 +230,7 @@ independently of anything else in this version.
 
 ---
 
-## v1.8.7 — Terrain
+## v1.8.7 — Terrain ✅ released
 
 **Corrected 2026-09-01. This entry used to say "the version that adds the Beta 1.7.3
 world". That was wrong, and it was wrong against code that had already shipped.**
@@ -281,7 +295,7 @@ Full research, with sources and file:line evidence: `docs/research/terrain-beta-
 
 ---
 
-## v1.8.8 — Biome identity
+## v1.8.8 — Biome identity ✅ released
 
 **Changed — colour comes from tint, not from blocks.** This is Minecraft's own
 approach and it is the right one here: there is no separate block for desert dirt or
@@ -319,7 +333,7 @@ everything below this line needs it.
 
 ---
 
-## v1.8.9 — Sky and weather
+## v1.8.9 — Sky and weather ✅ released
 
 **Changed.** The day/night cycle and the sun's movement, matched to Minecraft's
 timings and light curve.
@@ -335,7 +349,7 @@ of snow.
 
 ---
 
-## v1.8.10 — Light
+## v1.8.10 — Light ✅ released
 
 **Added.** Torches, with smooth lighting — gradients across a face, not a flat value
 per block.
@@ -351,7 +365,7 @@ at all it may be a New 3DS option only.
 
 ---
 
-## v1.8.11 — Caves
+## v1.8.11 — Caves ✅ released
 
 **Added.** Cave generation in the legacy console-edition style — long connected
 tunnels and open ravines, not pockets. The carver walks a damped random path with a
@@ -362,7 +376,7 @@ actually goes somewhere.
 
 ---
 
-## v1.8.12 — Ores
+## v1.8.12 — Ores ✅ released
 
 **Added.** Ore generation on the legacy distribution — coal high and common, iron
 below it, gold, redstone, lapis and diamond in the deep, each in veins rather than
@@ -372,20 +386,20 @@ singles.
 
 ---
 
-## v1.8.13 — Survival
+## v1.8.13 — Survival ✅ released
 
 **Added.** Health, hunger, fall damage, eating, death and respawn.
 
 ---
 
-## v1.8.14 — Animals
+## v1.8.14 — Animals ✅ released
 
 **Added.** The entity system, and the first animals on it: pigs, cows, chickens,
 sheep. They wander, they can be killed, and they drop meat.
 
 ---
 
-## v1.8.15 — Furnace
+## v1.8.15 — Furnace ✅ released
 
 **Added.** A furnace block with fuel and a smelting timer. Raw meat becomes cooked
 meat.
@@ -418,7 +432,7 @@ v1.8.18 below.
 
 ---
 
-## v1.8.17 — New 3DS, in earnest
+## v1.8.17 — New 3DS, in earnest ✅ released
 
 **In flight, not committed as written.** This is being built right now, across parallel
 work, so treat everything below as scope rather than fact — no part of it is verified, and
@@ -445,10 +459,13 @@ per-biome materials list v1.8.8 otherwise completed.
 
 ---
 
-## v1.8.18 — Monsters
+## v1.8.18 — Monsters ✅ released
 
-**Added.** Zombies and skeletons, spawning in the dark and in caves, on the light and
-space rules that make a torch worth placing.
+**Added.** Zombies and skeletons, spawning in the dark, on the light and space rules that
+make a torch worth placing. Caves are not a spawn condition in their own right —
+`monsterSpawnTick()` in `source/entity/monster.c` gates only on darkness (both the sky and
+block light channels reading zero) and never calls `worldgenIsCave()`. Caves fill with
+monsters because caves are dark, which is the same rule working, not a second one.
 
 ---
 

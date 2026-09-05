@@ -93,10 +93,46 @@ dump of it to `sdmc:/blocksmith/cmdhang.bin`, with an offline decoder at
 
 ## 3. Multiplayer sync audit
 
-**Status: paused mid-flight.** The lane was writing a hand-off hunk for `source/main.c`
-when it was stopped, and never delivered it. Nothing was applied to the tree, so there is
-no half-landed change to clean up. Resume by re-running the audit; its findings were not
-captured anywhere and are lost. Low risk, moderate cost to redo.
+**Status: DONE 2026-09-05.** The audit was re-run and its findings are recorded here so they
+cannot be lost a second time. Nothing was applied to the tree — this entry is the deliverable.
+
+The protocol in `deps/blocksmith-server/proto/bs_proto.h` carries block edits, player pose,
+world sync and seed, per-column diff streaming, inventory, player state (health, hunger,
+armour, XP) and the block registry. The client implements **all nine inbound types and every
+outbound one** — nothing in the wire format is unimplemented client-side. The gaps are all
+state that the protocol has no message for at all.
+
+Unsynced, worst first:
+
+1. **Mobs — the worst by a distance.** No message type carries entities. `monsterSpawnTick()`
+   (`source/entity/monster.c:379`) rolls spawns from `(tick, player_x, player_y)` locally, so
+   two players standing together see different monsters, or one sees none. Killing one does
+   nothing to the other player's copy. Fixing it needs a server-authoritative entity system —
+   `deps/blocksmith-server/game/bsgame.c` has no entity simulation at all today, so this is a
+   new server subsystem, not a new opcode. Largest of the three by far.
+2. **Time of day.** Two independent local clocks. One player sees noon while the other sees
+   dusk. **The fix is already specified**: `source/world/daynight.h:338-365` names the exact
+   missing opcode — `BS_APP_TIME_SYNC` (0x10), an 8-byte tick counter, S→C only, sent at join
+   and about once a second — and `dayNightSet()` already exists as the client entry point, so
+   the client change is one decoder case. The server must own and broadcast an authoritative
+   tick. Additive and S→C only, so an old client simply ignores it.
+3. **Weather.** Rides on time-of-day for free: `source/world/weather.h:31-47` says `weatherAt`
+   is already a pure function of `(seed, tick, x, z)`, so once the tick is shared there is no
+   separate payload to send. Today it drifts — snow piling on a hillside the other player sees
+   bare. **No extra server work beyond item 2.**
+4. **Furnace state.** A remotely-placed furnace's block syncs but its blockstate record (fuel,
+   progress, lit) is never created, so the other player cannot use it. Already reproduced by a
+   host test whose own comment calls it "THE DEFECT" (`source/net/networld_test.c:1717-1794`).
+   **This one is a client-only bug fix** in `net/networld.c`'s block-edit apply path — no new
+   message, no protocol change, no coordinated release.
+5. Water flow — self-correcting, since the block edits that cause it do sync. Low priority.
+6. Break-progress crack overlay — cosmetic, and arguably should not sync.
+
+Lighting is not a gap: it is recomputed client-side from already-synced block data. Item drops
+are not a gap either — no ground-item entity exists, pickups go straight to the inventory.
+
+**Recommended order when this is picked up: 4 (client-only bug), then 2+3 (one server change
+buys both), then 1 (its own project).**
 
 ---
 
@@ -142,7 +178,33 @@ Note also that coal ore is **not** useless today — `RECIPE_COAL_ORE_TO_TORCH` 
 
 ## 6. Documentation corrections found but not yet applied
 
-Three real defects were measured by the version-list audit and are not yet fixed:
+**Status: ALL THREE FIXED 2026-09-05.** Kept below with what each turned out to be, because
+two of them were worse or differently shaped than this entry recorded, and the third could not
+be settled by reading at all.
+
+**1 — fixed.** The v1.7.1 paragraph now says a fifth item, region compaction, was claimed there
+when the entry was written but was not wired until v1.8.2, and is credited to that release.
+
+**2 — fixed, and it was worse than recorded here.** The contradiction was not only between the
+doc and the source: `source/scene/chunk_render.c`'s own prose disagreed with its own measurement
+table four lines above it, and `VERSION-LIST.md` printed 0.0089 in one sentence and 0.0051 two
+lines later. **It could not be resolved by reading, because both numbers were plausible and the
+harness that produced either had been thrown away.** So it was re-measured: both sorts lifted
+out again (the insertion sort recovered from commit `f8c4dc22`, which removed it) into a new
+`tools/sortbench.c`, gcc -O2, three runs. The worst-case new arm measured 0.0062 / 0.0065 /
+0.0061 ms against an old arm of 0.2825 / 0.2756 / 0.2781 — nowhere near 0.0089. The table was
+right, the prose was wrong, and both copies now read 0.0051 ms / 50.9×. `tools/sortbench.c` is
+left in the tree so this figure cannot be lost a third time.
+
+**3 — fixed.** The ROADMAP v1.8.18 entry now says spawning gates on darkness alone and explains
+that caves fill with monsters because caves are dark, not because a cave test exists.
+
+The `.text +792 bytes` sub-claim noted below remains unverified — it needs an ARM build with
+`arm-none-eabi-size` run against both arms, which was not done.
+
+---
+
+The original record of the three, as found:
 
 1. **`docs/VERSION-LIST.md`, v1.7.1 section (~lines 231-233)** — the "Changed" paragraph
    says region compaction was "one of the four" measured performance fixes and was later
@@ -196,3 +258,37 @@ Together the redstone and dimensions plans alone ask for **15 tiles against a ce
 6**. This is a real conflict between committed plans and it will have to be resolved by a
 decision — either a larger atlas, a second sheet, or cutting scope. **That decision is
 steve's and has not been made.** Nothing should spend those slots until it is.
+
+**[2026-09-05] The three options are now costed, so the decision can be made on numbers.**
+The first thing to say is that "just make the sheet bigger" is **not available**:
+
+- The atlas is a **16 × 1024** one-tile-wide strip, RGBA5551, 32,768 bytes of VRAM, 64 slots
+  (`source/world/atlas_uv.h:48-50`, `tools/make_atlas.py:113-120`).
+- **`ATLAS_H_PX` is already 1024, which `atlas_uv.h:15-21` documents as the PICA200's hard
+  per-dimension maximum** (citro3d's `checkTexSize`: each dimension 8..1024 and a power of
+  two). The dimension that determines slot count is at the ceiling and cannot go up.
+- The width *could* grow, but it is load-bearing, not spare. It is exactly one tile so that
+  `GPU_REPEAT` in U has a period of exactly one tile, which is what lets the greedy mesher
+  merge N co-planar faces into a single quad and still have the tile repeat across it
+  (`atlas_uv.h:23-31`). Widening to two or more columns makes a merged quad sample into the
+  neighbouring column instead of repeating — every merged face past column 1 corrupts. That
+  is a mesher and shader redesign, not a constant.
+
+The two real options:
+
+1. **A second atlas on the spare texture unit.** The PICA200 has three; unit 0 is the atlas,
+   unit 1 the fog ramp, unit 2 is bound by weather and water shimmer in *separate* passes, so
+   it is free during the opaque terrain pass. Four of six TEV stages are also free. Cost: up
+   to +32 KiB VRAM (less if the second sheet is sized to what is actually needed — ~10 KiB for
+   about 20 tiles), an extra draw call per chunk, and real surgery in `mesher.c` (bucket faces
+   by sheet), `chunk_render.c`, both world vertex shaders, and the tile-id headers. Spends the
+   last free texture unit and two of the last four TEV stages — permanently.
+2. **Halve `TILE_PX` from 16 to 8.** Doubles capacity to 128 slots inside the same strip and
+   keeps the REPEAT invariant intact, so it is structurally the cheapest by a long way, and
+   costs zero extra VRAM. The price is that **all 57 existing tiles must be redrawn at half
+   resolution** in `tools/make_atlas.py`, with a real risk they read as mush on a 400×240 top
+   screen where 16 px is already small. `make_atlas.py` is properly parameterised, so the
+   script does not need rewriting — the art does.
+
+Not a third option but worth stating: cutting scope costs nothing and is reversible, which
+neither of the above is.

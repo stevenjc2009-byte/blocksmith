@@ -3076,10 +3076,26 @@ static void cullFrame(const C3D_Mtx* view)
 	// The two rows where the new sort loses are the honest cost of the trade and they are
 	// stated here so nobody re-derives them as a regression: a radix sort pays its four passes
 	// whatever the input, so it cannot beat insertion sort's linear best case. What it buys is
-	// that the WORST row moves from 0.2583 ms to 0.0089 ms — a 29x cut in the most this line
+	// that the WORST row moves from 0.2583 ms to 0.0051 ms — a 50.9x cut in the most this line
 	// can ever cost a frame — and that the row the renderer actually hits every frame is the
 	// shuffled one, not the sorted one. Sorted-ascending costs 5.8 microseconds more; that is
 	// the entire downside.
+	//
+	// [2026-09-05] That paragraph used to say 0.0089 ms and 29x, which contradicted the table
+	// four lines above it — 0.0089 appears in no row, and every "new" figure in the table is
+	// 0.0051 to 0.0072. docs/VERSION-LIST.md repeated the wrong pair while ALSO printing 0.0051
+	// as the n=968 value in its own scaling sweep two lines further down, so the error had been
+	// copied without either copy being read against the other.
+	//
+	// It was resolved by re-running the benchmark rather than by picking the number that looked
+	// better. The original harness had been thrown away, so both sorts were lifted out again —
+	// the radix one from this file, the insertion one recovered from its removal in commit
+	// f8c4dc22 — into tools/sortbench.c, which is left in the tree precisely so this cannot rot
+	// a second time. On the x86-64 host, three runs, the reverse row's new arm measured 0.0062 /
+	// 0.0065 / 0.0061 ms against an old arm of 0.2825 / 0.2756 / 0.2781. Different machine, so
+	// the absolute figures are not this table's, but 0.0089 is roughly 40% above anything the
+	// new arm produced in any run, and the ratio lands at ~44.6x rather than 29x. The table was
+	// right and the prose was wrong. 0.0051 / 50.9x above is the table's own value, unchanged.
 	//
 	// Compiled with this project's real ARM flags (-march=armv6k -mtune=mpcore -mfloat-abi=hard
 	// -mtp=soft -O3), the old inner loop was 9 instructions built around a vcmpe.f32 followed

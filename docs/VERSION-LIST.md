@@ -229,8 +229,9 @@ existing worlds keep their old terrain. *This is the version that added the Beta
 wrong position, unbreakable tall grass, and repeated region-file rereads.
 
 **Changed.** Four measured performance fixes to the mesher, column install, horizon
-culling and light-fill. One of the four originally claimed here (region compaction) was
-later found to still be unwired — corrected under v1.8.2 below.
+culling and light-fill. A fifth — region compaction — was claimed here when this entry was
+first written but was not wired up until v1.8.2, so it has been struck from the list above
+and credited to that release instead.
 
 ### v1.8.0 — water moves — released and published
 
@@ -660,9 +661,16 @@ of what was reported before the hardware freeze.
 
 Replaced with a four-pass LSD radix sort over the float bit pattern. Measured host-side at
 n=968: **20.3× on the shuffled input the renderer actually produces** (0.1274 → 0.0063 ms) and
-**29× on the worst case a frame can hit** (0.2583 → 0.0089 ms), with the complexity change
+**50.9× on the worst case a frame can hit** (0.2583 → 0.0051 ms), with the complexity change
 visible in the sweep — old reverse-order goes 0.0041 → 0.0147 → 0.0615 → 0.2583 ms across
 n = 121/242/484/968 while the new one goes 0.0011 → 0.0015 → 0.0027 → 0.0051.
+
+**Corrected 2026-09-05.** This paragraph read "29× … 0.0089 ms" until now, which disagreed with
+the 0.0051 printed at the end of its own sentence and with the measurement table in
+`source/scene/chunk_render.c`. It was settled by re-running the benchmark, not by choosing:
+both sorts were lifted out again into `tools/sortbench.c` — which is kept in the tree so the
+figure cannot be lost a third time — and across three host runs the worst-case arm measured
+0.0062 / 0.0065 / 0.0061 ms, nowhere near 0.0089. The table was right; the prose was wrong.
 
 Stated against the temptation to re-derive it as a regression: on already-sorted, all-equal and
 nearly-sorted inputs the radix sort is **slower**, because it pays four passes regardless of
