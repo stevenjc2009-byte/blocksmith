@@ -8,11 +8,21 @@ build-host/
 *.cia
 *.bnr
 
-# Host-side test output for the net modules. Named build-<module> rather than build/ on
-# purpose — a host .o left beside its source is found by the console build's VPATH scan,
-# which then hands ld an object the ARM compiler never produced.
-build-blockdiff/
-build-networld/
+# Host-side test output. Named build-<module> rather than build/ on purpose — a host .o left
+# beside its source is found by the console build's VPATH scan, which then hands ld an object
+# the ARM compiler never produced.
+#
+# A glob rather than a list, because the list fell behind: build-blockdiff/ and build-networld/
+# were named here, but source/world/Makefile.inventory-persist-test writes build-inventory-persist/
+# and never got an entry, so its 69 KB host binary sat untracked in `git status` long enough that
+# nobody could remember what it was. Any Makefile or ad-hoc run that follows the build-<thing>/
+# convention is now covered without a second edit. Does not match build/ — that is line 3.
+build-*/
+
+# Bytecode cache, written by the interpreter the moment one tools/ script imports another.
+# tools/make_sounds.py importing tools/make_sfx_synth.py creates it, so it appears the first
+# time anyone regenerates the audio and is pure build output.
+__pycache__/
 
 # Third-party and cross-repo sources fetched by `make deps`, both pinned to a commit:
 # libhydrogen, and the gateway's bs_proto.h (the wire format, which is defined in the
