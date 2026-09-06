@@ -148,8 +148,53 @@ jobs:
                   parts.append(tail)
               return parts or ["_This release has no notes._"]
 
-          trimmed = strip_sections(body)
-          print(f"sections trimmed: {len(body)} -> {len(trimmed)} chars")
+          def parse_whatsnew(text):
+              """Render the player-facing whatsnew<ver>.txt as Discord sections.
+
+              That file's format: '#' comment lines, then [features] / [fixes] headers
+              with one plain-English item per line, a leading '- ' optional. Section
+              order is taken from the file, not reordered — some releases lead with
+              fixes. An unrecognised [section] is title-cased rather than dropped.
+              """
+              labels = {"features": "Added", "fixes": "Fixed", "changes": "Changed"}
+              order, items, cur = [], {}, None
+              for raw in text.split("\n"):
+                  line = raw.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  m = re.match(r"^\[(.+?)\]$", line)
+                  if m:
+                      cur = m.group(1).lower()
+                      if cur not in items:
+                          order.append(cur)
+                          items[cur] = []
+                      continue
+                  if cur:
+                      items[cur].append(re.sub(r"^-\s*", "", line))
+              out = []
+              for k in order:
+                  if items[k]:
+                      out.append(f"### {labels.get(k, k.title())}")
+                      out += [f"- {i}" for i in items[k]]
+                      out.append("")
+              return "\n".join(out).strip()
+
+          # Prefer the short player-facing notes. The GitHub release body is written for
+          # developers and runs to 12,000 characters; whatsnew<ver>.txt is the same
+          # release said in plain English for a player, and every release from v1.6.0
+          # carries one. Fall back to the trimmed release body when it is absent.
+          trimmed = ""
+          if news:
+              try:
+                  with urllib.request.urlopen(news, timeout=20) as r:
+                      trimmed = parse_whatsnew(r.read().decode("utf-8", "replace"))
+                  print(f"using whatsnew{ver}.txt -> {len(trimmed)} chars")
+              except Exception as e:
+                  print(f"could not read whatsnew{ver}.txt ({e}); falling back to the release body")
+          if not trimmed:
+              trimmed = strip_sections(body)
+              print(f"using the release body, sections trimmed: {len(body)} -> {len(trimmed)} chars")
+
           parts = split(trimmed)
           truncated = len(parts) > MAX_CHUNKS
           parts = parts[:MAX_CHUNKS]
