@@ -1,0 +1,182 @@
+name: Announce release on Discord
+
+# Fires when a Blocksmith release is published, and posts the tag, the release
+# link, both release assets and the full release body into a Discord channel.
+#
+# Two Blocksmith-specific reasons this is not a one-liner marketplace action:
+#
+#   1. Release bodies here are long. Measured 2026-09-06 across every published
+#      release: v1.8.3 is 12,405 characters, v1.6.0 is 7,180, and nine releases
+#      exceed 4,096. Discord's embed description limit IS 4,096, so a single-embed
+#      post fails with HTTP 400 on a typical Blocksmith release. The body is
+#      therefore split across several messages on line boundaries.
+#   2. Asset URLs are looked up by their real `.name` from the API rather than
+#      being constructed from the tag. `gh release create file#label` sets a
+#      display label, not the filename, so a hand-built URL can 404 while the
+#      release page looks correct.
+#
+# The release body is untrusted text. It is never interpolated into a shell
+# command via ${{ }} — it is fetched to a file and read by Python.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to announce, e.g. v1.8.20"
+        required: true
+        type: string
+      dry_run:
+        description: "Build the payload and print it, do not post to Discord"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: discord-announce-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  announce:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" > release.json
+          echo "Fetched $(jq -r '.tag_name' release.json), body $(jq -r '.body | length' release.json) chars, assets:"
+          jq -r '.assets[].name' release.json
+
+      - name: Post to Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys, time, urllib.request, urllib.error
+
+          DRY = os.environ.get("DRY_RUN", "false").lower() == "true"
+          HOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
+          if not HOOK and not DRY:
+              sys.exit("DISCORD_RELEASE_WEBHOOK secret is empty or missing.")
+
+          rel = json.load(open("release.json"))
+
+          tag   = rel["tag_name"]                 # v1.9.0
+          ver   = tag[1:] if tag.startswith("v") else tag   # 1.9.0
+          name  = rel.get("name") or f"Blocksmith {tag}"
+          link  = rel["html_url"]
+          body  = (rel.get("body") or "").replace("\r\n", "\n").strip()
+          pre   = rel.get("prerelease", False)
+
+          # Assets by their REAL name from the API, never a constructed URL.
+          assets = {a["name"]: a["browser_download_url"] for a in rel.get("assets", [])}
+          cia    = assets.get(f"blocksmith{ver}.cia")
+          news   = assets.get(f"whatsnew{ver}.txt")
+
+          CHUNK      = 3900   # headroom under Discord's 4096 embed-description limit
+          MAX_CHUNKS = 5      # 5 x 3900 = 19,500 chars; the largest body so far is 12,405
+          COLOUR     = 0x6AA84F
+          PAUSE      = 1.0    # seconds between messages, to stay clear of the webhook rate limit
+
+          def split(text, limit=CHUNK):
+              """Split on line boundaries, keeping ``` fences balanced across chunks."""
+              parts, buf, size, fence = [], [], 0, False
+              lines = []
+              for line in text.split("\n"):
+                  # A single line longer than the limit has no boundary to split on,
+                  # so cut it by characters. Real bodies top out around 660 chars per
+                  # line; this only guards a pathological one.
+                  while len(line) + 1 > limit:
+                      lines.append(line[:limit - 1])
+                      line = line[limit - 1:]
+                  lines.append(line)
+              for line in lines:
+                  if buf and size + len(line) + 1 > limit:
+                      chunk = "\n".join(buf) + ("\n```" if fence else "")
+                      parts.append(chunk)
+                      buf, size = (["```"], 4) if fence else ([], 0)
+                  buf.append(line)
+                  size += len(line) + 1
+                  if line.lstrip().startswith("```"):
+                      fence = not fence
+              # Strip only blank lines: a chunk boundary can land on an indented
+              # continuation line, and .strip() would eat its markdown indent.
+              tail = "\n".join(buf).strip("\n")
+              if tail.strip():
+                  parts.append(tail)
+              return parts or ["_This release has no notes._"]
+
+          parts = split(body)
+          truncated = len(parts) > MAX_CHUNKS
+          parts = parts[:MAX_CHUNKS]
+
+          fields = []
+          if cia:
+              fields.append({"name": "Download (CIA)", "value": f"[blocksmith{ver}.cia]({cia})", "inline": True})
+          if news:
+              fields.append({"name": "In-game notes",  "value": f"[whatsnew{ver}.txt]({news})",  "inline": True})
+          if not cia:
+              fields.append({"name": "Download (CIA)",
+                             "value": f"No `blocksmith{ver}.cia` asset on this release.", "inline": True})
+
+          title = f"{name}{' (pre-release)' if pre else ''}"[:256]
+
+          messages = []
+          messages.append({
+              "content": f"New Blocksmith release: **{tag}**\n{link}",
+              "allowed_mentions": {"parse": []},
+              "embeds": [{
+                  "title": title,
+                  "url": link,
+                  "description": parts[0],
+                  "color": COLOUR,
+                  "fields": fields,
+                  "footer": {"text": f"Blocksmith for Nintendo 3DS · {tag}"},
+                  "timestamp": rel.get("published_at"),
+              }],
+          })
+          for i, part in enumerate(parts[1:], start=2):
+              desc = part
+              if truncated and i == len(parts):
+                  desc += f"\n\n… notes truncated. Full release notes: {link}"
+              messages.append({
+                  "allowed_mentions": {"parse": []},
+                  "embeds": [{
+                      "description": desc,
+                      "color": COLOUR,
+                      "footer": {"text": f"{tag} — continued ({i}/{len(parts)})"},
+                  }],
+              })
+
+          print(f"{tag}: {len(body)} chars of notes -> {len(parts)} message(s), truncated={truncated}")
+
+          for n, msg in enumerate(messages, start=1):
+              if DRY:
+                  print(f"--- message {n}/{len(messages)} (dry run) ---")
+                  print(json.dumps(msg, indent=2)[:4000])
+                  continue
+              data = json.dumps(msg).encode("utf-8")
+              req = urllib.request.Request(
+                  HOOK + ("&" if "?" in HOOK else "?") + "wait=true",
+                  data=data,
+                  headers={"Content-Type": "application/json",
+                           "User-Agent": "blocksmith-release-announcer"},
+                  method="POST",
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      print(f"message {n}/{len(messages)}: HTTP {r.status}")
+              except urllib.error.HTTPError as e:
+                  # Discord returns a JSON explanation on 400 — print it, do not swallow it.
+                  sys.exit(f"message {n}/{len(messages)} failed: HTTP {e.code} {e.read().decode('utf-8', 'replace')}")
+              time.sleep(PAUSE)
+          PY
