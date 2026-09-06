@@ -61,7 +61,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import json, os, sys, time, urllib.request, urllib.error
+          import json, os, re, sys, time, urllib.request, urllib.error
 
           DRY = os.environ.get("DRY_RUN", "false").lower() == "true"
           HOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
@@ -86,6 +86,39 @@ jobs:
           MAX_CHUNKS = 5      # 5 x 3900 = 19,500 chars; the largest body so far is 12,405
           COLOUR     = 0x6AA84F
           PAUSE      = 1.0    # seconds between messages, to stay clear of the webhook rate limit
+
+          # Sections dropped from the Discord post. The full text stays on the GitHub
+          # release page — this only trims what gets mirrored into the channel, to the
+          # three groups steve asked for: what was added, changed and fixed.
+          #
+          # Heading styles vary a lot across this repo's releases: some use Keep-a-Changelog
+          # sections (### Added / ### Fixed / ### Changed), others use prose headings
+          # (## Sound (was v1.8.19)). So this is a blocklist, not a whitelist — a whitelist
+          # of Added/Changed/Fixed would delete almost all of v1.8.20.
+          DROP = re.compile(
+              r"^\s*(compatibility"
+              r"|not[- ]verified"
+              r"|verified"
+              r"|verification"
+              r"|how (this build|it) was verified)\s*$",
+              re.I,
+          )
+
+          def strip_sections(text):
+              """Drop blocklisted headed sections, including any nested subheadings."""
+              out, drop_level = [], None
+              for line in text.split("\n"):
+                  m = re.match(r"^(#{1,6})\s+(.*?)\s*$", line)
+                  if m:
+                      level, title = len(m.group(1)), m.group(2)
+                      if drop_level is not None and level <= drop_level:
+                          drop_level = None          # this heading ends the dropped section
+                      if drop_level is None and DROP.match(title):
+                          drop_level = level
+                          continue
+                  if drop_level is None:
+                      out.append(line)
+              return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
 
           def split(text, limit=CHUNK):
               """Split on line boundaries, keeping ``` fences balanced across chunks."""
@@ -115,9 +148,24 @@ jobs:
                   parts.append(tail)
               return parts or ["_This release has no notes._"]
 
-          parts = split(body)
+          trimmed = strip_sections(body)
+          print(f"sections trimmed: {len(body)} -> {len(trimmed)} chars")
+          parts = split(trimmed)
           truncated = len(parts) > MAX_CHUNKS
           parts = parts[:MAX_CHUNKS]
+
+          # Per-version install QR, read from the repo at the release's own tag so it
+          # always matches the version being announced. Verified 2026-09-07: the PNG at
+          # tag v1.8.20 decodes (two independent decoders) to that version's .cia URL.
+          # Attached only if it really resolves — a 404 here would show a broken image.
+          qr = f"https://raw.githubusercontent.com/{os.environ['GITHUB_REPOSITORY']}/{tag}/docs/install-qr.png"
+          try:
+              with urllib.request.urlopen(urllib.request.Request(qr, method="HEAD"), timeout=15) as r:
+                  if r.status != 200:
+                      qr = None
+          except Exception as e:
+              print(f"no install QR at {tag}: {e}")
+              qr = None
 
           fields = []
           if cia:
@@ -130,19 +178,26 @@ jobs:
 
           title = f"{name}{' (pre-release)' if pre else ''}"[:256]
 
+          # Only the FIRST message pings, and only that one carries parse:["everyone"].
+          # The continuation messages keep parse:[] so a 5-part release notifies once,
+          # not five times.
+          first = {
+              "title": title,
+              "url": link,
+              "description": parts[0],
+              "color": COLOUR,
+              "fields": fields,
+              "footer": {"text": f"Blocksmith for Nintendo 3DS · {tag}"},
+              "timestamp": rel.get("published_at"),
+          }
+          if qr:
+              first["image"] = {"url": qr}
+
           messages = []
           messages.append({
-              "content": f"New Blocksmith release: **{tag}**\n{link}",
-              "allowed_mentions": {"parse": []},
-              "embeds": [{
-                  "title": title,
-                  "url": link,
-                  "description": parts[0],
-                  "color": COLOUR,
-                  "fields": fields,
-                  "footer": {"text": f"Blocksmith for Nintendo 3DS · {tag}"},
-                  "timestamp": rel.get("published_at"),
-              }],
+              "content": f"@everyone New Blocksmith release: **{tag}**\n{link}",
+              "allowed_mentions": {"parse": ["everyone"]},
+              "embeds": [first],
           })
           for i, part in enumerate(parts[1:], start=2):
               desc = part
