@@ -62,6 +62,8 @@
 
 #include <citro3d.h>   // C3D_Tex only — see the file comment above for why
 
+#include "net/networld.h"      // NetworldInvState — v1.9.1, see uiApplyInvSnapshot. The type is
+                               // an anonymous-struct typedef, so it cannot be forward-declared.
 #include "scene/ui_gesture.h"  // UiGesture — v1.9.0 SPLIT, see UiState.gesture
 #include "world/chest.h"       // ChestState — see uiUpdateDraw's `chest` parameter
 #include "world/furnace.h"     // FurnaceState — see uiUpdateDraw's `furnace` parameter
@@ -220,6 +222,34 @@ void uiOpenChest(UiState* ui, int x, int y, int z);
 // off networldSessionActive(): the callback while a session is up, NULL otherwise, which is
 // what keeps single player on the local apply with no second code path.
 void uiSetChestTransferFn(UiState* ui, UiChestTransferFn fn, void* ud);
+
+// v1.9.1 DUPE FIX. The ONLY way a server BS_APP_INV_STATE snapshot may reach the inventory:
+// discards any detached split half, then applies the snapshot via invBridgeApplyState.
+//
+// Why it has to exist at all. A Y split moves the larger half of a stack OUT of the bag into
+// `ui->lift`, which is a field of UiState and NOT part of Inventory, and net/inv_bridge.h says
+// plainly that a split is never reported to the server. So while a half is in the air the two
+// copies disagree ON PURPOSE: the server still believes the whole undivided stack sits in the
+// origin slot. invBridgeApplyState then overwrites every slot wholesale, which is exactly what
+// it is for — but it has never known `ui->lift` existed, so the origin slot came back at its
+// full pre-split count while the lifted half was STILL held separately. Those units were
+// created out of nothing, and the gesture is repeatable, so it was an unbounded duplication.
+//
+// It is not exotic to reach. The bag screen is not the pause menu, so L/R hotbar cycling and
+// the craft rows both still work with a half in the air, and the server answers EVERY accepted
+// inventory action with a fresh snapshot (deps/blocksmith-server/game/bsgame.c's
+// handle_inv_action ends in an unconditional send_inv_state). Split, nudge L, place: more items
+// than you started with.
+//
+// DISCARDED, not returned. The incoming snapshot already accounts for the lifted units — they
+// are part of the count the server is reporting for the origin slot, because it was never told
+// they left it. Adding them back on top would be the same duplication by a different route.
+// The player sees their half drop back into the stack it came from, which is what the server
+// thinks happened anyway; nothing is lost.
+//
+// Single player never calls this: with no session no snapshot is ever produced, which is why
+// the split gesture's local-only design was sound for the case it was written for.
+void uiApplyInvSnapshot(UiState* ui, Inventory* inv, const NetworldInvState* state);
 
 // One frame's touch point. See the file comment for why there is no keys_down here, unlike
 // TitleInput.

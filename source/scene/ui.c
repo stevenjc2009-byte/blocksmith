@@ -179,7 +179,16 @@ static void returnLift(UiState* ui, Inventory* inv)
 {
 	if (!liftDetached(ui)) return;
 	(void)invBridgeReturnLift(inv, ui->lift_from, &ui->lift);
-	ui->lift_from = -1;
+
+	// v1.9.1. Cleared only if the bag actually took the whole half back. invBridgeReturnLift
+	// can refuse a remainder (its header: "units the bag would not take back are still in
+	// lift"), and clearing lift_from unconditionally stranded that remainder: with lift_from
+	// at -1, reconcileLift's `picked_slot != lift_from` goes false as soon as picked_slot
+	// resets to -1 too, so nothing ever retried, while liftDetached() stayed true and
+	// handleSplit refused every later split for the rest of the session. Keeping the origin
+	// index means reconcileLift picks it up again on the next frame that names a different
+	// slot, so it self-heals the moment the bag has room.
+	if (!liftDetached(ui)) ui->lift_from = -1;
 }
 
 static void reconcileLift(UiState* ui, Inventory* inv)
@@ -989,24 +998,22 @@ static void handleSplit(UiState* ui, Inventory* inv, int slot)
 	ui->picked_slot = slot;
 }
 
-// The chest slot a quick-move lands `item` in: the first same-item slot with room, else the
-// first empty one — the strip rule invBridgePlanQuickMove applies, restated for a chest. -1
-// when the chest has no room, which is a refusal that changes nothing.
-static int chestQuickSlot(const ChestState* cs, ItemId item)
-{
-	for (int c = 0; c < CHEST_SLOTS; c++)
-		if (cs->item[c] == item && cs->count[c] < INV_STACK_MAX) return c;
-	for (int c = 0; c < CHEST_SLOTS; c++)
-		if (cs->item[c] == ITEM_NONE) return c;
-	return -1;
-}
-
 // X. Sends `slot`'s whole stack to the other container without a second tap: the other strip
 // of the bag, or — with the chest panel up — the open chest, by exactly the deposit path a
 // lift-and-tap takes (placeStack locally; the transfer callback under a session — it gets
 // the count, and picked_slot names the source for the frame of the call, as ui.h says a
 // registrant may read it). Any lift is dropped first: a detached half goes back to its
 // slot, so it is the whole stack that moves, never half of it.
+//
+// v1.9.1: the chest half of this used to pick ONE landing slot — a private chestQuickSlot()
+// that returned the first same-item slot with ANY room, else the first empty one — and send
+// the entire stack to it, while its own comment claimed it applied invBridgePlanQuickMove's
+// strip rule. It did not: that rule SPILLS across every eligible slot. Two chest slots at 90
+// of an item with 20 in hand moved 9 and left 11 in the bag with no refusal shown, even
+// though the second slot had room for all of them. The rule now lives in
+// invBridgePlanChestDeposit (net/inv_bridge.c), stated as a plan so a test can read the
+// answer directly; tests/ui_chest_test.c drives THIS function through a real frame to prove
+// the two agree.
 static void handleQuickMove(UiState* ui, Inventory* inv, ChestState* cs, int slot, bool to_chest)
 {
 	returnLift(ui, inv);
@@ -1017,17 +1024,33 @@ static void handleQuickMove(UiState* ui, Inventory* inv, ChestState* cs, int slo
 		return;
 	}
 
-	InvSlot* src = &inv->slots[slot];
-	const int c = chestQuickSlot(cs, src->item);
-	if (c < 0) return;                                     // chest full: refused
+	InvBridgeChestDeposit plan[INV_BRIDGE_CHEST_PLAN_MAX];
+	const int n = invBridgePlanChestDeposit(inv, slot, cs, plan, INV_BRIDGE_CHEST_PLAN_MAX);
+	if (n == 0) return;                                    // chest full: refused, nothing moves
 
-	if (ui->chest_fn) {
-		ui->picked_slot = slot;
-		chestTransferViaFn(ui, UI_CHEST_OP_DEPOSIT, (uint8_t)src->item, (uint8_t)c, src->count);
-		ui->picked_slot = -1;                              // sent or refused, X holds nothing
-		return;
+	InvSlot* src = &inv->slots[slot];
+	for (int i = 0; i < n; i++) {
+		const int c = plan[i].chest_slot;
+
+		if (ui->chest_fn) {
+			// picked_slot is re-set EVERY iteration, not once before the loop:
+			// chestTransferViaFn calls dropLifts() on a successful send, which sets
+			// picked_slot back to -1, and the registrant reads it to name the source bag
+			// slot. Set once, only the first deposit of a spill would carry a source.
+			ui->picked_slot = slot;
+			chestTransferViaFn(ui, UI_CHEST_OP_DEPOSIT, (uint8_t)src->item, (uint8_t)c, plan[i].count);
+			continue;
+		}
+
+		// Offline: placeStack moves min(src->count, room), which for a slot this plan chose
+		// is exactly plan[i].count — the plan is computed from the same counts placeStack
+		// then reads, and each planned slot is visited once. Reusing the tested primitive
+		// rather than restating the arithmetic is the point; its swap branch is unreachable
+		// here because the plan only ever names an empty or same-item slot.
+		if (src->item == ITEM_NONE) break;
+		placeStack(src, &cs->item[c], &cs->count[c]);
 	}
-	placeStack(src, &cs->item[c], &cs->count[c]);
+	ui->picked_slot = -1;                                  // sent or refused, X holds nothing
 }
 
 // ── Chest panel (v1.9.0 CHEST) ─────────────────────────────────────────────────────────
@@ -1097,6 +1120,26 @@ void uiSetChestTransferFn(UiState* ui, UiChestTransferFn fn, void* ud)
 {
 	ui->chest_fn = fn;
 	ui->chest_ud = ud;
+}
+
+void uiApplyInvSnapshot(UiState* ui, Inventory* inv, const NetworldInvState* state)
+{
+	if (!ui || !inv || !state) return;
+
+	// Cleared BEFORE the apply, not after, and by zeroing rather than by returnLift(): the
+	// units in the air are already inside the counts `state` is about to write (the server was
+	// never told they left the origin slot), so putting them back into `inv` first would land
+	// them in slots the apply is about to overwrite anyway — and putting them back AFTER would
+	// be the duplication this function exists to stop, just spelled differently. See ui.h.
+	ui->lift.item  = ITEM_NONE;
+	ui->lift.count = 0;
+	ui->lift_from  = -1;
+
+	// picked_slot is deliberately left alone. It is an INDEX, not a copy of anything: it names
+	// a bag slot whose contents the snapshot is free to change, and the panel re-reads that
+	// slot every frame, so the player sees the new contents under the highlight rather than a
+	// stale amount. Nothing is conserved through it, so nothing can be duplicated by it.
+	(void)invBridgeApplyState(inv, state);
 }
 
 UiResult uiUpdateDraw(UiState* ui, Inventory* inv, C3D_Tex* block_icons,

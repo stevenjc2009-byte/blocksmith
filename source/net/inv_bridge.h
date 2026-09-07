@@ -42,6 +42,7 @@
 #include <stdint.h>
 
 #include "net/networld.h"
+#include "world/chest.h"       // ChestState, CHEST_SLOTS — for invBridgePlanChestDeposit
 #include "world/inventory.h"
 
 // ── Server-reported mutations ────────────────────────────────────────────────────────────
@@ -156,6 +157,45 @@ uint8_t invBridgeApplyMove(Inventory* inv, const InvBridgeMove* m);
 // across three slots is three packets, each carrying what that piece actually was. Returns the
 // total units moved; 0 when the other strip had no room, leaving both strips untouched.
 uint8_t invBridgeQuickMove(Inventory* inv, int slot);
+
+// One deposit as BS_APP_CHEST_ACTION's DEPOSIT carries it: which chest slot, and how many
+// units land there. Deliberately NOT an InvBridgeMove — that struct's a/b are both inventory
+// slot indices in one strip, and a chest is a different address space (a (x,y,z) block's
+// 8-slot payload), so reusing it would make two unrelated indices share a field name.
+typedef struct {
+	uint8_t chest_slot;
+	uint8_t count;
+} InvBridgeChestDeposit;
+
+// The most deposits one chest quick-move can describe. Same argument as INV_BRIDGE_PLAN_MAX:
+// pass 0 tops up each same-item chest slot once and pass 1 fills each empty one once, and the
+// two passes are disjoint, so no chest slot is ever described twice.
+#define INV_BRIDGE_CHEST_PLAN_MAX CHEST_SLOTS
+
+// Describes inventory slot `slot`'s whole stack going into chest `cs`, without moving
+// anything. This is invBridgePlanQuickMove's strip rule with a chest as the destination
+// strip: every chest slot already holding the same item is topped up first, lowest index
+// first, then whatever is left fills the first empty slots. Anything the chest has no room
+// for stays in the bag, so a full chest describes zero deposits.
+//
+// It exists because scene/ui.c's chest quick-move did NOT do this, and its own comment said
+// it did. Until v1.9.1 that path picked a SINGLE landing slot — the first same-item slot with
+// any room at all, else the first empty one — and sent the player's entire stack to it. With
+// two chest slots each holding 90 of an item and 20 in hand, 9 units moved and 11 stayed in
+// the bag with no refusal shown, even though the second slot had room for all of them. The
+// server clamps a deposit to the slot's room and debits exactly what it took
+// (deps/blocksmith-server/game/bsgame.c, BS_CHEST_OP_DEPOSIT), so nothing was ever lost — it
+// was silent under-delivery, which is the harder kind to notice.
+//
+// It lives here rather than in scene/ui.c for the same reason invBridgePlanQuickMove does:
+// a rule stated as a plan is a rule a test can read the ANSWER of without driving a frame of
+// UI to get at it. (scene/ui.c is host-linkable — tools/run_host_tests.sh's ui_chest_test
+// stanza links the real file against tests/ui_chest_stub/ — so the gesture that calls this is
+// covered too; the split is about where the arithmetic is easiest to pin down, not about what
+// can be compiled.) Writes up to `cap` deposits into `out` and returns how many; 0 for an
+// empty source slot, a bad index, a NULL or a chest with no room.
+int invBridgePlanChestDeposit(const Inventory* inv, int slot, const ChestState* cs,
+                              InvBridgeChestDeposit* out, int cap);
 
 // Detaches the larger half of `slot`'s stack into `*out_lift`: the lift gets ceil(count / 2)
 // and the slot keeps floor(count / 2) — 7 becomes a lift of 4 over a slot of 3, 2 becomes 1

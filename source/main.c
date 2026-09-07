@@ -1394,9 +1394,20 @@ static uint32_t s_seed_used = BS_WORLD_SEED;
 // v1.4.0: control-remap screen state and the debug-menu flag. Reset per session, like the
 // seed above. The minimap's fog-of-war buffer and save path used to live here too; the
 // whole feature was removed in v1.5.1 (see below, at the old init site).
-static RemapState s_remap;
+// The two OPEN flags stay unguarded: the frame loop tests them outside the bottom-UI blocks
+// (`if (!s_remap_open && !s_debug_open)` gates ordinary input), so a console build still reads
+// them — it just never sets them true.
 static bool       s_remap_open;
 static bool       s_debug_open;
+
+// The remap screen's state, the debug menu's live INFO numbers, and the render-distance
+// stepper's callback are BS_BOTTOM_UI-only: both screens ARE the bottom UI, and every reader
+// below (bsDbgSetDist, the entry tables, the frame loop's remap/debug branch) already sits
+// inside `#if BS_BOTTOM_UI`. Unguarded, a `-DBS_BOTTOM_UI=0` probe build — which gfx/screen.h
+// requires of every measurement build — failed outright on -Werror=unused-variable and
+// -Werror=unused-function before these three ever reached the linker.
+#if BS_BOTTOM_UI
+static RemapState s_remap;
 
 // Live numbers the debug menu's INFO rows read. Refreshed every frame the menu is open;
 // entries hold this struct's address, so it lives at file scope rather than on the frame.
@@ -1407,6 +1418,7 @@ static DebugContext s_dctx;
 // genSetRadius clamps and re-meshes the ring live; persisting opts.render_dist is the
 // caller's job, done right after debugMenuUiUpdate returns.
 static void bsDebugSetRenderDist(int r) { genSetRadius(r); }
+#endif
 
 #if BS_BOTTOM_UI
 static int bsDbgGetDist(void* ctx)
@@ -3055,6 +3067,15 @@ static bool mainChestTransfer(void* ud, uint8_t op, int x, int y, int z, uint8_t
 	if (count == 0) return false;
 	return networldSendChestAction(op, x, y, z, a, b, count);
 }
+// The bottom-UI block pauses here and resumes after mainBagFits below. Those two callbacks
+// touch s_blockstate and s_inv only -- no UiState, no render target, nothing this block is for
+// -- and the interactSetBrokeContentsFn/interactSetBagFitsFn registrations at world entry are
+// NOT guarded, so leaving them inside broke a `-DBS_BOTTOM_UI=0` probe build outright with
+// "'mainStatefulBrokeContents' undeclared". Guarding the registrations instead would have
+// compiled, and silently reverted a console build to the pre-v1.8.17 behaviour where a broken
+// furnace or chest destroys its contents -- a probe build that quietly plays by different
+// rules than the shipped one is worth less than no probe build.
+#endif
 
 // v1.8.17. What a broken furnace hands back. Registered with scene/interact.c once at startup
 // and called by it from breakComplete, at the one moment the block has been decided broken but
@@ -3176,6 +3197,7 @@ static bool mainBagFits(const BlockId* items, const uint8_t* counts, int n)
 	}
 	return true;
 }
+#if BS_BOTTOM_UI   // resumes the block paused above mainStatefulBrokeContents
 
 // Step 8.2. The bottom screen's whole content: hotbar, inventory grid, crafting panel, and
 // the engine numbers step 8.3's screen carried.
@@ -4297,15 +4319,30 @@ static void onWorldEdit(void* ud, const World* w, int x, int y, int z, BlockId p
 // and the snapshot is the only thing that ever notices. Merging would preserve exactly the
 // divergence the snapshot exists to erase.
 //
-// No remesh, no UI reset, nothing else to do: scene/ui.c reads s_inv fresh every frame (it owns
-// no copy of it) and the main loop re-reads inventoryHeldItem() every frame too, for reasons its
-// own comment already gives. A rejected snapshot (an item id this build does not have) leaves
-// s_inv untouched — invBridgeApplyState's comment covers what that means and why it is still the
-// right failure.
+// No remesh and nothing to re-read: scene/ui.c reads s_inv fresh every frame and the main loop
+// re-reads inventoryHeldItem() every frame too, for reasons its own comment already gives. A
+// rejected snapshot (an item id this build does not have) leaves s_inv untouched —
+// invBridgeApplyState's comment covers what that means and why it is still the right failure.
+//
+// v1.9.1 DUPE FIX, and a correction to what this comment used to say. It read "no UI reset...
+// (it owns no copy of it)", and that stopped being true in v1.9.0: a Y split detaches half a
+// stack into scene/ui.h's UiState.lift, which IS a copy of part of the bag, living outside
+// Inventory and deliberately never reported to the server. A snapshot landing while that half
+// was in the air restored the origin slot to its full pre-split count with the half still held
+// separately — units created out of nothing, repeatably. So this goes through
+// uiApplyInvSnapshot() now, which drops the lift and then applies; read its comment in
+// scene/ui.h for the whole argument. The call is not optional and must not be routed around:
+// invBridgeApplyState is no longer safe to reach directly from here.
 static void onInvState(void* userdata, const NetworldInvState* state)
 {
 	(void)userdata;
+#if BS_BOTTOM_UI
+	uiApplyInvSnapshot(&s_ui, &s_inv, state);
+#else
+	// No bottom UI in this build, so there is no UiState and no lift to reconcile: the split
+	// gesture is part of the bag screen that BS_BOTTOM_UI=0 compiles out entirely.
 	(void)invBridgeApplyState(&s_inv, state);
+#endif
 }
 
 // v1.8.5. What the boot actually costs, read off the console instead of derived on paper.
@@ -6870,7 +6907,13 @@ session_start:
 		// v1.9.0 SPLIT: X and Y are the bag screens' quick-move / split keys
 		// (scene/ui_gesture.h) while any bag screen is up, so a press there must not also
 		// break or place a block on the world behind it. See the SPLIT patch notes.
+#if BS_BOTTOM_UI
 		const u32 ui_keys   = (s_ui.screen != UI_SCR_HUD) ? (KEY_X | KEY_Y) : 0u;
+#else
+		// A console build has no bag screens at all (scene/ui.c is what they are), so X and Y
+		// never carry the split/quick-move meaning and there is nothing to mask out.
+		const u32 ui_keys   = 0u;
+#endif
 		const u32 edit_down = (paused ? 0u : down) & ~ui_keys
 		                    & ~(ate_this_frame ? inputKey(ACTION_PLACE) : 0u)
 		                    & ~(opened_furnace_this_frame ? inputKey(ACTION_PLACE) : 0u)

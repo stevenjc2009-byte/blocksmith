@@ -849,6 +849,102 @@ static void test_plan_quick_move_describes_without_touching(void)
           "an op the bridge does not describe is refused, moves nothing and is not sent");
 }
 
+/* v1.9.1: the chest deposit planner. scene/ui.c's chest quick-move used to pick ONE landing
+ * slot and send the whole stack to it while its own comment claimed the strip rule applied;
+ * these two tests are that rule, checked as arithmetic. The GESTURE that calls it is covered
+ * separately in tests/ui_chest_test.c, which links the real scene/ui.c against
+ * tests/ui_chest_stub/ and presses X for real; these two are here because a plan's answer can
+ * be read directly, without driving a frame of UI to get at it. */
+static void test_plan_chest_deposit_spills_across_slots(void)
+{
+    puts("a chest deposit tops up every same-item slot, then fills empties, and describes each piece");
+
+    Inventory inv;
+    armSession(&inv);
+    setSlot(&inv, 0, BLOCK_STONE, 20);
+
+    /* The exact shape the old single-slot path got wrong: same-item chest slots with 9 and 4
+     * room and 20 units in hand. It described one deposit of 20 into slot 0; the server
+     * clamped that to 9 and debited 9, so 11 stayed in the bag with nothing on screen to say
+     * why, even though slot 3 and four empty slots could have taken all of it. */
+    ChestState cs;
+    chestStateInit(&cs);
+    cs.item[0] = BLOCK_STONE; cs.count[0] = (uint8_t)(INV_STACK_MAX - 9);
+    cs.item[1] = BLOCK_DIRT;  cs.count[1] = 5;                 /* different item: skipped */
+    cs.item[2] = BLOCK_STONE; cs.count[2] = INV_STACK_MAX;     /* same item, no room: skipped */
+    cs.item[3] = BLOCK_STONE; cs.count[3] = (uint8_t)(INV_STACK_MAX - 4);
+
+    const ChestState before_cs  = cs;
+    const Inventory  before_inv = inv;
+    InvBridgeChestDeposit plan[INV_BRIDGE_CHEST_PLAN_MAX];
+    const int n = invBridgePlanChestDeposit(&inv, 0, &cs, plan, INV_BRIDGE_CHEST_PLAN_MAX);
+
+    check(n == 3, "three deposits described");
+    check(plan[0].chest_slot == 0 && plan[0].count == 9, "deposit 0 tops chest slot 0 up by 9");
+    check(plan[1].chest_slot == 3 && plan[1].count == 4, "deposit 1 tops chest slot 3 up by 4");
+    check(plan[2].chest_slot == 4 && plan[2].count == 7,
+          "deposit 2 puts the remaining 7 in the first EMPTY slot, which is 4 (1 holds dirt)");
+    check(memcmp(&before_cs,  &cs,  sizeof cs)  == 0, "the chest is byte-identical afterwards");
+    check(memcmp(&before_inv, &inv, sizeof inv) == 0, "the inventory is byte-identical afterwards");
+    check(fake_sent_calls == 0, "planning sends nothing");
+
+    /* The property the old path broke, stated directly rather than inferred from the three
+     * counts above: nothing in the player's hand is left without a home. */
+    int total = 0;
+    for (int i = 0; i < n; i++) total += plan[i].count;
+    check(total == 20, "every unit of the 20 in hand has somewhere to land");
+
+    InvBridgeChestDeposit one;
+    check(invBridgePlanChestDeposit(&inv, 0, &cs, &one, 1) == 1 && one.chest_slot == 0 && one.count == 9,
+          "a cap of 1 describes the first deposit only");
+}
+
+static void test_plan_chest_deposit_refuses_and_clamps(void)
+{
+    puts("a chest with no room describes nothing, and a partly-full one describes only what fits");
+
+    Inventory inv;
+    armSession(&inv);
+    setSlot(&inv, 0, BLOCK_STONE, 30);
+
+    InvBridgeChestDeposit plan[INV_BRIDGE_CHEST_PLAN_MAX];
+
+    ChestState full;
+    chestStateInit(&full);
+    for (int c = 0; c < CHEST_SLOTS; c++) { full.item[c] = BLOCK_DIRT; full.count[c] = INV_STACK_MAX; }
+    check(invBridgePlanChestDeposit(&inv, 0, &full, plan, INV_BRIDGE_CHEST_PLAN_MAX) == 0,
+          "a chest full of a DIFFERENT item describes nothing");
+
+    /* Same item in every slot, every one at the cap. A planner that tested only "is this my
+     * item" and not "has it room" would describe eight zero-unit deposits here, each of which
+     * the server would reject one at a time -- eight packets for nothing. */
+    for (int c = 0; c < CHEST_SLOTS; c++) full.item[c] = BLOCK_STONE;
+    check(invBridgePlanChestDeposit(&inv, 0, &full, plan, INV_BRIDGE_CHEST_PLAN_MAX) == 0,
+          "a chest full of the SAME item describes nothing either");
+
+    /* Exactly one slot with 3 room, 30 units in hand: the deposit is clamped to the room, and
+     * the other 27 stay in the bag rather than being described into a slot that cannot hold
+     * them. */
+    ChestState tight;
+    chestStateInit(&tight);
+    for (int c = 0; c < CHEST_SLOTS; c++) { tight.item[c] = BLOCK_DIRT; tight.count[c] = INV_STACK_MAX; }
+    tight.item[5] = BLOCK_STONE; tight.count[5] = (uint8_t)(INV_STACK_MAX - 3);
+    const int n = invBridgePlanChestDeposit(&inv, 0, &tight, plan, INV_BRIDGE_CHEST_PLAN_MAX);
+    check(n == 1 && plan[0].chest_slot == 5 && plan[0].count == 3,
+          "only the 3 units that fit are described, in the one slot with room");
+
+    check(invBridgePlanChestDeposit(&inv, 5, &tight, plan, INV_BRIDGE_CHEST_PLAN_MAX) == 0,
+          "an empty inventory slot describes nothing");
+    check(invBridgePlanChestDeposit(&inv, -1, &tight, plan, INV_BRIDGE_CHEST_PLAN_MAX) == 0,
+          "a negative slot index describes nothing");
+    check(invBridgePlanChestDeposit(&inv, INV_SLOT_COUNT, &tight, plan, INV_BRIDGE_CHEST_PLAN_MAX) == 0,
+          "a slot index past the end describes nothing");
+    check(invBridgePlanChestDeposit(&inv, 0, NULL, plan, INV_BRIDGE_CHEST_PLAN_MAX) == 0,
+          "a NULL chest describes nothing");
+    check(invBridgePlanChestDeposit(&inv, 0, &tight, plan, 0) == 0, "a cap of 0 describes nothing");
+    check(fake_sent_calls == 0, "none of these refusals sent anything");
+}
+
 static void test_lift_and_quick_move_offline_still_mutate(void)
 {
     puts("with no session, quick-move and place-lift perform their local op and send nothing");
@@ -905,6 +1001,10 @@ int main(void)
     test_plan_quick_move_describes_without_touching();
     test_lift_and_quick_move_offline_still_mutate();
 
+    /* v1.9.1 CHEST DEPOSIT PLANNER */
+    test_plan_chest_deposit_spills_across_slots();
+    test_plan_chest_deposit_refuses_and_clamps();
+
     /* ---- check-count guard -----------------------------------------------------------------
      *
      * This suite counts failures, and until 2026-08-25 that was ALL it counted. A suite that
@@ -941,7 +1041,7 @@ int main(void)
      *   and find out which checks stopped running, and why.
      *
      *   Note the number is the count BEFORE this guard itself, so the summary line prints one
-     *   more than it (158 here, 159 on the PASS line). That off-by-one is deliberate: it means
+     *   more than it (176 here, 177 on the PASS line). That off-by-one is deliberate: it means
      *   blind-pasting the number off the PASS line lands you a red, not a false green.
      *
      *   Latched into `ran` first, and compared through that, so the pin means "checks before
@@ -951,19 +1051,19 @@ int main(void)
      *   there silently wants a number one higher. Same latch everywhere, same meaning
      *   everywhere, and it stays correct if this file's check() is ever turned into a macro. */
     const int ran = g_checks;
-    if (ran != 158)
+    if (ran != 176)
         printf("\nCHECK-COUNT GUARD: %d checks ran, %d expected.\n"
                "  %s\n"
                "  This is NOT an ordinary assertion failure.\n"
                "  Read the comment above this guard in net/inv_bridge_test.c before"
                " touching the pinned number.\n",
-               ran, 158,
-               ran < 158
+               ran, 176,
+               ran < 176
                    ? "Checks went MISSING: checks that should have run never ran at all."
                    : "Extra checks appeared: either you added checks and did not update the"
                      " pin, or something is emitting checks it should not.");
-    check(ran == 158,
-          "check-count guard: every check in this suite actually ran (158 before this line)");
+    check(ran == 176,
+          "check-count guard: every check in this suite actually ran (176 before this line)");
 
     printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;

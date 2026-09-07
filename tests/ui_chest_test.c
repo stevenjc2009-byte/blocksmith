@@ -83,7 +83,7 @@ static char s_first[160];
 //
 // Seeded at a placeholder 1 first; the first green run's "CHECK COUNT: N check(s) were ADDED"
 // line is what set it — see tools/run_host_tests.sh's ui_chest stanza for the measured line.
-#define UI_CHEST_TEST_EXPECTED_CHECKS 437
+#define UI_CHEST_TEST_EXPECTED_CHECKS 486
 
 // gfx/sprite.c's per-frame quad ceiling, restated as a literal for the same reason as the pin
 // above: sprite.c cannot be linked here (it is the GPU batch), and the number is the budget
@@ -1456,9 +1456,14 @@ static void testXQuickMoveOnFurnaceScreenMovesWithinTheBagNotIntoTheFurnace(void
 }
 
 // X on the chest screen: `to_chest` is true, so the whole lifted stack is sent INTO the chest
-// (ui.c's chestQuickSlot: first same-item slot with room, else first empty) — and a full chest
-// refuses it, leaving the bag untouched, though the lift pointer is still cleared (handleQuickMove
-// drops any lift BEFORE it knows whether the chest has room; see its own comment on why).
+// (ui.c's handleQuickMove over invBridgePlanChestDeposit's plan) — and a full chest refuses it,
+// leaving the bag untouched, though the lift pointer is still cleared (handleQuickMove drops any
+// lift BEFORE it knows whether the chest has room; see its own comment on why).
+//
+// Both cases here land in ONE chest slot: the first has an empty chest, the second has no room
+// at all. That is why this test passed for the whole of v1.9.0 while the spill across several
+// slots was broken — see testXQuickMoveSpillsAcrossEveryChestSlotWithRoom below, which is the
+// case this one never reached.
 static void testXQuickMoveOnChestScreenDepositsIntoTheChest(void)
 {
 	{
@@ -1501,6 +1506,299 @@ static void testXQuickMoveOnChestScreenDepositsIntoTheChest(void)
 		CHECK(nothingLifted(&ui));      // still cleared: X drops the pointer regardless of outcome
 		CHECK(units(&inv, &cs, BLOCK_STONE) == 40);
 	}
+}
+
+// ── v1.9.1: X on the chest screen SPILLS ─────────────────────────────────────────────────
+//
+// The defect this pair exists for. Until v1.9.1 handleQuickMove picked ONE chest slot — the
+// first same-item slot with ANY room, else the first empty one — and sent the player's whole
+// stack to it, while its own comment claimed it applied invBridgePlanQuickMove's strip rule.
+// It did not: that rule spills across every eligible slot. Nothing caught it because the only
+// chest-X coverage was testXQuickMoveOnChestScreenDepositsIntoTheChest above, whose two cases
+// are "empty chest" and "no room anywhere" — the two shapes where one slot is the right answer.
+//
+// The bug was under-delivery, not loss: deps/blocksmith-server/game/bsgame.c clamps a deposit
+// to the slot's remaining room and debits exactly what it took, so the surplus stayed in the
+// bag. Silent, and with no refusal shown, which is the harder kind to notice in play.
+
+// A transfer spy that keeps EVERY call, not just the last, and records ui->picked_slot as the
+// callback saw it. s_spy above cannot be used: spyGot() hard-codes `calls == 1`, and a spill is
+// several calls by construction. picked_slot is captured because it is the subtle half of the
+// fix — chestTransferViaFn calls dropLifts() on a successful send, which sets picked_slot back
+// to -1, so a loop that set it once before the loop would leave every deposit after the first
+// with no source slot for the registrant to read (scene/ui.h says a registrant may read it).
+#define SPILL_SPY_MAX 8
+
+static struct {
+	int     calls;
+	uint8_t op[SPILL_SPY_MAX], a[SPILL_SPY_MAX], b[SPILL_SPY_MAX], count[SPILL_SPY_MAX];
+	int     picked[SPILL_SPY_MAX];
+	bool    answer;
+} s_spill;
+
+// `ud` is the UiState itself, so the spy can read picked_slot as it stood during the call.
+static bool spillSpy(void* ud, uint8_t op, int x, int y, int z, uint8_t a, uint8_t b,
+                     uint8_t count)
+{
+	(void)x; (void)y; (void)z;
+	if (s_spill.calls < SPILL_SPY_MAX) {
+		const int i = s_spill.calls;
+		s_spill.op[i]     = op;
+		s_spill.a[i]      = a;
+		s_spill.b[i]      = b;
+		s_spill.count[i]  = count;
+		s_spill.picked[i] = ((const UiState*)ud)->picked_slot;
+	}
+	s_spill.calls++;
+	return s_spill.answer;
+}
+
+// Chest slot 0 has 9 units of room, slot 1 has 4, slots 2-7 are empty, and the player is
+// holding 20. The strip rule tops up 0 then 1 then fills the first empty slot, so all 20 land.
+// The old one-slot code moved 9 and left 11 in the bag.
+static void testXQuickMoveSpillsAcrossEveryChestSlotWithRoom(void)
+{
+	UiState ui; Inventory inv; ChestState cs;
+	openChest(&ui);
+	inventoryInit(&inv);
+	chestStateInit(&cs);
+	setChest(&cs, 0, BLOCK_STONE, (uint8_t)(INV_STACK_MAX - 9));
+	setChest(&cs, 1, BLOCK_STONE, (uint8_t)(INV_STACK_MAX - 4));
+	setBag(&inv, 3, BLOCK_STONE, 20);
+	const int total = units(&inv, &cs, BLOCK_STONE);
+	uiChestStubResetNet();
+
+	tapRectKeys(&ui, &inv, NULL, &cs, hotbarSlotRect(3));
+	CHECK(ui.picked_slot == 3);
+
+	pressKeyOnLift(&ui, &inv, NULL, &cs, UI_GESTURE_KEY_X);
+
+	CHECK(chestSlotIs(&cs, 0, BLOCK_STONE, INV_STACK_MAX));   // topped up by 9
+	CHECK(chestSlotIs(&cs, 1, BLOCK_STONE, INV_STACK_MAX));   // topped up by 4
+	CHECK(chestSlotIs(&cs, 2, BLOCK_STONE, 7));               // the remaining 7 to the first empty
+	CHECK(bagSlotIs(&inv, 3, ITEM_NONE, 0));                  // and NOTHING is left behind
+	CHECK(nothingLifted(&ui));
+	CHECK(units(&inv, &cs, BLOCK_STONE) == total);            // conservation across the spill
+	CHECK(uiChestStubNet()->calls == 0);   // the chest path never goes through inv_bridge
+
+	// A chest that cannot take all of it still takes everything it CAN, and the surplus stays
+	// in the bag rather than vanishing — the clamp, checked on this side of the wire too.
+	{
+		UiState ui2; Inventory inv2; ChestState cs2;
+		openChest(&ui2);
+		inventoryInit(&inv2);
+		chestStateInit(&cs2);
+		fillChest(&cs2, BLOCK_DIRT, INV_STACK_MAX);              // every slot occupied...
+		setChest(&cs2, 6, BLOCK_STONE, (uint8_t)(INV_STACK_MAX - 3));   // ...except 3 units of room
+		setBag(&inv2, 3, BLOCK_STONE, 20);
+		const int total2 = units(&inv2, &cs2, BLOCK_STONE);
+
+		tapRectKeys(&ui2, &inv2, NULL, &cs2, hotbarSlotRect(3));
+		pressKeyOnLift(&ui2, &inv2, NULL, &cs2, UI_GESTURE_KEY_X);
+
+		CHECK(chestSlotIs(&cs2, 6, BLOCK_STONE, INV_STACK_MAX));
+		CHECK(bagSlotIs(&inv2, 3, BLOCK_STONE, 17));   // 20 - 3, still in hand
+		CHECK(units(&inv2, &cs2, BLOCK_STONE) == total2);
+	}
+}
+
+// The same spill under a session: nothing is applied locally (the server owns it), and each
+// piece goes out as its own DEPOSIT naming its own chest slot and its own count.
+static void testXQuickMoveSpillSendsOneDepositPerChestSlot(void)
+{
+	UiState ui; Inventory inv; ChestState cs;
+	openChest(&ui);
+	memset(&s_spill, 0, sizeof(s_spill));
+	s_spill.answer = true;                       // "sent — the server owns it"
+	uiSetChestTransferFn(&ui, spillSpy, &ui);    // ud is the UiState: see spillSpy's comment
+	inventoryInit(&inv);
+	chestStateInit(&cs);
+	setChest(&cs, 0, BLOCK_STONE, (uint8_t)(INV_STACK_MAX - 9));
+	setChest(&cs, 1, BLOCK_STONE, (uint8_t)(INV_STACK_MAX - 4));
+	// Bag slot 5, not 3: BLOCK_STONE IS 3, so a lift from slot 3 could not tell "a = item id"
+	// from "a = source bag slot" apart — the same reason the hook tests above use slot 5.
+	setBag(&inv, 5, BLOCK_STONE, 20);
+	const Inventory  inv0 = inv;
+	const ChestState cs0  = cs;
+
+	tapRectKeys(&ui, &inv, NULL, &cs, hotbarSlotRect(5));
+	CHECK(ui.picked_slot == 5);
+	CHECK(s_spill.calls == 0);   // a lift is not a transfer
+
+	pressKeyOnLift(&ui, &inv, NULL, &cs, UI_GESTURE_KEY_X);
+
+	CHECK(s_spill.calls == 3);
+	CHECK(s_spill.op[0] == UI_CHEST_OP_DEPOSIT && s_spill.a[0] == (uint8_t)BLOCK_STONE
+	      && s_spill.b[0] == 0 && s_spill.count[0] == 9);
+	CHECK(s_spill.op[1] == UI_CHEST_OP_DEPOSIT && s_spill.a[1] == (uint8_t)BLOCK_STONE
+	      && s_spill.b[1] == 1 && s_spill.count[1] == 4);
+	CHECK(s_spill.op[2] == UI_CHEST_OP_DEPOSIT && s_spill.a[2] == (uint8_t)BLOCK_STONE
+	      && s_spill.b[2] == 2 && s_spill.count[2] == 7);
+
+	// The re-set: every deposit names the source bag slot, not just the first. A loop that set
+	// picked_slot once would give 5, -1, -1 here, because a successful send clears it.
+	CHECK(s_spill.picked[0] == 5 && s_spill.picked[1] == 5 && s_spill.picked[2] == 5);
+
+	CHECK(bagEq(&inv, &inv0));    // applied nothing locally, either side
+	CHECK(chestEq(&cs, &cs0));
+	CHECK(nothingLifted(&ui));
+	CHECK(ui.picked_slot == -1);  // and X holds nothing once the whole spill is out
+
+	uiSetChestTransferFn(&ui, NULL, NULL);
+}
+
+// ── v1.9.1: a server snapshot must not duplicate a detached split half ───────────────────
+//
+// The most serious defect found in the v1.9.0 sweep. A Y split moves half a stack into
+// ui->lift, which lives in UiState and NOT in Inventory, and is deliberately never reported to
+// the server (net/inv_bridge.h). main.c's inventory hook used to call invBridgeApplyState
+// directly, which overwrites every slot wholesale from the server's copy — a copy that still
+// showed the whole undivided stack in the origin slot, because it was never told about the
+// split. The origin came back full while the lifted half was still held separately: units
+// created from nothing, repeatable without bound.
+//
+// Reaching it needed no exotic input. The bag screen is not the pause menu, so L/R hotbar
+// cycling and the craft rows both work with a half in the air, and the server answers EVERY
+// accepted inventory action with a fresh snapshot (deps/blocksmith-server/game/bsgame.c's
+// handle_inv_action ends in an unconditional send_inv_state). Split, nudge L, place.
+//
+// This drives the REAL production path: uiApplyInvSnapshot() is what main.c's onInvState calls
+// now, so a future edit that routes around it fails here rather than on a console.
+
+// The server's view of the bag: one slot, one item, the count it believes is there. Everything
+// else empty, which is what the server would report for a bag holding only this stack.
+static NetworldInvState serverSnapshot(int slot, ItemId item, uint8_t count)
+{
+	NetworldInvState s;
+	memset(&s, 0, sizeof(s));
+	s.selected_hotbar   = 0;
+	s.slots[slot].item  = (uint8_t)item;
+	s.slots[slot].count = count;
+	return s;
+}
+
+static void testSnapshotDuringASplitDropsTheLiftInsteadOfDuplicatingIt(void)
+{
+	UiState ui; Inventory inv;
+	uiInit(&ui);
+	ui.screen = UI_SCR_INVENTORY;
+	inventoryInit(&inv);
+	setBag(&inv, 4, BLOCK_STONE, 80);
+
+	tapRectKeys(&ui, &inv, NULL, NULL, hotbarSlotRect(4));
+	pressKeyOnLift(&ui, &inv, NULL, NULL, UI_GESTURE_KEY_Y);
+
+	// Mid-air: 40 in the lift, 40 left behind, 80 accounted for. The server still thinks 80.
+	CHECK(ui.lift.item == BLOCK_STONE && ui.lift.count == 40);
+	CHECK(bagSlotIs(&inv, 4, BLOCK_STONE, 40));
+	CHECK(bagUnits(&inv, BLOCK_STONE) + ui.lift.count == 80);
+
+	// The snapshot the server sends in reply to an unrelated action (an L/R hotbar nudge, a
+	// craft): its copy of the origin slot, still undivided.
+	const NetworldInvState snap = serverSnapshot(4, BLOCK_STONE, 80);
+	uiApplyInvSnapshot(&ui, &inv, &snap);
+
+	// picked_slot is deliberately NOT cleared, so nothingLifted() (which reads picked_slot and
+	// picked_chest, not the detached lift) is the wrong question here. It stays naming slot 4:
+	// it is an INDEX, nothing is conserved through it, and the panel re-reads that slot every
+	// frame, so the player sees the restored 80 under the highlight. See uiApplyInvSnapshot.
+	CHECK(ui.picked_slot == 4);
+	CHECK(ui.lift.item == ITEM_NONE && ui.lift.count == 0);   // the half is gone from the air...
+	CHECK(ui.lift_from == -1);
+	CHECK(bagSlotIs(&inv, 4, BLOCK_STONE, 80));       // ...and back inside the count the server sent
+
+	// The whole point, stated as conservation rather than as slot contents: 80 units existed
+	// before the split and 80 exist after the snapshot. The old code left this at 120.
+	CHECK(bagUnits(&inv, BLOCK_STONE) + ui.lift.count == 80);
+	CHECK(bagTotal(&inv) == 80);
+}
+
+// The same guard with NOTHING in the air: an ordinary snapshot must still apply in full. A fix
+// that dropped the SNAPSHOT instead of the lift would pass every check above while breaking
+// what invBridgeApplyState is actually for, so this is the other half of the pair.
+static void testSnapshotWithNoLiftStillAppliesWholesale(void)
+{
+	UiState ui; Inventory inv;
+	uiInit(&ui);
+	ui.screen = UI_SCR_INVENTORY;
+	inventoryInit(&inv);
+	setBag(&inv, 4, BLOCK_STONE, 12);
+	setBag(&inv, 7, BLOCK_DIRT,  3);
+
+	const NetworldInvState snap = serverSnapshot(2, BLOCK_STONE, 55);
+	uiApplyInvSnapshot(&ui, &inv, &snap);
+
+	CHECK(bagSlotIs(&inv, 2, BLOCK_STONE, 55));   // the server's slot took effect
+	CHECK(bagSlotIs(&inv, 4, ITEM_NONE, 0));      // and the local ones it did not mention are gone
+	CHECK(bagSlotIs(&inv, 7, ITEM_NONE, 0));
+	CHECK(bagTotal(&inv) == 55);
+	CHECK(nothingLifted(&ui));
+
+	// A NULL is a refusal that changes nothing, not a crash. main.c hands this the address of
+	// a static, so neither case arises there today; they are checked because this function is
+	// now the only door into invBridgeApplyState and a door should not have a hole in it.
+	uiApplyInvSnapshot(&ui, &inv, NULL);
+	CHECK(bagTotal(&inv) == 55);
+	uiApplyInvSnapshot(NULL, &inv, &snap);
+	CHECK(bagTotal(&inv) == 55);
+}
+
+// v1.9.1, the second half of the same defect. ui.c's returnLift() used to clear lift_from
+// UNCONDITIONALLY, even when invBridgeReturnLift refused a remainder (its contract: "units the
+// bag would not take back are still in lift"). With lift_from at -1, reconcileLift's
+// `picked_slot != lift_from` test went false as soon as picked_slot reset to -1 as well, so
+// nothing ever retried; liftDetached() stayed true, and handleSplit's `if (liftDetached) return`
+// refused every later split for the rest of the session. Keeping the origin index instead makes
+// it self-heal on the next frame that names another slot.
+//
+// The precondition -- a full bag with a DIFFERENT item in the origin slot -- can only arise
+// from a desync, which the snapshot fix above now prevents at source. It is fixed and checked
+// anyway: the whole reason the duplication existed is that a piece of state was left in a
+// condition no caller expected, and a lift that can never be returned is that same shape.
+static void testARefusedLiftReturnKeepsItsOriginAndRetriesLater(void)
+{
+	UiState ui; Inventory inv;
+	uiInit(&ui);
+	ui.screen = UI_SCR_INVENTORY;
+	inventoryInit(&inv);
+
+	// Every slot full, so inventoryAdd's fallback inside invBridgeReturnLift has nowhere to
+	// put a remainder. BLOCK_STONE + i would collide with the split slot's own item, so the
+	// origin gets its own item and the rest get another.
+	for (int i = 0; i < INV_SLOT_COUNT; i++) setBag(&inv, i, BLOCK_DIRT, INV_STACK_MAX);
+	setBag(&inv, 4, BLOCK_STONE, INV_STACK_MAX);
+
+	tapRectKeys(&ui, &inv, NULL, NULL, hotbarSlotRect(4));
+	pressKeyOnLift(&ui, &inv, NULL, NULL, UI_GESTURE_KEY_Y);
+	CHECK(ui.lift.item == BLOCK_STONE);
+	CHECK(ui.lift.count == 50);   // ceil(99/2)
+	CHECK(ui.lift_from == 4);
+
+	// The desync, staged directly: the origin now holds a different item, at the cap, and every
+	// other slot is full of that item too. invBridgeReturnLift's liftInto refuses on the item
+	// mismatch and its inventoryAdd fallback has no room, so the whole 50 come back refused.
+	// (This throws away the 49 left behind by the split, so no conservation check here — the
+	// point of the fixture is the refusal, not the arithmetic, which the tests above cover.)
+	setBag(&inv, 4, BLOCK_DIRT, INV_STACK_MAX);
+
+	// Tap the origin again: handleSlotTap's cancel branch (ui.c:203-207), which is returnLift
+	// followed by picked_slot = -1. That -1 is what used to make the loss permanent.
+	tapRectKeys(&ui, &inv, NULL, NULL, hotbarSlotRect(4));
+
+	CHECK(ui.lift.item == BLOCK_STONE);   // refused: still in the air
+	CHECK(ui.lift.count == 50);
+	CHECK(ui.lift_from == 4);   // and it REMEMBERS where it came from. The old code put -1 here.
+	CHECK(ui.picked_slot == -1);
+
+	// Free the origin, then give the UI a frame: reconcileLift sees picked_slot != lift_from
+	// and retries the return that previously could never happen again.
+	setBag(&inv, 4, ITEM_NONE, 0);
+	(void)frameKeys(&ui, &inv, NULL, NULL, false, 0, 0, 0);
+
+	CHECK(ui.lift.item == ITEM_NONE);   // recovered
+	CHECK(ui.lift.count == 0);
+	CHECK(ui.lift_from == -1);
+	CHECK(bagSlotIs(&inv, 4, BLOCK_STONE, 50));   // back where it was lifted from
 }
 
 // X is fed every frame including the HUD (ui_gesture.h's contract), but on the HUD slot_under
@@ -1618,6 +1916,11 @@ int main(void)
 	testXQuickMovesTheWholeStackToTheOtherStripOnTheOverlay();
 	testXQuickMoveOnFurnaceScreenMovesWithinTheBagNotIntoTheFurnace();
 	testXQuickMoveOnChestScreenDepositsIntoTheChest();
+	testXQuickMoveSpillsAcrossEveryChestSlotWithRoom();
+	testXQuickMoveSpillSendsOneDepositPerChestSlot();
+	testSnapshotDuringASplitDropsTheLiftInsteadOfDuplicatingIt();
+	testSnapshotWithNoLiftStillAppliesWholesale();
+	testARefusedLiftReturnKeepsItsOriginAndRetriesLater();
 	testXIsInertOnTheHudScreen();
 
 	testEveryScreenFitsTheSpriteQuadBudget();

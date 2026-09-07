@@ -153,6 +153,50 @@ int invBridgePlanQuickMove(const Inventory* inv, int slot, InvBridgeMove* out, i
 	return n;
 }
 
+int invBridgePlanChestDeposit(const Inventory* inv, int slot, const ChestState* cs,
+                              InvBridgeChestDeposit* out, int cap)
+{
+	if (!inv || !cs || !out || cap <= 0 || slot < 0 || slot >= INV_SLOT_COUNT) return 0;
+
+	const ItemId item = inv->slots[slot].item;
+	if (item == ITEM_NONE) return 0;
+
+	uint8_t left = inv->slots[slot].count;
+	if (left == 0) return 0;
+
+	// No simulated copy of the chest here, unlike invBridgePlanQuickMove's `Inventory sim`.
+	// It needs one because inventoryMoveUnits is the primitive that owns the rules and it
+	// mutates; a chest has no such primitive on this side of the wire (the server owns the
+	// authoritative version), so room is arithmetic and the only thing a copy would buy is
+	// re-reading a slot this loop visits at most once. Each pass tests the ORIGINAL cs->item,
+	// so pass 0 sees only same-item slots and pass 1 only empty ones — disjoint sets — and
+	// within a pass `c` never repeats. That is what makes reading cs->count[c] directly safe.
+	int n = 0;
+	for (int pass = 0; pass < 2 && left > 0 && n < cap; pass++) {
+		for (int c = 0; c < CHEST_SLOTS && left > 0 && n < cap; c++) {
+			uint8_t room;
+			if (pass == 0) {
+				// >= rather than ==: a count above the cap would underflow the subtraction
+				// below into a room of ~250 and describe a deposit the server would clamp
+				// away. Nothing on this side produces one, but the payload arrives off the
+				// wire and this is the cheap end of that argument.
+				if (cs->item[c] != item || cs->count[c] >= INV_STACK_MAX) continue;
+				room = (uint8_t)(INV_STACK_MAX - cs->count[c]);
+			} else {
+				if (cs->item[c] != ITEM_NONE) continue;
+				room = INV_STACK_MAX;   // untouched by pass 0, which skips empty slots
+			}
+
+			const uint8_t units = left < room ? left : room;
+			out[n].chest_slot = (uint8_t)c;
+			out[n].count      = units;
+			n++;
+			left = (uint8_t)(left - units);
+		}
+	}
+	return n;
+}
+
 uint8_t invBridgeApplyMove(Inventory* inv, const InvBridgeMove* m)
 {
 	if (!inv || !m || m->op != BS_INV_OP_MOVE) return 0;
