@@ -47,6 +47,23 @@ serves. `v1.9.0` is tagged and built but its GitHub Release is not published. `v
 branch currently checked out and is a build in progress, not a release. Order, scope, and
 whether a version still ahead ships at all can still change before it does.
 
+**[2026-09-07 11:57] v1.9.1 published; this header is now stale.** Branch `v1.9.1` is pushed to
+`origin` (head `7a07008`, preceding commit `ddd7b59`); annotated tag `v1.9.1` is on the remote
+(pushed as `refs/tags/v1.9.1` — plain `git push origin v1.9.1` failed with `src refspec v1.9.1
+matches more than one`, since a branch and a tag shared the name). A GitHub Release is published
+(not a draft, not a prerelease) at
+`https://github.com/stevenjc2009-byte/blocksmith/releases/tag/v1.9.1`, carrying
+`blocksmith1.9.1.cia` (1,479,616 bytes) and `whatsnew1.9.1.txt` (963 bytes). Verified after
+publishing: `/releases/latest` returns HTTP 302 to `/releases/tag/v1.9.1`, and
+`/releases/download/v1.9.1/blocksmith1.9.1.cia` returns 200, 1,479,616 bytes, md5
+`9049ade3bc7e0c47cccbf7935a3f4bd2` — an exact match for the locally built file. **Options →
+Check for Update now resolves to v1.9.1. Newest published version is 1.9.1, not 1.8.20.** v1.9.0
+still has no GitHub Release of its own, and that is now a settled decision rather than an
+outstanding gap: v1.9.1 supersedes v1.9.0 and contains its content, and `/releases/latest`
+correctly lands on v1.9.1. Not verified: the `.cia` has not been booted on a console or an
+emulator. No Discord announcement fired — `.github/` (holding `discord-release.yml`) is
+untracked in this repo, so no workflow ran on the release.
+
 That parenthetical is deliberately about the *redirect* and not about the GitHub API. The
 in-game updater cannot use the API: it is rate limited to 60 requests an hour **per IP**, and
 that IP is shared by everyone behind the same NAT, so it fails for real players at random and
@@ -1119,7 +1136,13 @@ entry says the GitHub Release carrying it "is not published yet", so **Options �
 Update** still falls back to v1.8.20 and the README's install QR still 404s. That has not
 changed as of this pass.
 
-### v1.9.1 — The new interface — built, not tagged, not released
+**[2026-09-07 11:57] Settled, not outstanding.** v1.9.1 has since been published as a full
+GitHub Release (`https://github.com/stevenjc2009-byte/blocksmith/releases/tag/v1.9.1`),
+superseding v1.9.0 and containing its content; `/releases/latest` correctly redirects to
+v1.9.1. v1.9.0 having no GitHub Release of its own is now a deliberate outcome, not a gap
+waiting to be closed — nothing further is planned to give v1.9.0 a release of its own.
+
+### v1.9.1 — The new interface — released and published
 
 **Changed.** The menus and inventory redrawn around a long horizontal bar of categories,
 with the focused category's items descending in a list below it — the interaction shape
@@ -1178,14 +1201,78 @@ and `docs/research/ui-skin.md`, named above, were early research; the design tha
 shipped, with its own corrections against reality, is recorded in
 `docs/blueprint-1.9.1-interface.md`.
 
-### v1.9.2 — Redstone — planned
+**[2026-09-07 11:57] Published.** The branch is now `7a07008` (one commit past `ddd7b59`) and
+pushed to `origin`. Annotated tag `v1.9.1` is on the remote — pushed as `refs/tags/v1.9.1`
+because a plain `git push origin v1.9.1` fails with `src refspec v1.9.1 matches more than one`
+when a branch and a tag share the name. A GitHub Release is published (not a draft, not a
+prerelease): `https://github.com/stevenjc2009-byte/blocksmith/releases/tag/v1.9.1`, with
+`blocksmith1.9.1.cia` (1,479,616 bytes) and `whatsnew1.9.1.txt` (963 bytes) attached.
+`/releases/latest` now returns HTTP 302 to `/releases/tag/v1.9.1`, and the asset URL
+`/releases/download/v1.9.1/blocksmith1.9.1.cia` returns 200, 1,479,616 bytes, md5
+`9049ade3bc7e0c47cccbf7935a3f4bd2` — matching the locally built file exactly — so Options →
+Check for Update now resolves to v1.9.1. **Still not verified: the `.cia` has never been
+booted on a console or an emulator** — everything above is a file-level and network-level
+check, not a play test. No Discord announcement fired for this release, because `.github/`
+(holding `discord-release.yml`) is untracked in this repo, so no workflow ran.
+
+### v1.9.2 — The freeze hotfix
+
+**Fixed.** v1.9.1 could stop answering every button while still drawing at full rate — what
+steve reported as "i create aworld and i cant move it is frozen completeley". Not a hang: a
+stylus still resting on the bottom screen when one screen handed over to another was read as a
+fresh press by the receiving screen, that press landed on `hudToggleRect()` (x 0..320,
+y 40..66, `source/scene/ui_layout.c:26-30`), and the `inputMapSetMenuOwnsPad()` that v1.9.1
+introduced makes an open bar return 0 from `inputKey()` for every bound verb and 0.0f from
+`inputLookScale()`. Move, look, jump, break, place and eat all stopped while the world kept
+drawing, and **B** was the only way out. In v1.8.20 the same stray tap opened a cosmetic
+overlay and the player kept walking; the kill switch is what turned it into a freeze.
+
+Three hand-offs reached it, all fixed in `source/main.c`: creating a world (title row 0 "NEW
+WORLD" is y 52..78, overlapping on y 52..66 — no saved-world row does, they start at y 80,
+which is exactly the create-vs-load asymmetry steve described); tapping Resume in the pause
+menu (pausebar row 0 is y 58..80, and `pauseMenuTouch()` closes the panel *synchronously*, so
+`paused` is already false when `drawBottomUi()` runs later in the same frame — this fired on a
+plain tap, not only a hold, and is the likeliest one hit); and tapping Quit to title (pausebar
+row 1 is y 80..102 against the title's first saved world at y 80..106, and the title screen
+starts a world on the press edge with no confirmation, so quitting dropped the player straight
+back into a world they had not chosen).
+
+**How.** A carried-touch gate in both loops: a touch that is already down when a screen is
+entered is ignored until the stylus has been seen off the glass once. Gated on an observed
+release rather than on a frame count, because the stylus is down for many frames — seeding
+`touch_prev = true` would have suppressed exactly one. Gated where the shared `UiInput` is
+built rather than inside `source/scene/ui.c`, because the pause menu, the remap screen and the
+debug menu all read the same value. Eight functional lines.
+
+**Verified.** A/B in Azahar with the published v1.9.1 asset as the red control (`blocksmith.cia`,
+md5 `9049ade3bc7e0c47cccbf7935a3f4bd2`, byte-identical to the file on the release page). On
+that build: creating a world with the stylus held opened the tab bar, and three seconds of held
+D-pad produced byte-identical frames (`a7d4409e…` twice); a 90 ms Resume tap did the same
+(`5718d824…` twice); pressing **B** made the frames differ (`042ac609` vs `accf6fd1`), which is
+what proves the process was alive and the input path was the dead thing. On the fixed build all
+three routes leave the HUD alone and the player walks. Regressions checked: a deliberate
+press-and-hold on the strip still opens the bar, and tapping a world row on the title screen
+still loads it. Host suite exit 0 with the pins unchanged (worldlist 595, ui_gesture 103,
+barnav 3306, pausebar 34082, chest_ui 521); `BS_BOTTOM_UI=0` still compiles.
+
+**Not verified.** The freeze was never reproduced on real hardware — only in Azahar, with the
+stylus driven by `PostMessage`. The emulator defect has the identical signature and the same
+three triggers, but a matched signature is not the device. Also unexamined:
+`runLoadingScreen()` (`source/main.c:2150`) keeps its own `touch_prev` at 2157 and has no
+carried-touch gate; what a stale press does there was not looked at.
+
+**Renumbering.** This hotfix takes the v1.9.2 number that `docs/ROADMAP.md` had reserved for
+redstone, so redstone is now v1.9.3 and the dimensions version is v1.9.4.
+`docs/blueprint-1.9.2-redstone.md` keeps its filename.
+
+### v1.9.3 — Redstone — planned
 
 **Added.** Wire, power, levers, buttons, pressure plates, doors, pistons.
 
 `docs/ROADMAP.md` gives this version one short paragraph; nothing beyond it has been
 researched or specified yet.
 
-### v1.9.3 — The other worlds — planned
+### v1.9.4 — The other worlds — planned
 
 **Added.** Two more dimensions with their own names — the fire one and the end one, named
 but not copied from anything — each with its own generator, its own blocks and its own

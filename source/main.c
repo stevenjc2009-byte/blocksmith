@@ -3858,6 +3858,15 @@ static bool runTitleScreen(Options* opts, bool returning_from_server)
 		s_world_refused_why = NULL;
 	}
 
+	// v1.9.2. The same carried-touch gate the gameplay loop runs, for the other direction of
+	// the same hand-off. The pause panel's "Quit to title" is scene/pausebar.h row 1, y 80..102,
+	// and this screen's first saved world is titleRowRect(1), y 80..106 — they overlap almost
+	// exactly. titleInit() above has just zeroed TitleState.touch_prev, so a stylus still on
+	// the glass reads as a fresh press on that row, and title.c starts a world on the press
+	// edge with no confirmation: the player asks to quit and is dropped straight back into a
+	// world they did not pick. Ignore the stylus until it has been lifted once.
+	bool title_touch_carried = true;
+
 	while (aptMainLoop()) {
 		hidScanInput();
 		BS_STAGE_ONCE(BS_STAGE_ID_INPUT_POLL, "INPUT_POLL_FIRST");
@@ -3897,10 +3906,15 @@ static bool runTitleScreen(Options* opts, bool returning_from_server)
 		hidCircleRead(&title_cp);
 		const u32 title_stick = barStickEdge(&s_title_stick, title_cp.dx, title_cp.dy);
 
+		// One clean release retires the touch the pause panel handed us — see
+		// title_touch_carried before the loop.
+		const bool title_raw_touch = (held & KEY_TOUCH) != 0 || tp.px != 0 || tp.py != 0;
+		if (title_touch_carried && !title_raw_touch) title_touch_carried = false;
+
 		const TitleInput in = {
 			.keys_down  = hidKeysDown() | title_stick,
 			.keys_held  = held,
-			.touch_down = (held & KEY_TOUCH) != 0 || tp.px != 0 || tp.py != 0,
+			.touch_down = title_raw_touch && !title_touch_carried,
 			.touch_x    = tp.px,
 			.touch_y    = tp.py,
 		};
@@ -5919,6 +5933,30 @@ session_start:
 	// scene/ui.c edge-detects against its own touch_prev and taking that away would break
 	// the hotbar.
 	bool touch_prev = false;
+
+	// v1.9.2. True until the stylus has been seen OFF the glass at least once, and while it
+	// is true the frame reports no touch at all.
+	//
+	// The bug this fixes: the world is entered from the title screen's world list, and the
+	// list row that starts it is under the player's stylus at the moment it does. Row 0 is
+	// "NEW WORLD" at y 52..78 (scene/title.c titleRowRect(0)), and the gameplay strip that
+	// opens the tab bar is hudToggleRect() at y 40..66 (scene/ui_layout.c) — they overlap on
+	// y 52..66, so the point the player pressed to create a world is a point that opens the
+	// bar once the world is up. touch_prev above starts false and the first gameplay frame
+	// therefore reads a still-down stylus as a fresh press: the bar opens on frame one,
+	// main.c's inputMapSetMenuOwnsPad(bar_open) below zeroes every move and look verb, and
+	// the game renders on at full rate with nothing responding. That is indistinguishable
+	// from a hang from the outside, which is what it was reported as.
+	//
+	// Only the NEW WORLD row overlaps — the world rows below it start at y 80 — which is why
+	// creating a world hit this and loading one did not.
+	//
+	// Gated here rather than in scene/ui.c because ui.c is not the only consumer: pausemenu,
+	// the remap screen and the debug menu all read this same UiInput, and a stylus carried in
+	// from another screen is not a press any of them should see either. Not fixed by seeding
+	// touch_prev = true, because that suppresses exactly one frame and the stylus is down for
+	// many; the state has to persist until an actual release is observed.
+	bool touch_carried = true;
 #endif
 
 	// Only the two scripted knobs read this, so a playtest build does not carry it.
@@ -6017,8 +6055,14 @@ session_start:
 		// costs nothing.
 		touchPosition tp = {0};
 		hidTouchRead(&tp);
+		// The stylus as the hardware reports it, before the carried-touch gate below.
+		const bool raw_touch = (hidKeysHeld() & KEY_TOUCH) != 0 || tp.px != 0 || tp.py != 0;
+		// One clean release retires the touch the title screen handed us — see touch_carried's
+		// declaration before the loop. Cleared on release rather than on the first frame
+		// because the stylus is down for many frames, not one.
+		if (touch_carried && !raw_touch) touch_carried = false;
 		const UiInput touch = {
-			.touch_down = (hidKeysHeld() & KEY_TOUCH) != 0 || tp.px != 0 || tp.py != 0,
+			.touch_down = raw_touch && !touch_carried,
 			.touch_x    = tp.px,
 			.touch_y    = tp.py,
 			.keys_held  = hidKeysHeld(),   // v1.9.0 SPLIT: X / Y for scene/ui_gesture.h
@@ -6041,6 +6085,12 @@ session_start:
 		// called from exactly one place — just below, off the menu's answer instead of off
 		// the button — for the reason step 7.6 gave: leaving 3D on while only one eye is
 		// drawn shows the right eye a stale buffer.
+#if BS_BOTTOM_UI
+		// v1.9.2. Snapshot taken before anything in this frame can close the pause panel:
+		// the SELECT toggle immediately below, pauseMenuTouch and pauseMenuInput all close
+		// it synchronously. Consumed where `paused` is read, further down.
+		const bool pause_was_open = pauseMenuOpen();
+#endif
 		if (down & KEY_SELECT) pauseMenuToggle();
 
 		int  dist_step     = 0;
@@ -6118,6 +6168,24 @@ session_start:
 		// options page is showing hold still while they are being read. Networking is the
 		// deliberate exception — see the netUpdate() block below.
 		const bool paused = pauseMenuOpen();
+
+#if BS_BOTTOM_UI
+		// v1.9.2. The frame the pause panel closes still belongs to the panel as far as the
+		// bottom UI is concerned. The panel's RESUME row is scene/pausebar.h's row 0, y 58..80,
+		// and the strip that opens the tab bar is hudToggleRect(), y 40..66 — they overlap on
+		// y 58..66, so the pixel that resumes the game is a pixel that opens the bar. Because
+		// pauseMenuTouch() above closes the panel synchronously, `paused` is already false by
+		// the time drawBottomUi() runs, and the stylus that resumed is still on the glass:
+		// ui.c would edge-detect it as a fresh press (its own touch_prev was pinned false by
+		// the `blank` fed to it all through the pause) and open the bar, which
+		// inputMapSetMenuOwnsPad() below turns into a total input lockout. That is the same
+		// freeze the world-entry gate fixes, reached from the commonest action in the menu.
+		//
+		// Two halves: keep the bottom UI blind for the rest of this frame, and re-arm the
+		// carried-touch gate so the stylus must be lifted once before it counts again.
+		const bool pause_closed_now = pause_was_open && !paused;
+		if (pause_closed_now) touch_carried = true;
+#endif
 
 		// Every scene, every frame, whether or not Multiplayer is even open — see netUpdate()
 		// and networldUpdate()'s own contracts for why neither ever blocks a frame. Pumped
@@ -7861,7 +7929,7 @@ session_start:
 			// then register as a fresh press.
 			const UiInput blank = {0};
 			drawBottomUi(ui_ok, highlight_ok ? status : "HIGHLIGHT INIT FAILED",
-			             netline, paused ? &blank : &touch);
+			             netline, (paused || pause_closed_now) ? &blank : &touch);
 
 			// v1.4.0 battery gauge, top-right corner of the bottom screen. Own sprite pass
 			// for the same reason pauseMenuDraw opens one: uiUpdateDraw closed its batch.

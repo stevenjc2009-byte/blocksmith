@@ -4,11 +4,61 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.9.2] - 2026-09-07
+
+**A hotfix for one defect in v1.9.1: the game could enter a state where it rendered at full
+framerate and answered no input at all.** Three separate hand-offs could reach it; all three
+are fixed and all three were reproduced against the published v1.9.1 `.cia` and re-run against
+this build.
+
+### Fixed
+
+- **A stylus still resting on the bottom screen when one screen hands over to another was read
+  as a fresh press by the receiving screen.** That press landed on `hudToggleRect()` — the
+  full-width strip at y 40..66 that opens the tab bar — and v1.9.1's new
+  `inputMapSetMenuOwnsPad()` makes an open bar answer 0 for every bound verb and 0.0f for the
+  look scale. Movement, camera, jump, break, place and eat all stopped while the world kept
+  drawing, which is indistinguishable from a hang; **B** was the only way out. Three routes
+  reached it, all in `source/main.c`:
+  - **Creating a world.** The title screen's "NEW WORLD" row is y 52..78 and overlaps the
+    strip on y 52..66. No saved-world row does — they start at y 80 — so this happened when
+    creating a world and not when loading one.
+  - **Tapping "Resume" in the pause menu.** The pause panel's Resume row is y 58..80,
+    overlapping on y 58..66. `pauseMenuTouch()` closes the panel synchronously, so `paused` is
+    already false when the bottom UI is drawn later in the same frame and the live stylus
+    reaches it. This fired on an ordinary tap, not only on a held one.
+  - **Tapping "Quit to title".** The pause panel's Quit row is y 80..102 and the title
+    screen's first saved world is y 80..106, and the title screen starts a world on the press
+    edge with no confirmation — so quitting could drop the player straight back into a world
+    they had not chosen.
+
+  The fix is a carried-touch gate in both loops: a touch that is already down when a screen is
+  entered is ignored until the stylus has been seen off the glass once. It re-arms when the
+  pause panel closes, and the frame on which the panel closes is treated as still paused for
+  the bottom UI. Gated where the shared `UiInput` is built rather than inside `scene/ui.c`,
+  because the pause menu, the remap screen and the debug menu read the same value.
+
+### Verified
+
+A/B in Azahar against the published v1.9.1 asset (`blocksmith.cia`, md5
+`9049ade3bc7e0c47cccbf7935a3f4bd2`, byte-identical to the file on the release page): on that
+build, creating a world with the stylus held opened the tab bar and three seconds of held
+D-pad produced byte-identical frames, and tapping Resume did the same; pressing **B** made the
+frames differ again, proving the process was alive and the input path was the thing that was
+dead. On this build all three routes leave the HUD alone and the player walks. A deliberate
+press on the strip still opens the bar and tapping a world row on the title screen still loads
+it. Host suite exits 0 with its check counts unchanged; `BS_BOTTOM_UI=0` still compiles.
+
+**Not verified:** the freeze was never reproduced on real hardware — only in an emulator, with
+the stylus driven synthetically. The signature matches the report exactly, but a matched
+signature is not the device.
+
 ## [1.9.1] - 2026-09-07
 
-**Not released, not committed.** This entry documents what is in the working tree. The host
-suite is green (`SUITE_EXIT=0`) and both console arms compile clean, but a compile is not a
-playtest and none of the visual claims below have been looked at on hardware.
+**Released 2026-09-07**, superseded by 1.9.2 above, which fixes an input lockout this release
+introduced. The host suite was green (`SUITE_EXIT=0`) and both console arms compiled clean, but
+a compile is not a playtest and none of the visual claims below were looked at on hardware
+before it shipped.
 
 `docs/ROADMAP.md` calls this version "The new interface". The inventory, crafting, chest and
 furnace screens stop being four separate screens and become **tabs on one bar**. Only the tabs

@@ -36,15 +36,15 @@ Two rules run through the whole ladder:
 > not six"). Only slots 58–62 remain (five), while the redstone and dimensions plans together
 > still ask for fifteen. `docs/blueprint-1.9.2-redstone.md` alone spends all five: wire, torch,
 > lamp and both door tiles (`TILE_USED_COUNT 54 → 59`), leaving the atlas full at 59 of 64 and
-> nothing for v1.9.3 at all. Enlarging the sheet was costed on 2026-09-05 and is **not** the
+> nothing for the dimensions version at all. Enlarging the sheet was costed on 2026-09-05 and is **not** the
 > cheap escape it looks like: `ATLAS_H_PX` is already 1024, which `source/world/atlas_uv.h:15-21`
 > documents as the PICA200's hard per-dimension maximum, and the width is pinned to one tile
 > because the greedy mesher relies on `GPU_REPEAT` having a period of exactly one tile. The two
 > real options are a second atlas bound to the one free texture unit (+32 KiB VRAM, mesher and
 > shader surgery, spends the last unit), or halving `TILE_PX` to 8 (free, but every one of the
 > 57 existing tiles must be redrawn at half resolution and may read as mush at 400×240).
-> Nothing should spend those five slots until this is decided, and v1.9.2 as scoped spends all
-> of them.
+> Nothing should spend those five slots until this is decided, and redstone as scoped spends all
+> of them. (Redstone is v1.9.3 as of 2026-09-07 — v1.9.2 became the freeze hotfix.)
 >
 > **[2026-09-07] Corrected: v1.9.0 is not released.** The entry below used to read "✅
 > released". It was not: `git tag -l 'v1.9*'` is empty, `git log refs/tags/v1.8.20..HEAD`
@@ -53,6 +53,13 @@ Two rules run through the whole ladder:
 > the working tree (`git status` lists it), and `CHANGELOG.md`'s `[1.9.0]` entry already
 > says plainly that nothing in it has run on a console. The "✅ released" mark is removed
 > below until a v1.9.0 tag and release actually exist.
+>
+> **[2026-09-07 11:57] v1.9.0's missing release is now settled, not outstanding.** v1.9.1
+> has since published as a full GitHub Release
+> (`https://github.com/stevenjc2009-byte/blocksmith/releases/tag/v1.9.1`), superseding
+> v1.9.0 and containing its content; `/releases/latest` correctly redirects to v1.9.1. No
+> v1.9.0 tag or release is still needed or planned — the "until a v1.9.0 tag and release
+> actually exist" condition above will not be met, by decision, not by oversight.
 
 ---
 
@@ -637,7 +644,7 @@ and the UI gesture — not the mechanic.
 
 ---
 
-## v1.9.1 — The new interface
+## v1.9.1 — The new interface ✅ released
 
 **Changed.** The menus and inventory redrawn around a long horizontal bar of options —
 the shape the legacy console crafting menu and the PS3 system menu share. Referenced,
@@ -650,10 +657,55 @@ not copied: none of their art, none of their layout metrics, none of their icons
 > (default and `BS_BOTTOM_UI=0`) compile clean. **No tick, for the same reason v1.9.0 has
 > none** (see the note at the top of this file): nothing here has run on a console, and
 > v1.9.0's own GitHub Release is still unpublished, so v1.9.1 cannot ship ahead of it.
+>
+> **[2026-09-07 11:57] Published; the "cannot ship ahead of it" line above did not hold.**
+> Branch `v1.9.1` is pushed to `origin` (head `7a07008`); annotated tag `v1.9.1` is on the
+> remote (pushed as `refs/tags/v1.9.1`, since a plain `git push origin v1.9.1` fails with
+> `src refspec v1.9.1 matches more than one` when a branch and a tag share the name). A
+> GitHub Release is published (not a draft, not a prerelease) at
+> `https://github.com/stevenjc2009-byte/blocksmith/releases/tag/v1.9.1`, carrying
+> `blocksmith1.9.1.cia` (1,479,616 bytes) and `whatsnew1.9.1.txt` (963 bytes).
+> `/releases/latest` now returns HTTP 302 to `/releases/tag/v1.9.1`, and
+> `/releases/download/v1.9.1/blocksmith1.9.1.cia` returns 200, 1,479,616 bytes, md5
+> `9049ade3bc7e0c47cccbf7935a3f4bd2` — an exact match for the locally built file. v1.9.0
+> never got a GitHub Release of its own and now will not: v1.9.1 supersedes it and
+> `/releases/latest` correctly lands on v1.9.1. **Still not run on a console or an
+> emulator** — nothing above is a play test, only a file- and network-level check. No
+> Discord announcement fired, because `.github/` (holding `discord-release.yml`) is
+> untracked in this repo, so no workflow ran on the release.
 
 ---
 
-## v1.9.2 — Redstone
+## v1.9.2 — The freeze hotfix
+
+**Fixed.** v1.9.1 could stop answering every button while still drawing at full rate. A
+stylus still resting on the bottom screen when one screen handed over to another was read as
+a fresh press by the receiving screen, that press landed on the strip that opens the tab bar
+(`hudToggleRect()`, y 40..66), and v1.9.1's new `inputMapSetMenuOwnsPad()` makes an open bar
+answer 0 for every bound verb and 0.0f for the look scale. Three routes reached it: creating
+a world (title "NEW WORLD" row, y 52..78), tapping Resume in the pause menu (row y 58..80 —
+this one fired on an ordinary tap, and is almost certainly what steve hit), and tapping Quit
+to title (row y 80..102, overlapping the title's first saved world, which the title screen
+starts on the press edge with no confirmation). Fixed in `source/main.c` with a carried-touch
+gate: a touch already down when a screen is entered is ignored until the stylus has been seen
+off the glass once.
+
+> **Verified A/B in Azahar against the published v1.9.1 artifact** (`blocksmith.cia`, md5
+> `9049ade3bc7e0c47cccbf7935a3f4bd2`, byte-identical to the release asset): on that build,
+> creating a world with the stylus held opened the bar and three seconds of held D-pad gave
+> byte-identical frames, and a Resume tap did the same; pressing **B** made the frames differ,
+> proving the process was alive and the input path was what was dead. On the fixed build all
+> three routes leave the HUD alone and the player walks. **Never reproduced on real hardware**
+> — only in an emulator with the stylus driven synthetically. The signature matches steve's
+> report exactly, but a matched signature is not the device.
+
+**Renumbering.** This version takes the v1.9.2 slot that redstone held, so redstone becomes
+v1.9.3 and the dimensions version becomes v1.9.4. `docs/blueprint-1.9.2-redstone.md` keeps
+its filename — it is referenced from several places and renaming it is a separate change.
+
+---
+
+## v1.9.3 — Redstone
 
 **Added.** Wire, power, redstone torches, levers, buttons, pressure plates, redstone lamps,
 doors, pistons. Not this version, per `docs/blueprint-1.9.2-redstone.md` §0: repeaters,
@@ -666,7 +718,7 @@ join at all.
 
 ---
 
-## v1.9.3 — The other worlds
+## v1.9.4 — The other worlds
 
 **Added.** Two more dimensions with their own names — the fire one and the end one —
 each with its own generator, its own blocks and its own way in.
