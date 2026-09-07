@@ -4,15 +4,16 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [1.9.0] - not yet released
+## [1.9.0] - 2026-09-07
 
-There is no v1.9.0 tag, release or CIA yet. HEAD sits at `d3ab9de` (`chore(release): bump to
-1.8.20 and refresh the README and install QR`) and every change this entry describes is still
-uncommitted — `git log v1.8.20..HEAD` is empty, and `git status` shows the tree dirty across
-`source/world/chest.c`, `source/net/inv_bridge.c`, `source/scene/worldlist.c`,
-`source/scene/ui_gesture.c` and roughly forty other files. Kept here, ahead of that commit, so
-the reasoning is not lost before it ships; the date above becomes real at release, the way
-every other entry in this file already is.
+Committed and tagged. `refs/heads/v1.9.0` and the annotated tag `refs/tags/v1.9.0` are both on
+the remote, and the tag dereferences to `02f3954d` (`feat(chest): v1.9.0 storage and quality of
+life, pinned to server v1.9.10`) — the same commit the CIA was built from, in a detached
+worktree so nothing still dirty in the main tree could leak into the artifact:
+`blocksmith1.9.0.cia`, 1471424 bytes, md5 `74ccb73a998ff864d4113ae4f20228d4`.
+
+The GitHub Release carrying that file is **not published yet**, so until it is, the in-game
+**Options → Check for Update** and the README's install QR both still resolve to v1.8.20.
 
 `docs/ROADMAP.md` calls this version "Storage and quality of life". The bulk of it is chests
 — the first player-facing storage block — plus a set of interface conveniences that had been
