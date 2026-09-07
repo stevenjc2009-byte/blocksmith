@@ -6731,6 +6731,64 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 rm -rf "$BHUG"
 
+# tests/barnav_test.c -- scene/barnav.c, the v1.9.1 tabbed bar's navigation model (cursor
+# clamping across every category shape, row wrap at every edge, category stepping, horizontal
+# mode dispatch (content grid / cat list / stepper), priority-one-event-per-frame, the fuzz
+# invariant, scroll-follows-cursor, and the analog-stick edge detector re-arming). barnav.c has
+# no <3ds.h> outside an #ifdef __3DS__ guard (only a _Static_assert against libctru's KEY_* bits
+# lives there), same carve-out tests/hotbar_test.c, tests/ui_gesture_test.c and
+# tests/ringorder_test.c made, so the real module links here on its own -- no other source/ file
+# needed. 3306 checks, pinned via BARNAV_TEST_EXPECTED_CHECKS, compared straight
+# (CHECK(s_checks == BARNAV_TEST_EXPECTED_CHECKS)) -- the file's own comment notes this
+# deliberately differs from tests/hotbar_test.c's "+1" convention so the printed PASS count
+# equals the pin exactly.
+#
+# NOT proved here: that scene/ui.c calls barNavInput() from the frame loop with a real
+# hidKeysDown()/hidCircleRead() word, that BAR_EV_COMMIT becomes a synthetic tap at the focused
+# cell's centre, or that anything is drawn in the right place. Those are the console's and the
+# integrator's.
+BHBN="build-host/run-$$-barnav"
+mkdir -p "$BHBN"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	tests/barnav_test.c \
+	source/scene/barnav.c \
+	-o "$BHBN/barnav_test"
+
+"./$BHBN/barnav_test"
+
+rm -rf "$BHBN"
+
+# tests/pausebar_test.c -- scene/pausebar.c, the v1.9.1 pause panel's tab/row/cursor model
+# (strip tiling exactly across the panel, rows disjoint and inside the panel, arrow boxes inside
+# their row, labels fit their boxes, row wrap on every tab, tabs clamp and never wrap but
+# remember their row, commit on every row, B resumes from every tab/row, left/right steps
+# options but switches tabs elsewhere, repeated presses in one frame, corrupt-cursor clamp
+# repair, touch on the strip/rows/arrows). pausebar.c has no <3ds.h>, no gfx/font.h and no
+# scene/ui_layout.h outside an #ifdef __3DS__ guard (only _Static_asserts mirroring libctru's
+# KEY_* bits, gfx/font.h's metrics and scene/ui_layout.h's screen size live there), same
+# carve-out scene/hotbar.c, scene/ui_gesture.c and scene/ui_layout.c already made, so the real
+# module links here on its own. 34082 checks, pinned via PAUSEBAR_EXPECTED_CHECKS using the same
+# "+1" convention tests/hotbar_test.c's own pin uses (the CHECK macro's own increment means the
+# printed PASS count reads one less than the pin constant -- see the file's own comment).
+#
+# NOT proved here: that scene/pausemenu.c wires real hidKeysDown()/hidKeysHeld() and real touch
+# state into pauseBarInput()/pauseBarTouch(), or that the panel draws where this model says it
+# should. Those are the console's.
+BHPB="build-host/run-$$-pausebar"
+mkdir -p "$BHPB"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	tests/pausebar_test.c \
+	source/scene/pausebar.c \
+	-o "$BHPB/pausebar_test"
+
+"./$BHPB/pausebar_test"
+
+rm -rf "$BHPB"
+
 # tests/ui_chest_test.c -- the chest panel in scene/ui.c (v1.9.0 CHEST/CHEST-NET): the two-tap
 # lift/place transfer semantics, what the panel draws, and the network transfer callback,
 # driven through the real uiUpdateDraw() with real taps against the real ChestState and the
