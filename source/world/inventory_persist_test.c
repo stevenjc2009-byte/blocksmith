@@ -345,15 +345,24 @@ static void testMaxValidItemIdRoundTrips(void)
 	freshDir();
 
 	/* The premise, checked rather than assumed: these really are the two sides of the edge.
-	 * If a future row lands at 43 this goes red and the case gets re-pointed, instead of
-	 * quietly testing the middle of the table while calling it the boundary. */
-	CHECK(inventoryCanHold((ItemId)BLOCK_FURNACE));
-	CHECK(!inventoryCanHold((ItemId)(BLOCK_FURNACE + 1)));
+	 * If a future row lands at 44 this goes red and the case gets re-pointed, instead of
+	 * quietly testing the middle of the table while calling it the boundary.
+	 *
+	 * v1.9.0 "Storage" is the third version to fire this, and again verbatim — a row landed at
+	 * 43 (BLOCK_CHEST) and the negation flipped:
+	 *
+	 *   FAIL  L351 !inventoryCanHold((ItemId)(BLOCK_FURNACE + 1))
+	 *
+	 * One failure and no others ("inventory persistence self-test: FAIL 106 checks, 1 failed"),
+	 * the same control as the two times before it. Re-pointed to BLOCK_CHEST rather than having
+	 * the literal bumped, so the case keeps testing the edge and not the middle. */
+	CHECK(inventoryCanHold((ItemId)BLOCK_CHEST));
+	CHECK(!inventoryCanHold((ItemId)(BLOCK_CHEST + 1)));
 
 	Inventory in;
 	inventoryInit(&in);
 	in.slots[0] = (InvSlot){ .item = BLOCK_LEAVES, .count = INV_STACK_MAX };  /* 6: the old top */
-	in.slots[1] = (InvSlot){ .item = BLOCK_FURNACE, .count = INV_STACK_MAX };   /* 42: real one */
+	in.slots[1] = (InvSlot){ .item = BLOCK_CHEST, .count = INV_STACK_MAX };    /* 43: real one */
 
 	CHECK(inventorySave(&in, INV_DIR));
 	Inventory out;
@@ -362,7 +371,7 @@ static void testMaxValidItemIdRoundTrips(void)
 	CHECK(invEqual(&out, &in));
 	/* Spelled out as well as compared, so a failure says WHICH id was lost rather than only
 	 * that two structs differ. invEqual is the check; this is the error message. */
-	CHECK(out.slots[1].item == BLOCK_FURNACE && out.slots[1].count == INV_STACK_MAX);
+	CHECK(out.slots[1].item == BLOCK_CHEST && out.slots[1].count == INV_STACK_MAX);
 }
 
 /* ── v1.8.8: the widened capacity, on disk ──────────────────────────────────────────────

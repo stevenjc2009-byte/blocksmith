@@ -200,7 +200,7 @@ durability over more than a decade.
 ## Part B — Read-only survey of Blocksmith's own generator
 
 All line numbers are from the tree as read on 2026-09-01, under
-`C:\Users\steve\Documents\3ds-project-folder\mc\source\world\`. Nothing in this tree was
+`<repo root>\source\world\`. Nothing in this tree was
 modified for this brief.
 
 ### B1. 2D heightmap, 3D density field, or hybrid? — **Hybrid, version-dispatched, and this is by design**

@@ -4,6 +4,151 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.9.0] - not yet released
+
+There is no v1.9.0 tag, release or CIA yet. HEAD sits at `d3ab9de` (`chore(release): bump to
+1.8.20 and refresh the README and install QR`) and every change this entry describes is still
+uncommitted — `git log v1.8.20..HEAD` is empty, and `git status` shows the tree dirty across
+`source/world/chest.c`, `source/net/inv_bridge.c`, `source/scene/worldlist.c`,
+`source/scene/ui_gesture.c` and roughly forty other files. Kept here, ahead of that commit, so
+the reasoning is not lost before it ships; the date above becomes real at release, the way
+every other entry in this file already is.
+
+`docs/ROADMAP.md` calls this version "Storage and quality of life". The bulk of it is chests
+— the first player-facing storage block — plus a set of interface conveniences that had been
+waiting on it or on each other: world list delete/rename, hotbar cycling on the shoulder
+buttons, an aim-target readout, and inventory gestures for moving stacks around without
+dragging each item one at a time.
+
+Nothing in this version has run on a console. The v1.8.17 boot freeze is still unfixed, so
+every claim below is a source read or a host measurement from an earlier lane's work, not a
+playtest — this entry documents what landed in the working tree, not a fresh build.
+
+### Added
+
+- **Chests.** An 8-slot storage block (`BS_CHEST_SLOTS` = 8, `deps/blocksmith-server/proto/bs_proto.h:598`),
+  craftable and usable both single-player and over multiplayer. `BLOCK_CHEST = 43`
+  (`source/world/block.h:262`, static-asserted at line 299). A chest's contents live in the
+  same `BlockStateTable` a local place/break already used, so `scene/ui.c`'s chest panel, the
+  break path and the save path all read a networked chest exactly like a local one
+  (`source/net/networld.h:191-193`). `BLOCKSTATE_SLOTS` raised 64 → 256 to give that table
+  headroom (`source/world/blockstate.h:138-160`).
+
+- **Multiplayer chests, three new opcodes.** `BS_APP_SERVER_CAPS` (`0x11`, S→C once at join),
+  `BS_APP_CHEST_STATE` (`0x12`, S→C, one whole chest, authoritative) and `BS_APP_CHEST_ACTION`
+  (`0x13`, C→S, one requested transfer) — `deps/blocksmith-server/proto/bs_proto.h:416-419`.
+  The client never applies a chest transfer itself while in a session: it sends the request
+  and waits for the server's snapshot (`source/net/networld.h:185-236`).
+
+  **Capability-gated, not version-gated at the point of use.** The server announces
+  `BS_CAP_CHESTS` (bit 0) in `SERVER_CAPS`; `networldSendChestAction()` sends nothing and
+  returns `false` unless that bit was seen (`source/net/networld.c:1433`), and the caller
+  applies the transfer locally instead — the same posture single-player already had. Bits
+  this build does not recognise are kept verbatim and never interpreted.
+
+  **The join-time gate is the one that actually blocks an old server.** The chest block row
+  changes the registry hash, and `registryVerdictTick()` / `registryMatchesInfo()` refuse the
+  join outright on a mismatch (`source/net/networld.c:331,923-945`), so a v1.9.0 client cannot
+  get into a pre-chest server's world at all — it is refused at join, not at the chest lid.
+
+- **World list: delete-twice confirm, and rename.** A stray tap can no longer delete a world;
+  the first press arms a confirmation latch that only fires if the *same* world is pressed
+  again — `worldlistConfirmPress()`, called through `worldlistUiStep()`, is what actually
+  checks that (`source/scene/worldlist.c:346-430`). Renaming now happens from the list itself,
+  without loading the world first — `title.c` calls `worldlistRenameAt()`, which wraps the
+  lower-level `worldlistRename()` (`source/scene/worldlist.c:304-344,448-477`).
+
+- **L/R now cycle the hotbar.** Previously L/R stepped render distance live during play;
+  that control now lives only on the pause menu's distance row (`source/scene/hotbar.h:1-14`,
+  `source/scene/pausemenu.c:25,106-109`).
+
+- **An aim-target readout under the crosshair**, naming whatever block the reticle is on —
+  "stone", "birch_planks", "chest" (`source/scene/aimtext.h:1-6`, `source/scene/aimtext.c`,
+  tested by `tests/aimtext_test.c`).
+
+- **Inventory gestures: split, merge, quick-move.** `UI_GESTURE_SPLIT`, `UI_GESTURE_MERGE`
+  and `UI_GESTURE_QUICK_MOVE` (`source/scene/ui_gesture.h:79-86`). Merge and quick-move build
+  on the v1.8.x model layer's `inventoryMoveUnits()` (`source/world/inventory.c:115`), which
+  already existed and was already host-tested before this version wired a gesture to it.
+  Split does not: `inventorySplitStack()` (`source/world/inventory.c:145`) requires an empty
+  destination and has zero runtime callers — only `inventory_test.c` ever calls it — so split
+  is built on a new, independent `invBridgeSplitStack()` (`source/net/inv_bridge.c:174-188`)
+  with the opposite rounding rule: `ceil(count/2)` goes to the lift, `floor(count/2)` stays
+  behind.
+
+### Server requirement
+
+- **`PROTO_COMMIT` points at server v1.9.10** (`13843c1cb940758143e347df54bacc9c50770146`,
+  `Makefile:444`), which is the release that carries the three opcodes this entry describes.
+  The server was tagged and released first, on purpose: the re-pin is the mechanical step that
+  actually ties this client to those opcodes, and there was nothing to re-pin to until v1.9.10
+  existed as a commit. `check-proto-drift` was run at the new pin with a red arm — green against
+  `13843c1c` (blob `860732d0`), red against the old `7454d025` (blob `e57b3fe0`) — so the green
+  result is not one that could have passed by accident.
+
+  For the record, because this entry was drafted before the server shipped and the earlier
+  ordering argument is easy to carry over wrongly: v1.9.9 had to precede the client because its
+  chest **registry row** moves the registry hash and `registryMatchesInfo()` refuses a
+  mismatched join outright. v1.9.10 touches no registry row, so it imposes no join gate in
+  either direction — a v1.9.0 client meeting a v1.9.9 server simply never sees `BS_CAP_CHESTS`,
+  never sends `CHEST_ACTION`, and gets client-local chests instead of synced ones. Degraded,
+  not refused. That is exactly what the capability bit was added to buy, since the kick path is
+  `handle_app_payload()`'s unknown-opcode tail and v1.9.10 does ship new opcodes.
+
+- **The `BS_APP_CHEST_ACTION` field contract this client implements** — `a`/`b` meanings for
+  deposit vs. withdraw — was agreed with the server side for v1.9.10. `bs_proto.h`'s own
+  one-line comment on `BS_CHEST_OP_DEPOSIT` is stale ("a = inventory slot") and does not
+  describe what either side actually does (`source/net/networld.h:226-234`).
+
+- **Against server v1.9.9** (chest block present, capability opcode not yet sent): join
+  succeeds and ordinary chest placing/breaking works, but transfers do not.
+  `networldSendChestAction()` returns `false` because `BS_CAP_CHESTS` was never announced
+  (`source/net/networld.c:1433`), and the caller keeps the lift and changes nothing rather than
+  applying the transfer locally (`source/scene/ui.h:105-148`) — chests are read-only over that
+  connection, not broken and not silently faked. **Against anything older than v1.9.9**, the
+  registry hash no longer matches and the join itself is refused before chests are a question
+  (`source/net/networld.c:331,923-945`).
+
+### Fixed
+
+- **The strict-warning build of the networking tests links again.**
+  `source/net/Makefile.networld-test` rebuilds `networld_test` under `-Wconversion`,
+  `-Wsign-conversion` and `-Wcast-qual` over `source/net/networld.c` — the decoder for
+  attacker-controlled bytes — which the suite's own `-Wall -Wextra` line does not have, and
+  that extra coverage is the whole reason the file is kept. `tools/run_host_tests.sh:974` had
+  grown `source/world/water.c` for `networld_test.c`'s rejoin-replay scenarios
+  (`test_a_replayed_water_diff_still_spreads`, `test_a_rejoin_replay_keeps_the_players_own_water`);
+  this Makefile had not, so `make -f Makefile.networld-test test` died at the link with 17
+  undefined references (`waterInit`, `waterPending`, `waterSettle`, `waterFlowCells`,
+  `waterQueueFull`, `waterNotify`, `waterReplaySkippable`) instead of running a check. Every
+  object still compiled clean, so nothing warned — only the final link broke, which meant the
+  strict coverage had quietly stopped being obtainable at all while the file's own header still
+  advertised it as the way to run these tests. Adding `water.o` fixes it; it needs no relaxed
+  flags, unlike `mesher.o`.
+- **That Makefile's `test` target now runs the binary from the repository root**, matching where
+  the suite runs it (`tools/run_host_tests.sh:976`). Some scenarios open repo files by
+  root-relative path, so run from `source/net` it reported `source/main.c could be read` as a
+  failure and tripped the check-count guard: 4 failed, 525 of 545 checks reached — a false red
+  caused entirely by the working directory.
+- **The suite now runs that strict build itself**, rather than trusting a comment to keep the two
+  file lists in step. The comment had asked for exactly that and the invariant regressed three
+  times regardless — `source/app/session.c` in v1.6.0 (`undefined reference to 'sessionBegin'`),
+  the chest trio in v1.9.0, and `world/water.c` here. It is a gate now.
+
+### Verified
+
+- **The full host suite passes top to bottom** — `sh tools/run_host_tests.sh`, 99 suites, exit 0.
+  It had never completed before this release: `source/app/version_history_data.c` was stale, and
+  under `set -e` its freshness guard killed every stanza below it, which is where all the v1.9.0
+  suites live. Regenerating the artefact is what let them run in sequence rather than only
+  individually.
+
+### Not verified
+
+- **Nothing has run on a console.** No devkitARM build and no hardware boot — every number in
+  this entry comes from host gcc under WSL. The v1.8.17 boot-freeze report remains open and
+  unresolved.
+
 ## [1.8.20] - 2026-09-05
 
 Not a roadmap version. `docs/ROADMAP.md` goes v1.8.19 "Sound" straight to v1.9.0 "Storage and
@@ -50,7 +195,7 @@ every claim below is a host measurement, a host suite result or a clean devkitAR
 
 ### Changed
 
-- **`PROTO_COMMIT` bumped** (`Makefile:374`) to server v1.9.8. The wire change is purely
+- **`PROTO_COMMIT` bumped** (`Makefile:375`) to server v1.9.8. The wire change is purely
   additive and **one-directional**, so the usual lockstep does not apply in both directions:
   an old client against a new server ignores `0x10` at `networld.c`'s `default: break;`, and
   a new client against an old server simply never receives one and keeps running its own
@@ -1725,9 +1870,9 @@ Worlds made in 1.8.1 open unchanged and no block id moved — see Compatibility.
   (recorded 2026-08-25).** This is the omission, not a change of behaviour: the code shipped in
   1.8.2 and only the record is being repaired. `regionCompact()` had no caller in any shipped
   build through 1.8.1, so a heavily edited world's region file grew on the card until the player
-  deleted the world. It now has one. `regionMaintain()` (`source/world/region.c:740-748`) is a
+  deleted the world. It now has one. `regionMaintain()` (`source/world/region.c:918-951`) is a
   gated call to `regionCompact()`, and `workerWriteSave` calls it on the worker thread straight
-  after `regionWriteColumn` (`source/app/worker.c:199`) — not at world close, where the number of
+  after `regionWriteColumn` (`source/app/worker.c:346`) — not at world close, where the number of
   regions to rewrite is unbounded and the file swap would land at the moment a player is most
   likely to close the lid. The wiring lives in `region.c` rather than as a bare `regionCompact`
   call in `worker.c` specifically so a host test can reach it; the threshold stays inside
@@ -1858,16 +2003,16 @@ Worlds made in 1.7.x open in 1.8.0 unchanged, and no block id moved — see Comp
   **Correction (2026-08-25).** This entry originally said the server "compares a CRC of the
   shared block registry on connect". It does not, and never has — verified by reading the code
   on 2026-08-25. The server only *announces* its fingerprint, once: `send_registry_info()`
-  (`deps/blocksmith-server/game/bsgame.c:569-576`) sends `{rev, count, crc16}` from
-  `handle_join()` (`bsgame.c:915`). `BS_APP_REGISTRY_INFO` is server-to-client only
+  (`deps/blocksmith-server/game/bsgame.c:1055-1063`) sends `{rev, count, crc16}` from
+  `handle_join()` (`bsgame.c:1338`). `BS_APP_REGISTRY_INFO` is server-to-client only
   (`proto/bs_proto.h:291`) and the only registry message going the other way is
   `BS_APP_REGISTRY_FETCH`, two bytes of type plus `first_index` (`bs_proto.h:292`). No CRC ever
   travels client-to-server, so the server has nothing to compare and performs no comparison.
-  The whole gate is client-side, in `registryMatchesInfo()` at `source/net/networld.c:210-216`.
+  The whole gate is client-side, in `registryMatchesInfo()` at `source/net/networld.c:331-337`.
 
   A mismatch also cannot repair itself. The client retries `REGISTRY_FETCH` four times at 250 ms,
   but a `REGISTRY_DEFS` batch can only carry *dynamic* rows — `registryDefUnpack()`
-  (`source/world/registry.c:363`) rejects any id below `REG_ID_DYN_LO` at `:367`, so core rows
+  (`source/world/registry.c:993`) rejects any id below `REG_ID_DYN_LO` at `:997`, so core rows
   are compiled in and untransmittable by construction. After the 2000 ms deadline the client
   enters the world degraded, permanently for that session. That degraded state is effectively
   invisible to a player: the "Joined - syncing block table..." row vanishes on the deadline
@@ -1965,7 +2110,7 @@ than claiming a fix that was never made.
   are **reproducible on demand** — they are printed by a suite that lives in this repository.
   `tests/horizon_test.c` enumerates the configuration space and its final `printf` reports the
   case count, the ref-vs-new disagreement count and the reference's cull count. Built and run
-  on the host on 2026-08-25 from the recipe in `tools/run_host_tests.sh:1480-1491` (gcc -O1,
+  on the host on 2026-08-25 from the recipe in `tools/run_host_tests.sh:1901-1912` (gcc -O1,
   the `horizonHidden` body extracted out of `source/scene/chunk_render.c` by awk so the test
   links the shipped predicate rather than a copy of it), the verbatim line is:
 
@@ -2047,9 +2192,9 @@ than claiming a fix that was never made.
 
   **Correction (2026-08-25).** The headline of this bullet is **no longer true, and the retraction
   belongs here as well as under 1.8.2 below.** Region compaction *is* wired now. `regionMaintain()`
-  (`source/world/region.c:740-748`) calls `regionCompact()`, and `workerWriteSave` calls
+  (`source/world/region.c:918-951`) calls `regionCompact()`, and `workerWriteSave` calls
   `regionMaintain` on the worker thread straight after `regionWriteColumn`
-  (`source/app/worker.c:199`). That landed in 1.8.2 and was never recorded in the 1.8.0, 1.8.1 or
+  (`source/app/worker.c:346`). That landed in 1.8.2 and was never recorded in the 1.8.0, 1.8.1 or
   1.8.2 entries, so this paragraph stood as the newest word on the subject for three releases
   while the opposite was shipping. It is now recorded under 1.8.2. The `remove()`-then-`rename()`
   window described above is not merely accepted either: the sequence renames the old file aside

@@ -11,17 +11,19 @@
 // comment on why the numbers have to stay byte-identical to what shipped before this split
 // (tools/run_host_tests.sh's new ui_layout_test binary is what proves that, not this file).
 //
-// No <3ds.h>, no <citro3d.h>, no gfx/*.h — only <stdbool.h>/<stdint.h> and the two data
+// No <3ds.h>, no <citro3d.h>, no gfx/*.h — only <stdbool.h>/<stdint.h> and three data
 // headers (world/inventory.h for INV_HOTBAR_SLOTS/INV_MAIN_COLS/INV_MAIN_ROWS, world/
 // crafting.h for RECIPE_COUNT, which CRAFT_ROW_H below divides the crafting panel's height
-// by). Both of those headers are already pure C themselves — see their own file comments —
-// so pulling them in here does not reintroduce the console dependency this split exists to
-// remove.
+// by, and — since v1.9.0 CHEST — world/chest.h for CHEST_SLOTS, which the chest panel
+// block below divides the bottom screen's width by the same way). All three are already
+// pure C themselves — see their own file comments — so pulling them in here does not
+// reintroduce the console dependency this split exists to remove.
 #pragma once
 
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "world/chest.h"      // CHEST_SLOTS — see the chest panel block below
 #include "world/crafting.h"
 #include "world/inventory.h"
 
@@ -239,6 +241,57 @@
 #define FURN_HIT_FUEL     1
 #define FURN_HIT_OUTPUT   2
 
+// ── Chest panel (v1.9.0 CHEST) ─────────────────────────────────────────────────────────
+//
+// A THIRD storage screen, same reason UI_SCR_FURNACE got one of its own instead of a
+// fourth region on the inventory overlay: that overlay's 240px are already fully spoken
+// for (see the furnace block above), so a chest reuses the vertical budget from scratch
+// the same way the furnace does, and reuses FURN_GRID_Y's own relocated-grid trick outright
+// rather than picking a new number for it — CHEST_GRID_Y below is byte-identical to
+// FURN_GRID_Y on purpose, so the main grid lands in the same place on either storage
+// screen and a player does not have to relearn where their bag is depending on which
+// container they opened.
+//
+// ── Why one row of eight, and not the furnace's three fixed x's ───────────────────────
+//
+// The furnace's input/fuel/output sit at hand-picked x's because the three slots MEAN
+// different things (what goes in, what burns, what comes out — see FURN_INPUT_X's own
+// comment on why an even split would lose that grouping). A chest slot means nothing
+// different from any other chest slot — world/chest.h's own file comment is explicit that
+// every slot accepts every item and nothing distinguishes slot 3 from slot 5 except which
+// one was tapped — so there is no grouping to preserve and an even split is not a
+// simplification of a real layout, it is the honestly correct one. CHEST_SLOTS (8) times
+// SLOT_PX (40) is exactly SCR_W (320), so the row needs no gutter math at all: it is the
+// hotbar's own row, shape for shape, just lower on the screen.
+//
+// ── The vertical budget ─────────────────────────────────────────────────────────────────
+//
+//   hotbar          y   0..40    HOTBAR_Y / HOTBAR_H, unchanged and always visible
+//   close bar       y  40..66    CHEST_CLOSE_Y / _H — same 26px as the furnace's own
+//   chest slot row  y  72..112   all eight slots, full SLOT_PX (40), full SCR_W width
+//   hint lines      y 118..137   two 7px rows of text, same 12px step as everywhere else
+//   main grid       y 160..240   CHEST_GRID_Y, 2 rows of 40 — same position as the furnace
+//                                 screen's own relocated grid (FURN_GRID_Y)
+//
+// The 23px gap between the last hint glyph (137) and the grid (160) is deliberate slack,
+// not a measured floor the way FURN_HINT_Y's own comment checks one — there is no third
+// hint row here that could grow into it, so nothing currently depends on the gap being
+// exactly that size.
+#define CHEST_CLOSE_Y  GRID_Y            // 40 — directly under the hotbar, like FURN_CLOSE_Y
+#define CHEST_CLOSE_H  26                // same close-bar height as the furnace panel
+
+#define CHEST_SLOT_PX  SLOT_PX           // 40 — same cell size as every other slot on the panel
+#define CHEST_ROW_Y    72                // top of the chest's one-row-of-eight, same offset
+                                          // under the close bar as the furnace's FURN_ROW_Y
+
+#define CHEST_HINT_Y    (CHEST_ROW_Y + CHEST_SLOT_PX + 6)   // 118
+#define CHEST_HINT_STEP 12
+#define CHEST_HINT_ROWS 2
+
+// The relocated main grid — see the vertical budget above. Byte-identical to FURN_GRID_Y;
+// see this block's own file comment for why that is intentional rather than coincidental.
+#define CHEST_GRID_Y 160
+
 // ── Rects ──────────────────────────────────────────────────────────────────────────────
 
 typedef struct { int x, y, w, h; } URect;
@@ -304,6 +357,34 @@ int hitFurnaceSlot(int x, int y);
 // two different slots. Both are checked against each other in ui_layout_test.c — a point in
 // the furnace screen's grid must miss hitInventorySlot() entirely, and vice versa.
 int hitFurnaceInvSlot(int x, int y);
+
+// ── Chest rects and hit tests (v1.9.0 CHEST) ───────────────────────────────────────────
+
+URect chestCloseRect(void);
+
+// Pixel rect for chest slot `i` (0..CHEST_SLOTS-1). One row across the full screen width —
+// see the chest panel block above for why there is no per-slot x table the way the
+// furnace's three slots have.
+URect chestSlotRect(int i);
+
+// Pixel rect for main-grid slot `i` (0..INV_MAIN_SLOTS-1) AS DRAWN ON THE CHEST SCREEN.
+// Same columns and cell size as gridSlotRect()/furnGridSlotRect(), CHEST_GRID_Y instead of
+// GRID_Y/FURN_GRID_Y — a separate function rather than a parameter on either existing one,
+// for the identical reason furnGridSlotRect() is its own function and not a mode on
+// gridSlotRect(): see that function's own comment.
+URect chestGridSlotRect(int i);
+
+// Which chest slot (0..CHEST_SLOTS-1) a point lands in, or -1. The close bar, the hotbar
+// and the relocated main grid all answer -1 here, the same "this function knows about its
+// own rects and nothing else" shape hitFurnaceSlot() documents for itself.
+int hitChestSlot(int x, int y);
+
+// The inventory-side hit test for the chest screen: the hotbar (at its usual place) plus
+// the RELOCATED main grid (at CHEST_GRID_Y). Returns a world/inventory.h slot index, or -1.
+// A separate function from hitInventorySlot() and from hitFurnaceInvSlot(), for the same
+// reason hitFurnaceInvSlot() is not a third mode on hitInventorySlot()'s own flag: see that
+// function's own comment.
+int hitChestInvSlot(int x, int y);
 
 // How many pixels of a `total_px`-wide bar are filled at progress `num`/`den`.
 //

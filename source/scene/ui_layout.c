@@ -132,6 +132,49 @@ int hitFurnaceInvSlot(int x, int y)
 	return -1;
 }
 
+// ── Chest panel (v1.9.0 CHEST) ──────────────────────────────────────────────────────────
+//
+// See ui_layout.h's chest panel block for the layout itself and for why every one of these
+// numbers is what it is. Nothing here re-derives or re-justifies them.
+
+URect chestCloseRect(void)
+{
+	URect r = { 0, CHEST_CLOSE_Y, SCR_W, CHEST_CLOSE_H };
+	return r;
+}
+
+URect chestSlotRect(int i)
+{
+	URect r = { i * SLOT_PX, CHEST_ROW_Y, SLOT_PX, SLOT_PX };
+	return r;
+}
+
+URect chestGridSlotRect(int i)
+{
+	const int col = i % INV_MAIN_COLS;
+	const int row = i / INV_MAIN_COLS;
+	URect r = { col * SLOT_PX, CHEST_GRID_Y + row * SLOT_PX, SLOT_PX, SLOT_PX };
+	return r;
+}
+
+int hitChestSlot(int x, int y)
+{
+	for (int i = 0; i < CHEST_SLOTS; i++)
+		if (ptInRect(chestSlotRect(i), x, y)) return i;
+	return -1;
+}
+
+int hitChestInvSlot(int x, int y)
+{
+	for (int i = 0; i < INV_HOTBAR_SLOTS; i++)
+		if (ptInRect(hotbarSlotRect(i), x, y)) return i;
+
+	for (int i = 0; i < INV_MAIN_SLOTS; i++)
+		if (ptInRect(chestGridSlotRect(i), x, y)) return INV_HOTBAR_SLOTS + i;
+
+	return -1;
+}
+
 int furnBarFill(int total_px, int num, int den)
 {
 	// Order matters here and the order is "reject the impossible, then clamp the extremes,

@@ -54,6 +54,71 @@ void interactSetBrokeContentsFn(InteractBrokeContentsFn fn)
 	s_broke_contents_fn = fn;
 }
 
+// ── v1.9.0: the bag-capacity question ───────────────────────────────────────────────────
+//
+// NULL until main.c (or a host case) opts in, and NULL means "yes, always" — see interact.h
+// for why that is the honest default and why this is a callback rather than a direct
+// inventoryAdd(), which two of the three host stanzas linking this file could not resolve.
+static InteractBagFitsFn s_bag_fits_fn;
+
+void interactSetBagFitsFn(InteractBagFitsFn fn)
+{
+	s_bag_fits_fn = fn;
+}
+
+// Would breaking the stateful block `id` at (x,y,z) put anything on the floor? True means
+// every unit the break would yield — the block itself, plus whatever it is holding — fits in
+// the bag as it stands right now.
+//
+// The contents come from s_broke_contents_fn, the SAME reader breakComplete() uses further
+// down, and that is deliberate rather than incidental: a guard reading the contents through
+// one path and the payout reading them through another is two answers to one question, and
+// either direction of disagreement is a bug — a refusal for items that would have fit, or a
+// break that lands and then drops the tail of what it found. The record is still live at this
+// point (main.c's blockStateRemove() does not run until after the break lands), so this reads
+// exactly what breakComplete() will read.
+//
+// The block itself goes FIRST, matching the order the break actually pays out in: breakComplete
+// sets broke_id and only then fills broke_extra_*. Order matters to the answer, because an
+// earlier entry can consume the empty slot a later one needed.
+static bool bagFitsBrokenBlock(BlockId id, int x, int y, int z)
+{
+	if (s_bag_fits_fn == NULL)
+		return true;
+
+	// 1 + the ceiling: the block, then its contents. 18 bytes of locals here and 16 in the
+	// inner buffers below — named because interact.h's note on raising the ceiling has to stay
+	// true, and because an oversized local on this platform kills a function silently.
+	BlockId items[1 + INTERACT_BROKE_EXTRA_MAX];
+	uint8_t counts[1 + INTERACT_BROKE_EXTRA_MAX];
+	int n = 0;
+
+	items[n]  = id;
+	counts[n] = 1;
+	n++;
+
+	if (s_broke_contents_fn != NULL) {
+		BlockId extra[INTERACT_BROKE_EXTRA_MAX];
+		uint8_t qtys[INTERACT_BROKE_EXTRA_MAX];
+		int m = s_broke_contents_fn(id, x, y, z, extra, qtys);
+
+		// The same clamp-and-skip breakComplete() applies to the same reader, restated here
+		// rather than shared, because the two loops fill different destinations. A reader that
+		// misbehaves must not be able to overrun either one.
+		if (m < 0)                        m = 0;
+		if (m > INTERACT_BROKE_EXTRA_MAX) m = INTERACT_BROKE_EXTRA_MAX;
+		for (int i = 0; i < m; i++) {
+			if (qtys[i] == 0)
+				continue;
+			items[n]  = extra[i];
+			counts[n] = qtys[i];
+			n++;
+		}
+	}
+
+	return s_bag_fits_fn(items, counts, n);
+}
+
 // The edited column's relight, queued where there is a queue and run on the spot where there
 // is not. This is source/main.c's onRemoteEdit shape verbatim (main.c:2957) — a remote edit
 // and a local one produce exactly the same work, and until v1.8.7 only the remote one queued
@@ -172,6 +237,13 @@ void interactInit(Interact* it)
 	it->prev_keys = 0;
 	it->broke_id  = BLOCK_AIR;
 	it->placed_id = BLOCK_AIR;
+	// v1.9.0 F1. Named here for exactly the reason the paragraph below gives about
+	// broke_valid: this function initialises field by field, so a new field left out is
+	// INDETERMINATE until the first interactEdit clears it, and a caller that read it before
+	// then would revert a cell to whatever byte was on the stack. BLOCK_AIR is 0, so the
+	// wrong value happens to be harmless most of the time, which is the worst way for a bug
+	// like this to behave.
+	it->placed_was = BLOCK_AIR;
 
 	// Explicit, because this function initialises field by field rather than memsetting the
 	// struct — a new field that is not named here is left indeterminate, and an indeterminate
@@ -242,6 +314,57 @@ static int breakComplete(Interact* it, World* w, int x, int y, int z, BlockId br
 	// ceiling below, and what that cost.
 	const bool no_drop = blockDropsNothing(broken);
 	int queued = 0;
+
+	// ── v1.9.0 F2: ask the capacity question AGAIN, here, at the payout ─────────────────────
+	//
+	// breakProgress() above already asks bagFitsBrokenBlock() — but only on the frame a hold
+	// STARTS or restarts, and a chest is hardness 40 (world/registry.c), which is two seconds
+	// of holding at 20 TPS. The bag is not frozen for those two seconds. In a joined session
+	// source/main.c's onInvState() writes a whole authoritative BS_APP_INV_STATE straight into
+	// the live inventory with no "a break is in progress" gate, so the single free slot the
+	// start-time guard measured can be filled by the server a full second before this function
+	// is reached.
+	//
+	// What that cost, and it is the exact outcome the start-time guard was added to prevent:
+	// worldSet() below writes air, main.c's payout then offers the chest and each of its
+	// stacks to invBridgeAdd(), a full bag REFUSES them, and main.c's own comment at the
+	// broke_id call site says a refused stack is dropped with no message. The chest and up to
+	// CHEST_SLOTS other stacks stop existing, silently, on a client that has no toast and no
+	// status line to say otherwise. blockStateRemove() then retires the record, so there is
+	// nothing left to reconstruct from either.
+	//
+	// WHY THIS IS NOT THE v1.8.1 DEFECT COMING BACK. v1.8.1 moved the TYPE question from the
+	// break to the hold precisely so a player would not watch a full crack animation play out
+	// on a block that was never going to go, and breakProgress()'s comment says a check "just
+	// before the worldSet" would be "correct about the world and wrong about the player". That
+	// judgement is kept, not overturned: the start-time check is still there and still refuses
+	// instantly in every case it can see. This is a SECOND, narrower question it is not able to
+	// ask — "is the answer still true now" — and it can only ever fire when the bag filled up
+	// during the hold, which single player cannot do at all and which in multiplayer means the
+	// server moved something into the bag. A wasted animation in that window is the price, and
+	// it is the right way round: two seconds of the player's time against nine stacks of their
+	// items, on the one failure they cannot see happen and cannot undo.
+	//
+	// The SAME predicate and the SAME reader as the start-time guard, deliberately — see
+	// bagFitsBrokenBlock()'s own comment on why a guard and a payout reading the contents
+	// through two paths is two answers to one question. It is called here at the only moment
+	// that is still both late enough to be current and early enough to be free: the record is
+	// live (main.c's blockStateRemove() has not run) and the cell is untouched (worldSet is the
+	// next statement), so refusing costs exactly the one thing a refusal should cost — nothing.
+	//
+	// GATED ON BLOCK_CHEST ONLY, matching breakProgress() line for line. Widening it to the
+	// furnace is docs/design-1.9.0-chest-multiplayer.md's open question 3 and is out of scope;
+	// every non-chest block takes the byte-identical path it took before this branch existed.
+	//
+	// Refuses the way every other refusal in this file does — count one, retire the hold, leave
+	// the world alone — which is also what keeps the player's next press honest: breakCancel()
+	// spends the progress, so the following press re-enters breakProgress(), asks the START-time
+	// question against the now-full bag, and is turned away immediately with no animation at all.
+	if (broken == BLOCK_CHEST && !bagFitsBrokenBlock(broken, x, y, z)) {
+		it->refused++;
+		breakCancel(it);
+		return queued;
+	}
 
 	// worldSet refuses y outside the world, which is exactly what should happen when the
 	// ray hit the solid floor below y == 0 — that is not a block anyone owns.
@@ -429,6 +552,47 @@ static int breakProgress(Interact* it, World* w, const RayHit* t, int ticks, boo
 			return 0;
 		}
 
+		// ── v1.9.0: the CAPACITY question, beside the TYPE question above ────────────────
+		//
+		// The guard above asks "is this block carryable at all" — inventoryCanHold() is
+		// "defined, not air, not a liquid", a property of the ID and of nothing else.
+		// BLOCK_CHEST passes it trivially and always will. It cannot ask, and was never
+		// written to ask, whether there is ROOM right now, which is a different question with
+		// a different answer every minute of a real session.
+		//
+		// That gap does not matter for an ordinary block: breaking stone with a full bag
+		// loses one stone, which the player can see happen and can undo by putting the stone
+		// back. It matters enormously for a chest, because a chest carries up to CHEST_SLOTS
+		// other stacks, and breakComplete() writes air at the top of the break (interact.c's
+		// worldSet, further down) and only then reads what was inside. A chest broken with a
+		// full bag is therefore the chest AND everything in it gone at once, silently — this
+		// client has no toast and no status line to say otherwise
+		// (docs/decision-1.9.0-chest-storage.md makes the same point about placement).
+		//
+		// WHY HERE AND NOT IN breakComplete(). The obvious alternative — check just before
+		// the worldSet — would be correct about the world and wrong about the player: it
+		// would let a full crack animation play out on a block that was never going to break.
+		// That is precisely the defect v1.8.1 removed when it moved the type guard from the
+		// moment of the break to the moment the hold starts, and reintroducing it here would
+		// undo that for the one block most likely to hit it. So the capacity question is
+		// asked in the same place, on the same schedule, and refuses in the same way — cancel
+		// the hold, count one refusal per press, and leave the world untouched.
+		//
+		// GATED ON BLOCK_CHEST, and only BLOCK_CHEST. The furnace has the identical problem
+		// and is already shipping with it; docs/design-1.9.0-chest-multiplayer.md's open
+		// question 3 puts that deliberately out of scope, and widening this to every stateful
+		// block would change what a furnace break does in a version that did not ask for it.
+		// Every non-chest block takes exactly the path it took before this branch existed.
+		if (here == BLOCK_CHEST && !bagFitsBrokenBlock(here, t->x, t->y, t->z)) {
+			breakCancel(it);
+			// Same idiom, same reason, same debug-overlay `r` as the type guard above: this
+			// client has nothing louder to say, and a silent refusal is a far smaller lie
+			// than a silent deletion of eight stacks.
+			if (pressed)
+				it->refused++;
+			return 0;
+		}
+
 		it->breaking    = true;
 		it->break_x     = t->x;
 		it->break_y     = t->y;
@@ -469,6 +633,14 @@ int interactEdit(Interact* it, World* w, const Body* body,
 	// until the next edit.
 	it->broke_id  = BLOCK_AIR;
 	it->placed_id = BLOCK_AIR;
+
+	// v1.9.0 F1, on that same schedule and for a sharper version of the same reason. A
+	// `placed_was` surviving from an earlier call would not merely be stale, it would be
+	// stale AND plausible: main.c's full-table refusal writes it straight back into the
+	// world, so a leftover value reverts this cell to a block that was never in it. Cleared
+	// here, the worst a caller can read on a call that placed nothing is BLOCK_AIR, which is
+	// what the field meant before it existed.
+	it->placed_was = BLOCK_AIR;
 
 	// Cleared on the same schedule and for the same reason (v1.8.15). Only the flag needs
 	// clearing — the coordinates are meaningless while it is false, and zeroing them too would
@@ -576,6 +748,17 @@ int interactEdit(Interact* it, World* w, const Body* body,
 		// really there and "air" is only the ordinary case: a non-solid cell can hold tall
 		// grass, and reverting that to BLOCK_AIR would delete the plant on a failed send.
 		const BlockId place_was = worldGet(w, t->px, t->py, t->pz);
+		// v1.9.0 F1. And PUBLISHED, here at the read rather than beside placed_valid further
+		// down, because "what was in the cell" is the same true statement on the two refusal
+		// arms immediately below as it is on the success path — putting it in the success
+		// branch would mean writing the same worldGet result twice, in two places that could
+		// drift. The caller is told (interact.h) to act on it only when placed_valid is true,
+		// which is what keeps a refusal that never wrote the world from being "undone".
+		//
+		// main.c's full-blockstate-table refusal is the reader this exists for: it reverts the
+		// cell to it->placed_was, so a placement into tall grass that the table refuses now
+		// puts the grass back instead of the BLOCK_AIR it used to write.
+		it->placed_was = place_was;
 		if (blockIsSolid(place_was)) {
 			it->refused++;
 			return queued;

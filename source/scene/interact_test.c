@@ -26,6 +26,9 @@
 #include "net/networld.h"
 #include "scene/interact.h"
 #include "world/block.h"
+// v1.9.0: CHEST_SLOTS, for the chest arm of the contents spy and for the ceiling pin below.
+// Header-only — nothing here calls into world/chest.c, so this stanza's link is unchanged.
+#include "world/chest.h"
 #include "world/inventory.h"
 #include "world/light.h"
 // v1.8.8: the cactus case asserts the break landed on the tick breakTicksRequired() says it
@@ -155,6 +158,10 @@ static void freshAimedAt(Interact* it, BlockId target_block)
 	// register brokeContentsSpy cannot leak into the twenty-odd written before this fix
 	// existed — same reasoning as the relight-queue reset immediately above.
 	interactSetBrokeContentsFn(NULL);
+	// v1.9.0: and back to "no bag predicate registered", which interact.h defines as "yes,
+	// always" — the pre-v1.9.0 behaviour every case above this line was written against. Same
+	// leak-prevention reasoning as the two resets immediately above it.
+	interactSetBagFitsFn(NULL);
 
 	if (target_block != BLOCK_AIR)
 		worldSet(&s_world, TX, TY, TZ, target_block);
@@ -299,9 +306,15 @@ static void testTheCarryCeilingIsWhereItSays(void)
 	// server's own bsgame_test.c — every one of them clean in `git diff`, every one of them
 	// found by running the full suite. After appending a core row the instrument is a suite
 	// run, not a grep, and "I did not touch that file" reasons about the wrong thing entirely.
+	//
+	// v1.9.0 "Storage" made it five, moving the edge again to BLOCK_CHEST (id 43). This file
+	// went stale in exactly the way the paragraph above describes and was found in exactly the
+	// way it prescribes: `git diff` reported interact_test.c clean, and the full suite reported
+	// `FAIL L304 last_defined == (ItemId)BLOCK_FURNACE`. The prediction held on the first
+	// version to test it, which is why that paragraph is kept rather than trimmed.
 	const ItemId last_defined  = (ItemId)(registryCount() - 1);
 	const ItemId first_beyond  = (ItemId)registryCount();
-	CHECK(last_defined == (ItemId)BLOCK_FURNACE);        // premise: the table is 43 rows
+	CHECK(last_defined == (ItemId)BLOCK_CHEST);          // premise: the table is 44 rows
 	CHECK(inventoryCanHold(last_defined));
 	CHECK(!inventoryCanHold(first_beyond));
 
@@ -588,7 +601,13 @@ static void testEveryCoreBlockStillBreaks(void)
 	// at 9 — no CROSS row was added this version. Measured, not reasoned, exactly as the entry
 	// above insists: the stale number went red as "interact self-test: FAIL 2/757  L568
 	// targetable_seen == 36", and 41 is what the loop counted afterwards.
-	CHECK(targetable_seen == 41);   // 42 rows past air, less water
+	//
+	// v1.9.0: 41 -> 42, a fourth time and the smallest move yet. One row, the chest (43), which
+	// is FULL_CUBE and SOLID like the furnace before it, so it lands in targetable_seen and
+	// cross_seen stays at 9 again. Measured, not reasoned, as every entry above insists: the
+	// stale number went red as "interact self-test: FAIL 3/1143  L591 targetable_seen == 41",
+	// and 42 is what the loop counted afterwards.
+	CHECK(targetable_seen == 42);   // 43 rows past air, less water
 	CHECK(cross_seen == 9);         // tall grass, dead bush, fern, tall grass top,
 	                                 // poppy, daisy, bluebell, orchid, torch
 }
@@ -1896,7 +1915,10 @@ static void testEveryNonFoodCoreBlockStillPlaces(void)
 	// Both numbers read off a real run of this binary, never worked out on paper — the standing
 	// rule this file's break sweep states three times over. Seeded as -1 and -1 first, so the
 	// first run printed what they actually are.
-	CHECK(placed_ok    == 33);
+	// v1.9.0: 33 -> 34. The chest (43) is not a food item, so it takes the placeable arm above.
+	// Read off the run that went red as "interact self-test: FAIL 3/1143  L1899 placed_ok == 33",
+	// not adjusted on paper.
+	CHECK(placed_ok    == 34);
 	CHECK(food_refused == 9);
 }
 
@@ -1923,9 +1945,38 @@ static int     s_spy_return;      // how many entries to hand back; < 0 exercise
 // Fixed content, standing in for a real furnace's input/fuel/output: a real recipe pair
 // (world/furnace.c's FURNACE_RECIPE_PORK) plus a real fuel item, so nothing here is inventing
 // an item combination the game could not actually produce.
-static const BlockId kSpyItems[INTERACT_BROKE_EXTRA_MAX] =
+//
+// v1.9.0: sized SPY_FURNACE_SLOTS (3) rather than INTERACT_BROKE_EXTRA_MAX, because those two
+// numbers came apart the moment the ceiling went 3 -> 8 for the chest. Left at
+// INTERACT_BROKE_EXTRA_MAX these arrays would have gained five zero-filled tail entries, and
+// testBrokenFurnaceClampsAnOverclaimingReader below -- whose whole point is that
+// breakComplete() clamps to the ceiling -- would have quietly started measuring the zero-qty
+// SKIP instead, passing for a reason unrelated to what it claims. A furnace has three slots;
+// that is what this constant now says, out loud.
+#define SPY_FURNACE_SLOTS 3
+static const BlockId kSpyItems[SPY_FURNACE_SLOTS] =
 	{ BLOCK_RAW_PORKCHOP, BLOCK_PLANKS, BLOCK_COOKED_PORKCHOP };
-static const uint8_t kSpyQtys[INTERACT_BROKE_EXTRA_MAX] = { 3, 7, 1 };
+static const uint8_t kSpyQtys[SPY_FURNACE_SLOTS] = { 3, 7, 1 };
+
+// v1.9.0: the CHEST arm of the same reader. A chest enforces no per-slot rule (world/chest.h
+// says so at length), so this is simply CHEST_SLOTS distinct carryable core blocks with
+// non-zero counts. How many of them the reader hands back is s_spy_chest_n, per case.
+static const BlockId kChestItems[CHEST_SLOTS] = {
+	BLOCK_STONE, BLOCK_DIRT,   BLOCK_PLANKS,    BLOCK_SNOW,
+	BLOCK_ICE,   BLOCK_CACTUS, BLOCK_DEAD_BUSH, BLOCK_FERN,
+};
+static const uint8_t kChestQtys[CHEST_SLOTS] = { 11, 22, 33, 44, 55, 66, 77, 88 };
+
+// How many chest slots the reader reports. 0 for every case written before v1.9.0, so the
+// chest arm is inert unless a case asks for it.
+static int s_spy_chest_n;
+
+// v1.9.0 F2: the chest arm's own flip, the contents-spy twin of s_fits_flip_after_call above --
+// a remote CHEST_STATE landing mid-hold changes what the NEXT read of the chest finds, not what
+// an earlier one already returned. s_spy_chest_flip_after_call at 0 (every case above the F2
+// guard section) means every call reports s_spy_chest_n, exactly as before this pair existed.
+static int s_spy_chest_n_late;
+static int s_spy_chest_flip_after_call;
 
 // v1.8.16 F1, sub-case: index 1 (the fuel slot) reports qty 0 -- an empty slot, which a real
 // FurnaceState can legitimately have (no fuel loaded) and which breakComplete() must skip
@@ -1942,6 +1993,25 @@ static int brokeContentsSpy(BlockId id, int x, int y, int z,
 	s_spy_last_y  = y;
 	s_spy_last_z  = z;
 
+	// v1.9.0: the chest arm, ahead of the furnace one because it is the block this section's
+	// new cases are about. Same shape as the furnace arm -- a real reader (main.c's) will gate
+	// on the id and then blockStateGet with that id as expect_block_id, so one reader answering
+	// for two block kinds is what the real one has to do too.
+	if (id == BLOCK_CHEST) {
+		// s_spy_calls was just incremented above, so it is already the 1-based number of
+		// THIS call -- same numbering bagFitsSpy's flip uses, and it has to be: the two
+		// spies are called in lockstep, once each per bagFitsBrokenBlock() invocation.
+		const int n = (s_spy_chest_flip_after_call > 0 && s_spy_calls >= s_spy_chest_flip_after_call)
+		              ? s_spy_chest_n_late : s_spy_chest_n;
+		int write_n = n;
+		if (write_n > CHEST_SLOTS) write_n = CHEST_SLOTS;
+		for (int i = 0; i < write_n; i++) {
+			items_out[i]  = kChestItems[i];
+			counts_out[i] = kChestQtys[i];
+		}
+		return n;
+	}
+
 	// Only the furnace carries state today -- a real reader (main.c's) gates the same way,
 	// via blockStateGet's own expect_block_id check, so this mirrors that rather than
 	// inventing a different rule.
@@ -1954,12 +2024,17 @@ static int brokeContentsSpy(BlockId id, int x, int y, int z,
 	// Never write past the real buffer even when told to CLAIM more than that -- s_spy_return
 	// itself is returned unclamped below, which is what lets testBrokenFurnaceClampsAnOverclaimingReader
 	// prove breakComplete() is the one doing the clamping, not this spy.
+	//
+	// v1.9.0: the source arrays are SPY_FURNACE_SLOTS long and the ceiling is now wider than
+	// they are, so the read wraps rather than running off the end. For every count at or under
+	// three -- which is every case except the overclaim one -- this is byte-identical to the
+	// straight kSpyItems[i] it replaced.
 	int write_n = s_spy_return;
 	if (write_n > INTERACT_BROKE_EXTRA_MAX) write_n = INTERACT_BROKE_EXTRA_MAX;
 
 	for (int i = 0; i < write_n; i++) {
-		items_out[i]  = kSpyItems[i];
-		counts_out[i] = (s_spy_zero_middle && i == 1) ? 0 : kSpyQtys[i];
+		items_out[i]  = kSpyItems[i % SPY_FURNACE_SLOTS];
+		counts_out[i] = (s_spy_zero_middle && i == 1) ? 0 : kSpyQtys[i % SPY_FURNACE_SLOTS];
 	}
 	return s_spy_return;
 }
@@ -1969,8 +2044,16 @@ static void resetSpy(void)
 	s_spy_calls       = 0;
 	s_spy_last_id     = BLOCK_AIR;
 	s_spy_last_x = s_spy_last_y = s_spy_last_z = -1;
-	s_spy_return       = INTERACT_BROKE_EXTRA_MAX;
+	// v1.9.0: SPY_FURNACE_SLOTS, not INTERACT_BROKE_EXTRA_MAX. It was the ceiling only because
+	// the ceiling happened to be a furnace's slot count; now that it is a chest's, the default
+	// has to say which of the two it meant, and it meant the furnace.
+	s_spy_return       = SPY_FURNACE_SLOTS;
 	s_spy_zero_middle  = false;
+	s_spy_chest_n      = 0;
+	// Off by default -- see the comment above s_spy_chest_n_late. Every case that does not
+	// explicitly arm this keeps getting s_spy_chest_n on every call, as before this pair existed.
+	s_spy_chest_n_late          = 0;
+	s_spy_chest_flip_after_call = 0;
 }
 
 // THE case this section exists for. Every CHECK from broke_extra_count onward is red against
@@ -2073,7 +2156,11 @@ static void testBrokenFurnaceClampsAnOverclaimingReader(void)
 	Interact it;
 	freshAimedAt(&it, BLOCK_FURNACE);
 	resetSpy();
-	s_spy_return = 5;   // more than INTERACT_BROKE_EXTRA_MAX; the spy still only WRITES 3
+	// More than INTERACT_BROKE_EXTRA_MAX, expressed relative to it so this case keeps
+	// overclaiming if the ceiling moves again. It was the literal 5 while the ceiling was 3;
+	// v1.9.0 raised the ceiling to 8 and a literal 5 would have become an UNDER-claim, quietly
+	// turning this case into a second copy of the ordinary one.
+	s_spy_return = INTERACT_BROKE_EXTRA_MAX + 2;
 	interactSetBrokeContentsFn(brokeContentsSpy);
 
 	const Body body = farAwayBody();
@@ -2120,6 +2207,664 @@ static void testBrokeExtraCountClearsOnTheNextCall(void)
 	CHECK(it.broke_extra_count == 0);
 
 	interactSetBrokeContentsFn(NULL);
+}
+
+// ── v1.9.0: a chest break is REFUSED when the bag cannot take what is inside it ─────────
+//
+// THE defect this section exists for, stated as the thing a player would see: break a chest
+// with eight stacks in it and a bag with no room, and the chest and all eight stacks are gone
+// at once, silently. That is not the ordinary "one block lost on a full bag" — breakComplete()
+// writes air FIRST (worldSet at the top of it) and only then reads the contents, so by the
+// time anything knows what was inside, the cell it was keyed to is already empty.
+//
+// The existing guard beside the new one asks a TYPE question — inventoryCanHold() is
+// "defined, not air, not a liquid", a property of the id — and BLOCK_CHEST passes it
+// trivially. There was no capacity check anywhere in this client before this version.
+//
+// WHERE it had to go, and what these cases actually pin: at the start of the HOLD, next to
+// that type guard, not inside breakComplete(). Checking inside breakComplete would be correct
+// about the world and wrong about the player — a full crack animation on a block that was
+// never going to break, which is the exact regression v1.8.1 removed when it moved the type
+// guard forward. So the load-bearing assertion in the refusal case is not `broke == 0`; it is
+// that the world still holds BLOCK_CHEST afterwards. A refusal placed too late passes the
+// first and fails the second.
+//
+// The predicate is a callback for a LINK reason, not a stylistic one: inventoryAdd() lives in
+// world/inventory.c and two of the three stanzas that link scene/interact.c (this one and
+// audio_cue_test) do not link it. See interact.h. That makes the spy below a SPY and not a
+// stand-in for something the host cannot supply — it records the exact stack list interact.c
+// assembled and answers from a knob, so it decides nothing the cases do not set.
+
+static int     s_fits_calls;
+static bool    s_fits_answer;
+static int     s_fits_last_n;
+static BlockId s_fits_last_items[1 + INTERACT_BROKE_EXTRA_MAX];
+static uint8_t s_fits_last_counts[1 + INTERACT_BROKE_EXTRA_MAX];
+
+// v1.9.0 F2 guard cases (below, after testAChestBreakIsRefusedWhenItsContentsWillNotFit): the
+// bag's free space is not fixed for the whole two-second hold, which is the entire reason
+// breakComplete() asks bagFitsBrokenBlock() a SECOND time (interact.c:363) rather than trusting
+// the answer breakProgress() got when the hold started. Every case above this comment gives
+// bagFitsSpy one constant answer for the whole hold -- s_fits_capacity stays 0, capacity mode
+// stays off, and the ternary below falls through to that same constant s_fits_answer, byte for
+// byte the same body this spy always had. A case that wants the LATE call (the one immediately
+// before worldSet) to answer differently from the EARLY one (the one at hold-start) sets
+// s_fits_capacity_early/late and s_fits_flip_after_call instead; capacity mode judges fit from
+// n itself -- the real item count bagFitsBrokenBlock assembled -- rather than from a canned
+// bool, so the predicate's answer tracks what interact.c actually offered it on each call.
+static int s_fits_capacity_early;   // <= 0: capacity mode off, s_fits_answer decides instead
+static int s_fits_capacity_late;
+static int s_fits_flip_after_call;  // 1-based call number the LATE capacity applies from; 0 = never
+
+static bool bagFitsSpy(const BlockId* items, const uint8_t* counts, int n)
+{
+	s_fits_calls++;
+	s_fits_last_n = n;
+	for (int i = 0; i < n && i < (int)(sizeof s_fits_last_items / sizeof s_fits_last_items[0]); i++) {
+		s_fits_last_items[i]  = items[i];
+		s_fits_last_counts[i] = counts[i];
+	}
+
+	if (s_fits_capacity_early > 0 || s_fits_capacity_late > 0) {
+		const int cap = (s_fits_flip_after_call > 0 && s_fits_calls >= s_fits_flip_after_call)
+		                ? s_fits_capacity_late : s_fits_capacity_early;
+		return n <= cap;
+	}
+	return s_fits_answer;
+}
+
+static void resetFitsSpy(bool answer)
+{
+	s_fits_calls   = 0;
+	s_fits_answer  = answer;
+	s_fits_last_n  = -1;
+	memset(s_fits_last_items,  0, sizeof s_fits_last_items);
+	memset(s_fits_last_counts, 0, sizeof s_fits_last_counts);
+	// Capacity mode off by default -- see the comment above bagFitsSpy. Every case that does
+	// not explicitly arm it (which is every case above the F2 guard section) gets the same
+	// constant-answer spy this file has always had.
+	s_fits_capacity_early  = 0;
+	s_fits_capacity_late   = 0;
+	s_fits_flip_after_call = 0;
+}
+
+// The ceiling and the chest's slot count are tied by a _Static_assert in interact.h, which
+// fails the BUILD rather than a check. Pinned here as well because a static assert says
+// "these two are compatible" and this says what they actually ARE — a reader who sees the
+// build stay green after changing one of them learns nothing from the assert alone.
+static void testTheExtraContentsCeilingCoversAWholeChest(void)
+{
+	CHECK(CHEST_SLOTS == 8);
+	CHECK(INTERACT_BROKE_EXTRA_MAX == 8);
+	CHECK(INTERACT_BROKE_EXTRA_MAX >= CHEST_SLOTS);
+}
+
+// The allowed case. A chest with three stacks in it, a bag that can take all of it: the break
+// lands exactly as any other block's does, and the predicate was asked ONCE — at the moment
+// the hold started, not once per frame of it.
+static void testAChestBreaksWhenItsContentsFit(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_CHEST);
+	resetSpy();
+	resetFitsSpy(true);
+	s_spy_chest_n = 3;
+	interactSetBrokeContentsFn(brokeContentsSpy);
+	interactSetBagFitsFn(bagFitsSpy);
+
+	const Body body = farAwayBody();
+	CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) > 0);
+
+	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_AIR);
+	CHECK(it.broke == 1);
+	CHECK(it.refused == 0);
+	CHECK(it.broke_id == BLOCK_CHEST);
+	CHECK(it.broke_extra_count == 3);
+
+	// Asked TWICE, and each time about the block AND its contents in the order the break pays
+	// them out: the chest itself first (one of it), then each non-empty slot.
+	//
+	// Twice, not once, since the v1.9.0 late re-check: breakComplete() asks again immediately
+	// before worldSet, because the first ask happened when the break STARTED and a chest's
+	// contents can change under a multi-second hold (a remote CHEST_STATE, or the bag filling
+	// up meanwhile). Pinned to the exact number rather than left loose so that deleting the
+	// late re-check turns this red instead of silently passing.
+	CHECK(s_fits_calls == 2);
+	CHECK(s_fits_last_n == 4);
+	CHECK(s_fits_last_items[0] == BLOCK_CHEST && s_fits_last_counts[0] == 1);
+	CHECK(s_fits_last_items[1] == kChestItems[0] && s_fits_last_counts[1] == kChestQtys[0]);
+	CHECK(s_fits_last_items[2] == kChestItems[1] && s_fits_last_counts[2] == kChestQtys[1]);
+	CHECK(s_fits_last_items[3] == kChestItems[2] && s_fits_last_counts[3] == kChestQtys[2]);
+
+	interactSetBrokeContentsFn(NULL);
+	interactSetBagFitsFn(NULL);
+}
+
+// A FULL chest, all CHEST_SLOTS of it, still fitting. This is the case the ceiling raise was
+// for: at INTERACT_BROKE_EXTRA_MAX 3 the last five slots would never reach the predicate and
+// never reach the bag.
+static void testAFullChestOffersEveryOneOfItsSlots(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_CHEST);
+	resetSpy();
+	resetFitsSpy(true);
+	s_spy_chest_n = CHEST_SLOTS;
+	interactSetBrokeContentsFn(brokeContentsSpy);
+	interactSetBagFitsFn(bagFitsSpy);
+
+	const Body body = farAwayBody();
+	CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) > 0);
+
+	CHECK(s_fits_last_n == 1 + CHEST_SLOTS);
+	CHECK(it.broke_extra_count == CHEST_SLOTS);
+	for (int i = 0; i < CHEST_SLOTS; i++) {
+		CHECK(s_fits_last_items[1 + i]  == kChestItems[i]);
+		CHECK(s_fits_last_counts[1 + i] == kChestQtys[i]);
+		CHECK(it.broke_extra_item[i] == kChestItems[i]);
+		CHECK(it.broke_extra_qty[i]  == kChestQtys[i]);
+	}
+
+	interactSetBrokeContentsFn(NULL);
+	interactSetBagFitsFn(NULL);
+}
+
+// THE case. The bag cannot take it, so the break never happens -- and the assertion that
+// matters most is the third one: the chest is STILL THERE. A refusal written inside
+// breakComplete() would satisfy `broke == 0` and leave BLOCK_AIR in the cell.
+static void testAChestBreakIsRefusedWhenItsContentsWillNotFit(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_CHEST);
+	resetSpy();
+	resetFitsSpy(false);
+	s_spy_chest_n = CHEST_SLOTS;
+	interactSetBrokeContentsFn(brokeContentsSpy);
+	interactSetBagFitsFn(bagFitsSpy);
+
+	const Body body = farAwayBody();
+	CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) == -1);   // never lands, however long
+
+	// The world is untouched. This is the one that catches a refusal placed too late.
+	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_CHEST);
+	CHECK(it.broke == 0);
+	CHECK(it.broke_id == BLOCK_AIR);
+	CHECK(it.broke_valid == false);
+	CHECK(it.broke_extra_count == 0);
+
+	// Counted once per PRESS, not once per frame of a 200-frame hold -- the same accounting
+	// the type guard beside it already has, and the reason `pressed` is threaded down there.
+	CHECK(it.refused == 1);
+
+	// Nothing on the wire, and no crack animation: the hold was never allowed to start, so
+	// there is no progress for the overlay to draw.
+	CHECK(s_edits_sent == 0);
+	CHECK(it.breaking == false);
+	CHECK(interactBreakStage(&it) == -1);
+
+	// And the predicate really was consulted -- a case that refused for some other reason
+	// entirely would satisfy every check above this one.
+	CHECK(s_fits_calls > 0);
+	CHECK(s_fits_last_n == 1 + CHEST_SLOTS);
+
+	interactSetBrokeContentsFn(NULL);
+	interactSetBagFitsFn(NULL);
+}
+
+// ── v1.9.0 F2: the LATE re-check itself, not just its call count ────────────────────────
+//
+// A verify agent red-armed this file by deleting breakComplete()'s late re-check (interact.c,
+// the block starting `if (broken == BLOCK_CHEST && !bagFitsBrokenBlock(...))` at line 363) and
+// re-running the suite. Its verbatim finding: of 1261 checks, the only one that went red was
+// `CHECK(s_fits_calls == 2)` in testAChestBreaksWhenItsContentsFit above. Every case that
+// exercises breakComplete()'s BEHAVIOUR — the world cell, broke_id, broke_extra_count, refused —
+// stayed green, because every one of them gives bagFitsSpy a single CONSTANT answer for the
+// whole hold. A constant-true answer makes the late call redundant with the one call a
+// single-ask implementation still makes; a constant-false answer (testAChestBreakIsRefusedWhen-
+// ItsContentsWillNotFit, above) refuses at breakProgress()'s START-time guard (interact.c:586)
+// and never reaches breakComplete()'s line 363 at all. Neither shape can tell "asked twice" from
+// "asked once, then trusted".
+//
+// The two cases below are what was missing: the predicate's answer DIFFERS between the early
+// call (breakProgress, hold start) and the late one (breakComplete, immediately before
+// worldSet), so a build that only asks once necessarily gets the EARLY (fitting) answer and
+// lets the break land — which spills the chest's contents into broke_extra_item/qty and writes
+// BLOCK_AIR over a chest whose contents were never actually offered to a full bag. Every
+// assertion below is about that world state and those contents, not about how many times
+// anything was called.
+// The bag fills up DURING the hold: room enough when the two-second break starts, none left by
+// the time it finishes. This is interact.c:322-326's own scenario, verbatim -- a joined
+// session's onInvState() can write a whole authoritative BS_APP_INV_STATE into the live
+// inventory with no "a break is in progress" gate, so the free slot the start-time guard saw
+// can be gone before breakComplete() is reached.
+static void testAChestBreakIsRefusedWhenTheBagFillsDuringTheHold(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_CHEST);
+	resetSpy();
+	resetFitsSpy(true);
+	s_spy_chest_n = 3;                     // contents constant across the whole hold
+	// Capacity mode: call 1 (breakProgress, hold start) sees room for 10, easily fitting the
+	// chest-plus-3-stacks n==4 this fixture offers. Call 2 onward (breakComplete, the late
+	// re-check) sees room for only 2 -- the bag filled up while the player was still holding
+	// the button down.
+	s_fits_capacity_early  = 10;
+	s_fits_capacity_late   = 2;
+	s_fits_flip_after_call = 2;
+	interactSetBrokeContentsFn(brokeContentsSpy);
+	interactSetBagFitsFn(bagFitsSpy);
+
+	const Body body = farAwayBody();
+
+	// Drive the hold for EXACTLY as many ticks as breakTicksRequired() says a chest needs --
+	// not holdBreakUntilDone()'s usual NEVER_TICKS. The late re-check refuses on the tick the
+	// hold would otherwise complete, and breakCancel() leaves it->breaking false; one frame
+	// further and breakProgress()'s START branch re-enters on its own (interact.c's own
+	// breakComplete() comment: "the following press ... asks the START-time question ... and is
+	// turned away immediately") and calls bagFitsBrokenBlock() again -- correct behaviour on
+	// interact.c's part, and not what this case is measuring, so the drive stops the instant the
+	// late re-check has had its one chance to fire.
+	const uint32_t need = breakTicksRequired(BLOCK_CHEST, it.holding);
+	for (uint32_t t = 0; t < need; t++)
+		holdBreakFrame(&it, &body, 1);
+
+	// THE assertions a call-count pin cannot make. Delete the late re-check and every one of
+	// these goes red together: the chest is gone (BLOCK_AIR), it.broke is 1, broke_id is
+	// BLOCK_CHEST, and broke_extra_count is 3 -- the exact silent-destruction defect v1.9.0 F2
+	// exists to prevent.
+	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_CHEST);   // still standing, unopened
+	CHECK(it.broke == 0);
+	CHECK(it.broke_id == BLOCK_AIR);
+	CHECK(it.broke_valid == false);
+	CHECK(it.broke_extra_count == 0);                       // nothing spilled into the bag
+
+	// Conservation: the chest is the only place its three stacks were ever going to come from,
+	// and it is still standing with nothing extracted -- so what was inside it before the press
+	// is exactly what is inside it now. Nothing went out over the wire either.
+	CHECK(s_edits_sent == 0);
+	CHECK(it.refused == 1);
+	CHECK(it.breaking == false);
+
+	// The tripwire, kept -- still useful (a build that stopped asking entirely at all would
+	// fail this even with the checks above coincidentally passing some other way), but no
+	// longer the only thing standing guard.
+	CHECK(s_fits_calls == 2);
+
+	interactSetBrokeContentsFn(NULL);
+	interactSetBagFitsFn(NULL);
+}
+
+// The chest's own CONTENTS change during the hold, as a remote CHEST_STATE arriving mid-hold
+// would do -- not the bag's free space this time, but what the chest itself reports holding.
+// Three stacks at the start (fits easily); a full eight by the time breakComplete() asks again
+// (does not). The bag's own capacity never moves in this case, which is the point: it is the
+// SOURCE data that changed under the hold, and the late re-check is what catches that too.
+static void testAChestBreakIsRefusedWhenItsContentsChangeDuringTheHold(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_CHEST);
+	resetSpy();
+	resetFitsSpy(true);
+	// A fixed capacity of 5 for both calls -- what changes is n, not the ceiling it is judged
+	// against.
+	s_fits_capacity_early  = 5;
+	s_fits_capacity_late   = 5;
+	// Call 1 (hold start): 3 stacks, n == 1 + 3 == 4, fits (4 <= 5).
+	s_spy_chest_n = 3;
+	// Call 2 onward (the late re-check): a remote CHEST_STATE filled every slot, n == 1 + 8 ==
+	// 9, no longer fits (9 <= 5 is false).
+	s_spy_chest_n_late          = CHEST_SLOTS;
+	s_spy_chest_flip_after_call = 2;
+	interactSetBrokeContentsFn(brokeContentsSpy);
+	interactSetBagFitsFn(bagFitsSpy);
+
+	const Body body = farAwayBody();
+	// Same reasoning as the case above for driving exactly `need` frames rather than
+	// holdBreakUntilDone()'s NEVER_TICKS -- see the comment there.
+	const uint32_t need = breakTicksRequired(BLOCK_CHEST, it.holding);
+	for (uint32_t t = 0; t < need; t++)
+		holdBreakFrame(&it, &body, 1);
+
+	// Same shape of proof as the case above: the world, not a counter.
+	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_CHEST);
+	CHECK(it.broke == 0);
+	CHECK(it.broke_id == BLOCK_AIR);
+	CHECK(it.broke_valid == false);
+	CHECK(it.broke_extra_count == 0);
+
+	// Conservation: the now-eight-stack chest is still sitting in the world with everything
+	// still in it -- none of the eight stacks the late CHEST_STATE reported were ever added to
+	// broke_extra_item/qty, because the break never landed to read them for payout.
+	CHECK(s_edits_sent == 0);
+	CHECK(it.refused == 1);
+
+	// What the late call was actually asked, confirming the refusal is about the NEW contents
+	// and not a stale copy of the old ones.
+	CHECK(s_fits_last_n == 1 + CHEST_SLOTS);
+
+	CHECK(s_fits_calls == 2);   // the tripwire, kept, not the only guard
+
+	interactSetBrokeContentsFn(NULL);
+	interactSetBagFitsFn(NULL);
+}
+
+// An EMPTY chest with a full bag is still refused, because the chest itself is an item too.
+// Worth its own case: the obvious wrong implementation checks only the contents, and an empty
+// chest has none.
+static void testAnEmptyChestIsStillRefusedByAFullBag(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_CHEST);
+	resetSpy();
+	resetFitsSpy(false);
+	s_spy_chest_n = 0;
+	interactSetBrokeContentsFn(brokeContentsSpy);
+	interactSetBagFitsFn(bagFitsSpy);
+
+	const Body body = farAwayBody();
+	CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) == -1);
+	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_CHEST);
+	CHECK(it.refused == 1);
+
+	// One entry, the chest itself -- so "the block being broken" is always in the list, not
+	// only when it has contents.
+	CHECK(s_fits_last_n == 1);
+	CHECK(s_fits_last_items[0] == BLOCK_CHEST && s_fits_last_counts[0] == 1);
+
+	interactSetBrokeContentsFn(NULL);
+	interactSetBagFitsFn(NULL);
+}
+
+// A chest with no reader registered at all -- the state the console is in until main.c wires
+// one -- still asks the capacity question about the chest itself. The two callbacks are
+// independent; neither being absent may disable the other.
+static void testAChestWithNoContentsReaderStillAsksAboutItself(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_CHEST);
+	resetFitsSpy(false);
+	interactSetBrokeContentsFn(NULL);
+	interactSetBagFitsFn(bagFitsSpy);
+
+	const Body body = farAwayBody();
+	CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) == -1);
+	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_CHEST);
+	CHECK(s_fits_last_n == 1);
+	CHECK(s_fits_last_items[0] == BLOCK_CHEST);
+
+	interactSetBagFitsFn(NULL);
+}
+
+// The default, unwired state: no predicate registered means "yes, always", i.e. exactly the
+// pre-v1.9.0 behaviour. Every one of the fifty-odd cases above this section depends on that
+// being true, so it is asserted rather than left implicit.
+static void testNoBagPredicateMeansAChestBreaksAsBefore(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_CHEST);
+	resetSpy();
+	s_spy_chest_n = CHEST_SLOTS;
+	interactSetBrokeContentsFn(brokeContentsSpy);
+	interactSetBagFitsFn(NULL);   // explicit, though freshAimedAt already did this
+
+	const Body body = farAwayBody();
+	CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) > 0);
+	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_AIR);
+	CHECK(it.broke_id == BLOCK_CHEST);
+	CHECK(it.broke_extra_count == CHEST_SLOTS);
+
+	interactSetBrokeContentsFn(NULL);
+}
+
+// The non-chest path is UNCHANGED, and this is the case that proves the new branch is gated
+// rather than merely ordered: with the bag answering "nothing fits" for everything, stone and
+// a furnace both still break, and the predicate is never even consulted for them.
+//
+// The furnace half is deliberate scope, not an oversight -- it has the identical problem and
+// is already shipping with it, and docs/design-1.9.0-chest-multiplayer.md's open question 3
+// puts furnaces out of scope for this version. If that is ever taken on, this case is the one
+// that goes red and says so.
+static void testANonChestBreakNeverAsksAboutCapacity(void)
+{
+	const BlockId ids[] = { BLOCK_STONE, BLOCK_DIRT, BLOCK_FURNACE, BLOCK_TALL_GRASS };
+
+	for (size_t i = 0; i < sizeof ids / sizeof ids[0]; i++) {
+		Interact it;
+		freshAimedAt(&it, ids[i]);
+		resetSpy();
+		resetFitsSpy(false);   // the bag is full and refuses everything
+		interactSetBrokeContentsFn(brokeContentsSpy);
+		interactSetBagFitsFn(bagFitsSpy);
+
+		const Body body = farAwayBody();
+		CHECK(holdBreakUntilDone(&it, &body, NEVER_TICKS) > 0);
+		CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_AIR);
+		CHECK(it.refused == 0);
+		CHECK(s_fits_calls == 0);
+
+		interactSetBrokeContentsFn(NULL);
+		interactSetBagFitsFn(NULL);
+	}
+}
+
+// ── v1.9.0 F1: a refused placement must put back what was really there ──────────────────
+//
+// THE DEFECT, and it is a REFUSAL path, which is the only reason it is worth three cases for
+// something a player meets once in a blue moon: v1.9.0 made a placement refuse when
+// blockStateCreate() answers false -- the side table holds 256 live records and none of them
+// is this cell -- and source/main.c undoes the placement by writing the cell back. It wrote
+// BLOCK_AIR, because interactEdit kept the cell's previous contents in a LOCAL (`place_was`)
+// and never published them. main.c's own comment said so and called the consequence bounded:
+//
+//     WHAT THE CELL GOES BACK TO IS BLOCK_AIR, AND THAT IS NOT EXACTLY RIGHT. [...] placing
+//     a chest into a tuft of grass with the state table full destroys the grass. Fixing it
+//     properly needs a `placed_was` field beside placed_id in scene/interact.h, which this
+//     change does not own.
+//
+// So a refusal whose whole contract is "nothing happened" DELETED A BLOCK. Air is only the
+// ordinary case: the place path refuses a solid cell and accepts every non-solid one, and
+// tall grass is a non-solid cell a player walks through constantly.
+//
+// WHY THESE CASES POISON THE FIELD FIRST. `placed_was` is read by the caller AFTER
+// interactEdit returns, and the claim under test is that the call PUBLISHES it -- not that it
+// happened to hold the right value already. Writing a deliberate wrong value in first is what
+// makes that distinguishable, and it is also what makes the red arm DETERMINISTIC: against an
+// interact.c that never writes the field there is nothing else to read, and an indeterminate
+// stack byte is not evidence about anything. BLOCK_STONE is the poison because it is neither
+// the block being placed, nor what the cell held, nor BLOCK_AIR.
+//
+// The revert these cases perform is main.c's own line, not a paraphrase of it: worldSet on the
+// place cell with it.placed_was, guarded by it.placed_valid exactly as main.c's `if` guards it.
+// The four other lines of that revert (dirty, relight, remesh, the wire) are main.c's business
+// and are not what this file is about -- what IS this file's business is that the id main.c
+// puts back is the right one.
+static void testAPlacementIntoTallGrassPublishesTheGrass(void)
+{
+	// The premise, pinned rather than assumed: a placement is only allowed into a NON-solid
+	// cell (interact.c refuses `blockIsSolid(place_was)`), so if tall grass ever became solid
+	// this whole case would be testing the refusal above instead, and would pass for the wrong
+	// reason.
+	CHECK(!blockIsSolid(BLOCK_TALL_GRASS));
+
+	Interact it;
+	freshAimedAt(&it, BLOCK_STONE);
+	it.holding = BLOCK_PLANKS;
+
+	// The place cell is not empty. This is the whole scenario: a tuft of grass where the
+	// player is about to put a block.
+	worldSet(&s_world, TX, TY + 1, TZ, BLOCK_TALL_GRASS);
+	CHECK(worldGet(&s_world, TX, TY + 1, TZ) == BLOCK_TALL_GRASS);
+
+	it.placed_was = BLOCK_STONE;   // poison — see the section note above
+
+	const Body body = farAwayBody();
+	interactEdit(&it, &s_world, &body, placeKey(), 0, 0);
+
+	// The placement itself landed, exactly as it always did. If any of these three go red the
+	// case is no longer about the revert at all.
+	CHECK(worldGet(&s_world, TX, TY + 1, TZ) == BLOCK_PLANKS);
+	CHECK(it.placed_id == BLOCK_PLANKS);
+	CHECK(it.placed_valid == true);
+
+	// THE published field. This is the check that is red without the fix.
+	CHECK(it.placed_was == BLOCK_TALL_GRASS);
+
+	// And main.c's refusal revert, run for real over the world this file owns. Without the fix
+	// it puts back the poison; before the fix existed at all it put back BLOCK_AIR. Either way
+	// the grass is gone, and this is what says so.
+	if (it.placed_valid)
+		worldSet(&s_world, it.placed_x, it.placed_y, it.placed_z, it.placed_was);
+
+	CHECK(worldGet(&s_world, TX, TY + 1, TZ) == BLOCK_TALL_GRASS);
+	CHECK(worldGet(&s_world, TX, TY + 1, TZ) != BLOCK_AIR);       // the defect, stated directly
+	CHECK(worldGet(&s_world, TX, TY + 1, TZ) != BLOCK_PLANKS);    // and the placement is gone
+
+	// The block that was under the crosshair is untouched throughout — the revert names the
+	// PLACE cell and nothing else.
+	CHECK(worldGet(&s_world, TX, TY, TZ) == BLOCK_STONE);
+}
+
+// The ordinary case, which must not move: an empty place cell publishes BLOCK_AIR, so the
+// revert writes exactly what main.c's old hardcoded BLOCK_AIR wrote. Without this, a
+// `placed_was` that was only ever set for non-air cells would pass the case above and quietly
+// change what a normal refused placement does.
+static void testAnOrdinaryPlacementIntoAirPublishesAir(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_STONE);
+	it.holding = BLOCK_PLANKS;
+	CHECK(worldGet(&s_world, TX, TY + 1, TZ) == BLOCK_AIR);
+
+	it.placed_was = BLOCK_STONE;   // poison, same reason
+
+	const Body body = farAwayBody();
+	interactEdit(&it, &s_world, &body, placeKey(), 0, 0);
+
+	CHECK(it.placed_valid == true);
+	CHECK(it.placed_was == BLOCK_AIR);
+
+	if (it.placed_valid)
+		worldSet(&s_world, it.placed_x, it.placed_y, it.placed_z, it.placed_was);
+
+	CHECK(worldGet(&s_world, TX, TY + 1, TZ) == BLOCK_AIR);
+}
+
+// The STALE case, and it is the one that would turn this fix into a worse bug than the one it
+// closes. main.c reads placed_was on a later frame; a value left standing from an EARLIER
+// placement would revert this cell to a block that was never in it — a block conjured out of
+// somewhere else in the world, which is strictly worse than the air it used to write.
+//
+// So placed_was is cleared at the top of every interactEdit, on placed_id's own schedule, and
+// this is what holds that. The second frame here is a plain release (no keys), which is the
+// cheapest call that reaches the top of interactEdit and gets nowhere near the place path.
+static void testPlacedWasDoesNotSurviveIntoALaterCall(void)
+{
+	Interact it;
+	freshAimedAt(&it, BLOCK_STONE);
+	it.holding = BLOCK_PLANKS;
+	worldSet(&s_world, TX, TY + 1, TZ, BLOCK_TALL_GRASS);
+
+	it.placed_was = BLOCK_STONE;   // poison, same reason as the two cases above
+
+	const Body body = farAwayBody();
+	interactEdit(&it, &s_world, &body, placeKey(), 0, 0);
+	CHECK(it.placed_was == BLOCK_TALL_GRASS);   // the value that must not persist
+
+	releaseFrame(&it, &body, 1);
+
+	// Cleared, and cleared TOGETHER with the flag that gates it. A reader doing main.c's job on
+	// this frame finds nothing to revert and, if it looked anyway, would find BLOCK_AIR — the
+	// value the field meant before it existed.
+	CHECK(it.placed_valid == false);
+	CHECK(it.placed_was == BLOCK_AIR);
+
+	// And the world was not touched by the release frame.
+	CHECK(worldGet(&s_world, TX, TY + 1, TZ) == BLOCK_PLANKS);
+}
+
+// ── v1.9.0 F1, the main.c half: the revert really reads placed_was, and the charge waits ──
+//
+// The three cases above prove interact.c PUBLISHES the field. They cannot prove main.c READS
+// it: source/main.c opens with <3ds.h> and carries main(), so it links into no host binary,
+// and the revert those cases perform is a copy of main.c's line, not main.c's line. Put
+// BLOCK_AIR back into main.c's worldSet -- the exact pre-fix defect -- and every check above
+// stays green. Measured, not reasoned: that sabotage was run against this binary before this
+// pin existed and the run was "PASS 1252 checks".
+//
+// So the wiring is pinned the way this suite already pins main.c elsewhere
+// (world/framesync_guard_test.c, app/session_test.c, world/playerpose_test.c): read the file
+// as text and assert the exact lines are there. Whitespace is collapsed to single spaces
+// over the WHOLE file before searching, so a call that spans two lines (the
+// networldSendBlockEdit below does) is one searchable string and re-indenting main.c cannot
+// turn a pin red. Comments in main.c quote fragments of these lines but never a whole call
+// with its arguments, which is why every needle below is a complete statement.
+//
+// The path is relative to the cwd because the binary runs from the repo root, as
+// tools/run_host_tests.sh runs every other main.c pin. A file that cannot be opened is a
+// FAILURE, never "no lines, therefore nothing to complain about".
+static char* readMainCSquashed(void)
+{
+	FILE* f = fopen("source/main.c", "rb");
+	if (!f) return NULL;
+	if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+	const long len = ftell(f);
+	if (len < 0) { fclose(f); return NULL; }
+	rewind(f);
+
+	char* buf = malloc((size_t)len + 1);
+	if (!buf) { fclose(f); return NULL; }
+	const size_t got = fread(buf, 1, (size_t)len, f);
+	fclose(f);
+
+	// Collapse every run of whitespace to one space, in place.
+	size_t o  = 0;
+	bool   sp = false;
+	for (size_t i = 0; i < got; i++) {
+		const char c = buf[i];
+		if (c == ' ' || c == '\t' || c == '\r' || c == '\n') { sp = (o > 0); continue; }
+		if (sp) { buf[o++] = ' '; sp = false; }
+		buf[o++] = c;
+	}
+	buf[o] = '\0';
+	return buf;
+}
+
+static int countIn(const char* hay, const char* needle)
+{
+	int n = 0;
+	for (const char* p = hay; (p = strstr(p, needle)) != NULL; p += strlen(needle))
+		n++;
+	return n;
+}
+
+static void testMainCRevertsTheRefusedPlacementToPlacedWas(void)
+{
+	char* src = readMainCSquashed();
+	CHECK(src != NULL);
+	if (!src) return;
+
+	// THE line. Exactly one worldSet names the placed cell, and it writes placed_was -- the
+	// second count is what refuses ANY other id there, BLOCK_AIR included.
+	CHECK(countIn(src, "worldSet(&s_world, it.placed_x, it.placed_y, it.placed_z, it.placed_was);") == 1);
+	CHECK(countIn(src, "worldSet(&s_world, it.placed_x, it.placed_y, it.placed_z,") == 1);
+
+	// The pre-fix defect, stated directly.
+	CHECK(countIn(src, "worldSet(&s_world, it.placed_x, it.placed_y, it.placed_z, BLOCK_AIR)") == 0);
+
+	// And the server is told the SAME value, or the revert trades one divergence for another.
+	CHECK(countIn(src, "networldSendBlockEdit(it.placed_x, it.placed_y, it.placed_z, (uint8_t)it.placed_was);") == 1);
+	CHECK(countIn(src, "networldSendBlockEdit(it.placed_x, it.placed_y, it.placed_z,") == 1);
+
+	// ORDER: the refusal clears placed_id BEFORE the hotbar charge reads it, which is what
+	// keeps a refused placement from costing the player the block. Both statements exist
+	// exactly once, and the clear comes first in the file.
+	const char* clear  = strstr(src, "it.placed_id = BLOCK_AIR;");
+	const char* charge = strstr(src, "if (it.placed_id != BLOCK_AIR) invBridgeRemove(&s_inv, it.placed_id, 1);");
+	CHECK(countIn(src, "it.placed_id = BLOCK_AIR;") == 1);
+	CHECK(countIn(src, "if (it.placed_id != BLOCK_AIR) invBridgeRemove(&s_inv, it.placed_id, 1);") == 1);
+	CHECK(clear != NULL && charge != NULL && clear < charge);
+
+	free(src);
 }
 
 int main(void)
@@ -2200,6 +2945,31 @@ int main(void)
 	testBrokenFurnaceClampsAnOverclaimingReader();
 	testBrokenFurnaceClampsANegativeReader();
 	testBrokeExtraCountClearsOnTheNextCall();
+
+	// v1.9.0 "Storage" — a chest break must not destroy what is inside it. The ceiling pin
+	// first, then the allowed cases, then THE refusal, then the two halves that must not move:
+	// an unwired predicate behaves as before, and no non-chest block is affected.
+	testTheExtraContentsCeilingCoversAWholeChest();
+	testAChestBreaksWhenItsContentsFit();
+	testAFullChestOffersEveryOneOfItsSlots();
+	testAChestBreakIsRefusedWhenItsContentsWillNotFit();
+	// v1.9.0 F2 -- the late re-check itself, not just testAChestBreaksWhenItsContentsFit's
+	// s_fits_calls == 2 call-count pin. See the section comment above the first of these two.
+	testAChestBreakIsRefusedWhenTheBagFillsDuringTheHold();
+	testAChestBreakIsRefusedWhenItsContentsChangeDuringTheHold();
+	testAnEmptyChestIsStillRefusedByAFullBag();
+	testAChestWithNoContentsReaderStillAsksAboutItself();
+	testNoBagPredicateMeansAChestBreaksAsBefore();
+	testANonChestBreakNeverAsksAboutCapacity();
+
+	// v1.9.0 F1 — a refused placement puts back what was really in the cell. THE case first,
+	// then the ordinary air case that must not move, then the stale-value guard.
+	testAPlacementIntoTallGrassPublishesTheGrass();
+	testAnOrdinaryPlacementIntoAirPublishesAir();
+	testPlacedWasDoesNotSurviveIntoALaterCall();
+	// v1.9.0 F1, the main.c half -- pinned as text, because main.c links into no host binary
+	// and a BLOCK_AIR put back into its revert leaves the three cases above green.
+	testMainCRevertsTheRefusedPlacementToPlacedWas();
 
 	if (s_fails == 0)
 		printf("interact self-test: PASS  %d checks\n", s_checks);

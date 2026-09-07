@@ -121,6 +121,30 @@
 // wired without moving twice; the worldgen lane that adds the actual decorator is what reaches
 // it — nothing in the world today generates at this version yet, so every pinned fingerprint
 // in world_test.c is untouched by this constant existing.
+//
+// ── Superseded 2026-09-07: the worldgen lane landed. The paragraph above is HISTORY ─────
+//
+// "Nothing in the world today generates at this version yet" was true only for the window
+// between the ORE-BLOCKS lane minting this number and the worldgen lane arriving. Kept rather
+// than deleted, for the same reason genVersionForSession()'s pre-Phase-4 paragraph further down
+// this file is kept: it is why the constant exists at all, and reads as a live claim only if
+// you stop before here.
+//
+// The ore-vein decorator (world/ore_gen.h) now exists and is reached from
+// world/worldgen_density.c in two places: the once-per-column mask pre-pass at :652, and the
+// block write site at :843-846, where a cell that came out BLOCK_STONE is replaced by the
+// mask's ore id. Both are gated on `g->version >= GEN_VERSION_ORES`, which is the dispatch rule
+// GEN_VERSION_CAVES above asks the next generator to keep to.
+//
+// What that gate buys is unchanged, and is now MEASURED rather than argued: only a world
+// stamped 5 or above gets ore, and every world stamped LEGACY, DENSITY, BIOME or CAVES
+// generates byte-identical terrain to the terrain it generated before ore existed. See
+// debug/loadprof_test.c:756-769, which rebuilds that suite's whole fixture at
+// GEN_VERSION_CAVES on this tree and reproduces the pre-ore hashes exactly.
+//
+// **What HAS changed is new worlds: GEN_VERSION_FOR_NEW_WORLDS is GEN_VERSION_NEWEST is
+// GEN_VERSION_ORES (both defined immediately below), so every world created by this build is
+// stamped 5 and does generate ore.** The "yet" is spent.
 #define GEN_VERSION_ORES     5u
 
 // The newest generator this build can produce. A stamp above this is a world from the

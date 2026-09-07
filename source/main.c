@@ -58,11 +58,13 @@
 #include "net/bsnet.h"
 #include "net/inv_bridge.h"
 #include "net/networld.h"
+#include "scene/aimtext.h"
 #include "scene/camera.h"
 #include "scene/chunk_render.h"
 #include "scene/crackoverlay.h"
 #include "scene/crosshair.h"
 #include "scene/highlight.h"
+#include "scene/hotbar.h"
 #include "scene/playermodel.h"
 #include "scene/entitymodel.h"
 #include "scene/interact.h"
@@ -75,6 +77,7 @@
 #include "scene/ui.h"
 #include "world/blockstate.h"
 #include "world/budget.h"
+#include "world/chest.h"
 #include "world/daynight.h"
 #include "world/furnace.h"
 #include "world/genrefuse.h"
@@ -158,6 +161,11 @@ static uint64_t relightNowTicks(void) { return (uint64_t)svcGetSystemTick(); }
 // render frame, so a mechanic runs at the same speed whether the console is holding 59.83 fps or
 // struggling at 30. See world/tick.h.
 static TickClock s_tickclock;
+
+// v1.9.0 AIM-TEXT. The block-name readout under the reticle — which name, and how faded. Fed
+// once per frame from this frame's raycast (beside interactAim, after the animal tie-break),
+// read by drawEye's crosshairDraw() in both eyes. scene/aimtext.h; 28 bytes, no allocation.
+static AimText s_aimtext;
 
 // v1.8.9 day/night. The world clock -- ticks within the current day plus elapsed-day count -- see
 // world/daynight.h. Initialised from the world's time.bin sidecar (or DAY_START_TICKS on a fresh
@@ -1363,12 +1371,17 @@ static void genSetRadius(int radius)
 // The one thing the hoisted block still needs from the streaming machinery, in the build that
 // has none. There is no ring to resize when the world is hand-built — it is filled and meshed
 // in one call and never re-meshed — so a render-distance change has nothing to act on and this
-// does nothing. A no-op definition rather than an #if at each caller because there are three
-// of them and two (the debug menu's slider, the pause menu's stepper) are shared UI compiled
-// into both builds; the third, the L and R shortcut in the frame loop, is already compiled out
-// under BS_WORLD_GEN=0 for the same reason, and that is the precedent this follows. It is
-// deliberately not chunkRenderSetDistance: changing the fog and the near plane in a world
-// nothing streams into would be new behaviour, and nothing has asked for it.
+// does nothing. A no-op definition rather than an #if at each caller because both callers —
+// the debug menu's slider (bsDebugSetRenderDist) and the pause menu's stepper (the
+// `dist_step != 0` block in the frame loop) — are shared UI compiled into both builds, so
+// there is no one place an #if would sit. It is deliberately not chunkRenderSetDistance:
+// changing the fog and the near plane in a world nothing streams into would be new behaviour,
+// and nothing has asked for it.
+//
+// v1.9.0 HOTBAR-LR: there used to be a THIRD caller, the L and R shortcut in the frame loop,
+// and this comment cited it as the precedent for the no-op (it was already compiled out under
+// BS_WORLD_GEN=0). L and R now cycle the hotbar instead (scene/hotbar.h) and that caller is
+// gone; two remain, and both are the shared-UI kind.
 #if !BS_WORLD_GEN
 static void genSetRadius(int radius) { (void)radius; }
 #endif
@@ -2894,7 +2907,11 @@ static void drawEye(C3D_RenderTarget* target, const C3D_Mtx* view, const RayHit*
 	// inside drawEye rather than outside it so that each eye gets one at the same screen
 	// position — which is what puts it at screen depth instead of floating in front of or
 	// behind the block being aimed at. It opens and closes its own sprite batch.
-	crosshairDraw(400.0f, 240.0f);
+	//
+	// v1.9.0 AIM-TEXT: the block's name rides under the reticle in the same batch, at the same
+	// screen depth. NULL / 0 for every hidden case — crosshair.c draws nothing for those, so
+	// an untargeted frame costs no quads.
+	crosshairDraw(400.0f, 240.0f, aimTextLabel(&s_aimtext), aimTextAlpha(&s_aimtext));
 }
 
 // The player's items. Outside the BS_BOTTOM_UI guard on purpose: a build with no bottom
@@ -2904,15 +2921,29 @@ static void drawEye(C3D_RenderTarget* target, const C3D_Mtx* view, const RayHit*
 // bottom-screen draw below is a file-scope function and needs it.
 static Inventory s_inv;
 
+// v1.9.0 HOTBAR-LR. The L/R shoulder buttons' held-to-repeat state (scene/hotbar.h). Beside
+// s_inv because it is the inventory's selection it drives; zero-initialised, and only ever
+// touched through hotbarNavFrame in the frame loop.
+static HotbarNav s_hotbar_nav;
+
 // v1.8.15. Per-block state for blocks that carry any — currently only the furnace, which needs
-// to remember its fuel, its input and how far along the smelt is. A single 2 KB side table
-// (BLOCKSTATE_SLOTS 64 entries of 32 bytes) rather than widening the block id or the chunk
+// to remember its fuel, its input and how far along the smelt is. A single 8 KB side table
+// (BLOCKSTATE_SLOTS 256 entries of 32 bytes) rather than widening the block id or the chunk
 // format, because the overwhelming majority of blocks carry no state at all and paying for a
-// payload on every cell in the world to serve sixty-four of them is the expensive way round.
+// payload on every cell in the world to serve two hundred and fifty-six of them is the
+// expensive way round.
 //
 // File static for the same two reasons as s_inv above: the bottom-screen draw is a file-scope
 // function, and the lid-close flush hook is a callback. Neither can see main()'s locals.
 static BlockStateTable s_blockstate;
+
+// Set at the load call site below from blockStateLoad's own return value, and read at the save
+// call site far below it. blockStateLoad now returns false (not the old, dishonest true) when
+// its read-buffer malloc fails — see world/blockstate.c/.h — which leaves s_blockstate at a
+// safe EMPTY default that must never be written back over a real file on disk. Same shape as
+// world_refused: a boolean the load side sets and the save side guards against, threaded across
+// the two ends of one world session.
+static bool s_blockstate_load_incomplete;
 
 // v1.8.13 SURV-WIRE. The player's vitals, reachable from file scope for exactly the two
 // reasons s_sleep_player below is a file static: the bottom-screen draw is a file-scope
@@ -2958,7 +2989,7 @@ static UiState s_ui;
 // would be wrong.
 //
 // world/blockstate.c owns the only copy of every furnace's state. The per-tick loop below
-// advances all sixty-four of them — burning fuel, cooking, going dark — on the same table the
+// advances all two hundred and fifty-six of them — burning fuel, cooking, going dark — on the same table the
 // panel is editing. If this file kept its own FurnaceState across frames and wrote it back at
 // the end, every tick the panel was open would be undone: the player would watch a furnace
 // that never burns down, because the frame path would keep restoring the copy it took before
@@ -2973,6 +3004,58 @@ static UiState s_ui;
 static bool s_furnace_open;
 static int  s_furnace_x, s_furnace_y, s_furnace_z;
 
+// v1.9.0 CHEST. WHICH chest the bottom-screen panel is currently showing, and the exact twin
+// of the four furnace fields above -- same four fields, same types, same reasoning, restated
+// only where the chest differs.
+//
+// Everything the furnace block says about holding a CELL ADDRESS rather than a ChestState
+// applies here verbatim and is not repeated: world/blockstate.c owns the only copy, the panel
+// unpacks fresh immediately before uiUpdateDraw and packs back immediately after, and nothing
+// is carried between frames. The one thing that is DIFFERENT is worth naming, because it looks
+// like the reasoning should be weaker for a chest and it is not: a chest has no tick, so
+// nothing advances its state behind the panel's back the way furnaceTick advances a furnace's,
+// and a reader could conclude that holding a ChestState across frames would therefore be safe
+// here. It would not be. Another player breaking the chest over the network, or the record
+// being evicted, both destroy the record while the panel is open -- and a held copy written
+// back afterwards would resurrect a chest that no longer exists, in a table with only
+// BLOCKSTATE_SLOTS 256 entries to spare. Same shape, same fresh-every-frame rule, different
+// reason for it.
+//
+// s_chest_open rather than a sentinel coordinate, for blockstate.h's own reason: (0,0,0) is an
+// ordinary cell a player can build a chest in, so no coordinate triple is free to mean "no
+// chest open".
+static bool s_chest_open;
+static int  s_chest_x, s_chest_y, s_chest_z;
+
+// v1.9.0 CHEST-NET. The chest panel's transfer callback while a session is up (scene/ui.h's
+// UiChestTransferFn): put the transfer on the wire and apply nothing — the server applies it
+// and its INV_STATE / CHEST_STATE snapshots rewrite both sides. Registered per frame, below,
+// off networldSessionActive(), and cleared (NULL = the panel applies locally) when there is
+// no session.
+//
+// The count is a PARAMETER here, forwarded straight through; it is NOT re-derived. The patch
+// this adapter came from was written against an older UiChestTransferFn that carried only
+// (op, a, b) and worked the count out itself, off s_ui.picked_slot for a deposit and the
+// blockstate table for a withdraw. scene/ui.h's live signature carries the count, so that
+// derivation is gone rather than kept as a second source of truth for one number.
+//
+// It is also the only correct source. net/networld.h's wire block says byte 16 travels
+// precisely because "after a stack split the lift holds part of a stack, and 'all of it' is
+// not a quantity a server can infer" — and v1.9.0 SPLIT is that split. Re-deriving a DEPOSIT
+// from s_inv.slots[s_ui.picked_slot].count would send the units left BEHIND in the origin
+// slot rather than the half actually in the air.
+//
+// count == 0 is refused here instead of sent: the server range-checks byte 16 and refuses a
+// zero with nothing on either side to say why. Answering false turns that into the panel's own
+// documented "refused — not sent", which keeps the lift in the player's hand (scene/ui.h).
+static bool mainChestTransfer(void* ud, uint8_t op, int x, int y, int z, uint8_t a, uint8_t b,
+                               uint8_t count)
+{
+	(void)ud;
+	if (count == 0) return false;
+	return networldSendChestAction(op, x, y, z, a, b, count);
+}
+
 // v1.8.17. What a broken furnace hands back. Registered with scene/interact.c once at startup
 // and called by it from breakComplete, at the one moment the block has been decided broken but
 // its blockstate record still exists — the removal is twenty lines further down in this file's
@@ -2984,31 +3067,114 @@ static int  s_furnace_x, s_furnace_y, s_furnace_z;
 // would pull blockstate.c, furnace.c and crc32.c into three separate shared gcc stanzas in
 // tools/run_host_tests.sh, and the callback needs no new link dependency at all.
 //
-// Returns the number of stacks written, never more than INTERACT_BROKE_EXTRA_MAX. The three
-// slots are exactly the three a furnace has, so the bound is the furnace's own shape and not
-// an arbitrary cap — if a future stateful block has more, that constant moves with it.
+// Returns the number of stacks written, never more than INTERACT_BROKE_EXTRA_MAX.
 //
-// The blockStateGet call is guarded on BLOCK_FURNACE by its expect_block_id argument as well
-// as by the test above it. That is not redundant: a cell can hold a record whose block_id
-// disagrees with what was just broken, and the id check is what stops a furnace's payload
-// being unpacked out of some other block's bytes.
-static int mainFurnaceBrokeContents(BlockId id, int x, int y, int z,
-                                    BlockId items_out[INTERACT_BROKE_EXTRA_MAX],
-                                    uint8_t counts_out[INTERACT_BROKE_EXTRA_MAX])
+// The blockStateGet calls are guarded on the block id by their expect_block_id argument as
+// well as by the switch above them. That is not redundant: a cell can hold a record whose
+// block_id disagrees with what was just broken, and the id check is what stops a furnace's
+// payload being unpacked out of a chest's bytes or the other way round — the two share one
+// 16-byte payload and neither packing is self-describing, so nothing else in the system would
+// notice the mistake.
+//
+// v1.9.0 CHEST. RENAMED from mainFurnaceBrokeContents, because it now serves two blocks and a
+// name that says "Furnace" would be the third place a reader has to discover that. The only
+// caller is the interactSetBrokeContentsFn() registration at world entry, which moved with it.
+//
+// v1.9.0 CHEST, the second reason this matters beyond the drop itself: scene/interact.c's
+// break path calls this reader to size the payout BEFORE the block is destroyed, so a chest
+// whose contents would not fit in the player's bag can be refused rather than mined into
+// nothing. That makes this function's answer load-bearing in a way it was not at v1.8.17, when
+// it only ever fed a payout that had already happened — a chest arm that under-reported would
+// now silently re-open the very hole v1.8.17 closed, one block later.
+static int mainStatefulBrokeContents(BlockId id, int x, int y, int z,
+                                     BlockId items_out[INTERACT_BROKE_EXTRA_MAX],
+                                     uint8_t counts_out[INTERACT_BROKE_EXTRA_MAX])
 {
-	if (id != BLOCK_FURNACE) return 0;
-
 	uint8_t payload[BLOCKSTATE_PAYLOAD_BYTES];
-	if (!blockStateGet(&s_blockstate, x, y, z, BLOCK_FURNACE, payload)) return 0;
 
-	FurnaceState fs;
-	furnaceStateUnpack(&fs, payload);
+	if (id == BLOCK_FURNACE) {
+		if (!blockStateGet(&s_blockstate, x, y, z, BLOCK_FURNACE, payload)) return 0;
 
-	int n = 0;
-	if (fs.input_count  > 0) { items_out[n] = fs.input_item;  counts_out[n] = fs.input_count;  n++; }
-	if (fs.fuel_count   > 0) { items_out[n] = fs.fuel_item;   counts_out[n] = fs.fuel_count;   n++; }
-	if (fs.output_count > 0) { items_out[n] = fs.output_item; counts_out[n] = fs.output_count; n++; }
-	return n;
+		FurnaceState fs;
+		furnaceStateUnpack(&fs, payload);
+
+		// Unbounded on purpose, unlike the chest loop below: three slots are exactly the three
+		// a furnace has, so the bound is the furnace's own shape rather than an arbitrary cap,
+		// and INTERACT_BROKE_EXTRA_MAX has never been smaller than 3 (interact.h's comment on
+		// the constant names the furnace as the reason it is at least that big).
+		int n = 0;
+		if (fs.input_count  > 0) { items_out[n] = fs.input_item;  counts_out[n] = fs.input_count;  n++; }
+		if (fs.fuel_count   > 0) { items_out[n] = fs.fuel_item;   counts_out[n] = fs.fuel_count;   n++; }
+		if (fs.output_count > 0) { items_out[n] = fs.output_item; counts_out[n] = fs.output_count; n++; }
+		return n;
+	}
+
+	// v1.9.0 CHEST. CHEST_SLOTS is 8 (world/chest.h: 16 payload bytes / 2 per slot), so this
+	// arm can want to report more stacks than the furnace arm above ever could.
+	//
+	// The loop is bounded by INTERACT_BROKE_EXTRA_MAX and NOT by CHEST_SLOTS alone, and that is
+	// the load-bearing line rather than defensive padding. The two constants live in different
+	// headers owned by different concerns — scene/interact.h sizes Interact's out-arrays,
+	// world/chest.h sizes the chest — and there is nothing in the build that makes one follow
+	// the other. Writing eight entries into a three-entry array is a stack smash on a console
+	// whose default thread stack is 32 KB and which does not fault on the way past the end; it
+	// would show up as some unrelated local changing value, which is the hardest possible way
+	// to find this. Bounding by the array's own constant makes the code correct for any value
+	// the constant takes, including the 3 it holds until scene/interact.h is raised to 8, where
+	// the honest outcome is that the last few stacks are simply not reported.
+	if (id == BLOCK_CHEST) {
+		if (!blockStateGet(&s_blockstate, x, y, z, BLOCK_CHEST, payload)) return 0;
+
+		ChestState cs;
+		chestStateUnpack(&cs, payload);
+
+		int n = 0;
+		for (int i = 0; i < CHEST_SLOTS && n < INTERACT_BROKE_EXTRA_MAX; i++) {
+			// count, not item, for the same reason the furnace arm tests count: an empty slot
+			// reads back as { ITEM_NONE, 0 } (world/inventory.h) and a zero-qty entry is
+			// dropped by breakComplete() anyway, so count is the one field that decides.
+			if (cs.count[i] == 0) continue;
+			items_out[n]  = cs.item[i];
+			counts_out[n] = cs.count[i];
+			n++;
+		}
+		return n;
+	}
+
+	return 0;
+}
+
+// v1.9.0 CHEST. The other half of the refusal: scene/interact.c can now ask, before a break
+// starts, whether everything the block is about to pay out will actually fit in the bag. It
+// cannot answer that itself — inventoryAdd() lives in world/inventory.c, and two of the three
+// host stanzas that link scene/interact.c (interact_test and audio_cue_test) do not link
+// world/inventory.c at all, so a direct call there would break both binaries' link over a rule
+// neither test is about. So it asks, through a callback, the one file that owns both the live
+// Inventory and the BlockStateTable, which is this one.
+//
+// "Would these fit" is answered by ACTUALLY ADDING THEM to a throwaway copy of the live bag,
+// with the real inventoryAdd(), in the order breakComplete() will pay them out. Not by a
+// hand-written capacity sum. The distinction is load-bearing: the true answer depends on
+// partial stacks (an existing stack of the same item with room left absorbs units without
+// costing a slot) and on ORDER (an earlier entry can consume the last empty slot a later one
+// needed). Any arithmetic reimplementation of that is a second copy of a rule this codebase
+// already owns, and the two would eventually disagree — which is the recurring bug the
+// comments in world/placeable.c and world/inventory.c both warn about at length.
+//
+// The copy is why this is safe to run every frame the player is aiming at a chest: `probe` is
+// a by-value snapshot, inventoryAdd() mutates only that, and s_inv is never touched.
+static bool mainBagFits(const BlockId* items, const uint8_t* counts, int n)
+{
+	// One Inventory on the frame. sizeof(Inventory) is 24 slots x (ItemId + count), small
+	// against the 32 KB libctru thread stack, and this is a leaf call off interactEdit().
+	Inventory probe = s_inv;
+
+	for (int i = 0; i < n; i++) {
+		if (counts[i] == 0) continue;   // same zero-qty skip breakComplete() applies
+		if (inventoryAdd(&probe, (ItemId)items[i], counts[i], NULL) != INV_ADD_OK)
+			return false;
+	}
+	return true;
 }
 
 // Step 8.2. The bottom screen's whole content: hotbar, inventory grid, crafting panel, and
@@ -3108,10 +3274,46 @@ static void drawBottomUi(bool ok, const char* status, const char* netline, const
 		}
 	}
 
+	// v1.9.0 CHEST. The exact twin of the furnace block above -- same unpack-fresh/pack-back
+	// schedule, same blockStateGet failure branch, same reasoning. Only the two things that
+	// differ are spelled out here.
+	//
+	// The failure branch is if anything MORE live than the furnace's, not less. A chest is the
+	// block a player leaves standing in a shared world for hours, so "the record stopped
+	// existing while the panel was open" is the ordinary case and not the exotic one: another
+	// player breaks it, or the 256-slot table evicts it. blockStateGet refuses on both "no
+	// record here" and "a record whose block_id is not BLOCK_CHEST", so a cell that became a
+	// dirt block reads exactly like a cell that became nothing, and both close the panel rather
+	// than editing whatever occupies the slot now.
+	//
+	// `cp` stays NULL in that case and ui.h's contract takes over exactly as it does for the
+	// furnace: uiUpdateDraw corrects UI_SCR_CHEST to UI_SCR_INVENTORY on the spot and drops any
+	// lifted stack, so the player is put back in their bag holding their items rather than
+	// looking at a panel for a block that is gone.
+	ChestState  cs;
+	ChestState* cp = NULL;
+	uint8_t     cpay[BLOCKSTATE_PAYLOAD_BYTES];
+
+	if (s_chest_open) {
+		if (blockStateGet(&s_blockstate, s_chest_x, s_chest_y, s_chest_z,
+		                   BLOCK_CHEST, cpay)) {
+			chestStateUnpack(&cs, cpay);
+			cp = &cs;
+		} else {
+			s_chest_open = false;
+		}
+	}
+
+	// v1.9.0 CHEST-NET. Re-registered every frame rather than once at connect, so a session
+	// that drops while the panel is open falls back to the local apply on the next tap and a
+	// session that comes up mid-panel starts routing on the next tap. Cheap: two pointer
+	// stores. NULL is the documented "apply locally" (scene/ui.h).
+	uiSetChestTransferFn(&s_ui, networldSessionActive() ? mainChestTransfer : NULL, NULL);
+
 	// atlasTexture() rather than atlasBind(): gfx/sprite.c tracks the bound texture itself so
 	// it can flush exactly once per switch, and binding behind its back would leave it certain
 	// it had not switched. See gfx/atlas.h.
-	const UiResult ures = uiUpdateDraw(&s_ui, &s_inv, atlasTexture(), &stats, in, fp);
+	const UiResult ures = uiUpdateDraw(&s_ui, &s_inv, atlasTexture(), &stats, in, fp, cp);
 
 	// Written back BEFORE the close is acted on, not after, and the order matters: the tap that
 	// closes the panel can be the same tap that took the cooked item out of the output slot, so
@@ -3122,7 +3324,35 @@ static void drawBottomUi(bool ok, const char* status, const char* netline, const
 		(void)blockStateSet(&s_blockstate, s_furnace_x, s_furnace_y, s_furnace_z,
 		                     BLOCK_FURNACE, fpay);
 	}
+	// v1.9.0 CHEST. Same write-back, same position relative to the close test below, and the
+	// furnace's "the tap that closes the panel can be the same tap that took the item out"
+	// argument is if anything stronger here: every one of a chest's eight slots is a withdrawal
+	// the closing tap could have made, where a furnace only had the output slot. Guarded on
+	// `cp` and not on the close test for exactly that reason.
+	if (cp) {
+		chestStatePack(cp, cpay);
+		(void)blockStateSet(&s_blockstate, s_chest_x, s_chest_y, s_chest_z,
+		                     BLOCK_CHEST, cpay);
+	}
 	if (!ures.furnace_open) s_furnace_open = false;
+
+	// v1.9.0 CHEST. The close test, and the ONE place this wiring does not mirror the furnace
+	// line above it. The furnace reads UiResult.furnace_open; UiResult has no chest_open twin
+	// in scene/ui.h's v1.9.0 contract, so this reads the screen the UiState is now on instead.
+	//
+	// That is a real difference in WHEN, not just in spelling, and it is the safe direction.
+	// UiResult reports the screen this frame DREW (ui.h says so of both its fields), whereas
+	// s_ui.screen after the call is the screen the next frame will draw -- so this closes one
+	// frame EARLIER than a UiResult field would. Closing early costs nothing: the write-back
+	// above has already run for this frame, so nothing the player did on the closing tap is
+	// lost, and a chest that is closed a frame early simply stops being unpacked a frame early.
+	// Closing late would be the dangerous direction, because that is the frame on which a panel
+	// nobody is looking at could still be written back.
+	//
+	// If scene/ui.h ever grows UiResult.chest_open, this should become `if (!ures.chest_open)`
+	// so the two panels read the same way; it is written like this only because that field does
+	// not exist, not because the screen is the better source.
+	if (s_ui.screen != UI_SCR_CHEST) s_chest_open = false;
 }
 
 #endif   // BS_BOTTOM_UI
@@ -3486,6 +3716,14 @@ _Static_assert(OPT_KEY_DRIGHT == KEY_DRIGHT, "OPT_KEY_DRIGHT drifted from libctr
 // hardcodes are ever checked against the real header.
 _Static_assert(OPT_KEY_ZL     == KEY_ZL,     "OPT_KEY_ZL drifted from libctru KEY_ZL");
 _Static_assert(OPT_KEY_ZR     == KEY_ZR,     "OPT_KEY_ZR drifted from libctru KEY_ZR");
+// v1.9.0 SPLIT. scene/ui_gesture.h hardcodes the same four bits for the same reason (it is
+// host-tested and cannot include <3ds.h>) and its comment states that main.c carries this
+// check. It did not, until now. X and Y are the two it actually reads: if either drifted, a
+// bag screen would classify the wrong press as a split or a quick-move with no compile error.
+_Static_assert(UI_GESTURE_KEY_A == KEY_A, "UI_GESTURE_KEY_A drifted from libctru KEY_A");
+_Static_assert(UI_GESTURE_KEY_B == KEY_B, "UI_GESTURE_KEY_B drifted from libctru KEY_B");
+_Static_assert(UI_GESTURE_KEY_X == KEY_X, "UI_GESTURE_KEY_X drifted from libctru KEY_X");
+_Static_assert(UI_GESTURE_KEY_Y == KEY_Y, "UI_GESTURE_KEY_Y drifted from libctru KEY_Y");
 
 #if BS_TITLE
 
@@ -3831,7 +4069,7 @@ static void onRemoteEdit(void* userdata, int x, int y, int z)
 	// spells out: blockStateRemove on a cell holding no state is a no-op by contract, and
 	// asking "is this a stateful block" here would be a second, separate opinion about
 	// which blocks those are -- the day it disagreed with the table the symptom would be a
-	// slot that never frees. With BLOCKSTATE_SLOTS at 64 that is not a memory leak, it is
+	// slot that never frees. With BLOCKSTATE_SLOTS at 256 that is not a memory leak, it is
 	// a fixed pool that fills: enough remote furnace breaks and a legitimate new furnace
 	// gets no state at all. Worse, a furnace later placed on the same coordinate read the
 	// dead one's contents straight back out of blockStateGet, and since v1.8.17 breaking a
@@ -3854,31 +4092,74 @@ static void onRemoteEdit(void* userdata, int x, int y, int z)
 	// which is this file. worldGet is the same question the mesher asks about the same
 	// cell one line below, so it is already warm.
 	//
-	// Gated on BLOCK_FURNACE, unlike the remove above, and the asymmetry is the same one
-	// the local path spells out at length: removing state costs nothing and is idempotent,
+	// Gated on the stateful block ids, unlike the remove above, and the asymmetry is the same
+	// one the local path spells out at length: removing state costs nothing and is idempotent,
 	// so the break side can afford to hold no opinion about which blocks are stateful.
-	// Creating is not free -- BLOCKSTATE_SLOTS is 64, and creating a record for every
+	// Creating is not free -- BLOCKSTATE_SLOTS is 256, and creating a record for every
 	// remote dirt block would fill the table in seconds of somebody else building and
 	// leave no slot for a real furnace.
 	//
-	// The return is discarded for the same reason it is discarded locally: a full table
-	// means 64 live records, and the furnace block itself has already landed in the world
-	// via net/networld.c's worldSet. Un-placing another player's block underneath them
-	// would be a far stranger outcome than a furnace that will not hold fuel, and every
-	// read of an absent record is a clean "no state here" by world/blockstate.h's contract.
-	if (worldGet(&s_world, x, y, z) == BLOCK_FURNACE) {
-		if (blockStateCreate(&s_blockstate, x, y, z, BLOCK_FURNACE)) {
-			// Packing a zeroed FurnaceState over blockStateCreate's own zero-fill is
-			// redundant today and done anyway, for the reason the local path gives: "zero
-			// happens to mean empty" is a property of world/furnace.h's current field
-			// layout, not a promise it makes. The day a field gains a non-zero resting
-			// value, this is what keeps a remotely placed furnace correct.
-			FurnaceState fs;
-			furnaceStateInit(&fs);
+	// v1.9.0 CHEST. BLOCK_CHEST joins BLOCK_FURNACE here, and it is the same v1.8.18 defect
+	// one block later: a chest placed by another player would otherwise exist as a block and
+	// nothing else, blockStateGet would answer false on it forever, and every item put into it
+	// would vanish when the panel closed. The local place path in the main loop gained the
+	// chest in this same change; this is the other half of it.
+	//
+	// ── v1.9.0: why a false return REFUSES the placement locally and NOT here ──────────────
+	//
+	// The local site (the main loop's `it.placed_valid` block) now undoes the placement when
+	// the table is full: it puts the cell back, tells the renderer, tells the server, does not
+	// charge the hotbar, and counts a refusal. This site deliberately does NOT, and the two
+	// are not inconsistent -- they answer different questions, because the AUTHORITY over the
+	// cell is in a different place.
+	//
+	// Locally, this client is the authority: the player's own press created the block, the
+	// server has been told about it, and un-telling it (sending BLOCK_AIR back) restores
+	// agreement. Every party ends up believing the same thing, and the player learns their
+	// press did nothing.
+	//
+	// Here, the block belongs to somebody else and the SERVER is the authority. Reverting it
+	// would delete another player's block out of this client's world only: no other client
+	// would drop it, the server would still hold it, and net/networld.c has no "reject an
+	// applied edit" direction to send -- this hook is called AFTER the write, from a path
+	// whose whole contract is that the server has already decided. The result would be a
+	// permanent local hole that the next chunk stream silently fills back in, at which point
+	// this hook runs again against the same full table and produces the same recordless block
+	// -- so the refusal would not even be durable, it would just be a flicker plus a divergence.
+	// Worse, the local player would be deleting a container another player is standing at,
+	// with no press of their own to attribute it to and no way to put it back.
+	//
+	// So the honest behaviour on this path is the pre-v1.9.0 one: leave the block, leave the
+	// record absent, and take the loss. A full table is a LOCAL resource shortage and the
+	// remote world is not this client's to edit over it. The observable consequence is
+	// unchanged from v1.8.18 and is stated rather than hidden: on a client whose 256 slots are
+	// full, a chest another player places is inert here -- it will not store anything and the
+	// panel will refuse to open on it, because drawBottomUi's blockStateGet answers false and
+	// closes the panel on the spot.
+	{
+		const BlockId here = worldGet(&s_world, x, y, z);
+		if (here == BLOCK_FURNACE || here == BLOCK_CHEST) {
+			if (blockStateCreate(&s_blockstate, x, y, z, here)) {
+				// Packing a zeroed FurnaceState/ChestState over blockStateCreate's own
+				// zero-fill is redundant today and done anyway, for the reason the local path
+				// gives: "zero happens to mean empty" is a property of world/furnace.h's and
+				// world/chest.h's current field layouts, not a promise either makes. The day a
+				// field gains a non-zero resting value, this is what keeps a remotely placed
+				// block correct.
+				uint8_t payload[BLOCKSTATE_PAYLOAD_BYTES];
 
-			uint8_t payload[BLOCKSTATE_PAYLOAD_BYTES];
-			furnaceStatePack(&fs, payload);
-			(void)blockStateSet(&s_blockstate, x, y, z, BLOCK_FURNACE, payload);
+				if (here == BLOCK_FURNACE) {
+					FurnaceState fs;
+					furnaceStateInit(&fs);
+					furnaceStatePack(&fs, payload);
+				} else {
+					ChestState cs_new;
+					chestStateInit(&cs_new);
+					chestStatePack(&cs_new, payload);
+				}
+
+				(void)blockStateSet(&s_blockstate, x, y, z, here, payload);
+			}
 		}
 	}
 
@@ -5166,6 +5447,9 @@ session_start:
 
 	Interact it;
 	interactInit(&it);
+	// v1.9.0 AIM-TEXT. Same lifetime as the Interact above: a label cached from the previous
+	// server's registry must not name this server's 0x80 for a frame (scene/aimtext.h).
+	aimTextInit(&s_aimtext);
 	// v1.8.7. Hands scene/interact.c the same worklist onRemoteEdit above already pushes to
 	// and the frame loop below already drains (relightDrain, ahead of chunkRenderDrainDirty),
 	// so a LOCAL break or place stops paying for a full 32768-cell column relight on the very
@@ -5178,7 +5462,17 @@ session_start:
 	// dead code: it defaults to no reader, reports nothing, and every furnace's contents are
 	// destroyed exactly as they were before. Registered here, beside the relight queue, for
 	// the same reason — both are this file's state being lent to interact.c for the duration.
-	interactSetBrokeContentsFn(mainFurnaceBrokeContents);
+	// v1.9.0 CHEST: renamed from mainFurnaceBrokeContents when it grew a BLOCK_CHEST arm. Same
+	// registration, same place, same one-call contract -- only the name moved.
+	interactSetBrokeContentsFn(mainStatefulBrokeContents);
+
+	// v1.9.0 CHEST. Without this line the capacity guard in scene/interact.c is inert in
+	// exactly the way the line above was before v1.8.17: interact.c defaults the predicate to
+	// NULL and reads NULL as "yes, it fits", so a chest breaks on a full bag and its contents
+	// are destroyed. That is the pre-v1.9.0 behaviour, so nothing regresses — but the bug is
+	// simply not fixed until this registration exists, and the host suite cannot tell the
+	// difference on its own, because it registers its own spy.
+	interactSetBagFitsFn(mainBagFits);
 
 	// v1.9.0 audio. The footstep cadence, beside `it` because it has the same lifetime: one
 	// visit to one world. A break and a place each have an instant to hang a sound on inside
@@ -5357,12 +5651,57 @@ session_start:
 	// and a world whose inventory persists but whose furnaces do not would be a strange,
 	// hard-to-report halfway state. One directory decision, both files.
 	//
-	// blockStateLoad, like inventoryLoad, always leaves the table valid — a missing or corrupt
-	// sidecar is an empty table, not an error to handle here. Its return value says whether a
-	// file was actually read, which nothing needs yet; ignoring it is deliberate rather than an
-	// oversight, and is why the (void) is written out.
-	if (inv_dir) (void)blockStateLoad(&s_blockstate, inv_dir);
-	else         blockStateInit(&s_blockstate);
+	// blockStateLoad always leaves the table valid (see world/blockstate.h) — a missing or
+	// corrupt sidecar is an empty table, not an error to handle here. Its return value now DOES
+	// matter, though: false is either a caller bug (impossible here — s_blockstate and inv_dir
+	// are both known good) or a failed read-buffer allocation, which leaves this table at that
+	// same safe empty default but means it must never be persisted over whatever real file is
+	// already on the card. s_blockstate_load_incomplete carries that fact to the save call site
+	// far below, the same way world_refused already does for a different reason.
+	if (inv_dir) s_blockstate_load_incomplete = !blockStateLoad(&s_blockstate, inv_dir);
+	else       { blockStateInit(&s_blockstate); s_blockstate_load_incomplete = false; }
+
+	// ── v1.9.0 CHEST SYNC: the registration that was written down and never made ───────────
+	//
+	// net/networld.h's networldSetBlockStateTable() says in as many words that main.c wires
+	// this up and that "while it is NULL every snapshot is dropped on the floor". Nothing ever
+	// wired it up. The consequence in a joined session was total and silent: the server
+	// accepted a chest action, broadcast BS_APP_CHEST_STATE, applyChestState() found
+	// s_blockstate NULL and returned, and the panel never moved. Every multiplayer chest was
+	// write-only.
+	//
+	// WHY HERE and not up beside networldSetWorld(). The same two-sided order argument the
+	// inventory hook makes forty lines below, and it lands on the same answer for the same
+	// reason. Too early is wrong: the two lines directly above are the only point at which
+	// this table becomes THIS world's table, and blockStateLoad/blockStateInit overwrite it
+	// whole — a snapshot mirrored in before them is wiped by them, so registering at
+	// networldSetWorld() time would buy nothing and would additionally leave the previous
+	// session's table live while the loading screen pumps networldUpdate() (main.c:3825).
+	// Registering on the line after the load is the first instant the pointer names a table
+	// that both exists and holds this world's records.
+	//
+	// There is no replay to lose by registering late, which is the one way this differs from
+	// networldSetInvHook(): net/networld.c retains the join-time INV_STATE and re-delivers it
+	// the moment a hook appears, and deliberately retains NO chest snapshot ("Never queued",
+	// networld.h) because a snapshot is contents at one instant rather than a change. A
+	// CHEST_STATE that arrives while this is NULL is gone, and that is the header's stated
+	// behaviour, not a regression introduced here.
+	//
+	// Re-registered on every pass through session_start, exactly like networldSetWorld() and
+	// both hooks: netDisconnect() calls networldInit() on the way back to the title, and while
+	// networldInit() does not itself clear this pointer, the teardown below does — see the
+	// networldSetBlockStateTable(NULL) beside networldSetWorld(NULL).
+	//
+	// LIFETIME. s_blockstate is a file static (main.c:2938) and BlockStateTable owns no heap
+	// — world/blockstate.c mallocs only transient IO buffers inside save/load — so this
+	// pointer can never dangle at a freed address the way a pointer into main()'s frame could.
+	// What it CAN do, and what the teardown clearing exists to stop, is stay live across the
+	// title screen and let a snapshot for the world just left write into the table the next
+	// blockStateLoad() is about to overwrite. Cleared with the world, for the same reason.
+	//
+	// Single player is unaffected: no server, no CHEST_STATE, so this registers a pointer that
+	// nothing ever dereferences.
+	networldSetBlockStateTable(&s_blockstate);
 
 	// v1.7.1 task 46b. What the lid-close flush hook needs to write a pose, handed over now
 	// that both halves exist — the Player was built above and the directory on the line
@@ -5526,6 +5865,7 @@ session_start:
 			.touch_down = (hidKeysHeld() & KEY_TOUCH) != 0 || tp.px != 0 || tp.py != 0,
 			.touch_x    = tp.px,
 			.touch_y    = tp.py,
+			.keys_held  = hidKeysHeld(),   // v1.9.0 SPLIT: X / Y for scene/ui_gesture.h
 		};
 		// The rising edge of the above, for the remap screen and the debug menu — see
 		// touch_prev's declaration before the loop. One press is one true, however long the
@@ -5641,15 +5981,33 @@ session_start:
 		audioSetListener(player.body.x, player.body.y, player.body.z, player.cam.yaw);
 		audioUpdate();
 
-#if BS_WORLD_GEN && !BS_FLY
-		// Step 7.7. L and R change the render distance. They are free in walking mode — only
-		// the free-fly camera uses them, for up and down — and this is the one control the
-		// setting can have until step 8.4 gives the game an options screen to hold it. It is
-		// wired up rather than left for 8.4 because a setting that cannot be changed cannot be
-		// verified: the two distances have to be reachable in one run for the fog and the ring
-		// to be judged against each other.
-		if (!paused && (down & KEY_L)) genSetRadius(s_mesh_radius - 1);
-		if (!paused && (down & KEY_R)) genSetRadius(s_mesh_radius + 1);
+#if !BS_FLY
+		// v1.9.0 HOTBAR-LR. L and R cycle the hotbar selection — R one slot on, L one back,
+		// wrapping at both ends, once on the press and then repeating while held. scene/hotbar.h
+		// owns the wrap and the cadence (HOTBAR_REPEAT_DELAY / PERIOD) and tests/hotbar_test.c
+		// proves both; this site only feeds it the frame's two HID words and acts on the answer.
+		//
+		// They stepped the render distance live from step 7.7 until now. That setting has
+		// exactly one control, the pause menu's "Render dist" row (scene/pausemenu.c
+		// OPT_ROW_DIST, applied by the `if (dist_step != 0)` block above), and this is not the
+		// place to grow it a second one.
+		//
+		// !BS_FLY because the free-fly camera reads the same two buttons for up and down
+		// (scene/camera.c). The words are zeroed while paused rather than the call skipped —
+		// the `edit_held = (paused ? 0u : held)` idiom below — for two reasons: the debug menu
+		// lives inside the pause and pages on L/R (app/debugmenu_ui.c), so the hotbar must not
+		// also move under it; and a zeroed word reads as a release to hotbar.c, so a button
+		// still held when the menu closes cannot fire until it is pressed again.
+		//
+		// Gated on the ANSWER, not the press: an unchanged slot sends no BS_INV_OP_SELECT.
+		// invBridgeSelectHotbar is the one write path the touchscreen tap already uses
+		// (scene/ui.c handleHotbarSelect), so both controls share its clamp and its message.
+		{
+			int slot = s_inv.selected_hotbar;
+			if (hotbarNavFrame(&s_hotbar_nav, paused ? 0u : down, paused ? 0u : held,
+			                   &slot, INV_HOTBAR_SLOTS))
+				invBridgeSelectHotbar(&s_inv, (uint8_t)slot);
+		}
 #endif
 
 		// v1.8.13 SURV-WIRE. Eat the SELECTED hotbar slot, on the edge and never on held —
@@ -5657,7 +6015,7 @@ session_start:
 		// is pointing at is the one that empties, and a held button would drain a stack in a
 		// third of a second.
 		//
-		// Outside the BS_WORLD_GEN && !BS_FLY guard above so it works in every build that has a
+		// Outside the `#if !BS_FLY` guard above so it works in every build that has a
 		// survival state to feed, and behind inputKey(ACTION_EAT) rather than a literal so the
 		// remap screens actually reach it. inputKey answers 0 for an action the map does not
 		// know, and `down & 0` is false, so a build whose options never loaded simply cannot eat
@@ -6114,13 +6472,15 @@ session_start:
 			// empty" rule is already the module's stated invariant, so a new function would
 			// have restated it rather than encapsulated it.
 			//
-			// BLOCKSTATE_SLOTS is 64, so this is a fixed 64-iteration scan whose cost does not
+			// BLOCKSTATE_SLOTS is 256, so this is a fixed 256-iteration scan whose cost does not
 			// depend on how many furnaces exist. That is the point: it cannot degrade as a
-			// world fills up, and 64 comparisons of a uint8_t at 20 TPS is not a budget worth
-			// managing. It is deliberately NOT decimated by distance the way entityTick is --
-			// a furnace the player walked away from must keep burning, or leaving the room to
-			// go mining would silently pause the smelt they left running, which is exactly the
-			// behaviour a player would report as "the furnace is broken".
+			// world fills up. In raw terms: 256 entries of 32 bytes each is 8192 bytes walked
+			// per tick, and at 20 TPS that is roughly 160 KB/s of sequential memory traffic --
+			// reasoned arithmetic, not a measurement; nobody has profiled this loop on hardware.
+			// It is deliberately NOT decimated by distance the way entityTick is -- a furnace
+			// the player walked away from must keep burning, or leaving the room to go mining
+			// would silently pause the smelt they left running, which is exactly the behaviour
+			// a player would report as "the furnace is broken".
 			//
 			// The pack-back is unconditional rather than gated on furnaceTick's return. That
 			// return reports whether anything OBSERVABLE changed (for a future re-mesh of the
@@ -6309,6 +6669,14 @@ session_start:
 		const bool animal_owns_aim =
 			animal_slot >= 0 && (!it.target.hit || animal_dist <= it.target.distance);
 
+		// v1.9.0 AIM-TEXT. The name under the reticle, from this frame's raycast, after the
+		// tie-break above so an aimed animal names nothing rather than the wall behind it. The
+		// id is only read on a hit — a miss passes BLOCK_AIR without touching the world.
+		aimTextUpdate(&s_aimtext, it.target.hit && !animal_owns_aim,
+		              it.target.hit ? worldGet(&s_world, it.target.x, it.target.y, it.target.z)
+		                            : BLOCK_AIR,
+		              (uint32_t)osGetTime());
+
 		// v1.8.14 animals, the damage half. Mirrors ate_this_frame at the top of this loop and
 		// means the same thing: this frame's press was consumed by something other than the
 		// ordinary verb, so the mask below has to take it away from that verb.
@@ -6424,6 +6792,13 @@ session_start:
 		// interactAim() ran at the top of this block, so it.target is THIS frame's raycast and
 		// not the previous frame's; that matters because the whole decision hangs on it.
 		bool opened_furnace_this_frame = false;
+		// v1.9.0 CHEST. The chest's twin of the flag above, and it is a SECOND flag rather than
+		// one `opened_panel_this_frame` shared between them. Both feed the same place-bit mask
+		// below and would work as one bool today -- but the two cases are already disjoint by
+		// target (the ray ends on a furnace, or on a chest, or on neither; never on two blocks),
+		// so a shared flag would save nothing and would erase which panel opened at the one
+		// place a future reader would look to find out.
+		bool opened_chest_this_frame = false;
 #if BS_BOTTOM_UI
 		if (!paused && (down & inputKey(ACTION_PLACE)) && it.target.hit &&
 		    worldGet(&s_world, it.target.x, it.target.y, it.target.z) == BLOCK_FURNACE) {
@@ -6436,6 +6811,37 @@ session_start:
 			// leave that stack held over a panel whose slots it cannot legally go into.
 			uiOpenFurnace(&s_ui);
 			opened_furnace_this_frame = true;
+		}
+
+		// v1.9.0 CHEST. The same gesture on a chest, and every word of the furnace block above
+		// applies unchanged: PLACE is overloaded rather than a third binding being added,
+		// because the two cases are disjoint by their TARGET and not by a modifier the player
+		// has to remember, and because a new world action would have to appear in
+		// app/remap_ui.c and in every saved binding file.
+		//
+		// A plain second `if` rather than a dispatch table keyed on block id, even though there
+		// are now two rows. A table would have to carry a per-block open function AND a
+		// per-block "which three ints does it write" -- s_furnace_x/y/z and s_chest_x/y/z are
+		// separate storage, not one slot -- so it would be a table of two entries that each
+		// needed their own code anyway. The day a third interactive block lands with the same
+		// shape, that is the moment to build one; two is not that day.
+		//
+		// Not chained onto the furnace test with `else`, deliberately, and it makes no
+		// behavioural difference today: worldGet returns one id, so at most one of the two
+		// bodies can run whatever the structure. It is written as two independent tests so
+		// neither reads as a fallback for the other.
+		if (!paused && (down & inputKey(ACTION_PLACE)) && it.target.hit &&
+		    worldGet(&s_world, it.target.x, it.target.y, it.target.z) == BLOCK_CHEST) {
+			s_chest_x = it.target.x;
+			s_chest_y = it.target.y;
+			s_chest_z = it.target.z;
+			s_chest_open = true;
+			// uiOpenChest rather than writing s_ui.screen, for the reason uiOpenFurnace is
+			// called above: it drops any stack the player had lifted in the bag (and, since
+			// v1.9.0 CHEST-NET, any chest-slot lift from a previous chest). The position is
+			// what the transfer callback names the block by on the wire.
+			uiOpenChest(&s_ui, s_chest_x, s_chest_y, s_chest_z);
+			opened_chest_this_frame = true;
 		}
 #endif
 
@@ -6461,9 +6867,17 @@ session_start:
 		// v1.8.15 FURNACE: and the place bit is stripped on the frame that opened a furnace
 		// panel, for exactly the reason the eat mask above exists — one press must not both open
 		// the furnace and place a block against its face. Same mask, same line, same bit.
-		const u32 edit_down = (paused ? 0u : down)
+		// v1.9.0 SPLIT: X and Y are the bag screens' quick-move / split keys
+		// (scene/ui_gesture.h) while any bag screen is up, so a press there must not also
+		// break or place a block on the world behind it. See the SPLIT patch notes.
+		const u32 ui_keys   = (s_ui.screen != UI_SCR_HUD) ? (KEY_X | KEY_Y) : 0u;
+		const u32 edit_down = (paused ? 0u : down) & ~ui_keys
 		                    & ~(ate_this_frame ? inputKey(ACTION_PLACE) : 0u)
 		                    & ~(opened_furnace_this_frame ? inputKey(ACTION_PLACE) : 0u)
+		// v1.9.0 CHEST: and the same bit stripped on the frame that opened a CHEST panel, for
+		// the identical reason -- one press must not both open the chest and place a block
+		// against its face. Same mask, same bit, one more term.
+		                    & ~(opened_chest_this_frame ? inputKey(ACTION_PLACE) : 0u)
 		// v1.8.14 animals: and the break bit is stripped on a frame the swing above consumed it,
 		// so one press cannot both damage an animal and start breaking the block behind it.
 		// interact.c reads keys_down for break in two places -- `fresh & key_break` becomes
@@ -6486,7 +6900,7 @@ session_start:
 		// (interactEdit's `if (!holding_break) breakCancel`), and the player starts that block
 		// again once it has moved. Progress not surviving an interruption is already this
 		// module's rule for letting go of the button.
-		const u32 edit_held = (paused ? 0u : held)
+		const u32 edit_held = (paused ? 0u : held) & ~ui_keys
 		                    & ~(animal_owns_aim ? inputKey(ACTION_BREAK) : 0u);
 		interactEdit(&it, &s_world, &player.body, edit_down, edit_held, ticks_now);
 
@@ -6512,7 +6926,7 @@ session_start:
 		// Gated on broke_valid, NOT on broke_id, and the difference matters. broke_id is
 		// BLOCK_AIR for a break that dropped nothing — a plant, or a block mined by the wrong
 		// tool — and those still vacate the cell. Hanging this off broke_id would leave the
-		// state of any such block in the table forever, which with only BLOCKSTATE_SLOTS 64
+		// state of any such block in the table forever, which with only BLOCKSTATE_SLOTS 256
 		// entries is a leak that fills a fixed pool rather than one that merely wastes memory.
 		//
 		// blockStateRemove on a cell holding no state is a no-op by contract, so this runs
@@ -6538,10 +6952,166 @@ session_start:
 			blockStateRemove(&s_blockstate, it.broke_x, it.broke_y, it.broke_z);
 		}
 
+		// v1.8.15 "Furnace", extended to the chest in v1.9.0. A placed block that carries
+		// per-position state acquires its own empty record, the exact mirror of the
+		// blockStateRemove above -- place claims a slot, break frees it.
+		//
+		// Gated on the block id and NOT run unconditionally, which is the opposite of the break
+		// path twenty lines up, and the asymmetry is deliberate rather than an inconsistency.
+		// Removing state for a cell that has none is free and idempotent, so the break side can
+		// afford to hold no opinion about which blocks are stateful. CREATING state is not free:
+		// BLOCKSTATE_SLOTS is 256, so calling blockStateCreate for every dirt block placed would
+		// fill the table within seconds of ordinary building and leave no room for a furnace.
+		// The table has to be told what deserves a slot; only the break side can afford not to
+		// care.
+		//
+		// ── v1.9.0: MOVED ABOVE the inventory charge, and that order is now load-bearing ────
+		//
+		// This block used to sit BELOW the `if (it.placed_id != BLOCK_AIR) invBridgeRemove(...)`
+		// that now follows it. The two were independent while a failed blockStateCreate did
+		// nothing; they stopped being independent the moment a failure started REFUSING the
+		// placement, because a refused placement must not charge the hotbar. Running the create
+		// first and clearing it.placed_id on failure means the charge below simply never sees
+		// the placement -- which is the mechanism interactEdit's own five refusal paths already
+		// use, described in the charge block's own comment as "it.placed_id stays BLOCK_AIR on
+		// every refusal path". Reusing it was the point of the move: the alternative was to
+		// charge and then refund with invBridgeAdd, which would put a BS_INV_OP_CONSUME and a
+		// BS_INV_OP_PICKUP for the same item on the wire one after the other and ask the server
+		// to reason about a round trip that never really happened.
+		//
+		// ── v1.9.0: the return is NOT discarded, and a false REFUSES the placement ──────────
+		//
+		// (The comment that used to stand here said "the return is deliberately discarded". That
+		// was wrong about its own code even then -- the return has always been the condition of
+		// an `if` -- and right only in the sense that nothing REACTED to a false. It is deleted
+		// rather than corrected, because both halves have now changed.)
+		//
+		// blockStateCreate answers false when the table is genuinely full: 256 live records,
+		// none of them this cell. The old behaviour was to leave the block standing anyway and
+		// say nothing, which for a furnace was defensible -- a furnace that will not hold fuel
+		// is visibly inert the first time the player opens it, so the limit announces itself.
+		// For a CHEST it is not defensible: a chest with no record accepts an item into a panel
+		// slot, draws it there for as long as the panel is open, and loses it the instant the
+		// panel closes, because the write-back in drawBottomUi is guarded on a blockStateGet
+		// that answers false. That is silent item destruction, which is the one outcome a
+		// player cannot undo and cannot diagnose.
+		//
+		// So the placement is undone instead: the cell goes back, the renderer and the light are
+		// told, the server is told, the hotbar is not charged, and `refused` ticks. The player
+		// gets a press that did nothing, which is a far smaller lie than a container that eats
+		// what it is given. Applied to the furnace as well as the chest rather than only to the
+		// chest, because "sometimes a full table silently degrades the block and sometimes it
+		// refuses it" would be two behaviours for one cause.
+		//
+		// WHAT THE CELL GOES BACK TO IS it.placed_was, WHICH IS NOT ALWAYS AIR. (The comment
+		// that stood here said the revert wrote BLOCK_AIR and that this "is not exactly right",
+		// because scene/interact.c kept the cell's previous contents in a local -- `place_was`
+		// -- that it never published, so this file could not see it. That is fixed rather than
+		// documented now: interact.h carries a `placed_was` field beside placed_id, filled the
+		// moment the place cell is read.) It matters because "air" was only the ordinary case:
+		// a placement lands legally in any non-solid cell, tall grass being the one a player
+		// meets constantly, and reverting that to air destroyed the grass on the ONE path whose
+		// whole contract is that nothing happened. Read under it.placed_valid, which is the
+		// flag interact.h says gates it -- and which this `if` has already tested.
+		if (it.placed_valid &&
+		    (it.placed_id == BLOCK_FURNACE || it.placed_id == BLOCK_CHEST)) {
+			const BlockId placed_kind = it.placed_id;
+
+			if (blockStateCreate(&s_blockstate, it.placed_x, it.placed_y, it.placed_z,
+			                      placed_kind)) {
+				// blockStateCreate hands back an all-zero payload, and an all-zero FurnaceState
+				// -- or ChestState -- is already the correct empty block: every slot ITEM_NONE,
+				// no fuel, no progress, unlit. Packing the Init result over the top is therefore
+				// redundant TODAY for both. It is done anyway, because "zero happens to mean
+				// empty" is a property of furnace.h's and chest.h's current field layouts and
+				// not a promise either makes; the day a field gains a non-zero resting value,
+				// this is what keeps a freshly placed block correct, and its absence would be a
+				// bug nobody could see. (chest.h's chestStateInit comment says exactly this
+				// about itself, in the same words, for the same reason.)
+				uint8_t payload[BLOCKSTATE_PAYLOAD_BYTES];
+
+				if (placed_kind == BLOCK_FURNACE) {
+					FurnaceState fs;
+					furnaceStateInit(&fs);
+					furnaceStatePack(&fs, payload);
+				} else {
+					ChestState cs_new;
+					chestStateInit(&cs_new);
+					chestStatePack(&cs_new, payload);
+				}
+
+				(void)blockStateSet(&s_blockstate, it.placed_x, it.placed_y, it.placed_z,
+				                     placed_kind, payload);
+			} else {
+				// The table is full. Undo the placement interactEdit already made.
+				//
+				// The four world-side lines are onRemoteEdit's order, not a new one: write the
+				// cell, mark the column dirty, relight (queued, with the inline fallback a full
+				// queue takes), then queue the remesh. Relight BEFORE the remesh, because the
+				// remesh bakes light into the vertices and doing it the other way round leaves
+				// the block's absence lit as though it were still there.
+				worldSet(&s_world, it.placed_x, it.placed_y, it.placed_z, it.placed_was);
+				worldMarkDirty(&s_world, it.placed_x, it.placed_z);
+				if (lightEnabled() &&
+				    !relightqPush(&s_relightq, it.placed_x >> 4, it.placed_z >> 4))
+					lightRelightColumn(&s_world, it.placed_x >> 4, it.placed_z >> 4);
+				(void)chunkRenderTouch(&s_world, it.placed_x, it.placed_y, it.placed_z);
+
+				// AND THE SERVER, which is not optional. interactEdit's sendEditOrRevert already
+				// told the server this block was placed and got a successful send, or this code
+				// would not be running -- a failed send rolls the placement back inside
+				// interact.c and leaves placed_valid false. So by the time we get here the
+				// server believes there is a furnace/chest at this cell. Undoing it locally and
+				// staying quiet would be exactly the divergence sendEditOrRevert exists to
+				// prevent, in the other direction: the block would come back the next time the
+				// column streamed in, with no record and no explanation.
+				//
+				// Fire and forget, like every other networldSendBlockEdit caller. It answers
+				// false in single player (no transport) and on a dropped packet, and neither is
+				// worth branching on here: single player has no server to diverge from, and a
+				// send that did not leave the console leaves the same divergence the periodic
+				// state sync is already responsible for.
+				//
+				// v1.9.0 F1: it.placed_was here too, and it has to be the SAME value the
+				// worldSet above wrote. This send exists to keep the client and the server
+				// agreeing about this cell; telling the server "air" while putting tall grass
+				// back locally would swap one divergence for another, and it would be a
+				// divergence this revert introduced rather than one it inherited.
+				(void)networldSendBlockEdit(it.placed_x, it.placed_y, it.placed_z,
+				                             (uint8_t)it.placed_was);
+
+				// `refused` is this codebase's existing and ONLY idiom for "the press did
+				// nothing" -- scene/interact.c counts it for a miss, an occupied cell, an empty
+				// hand and an uncarryable break, and it surfaces on the debug overlay as `r`
+				// (see the status line further down, which prints it.refused). Nothing louder is
+				// invented here on purpose: interact.c:422 states in as many words that this
+				// client has no toast and no status line for a refused action, and inventing one
+				// for this single case would be a second, quieter refusal mechanism that only
+				// one caller uses.
+				it.refused++;
+
+				// it.placed is deliberately NOT decremented. It is a cumulative counter whose
+				// stated job is to make "a placed block that silently did not appear" visible,
+				// and a placement that was made and then rolled back is exactly that event; `p`
+				// ticking while `r` ticks in the same frame is the honest record of it. Winding
+				// a monotonic counter backwards would erase the one trace this leaves.
+
+				// And the two fields the rest of this frame reads. Clearing placed_id is what
+				// stops the charge below -- see the long note above -- and placed_valid goes
+				// with it so nothing downstream can treat the cell as still holding a placement.
+				it.placed_id    = BLOCK_AIR;
+				it.placed_valid = false;
+			}
+		}
+
 		// Charged only for a placement the world actually accepted. it.placed_id stays
 		// BLOCK_AIR on every refusal path in interactEdit — no target, no entry face, cell
 		// occupied, would entomb the player, empty hand — so a refused place cannot silently
 		// consume a block out of the hotbar.
+		//
+		// v1.9.0: and on the sixth refusal path, which is not in interactEdit at all -- the
+		// full-blockstate-table refusal directly above clears it.placed_id for exactly this
+		// line to read.
 		//
 		// v1.3.0: through net/inv_bridge.h, reporting BS_INV_OP_CONSUME. Same rule as the pickup
 		// above — the number sent is what was really taken out, so a placement charged against an
@@ -6549,46 +7119,6 @@ session_start:
 		// server to remove a block it can see the player does not have.
 		if (it.placed_id != BLOCK_AIR)
 			invBridgeRemove(&s_inv, it.placed_id, 1);
-
-		// v1.8.15 "Furnace". A placed furnace acquires its own empty state, the exact mirror of
-		// the blockStateRemove above -- place claims a slot, break frees it.
-		//
-		// Gated on the block id and NOT run unconditionally, which is the opposite of the break
-		// path twenty lines up, and the asymmetry is deliberate rather than an inconsistency.
-		// Removing state for a cell that has none is free and idempotent, so the break side can
-		// afford to hold no opinion about which blocks are stateful. CREATING state is not free:
-		// BLOCKSTATE_SLOTS is 64, so calling blockStateCreate for every dirt block placed would
-		// fill the table within seconds of ordinary building and leave no room for a furnace.
-		// The table has to be told what deserves a slot; only the break side can afford not to
-		// care.
-		//
-		// The return is deliberately discarded. blockStateCreate answers false when the table is
-		// genuinely full -- 64 live records, none of them this cell -- and there is nothing
-		// useful to do about it here: the furnace block itself has already been placed into the
-		// world by interactEdit, and un-placing it underneath the player would be a stranger
-		// outcome than a furnace that refuses to hold fuel. A player who has 64 furnaces going
-		// at once has found the limit; the 65th behaves like decoration rather than crashing or
-		// silently eating what they put in it, because every read of an absent record is a clean
-		// "no state here" by blockstate.h's contract.
-		if (it.placed_valid && it.placed_id == BLOCK_FURNACE) {
-			if (blockStateCreate(&s_blockstate, it.placed_x, it.placed_y, it.placed_z,
-			                      BLOCK_FURNACE)) {
-				// blockStateCreate hands back an all-zero payload, and an all-zero FurnaceState
-				// is already the correct empty furnace -- every slot ITEM_NONE, no fuel, no
-				// progress, unlit. Packing furnaceStateInit's result over the top is therefore
-				// redundant TODAY. It is done anyway, because "zero happens to mean empty" is a
-				// property of furnace.h's current field layout and not a promise it makes; the
-				// day a field gains a non-zero resting value, this line is what keeps a freshly
-				// placed furnace correct, and its absence would be a bug nobody could see.
-				FurnaceState fs;
-				furnaceStateInit(&fs);
-
-				uint8_t payload[BLOCKSTATE_PAYLOAD_BYTES];
-				furnaceStatePack(&fs, payload);
-				(void)blockStateSet(&s_blockstate, it.placed_x, it.placed_y, it.placed_z,
-				                     BLOCK_FURNACE, payload);
-			}
-		}
 
 #if BS_EDIT_STRESS
 		// The 4.5 check: an edit on a chunk corner every frame, which dirties eight
@@ -7346,7 +7876,13 @@ session_start:
 	// written into it would describe a session that did not happen — the same rule the two lines
 	// above and below are both keeping. Written whole for the same reason the inventory is: 2 KB
 	// is not worth an SD round trip inside the frame that just broke a block.
-	if (inv_dir && !world_refused) (void)blockStateSave(&s_blockstate, inv_dir);
+	//
+	// !s_blockstate_load_incomplete added alongside !world_refused: a load that could not
+	// allocate its read buffer left s_blockstate at a safe empty default, not a trustworthy one,
+	// and saving it here would silently and permanently erase every furnace and chest already on
+	// disk. See world/blockstate.h's blockStateLoad comment and the load call site above.
+	if (inv_dir && !world_refused && !s_blockstate_load_incomplete)
+		(void)blockStateSave(&s_blockstate, inv_dir);
 
 	// v1.7.1 task 46b, and deliberately on this exact line rather than anywhere else on the
 	// main thread. app/worker.h:92-97 allows exactly one thread inside the SD's FS service
@@ -7431,6 +7967,28 @@ session_start:
 	// function's own early return — and puts arriving diffs back in the pending store where
 	// they wait for whatever world comes next.
 	networldSetWorld(NULL);
+
+	// v1.9.0 CHEST SYNC, and deliberately on the line under networldSetWorld(NULL) rather than
+	// anywhere else in this teardown: net/networld.h says this pointer has the "same shape and
+	// lifetime as networldSetWorld()", so the two are registered together at world entry and
+	// cleared together here, and a reader looking for one finds the other.
+	//
+	// What it stops. s_blockstate is a file static and is never freed, so this is not a
+	// use-after-free guard — it is a WRONG-WORLD guard. The menu loop this teardown returns to
+	// pumps networldUpdate() every frame (the sentence directly above says why), and a joined
+	// player who quits to title while still connected would otherwise have every CHEST_STATE
+	// the server sends mirrored into a table that no longer describes any loaded world. Those
+	// records would then sit there until the next session_start's blockStateLoad() overwrote
+	// them — and in the one case where it does NOT overwrite them, a single-player world
+	// entered after leaving a server, they would be the server's chests appearing in a local
+	// save, which blockStateSave() at the top of this same teardown would then write to the SD
+	// card.
+	//
+	// Cleared unconditionally, and after the blockStateSave() above rather than before it: no
+	// networldUpdate() call sits anywhere between that save and this line, so nothing can
+	// arrive in the gap, and clearing a pointer that was never set (a world refused before
+	// session_start reached the registration) is a plain no-op.
+	networldSetBlockStateTable(NULL);
 
 	// v1.7.1 task 46, and it has to be here rather than in app_shutdown with chunkRenderExit:
 	// both paths below can jump back to session_start with the process still alive, and the

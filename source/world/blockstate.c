@@ -1,6 +1,7 @@
 #include "world/blockstate.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "world/crc32.h"
@@ -204,9 +205,14 @@ bool blockStateSave(const BlockStateTable* t, const char* world_dir)
 		if (t->slots[i].block_id != BLOCK_AIR) count++;
 
 	const size_t total = BS_FILE_BYTES(count);
-	// BLOCKSTATE_SLOTS is a compile-time 64 and BLOCKSTATE_PAYLOAD_BYTES is 16, so `total`
-	// tops out at 16 + 64*32 = 2,080 bytes -- a fixed, small stack buffer, no malloc.
-	uint8_t buf[BS_FILE_BYTES(BLOCKSTATE_SLOTS)];
+	// BLOCKSTATE_SLOTS was a compile-time 64 when this buffer was a stack array (`total`
+	// topped out at 16 + 64*32 = 2,080 bytes -- fixed and small enough for a stack frame).
+	// Raised to 256 for chests (see blockstate.h), `total` now tops out at 16 + 256*32 =
+	// 8,208 bytes -- too much to spend on one frame of libctru's 32 KB default thread stack
+	// (an over-large local silently kills the function on this platform, no crash), so this
+	// is heap-allocated instead. Freed on every exit path from here on.
+	uint8_t* buf = malloc(BS_FILE_BYTES(BLOCKSTATE_SLOTS));
+	if (!buf) return false;   // cannot proceed without the buffer: same as any other IO failure
 
 	size_t w = BS_HDR_BYTES;
 	for (int i = 0; i < BLOCKSTATE_SLOTS; i++) {
@@ -229,9 +235,10 @@ bool blockStateSave(const BlockStateTable* t, const char* world_dir)
 	put32(buf + 12, crc);
 
 	FILE* f = fopen(tmp, "wb");
-	if (!f) return false;
+	if (!f) { free(buf); return false; }
 
 	const bool wrote_ok = fwrite(buf, 1, total, f) == total;
+	free(buf);
 
 	// fclose is the flush: this is what makes the bytes actually reach the card rather than
 	// sitting in stdio's buffer when the rename below runs -- same reasoning as
@@ -272,6 +279,18 @@ static void blockStateRecover(const char* path)
 	rename(tmp, path);
 }
 
+#ifndef __3DS__
+// Test-only hook: forces the next blockStateLoad's read-buffer allocation to behave exactly
+// as an out-of-memory malloc does, so the allocation-failure path a few lines below can be
+// entered on purpose instead of only by actually exhausting the heap. Mirrors world/light.c's
+// lightFailEditQueueForTest for the same reason: a failure path that cannot be forced to run
+// is unproven, not merely rare. Nothing in production sets this; compiled out of the console
+// build entirely (see the declaration in blockstate.h) rather than merely left unused there.
+static bool s_fail_load_alloc_for_test;
+
+void blockStateFailLoadAllocForTest(bool fail) { s_fail_load_alloc_for_test = fail; }
+#endif
+
 bool blockStateLoad(BlockStateTable* t, const char* world_dir)
 {
 	if (!t || !dirUsable(world_dir)) return false;
@@ -295,23 +314,45 @@ bool blockStateLoad(BlockStateTable* t, const char* world_dir)
 	// inventory.c's inventoryLoad and world/playerpose.c's playerPoseLoad apply to their own
 	// records -- a file longer than anything this format can produce is as wrong as a short
 	// one, not something to read the first N bytes of and ignore the rest.
-	uint8_t buf[BS_FILE_BYTES(BLOCKSTATE_SLOTS) + 1];
-	const size_t got = fread(buf, 1, sizeof(buf), f);
+	//
+	// Heap-allocated for the same reason blockStateSave's buffer is (see there): at the
+	// raised BLOCKSTATE_SLOTS = 256 this is 8,209 bytes, too much for one frame of libctru's
+	// 32 KB default thread stack.
+	//
+	// v1.9.x fix: a failed malloc here used to `return true` -- leave `t` at the zeroed
+	// default blockStateInit already set above, but report it as if that were a genuine,
+	// successful "no file / corrupt file" default. It is not: a real, good file may be
+	// sitting right there on the card, unread. Reporting success let a later blockStateSave
+	// write this empty table straight over it -- silent, irreversible data loss for every
+	// furnace and chest in the world, and it takes only memory pressure at the wrong moment
+	// to trigger, no corruption or missing file required. false is the honest answer: the
+	// load did not happen. See blockstate.h's comment on this function for why this is safe
+	// to change (nothing anywhere branches on false meaning "no file, use the empty table")
+	// and for what still has to happen in main.c before this stops the clobber end to end.
+#ifndef __3DS__
+	uint8_t* buf = s_fail_load_alloc_for_test ? NULL
+	                                           : malloc(BS_FILE_BYTES(BLOCKSTATE_SLOTS) + 1);
+#else
+	uint8_t* buf = malloc(BS_FILE_BYTES(BLOCKSTATE_SLOTS) + 1);
+#endif
+	if (!buf) { fclose(f); return false; }
+
+	const size_t got = fread(buf, 1, BS_FILE_BYTES(BLOCKSTATE_SLOTS) + 1, f);
 	fclose(f);
 
-	if (got < BS_HDR_BYTES) return true;   // too short even for a header: defaults
-	if (get32(buf + 0) != get32(BLOCKSTATE_MAGIC)) return true;
-	if (get32(buf + 4) != BLOCKSTATE_VERSION)      return true;
+	if (got < BS_HDR_BYTES) { free(buf); return true; }   // too short even for a header: defaults
+	if (get32(buf + 0) != get32(BLOCKSTATE_MAGIC)) { free(buf); return true; }
+	if (get32(buf + 4) != BLOCKSTATE_VERSION)      { free(buf); return true; }
 
 	const uint32_t count = get32(buf + 8);
-	if (count > (uint32_t)BLOCKSTATE_SLOTS) return true;   // more records than this build allows
+	if (count > (uint32_t)BLOCKSTATE_SLOTS) { free(buf); return true; }   // more records than this build allows
 
 	const size_t want = BS_FILE_BYTES(count);
-	if (got != want) return true;   // short (truncated) or long (trailing garbage): defaults
+	if (got != want) { free(buf); return true; }   // short (truncated) or long (trailing garbage): defaults
 
 #ifndef BS_SABOTAGE_NO_CRC_CHECK
 	const uint32_t want_crc = get32(buf + 12);
-	if (crc32(buf + BS_HDR_BYTES, want - BS_HDR_BYTES) != want_crc) return true;   // torn write
+	if (crc32(buf + BS_HDR_BYTES, want - BS_HDR_BYTES) != want_crc) { free(buf); return true; }   // torn write
 #endif
 	// Sabotage arm BS_SABOTAGE_NO_CRC_CHECK: skip crc validation entirely, so a corrupted
 	// payload loads as if it were fine -- the exact bug the crc field exists to catch.
@@ -326,7 +367,7 @@ bool blockStateLoad(BlockStateTable* t, const char* world_dir)
 		// A corrupt record claiming BLOCK_AIR (the free-slot sentinel) would silently vanish
 		// on the very next blockStateCreate scan and is not a value this format ever writes
 		// itself -- reject the whole file rather than load a table with a landmine in it.
-		if (id == BLOCK_AIR) { blockStateInit(t); return true; }
+		if (id == BLOCK_AIR) { blockStateInit(t); free(buf); return true; }
 
 		// Two records at the same position is not a value this format ever writes itself
 		// either (blockStateSave walks live slots, which are unique by construction — see
@@ -335,12 +376,14 @@ bool blockStateLoad(BlockStateTable* t, const char* world_dir)
 		// slot that still counts against BLOCKSTATE_SLOTS -- not a leak this table's own API
 		// can cause, but a corrupt file could, so it is rejected the same as any other
 		// malformed record rather than silently tolerated.
+		bool dup = false;
 		for (uint32_t j = 0; j < i; j++) {
 			if (t->slots[j].x == x && t->slots[j].y == y && t->slots[j].z == z) {
-				blockStateInit(t);
-				return true;
+				dup = true;
+				break;
 			}
 		}
+		if (dup) { blockStateInit(t); free(buf); return true; }
 
 		BlockStateEntry* e = &t->slots[i];
 		e->x = x; e->y = y; e->z = z;
@@ -349,5 +392,6 @@ bool blockStateLoad(BlockStateTable* t, const char* world_dir)
 		r += BS_RECORD_BYTES;
 	}
 
+	free(buf);
 	return true;
 }

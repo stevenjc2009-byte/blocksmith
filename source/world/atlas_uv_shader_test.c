@@ -225,7 +225,16 @@ static char s_first[512];
 // They are also the first painted slots on the sheet with transparent texels in them (see
 // tools/make_atlas.py's TILES comment for why that is safe here and would not be on a cube),
 // which the fingerprint below covers for free: it hashes the decoded RGBA, alpha included.
-#define ATLAS_PAINTED_SLOTS 57
+//
+// v1.9.0 STORAGE: 57 -> 58. tools/make_atlas.py's TILES list gained one entry, slot 57
+// "chest_top" - a real block-face tile (world/registry.c's chest row points its FACE_TOP at
+// it, world/block.h's BTEX_CHEST_TOP and gfx/atlas_tiles.h's TILE_CHEST_TOP both name it 57,
+// cross-checked at compile time by world/block_tiles_check.c's X-macro), not an item icon
+// like the nine slots just above it - so unlike those, it belongs back under TILE_USED_COUNT
+// (49 as of this move) and it is fully opaque: no transparent texels, because a cube face
+// must tile with GPU_REPEAT and a hole in it would show through to whatever the mesher packs
+// next to it.
+#define ATLAS_PAINTED_SLOTS 58
 
 // Slots 10 and 11 within that: water and tall grass (roadmap tasks 17 and 19). Named here
 // because the two texel-content checks further down are about what these two tiles ARE, not
@@ -1416,6 +1425,28 @@ int main(void)
 				0xAA762713344DB7BFull,   // 54 icon_cooked_beef    (NEW pin, v1.8.16 -- see below)
 				0x40F7DDD1B48EB222ull,   // 55 icon_cooked_chicken (NEW pin, v1.8.16 -- see below)
 				0x43A4875C71F6C61Eull,   // 56 icon_cooked_mutton  (NEW pin, v1.8.16 -- see below)
+				// v1.9.0 STORAGE, one NEW pin. Slot 57 is a real block-face tile again (not an
+				// icon like 48..56 just above it) - world/registry.c's chest row points its
+				// FACE_TOP at BTEX_CHEST_TOP, gfx/atlas_tiles.h names it TILE_CHEST_TOP, both 57,
+				// cross-checked at compile time by world/block_tiles_check.c. Fully opaque: no
+				// alpha-0 texels, unlike the icon rows above it.
+				//
+				// Measured via a placeholder run (scratchpad_atlas_uv_probe.sh), not
+				// reconstructed - and measured TWICE, because the first run silently read a
+				// STALE build/atlas.t3x (left over from before this move touched gfx/atlas.png)
+				// rather than this move's actual art: the atlas artefact guard a few stanzas
+				// above this one in tools/run_host_tests.sh caught that staleness on the next
+				// full-suite run and it was fixed by rebuilding build/atlas.t3x with tex3ds
+				// directly (scratchpad_rebuild_atlas_t3x.sh, the same invocation the guard uses
+				// for its own comparison copy). The first measurement, 0xAB5D4C84CED60325,
+				// happened to equal docs/chest-paused-v1.9.0.patch.txt's claimed golden for this
+				// slot - not a coincidence: that stale t3x was apparently the pre-revert build's
+				// artifact, gitignored and therefore untouched by the 2026-09-04 revert that hit
+				// tracked files. It does NOT describe this move's actual chest_top painter,
+				// which was written fresh from the patch's DESIGN INTENT, not its literal pixels,
+				// and paints different texels. The value below is the real one, measured against
+				// a build/atlas.t3x confirmed fresh by the guard passing.
+				0xC2047ACDDB80918Dull,   // 57 chest_top (NEW pin, v1.9.0 -- see below)
 			};
 			for (int slot = 0; slot < ATLAS_PAINTED_SLOTS; slot++) {
 				const uint64_t got = slotFingerprint(SLOT_PNG_TOP(slot));

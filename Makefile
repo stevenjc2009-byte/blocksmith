@@ -408,8 +408,60 @@ PROTO_REPO	:=	https://github.com/stevenjc2009-byte/blocksmith-server.git
 # pushed the v1.9.7 branch one commit past its own v1.9.7 tag. It now has its own v1.9.8
 # branch, and refs/heads/v1.9.7 was moved back to 2c822a09 so that branch, tag and remote
 # agree again.
+#
+# v1.9.0 -> 7454d0253f0bc59567e08018060bd0f3ea95f2d2, server v1.9.9, which carries the chest:
+# the registry gains the chest block row and crafting.c gains RECIPE_PLANKS_TO_CHEST, so
+# BS_RECIPE_COUNT moves 6u -> 7u. That constant is a hand-written restatement of
+# world/crafting.h's RECIPE_COUNT, because proto/bs_proto.h is deliberately NOT one of the
+# eleven files tools/sync-world-sources.sh mirrors; the server's own
+# _Static_assert(RECIPE_COUNT == BS_RECIPE_COUNT) at game/validate.c:57 is what catches the
+# restatement failing to follow, and it catches it as a build failure rather than a desync.
+#
+# RELEASE ORDER was server-first and here that is a correctness argument, not a formality,
+# for a reason that is NOT the recipe count. The recipe direction is benign both ways: the
+# server's craft bound at game/bsgame.c:1609 is symbolic (`if (a < RECIPE_COUNT)`), so a new
+# client's chest craft against an old server is silently DROPPED, not kicked -- the kick path
+# is handle_app_payload's unknown-opcode tail, and no new opcode ships here. What forces the
+# order is the REGISTRY: the chest row changes the registry hash, and registryMatchesInfo()
+# refuses a join outright when the two sides disagree. So an old client cannot join a v1.9.9
+# server at all, which is the loud, correct failure -- but it means the server has to exist
+# first, or a client shipping the chest row could join nothing.
+#
+# Verified the same four ways as the entry above, and a fifth. The four: `git ls-remote
+# origin` shows refs/heads/v1.9.9 and refs/tags/v1.9.9 both present on the remote;
+# refs/tags/v1.9.9 resolves to 7454d025; 7454d025:proto/bs_proto.h is blob e57b3fe0 --
+# byte-identical to what `git hash-object proto/bs_proto.h` reports on disk; and a genuine
+# fresh `git clone` of the remote into a scratch directory, checked out at 7454d025, whose
+# proto/bs_proto.h `cmp`s IDENTICAL against the one on disk.
+#
+# The fifth was added because even a fresh clone and the local one are still both git, over
+# the same protocol. VERSION and the header blob were also read straight off the GitHub API
+# at ?ref=7454d025 -- a different transport entirely -- returning 1.9.9 and e57b3fe0. Note
+# one trap found while doing it: reading VERSION out of a fresh clone BEFORE checking out the
+# pinned commit reads the default branch instead, which here says 1.1.0 and looks alarming.
+# Check out the commit first, or read the file at an explicit ref.
+#
+# v1.9.0 -> 13843c1cb940758143e347df54bacc9c50770146, server v1.9.10, which carries the chest
+# WIRE: BS_APP_SERVER_CAPS (0x11), BS_APP_CHEST_STATE (0x12) and BS_APP_CHEST_ACTION (0x13),
+# plus BS_CAP_CHESTS. proto/bs_proto.h gains those three opcode numbers and the caps bit and
+# nothing else -- BS_PROTO_VERSION stays 1u and BS_RECIPE_COUNT stays 7u, so this bump moves
+# neither the registry hash nor the recipe pin.
+#
+# RELEASE ORDER here is the OPPOSITE argument to the v1.9.9 entry above, and it is worth being
+# explicit about since the two entries sit next to each other. v1.9.9 had to ship first because
+# the chest registry row changes the registry hash and registryMatchesInfo() refuses the join
+# outright. Nothing in v1.9.10 touches the registry, so there is no join gate on either side:
+# a v1.9.0 client against a v1.9.9 server simply never sees BS_CAP_CHESTS, never sends
+# CHEST_ACTION, and gets client-local chests instead of synced ones. Degraded, not refused, and
+# not kicked -- which is precisely what the capability bit was added to buy, because the kick
+# path is handle_app_payload's unknown-opcode tail and this release DOES ship new opcodes.
+#
+# Verified: refs/heads/v1.9.10 and refs/tags/v1.9.10 are both on the remote; the annotated tag
+# dereferences (refs/tags/v1.9.10^{}) to 13843c1c, the same commit as the branch head; and the
+# GitHub release at that tag is the one releases/latest 302-redirects to. The blob check that
+# check-proto-drift itself performs is the binding one and is run below, not restated here.
 
-PROTO_COMMIT	:=	84b1400d4920b3c23feccaf9936aae12cbc4e255
+PROTO_COMMIT	:=	13843c1cb940758143e347df54bacc9c50770146
 PROTO		:=	deps/blocksmith-server
 
 .PHONY: deps

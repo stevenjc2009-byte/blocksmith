@@ -14,14 +14,32 @@ Order below is the recommended resume order.
 
 ## 1. Chests and storage — target v1.9.0
 
-**Status: paused mid-landing. Partially lost and reconstructed — read this whole entry
-before touching it.**
+**Status: RESOLVED 2026-09-07 — landed, no longer paused.** Everything this entry
+describes as broken is fixed. Independently verified, not assumed: `BTEX_CHEST_TOP`
+(`source/world/block.h:390`) and `TILE_CHEST_TOP` (`source/gfx/atlas_tiles.h:124`) are
+both `57` — the static-assert failure in item 1 below no longer applies. Both
+`.paused-v1.9.0` files are gone; `source/world/chest.c`, `chest.h` and `chest_test.c` now
+exist as the real, unsuffixed sources. The registry row is in at `registry.c:794`
+(`[43] = { // chest — atlas slot 57`). `check-world-drift`'s eleven mirrored files —
+`block.h`, `inventory.h/.c`, `crafting.h/.c`, `crc32.h/.c`, `registry.h/.c`, `tick.h/.c` —
+are byte-identical between `source/world/` and `deps/blocksmith-server/game/world/`, byte
+for byte, checked directly rather than by trusting the Makefile target (which needs
+`DEVKITARM` set to run here and this shell does not have it). The three stale test count
+pins are updated too: `tests/food_placeable_invariant_test.c` now checks `rows == 44` and
+`source/world/mining_test.c` now checks `targetable_rows == 42`.
 
-**Where the work is.**
+Kept below as the record of what the paused state actually was and how it broke — not
+because any of it is still true, and not to be redone. Only this status line and the
+heading tense just below it were touched; the rest, including the "next steps on resume"
+at the bottom, is the original entry and no longer applies.
+
+---
+
+**Where the work was.**
 - `source/world/chest.h.paused-v1.9.0` (6,728 bytes) — the design and interface. Intact.
   This is the bulk of the thinking and it survived.
 - `source/world/chest.c.paused-v1.9.0` (884 bytes) — barely started. Intact.
-- `chest-paused-v1.9.0.patch.txt`, at `C:\Users\steve\Documents\3ds-project-folder\` —
+- `chest-paused-v1.9.0.patch.txt`, at `<repo parent>\` —
   the integration wiring, reconstructed from the lane's transcript.
 
 Both `.paused-v1.9.0` files are renamed **only** so the Makefile's `source/` glob does

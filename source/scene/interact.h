@@ -36,6 +36,12 @@ typedef uint32_t u32;
 #include <stdbool.h>
 #include <stdint.h>
 
+// v1.9.0: CHEST_SLOTS, for the _Static_assert under INTERACT_BROKE_EXTRA_MAX below. Checked
+// rather than assumed before adding it: world/chest.h includes world/blockstate.h and
+// world/inventory.h, neither of which reaches scene/ — nothing in world/ includes a scene/
+// header at all — so there is no cycle. It is also header-only from every consumer's point of
+// view: only the CHEST_SLOTS macro is used here, so no link line gains world/chest.o for it.
+#include "world/chest.h"
 #include "world/physics.h"
 #include "world/raycast.h"
 #include "world/relightq.h"
@@ -47,10 +53,36 @@ typedef uint32_t u32;
 #define INTERACT_REACH  5.0f
 
 // How many (item, count) pairs a broken stateful block can report back through
-// broke_extra_item/qty below. 3 because a furnace — the only stateful block that exists
-// today — never carries more than input + fuel + output at once. Raise this if a future
-// stateful block (a chest) ever needs more slots than that.
-#define INTERACT_BROKE_EXTRA_MAX 3
+// broke_extra_item/qty below.
+//
+// ── v1.9.0: 3 → 8, and no longer a number of its own ────────────────────────────────────
+//
+// It used to be 3, and the comment here used to end "3 because a furnace — the only stateful
+// block that exists today — never carries more than input + fuel + output at once. Raise this
+// if a future stateful block (a chest) ever needs more slots than that." That future block is
+// here: world/chest.h's CHEST_SLOTS is 8, so 8 is the number, and it is now TIED to that
+// constant rather than restated as a literal — a chest that ever grows a ninth slot would
+// otherwise silently drop its last slot's contents on every break, which is exactly the class
+// of silent item loss the whole broke_extra_* mechanism was added (v1.8.16 F1) to end.
+//
+// The tie is a _Static_assert and not a `#define INTERACT_BROKE_EXTRA_MAX CHEST_SLOTS`,
+// because this constant is not "the chest's slot count": it is "the widest contents any
+// stateful block can report", and the furnace (3) is under it. Defining it AS the chest's
+// count would make the next stateful block wider than the chest silently truncate instead of
+// failing the build. The assert says the thing that actually has to hold — the ceiling is at
+// least as wide as the widest block that reports through it.
+//
+// STACK COST, because on this platform a large local is not a crash but a silently dead
+// function (libctru's default thread stack is 32KB). Two places grow, both by 10 bytes:
+// breakComplete()'s `items[]`/`qtys[]` pair go 3+3 = 6 B to 8+8 = 16 B, and Interact's own
+// broke_extra_item/qty pair do the same — Interact is a caller-owned struct, one per session,
+// so that is +10 B on main.c's frame, not per call. Both are noise against 32KB.
+#define INTERACT_BROKE_EXTRA_MAX 8
+_Static_assert(INTERACT_BROKE_EXTRA_MAX >= CHEST_SLOTS,
+               "a broken chest reports CHEST_SLOTS (item, count) pairs through "
+               "broke_extra_item/qty, so the ceiling on that array must be at least that "
+               "wide — a narrower one destroys the tail of a broken chest's contents with "
+               "no error, which is the exact defect v1.8.16 F1 exists to prevent");
 
 // v1.8.16 F1. Reads back what a just-broken STATEFUL block (`id`, the block that broke, at
 // `x,y,z`) was carrying, filling up to INTERACT_BROKE_EXTRA_MAX (item, count) pairs into
@@ -86,6 +118,44 @@ typedef int (*InteractBrokeContentsFn)(BlockId id, int x, int y, int z,
 // once at startup next to the existing interactSetRelightQueue() call).
 void interactSetBrokeContentsFn(InteractBrokeContentsFn fn);
 
+// ── v1.9.0: would the bag take a chest AND everything in it? ────────────────────────────
+//
+// Answers ONE question: if `n` stacks — `items[i]` x `counts[i]`, every entry non-zero, `n`
+// at most 1 + INTERACT_BROKE_EXTRA_MAX — were all added to the breaker's inventory right now,
+// in the order given, would every single unit land? False means at least one unit would be
+// refused or left over.
+//
+// WHAT THE IMPLEMENTATION MUST BE, because getting this wrong is the whole point of the
+// callback existing: run world/inventory.c's REAL inventoryAdd() over a COPY of the live
+// Inventory, once per entry in order, and answer false the moment one of them returns
+// anything other than INV_ADD_OK. An Inventory is 49 bytes, so the copy is free and the probe
+// cannot disturb the real bag. Do NOT reimplement "is there room" — an existing partial stack
+// of the same item with headroom under INV_STACK_MAX counts toward capacity exactly as a real
+// pickup does, and so does one entry spilling into the empty slot the previous entry created,
+// and a hand-written predicate that gets either wrong is a second copy of a rule this codebase
+// has already been bitten by having twice.
+//
+// A CALLBACK, for the same LINK reason interactSetBrokeContentsFn is one, and this time the
+// reason is load-bearing rather than tidy: inventoryAdd() lives in world/inventory.c, and two
+// of the three host stanzas that link scene/interact.c (tools/run_host_tests.sh's
+// interact_test and audio_cue_test) do NOT link world/inventory.c. A direct call would break
+// both binaries' link over a rule neither of them is about. interact.c's own use of
+// inventoryCanHold() is not a counter-example: that one is `static inline` in the header and
+// costs no object at all.
+//
+// It also puts the two halves of the answer in the one file that has both — main.c owns the
+// live Inventory and the BlockStateTable, and scene/interact.c has never held either.
+//
+// NULL is the default and means "yes, always", i.e. the pre-v1.9.0 behaviour: a chest breaks
+// regardless of the bag, exactly as it did before this guard existed. That is what every host
+// case gets unless it opts in, and what the console gets until main.c registers one.
+typedef bool (*InteractBagFitsFn)(const BlockId* items, const uint8_t* counts, int n);
+
+// Registers the predicate above; NULL restores the "yes, always" default. Same posture and
+// same registration point as interactSetBrokeContentsFn — one call at startup, beside the
+// existing interactSetRelightQueue().
+void interactSetBagFitsFn(InteractBagFitsFn fn);
+
 typedef struct {
 	RayHit  target;      // what the camera is looking at, recomputed every frame
 	BlockId holding;      // what a place would put down
@@ -104,6 +174,39 @@ typedef struct {
 	// each kind can happen per call, because the press that triggers it is edge-detected.
 	BlockId broke_id;
 	BlockId placed_id;
+
+	// ── v1.9.0 F1: what the PLACE CELL held before the placement overwrote it ────────────
+	//
+	// FIX for the defect the v1.9.0 chest wiring shipped with and wrote down in main.c rather
+	// than fixing: when blockStateCreate() answers false (the side table holds 256 live
+	// records and none of them is this cell) main.c REFUSES the placement and puts the cell
+	// back -- but it had no way to learn what "back" was, so it wrote BLOCK_AIR. interact.c
+	// has always known: interactEdit keeps the previous contents in a local (`place_was`)
+	// precisely because air is only the ORDINARY case -- a placement can legally land in a
+	// non-solid cell, tall grass being the one a player meets every minute -- and that local
+	// was simply never published. So placing a chest into a tuft of grass with the table full
+	// destroyed the grass and left air, on the one path whose entire contract is "nothing
+	// happened".
+	//
+	// SCHEDULE, and it is the same one placed_id is on: BLOCK_AIR at the top of every
+	// interactEdit, then set the moment the place cell is READ -- which is before the four
+	// place-path refusals that can still turn the press away, not after. Clearing it every
+	// call is what makes a stale value impossible, and that mattered more than it looks: a
+	// `placed_was` left over from an EARLIER placement would revert this cell to a block from
+	// somewhere else entirely, which is a worse bug than the one this field fixes.
+	//
+	// ONLY ACT ON IT WHEN placed_valid IS TRUE. It is deliberately still filled in on the
+	// refusal arms below the read (the cell is solid, the placement would entomb the player)
+	// because it costs nothing and "what was in the cell" is a true statement on those paths
+	// too -- but on every one of them the world was never written, so there is nothing to put
+	// back, and placed_valid is the flag that says so. Reverting off placed_was alone would
+	// write the cell's own contents back over itself on a path that never touched it.
+	//
+	// STACK COST: none. BlockId is a uint8_t and this sits in the padding that already stood
+	// between placed_id and broke_valid -- measured, not assumed: sizeof(Interact) is 136
+	// bytes both before and after this field (see the note on INTERACT_BROKE_EXTRA_MAX above
+	// for why a local's size is worth a line on this platform at all).
+	BlockId placed_was;
 
 	// WHERE the break landed, added v1.8.15 for the furnace. broke_id answers "what did the
 	// player earn" and is deliberately BLOCK_AIR for a plant, which breaks and drops nothing;

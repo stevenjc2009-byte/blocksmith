@@ -3,6 +3,34 @@
 > renumber; the filename is corrected to match. The content below, including its own "v1.8.18"
 > title and prose, is unchanged from before the rename.
 
+> **⚠ SECTION 2 SUPERSEDED [2026-09-05 18:18]** — this file's section 2 recommends "a
+> dedicated table instead of raising `BLOCKSTATE_SLOTS`". That recommendation was **not**
+> taken. See `docs/decision-1.9.0-chest-storage.md`.
+>
+> Chest contents live in the existing shared `BlockStateTable`, and `BLOCKSTATE_SLOTS` was
+> raised 64 → 256 instead. Section 2's own evidence is what settled it: it records that
+> raising the constant is "cheap and does not break old saves — a legitimate option, not a
+> version-format risk". Its objection is that 64 is a low ceiling for a storage room, which
+> is correct and which raising the cap answers directly; a dedicated table would have its own
+> cap and the same ceiling problem one level down, plus a second save file and a
+> re-implementation of `blockstate.c`'s keying, CRC and torn-write recovery for one caller.
+>
+> One constraint this file could not have known, because it is not visible from the save
+> format: the cap also sizes two whole-file **stack** buffers in `blockStateSave` and
+> `blockStateLoad`. Raising it is cheap in format terms and expensive in stack terms — at
+> 1024 slots the buffer exceeds libctru's whole 32KB thread stack, which on this platform
+> kills the function silently. Both buffers moved to the heap as part of the raise.
+>
+> **Section 2's most valuable observation stands and is now load-bearing elsewhere:** there
+> is no toast or status-line system anywhere in this codebase, so a refused placement is
+> silent to the player. That is why the chest path must refuse the *placement* rather than
+> accept it and drop the contents — a chest that silently fails to place is confusing, but a
+> chest that places and then eats what is put in it is item loss.
+>
+> Note also that this repository holds a second, larger v1.9.0 storage spec,
+> `docs/plan-1.9.0-storage-qol.md`, written the same day. The two disagree with each other as
+> well as with what was built; both now carry a note like this one.
+
 > **STATUS: SECOND OPINION, NOT THE CANONICAL SPEC.** The canonical v1.8.18 plan is
 > [`plan-1.9.0-storage-qol.md`](plan-1.9.0-storage-qol.md) (47,601 bytes), which is older,
 > broader, and already committed. This document was written by a later lane that was dispatched

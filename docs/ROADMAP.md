@@ -29,16 +29,30 @@ Two rules run through the whole ladder:
 > `source/scene/chunk_render.c` was settled by re-running the benchmark rather than by picking
 > a number: it is 50.9× / 0.0051 ms, and `tools/sortbench.c` now exists so it cannot rot again.
 >
-> **Still open, and still steve's call: the atlas-slot ceiling.** Only slots 57–62 remain (six),
-> while the redstone and dimensions plans together ask for fifteen. Enlarging the sheet was
-> costed on 2026-09-05 and is **not** the cheap escape it looks like: `ATLAS_H_PX` is already
-> 1024, which `source/world/atlas_uv.h:15-21` documents as the PICA200's hard per-dimension
-> maximum, and the width is pinned to one tile because the greedy mesher relies on `GPU_REPEAT`
-> having a period of exactly one tile. The two real options are a second atlas bound to the one
-> free texture unit (+32 KiB VRAM, mesher and shader surgery, spends the last unit), or halving
-> `TILE_PX` to 8 (free, but every one of the 57 existing tiles must be redrawn at half
-> resolution and may read as mush at 400×240). Nothing should spend those six slots until this
-> is decided.
+> **Still open, and still steve's call: the atlas-slot ceiling.** **Corrected 2026-09-06:** this
+> used to say slots 57–62 remain (six). Chest (v1.9.0) already took slot 57
+> (`BTEX_CHEST_TOP = 57`, `source/world/block.h`) — `docs/blueprint-1.9.1-interface.md`'s own
+> corrections section catches it too ("the atlas has five free slots, 58..62 … chest took 57 …
+> not six"). Only slots 58–62 remain (five), while the redstone and dimensions plans together
+> still ask for fifteen. `docs/blueprint-1.9.2-redstone.md` alone spends all five: wire, torch,
+> lamp and both door tiles (`TILE_USED_COUNT 54 → 59`), leaving the atlas full at 59 of 64 and
+> nothing for v1.9.3 at all. Enlarging the sheet was costed on 2026-09-05 and is **not** the
+> cheap escape it looks like: `ATLAS_H_PX` is already 1024, which `source/world/atlas_uv.h:15-21`
+> documents as the PICA200's hard per-dimension maximum, and the width is pinned to one tile
+> because the greedy mesher relies on `GPU_REPEAT` having a period of exactly one tile. The two
+> real options are a second atlas bound to the one free texture unit (+32 KiB VRAM, mesher and
+> shader surgery, spends the last unit), or halving `TILE_PX` to 8 (free, but every one of the
+> 57 existing tiles must be redrawn at half resolution and may read as mush at 400×240).
+> Nothing should spend those five slots until this is decided, and v1.9.2 as scoped spends all
+> of them.
+>
+> **[2026-09-07] Corrected: v1.9.0 is not released.** The entry below used to read "✅
+> released". It was not: `git tag -l 'v1.9*'` is empty, `git log refs/tags/v1.8.20..HEAD`
+> is empty, and `git describe --tags` on HEAD reports `v1.8.20` — HEAD is still v1.8.20's
+> own release commit. The chest and quality-of-life work is real and sits uncommitted in
+> the working tree (`git status` lists it), and `CHANGELOG.md`'s `[1.9.0]` entry already
+> says plainly that nothing in it has run on a console. The "✅ released" mark is removed
+> below until a v1.9.0 tag and release actually exist.
 
 ---
 
@@ -126,6 +140,24 @@ object with an empty symbol table against 88,832 B at `=1`. The buffers are now 
 after the batteries that use them anyway, which helps a diagnostic build and helps the
 shipping build by exactly nothing. **The 1.02 MB above is the whole of the real reclaim.**
 
+**Corrected 2026-09-07 — `BS_GPU_TESTS` no longer defaults to 0.** The paragraph above cites
+`app/gputest.h:37` for a default of 0. That was true when it was written; it is not true now.
+`source/app/gputest.h:45-47` is `#ifndef BS_GPU_TESTS` / `#define BS_GPU_TESTS 1` / `#endif`, and
+the comment opening at `:36` is headed "Default flipped ON." — flipped for the v1.8.18 freeze work,
+because every hardware freeze report came back with nothing on the card and the bounded wait plus
+post-mortem are what stop that. The old citation `:37` now lands inside that comment rather than on
+a define, so a reader who follows it finds prose where the sentence promises a `0`. **The
+conclusion survives, through a different gate.** The 512 KB this entry was disowning is the
+*boot-time preflight* battery, and that is switched separately: `BS_GPU_PREFLIGHT` defaults to 0
+(`source/app/gputest.h:49-53` — "That is BS_GPU_TESTS=1 BS_GPU_PREFLIGHT=0, and it is now what an
+unadorned `make` produces"), so a shipping build still never runs the preflight and still never
+allocates its scratch. What did change is that `app/gputest.c` is now *compiled into* a shipping
+build instead of vanishing at the preprocessor, so the `=0` versus `=1` object-size figures quoted
+above describe an override, not the default any more; the same header measures the shipped object
+at text=18696 bss=65952 bytes at `:60-61`, byte-identical whichever way `BS_GPU_PREFLIGHT` is set,
+because that gate is call-site only. **The 1.02 MB is untouched by all of this.** Checked by
+reading `source/app/gputest.h:36-70`.
+
 ---
 
 ## v1.8.6 — Speed ✅ released
@@ -139,9 +171,9 @@ ratio, never a frame cost.
 
 **Fixed — three quarters of the tree pass is thrown away after it is computed.** This is
 the version's first job because it is the largest confirmed win and the only one that can
-be proved exactly. `worldgenDecorate` (`world/worldgen.c:495-498`) scans tree cells out
+be proved exactly. `worldgenDecorate` (`world/worldgen.c:825-827`) scans tree cells out
 past the column being decorated, and `treeInCell` asks the generator for terrain height at
-`:348` *before* anything checks whether the tree can reach. `treePut` then discards the
+`:663` *before* anything checks whether the tree can reach. `treePut` then discards the
 whole tree with a bounds test. Classified across 8,273 queries over 900 columns:
 **75.3% are for a tree that cannot place a single block in the column being generated.**
 A horizontal-reach reject before the height query wins about **6.6% of column generation**,
@@ -151,7 +183,7 @@ It is also the safest change in the version, because `treePut` already discards 
 these trees: **the generated world must come out byte-identical**, so the acceptance test
 is an exact before-and-after comparison of generated columns, not a timing that could be
 argued with. In game, the figure that should move is `LOAD_STAGE_GENERATE`, already timed
-at `app/worker.c:270-273`.
+at `app/worker.c:461`.
 
 *The old entry claimed one height query costs ~476 noise evaluations against ~2,975 for a
 whole column. Measured over 1,271 columns and 6 seeds: **208** for a query and **24,204**
@@ -170,6 +202,28 @@ already carries `built`, `mesh_ms` and `meshq`, and the proof is `built` pinned 
 `mesh_ms` well under 4.0 and `meshq` elevated. If `mesh_ms` is near 4.0 there is nothing
 here to win.
 
+**Corrected 2026-09-07 — the measurement asked for above has been done, and one of the two knobs
+went the other way.** First, what is *not* wrong: this paragraph's claim that the millisecond
+budgets are untouched by any `hwIsNew3ds()` branch **still holds**. `DRAIN_BUDGET_MS` (`main.c:303`,
+`4.0f`) and `RELIGHT_BUDGET_MS` (`main.c:385`, `1.0f`) are each consumed with no console branch —
+`main.c:7242` and `main.c:7253` for the first, `main.c:7226-7227` for the second — and
+`main.c:296-302` records the flat clock as deliberate. `drainMaxChunks()` (`main.c:311-314`) does
+branch on `hwIsNew3ds()`, but it gates the *count*, which is the other knob and the one this
+paragraph itself names as the right one; that is not the claim above. What *is* stale is the last
+two sentences. **v1.8.17 measured it and moved the mesh count**: `DRAIN_MAX_CHUNKS_OLD3DS` 3 and
+`DRAIN_MAX_CHUNKS_NEW3DS` 9 (`main.c:304-305`), with the per-chunk Old 3DS cost of 1.79 ms and the
+arithmetic that picks 9 written out at `main.c:267-294`. The flat `DRAIN_MAX_CHUNKS` this paragraph
+names no longer exists — `debug/metrics.h:127-129` says so in passing. And **`RELIGHT_MAX_COLUMNS`
+is not "New 3DS only"**: it was measured in the same change and deliberately left flat at 4
+(`main.c:386`). `main.c:360-384` carries why — raising it is worth 2.5× on the host and nothing on
+either console, because at the ~19.5× host-to-console ratio one `lightRelightColumn` costs ~2.1 ms
+on an Old 3DS and ~0.7 ms on a New one, so the 1.0 ms clock stops the drain after one or two
+columns and a cap of 12 would never be reached. **The two line numbers above are left as written
+rather than renumbered.** `main.c:192-193` is now `s_tps` / `s_tps_mark_tick` and `:238-239` is the
+`BS_REPORT_ROW` `#define`, so the original ranges are gone, and it cannot be told from here whether
+they meant the two budgets alone or each budget plus the count beneath it. Renumbering a citation
+whose intent is unclear would only make a guess look checked.
+
 **Added — a real look at column generation itself.** `wgdColumn` is **91%** of the cost of
 generating a column: 22,031 noise evaluations and 1.25 ms against the 24,204 and 1.379 ms
 for everything. The entire tree pass above is the other 9%. No candidate on the original
@@ -177,14 +231,14 @@ list touched it, and it is where a serious worldgen win would have to come from.
 
 **Fixed — a test that does not test what it appears to.** `interact_test.c` never calls
 `lightEngineInit(true)`, so `lightEnabled()` is false for the whole binary and the relight
-paths at `scene/interact.c:114` and `:308` never execute in it. That is true today
+paths at `scene/interact.c:394` and `:786` never execute in it. That is true today
 independently of anything else in this version.
 
 ### Removed from this version, with the evidence that removed them
 
 - **Nearest-first chunk ordering.** The ordering claim was correct — raster scan into a
   strict FIFO (`main.c:849-861`, `world/jobq.c:25-33`), and your own column really is the
-  41st of 81 at radius 3, which `worker.c:139` already says. But `main.c:1541` sets
+  41st of 81 at radius 3, which `worker.c:139` already says. But `main.c:2099` sets
   `.ring_ready = in >= total` and `scene/loading.c:91` exits only when the *whole* ring is
   in, so **reordering the queue cannot shorten the loading screen by a single frame** — the
   work is identical and the exit condition is a conjunction over all of it. During play,
@@ -192,6 +246,38 @@ independently of anything else in this version.
   boundary where the fog is opaque anyway. There is a version of this worth doing, but it
   means starting play with an unmeshed periphery, and that is a design decision rather than
   an optimisation.
+
+  **Corrected 2026-09-07: v1.8.7 shipped this anyway.** The removal above is still an accurate
+  record of what v1.8.6 decided, and its loading-screen reasoning was never overturned — but a
+  reader who stops here concludes nearest-first ordering does not exist, and it has existed since
+  the very next version. `source/scene/ringorder.h` and `source/scene/ringorder.c` build a table of
+  `(dx, dz)` offsets sorted by increasing `dx*dx + dz*dz`, and `main.c:1041-1044` states it in the
+  tree: "v1.8.7. Both loops below walk scene/ringorder.h's table instead of `for dz { for dx }`, so
+  the ring is asked for and meshed NEAREST FIRST." Both loops do exactly that —
+  `genQueueReadyColumns` at `main.c:1092-1096` and `genRequestArea` at `main.c:1121-1125` each open
+  `const RingOffset* const ord = ringOrder();` and index `ord[i]`. It is committed, not
+  working-tree work: `git log --oneline -- source/scene/ringorder.h` returns the single commit
+  `c068673` ("feat(v1.8.7): terrain validation, two world-corrupting races fixed, generator
+  destaticised") and `git status --short` does not list the file. Note it was shipped for a
+  *different* reason than the one ruled out here — `ringorder.h:19-24` argues from what you are
+  looking at while the ring fills, not from the loading screen's length, so the conjunction
+  argument above stands. The citations rotted separately: `main.c:849-861` is now a `readdir` scan
+  for a `.bsr` file and the `GEN_MESH_SPAN` / `GEN_AREA_SPAN` comment, nothing to do with ordering,
+  while `world/jobq.c:25-33` is still a strict FIFO (`jobqPop`, head and tail wrapped `% JOBQ_CAP`)
+  and that half of the citation holds — what changed is what feeds it.
+
+  **Also corrected 2026-09-07: "which `worker.c:139` already says" defers to text that does not
+  exist.** `source/app/worker.c:139` is `static LightLock  s_lock;`, the per-lane event scheme's
+  lock, and says nothing about ring order. A recursive grep for that ordinal over the whole tree
+  returned no hit anywhere under `source/` — on 2026-09-07 the only hits in the repository were in
+  this document, and this note has since added two more, so scope any re-check to `source/`. Across
+  all history `git log --oneline -S` for it, restricted to `-- source/`, returns nothing, with the
+  same search for `s_lock` restricted to `-- source/app/worker.c` returning five commits as a
+  control that it can find something when there is something to find. Over all paths it returns the
+  single commit `645e6c9` (v1.8.5) — the commit that *added* this bullet,
+  where the same sentence cited `main.c:1541` for what now reads `main.c:2099`, so these citations
+  have been renumbered at least once since. The 41-of-81 arithmetic may well be right; what is
+  wrong is that no file under `source/` has ever carried it, so there is nowhere to go and check.
 - **Coalescing the local-edit relight.** The premise was backwards. `relightq` is fed only
   by remote edits and water; **a local break or place calls `lightRelightColumn`
   synchronously in single player and multiplayer alike**, so there is no gap between the two
@@ -214,14 +300,27 @@ independently of anything else in this version.
   console, which this project does not yet have. The specific pair originally cited cannot
   even coexist — that camera code is dead in a shipping build, though not for the reason
   first written here.
+  **Citation corrected 2026-09-07: that block is now `source/debug/metrics.h:141-147`.** Line 132
+  is blank today, so the `metrics.h:132` reference three sentences up reads as pointing at nothing.
+  It was right when it was made and drifted afterwards. `git show 785a652:source/debug/metrics.h`
+  — 785a652 being the v1.8.17 commit that provenance note names — has at line 132 exactly the
+  sentence beginning *docs/ROADMAP.md claims the main thread is "GPU-blocked for roughly 15.7 of
+  every 16.71 ms"*, which is the opening line of the block headed "v1.8.11 METRICS-VISIBLE" and
+  quotes this entry by name in order to rebut it. That file was 194 lines at that commit and is 205
+  now; v1.8.18 (`63e6ed7`) inserted eleven lines above the block for `metricsFlush()`, and
+  132 + 11 = 143, which is where the sentence sits today. **There is no second candidate.** The
+  only other Azahar passage in the file is the header comment at `:9-21`, which gives the constant
+  as "0.25 ms" and never uses the phrase being corrected here. *Noticed, not touched, because it is
+  outside this file:* `source/app/worker.h:181` carries the same "See debug/metrics.h:132"
+  reference and has gone stale in exactly the same way.
   **Corrected 2026-09-03:** the guard immediately around it is `#if BS_ORBIT`
-  (`camera.c:102`), not `BS_FLY`. The conclusion survives, because the whole `cameraUpdate()`
-  call is itself gated by `#if BS_FLY` at `main.c:4994`, which defaults off — so it is dead
+  (`camera.c:103`), not `BS_FLY`. The conclusion survives, because the whole `cameraUpdate()`
+  call is itself gated by `#if BS_FLY` at `main.c:6122`, which defaults off — so it is dead
   via the OUTER gate, not the inner one. Worth correcting because "it is inside `#if BS_FLY`"
   sends the next reader to the wrong line to check the claim, finds a different macro, and
   has no way to tell whether the entry or the code moved.
 
-  A genuine 4-transcendental residue existed between `player.c` and `interact.c:339-342`.
+  A genuine 4-transcendental residue existed between `player.c` and `interact.c:833-836`.
   **Half of it is now gone:** `player.c` asked for `sinf(yaw)` and `cosf(yaw)` twice each and
   as of 2026-09-03 asks once each. Folded despite this entry's own "not worth the version's
   attention", because it was free and provably exact rather than merely close — 16,000,025
@@ -237,10 +336,21 @@ world". That was wrong, and it was wrong against code that had already shipped.*
 
 The Beta 1.7.3 world is already here. It is not future work:
 
-- `world/genversion.h:104` stamps every new world `GEN_VERSION_FOR_NEW_WORLDS`, which
+- `world/genversion.h:131` stamps every new world `GEN_VERSION_FOR_NEW_WORLDS`, which
   is `GEN_VERSION_BIOME` (3), and the density field is `version >= GEN_VERSION_DENSITY`
   (2). So every new world already gets it. The density generator shipped in v1.7.0 and
   biome identity in v1.8.3 — both *earlier* than this entry.
+  **Corrected 2026-09-07: it is no longer (3).** The line number is right —
+  `world/genversion.h:131` is `#define GEN_VERSION_FOR_NEW_WORLDS GEN_VERSION_NEWEST` — but the
+  chain now resolves two steps further than it did: `GEN_VERSION_NEWEST` is `GEN_VERSION_ORES`
+  (`:128`) and `GEN_VERSION_ORES` is `5u` (`:124`). **A new world is stamped 5, not 3.** The two
+  versions minted in between are `GEN_VERSION_CAVES` `4u` (`:109`, v1.8.11's worm carver) and
+  `GEN_VERSION_ORES` `5u` (`:124`, v1.8.12's ore veins, reached at
+  `world/worldgen_density.c:652`). `GEN_VERSION_BIOME` is still `3u` (`:97`) and
+  `GEN_VERSION_DENSITY` still `2u` (`:73`), so **this bullet's actual point is unaffected and gets
+  stronger, not weaker** — a new world clears the density gate by three versions rather than one.
+  The file is committed and clean; `git log --oneline -- source/world/genversion.h` puts the last
+  change in `f8c4dc2` ("feat(v1.8.12)").
 - The lattice is Beta's own. `world/worldgen_density.h:64-73` is 5×5×17 sample points
   at 4 blocks horizontally and 8 vertically; Beta's documented grid is 5×5×17. The
   world is 128 tall (`world/world.h:23-24`) with sea at 64 — Beta's height and Beta's
@@ -250,7 +360,7 @@ The Beta 1.7.3 world is already here. It is not future work:
   old amplitude table the best any test seed managed was −2.68 blocks, meaning no
   overhang was geometrically possible anywhere. At the shipped table a mountainous seed
   reaches **+16.76 blocks, with 9.99% of all lattice steps rising**
-  (`world/worldgen_density.c:130-141`).
+  (`world/worldgen_density.c:125-130`).
 
 **What this version is instead: making it good on every seed, not on two.**
 
@@ -372,7 +482,10 @@ tunnels and open ravines, not pockets. The carver walks a damped random path wit
 sine-tapered radius, spawns rooms and branches, and crosses chunk borders so a tunnel
 actually goes somewhere.
 
-**Added.** Lava pools below the lava line, and underground water.
+**Fixed.** The chunk-hole streaming bug — a chunk mesh refused once was never retried,
+leaving a permanent gap in the world — and desert grass's tint, which stayed olive-green
+instead of sand. (Lava pools and underground water were planned for this pass but not
+shipped; `cave_carve.h` stops one step short of them on purpose.)
 
 ---
 
@@ -505,6 +618,23 @@ version. There was none; the bug explains it.
 **Added.** Chests. Stack splitting and merging, shift-move, and the small conveniences
 that a game gets tiring without.
 
+**Specs.** `docs/plan-1.9.0-storage-qol.md` is the original implementation spec and is still
+current except where the two documents below supersede it. `docs/decision-1.9.0-chest-storage.md`
+settles where a chest's contents live on the client — the shared `BlockStateTable` rather than
+a dedicated side table, with `BLOCKSTATE_SLOTS` raised 64 → 256 and the two whole-file buffers
+moved off the 32KB stack. `docs/design-1.9.0-chest-multiplayer.md` specifies the wire: three
+new opcodes at `0x11`–`0x13`, a server capability bitfield so that a new client can never be
+kicked by an old server, and the fully-verified transfer model rather than the trusted one.
+
+**Sequencing.** Single-player chests depend on nothing else and can land first. Multiplayer
+chests need a paired server release that ships **before** the client, because the chest action
+is a client-to-server opcode and older servers kick on an unknown one.
+
+**Already done at the model layer**, from the v1.8.x work: `inventoryMoveUnits` and
+`inventorySplitStack` exist and are host-tested, and `BS_INV_OP_SPLIT` is already on the wire.
+What is missing for stack splitting is the client bridge wrapper in `source/net/inv_bridge.c`
+and the UI gesture — not the mechanic.
+
 ---
 
 ## v1.9.1 — The new interface
@@ -517,7 +647,14 @@ not copied: none of their art, none of their layout metrics, none of their icons
 
 ## v1.9.2 — Redstone
 
-**Added.** Wire, power, levers, buttons, pressure plates, doors, pistons.
+**Added.** Wire, power, redstone torches, levers, buttons, pressure plates, redstone lamps,
+doors, pistons. Not this version, per `docs/blueprint-1.9.2-redstone.md` §0: repeaters,
+comparators, sticky pistons, hoppers, note blocks, and moving anything through the world
+beyond a piston's own one-block push — later 1.9.x follow-ups, not descoped.
+
+**Server-first, again.** New block ids move the registry hash, so the rule v1.9.0 already
+established applies again: the server releases before any client carrying these blocks can
+join at all.
 
 ---
 

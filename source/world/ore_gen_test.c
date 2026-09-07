@@ -8,9 +8,13 @@
 // documents at its own top, and the reason files under tests/ (e.g. tests/cave_carve_test.c,
 // this file's closest sibling) don't need one.
 //
-// NOT yet wired into tools/run_host_tests.sh -- this lane (ORE-GEN) is permission-blocked from
-// editing that script, the same restriction tests/cave_carve_test.c's own header notes for its
-// authoring lane. The exact stanza to paste in is in this change's final report.
+// WIRED into tools/run_host_tests.sh, at :5088-5141 -- the stanza links source/world/ore_gen.c
+// (:5134) alongside worldgen_density.c and runs this suite's own binary. It was NOT wired when
+// this file was written: the authoring lane (ORE-GEN) was permission-blocked from editing that
+// script -- the same restriction tests/cave_carve_test.c's own header notes for its lane -- and
+// handed the exact stanza over in its final report instead. The stanza's own comment records
+// that handover, and records that the more useful half of it was the eight link-line insertions
+// elsewhere in the script, which is what took the suite from dark back to green.
 //
 // ── What each family proves, and how it was proven able to go RED (see the final report for
 //    the actual sabotage/restore transcript and md5s) ──────────────────────────────────────

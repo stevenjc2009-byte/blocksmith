@@ -296,6 +296,19 @@ TILES = [
     "icon_cooked_beef",       # 54
     "icon_cooked_chicken",    # 55
     "icon_cooked_mutton",     # 56
+    # v1.9.0 "Storage" — the chest's lid, appended for the reason everything since the
+    # sentinel has been: this order IS the contract with gfx/atlas_tiles.h's TILE_* enum and
+    # world/block.h's BTEX_* mirror of it, so inserting would silently re-texture every tile
+    # after the insertion point. NOT the next slot after the icons in the C-side numbering —
+    # TILE_CHEST_TOP is explicitly 57, not an auto-incremented 57-from-icons coincidence
+    # (gfx/atlas_tiles.h's own comment explains why) — but it IS the next entry in TILES,
+    # because this list is append-only and index == slot for every entry in it regardless of
+    # gaps the C enum carries for other reasons.
+    #
+    # A BLOCK FACE, not an icon: FULL_CUBE, registered SOLID (world/registry.c's chest row),
+    # so — like every other block-face tile in this sheet — it must be fully opaque. No
+    # source/gfx/item_icons.h entry is needed; the chest's FACE_TOP is its own inventory icon.
+    "chest_top",              # 57
 ]
 
 
@@ -2802,6 +2815,70 @@ def tile_icon_cooked_mutton(rng):
     })
 
 
+def tile_chest_top(rng):
+    """The chest's lid — v1.9.0 "Storage", slot 57, world/registry.c's FACE_TOP tile and,
+    since a chest has no other face this build assigns any meaning to, its inventory icon
+    too (see world/block.h's BTEX_CHEST_TOP comment).
+
+    Reuses tile_planks' board palette (world/registry.c's chest row reuses BTEX_PLANKS on
+    the other five faces, so the lid should read as the same wood) but draws the boards
+    VERTICAL where tile_planks draws them horizontal, and adds a horizontal metal strap and
+    a centred dark latch square on top. That is what keeps the two tiles apart at a glance
+    on a 240px screen rather than by hue alone — the same "shape, not just colour" argument
+    tile_planks' own docstring makes against wood_side.
+
+    Fully opaque, no alpha-0 texels: this is a real block face (world/registry.c's chest row
+    points FACE_TOP directly at it), unlike the item icons at slots 48..56 which DO carry
+    alpha and must never be reused for a block face — see the note on TILE_USED_COUNT in
+    gfx/atlas_tiles.h for why that distinction is load-bearing.
+    """
+    plank_base = (168, 132, 88)
+    plank_warm = (182, 146, 100)
+    plank_cool = (150, 116, 78)
+    seam       = (96, 70, 46)
+    strap      = (132, 130, 124)
+    strap_dark = (86, 84, 80)
+    latch      = (54, 52, 48)
+
+    img = Image.new("RGB", (TILE_PX, TILE_PX))
+    px = img.load()
+    board_w = 4
+    # Vertical boards: each board is a column band board_w px wide, tinted individually so
+    # four identical stripes do not read as a printed pattern — the same construction as
+    # tile_planks' rows, rotated ninety degrees.
+    for x in range(TILE_PX):
+        board = x // board_w
+        tint = blend(plank_cool, plank_warm, (board * 0.31 + 0.15) % 1.0)
+        for y in range(TILE_PX):
+            px[x, y] = tint if rng.random() < 0.55 else blend(tint, plank_base, 0.5)
+
+    # Seams: the left column of every board, jittered the same way tile_planks jitters its
+    # row seams, so a vertical joint reads as sawn boards rather than a ruled line.
+    for board in range(TILE_PX // board_w):
+        x = board * board_w
+        for y in range(TILE_PX):
+            t = 0.62 if rng.random() < 0.88 else 0.40
+            px[x, y] = blend(px[x, y], seam, t)
+
+    # The strap: one horizontal band, a couple of rows tall, running the full width — the
+    # detail that says "banded chest" rather than "crate". Drawn after the seams so it sits
+    # on top of the boards rather than being interrupted by them.
+    strap_y = 6
+    for y in (strap_y, strap_y + 1):
+        for x in range(TILE_PX):
+            px[x, y] = strap if (x % 4) else strap_dark
+
+    # The latch: a small dark square centred on the strap, the one texel cluster that says
+    # "this opens".
+    lx0, ly0 = 6, strap_y - 1
+    for y in range(ly0, ly0 + 4):
+        for x in range(lx0, lx0 + 4):
+            if 0 <= x < TILE_PX and 0 <= y < TILE_PX:
+                px[x, y] = latch
+
+    return img
+
+
 def tile_sentinel(_rng):
     """Not art — a bleed alarm.
 
@@ -2907,6 +2984,7 @@ PAINTERS = {
     "icon_cooked_beef": tile_icon_cooked_beef,
     "icon_cooked_chicken": tile_icon_cooked_chicken,
     "icon_cooked_mutton": tile_icon_cooked_mutton,
+    "chest_top": tile_chest_top,
 }
 
 

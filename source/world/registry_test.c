@@ -57,7 +57,7 @@
 #define REGISTRY_DYN_LO_PIN     0x80  // first dynamic block id
 #define REGISTRY_DYN_HI_PIN     0xFD  // last one; 0xFE/0xFF stay reserved
 #define REGISTRY_DYN_ROWS_PIN   126   // 0xFD - 0x80 + 1, WRITTEN OUT, never computed
-#define REGISTRY_FULL_COUNT_PIN 169   // 43 core rows (air + forty-two) + 126 dyn rows
+#define REGISTRY_FULL_COUNT_PIN 170   // 44 core rows (air + forty-three) + 126 dyn rows
 
 // Compile-time layer. These fire when the host suite builds, which is every
 // tools/run_host_tests.sh run; the 3DS build never compiles this file (see the __3DS__
@@ -234,7 +234,25 @@ static void checkPin(bool cond, long got, long want, const char *what, const cha
 // Predicted (137) before the run, same discipline as the 117 move's comment describes; the
 // scratchpad WSL run of this exact suite after all of the above edits confirmed it: see this
 // lane's final report for the captured PASS transcript.
-#define REGISTRY_TEST_EXPECTED_CHECKS 137
+//
+// 137 -> 139 on 2026-09-05, v1.9.0 "Storage"'s one row (id 43: the chest). Counted off the
+// source first, same discipline as every entry above:
+//
+//   +1   coreHardnessIsDeclared()'s per-row loop runs one more iteration, the
+//        check(v->hardness != 0, v->name) for chest.
+//   +1   the new chest hardness pin — not a ladder, one block and one `==`, the same shape
+//        as the furnace pin just above it (and for the same reason: 40 is planks' value on
+//        purpose, and a bare nonzero check would not catch it silently drifting off that).
+//
+// 137 + 1 + 1 = 139. Nothing else in this suite gained a call, for the same reason nothing
+// else did in every move above: testRegistryCoreIdsStable and its kPhase3 table are both
+// written against FIXED id lists, so one new registry row does not enter either one, and the
+// crc golden is still exactly one check regardless of what value it holds. REGISTRY_FULL_COUNT_PIN
+// moved value too (169 -> 170) without adding a call, exactly as it has every previous time.
+//
+// Predicted (139) before the run; to be confirmed against the real WSL run of this exact
+// suite after all of the above edits, same discipline as every prior move.
+#define REGISTRY_TEST_EXPECTED_CHECKS 139
 
 // Deliberately NOT routed through check(): this must not perturb the number it is testing,
 // so it bumps g_fails only. Reporting shape is check()'s, so a failure here reads the same
@@ -290,10 +308,10 @@ static void testRegistryRoundTrip(void)
 	// six ores (0x1C..0x21): coal/iron/gold/redstone/lapis/diamond, plus v1.8.14's four raw
 	// meats (0x22..0x25): porkchop/beef/chicken/mutton, plus v1.8.15's four cooked meats and
 	// the furnace (0x26..0x2A): cooked_porkchop/cooked_beef/cooked_chicken/cooked_mutton/
-	// furnace. Every one of the last thirty-five is a core block and deliberately NOT an
-	// item — world/block.h records why BLOCK_COUNT stayed at 8 while the registry's row
-	// count moved to 43.
-	check(registryCount() == 43, "a fresh table defines exactly air + the forty-two core blocks");
+	// furnace, plus v1.9.0's chest (0x2B). Every one of the last thirty-six is a core block
+	// and deliberately NOT an item — world/block.h records why BLOCK_COUNT stayed at 8 while
+	// the registry's row count moved to 44.
+	check(registryCount() == 44, "a fresh table defines exactly air + the forty-three core blocks");
 	check(registryFind("grass") == BLOCK_GRASS, "core rows are findable by name");
 
 	// The runtime half of the dyn-range pin. The two _Static_asserts at the top of this
@@ -756,8 +774,30 @@ static void testRegistryCrcStability(void)
 	// before this client's furnace rows are safe to run against a live server — an old server
 	// refuses a mismatched crc at join time, so this is a safety refusal, not silent
 	// corruption, but it does mean single-player only until that ships.
-	check(base == 0xE486u,
-	      "core-only crc matches the pinned golden 0xE486");
+	//
+	// MOVED AN EIGHTH TIME 2026-09-05, 0xE486 -> 0x2A61, by v1.9.0 "Storage"'s one row (id 43:
+	// the chest, hardness 40 matching BLOCK_PLANKS, tex0=9 == BTEX_PLANKS on every face but
+	// FACE_TOP). registryCount() moves 43 -> 44, the same shape as every move above: one
+	// record APPENDED, nothing renumbered, so REGISTRY_REV stays 1.
+	//
+	// Measured the same way as the furnace move: a scratchpad probe (chestc_crc_probe.c)
+	// linking this tree's real world/registry.c and world/block.c, no test file linked so the
+	// golden pin is unreachable from the binary being measured. Printed:
+	//
+	//     count=44 crc=0x2A61 rev=1
+	//     id=43 name=chest    hardness= 40 flags=0x01 tex0=9  solid=1 liquid=0
+	//     targetable-rows=42
+	//
+	// NOT the patch's reconstructed guess of 0xE8BD — docs/chest-paused-v1.9.0.patch.txt says
+	// plainly that its numbers were RECONSTRUCTED, not re-derived, and this is exactly the
+	// case that warns about: 0x2A61 is what the real content stream hashes to, measured, not
+	// assumed.
+	//
+	// NOT cross-checked against deps/blocksmith-server this time either, for the identical
+	// off-limits reason the furnace move states above: bumping BS_REGISTRY_CORE_CRC16_GOLDEN
+	// and BS_REGISTRY_CORE_COUNT_GOLDEN in that tree is a separate lane's job.
+	check(base == 0x2A61u,
+	      "core-only crc matches the pinned golden 0x2A61");
 
 	// Content sensitivity: one extra def must move the crc, and re-init must
 	// put it back - proving the crc covers table content, not process state.
@@ -868,7 +908,7 @@ static void coreHardnessIsDeclared(void)
 	// the rule is green in a build where registryIsDefined() answers false for everything —
 	// a check that cannot go red proves nothing, and a `continue` is the easiest way to
 	// neutralise one by accident.
-	check(rows == 41, "and it ran over 41 rows: 43 core rows less air and less water");
+	check(rows == 42, "and it ran over 42 rows: 44 core rows less air and less water");
 
 	// A row must have its OWN number, not a neighbour's. The loop above is satisfied by a
 	// table where every hardness is 9, which is exactly the failure mode "make sure every
@@ -941,6 +981,14 @@ static void coreHardnessIsDeclared(void)
 	check(registryGet(BLOCK_FURNACE)->hardness == 45
 	      && registryGet(BLOCK_FURNACE)->hardness == registryGet(BLOCK_STONE)->hardness,
 	      "furnace hardness is 45, matching stone: a stone block with one face re-painted");
+
+	// v1.9.0's chest. The same shape as the furnace pin just above and for the identical
+	// reason: 40 is not an arbitrary nonzero byte, it is deliberately equal to BLOCK_PLANKS'
+	// hardness. The chest is a planks block with one re-painted face (its FACE_TOP, per
+	// world/registry.c's chest row), and its break time says so.
+	check(registryGet(BLOCK_CHEST)->hardness == 40
+	      && registryGet(BLOCK_CHEST)->hardness == registryGet(BLOCK_PLANKS)->hardness,
+	      "chest hardness is 40, matching planks: a planks block with one face re-painted");
 
 	// CONTROL. An id with no row still reads back as air, hardness 0, and that must NOT trip
 	// the rule above — the rule is about rows that exist. Green in every arm, including one

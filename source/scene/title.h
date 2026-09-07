@@ -87,6 +87,14 @@ typedef struct {
 	bool       world_list_truncated;
 	int        world_scroll;     // index of the first visible row in the world list
 
+	// World select's "press Y again to delete" latch (v1.9.0 item 6.3) — armed, disarmed,
+	// expired and consumed entirely by scene/worldlist.h's worldlistUiStep; this file only
+	// draws off it. Its all-zero value is "off" by construction (worldlist.h stores the row
+	// PLUS ONE for exactly that reason), so titleInit's memset already disarms it; titleInit
+	// and titleEnterWorldSelect still call worldlistConfirmReset on it so the disarm is
+	// visible at the two places it has to hold rather than an accident of the encoding.
+	WorldDeleteConfirm world_confirm;
+
 	// Bindings screen: the action index waiting for its next key press, or -1 for none.
 	int rebind_action;
 

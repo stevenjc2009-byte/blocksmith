@@ -177,7 +177,12 @@ static void testCoreHardness(void)
 	// (the four cooked meats, ids 38..41, and the furnace, id 42). All five are FULL_CUBE and
 	// SOLID, so all five enter this loop; none is a liquid, so none is exempt. Same count from
 	// the other side in registry_test.c's coreHardnessIsDeclared().
-	CHECK(targetable_rows == 41, "and there are 41: 43 core rows less air and less water");
+	//
+	// 41 -> 42 on 2026-09-05, v1.9.0 "Storage": one more targetable, non-liquid core row (the
+	// chest, id 43). FULL_CUBE and SOLID like the furnace, so it enters this loop; not a
+	// liquid, so not exempt. Same count from the other side in registry_test.c's
+	// coreHardnessIsDeclared().
+	CHECK(targetable_rows == 42, "and there are 42: 44 core rows less air and less water");
 
 	// The view is derived from the def, so the two must agree. This is what goes red if
 	// refreshView() copies the wrong field, or copies it from the wrong row.

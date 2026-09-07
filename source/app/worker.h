@@ -178,7 +178,7 @@
 //
 // [2026-09-03 CORRECTION, v1.8.17] That ~15.7 ms figure is an Azahar-measured inference
 // (frame time minus known CPU cost), not a GPU reading -- Azahar has no GPU cost model and
-// its C3D_GetDrawingTime() returns a constant 0.249 ms. See debug/metrics.h:132. A real
+// its C3D_GetDrawingTime() returns a constant 0.249 ms. See debug/metrics.h:141-147. A real
 // GPU-busy reading would need hardware profiling on console.
 //
 // The cache review this move needed, done rather than assumed. Two threads on one core

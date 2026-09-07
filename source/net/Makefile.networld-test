@@ -85,10 +85,31 @@ BUILD := build-networld
 $(BUILD):
 	mkdir -p $(BUILD)
 
+# v1.9.0 CHEST-NET added chest state syncing to networld.c's applyChestState() --
+# chestStatePack(), blockStateSet() and blockStateCreate() -- so blockstate.o and chest.o join
+# the link here, the same as tools/run_host_tests.sh's own networld_test stanza. crc32.o joins
+# behind blockstate.o, which checksums its own save/restore state the same way world/inventory.c
+# checksums its save file. None of the three were needed before because nothing in this link
+# touched chest state.
+#
+# v1.9.0: water.o joins too, and it is the SAME divergence session.o's note below describes,
+# for the third time. The runner's stanza (tools/run_host_tests.sh:974) had grown
+# world/water.c for networld_test.c's rejoin-replay scenarios; this file had not, so
+# `make -f Makefile.networld-test test` died at the link with 17 undefined references
+# (waterInit, waterPending, waterSettle, waterFlowCells, waterQueueFull, waterNotify,
+# waterReplaySkippable) instead of running a check -- measured, not inferred.
+#
+# That failure mode is worth naming because it is silent in the direction that matters: every
+# object above still COMPILED clean under the strict set, so nothing warned; only the final
+# link broke. A build that never links is a build nobody runs, which means -Wconversion,
+# -Wsign-conversion and -Wcast-qual over net/networld.c -- the decoder for attacker-controlled
+# bytes, and the whole reason this Makefile is kept beside the runner's coarser line -- had
+# quietly stopped being obtainable at all.
 $(BUILD)/networld_test: $(BUILD)/world.o $(BUILD)/block.o $(BUILD)/registry.o \
                          $(BUILD)/chunk.o $(BUILD)/budget.o $(BUILD)/mesher.o \
-                         $(BUILD)/visgraph.o $(BUILD)/scratch.o \
+                         $(BUILD)/visgraph.o $(BUILD)/scratch.o $(BUILD)/water.o \
                          $(BUILD)/blockdiff.o $(BUILD)/networld.o $(BUILD)/session.o \
+                         $(BUILD)/blockstate.o $(BUILD)/chest.o $(BUILD)/crc32.o \
                          $(BUILD)/networld_test.o
 	$(CC) $^ -o $@
 
@@ -122,6 +143,18 @@ $(BUILD)/visgraph.o: ../world/visgraph.c ../world/visgraph.h | $(BUILD)
 $(BUILD)/scratch.o: ../world/scratch.c ../world/scratch.h | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# v1.9.0: networld_test.c's rejoin-replay scenarios drive the water simulation directly --
+# test_a_replayed_water_diff_still_spreads() and test_a_rejoin_replay_keeps_the_players_own_water()
+# call waterInit/waterPending/waterSettle/waterFlowCells/waterQueueFull, and the replay hook
+# they install calls waterNotify() and waterReplaySkippable(). A LINK DEPENDENCY like mesher.c,
+# not a subject: none of the bytes water.c touches came off the wire.
+#
+# Takes the full strict set, unlike mesher.o. That is measured, not assumed -- water.c compiles
+# clean under -Wconversion/-Wsign-conversion here, so there is no reason to relax it, and
+# MESHER_CFLAGS stays the single documented exception rather than becoming a habit.
+$(BUILD)/water.o: ../world/water.c ../world/water.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 # v1.6.0 F2: joined tools/run_host_tests.sh's own link when
 # test_registry_join_after_a_single_player_quit_to_title() (added the same release) started
 # calling sessionBegin() directly instead of going through networldInit(). This Makefile's own
@@ -135,6 +168,23 @@ $(BUILD)/scratch.o: ../world/scratch.c ../world/scratch.h | $(BUILD)
 $(BUILD)/session.o: ../app/session.c ../app/session.h | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# v1.9.0 CHEST-NET: networld.c's applyChestState() calls blockStateSet()/blockStateCreate()
+# directly and networld_test.c's own chest-state scenarios call blockStateInit()/Get()/Count()
+# beside it, so blockstate.o joins the link -- see this file's own note on the
+# $(BUILD)/networld_test rule above.
+$(BUILD)/blockstate.o: ../world/blockstate.c ../world/blockstate.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# v1.9.0 CHEST-NET: applyChestState() calls chestStatePack() to fold an incoming DEFS record
+# into wire bytes before handing them to blockStateSet().
+$(BUILD)/chest.o: ../world/chest.c ../world/chest.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# blockstate.o's own save/restore checksum, the same shared object world/inventory.c's crc32.o
+# dependency already names in tools/run_host_tests.sh's inv_bridge_test stanza.
+$(BUILD)/crc32.o: ../world/crc32.c ../world/crc32.h | $(BUILD)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(BUILD)/blockdiff.o: blockdiff.c blockdiff.h | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -144,8 +194,19 @@ $(BUILD)/networld.o: networld.c networld.h blockdiff.h bsnet_transport.h | $(BUI
 $(BUILD)/networld_test.o: networld_test.c networld.h blockdiff.h bsnet_transport.h | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# Run from the REPO ROOT, not from source/net, because that is where the runner runs it from
+# (tools/run_host_tests.sh:976 is `"./$BH/networld_test"` with the suite's cwd at the root) and
+# some scenarios read repo files by root-relative path -- networld_test.c's own
+# "source/main.c's onWorldEdit composes the two guards the hook above copies" check opens
+# `source/main.c` literally. Run from here instead and it reports
+# "FAIL source/main.c could be read", then skips the rest of that group and trips the
+# check-count guard: 4 failed, 525 of 545 checks reached. Measured, and it is a false RED --
+# the code under test is fine, only the cwd was wrong.
+#
+# $(CURDIR) rather than a bare `cd ../..` so this does not depend on where make was invoked
+# from, and the binary is named by an absolute path so the cd cannot change which one runs.
 test: $(BUILD)/networld_test
-	./$(BUILD)/networld_test
+	cd ../.. && $(CURDIR)/$(BUILD)/networld_test
 
 clean:
 	rm -rf $(BUILD)

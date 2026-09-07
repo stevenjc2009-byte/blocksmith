@@ -81,8 +81,10 @@ typedef enum {
 // v1.8.13 survival. Added because ACTION_EAT needed a default and, at the time it landed,
 // every button on an Old 3DS was already spoken for: A/X/Y and the four D-pad directions are
 // the seven above, B is the universal menu cancel, SELECT opens the pause menu, START quits,
-// and L/R step the render distance live in-game (main.c, under BS_WORLD_GEN && !BS_FLY). The
-// shoulder Z buttons were the only bits nothing in source/ referenced at all.
+// and L/R stepped the render distance live in-game. (v1.9.0 HOTBAR-LR retired that: L/R now
+// step the hotbar selection instead, source/scene/hotbar.h; render distance moved to the
+// pause menu's OPT_ROW_DIST row, scene/pausemenu.c.) The shoulder Z buttons were the only
+// bits nothing in source/ referenced at all.
 //
 //   KEY_ZL      BIT(14)  = 0x00004000
 //   KEY_ZR      BIT(15)  = 0x00008000
@@ -92,7 +94,8 @@ typedef enum {
 // unreachable there and the player has to rebind it before they can eat. That is a real gap
 // and it is a design call, not a coding one — the alternatives were doubling up on Y (which
 // also places, and BLOCK_APPLE is a placeable block, so one press would eat AND place) or
-// taking L/R away from the render-distance shortcut.
+// taking L/R away from the hotbar-step shortcut they are wired to as of v1.9.0 HOTBAR-LR
+// (source/scene/hotbar.h).
 #define OPT_KEY_ZL      0x00004000u
 #define OPT_KEY_ZR      0x00008000u
 

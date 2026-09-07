@@ -42,7 +42,7 @@ _Static_assert(offsetof(BlockStateEntry, data) == 13,
 
 _Static_assert(sizeof(BlockStateEntry) == 32,
                "sizeof(BlockStateEntry) diverged between host and ARM EABI");
-_Static_assert(sizeof(BlockStateTable) == 2048,
+_Static_assert(sizeof(BlockStateTable) == 8192,
                "sizeof(BlockStateTable) diverged between host and ARM EABI");
 _Static_assert(sizeof(BlockStateTable) == (size_t)BLOCKSTATE_SLOTS * sizeof(BlockStateEntry),
                "BlockStateTable is not a flat array of BlockStateEntry on ARM EABI");
@@ -81,7 +81,16 @@ static char s_first[160];
 // 191, from the run itself (2026-09-03): "CHECK COUNT: 48 check(s) were ADDED - expected 143,
 // ran 191" -- 143 was a placeholder guess before the suite ever ran once; 191 is what it
 // actually counted.
-#define BLOCKSTATE_TEST_EXPECTED_CHECKS 191
+//
+// Re-pinned to 890 (2026-09-05): BLOCKSTATE_SLOTS raised 64 -> 256 for chests, and
+// testSaveLoadRoundTrip extended to fill the table to the new cap and round-trip it (see that
+// test) added 699 CHECKs on top of the prior 191 -- measured the same way, from the run itself:
+// "CHECK COUNT: 699 check(s) were ADDED - expected 191, ran 890."
+//
+// Re-pinned to 900 (2026-09-07): testLoadAllocFailureDoesNotClobberGoodFile added, covering the
+// seam audit's blockStateLoad-lies-about-a-failed-malloc bug. Measured the same way: "CHECK
+// COUNT: 10 check(s) were ADDED - expected 890, ran 900."
+#define BLOCKSTATE_TEST_EXPECTED_CHECKS 900
 
 static void checkCountPin(void)
 {
@@ -137,6 +146,8 @@ static const char* const s_test_paths[] = {
 	TEST_DIR "/duppos/blockstate.dat",
 	TEST_DIR "/crash_recover/blockstate.dat",
 	TEST_DIR "/crash_recover/blockstate.dat.tmp",
+	TEST_DIR "/allocfail/blockstate.dat",
+	TEST_DIR "/allocfail/blockstate.dat.tmp",
 };
 
 static void testCleanup(void)
@@ -423,6 +434,22 @@ static void testSaveLoadRoundTrip(void)
 	CHECK(blockStateSet(&out, 1, 2, 3, BLOCK_STONE, d1));
 	CHECK(blockStateSet(&out, -5, 60, 200, BLOCK_WATER, d2));
 
+	// Fill every remaining slot too, so this round-trip exercises the table at its NEW cap
+	// (BLOCKSTATE_SLOTS, raised 64 -> 256 for chests -- see blockstate.h) rather than at a
+	// handful of records that would have also fit on the old stack-allocated save/load
+	// buffers. This is what proves blockStateSave/blockStateLoad's now-heap-allocated buffers
+	// (see blockstate.c) are sized, filled and freed correctly at the size that actually
+	// matters, not just at a small count that happened to already work before this change.
+	// x = 2000+i never collides with the three explicit positions above (1, -5, 0).
+	for (int i = 0; blockStateCount(&out) < BLOCKSTATE_SLOTS; i++) {
+		const int x = 2000 + i;
+		CHECK(blockStateCreate(&out, x, 0, 0, BLOCK_STONE));
+		uint8_t d[BLOCKSTATE_PAYLOAD_BYTES];
+		payload(d, (uint8_t)(i * 3));
+		CHECK(blockStateSet(&out, x, 0, 0, BLOCK_STONE, d));
+	}
+	CHECK(blockStateCount(&out) == BLOCKSTATE_SLOTS);
+
 	CHECK(blockStateSave(&out, dir));
 
 	BlockStateTable in;
@@ -618,6 +645,68 @@ static void testCrashRecovery(void)
 	if (leftover) fclose(leftover);
 }
 
+// The seam audit's bug: blockStateLoad used to `return true` when its read-buffer malloc
+// failed, indistinguishable from a genuine "no file"/"corrupt file" default. A caller that
+// (reasonably) trusts true to mean "table is fine" and later calls blockStateSave with it
+// then overwrites a perfectly good on-disk file with an empty one -- silent, irreversible.
+//
+// blockStateFailLoadAllocForTest forces that malloc to fail without actually exhausting the
+// heap, so this failure path is exercised deterministically rather than only under real OOM.
+static void testLoadAllocFailureDoesNotClobberGoodFile(void)
+{
+	const char* dir  = TEST_DIR "/allocfail";
+	const char* path = TEST_DIR "/allocfail/blockstate.dat";
+	testMkdir(dir);
+	remove(path);
+	remove(TEST_DIR "/allocfail/blockstate.dat.tmp");
+
+	// A real, good file on disk -- what a live world's sidecar looks like right before the
+	// load that is about to be forced to fail.
+	BlockStateTable good;
+	blockStateInit(&good);
+	CHECK(blockStateCreate(&good, 9, 9, 9, BLOCK_STONE));
+	uint8_t d[BLOCKSTATE_PAYLOAD_BYTES];
+	payload(d, 0x70);
+	CHECK(blockStateSet(&good, 9, 9, 9, BLOCK_STONE, d));
+	CHECK(blockStateSave(&good, dir));
+
+	// The good file's raw bytes, read now, before the forced failure -- so "untouched" below
+	// is checked against the real thing on disk, not against blockStateGet's opinion of it.
+	FILE* rf = fopen(path, "rb");
+	CHECK(rf != NULL);
+	uint8_t before[4096];
+	size_t before_len = rf ? fread(before, 1, sizeof(before), rf) : 0;
+	if (rf) fclose(rf);
+	CHECK(before_len > 0);
+
+	// Force the read buffer's malloc to fail, the same shape a real OOM leaves: fopen()
+	// succeeds (the file is right there), the allocation right after it does not.
+	blockStateFailLoadAllocForTest(true);
+
+	BlockStateTable in;
+	const bool load_ok = blockStateLoad(&in, dir);
+	blockStateFailLoadAllocForTest(false);   // never leak the forced failure into later tests
+
+	CHECK(!load_ok);                     // the bug: this used to be true
+	CHECK(blockStateCount(&in) == 0);    // still the safe default -- blockStateInit ran
+
+	// The behaviour this fix exists to guarantee: a caller that checks blockStateLoad's return
+	// value (as main.c must -- see this fix's report for the patch main.c still needs) never
+	// carries this empty table into a save, so the good file on disk is never touched. Written
+	// as an explicit "if" rather than a bare assumption so the red arm (blockStateLoad reverted
+	// to always returning true) actually performs the clobbering save and gets caught below,
+	// instead of the bug quietly not being exercised.
+	if (load_ok) CHECK(blockStateSave(&in, dir));   // NOT reached once the fix is in place
+
+	FILE* af = fopen(path, "rb");
+	CHECK(af != NULL);
+	uint8_t after[4096];
+	size_t after_len = af ? fread(after, 1, sizeof(after), af) : 0;
+	if (af) fclose(af);
+	CHECK(after_len == before_len);
+	CHECK(after_len > 0 && memcmp(before, after, before_len) == 0);
+}
+
 static void testSaveLoadRefuseNullOrEmptyWorldDir(void)
 {
 	BlockStateTable t;
@@ -661,6 +750,7 @@ int main(void)
 	testLoadWrongVersionGivesEmptyTable();
 	testLoadDuplicatePositionsRejected();
 	testCrashRecovery();
+	testLoadAllocFailureDoesNotClobberGoodFile();
 	testSaveLoadRefuseNullOrEmptyWorldDir();
 
 	testCleanup();

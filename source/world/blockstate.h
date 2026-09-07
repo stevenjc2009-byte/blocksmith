@@ -135,13 +135,29 @@
 
 #include "world/block.h"
 
-// 64: matches docs/plan-1.8.15-furnace.md's own "concurrent furnace cap" reasoning ("just
-// enough for one base," not measured against anything) -- reused rather than re-derived,
-// since this table exists to serve exactly the case that number was chosen for. Cheap to
-// raise later: the save format below already stores a live COUNT and only that many
-// records, so a bigger cap reads an old, smaller save file with no format change (see
-// blockStateLoad).
-#define BLOCKSTATE_SLOTS  64
+// 256: raised from the original 64 (v1.9.0) once chests started sharing this same table.
+// 64 was sized off docs/plan-1.8.15-furnace.md's "concurrent furnace cap" ("just enough for
+// one base," not measured against anything) -- fine when only furnaces used this table,
+// because a refused furnace slot just means "won't hold fuel." A chest with no record reads
+// as empty, so a chest that loses the race for a slot DESTROYS whatever the player puts into
+// it -- a base with a few dozen chests could exhaust 64 easily. 256 gives that headroom.
+//
+// Cheap to raise again, AS A FORMAT: the save format below already stores a live COUNT and
+// only that many records, so a bigger cap reads an old, smaller save file with no format
+// change (see blockStateLoad). What is NOT cheap, and not obvious from the format, is the
+// stack cost: blockStateSave/blockStateLoad in blockstate.c each need one buffer sized off
+// this constant, and libctru's default thread stack is only 32 KB (see those functions --
+// they heap-allocate for exactly this reason as of the 64->256 raise). Raising this constant
+// again means checking that cost, not just the format, before picking a new number.
+//
+// Downgrade hazard: a save written by a build with this cap raised, holding MORE than an
+// older build's smaller BLOCKSTATE_SLOTS worth of live records, is rejected WHOLESALE by that
+// older build -- blockStateLoad's `count > BLOCKSTATE_SLOTS` check (see blockstate.c) drops
+// the entire table, silently losing every furnace's and chest's contents, not just the
+// records past the old cap. Expected and accepted, not a bug: there is no migration and no
+// format version bump for this. Never downgrade a build once a world has more live records
+// than the older build's cap allows.
+#define BLOCKSTATE_SLOTS  256
 
 // How many opaque bytes each record carries. Sized off the furnace design this table exists
 // to unblock: docs/plan-1.8.15-furnace.md's own FurnaceState needs input_item(1) +
@@ -249,11 +265,36 @@ int blockStateCount(const BlockStateTable* t);
 // game has not validated.
 
 // Loads "<world_dir>/blockstate.dat" into `t`. Always leaves `t` fully valid (see
-// blockStateInit) and always returns true, except when `t` is NULL or `world_dir` is
-// NULL/empty, which is a caller bug rather than a file-format problem.
+// blockStateInit): a missing, corrupt, truncated or wrong-version file all degrade to an
+// empty table and still return true, because none of those says anything is wrong with this
+// call -- only with what happened to already be on disk.
+//
+// Returns false, with `t` left at that same safe empty default, in two situations that must
+// not be treated the same way:
+//   - `t` is NULL or `world_dir` is NULL/empty: a caller bug. `t`, if non-NULL, is left
+//     completely untouched (not even zeroed) -- unchanged from before.
+//   - the read buffer's allocation failed (BS_FILE_BYTES(BLOCKSTATE_SLOTS)+1 bytes, see
+//     blockstate.c): a good file may exist on disk, but this call could not read it. `t` IS
+//     zeroed (blockStateInit already ran), yet the caller must NOT treat this the way it
+//     treats "there was no file" -- carrying this empty table into a later blockStateSave
+//     would overwrite that good file with nothing, permanently. Before v1.9.x this case
+//     returned true, indistinguishable from a genuinely-absent file, which is exactly what
+//     let a save clobber a good file under memory pressure. Fixing this here is necessary
+//     but not sufficient: the only production caller (main.c) currently discards this
+//     return value at both the load and the save call sites, so it must also start checking
+//     it before the guarantee actually holds end to end -- see this fix's report for the
+//     patch main.c needs (main.c is not owned by this change).
 bool blockStateLoad(BlockStateTable* t, const char* world_dir);
 
 // Saves every live record in `t` to "<world_dir>/blockstate.dat". False on any IO failure
 // (could not open the tmp file, a short write, the final rename failing) or a NULL/empty
 // `world_dir`, in which case the previous save (if any) is left exactly as it was.
 bool blockStateSave(const BlockStateTable* t, const char* world_dir);
+
+#ifndef __3DS__
+// Test-only hook: see blockstate.c. Forces the next blockStateLoad's read-buffer allocation
+// to fail exactly as an out-of-memory malloc would, so that path can be exercised on purpose
+// instead of only by actually exhausting the heap. Nothing outside the host test suite may
+// call this; compiled out of the console build entirely.
+void blockStateFailLoadAllocForTest(bool fail);
+#endif

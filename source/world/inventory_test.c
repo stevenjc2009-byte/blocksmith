@@ -149,7 +149,45 @@ static char s_first[160];
 // v1.8.15 would have shipped its own headline block registered, textured, ticked, saved and
 // covered by a 159-check suite, and unreachable by any player -- every part green, the payoff
 // absent. See world/crafting.c's own comment on the row for the full reasoning.
-#define INVENTORY_TEST_EXPECTED_CHECKS 260
+//
+// 260 -> 261 on 2026-09-05, v1.9.0 "Storage"'s one row: the chest (id 43). Same ordinary
+// shape as the furnace's five-row move above — one registry row appended, the whole delta
+// landing in testTheBagTakesEveryDefinedBlock()'s per-row loop as one
+// CHECK(inventoryCanHold(id)). 260 + 1 = 261.
+//
+// The number came from the run, not the sum, same rule as every entry above: the pin printed
+// "CHECK COUNT: 1 check(s) were ADDED - expected 260, ran 261" and this comment's boundary-pair
+// edit (BLOCK_FURNACE -> BLOCK_CHEST just above) is what the same run's L342 failure caught
+// before this pin was touched — the boundary drifting is a separate, correctness bug, not
+// this count pin's job to catch, which is exactly why this file carries both a loop-count pin
+// and a boundary check rather than either alone.
+//
+// ---- 2026-09-05, later the same day: 261 -> 270, and the paragraph above is now WRONG ----
+//
+// The entry above said "No recipe accompanies this row ... so RECIPE_COUNT does not move and
+// neither of the recipe-walking loops gains a call." That was true when it was written and
+// stopped being true a few hours later, when the chest's crafting wiring landed:
+// RECIPE_PLANKS_TO_CHEST (six planks -> one chest, world/crafting.c). RECIPE_COUNT moved 6 -> 7
+// and BOTH recipe-walking loops in this file gained a call, which is where nine of these checks
+// come from rather than one.
+//
+// It is left standing rather than deleted, because a reader who only sees "261 -> 270" cannot
+// otherwise tell that this file predicted the exact change that then broke it. That is the
+// same hazard world/registry_test.c and scene/interact_test.c both warn about: this file's
+// TEXT did not change, its INPUT did, so `git diff` reported it clean while it was stale.
+//
+// Measured, not summed. The run printed:
+//
+//   CHECK COUNT: 9 check(s) were ADDED - expected 261, ran 270
+//
+// 2026-09-06, v1.9.0: the hotbar work added inventoryHotbarStep() and four test functions for
+// it (wrap at both ends, dir 0 is a no-op, multi-step and out-of-range selections, and the
+// held-item follow-through). Those are 40 new checks, and they are new TEXT in this file --
+// unlike the 261 -> 270 move above, git diff does show them. Measured, not summed. The run
+// printed:
+//
+//   CHECK COUNT: 40 check(s) were ADDED - expected 270, ran 310
+#define INVENTORY_TEST_EXPECTED_CHECKS 310
 
 // Deliberately NOT routed through CHECK(): this must not perturb the number it is testing,
 // so it bumps s_fails only. It fills s_first (with both numbers, so the one-line summary is
@@ -304,7 +342,7 @@ static void testTheBagTakesEveryDefinedBlock(void)
 	// The loop ran, over the whole table rather than a prefix of it. Without this a
 	// definedness query answering false for everything leaves the rule green having asserted
 	// nothing at all.
-	CHECK(accepted == 41);            // 43 core rows less air and less water
+	CHECK(accepted == 42);            // 44 core rows less air and less water
 	CHECK(accepted > BLOCK_COUNT);    // and genuinely more than the old ceiling admitted
 
 	// THE BOUNDARY, both sides, derived rather than hard-coded: the last id with a row is
@@ -338,9 +376,15 @@ static void testTheBagTakesEveryDefinedBlock(void)
 	// named-block message, knowingly paid. What did NOT go stale silently this time is the
 	// count on the loop above: it went red the moment the rows landed, which is the whole
 	// argument for having both a loop and a pin rather than either alone.
-	CHECK(inventoryCanHold((ItemId)BLOCK_FURNACE));           // 42, the last defined row
-	CHECK(!inventoryCanHold((ItemId)(BLOCK_FURNACE + 1)));    // 43, no row
-	CHECK(!registryIsDefined((BlockId)(BLOCK_FURNACE + 1)));  // ...and that is why
+	//
+	// v1.9.0: a fifth time, to BLOCK_CHEST = 43, the chest itself. Same maintenance cost, same
+	// reason it is paid anyway: BLOCK_FURNACE + 1 stopped being "one past the last row" the
+	// moment the chest landed at exactly that id, and this suite run is what said so — L342's
+	// !inventoryCanHold((ItemId)(BLOCK_FURNACE + 1)) failed here because id 43 is now defined
+	// and acceptable, which is the boundary check doing exactly its job.
+	CHECK(inventoryCanHold((ItemId)BLOCK_CHEST));           // 43, the last defined row
+	CHECK(!inventoryCanHold((ItemId)(BLOCK_CHEST + 1)));    // 44, no row
+	CHECK(!registryIsDefined((BlockId)(BLOCK_CHEST + 1)));  // ...and that is why
 
 	// The two exclusions that survive the widening, each for its own reason. Neither of them
 	// is about where the id sits.
@@ -573,6 +617,69 @@ static void testHotbarSelectionAndHeldItem(void)
 	CHECK(inventoryHeldItem(&inv) == ITEM_NONE);   // that slot is empty
 }
 
+// v1.9.0 HOTBAR-LR. inventoryHotbarStep is what the L and R shoulder buttons cycle the hotbar
+// with: main.c hands its answer to invBridgeSelectHotbar, the same call the touchscreen tap
+// makes, so this suite only has to prove the arithmetic — the write path is already pinned by
+// testHotbarSelectionAndHeldItem above and net/inv_bridge_test.c.
+//
+// Every slot, both directions and the no-op, so the wrap at each end is reached by the loop
+// rather than by one hand-picked case. The two ends are ALSO pinned by hand against literals,
+// and the loop's expectation is written as "one more, except at the end" rather than as a % of
+// its own — an expectation computed with the same modulo the code uses would agree with an
+// off-by-one in both places at once and prove nothing.
+static void testHotbarStepWrapsBothEnds(void)
+{
+	// The two ends, by hand: R from the last slot is slot 0, L from slot 0 is the last slot.
+	CHECK(inventoryHotbarStep(INV_HOTBAR_SLOTS - 1, +1) == 0);
+	CHECK(inventoryHotbarStep(0, -1) == INV_HOTBAR_SLOTS - 1);
+
+	int visited = 0;
+	for (int s = 0; s < INV_HOTBAR_SLOTS; s++) {
+		const uint8_t sel  = (uint8_t)s;
+		const uint8_t next = (s == INV_HOTBAR_SLOTS - 1) ? (uint8_t)0 : (uint8_t)(s + 1);
+		const uint8_t prev = (s == 0) ? (uint8_t)(INV_HOTBAR_SLOTS - 1) : (uint8_t)(s - 1);
+		CHECK(inventoryHotbarStep(sel, +1) == next);
+		CHECK(inventoryHotbarStep(sel, -1) == prev);
+		CHECK(inventoryHotbarStep(sel,  0) == sel);     // dir 0 is a no-op on every slot
+		visited++;
+	}
+	CHECK(visited == 8);   // the loop covered the whole hotbar, not a prefix of it
+
+	// A full lap in each direction comes back to where it started. This is the check that
+	// catches a wrap landing one short or one long even if the expectation table above were
+	// itself wrong in the same way.
+	uint8_t lap = 5;
+	for (int i = 0; i < INV_HOTBAR_SLOTS; i++) lap = inventoryHotbarStep(lap, +1);
+	CHECK(lap == 5);
+	for (int i = 0; i < INV_HOTBAR_SLOTS; i++) lap = inventoryHotbarStep(lap, -1);
+	CHECK(lap == 5);
+
+	// dir is a direction, not a count — the header's contract, pinned so no caller can start
+	// leaning on +2 meaning two.
+	CHECK(inventoryHotbarStep(3, +5) == 4);
+	CHECK(inventoryHotbarStep(3, -7) == 2);
+
+	// An out-of-range selection is clamped to the last slot BEFORE stepping, the same rule
+	// inventorySelectHotbar applies, so the answer is always a real slot.
+	CHECK(inventoryHotbarStep(200, +1) == 0);
+	CHECK(inventoryHotbarStep(200, -1) == INV_HOTBAR_SLOTS - 2);
+	CHECK(inventoryHotbarStep(200,  0) == INV_HOTBAR_SLOTS - 1);
+
+	// End to end through the write main.c actually makes (less the wire): the selection lands
+	// where the step said, and what is "in hand" follows it across both wraps.
+	Inventory inv;
+	inventoryInit(&inv);
+	CHECK(inventoryAdd(&inv, BLOCK_STONE, 3, NULL) == INV_ADD_OK);   // slot 0
+	inventorySelectHotbar(&inv, INV_HOTBAR_SLOTS - 1);
+	CHECK(inventoryHeldItem(&inv) == ITEM_NONE);
+	inventorySelectHotbar(&inv, inventoryHotbarStep(inv.selected_hotbar, +1));   // R off the last
+	CHECK(inv.selected_hotbar == 0);
+	CHECK(inventoryHeldItem(&inv) == BLOCK_STONE);
+	inventorySelectHotbar(&inv, inventoryHotbarStep(inv.selected_hotbar, -1));   // L off slot 0
+	CHECK(inv.selected_hotbar == INV_HOTBAR_SLOTS - 1);
+	CHECK(inventoryHeldItem(&inv) == ITEM_NONE);
+}
+
 // ── Crafting ───────────────────────────────────────────────────────────────────────────
 
 static void testEveryRecipeCrafts(void)
@@ -796,6 +903,7 @@ int main(void)
 	testSwapTwoSlots();
 	testMoveUnitsRefusesMismatchedItem();
 	testHotbarSelectionAndHeldItem();
+	testHotbarStepWrapsBothEnds();   // v1.9.0 HOTBAR-LR — the L/R shoulder-button step
 
 	testEveryRecipeCrafts();
 	testRecipeWithInsufficientInputsRefusesAndConsumesNothing();

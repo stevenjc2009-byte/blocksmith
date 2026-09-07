@@ -88,7 +88,8 @@
 	X(BTEX_COOKED_CHICKEN,  TILE_COOKED_CHICKEN)  \
 	X(BTEX_COOKED_MUTTON,   TILE_COOKED_MUTTON)   \
 	X(BTEX_FURNACE_FRONT,     TILE_FURNACE_FRONT)     \
-	X(BTEX_FURNACE_FRONT_LIT, TILE_FURNACE_FRONT_LIT)
+	X(BTEX_FURNACE_FRONT_LIT, TILE_FURNACE_FRONT_LIT) \
+	X(BTEX_CHEST_TOP,         TILE_CHEST_TOP)
 
 // One _Static_assert per pair, exactly as before. The names are stringified into the message
 // because every one of these expands from the same source line, so the message is the only

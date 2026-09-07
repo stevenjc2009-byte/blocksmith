@@ -5,6 +5,24 @@
 > roadmap renumber; the filename is corrected to match. The content below, including its own
 > "v1.8.18" title and prose, is unchanged from before the rename.
 
+> **⚠ PARTLY SUPERSEDED [2026-09-05 18:03]** — two decisions taken after this spec was
+> written override parts of it. Everything not listed here still stands.
+>
+> - **Section 3.4 and section 8, chest storage and opcode numbers.** See
+>   `docs/decision-1.9.0-chest-storage.md` and `docs/design-1.9.0-chest-multiplayer.md`.
+>   Chest contents live in the existing shared `BlockStateTable` at **8 slots**, not in a
+>   dedicated sparse table at 16 — the objection this spec raised (chests competing with
+>   furnaces for 64 slots) is answered by raising `BLOCKSTATE_SLOTS` to 256, which costs
+>   less than a second table that would have its own cap and the same problem one level
+>   down. Raising it is bounded by the 32KB stack, not by the save format; the two
+>   whole-file buffers in `blockstate.c` move to the heap as part of that.
+> - **The proposed `BS_APP_CHEST_STATE = 0x10` is impossible.** `0x10` was taken by
+>   `BS_APP_TIME_SYNC` in v1.8.20, after this spec was written. The opcode enum numbers
+>   **both directions in one shared space**, so the chest opcodes are `0x11`–`0x13`.
+> - **Section 2.6's wire item-id ceiling concern is closed**, as this file's own later
+>   correction notes: `inventoryItemOnWire()` delegates to `inventoryCanHold()` as of
+>   client v1.8.10 / server v1.9.1.
+
 This is the detailed version of `docs/ROADMAP.md:379-383`'s v1.8.18 entry (*"Added. Chests.
 Stack splitting and merging, shift-move, and the small conveniences that a game gets tiring
 without."*) and `docs/VERSION-LIST.md:545-551`'s matching entry. Neither document names a

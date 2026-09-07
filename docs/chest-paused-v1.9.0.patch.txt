@@ -8,7 +8,7 @@ HOW THIS FILE WAS PRODUCED, AND WHAT TO TRUST HOW MUCH
 ============================================================================
 
 I independently verified the revert before writing anything: `git diff` and `git status`
-against C:\Users\steve\Documents\3ds-project-folder\mc showed source/world/block.h,
+against <repo root> showed source/world/block.h,
 source/world/registry.c, source/gfx/atlas_tiles.h, source/world/block_tiles_check.c and
 tools/make_atlas.py with ZERO chest-related content — confirmed missing, not assumed.
 source/world/chest.c and chest.h do survive, renamed on disk to:

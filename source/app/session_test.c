@@ -155,18 +155,18 @@ static void testSinglePlayerQuitToTitleLeavesTheTableJoinable(void)
 	// nothing ever dirtied it.
 	CHECK(enterWorldWithRows(sp_rows, 1) == 1);
 	CHECK(registryFrozen());
-	// Forty-three core rows since v1.8.15 added four cooked meats and the furnace on top of
-	// v1.8.14's four raw meats, v1.8.12's six ores, v1.8.10's torch, v1.8.8's twelve per-biome
-	// timber and flora rows, v1.8.3 Phase 3's snow, ice, cactus, dead bush and fern, and tasks
-	// 17/19's water and tall grass, plus the one dynamic row this world registered. (The
-	// measured symptom quoted above was taken when there were eight core rows; the +1/+0 shape
-	// of it is what matters, not the base.)
-	CHECK(registryCount() == 44);
+	// Forty-four core rows since v1.9.0 added the chest on top of v1.8.15's four cooked meats
+	// and the furnace, v1.8.14's four raw meats, v1.8.12's six ores, v1.8.10's torch, v1.8.8's
+	// twelve per-biome timber and flora rows, v1.8.3 Phase 3's snow, ice, cactus, dead bush and
+	// fern, and tasks 17/19's water and tall grass, plus the one dynamic row this world
+	// registered. (The measured symptom quoted above was taken when there were eight core
+	// rows; the +1/+0 shape of it is what matters, not the base.)
+	CHECK(registryCount() == 45);
 
 	quitToTitleFromSinglePlayer();
 
 	CHECK(!registryFrozen());
-	CHECK(registryCount() == 43);
+	CHECK(registryCount() == 44);
 	CHECK(registryFind("sp_sidecar") == 0);
 
 	// The join. This is the batch the server sends and the client refused for the whole
@@ -175,7 +175,7 @@ static void testSinglePlayerQuitToTitleLeavesTheTableJoinable(void)
 	packOne(rec, REG_ID_DYN_LO, "srv_blk");
 	CHECK(registryRemoteApply(REG_ID_DYN_LO, rec, 1) == 1);
 	CHECK(registryFind("srv_blk") == REG_ID_DYN_LO);
-	CHECK(registryCount() == 44);
+	CHECK(registryCount() == 45);
 	// The row at that id is the SERVER's row and usable, not merely a row. Checking
 	// registryIsDefined(REG_ID_DYN_LO) alone would have passed against the broken tree —
 	// the single-player world's own row was sitting in that slot, defined and solid — and
@@ -205,7 +205,7 @@ static void testSinglePlayerIntoSinglePlayerGetsItsOwnTable(void)
 	CHECK(registryFind("b_thatch") == REG_ID_DYN_LO);
 	CHECK(registryFind("a_marble") == 0);
 	CHECK(registryFind("a_basalt") == 0);
-	CHECK(registryCount() == 44);
+	CHECK(registryCount() == 45);
 }
 
 // ── 3. every exit from a world lands in the same state ───────────────────────────────────
@@ -268,7 +268,13 @@ static void testEveryExitFromAWorldLandsInTheSameState(void)
 	// `git diff` — they read the registry rather than listing it — which is why "I didn't touch
 	// that file" reasoned about the wrong thing. The rule this keeps re-teaching: after adding
 	// a core row, the instrument is a full suite run, not a grep.
-	CHECK(cold.count == 43 && !cold.frozen);
+	//
+	// 43 -> 44 on 2026-09-05: v1.9.0 "Storage" appends the chest, id 43. Sixth repetition of the
+	// identical blind spot — `cold.count`, not `registryCount()`, so nothing that greps for the
+	// latter finds it, and this file stayed clean in `git diff` right up until the full-suite
+	// run surfaced it (alongside registryCount()'s own five pins in this file, and the
+	// boundary/count pins in inventory_test.c). Same instrument, same result, sixth time.
+	CHECK(cold.count == 44 && !cold.frozen);
 
 	// Both exits leave the NEXT FREE SLOT at REG_ID_DYN_LO too, which the three numbers
 	// above do not cover: registryRemoteApply() refuses any batch that does not start
@@ -304,7 +310,7 @@ static void testTheResetIsHarmlessWhenThereIsNothingToReset(void)
 	sessionBegin();
 	sessionBegin();
 	CHECK(tableStateEq(tableState(), before));
-	CHECK(registryCount() == 43);
+	CHECK(registryCount() == 44);
 }
 
 // ── 5. main.c really calls it ────────────────────────────────────────────────────────────

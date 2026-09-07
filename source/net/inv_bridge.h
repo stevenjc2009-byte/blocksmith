@@ -46,11 +46,21 @@
 
 // ── Server-reported mutations ────────────────────────────────────────────────────────────
 //
-// One wrapper per mutating call scene/ui.c and main.c actually make. There is deliberately
-// no wrapper for inventorySplitStack: nothing in the client calls it yet (no split gesture
-// exists — see scene/ui.c's two-tap file comment), and BS_INV_OP_SPLIT is on the wire ready
-// for the day one does. Adding an unused wrapper now would be a function whose first caller
-// gets to discover whether it works.
+// One wrapper per mutating call scene/ui.c and main.c actually make — never one written
+// ahead of a caller, because an unused wrapper is a function whose first caller gets to
+// discover whether it works. Until v1.9.0 that rule kept inventorySplitStack out of here:
+// no split gesture existed.
+//
+// v1.9.0 SPLIT. The gestures exist now — Y (split), X (quick-move) and the two-tap merge on
+// the inventory overlay, decoded by scene/ui_gesture.h and acted on by scene/ui.c — and the
+// functions they call are in the "lift" section at the end of this file. None of them is
+// inventorySplitStack, and none sends BS_INV_OP_SPLIT, on purpose: that op is
+// inventorySplitStack on the server too (deps/blocksmith-server/game/bsgame.c, case
+// BS_INV_OP_SPLIT), which REFUSES a non-empty destination, whereas the gesture also drops a
+// half onto a same-item stack and lets the cap leave a remainder. Everything that leaves a
+// slot here goes out as BS_INV_OP_MOVE carrying the count this console actually realised —
+// the same "report what landed" rule as everything else here, and one the two copies cannot
+// read differently. BS_INV_OP_SPLIT stays on the wire, unused by this client.
 
 // inventoryMoveUnits, then BS_INV_OP_MOVE with the number of units that actually moved.
 // Returns exactly what inventoryMoveUnits returned. Sends nothing when it returned 0 —
@@ -85,6 +95,92 @@ InvAddResult invBridgeAdd(Inventory* inv, ItemId item, uint8_t count, uint8_t* o
 // inventoryRemove, then BS_INV_OP_CONSUME with the number actually removed. Returns that
 // same number.
 uint8_t invBridgeRemove(Inventory* inv, ItemId item, uint8_t count);
+
+// ── v1.9.0 SPLIT: described moves, the lift, and quick-move ─────────────────────────────
+//
+// Two things the gestures need that the wrappers above do not give them.
+//
+// THE LIFT. scene/ui.c's two-tap model lifts a slot BY INDEX (UiState.picked_slot) and moves
+// the whole stack on the second tap; nothing is ever "in the air". A split cannot work that
+// way — half of a stack has to live somewhere while the player chooses where it goes — so a
+// split DETACHES the larger half into an InvSlot the UI carries (UiState.lift), and the slot
+// keeps the smaller half. The three lift functions below are the only code that reads or
+// writes that carried stack. The server is told NOTHING at split time: as far as its copy is
+// concerned the whole stack is still in the slot, which is exactly right, because nothing has
+// left the bag. It is told at PLACE time, as a BS_INV_OP_MOVE from the slot the lift came from
+// to the slot it landed in, carrying the units that landed — and applying that MOVE to a copy
+// that never split gives the same result as splitting then placing. Returning the lift to its
+// origin (a cancel, a screen change) is therefore also silent. A lift can never be lost to a
+// panel closing: invBridgeReturnLift() runs whenever the UI drops a lift.
+//
+// DESCRIBED MOVES (the multiplayer rule, mirrored from the chest: scene/ui.h's UiChestTransferFn
+// sends the transfer and applies nothing, and the server's snapshot rewrites both sides).
+// InvBridgeMove is one move as the wire would carry it — exactly the (op, a, b, c) of a
+// BS_APP_INV_ACTION — and invBridgePlanQuickMove() describes a quick-move as a list of them
+// WITHOUT touching the inventory. A caller under a verified model hands each one to
+// networldSendInvAction() and applies nothing; the single-player path (invBridgeQuickMove,
+// and scene/ui.c today) applies the same list locally through invBridgeApplyMove(), which is
+// the ordinary optimistic apply-then-report every other wrapper in this file does. The plan
+// is computed on a private copy of the inventory using the REAL inventoryMoveUnits, so the
+// count in each described move is what would land, never what was asked for.
+
+// One move as BS_APP_INV_ACTION carries it. `op` is BS_INV_OP_MOVE (proto/bs_proto.h) for
+// every move this file describes today; a = src slot, b = dst slot, c = units.
+typedef struct {
+	uint8_t op;
+	uint8_t a, b, c;
+} InvBridgeMove;
+
+// The most moves one quick-move can describe. A quick-move never lands in a slot twice — pass
+// 1 tops up each same-item stack once, pass 2 fills each empty slot once — so the bound is the
+// slot count of the larger strip, and a plan buffer this size can never truncate.
+#define INV_BRIDGE_PLAN_MAX INV_MAIN_SLOTS
+
+// Describes `slot`'s whole stack going to the OTHER strip — a hotbar slot's stack into the
+// main grid, a main-grid slot's into the hotbar — without moving anything. The landing order
+// is inventoryAdd's own, restated for one strip: every stack of the same item already in that
+// strip is topped up first, lowest index first, then whatever is left fills the first empty
+// slots. Anything the strip has no room for stays where it is, so a full strip describes zero
+// moves and a partially full one describes exactly what fits. Writes up to `cap` moves into
+// `out` and returns how many; 0 for an empty slot, a bad index, or a strip with no room.
+int invBridgePlanQuickMove(const Inventory* inv, int slot, InvBridgeMove* out, int cap);
+
+// Applies one described move locally and reports it — invBridgeMoveUnits with the struct's
+// fields, so the value returned and the count on the wire are what actually moved, which for
+// a move invBridgePlanQuickMove described against this same inventory is the described count.
+// Returns 0 (and sends nothing) for an op this file does not describe.
+uint8_t invBridgeApplyMove(Inventory* inv, const InvBridgeMove* m);
+
+// The single-player quick-move: invBridgePlanQuickMove, then invBridgeApplyMove on every move
+// it described, in order. Each piece is its own BS_INV_OP_MOVE packet, so a stack that spills
+// across three slots is three packets, each carrying what that piece actually was. Returns the
+// total units moved; 0 when the other strip had no room, leaving both strips untouched.
+uint8_t invBridgeQuickMove(Inventory* inv, int slot);
+
+// Detaches the larger half of `slot`'s stack into `*out_lift`: the lift gets ceil(count / 2)
+// and the slot keeps floor(count / 2) — 7 becomes a lift of 4 over a slot of 3, 2 becomes 1
+// over 1. The rounding is the opposite of world/inventory.h's inventorySplitStack (which keeps
+// the ceiling in place) and that is deliberate: the half the player is about to carry
+// somewhere is the half they are acting on, so it is the one that gets the odd unit. Refuses
+// — false, nothing written, nothing changed — for a count under 2 (there is no half of one),
+// an empty slot, a bad index or a NULL. Sends nothing; see the section comment.
+bool invBridgeSplitStack(Inventory* inv, int slot, InvSlot* out_lift);
+
+// Drops as much of the carried `lift` as slot `dst` will take: an empty `dst` takes it whole,
+// a same-item `dst` takes what fits under INV_STACK_MAX and the remainder STAYS IN THE LIFT,
+// a different item refuses outright and moves nothing. `origin` is the slot the lift was
+// split from, which is what the server is told the units moved out of: a placed amount goes
+// out as BS_INV_OP_MOVE(origin, dst, placed). Placing back onto `origin` itself sends nothing
+// (nothing moved as far as the server's copy is concerned). Returns the units placed.
+uint8_t invBridgePlaceLift(Inventory* inv, int origin, int dst, InvSlot* lift);
+
+// Puts a carried `lift` back into the bag — onto `origin` first, where it always fits in
+// single player (the slot still holds the same item and the units came out of it), and
+// failing that anywhere inventoryAdd will take it. Nothing is sent either way: the server
+// never learned of the detach. Returns true when the lift is empty afterwards. False means
+// units the bag would not take back are still in `lift`; in single player that cannot happen,
+// and on a server the next snapshot re-asserts the slot the units came from regardless.
+bool invBridgeReturnLift(Inventory* inv, int origin, InvSlot* lift);
 
 // ── Applying the server's snapshot ───────────────────────────────────────────────────────
 

@@ -559,12 +559,16 @@ void metricsDrawOverlay(const char* status)
 	printf("3d %s sl%4.2f free%4luK eye%3luK\n", s_stereo ? "on " : "off", s_slider,
 	       (unsigned long)(s_vram_free / 1024), (unsigned long)(s_right_eye_bytes / 1024));
 	printf("%-32s\n", status ? status : "");
-	// Walking-mode controls, which is what a playtest build boots into. L and R are the
-	// render distance in this mode; in a BS_FLY build they are the camera's up and down
-	// instead, which is a developer knob and is why the legend does not mention it.
+	// Walking-mode controls, which is what a playtest build boots into. v1.9.0 HOTBAR-LR
+	// (source/scene/hotbar.h) moved L/R off render distance: they now step the hotbar
+	// selection, wrapping, with press-then-hold repeat. Render distance moved to the pause
+	// menu's OPT_ROW_DIST row (scene/pausemenu.c) instead. In a BS_FLY build L/R are still
+	// the camera's up and down (source/scene/camera.c reads them directly, independent of
+	// this build's hotbar/render-dist wiring), which is a developer knob and is why the
+	// legend does not mention it.
 	printf("pad look  D-pad walk  A jump   \n");
 	printf("X break  Y place  SELECT 3D    \n");
-	printf("L/R render dist  START exit    \n");
+	printf("L/R hotbar  START exit         \n");
 }
 
 #else   // BS_BOTTOM_UI: there is no console, so there is nothing to draw the overlay on

@@ -75,12 +75,18 @@ static void check(bool cond, const char *what)
 // a loop bound, so a check that silently stops running (a shrunk loop, an early continue) shows
 // up as a missing check rather than as a quiet pass.
 //
-//   43   one check per defined core row (testFoodImpliesUnplaceable's loop body)
-//    1   the loop ran over all 43 rows (not a truncated prefix, not zero)
+//   44   one check per defined core row (testFoodImpliesUnplaceable's loop body)
+//    1   the loop ran over all 44 rows (not a truncated prefix, not zero)
 //    1   the real food count is 9 (apple + four raw cuts + four cooked cuts)
 //
-// 43 + 1 + 1 = 45.
-#define FOOD_PLACEABLE_TEST_EXPECTED_CHECKS 45
+// 44 + 1 + 1 = 46.
+//
+// v1.9.0 "Storage": 45 -> 46. One new core row, the chest at id 43, so the loop body runs once
+// more. The food count does NOT move — a chest is not food — which is the useful half of this
+// pin: a new row that had wrongly declared a food value would have moved BOTH numbers, and this
+// one moved exactly one. Read off the run that went red as "CHECK COUNT: 1 check(s) were ADDED
+// - expected 45, ran 46", not adjusted on paper.
+#define FOOD_PLACEABLE_TEST_EXPECTED_CHECKS 46
 
 static void checkCountPin(void)
 {
@@ -144,7 +150,7 @@ static void testFoodImpliesUnplaceable(void)
 	// leave every check above unrun and the suite would still print "0 failed" - a check that
 	// cannot go red proves nothing, and world/registry_test.c's coreHardnessIsDeclared() states
 	// the identical concern about its own loop.
-	check(rows == 43, "and it ran over all 43 defined core rows (air + forty-two)");
+	check(rows == 44, "and it ran over all 44 defined core rows (air + forty-three)");
 
 	// The real count, not the count this file's comment header claims. If a food is ever added
 	// to world/survival.c's kFoods[] without also reaching world/placeable.c's kUnplaceable[],

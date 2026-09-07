@@ -113,6 +113,12 @@ static bool    fake_send_fail;
 static int     fake_refuse_calls;
 static char    fake_refuse_why[128];
 
+/* v1.9.0. What netTransportState() below answers. ESTABLISHED by default and after every
+ * fakeTransportReset() — see that function's own comment — and switched off only by the chest
+ * scenarios, whose sender is the first in this file gated on the session as well as on a
+ * server-has-spoken flag, so "no session" has to be a state this double can actually be in. */
+static NetTransportState fake_transport_state = NET_TRANSPORT_ESTABLISHED;
+
 static void fakeTransportReset(void)
 {
     fake_recv_head = fake_recv_tail = fake_recv_count = 0;
@@ -121,6 +127,7 @@ static void fakeTransportReset(void)
     fake_send_fail  = false;
     fake_refuse_calls  = 0;
     fake_refuse_why[0] = '\0';
+    fake_transport_state = NET_TRANSPORT_ESTABLISHED;
 }
 
 static void fakeRecvPush(const uint8_t *data, size_t len)
@@ -162,7 +169,7 @@ bool netTransportSend(const uint8_t *payload, size_t len)
  * says "this packet did not go", which is a different question from "is there a server". */
 NetTransportState netTransportState(void)
 {
-    return NET_TRANSPORT_ESTABLISHED;
+    return fake_transport_state;
 }
 
 void netTransportRefuse(const char *why)
@@ -1757,7 +1764,7 @@ static void test_edit_hook_fires_for_an_applied_edit(void)
 /* v1.8.17. main.c's LOCAL break path removes the blockstate record for the cell it has just
  * emptied (source/main.c, the `if (it.broke_valid)` block). The REMOTE path had no such step:
  * a furnace another player broke vanished from the world here while its record stayed in the
- * table. Two costs, both real. BLOCKSTATE_SLOTS is 64, so orphaned records fill a fixed pool
+ * table. Two costs, both real. BLOCKSTATE_SLOTS is 256, so orphaned records fill a fixed pool
  * and legitimate new furnaces silently get no state; and a furnace later placed on the same
  * coordinate reads the DEAD one's contents back out of blockStateGet -- which, now that
  * breaking a furnace pays its contents into the inventory, is an item duplication route
@@ -2226,6 +2233,343 @@ static void test_inv_state_flag_does_not_survive_fresh_session(void)
     check(fake_sent_calls == 0, "and never touched the transport for it");
 }
 
+/* ------------------------------------------------ chests (BS_APP_SERVER_CAPS / CHEST_*) --- */
+/* v1.9.0, docs/design-1.9.0-chest-multiplayer.md. The fourth server-speaks-first set, and the
+ * first whose client->server message is gated on an explicit capability word rather than on the
+ * mere arrival of its server->client twin: BS_APP_SERVER_CAPS latches a u32, BS_APP_CHEST_ACTION
+ * goes out only with BS_CAP_CHESTS in it, and BS_APP_CHEST_STATE is mirrored into the same
+ * BlockStateTable single-player's chests live in. The table is the observable here — there is no
+ * hook, because scene/ui.c reads a networked chest out of the table exactly as it reads a local
+ * one. Both real modules (world/blockstate.c, world/chest.c) are in this link and a record is
+ * read back through the real blockStateGet(). The payload is then compared as bytes against the
+ * layout world/chest.h documents for chestStatePack() — [2i] item, [2i+1] count, which
+ * docs/design-1.9.0-chest-multiplayer.md pins to the wire's own slot bytes — rather than through
+ * chestStateUnpack(): world/chest.h drags in world/inventory.h, and this file already holds the
+ * server's mirror copy of that header through game/players.h (line 60); the two are `#pragma
+ * once` under different paths and cannot share a translation unit. If chestStatePack()'s layout
+ * ever moves off the wire's, the memcmp against the wire bytes below goes red, which is the
+ * right moment to revisit that pin. */
+
+static void buildServerCaps(uint8_t *out, uint32_t caps)
+{
+    out[0] = BS_APP_SERVER_CAPS;
+    bs_put_u32(out + 1, caps);
+}
+
+static void buildChestState(uint8_t *out, int32_t x, int32_t y, int32_t z,
+                            const uint8_t *items, const uint8_t *counts)
+{
+    out[0] = BS_APP_CHEST_STATE;
+    bs_put_i32(out + 1, x);
+    bs_put_i32(out + 5, y);
+    bs_put_i32(out + 9, z);
+    uint8_t *p = out + 13;
+    for (uint32_t i = 0; i < BS_CHEST_SLOTS; i++) {
+        p[0] = items[i];
+        p[1] = counts[i];
+        p += 2;
+    }
+}
+
+/* A distinct, non-trivial chest: slot i holds item i+1 with count 10+i, except slot 3, which is
+ * empty — so an off-by-one in either direction, or a slot read from its neighbour's offset,
+ * changes what a check sees. */
+static void fillChest(uint8_t *items, uint8_t *counts)
+{
+    for (uint32_t i = 0; i < BS_CHEST_SLOTS; i++) {
+        items[i]  = (i == 3) ? 0 : (uint8_t)(i + 1);
+        counts[i] = (i == 3) ? 0 : (uint8_t)(10 + i);
+    }
+}
+
+/* The record at (x, y, z), read the way scene/ui.c's chest panel reads it: as a BLOCK_CHEST
+ * record through blockStateGet(), then slot by slot at chestStatePack()'s documented offsets.
+ * False for no record, a record of another kind, or any slot that disagrees. */
+static bool chestRecordEquals(const BlockStateTable *t, int x, int y, int z,
+                              const uint8_t *items, const uint8_t *counts)
+{
+    uint8_t payload[BLOCKSTATE_PAYLOAD_BYTES];
+    if (!blockStateGet(t, x, y, z, BLOCK_CHEST, payload)) return false;
+    for (uint32_t i = 0; i < BS_CHEST_SLOTS; i++)
+        if (payload[2 * i] != items[i] || payload[2 * i + 1] != counts[i]) return false;
+    return true;
+}
+
+static void test_server_caps_latches_whole_word_and_ignores_unknown_bits(void)
+{
+    puts("SERVER_CAPS latches the whole word: unknown bits kept verbatim, never interpreted");
+
+    networldInit();
+    fakeTransportReset();
+    check(networldServerCaps() == 0, "fresh session: no server has spoken, caps read 0");
+
+    uint8_t msg[BS_SERVER_CAPS_BYTES];
+
+    /* Every reserved bit set and bit 0 clear: a newer server with features this build has never
+     * heard of, and no chests. bs_proto.h: bits 1..31 must be IGNORED, never validated. */
+    buildServerCaps(msg, 0xFFFFFFFEu);
+    networldApplyPayload(msg, sizeof msg);
+    check(networldServerCaps() == 0xFFFFFFFEu,
+          "bits 1..31 are stored verbatim, neither masked off nor refused");
+    check((networldServerCaps() & BS_CAP_CHESTS) == 0,
+          "and BS_CAP_CHESTS reads clear through all of them");
+    check(networldSendChestAction(BS_CHEST_OP_DEPOSIT, 1, 2, 3, BLOCK_WOOD, 0, 1) == false,
+          "so a chest action is still refused: no unknown bit stands in for the one that matters");
+    check(fake_sent_calls == 0, "and the transport was never touched");
+
+    /* Bit 0 together with an unknown high bit: a resend overwrites, whole. */
+    buildServerCaps(msg, BS_CAP_CHESTS | 0x80000000u);
+    networldApplyPayload(msg, sizeof msg);
+    check(networldServerCaps() == (BS_CAP_CHESTS | 0x80000000u),
+          "a second CAPS overwrites the first: the server's latest word wins, whole");
+    check(networldSendChestAction(BS_CHEST_OP_DEPOSIT, 1, 2, 3, BLOCK_WOOD, 0, 1) == true,
+          "BS_CAP_CHESTS set alongside an unknown bit: the unknown bit does not veto it");
+    check(fake_sent_calls == 1, "the transport was asked to send exactly once");
+
+    /* Byte order, against literal bytes rather than through the same helper that would encode
+     * them. */
+    const uint8_t le[BS_SERVER_CAPS_BYTES] = { BS_APP_SERVER_CAPS, 0x01, 0x02, 0x03, 0x04 };
+    networldApplyPayload(le, sizeof le);
+    check(networldServerCaps() == 0x04030201u, "the u32 is little-endian on the wire");
+
+    /* Length-exact: short and long are both dropped, leaving the latched word alone. The
+     * padding is all-ones so a half-read would be visible. */
+    uint8_t short_msg[BS_SERVER_CAPS_BYTES - 1];
+    memset(short_msg, 0xFF, sizeof short_msg);
+    short_msg[0] = BS_APP_SERVER_CAPS;
+    networldApplyPayload(short_msg, sizeof short_msg);
+    check(networldServerCaps() == 0x04030201u, "one byte short: dropped, the latched word untouched");
+
+    uint8_t long_msg[BS_SERVER_CAPS_BYTES + 1];
+    memset(long_msg, 0xFF, sizeof long_msg);
+    long_msg[0] = BS_APP_SERVER_CAPS;
+    networldApplyPayload(long_msg, sizeof long_msg);
+    check(networldServerCaps() == 0x04030201u,
+          "one byte long: dropped too — a longer CAPS from a newer server is a new message, not "
+          "this one half-read");
+}
+
+static void test_send_chest_action_gated_and_byte_exact(void)
+{
+    puts("networldSendChestAction() sends nothing without a session or without BS_CAP_CHESTS, "
+         "and exactly the 17-byte frame with both");
+
+    networldInit();
+    fakeTransportReset();
+
+    check(networldSendChestAction(BS_CHEST_OP_DEPOSIT, 1, 2, 3, BLOCK_WOOD, 0, 1) == false,
+          "no SERVER_CAPS received yet: the send is refused");
+    check(fake_sent_calls == 0,
+          "the transport was never even touched — this is the capability probe itself, not a "
+          "defensive nicety in front of it");
+
+    uint8_t caps[BS_SERVER_CAPS_BYTES];
+    buildServerCaps(caps, BS_CAP_CHESTS);
+    networldApplyPayload(caps, sizeof caps);
+
+    /* The bit is latched but the session is gone: still refused. This sender is called from a
+     * UI path that also runs in single player, where "false" means "apply it locally". */
+    fake_transport_state = NET_TRANSPORT_IDLE;
+    check(networldSendChestAction(BS_CHEST_OP_DEPOSIT, 1, 2, 3, BLOCK_WOOD, 0, 1) == false,
+          "caps latched but no established session: refused");
+    check(fake_sent_calls == 0, "and the transport was not touched for that either");
+    fake_transport_state = NET_TRANSPORT_ESTABLISHED;
+
+    /* DEPOSIT: a = the item id, b = the chest slot. A negative x and a z past one byte, so the
+     * i32 encoding is exercised and not just its low byte. */
+    check(networldSendChestAction(BS_CHEST_OP_DEPOSIT, -2, 20, 300, BLOCK_WOOD, 5, 9) == true,
+          "caps and a session: the send goes through");
+    check(fake_sent_calls == 1, "the transport was asked to send exactly once");
+    check(fake_sent_len == BS_CHEST_ACTION_BYTES, "encoded to exactly BS_CHEST_ACTION_BYTES (17)");
+    check(fake_sent_buf[0] == BS_APP_CHEST_ACTION, "byte 0: type BS_APP_CHEST_ACTION");
+    check(fake_sent_buf[1] == BS_CHEST_OP_DEPOSIT, "byte 1: op");
+    check(bs_get_i32(fake_sent_buf + 2) == -2, "bytes 2..5: x, including negative");
+    check(bs_get_i32(fake_sent_buf + 6) == 20, "bytes 6..9: y");
+    check(bs_get_i32(fake_sent_buf + 10) == 300, "bytes 10..13: z");
+    check(fake_sent_buf[14] == BLOCK_WOOD, "byte 14: a (the item id, for a DEPOSIT)");
+    check(fake_sent_buf[15] == 5, "byte 15: b (the chest slot, for a DEPOSIT)");
+    check(fake_sent_buf[16] == 9, "byte 16: count, the number of items this transfer asks for");
+
+    /* The whole frame against literal bytes, not round-tripped through bs_get_i32. */
+    const uint8_t expect[BS_CHEST_ACTION_BYTES] = {
+        0x13, 0x00,
+        0xFE, 0xFF, 0xFF, 0xFF,
+        0x14, 0x00, 0x00, 0x00,
+        0x2C, 0x01, 0x00, 0x00,
+        BLOCK_WOOD, 0x05, 0x09,
+    };
+    check(memcmp(fake_sent_buf, expect, sizeof expect) == 0,
+          "the whole 17-byte frame matches the literal little-endian layout");
+
+    /* WITHDRAW: a = the chest slot, b = the inventory slot. */
+    check(networldSendChestAction(BS_CHEST_OP_WITHDRAW, 7, 8, 9, 3, 21, 4) == true,
+          "a WITHDRAW goes through the same gate");
+    check(fake_sent_len == BS_CHEST_ACTION_BYTES
+          && fake_sent_buf[1] == BS_CHEST_OP_WITHDRAW
+          && fake_sent_buf[14] == 3 && fake_sent_buf[15] == 21 && fake_sent_buf[16] == 4,
+          "op, a, b and count all round-trip");
+
+    /* A transport that refuses the packet: the answer is false, not "sent". */
+    fake_send_fail = true;
+    check(networldSendChestAction(BS_CHEST_OP_DEPOSIT, 1, 2, 3, BLOCK_WOOD, 0, 1) == false,
+          "a transport refusal is reported as false");
+    check(fake_sent_calls == 3,
+          "and the send was still attempted, so that was the transport and not the gate");
+    fake_send_fail = false;
+}
+
+static void test_chest_state_mirrors_into_the_table(void)
+{
+    puts("a CHEST_STATE snapshot is mirrored into the registered BlockStateTable as a "
+         "BLOCK_CHEST record");
+
+    BlockStateTable t;
+    blockStateInit(&t);
+    networldInit();
+    networldSetWorld(NULL);
+    networldSetBlockStateTable(&t);
+
+    uint8_t items[BS_CHEST_SLOTS], counts[BS_CHEST_SLOTS];
+    fillChest(items, counts);
+    uint8_t msg[BS_CHEST_STATE_BYTES];
+    buildChestState(msg, -5, 20, 300, items, counts);
+    networldApplyPayload(msg, sizeof msg);
+
+    check(blockStateCount(&t) == 1, "one record was created for the snapshot");
+    check(chestRecordEquals(&t, -5, 20, 300, items, counts),
+          "at the snapshot's own coordinate, readable as BLOCK_CHEST, every (item, count) pair "
+          "exact");
+    uint8_t raw[BLOCKSTATE_PAYLOAD_BYTES];
+    check(blockStateGet(&t, -5, 20, 300, BLOCK_CHEST, raw)
+          && memcmp(raw, msg + 13, BLOCKSTATE_PAYLOAD_BYTES) == 0,
+          "the stored payload is byte-for-byte the wire's slot bytes — chestStatePack's own "
+          "layout, so the panel reads it exactly as it reads a local chest");
+    check(!blockStateGet(&t, -5, 20, 300, BLOCK_FURNACE, raw),
+          "and it is a chest's record: not readable under the furnace's id");
+
+    /* A second snapshot for the same chest overwrites in place. */
+    items[0] = BLOCK_STONE; counts[0] = 99;
+    items[3] = BLOCK_WOOD;  counts[3] = 1;
+    buildChestState(msg, -5, 20, 300, items, counts);
+    networldApplyPayload(msg, sizeof msg);
+    check(blockStateCount(&t) == 1,
+          "a second snapshot for the same position does not create a second record");
+    check(chestRecordEquals(&t, -5, 20, 300, items, counts),
+          "and the record now holds the newer contents — a snapshot is the whole truth, not a "
+          "delta");
+
+    /* A stale record of another kind at the position: reset in place, per blockstate.h. */
+    check(blockStateCreate(&t, 8, 30, 8, BLOCK_FURNACE), "fixture: a furnace record stands at (8,30,8)");
+    uint8_t junk[BLOCKSTATE_PAYLOAD_BYTES];
+    memset(junk, 0xAB, sizeof junk);
+    check(blockStateSet(&t, 8, 30, 8, BLOCK_FURNACE, junk), "fixture: with non-zero contents");
+    buildChestState(msg, 8, 30, 8, items, counts);
+    networldApplyPayload(msg, sizeof msg);
+    check(blockStateCount(&t) == 2,
+          "the snapshot reclaimed the furnace's slot rather than adding a third record");
+    check(chestRecordEquals(&t, 8, 30, 8, items, counts),
+          "and the position now reads as a chest holding the snapshot's contents");
+    check(!blockStateGet(&t, 8, 30, 8, BLOCK_FURNACE, raw),
+          "the furnace's bytes are gone, not readable under the old id");
+
+    /* Mirrored regardless of the local World — the chest's own BLOCK_EDIT may still be in
+     * flight on the unordered transport. The cell holds STONE here and the snapshot lands
+     * anyway; the world itself is not touched. */
+    World w;
+    worldInit(&w);
+    worldColumnCreate(&w, 0, 0);
+    check(worldSet(&w, 4, 40, 4, BLOCK_STONE), "fixture: the local world holds STONE at (4,40,4)");
+    networldSetWorld(&w);
+    buildChestState(msg, 4, 40, 4, items, counts);
+    networldApplyPayload(msg, sizeof msg);
+    check(blockStateCount(&t) == 3 && chestRecordEquals(&t, 4, 40, 4, items, counts),
+          "a snapshot for a cell the local world does not (yet) hold a chest at is mirrored "
+          "anyway");
+    check(worldGet(&w, 4, 40, 4) == BLOCK_STONE,
+          "and the world is not touched: a snapshot is contents, not a block edit");
+    networldSetWorld(NULL);
+
+    /* No table registered: nowhere to write, so it goes nowhere. */
+    networldSetBlockStateTable(NULL);
+    buildChestState(msg, 1, 1, 1, items, counts);
+    networldApplyPayload(msg, sizeof msg);
+    check(blockStateCount(&t) == 3,
+          "with no table registered the snapshot is dropped — the old table is not written "
+          "behind its owner's back");
+}
+
+static void test_chest_state_malformed_dropped_without_touching_the_table(void)
+{
+    puts("a short, long or out-of-range CHEST_STATE is dropped whole and the table is not touched");
+
+    BlockStateTable t;
+    blockStateInit(&t);
+    networldInit();
+    networldSetWorld(NULL);
+    networldSetBlockStateTable(&t);
+
+    /* A bystander record, so "not touched" can be told from "still empty". */
+    check(blockStateCreate(&t, 2, 3, 4, BLOCK_FURNACE), "fixture: one furnace record stands in the table");
+    BlockStateTable before;
+    memcpy(&before, &t, sizeof before);
+
+    uint8_t items[BS_CHEST_SLOTS], counts[BS_CHEST_SLOTS];
+    fillChest(items, counts);
+    uint8_t msg[BS_CHEST_STATE_BYTES + 1];
+    buildChestState(msg, 5, 6, 7, items, counts);
+    msg[BS_CHEST_STATE_BYTES] = 0;
+
+    networldApplyPayload(msg, BS_CHEST_STATE_BYTES - 1);
+    check(memcmp(&before, &t, sizeof t) == 0, "one byte short: dropped, table byte-identical");
+    networldApplyPayload(msg, BS_CHEST_STATE_BYTES + 1);
+    check(memcmp(&before, &t, sizeof t) == 0, "one byte long: dropped, table byte-identical");
+    networldApplyPayload(msg, 13);   /* header + position, no slots at all */
+    check(memcmp(&before, &t, sizeof t) == 0, "a position with no slots: dropped, table byte-identical");
+
+    /* Out of range, the same posture as a BLOCK_EDIT's coordinates (editValid). */
+    buildChestState(msg, 5, WORLD_HEIGHT, 7, items, counts);
+    networldApplyPayload(msg, BS_CHEST_STATE_BYTES);
+    check(memcmp(&before, &t, sizeof t) == 0, "y == WORLD_HEIGHT: dropped, table byte-identical");
+    buildChestState(msg, 5, -1, 7, items, counts);
+    networldApplyPayload(msg, BS_CHEST_STATE_BYTES);
+    check(memcmp(&before, &t, sizeof t) == 0, "y == -1: dropped, table byte-identical");
+    /* 60001: one past networld.c's NETWORLD_XZ_LIMIT (60000), which is file-private there. */
+    buildChestState(msg, 60001, 6, 7, items, counts);
+    networldApplyPayload(msg, BS_CHEST_STATE_BYTES);
+    check(memcmp(&before, &t, sizeof t) == 0, "x past the xz limit: dropped, table byte-identical");
+
+    /* Control: the well-formed twin of every packet above lands, so the checks above could have
+     * failed. */
+    buildChestState(msg, 5, 6, 7, items, counts);
+    networldApplyPayload(msg, BS_CHEST_STATE_BYTES);
+    check(blockStateCount(&t) == 2 && chestRecordEquals(&t, 5, 6, 7, items, counts),
+          "control: the same builder with a legal length and position lands a record");
+
+    networldSetBlockStateTable(NULL);
+}
+
+static void test_server_caps_reset_on_disconnect(void)
+{
+    puts("the latched SERVER_CAPS word does not survive into a fresh session");
+
+    networldInit();
+    fakeTransportReset();
+    uint8_t caps[BS_SERVER_CAPS_BYTES];
+    buildServerCaps(caps, BS_CAP_CHESTS);
+    networldApplyPayload(caps, sizeof caps);
+    check(networldSendChestAction(BS_CHEST_OP_DEPOSIT, 1, 2, 3, BLOCK_WOOD, 0, 1) == true,
+          "control: within this session the send goes through");
+
+    /* Leaving a server — bsnet.c's netDisconnect() calls exactly this. */
+    networldInit();
+    fakeTransportReset();
+    check(networldServerCaps() == 0, "after leaving, caps read 0 again");
+    check(networldSendChestAction(BS_CHEST_OP_DEPOSIT, 1, 2, 3, BLOCK_WOOD, 0, 1) == false,
+          "so the next server is not spoken to before it has announced anything — the kick "
+          "the probe exists to prevent");
+    check(fake_sent_calls == 0, "and the transport was never touched");
+}
+
 /* ------------------------------------------------ saved player state (BS_APP_PLAYER_*) --- */
 /* BS_APP_PLAYER_STATE / BS_APP_PLAYER_REPORT, bs_proto.h's v1.5.0 pair — the third
  * server-speaks-first set after WORLD_INFO and INV_STATE. The decode side mirrors
@@ -2636,7 +2980,7 @@ static void test_registry_defs_converge(void)
 
     check(registryFind("wire_a") == REG_ID_DYN_LO && registryFind("wire_b") == REG_ID_DYN_LO + 1,
           "both defs landed under their consecutive ids");
-    check(registryCount() == 45, "count moved from 43 to 45 defined rows");
+    check(registryCount() == 46, "count moved from 44 to 46 defined rows");
     check(blockIsSolid(REG_ID_DYN_LO), "after sync the same id resolves to the real def");
     check(worldGet(&w, 5, 10, 7) == REG_ID_DYN_LO,
           "the stored raw byte needed no rewrite — tables agree around it");
@@ -2719,8 +3063,15 @@ static void test_registry_defs_converge(void)
      * rev=1`. The same probe built against the vendored deps/blocksmith-server copy printed the
      * identical numbers, and a third arm built from `git show HEAD:` (pre-sync) printed
      * `count=38 crc=0x9610 rev=1`, reproducing the OLD golden and proving the probe can tell the
-     * two tables apart rather than printing whatever it was pointed at. */
-    check(registryCrc16() != 0xE486u,
+     * two tables apart rather than printing whatever it was pointed at.
+     *
+     * 0xE486 -> 0x2A61 on 2026-09-05 by v1.9.0 "Storage"'s one row (the chest, id 43),
+     * registryCount() moving 43 -> 44. Same reasoning as every move above: this is an
+     * INEQUALITY check, so it did not go red on this move either — it is updated because the
+     * literal beside it is stale, not because anything complained. MEASURED the same way as the
+     * furnace move: source/world/registry_test.c's own comment on this exact golden documents
+     * the scratchpad probe (chestc_crc_probe.c) that printed `count=44 crc=0x2A61 rev=1`. */
+    check(registryCrc16() != 0x2A61u,
           "the converged table no longer hashes like the core-only one");
 }
 
@@ -2738,7 +3089,7 @@ static void test_registry_defs_malformed_dropped_whole(void)
 
     /* Short by one record byte: length-exact posture, drop without parsing. */
     networldApplyPayload(batch, len - 1);
-    check(registryCount() == 43 && registryFind("bad_a") == 0,
+    check(registryCount() == 44 && registryFind("bad_a") == 0,
           "a truncated DEFS applies nothing");
 
     /* Claiming more records than the sender's own cap can carry. */
@@ -2746,14 +3097,14 @@ static void test_registry_defs_malformed_dropped_whole(void)
     memcpy(greedy, batch, sizeof greedy);
     greedy[2] = BS_APP_REGISTRY_DEFS_MAX_N + 1u;
     networldApplyPayload(greedy, sizeof greedy);
-    check(registryCount() == 43, "an over-cap count is refused outright");
+    check(registryCount() == 44, "an over-cap count is refused outright");
 
     /* first below the dyn range would overwrite compiled-in core rows. */
     uint8_t hostile[BS_APP_REGISTRY_DEFS_BYTES(2)];
     memcpy(hostile, batch, sizeof hostile);
     hostile[1] = BLOCK_STONE;
     networldApplyPayload(hostile, sizeof hostile);
-    check(registryCount() == 43 && strcmp(blockInfo(BLOCK_STONE)->name, "stone") == 0,
+    check(registryCount() == 44 && strcmp(blockInfo(BLOCK_STONE)->name, "stone") == 0,
           "a batch aimed at the core range changes nothing");
 
     /* A record whose embedded id disagrees with its slot position: all-or-nothing. */
@@ -2761,7 +3112,7 @@ static void test_registry_defs_malformed_dropped_whole(void)
     memcpy(shuffled, batch, sizeof shuffled);
     shuffled[4] = REG_ID_DYN_LO + 1u;   /* record 0 claims id 0x81 */
     networldApplyPayload(shuffled, sizeof shuffled);
-    check(registryCount() == 43 && registryFind("bad_a") == 0 && registryFind("bad_b") == 0,
+    check(registryCount() == 44 && registryFind("bad_a") == 0 && registryFind("bad_b") == 0,
           "one inconsistent record refuses the WHOLE batch, not just itself");
 }
 
@@ -3055,6 +3406,21 @@ static const CoreRowSpec kCoreRowSpecs[] = {
     { 42, "furnace", { BTEX_STONE, BTEX_STONE, BTEX_STONE,
                        BTEX_STONE, BTEX_FURNACE_FRONT, BTEX_STONE },
       REG_FLAG_SOLID, 45, 0 },
+
+    /* v1.9.0 "Storage"'s one row, id 43: the chest. Transcribed the same way every row above
+     * was -- from world/block.h's BLOCK_CHEST/BTEX_CHEST_TOP constants and from
+     * world/registry.c's own row comment stating the intent, never from its .tex/.flags/
+     * .hardness fields. FULL_CUBE and SOLID like the furnace, but the distinct art sits on
+     * FACE_TOP (index 2 in the EAST, WEST, TOP, BOTTOM, SOUTH, NORTH order the furnace row
+     * above already established) rather than the furnace's FACE_SOUTH, because registry.c's
+     * comment says a chest has no "front" this build assigns meaning to, and top-facing art
+     * is what lets the same tile double as the inventory icon. The other five faces carry
+     * BTEX_PLANKS, not a chest-specific texture, because registry.c's comment states the
+     * block is built from planks. Hardness 40, BLOCK_PLANKS's own number, by the same
+     * "worked from its own material" argument the furnace row makes for stone. */
+    { 43, "chest", { BTEX_PLANKS, BTEX_PLANKS, BTEX_CHEST_TOP,
+                     BTEX_PLANKS, BTEX_PLANKS, BTEX_PLANKS },
+      REG_FLAG_SOLID, 40, 0 },
 };
 
 /* CRC-16/CCITT-FALSE, spelled out here rather than reached for in world/registry.c, so that the
@@ -3184,7 +3550,7 @@ static void test_registry_fetch_retries_a_lost_reply(void)
     uint8_t partial[BS_APP_REGISTRY_DEFS_BYTES(2)];
     len = buildRegistryDefs(partial, REG_ID_DYN_LO, two, 2, false);   /* not the last */
     networldApplyPayload(partial, len);
-    check(registryCount() == 45, "the partial batch landed two rows");
+    check(registryCount() == 46, "the partial batch landed two rows");
     fake_sent_calls = 0;
     fakeNowAdvance(NETWORLD_REG_FETCH_RETRY_MS);
     networldUpdate();
@@ -3343,13 +3709,13 @@ static void test_registry_table_resets_between_sessions(void)
     uint8_t batch[BS_APP_REGISTRY_DEFS_BYTES(2)];
     size_t len = buildRegistryDefs(batch, REG_ID_DYN_LO, defs, 2, true);
     networldApplyPayload(batch, len);
-    check(registryCount() == 45 && registryFind("srv1_a") == REG_ID_DYN_LO,
+    check(registryCount() == 46 && registryFind("srv1_a") == REG_ID_DYN_LO,
           "the first server's two rows are in the table");
 
     /* netDisconnect() runs networldInit() (net/bsnet.c), which is the whole of leaving a
      * session as far as this module is concerned. */
     networldInit();
-    check(registryCount() == 43, "after leaving, only the forty-three core rows remain");
+    check(registryCount() == 44, "after leaving, only the forty-four core rows remain");
     check(registryFind("srv1_a") == 0 && registryFind("srv1_b") == 0,
           "the first server's names are gone, not merely hidden");
     check(registryCrc16() == coreOnlyCrc16(),
@@ -3375,7 +3741,7 @@ static void test_registry_table_resets_between_sessions(void)
     networldApplyPayload(batch2, len);
     check(registryFind("srv2_only") == REG_ID_DYN_LO,
           "the second server's row takes 0x80, which server one had been holding");
-    check(registryCount() == 44, "and it is the only dynamic row in the table");
+    check(registryCount() == 45, "and it is the only dynamic row in the table");
 }
 
 /* v1.6.0 F2, and the scenario the test directly above could not be: it calls networldInit()
@@ -3413,7 +3779,7 @@ static void test_registry_join_after_a_single_player_quit_to_title(void)
     check(registryRegister(&sp) == REG_ID_DYN_LO,
           "control: the single-player world's sidecar row is really in the table");
     registryFreeze();
-    check(registryFrozen() && registryCount() == 44,
+    check(registryFrozen() && registryCount() == 45,
           "control: and genStart() has frozen it, in single player exactly as in a session");
 
     /* Quit to title. This is the whole of it. */
@@ -3435,7 +3801,7 @@ static void test_registry_join_after_a_single_player_quit_to_title(void)
 
     check(registryFind("srv_blk") == REG_ID_DYN_LO,
           "the server's block is committed at 0x80 rather than refused by the stale freeze");
-    check(registryCount() == 44 && registryFind("sp_sidecar") == 0,
+    check(registryCount() == 45 && registryFind("sp_sidecar") == 0,
           "and it is the only dynamic row: the last world's is gone");
     /* The NAME is checked, not just "a defined solid row exists at 0x80". Against the stale
      * table the single-player world's own row was sitting in that slot, defined and solid, so
@@ -3479,7 +3845,7 @@ static void test_registry_terminator_alone_is_not_a_synced_table(void)
     const size_t tlen = buildRegistryDefs(term, REG_ID_DYN_LO, declared, 0, true);
     networldApplyPayload(term, tlen);
 
-    check(registryCount() == 43,
+    check(registryCount() == 44,
           "the terminator carried no records, so the table is still core-only");
     check(!networldRegistrySynced(),
           "and a table that cannot reproduce the server's crc16 is not a synced table");
@@ -3545,7 +3911,7 @@ static void test_registry_terminator_alone_is_not_a_synced_table(void)
     uint8_t batch[BS_APP_REGISTRY_DEFS_BYTES(2)];
     const size_t blen = buildRegistryDefs(batch, REG_ID_DYN_LO, declared, 2, true);
     networldApplyPayload(batch, blen);
-    check(registryCount() == 43, "the frozen table refused the batch, per registry.h's contract");
+    check(registryCount() == 44, "the frozen table refused the batch, per registry.h's contract");
     check(!networldRegistrySynced(),
           "and a refused batch's LAST flag does not turn the indicator healthy");
 
@@ -3564,7 +3930,7 @@ static void test_registry_terminator_alone_is_not_a_synced_table(void)
     networldApplyPayload(wi, sizeof wi);
 
     networldApplyPayload(batch, blen);
-    check(registryCount() == 45, "the unsolicited batch's rows did land in the table");
+    check(registryCount() == 46, "the unsolicited batch's rows did land in the table");
     check(!networldRegistrySynced(),
           "but with no INFO there is no fingerprint, so nothing is verified");
 
@@ -3588,7 +3954,7 @@ static void test_registry_sync_is_proved_by_the_fingerprint(void)
     uint8_t all[BS_APP_REGISTRY_DEFS_BYTES(3)];
     size_t alen = buildRegistryDefs(all, REG_ID_DYN_LO, declared, 3, true);
     networldApplyPayload(all, alen);
-    check(registryCount() == 46, "all three declared rows landed");
+    check(registryCount() == 47, "all three declared rows landed");
     check(networldRegistrySynced(), "and the table reproduces the server's whole fingerprint");
     check(!networldRegistryWaiting(), "which releases world entry immediately");
 
@@ -3598,7 +3964,7 @@ static void test_registry_sync_is_proved_by_the_fingerprint(void)
     uint8_t two[BS_APP_REGISTRY_DEFS_BYTES(2)];
     const size_t twolen = buildRegistryDefs(two, REG_ID_DYN_LO, declared, 2, true);
     networldApplyPayload(two, twolen);
-    check(registryCount() == 45, "two of the three rows landed");
+    check(registryCount() == 46, "two of the three rows landed");
     check(!networldRegistrySynced(),
           "a short delivery is not a synced table however the LAST flag is set");
     fake_sent_calls = 0;
@@ -3614,7 +3980,7 @@ static void test_registry_sync_is_proved_by_the_fingerprint(void)
     uint8_t wrong[BS_APP_REGISTRY_DEFS_BYTES(3)];
     const size_t wlen = buildRegistryDefs(wrong, REG_ID_DYN_LO, impostor, 3, true);
     networldApplyPayload(wrong, wlen);
-    check(registryCount() == 46, "three rows landed, so rev and count both agree");
+    check(registryCount() == 47, "three rows landed, so rev and count both agree");
     check(registryFind("fp_X") == REG_ID_DYN_LO + 2u, "with the third row under its own name");
     check(!networldRegistrySynced(),
           "but the crc16 disagrees, so this is not the server's table and not synced");
@@ -3646,7 +4012,7 @@ static void test_registry_sync_is_proved_by_the_fingerprint(void)
 
     alen = buildRegistryDefs(all, REG_ID_DYN_LO, declared, 3, true);
     networldApplyPayload(all, alen);
-    check(registryCount() == 46, "control: the rows landed exactly as in the passing case");
+    check(registryCount() == 47, "control: the rows landed exactly as in the passing case");
     check(!networldRegistrySynced(), "but a foreign table revision is never verifiable");
 }
 
@@ -3745,7 +4111,7 @@ static void test_registry_mismatch_refuses_instead_of_degrading(void)
     const size_t wlen = buildRegistryDefs(wrong, REG_ID_DYN_LO, impostor, 3, true);
     networldApplyPayload(wrong, wlen);
 
-    check(registryCount() == 46,
+    check(registryCount() == 47,
           "control: three rows landed, so the server's count is reproduced exactly");
     check(!networldRegistrySynced(),
           "control: and only the crc16 disagrees — this is the same-count, wrong-content case");
@@ -4278,6 +4644,11 @@ int main(void)
     test_inv_state_count_over_cap_dropped();
     test_send_inv_action_gated_on_inv_state();
     test_inv_state_flag_does_not_survive_fresh_session();
+    test_server_caps_latches_whole_word_and_ignores_unknown_bits();
+    test_send_chest_action_gated_and_byte_exact();
+    test_chest_state_mirrors_into_the_table();
+    test_chest_state_malformed_dropped_without_touching_the_table();
+    test_server_caps_reset_on_disconnect();
     test_player_state_pose_and_meters_round_trip();
     test_player_state_flag_combinations();
     test_player_state_wrong_length_dropped();
@@ -4385,8 +4756,25 @@ int main(void)
      * into single player, an unsolicited packet being recorded rather than refused, and the
      * control that a neighbouring type byte does not reach the clock decoder. Nothing
      * removed. */
-    check(g_checks == 487,
-          "check-count guard: every check in this suite actually ran (487 before this line)");
+    /* 487 -> 545, same rule. The five v1.9.0 chest scenarios add 58:
+     * test_server_caps_latches_whole_word_and_ignores_unknown_bits adds 11 (the fresh 0, the
+     * verbatim reserved bits, the clear chest bit, the refused send and its untouched transport,
+     * the overwrite, the send an unknown bit does not veto and its one call, the byte order, and
+     * short/long each dropped);
+     * test_send_chest_action_gated_and_byte_exact adds 20 (no caps and no touch, no session and
+     * no touch, the accepted send, its one call, the length, the ten per-byte fields, the
+     * literal-frame memcmp, the WITHDRAW and its fields, and the transport refusal with its
+     * attempted call);
+     * test_chest_state_mirrors_into_the_table adds 15 (the record count, the exact contents, the
+     * raw payload, the wrong-id read, the overwrite's count and contents, the furnace fixture and
+     * its contents, the reclaimed slot, the chest that replaced it, the gone furnace, the STONE
+     * fixture, the mirrored-anyway record, the untouched world, and the no-table drop);
+     * test_chest_state_malformed_dropped_without_touching_the_table adds 8 (the fixture, short,
+     * long, no slots, y high, y low, x wide, and the control that lands);
+     * test_server_caps_reset_on_disconnect adds 4 (the control send, caps back to 0, the refused
+     * send, the untouched transport). Nothing removed. */
+    check(g_checks == 545,
+          "check-count guard: every check in this suite actually ran (545 before this line)");
 
     printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;

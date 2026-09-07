@@ -7,6 +7,8 @@
 #include "net/bsnet_sock.h"
 #include "net/bsnet_transport.h"
 #include "world/block.h"
+#include "world/blockstate.h"
+#include "world/chest.h"
 #include "world/mesher.h"
 #include "world/registry.h"
 #include "world/visgraph.h"
@@ -146,6 +148,13 @@ _Static_assert(NETWORLD_INV_SLOT_COUNT == BS_INV_SLOT_COUNT,
                "networld.h's slot count must match proto/bs_proto.h's");
 _Static_assert(NETWORLD_ARMOR_SLOTS == BS_ARMOR_SLOTS,
                "networld.h's armour slot count must match proto/bs_proto.h's");
+// v1.9.0: proto/bs_proto.h's BS_CHEST_SLOTS restates world/chest.h's CHEST_SLOTS (the server
+// keeps its own 8-slot record rather than mirroring chest.h) and names this bridge as the place
+// that keeps the two equal — bs_proto.h, "chests" section. applyChestState() below walks
+// CHEST_SLOTS pairs out of a frame sized by BS_CHEST_SLOTS, so the two disagreeing would be a
+// silent misparse, not a warning.
+_Static_assert(BS_CHEST_SLOTS == CHEST_SLOTS,
+               "proto/bs_proto.h's BS_CHEST_SLOTS must match world/chest.h's CHEST_SLOTS");
 
 // Who to tell when a valid BS_APP_INV_STATE arrives. See networld.h's own comment on
 // NetworldInvFn for why this is a hook rather than a direct call into world/inventory.h.
@@ -457,6 +466,17 @@ static bool     s_have_world_gen;
 static uint64_t s_time_sync_ticks;
 static bool     s_have_time_sync;
 
+// BS_APP_SERVER_CAPS (v1.9.0): the capability bits the server announced at join, latched whole.
+// 0 is the resting state and the permanent answer from every server older than the message —
+// see networld.h on networldServerCaps(). Unknown bits are stored and never looked at.
+static uint32_t s_server_caps;
+
+// Where a BS_APP_CHEST_STATE snapshot is written: main.c's own BlockStateTable, registered by
+// networldSetBlockStateTable() the way s_world is by networldSetWorld(), and NULL until then.
+// Not reset by networldInit(), for the same reason s_world is not — it is a registration, not
+// session state, and its owner clears it when the table goes away.
+static BlockStateTable* s_blockstate;
+
 // Traffic counters — see networld.h for what each one distinguishes. Plain ints, main thread
 // only, reset by networldInit(): they are a diagnostic readout, not part of any protocol.
 static int s_sent_edits;
@@ -610,6 +630,76 @@ static void applyTimeSync(const uint8_t* msg, size_t len)
 
 	s_time_sync_ticks = bs_get_u64(msg + 1);
 	s_have_time_sync  = true;
+}
+
+// BS_APP_SERVER_CAPS (v1.9.0): exactly BS_SERVER_CAPS_BYTES or dropped — applyTimeSync()'s
+// posture just above, for bs_proto.h's reason: a longer CAPS from a newer server must be
+// rejectable outright rather than half-read. Latched whole, unknown bits included, and a resend
+// overwrites: the server is the authority on what it can do, and its latest word wins.
+static void applyServerCaps(const uint8_t* msg, size_t len)
+{
+	if (len != BS_SERVER_CAPS_BYTES) return;
+
+	s_server_caps = bs_get_u32(msg + BS_APP_HDR_BYTES);
+}
+
+// BS_APP_CHEST_STATE (v1.9.0): one whole chest, authoritative, exactly BS_CHEST_STATE_BYTES or
+// dropped. Written into the registered BlockStateTable as a BLOCK_CHEST record through the SAME
+// chestStatePack() the local place path and scene/ui.c use, so the bytes on record are
+// byte-for-byte what single-player would have written for the same contents. Never queued — see
+// networld.h on networldSetBlockStateTable(). And never validated per pair beyond the wire's own
+// u8 width, unlike applyInvState() above: the server owns a chest's contents, and a client that
+// second-guessed an (item, count) pairing would only ever drop a snapshot it had no way to
+// correct.
+//
+// Deliberately NOT gated on what the local World holds at (x, y, z). The transport is unordered:
+// the BLOCK_EDIT that places another player's chest and the CHEST_STATE that fills it leave the
+// server back to back and can land here in either order, and a snapshot refused because the cell
+// still read as air would be gone for good — the server does not resend it until the next
+// mutation. The table's own contract makes mirroring early safe: a record is keyed by absolute
+// position and independent of chunk residency (blockstate.h's lifetime section), and if the edit
+// never arrives the record is an orphan of exactly the kind blockStateCreate()'s reset-in-place
+// already covers. The only drops are the ones that cannot be helped — a position outside the
+// world (editValid(), the same range posture as every other position off the wire in this file),
+// no table registered (title screen), and a table with no free slot.
+//
+// A position with no record yet — a chest another player placed — gets its record created here,
+// on the snapshot. A stale record of some OTHER block kind orphaned at this position is reset in
+// place by blockStateCreate() (blockstate.h's header): the snapshot describes what stands there
+// now, and that wins.
+static void applyChestState(const uint8_t* msg, size_t len)
+{
+	/* INTEROP-SEAM: chest */
+	if (len != BS_CHEST_STATE_BYTES) return;
+
+	const int32_t x = bs_get_i32(msg + 1);
+	const int32_t y = bs_get_i32(msg + 5);
+	const int32_t z = bs_get_i32(msg + 9);
+	// The block argument is what this snapshot claims stands there, which is always a chest.
+	if (!editValid(x, y, z, BLOCK_CHEST)) return;
+	if (!s_blockstate)                    return;
+
+	// Stack only — 16 bytes of ChestState and 16 of payload. Nothing is allocated on the receive
+	// path, and no struct is memcpy'd: each slot is read at its explicit wire offset.
+	ChestState cs;
+	const uint8_t* p = msg + 13;
+	for (int i = 0; i < CHEST_SLOTS; i++) {
+		cs.item[i]  = p[0];
+		cs.count[i] = p[1];
+		p += 2;
+	}
+
+	uint8_t payload[BLOCKSTATE_PAYLOAD_BYTES];
+	chestStatePack(&cs, payload);
+
+	if (blockStateSet(s_blockstate, x, y, z, BLOCK_CHEST, payload)) return;
+
+	// No record yet, or a record some other block kind left behind here: claim the position for
+	// the chest (zeroed, per blockstate.h) and write the snapshot over it. A full table is the
+	// one way this can still fail, and then the snapshot is dropped — the same answer the local
+	// place path gets when blockStateCreate() refuses it.
+	if (!blockStateCreate(s_blockstate, x, y, z, BLOCK_CHEST)) return;
+	(void)blockStateSet(s_blockstate, x, y, z, BLOCK_CHEST, payload);
 }
 
 // BS_APP_INV_STATE: the whole inventory, authoritative, exactly BS_INV_STATE_BYTES or dropped
@@ -1031,6 +1121,8 @@ void networldApplyPayload(const uint8_t* payload, size_t len)
 	case BS_APP_PLAYER_STATE: applyPlayerState(payload, len); break;
 	case BS_APP_REGISTRY_INFO: applyRegistryInfo(payload, len); break;
 	case BS_APP_REGISTRY_DEFS: registryApplyRemote(payload, len); break;
+	case BS_APP_SERVER_CAPS: applyServerCaps(payload, len); break;
+	case BS_APP_CHEST_STATE: applyChestState(payload, len); break;
 	// Every other type byte is something this client build has no use for. Silently skipped
 	// rather than treated as an error: the server is trusted to only ever send well-formed
 	// application types (server/game/bsgame.c kicks a *client* for sending one it does not
@@ -1063,6 +1155,11 @@ void networldSetWorld(World* w)
 	// is also the only point at which applying a diff is meaningful, since it has to go on top
 	// of the generated blocks rather than under them.
 	s_world = w;
+}
+
+void networldSetBlockStateTable(BlockStateTable* t)
+{
+	s_blockstate = t;
 }
 
 void networldSetEditHook(NetworldEditFn fn, void* userdata)
@@ -1171,6 +1268,10 @@ void networldInit(void)
 	// time" the resting state, which is the state single-player must always be in.
 	s_time_sync_ticks   = 0;
 	s_have_time_sync    = false;
+	// v1.9.0, and the same route again: netDisconnect() reaches here, so a capability word left
+	// over from the last server would let networldSendChestAction() speak to the NEXT one before
+	// it had announced anything — the exact kick the probe exists to prevent.
+	s_server_caps       = 0;
 	s_sent_edits        = 0;
 	s_recv_msgs         = 0;
 	s_sync_entries      = 0;
@@ -1318,6 +1419,31 @@ bool networldSendInvAction(uint8_t op, uint8_t a, uint8_t b, uint8_t c)
 	return netTransportSend(out, sizeof out);
 }
 
+// The chest counterpart of the probe above, with one more gate in front of it: the transport must
+// actually be ESTABLISHED. networldSendInvAction() can lean on s_have_inv_state alone because an
+// INV_STATE only ever arrives inside a live session; the caps word is latched the same way, but
+// this sender is called from a UI path that also runs in single player, and "false" here is what
+// tells that path to apply the transfer locally instead (networld.h). Both gates answer false in
+// single player — no transport, no caps — so neither can refuse a session the other would allow.
+// Hand encoded little-endian, never a struct memcpy, for the same reason as every sender above.
+bool networldSendChestAction(uint8_t op, int x, int y, int z, uint8_t a, uint8_t b, uint8_t count)
+{
+	/* INTEROP-SEAM: chest */
+	if (!networldSessionActive())         return false;
+	if (!(s_server_caps & BS_CAP_CHESTS)) return false;
+
+	uint8_t out[BS_CHEST_ACTION_BYTES];
+	out[0]  = BS_APP_CHEST_ACTION;
+	out[1]  = op;
+	bs_put_i32(out + 2,  (int32_t)x);
+	bs_put_i32(out + 6,  (int32_t)y);
+	bs_put_i32(out + 10, (int32_t)z);
+	out[14] = a;
+	out[15] = b;
+	out[16] = count;   // how many items this transfer asks for; see networld.h
+	return netTransportSend(out, sizeof out);
+}
+
 // The registry counterpart of the capability probe above, and the invariant this whole feature
 // hangs on: the ONLY two callers are applyRegistryInfo() and registryFetchTick(), and both are
 // reachable only once a well-formed BS_APP_REGISTRY_INFO has arrived — the first directly, the
@@ -1385,6 +1511,12 @@ bool networldTakeTimeSync(uint64_t* out)
 	if (out) *out = s_time_sync_ticks;
 	s_have_time_sync = false;
 	return true;
+}
+
+// See networld.h. Latched, the whole word, unknown bits and all.
+uint32_t networldServerCaps(void)
+{
+	return s_server_caps;
 }
 
 bool networldRegistrySynced(void)

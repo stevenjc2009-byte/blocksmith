@@ -1,5 +1,6 @@
 #include "scene/title.h"
 
+#include <errno.h>    // v1.9.0 item 6.3: the delete-failed status line names errno
 #include <stdio.h>
 #include <string.h>
 
@@ -334,6 +335,7 @@ static void titleEnterWorldSelect(TitleState* ts)
 	ts->world_scroll = 0;
 	ts->status[0] = '\0';
 	ts->status_ttl = 0;
+	worldlistConfirmReset(&ts->world_confirm);   // a delete armed last visit must not survive it
 
 	if (ts->world_list_truncated) {
 		snprintf(ts->status, sizeof(ts->status), "showing first %d worlds", WORLDLIST_MAX);
@@ -441,16 +443,100 @@ static void titleCreateWorldFlow(TitleState* ts, TitleResult* r)
 	snprintf(r->world_name, sizeof(r->world_name), "%s", name);
 }
 
+// v1.9.0 item 6.3: the same applet, opened from X on a world row with that world's current
+// name already in the field, so a one-letter fix is a one-letter edit. Everything after the
+// keyboard closes — the validation, the duplicate check, the disk write, the rescan and where
+// the cursor lands — is worldlistRenameAt's (scene/worldlist.h), proven on the host by
+// tests/worldlist_ops_test.c; this stays the glue titleCreateWorldFlow above is.
+static void titleRenameWorldFlow(TitleState* ts)
+{
+	if (ts->cursor < 0 || ts->cursor >= ts->world_count) return;   // worldlistUiStep already gates this
+
+	SwkbdState kbd;
+	swkbdInit(&kbd, SWKBD_TYPE_NORMAL, 2, WORLDLIST_NAME_MAX - 1);
+	swkbdSetHintText(&kbd, "New world name");
+	swkbdSetInitialText(&kbd, ts->worlds[ts->cursor].name);
+	// Same two layers as titleCreateWorldFlow: the applet's own filter, then the real gate.
+	swkbdSetValidation(&kbd, SWKBD_NOTEMPTY_NOTBLANK, SWKBD_FILTER_BACKSLASH, 0);
+
+	char name[WORLDLIST_NAME_MAX];
+	name[0] = '\0';
+	const SwkbdButton btn = swkbdInputText(&kbd, name, sizeof(name));
+
+	if (btn == SWKBD_BUTTON_LEFT) return;   // player cancelled: as silent as a cancelled create
+
+	if (btn != SWKBD_BUTTON_CONFIRM) {
+		// The same "special cases" set titleCreateWorldFlow's identical branch documents.
+		snprintf(ts->status, sizeof(ts->status), "keyboard error %d - retry",
+		         (int)swkbdGetResult(&kbd));
+		ts->status_ttl = WORLD_ERROR_STATUS_TTL;
+		return;
+	}
+
+	const WorldlistRenameResult res = worldlistRenameAt(REGION_ROOT, ts->worlds, WORLDLIST_MAX,
+	                                                    &ts->world_count, &ts->world_list_truncated,
+	                                                    &ts->cursor, &ts->world_confirm, name);
+	const char* msg = worldlistRenameResultText(res);
+	if (msg) {
+		snprintf(ts->status, sizeof(ts->status), "%s", msg);
+		ts->status_ttl = WORLD_ERROR_STATUS_TTL;
+	}
+}
+
+// The second Y press on the same row. worldlistDeleteAt (scene/worldlist.h) does the delete,
+// the rescan and the cursor; the one thing that is this file's is the scroll window, which
+// the list can now be shorter than.
+static void titleDeleteSelectedWorld(TitleState* ts)
+{
+	const bool ok = worldlistDeleteAt(REGION_ROOT, ts->worlds, WORLDLIST_MAX, &ts->world_count,
+	                                  &ts->world_list_truncated, &ts->cursor, &ts->world_confirm);
+	if (!ok) {
+		// v1.9.x audit fix. worldlistDeleteAt now rescans on failure too (see its own comment):
+		// worldlistRmTree's fail-closed walk can already have removed part of the tree before
+		// the failure that stopped it, so what is on screen after this call is the post-attempt
+		// truth, not a frozen pre-attempt snapshot papering over a directory that is no longer
+		// what it was. "incomplete" rather than "failed" for the same reason — this covers both
+		// "nothing was touched" and "some of it is gone", and claiming neither more nor less than
+		// that is the whole point of the fix. The errno number is enough to look up in <errno.h>
+		// from a photo of the bottom screen, exactly like the keyboard-error line above.
+		snprintf(ts->status, sizeof(ts->status), "delete incomplete (errno %d)", errno);
+		ts->status_ttl = WORLD_ERROR_STATUS_TTL;
+	}
+
+	// world_count can move on EITHER outcome now that a failed delete also rescans, so the
+	// scroll window is reclamped either way rather than only after a clean delete.
+	const int max_scroll = ts->world_count > LIST_VISIBLE_ROWS ? ts->world_count - LIST_VISIBLE_ROWS : 0;
+	if (ts->world_scroll > max_scroll) ts->world_scroll = max_scroll;
+}
+
 static TitleResult drawWorldSelect(TitleState* ts, const TitleInput* in, bool tap)
 {
 	TitleResult r = {TITLE_STAY, {0}};
-	const int new_world_idx = ts->world_count;
-	const int back_idx      = ts->world_count + 1;
-	const int total         = ts->world_count + 2;
+	const int total = ts->world_count + 2;   // the world rows, then NEW WORLD, then BACK
 
 	if (in->keys_down & KEY_DDOWN) ts->cursor = (ts->cursor + 1) % total;
 	if (in->keys_down & KEY_DUP)   ts->cursor = (ts->cursor + total - 1) % total;
-	const bool a = (in->keys_down & KEY_A) != 0;
+
+	// v1.9.0 item 6.3: X renames the focused world, Y deletes it — pressed twice — and B
+	// cancels an armed delete before it is allowed to mean "back". Which of those a frame
+	// gets is worldlistUiStep's decision (scene/worldlist.h), scripted through on the host by
+	// tests/worldlist_ops_test.c; this file reads the bits and does what it is told. X and Y
+	// are the two face buttons nothing on this screen reads (options' bindings map in-game
+	// actions only, and main.c hands the raw hidKeysDown() word in), and Y sits opposite A on
+	// the diamond: the destructive press is never on, or next to, the one that loads a world.
+	const WorldlistUiAction ui = worldlistUiStep(&ts->world_confirm, ts->cursor, ts->world_count,
+	                                             (in->keys_down & KEY_X) != 0,
+	                                             (in->keys_down & KEY_Y) != 0,
+	                                             (in->keys_down & KEY_B) != 0);
+	if (ui == WORLDLIST_UI_RENAME_PROMPT) titleRenameWorldFlow(ts);
+	if (ui == WORLDLIST_UI_DELETE_FIRE)   titleDeleteSelectedWorld(ts);
+
+	// Both AFTER the step: a delete just shortened the list, and a rename re-sorted it.
+	const int new_world_idx = ts->world_count;
+	const int back_idx      = ts->world_count + 1;
+	// A frame on which X/Y/B did something does not also load a row: the row under the
+	// cursor may no longer be the one the player was looking at when they pressed.
+	const bool a = (in->keys_down & KEY_A) != 0 && ui == WORLDLIST_UI_NONE;
 
 	// Scroll the minimum needed to keep the cursor's row on screen, rather than
 	// re-centring on every move — a re-centring list jumps under a thumb mid-scroll, the
@@ -462,8 +548,24 @@ static TitleResult drawWorldSelect(TitleState* ts, const TitleInput* in, bool ta
 			ts->world_scroll = ts->cursor - LIST_VISIBLE_ROWS + 1;
 	}
 
-	fontDraw(8, 4, 1, COL_TEXT_DIM, "SELECT WORLD");
-	if (ts->status_ttl > 0) fontDraw(120, 4, 1, COL_WARN, ts->status);
+	// Title bar. While a delete is armed for the focused row the prompt takes the whole strip
+	// and names the world, and it is drawn off the SAME predicate the next Y press goes
+	// through (worldlistConfirmArmedFor), so the text and the behaviour cannot disagree about
+	// which world. The strip is 312 px from x=8, 52 chars at FONT_ADVANCE 6; the 24-char
+	// prefix leaves 27 for the name, so a 28..31-char name is cut in the PROMPT only — the
+	// highlighted row directly under it still shows it in full. It drops on its own after
+	// WORLDLIST_CONFIRM_FRAMES (worldlistConfirmTrack, inside worldlistUiStep above), on B, or
+	// when the cursor moves. Otherwise the header as before, with the X/Y hint in the status
+	// slot whenever nothing is being reported there and there is a world to act on.
+	if (ts->cursor < ts->world_count && worldlistConfirmArmedFor(&ts->world_confirm, ts->cursor)) {
+		char prompt[24 + WORLDLIST_NAME_MAX];
+		snprintf(prompt, sizeof(prompt), "PRESS Y AGAIN TO DELETE %.27s", ts->worlds[ts->cursor].name);
+		fontDraw(8, 4, 1, COL_WARN, prompt);
+	} else {
+		fontDraw(8, 4, 1, COL_TEXT_DIM, "SELECT WORLD");
+		if (ts->status_ttl > 0)       fontDraw(120, 4, 1, COL_WARN, ts->status);
+		else if (ts->world_count > 0) fontDraw(120, 4, 1, COL_TEXT_DIM, "X RENAME  Y DELETE");
+	}
 
 	if (ts->world_count == 0)
 		fontDraw(10, LIST_TOP_Y + 10, 1, COL_TEXT_DIM, "No worlds yet - tap New World");
@@ -484,8 +586,10 @@ static TitleResult drawWorldSelect(TitleState* ts, const TitleInput* in, bool ta
 	if (uiButton(new_r, "NEW WORLD", ts->cursor == new_world_idx, tap, in->touch_x, in->touch_y, a))
 		titleCreateWorldFlow(ts, &r);
 
+	// B that just cancelled an armed delete is consumed by that (WORLDLIST_UI_DELETE_CANCELLED)
+	// and must not also leave the screen.
 	if (uiButton(back_r, "BACK", ts->cursor == back_idx, tap, in->touch_x, in->touch_y, a)
-	    || (in->keys_down & KEY_B)) {
+	    || ((in->keys_down & KEY_B) && ui != WORLDLIST_UI_DELETE_CANCELLED)) {
 		ts->screen = TITLE_SCR_MAIN;
 		ts->cursor = 0;
 	}
@@ -1448,6 +1552,7 @@ void titleInit(TitleState* ts)
 	memset(ts, 0, sizeof(*ts));
 	ts->screen = TITLE_SCR_MAIN;
 	ts->rebind_action = -1;
+	worldlistConfirmReset(&ts->world_confirm);   // already zero == off; explicit anyway (title.h)
 }
 
 TitleResult titleUpdateDraw(TitleState* ts, Options* opts, const TitleInput* in)

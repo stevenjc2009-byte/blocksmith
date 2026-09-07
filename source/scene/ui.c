@@ -14,6 +14,7 @@
 #include "scene/chunk_render.h"   // chunkRenderCamera, for the biome row's position
 #include "scene/ui_layout.h"
 #include "world/block.h"
+#include "world/chest.h"     // ChestState, CHEST_SLOTS — see handleChestSlotTap/handleChestInvSlotTap
 #include "world/crafting.h"
 #include "world/furnace.h"   // furnaceRecipeForInput / furnaceIsFuel, for the accept rules
 
@@ -155,9 +156,54 @@
 // this console. In single player nothing is sent (see inv_bridge.h on the capability probe),
 // so this file behaves identically offline.
 
+// ── v1.9.0 SPLIT: the detached lift ────────────────────────────────────────────────────
+//
+// A Y split (handleSplit, further down) moves the larger half of a stack OUT of the bag into
+// ui->lift; picked_slot still names the origin slot (which keeps the smaller half and stays
+// highlighted), and ui->lift_from remembers it for the wire report. While that half is in
+// the air, the second tap places the HALF, not the slot: onto the origin it goes back, onto
+// an empty or same-item slot it merges (any overflow stays lifted), onto a different item it
+// is refused and stays lifted — no swap, because a swap of half a stack has no meaning.
+// net/inv_bridge.h's lift functions do the arithmetic and the wire report.
+
+static bool liftDetached(const UiState* ui)
+{
+	return ui->lift.item != ITEM_NONE;
+}
+
+// Puts a detached half back into the bag. Called by handleSlotTap on the cancel tap, and by
+// reconcileLift whenever picked_slot has stopped naming lift_from — which is how every
+// existing "drop the lift" site in this file (uiOpenFurnace, uiOpenChest, the toggle, the
+// close bars, the NULL-guard corrections) returns the half without knowing it exists.
+static void returnLift(UiState* ui, Inventory* inv)
+{
+	if (!liftDetached(ui)) return;
+	(void)invBridgeReturnLift(inv, ui->lift_from, &ui->lift);
+	ui->lift_from = -1;
+}
+
+static void reconcileLift(UiState* ui, Inventory* inv)
+{
+	if (liftDetached(ui) && ui->picked_slot != ui->lift_from) returnLift(ui, inv);
+}
+
 // See the file comment for the two-tap pick-up/drop gesture this implements.
 static void handleSlotTap(UiState* ui, Inventory* inv, int slot)
 {
+	if (liftDetached(ui)) {
+		if (slot == ui->picked_slot) {
+			returnLift(ui, inv);          // the cancel: back where it came from
+			ui->picked_slot = -1;
+			return;
+		}
+		(void)invBridgePlaceLift(inv, ui->lift_from, slot, &ui->lift);
+		if (!liftDetached(ui)) {          // all of it landed; a remainder stays lifted
+			ui->lift_from   = -1;
+			ui->picked_slot = -1;
+		}
+		return;
+	}
+
 	if (ui->picked_slot < 0) {
 		// Nothing lifted: pick this slot up, but only if there is something in it — an
 		// empty slot has nothing to move, so tapping one here is a no-op rather than
@@ -657,6 +703,13 @@ static void drawCraftPanelFont(const Inventory* inv)
 //
 // An ITEM_NONE slot is normalised to count 0, so a stale count left behind by a corrupt
 // blockstate payload cannot draw a count badge on a visibly empty cell.
+//
+// v1.9.0 CHEST reuses this unchanged for a chest slot's (item, count) pair — its name still
+// says "furn" only because it was written first, not because the shape is furnace-specific.
+// Renaming it was considered and rejected as a diff this task does not need to make: the
+// function has no furnace-specific behaviour to begin with (it never touches a FurnaceState
+// field), so the two callers sharing it costs nothing and a rename here would only be
+// cosmetic churn on a file that already has enough surface area to review.
 static InvSlot furnSlotView(ItemId item, uint8_t count)
 {
 	InvSlot s;
@@ -759,13 +812,260 @@ static void drawFurnacePanelFont(const FurnaceState* fs, const Inventory* inv, i
 	         "tap a bag slot, then a furnace slot");
 }
 
+// ── Chest transfers (v1.9.0 CHEST) ─────────────────────────────────────────────────────
+//
+// The chest uses the SAME two-tap lift/place gesture as the inventory overlay (see the file
+// comment at the top), not the furnace's carry-and-resolve one. The furnace needed its own
+// gesture because its three slots each accept different things and a lift/place across them
+// would have needed a "would this slot take what I'm carrying" answer per slot; a chest has no
+// such distinction — every chest slot accepts every item (world/chest.h's own file comment) —
+// so the overlay's gesture carries over unchanged: lift a stack on either side, tap where it
+// goes on either side. The player chooses the destination slot, which is also what the wire
+// contract needs (a chest slot index for a deposit, an inventory slot index for a withdraw —
+// see ui.h's UiChestTransferFn), and which a "tap once, the code picks a slot" mapping could
+// not have supplied.
+//
+// A lifted CHEST slot cannot live in ui->picked_slot (an inventory.h slot INDEX, and the
+// furnace block above says why that matters), so it has its own field, ui->picked_chest. At
+// most one of the two is ever >= 0: a lift only starts when nothing is lifted on either side,
+// and every place clears whichever one it consumed. Closing the panel, opening another panel,
+// or the NULL-chest correction in uiUpdateDraw clears both, so nothing is ever "in the air"
+// — the lifted stack is never removed from its source until the place tap resolves it.
+//
+// ── The place rules, and why this does not hand-write a second copy of them ───────────
+//
+// placeStack() below is the overlay's handleSlotTap resolution restated against a destination
+// that is not an inventory slot: empty or same item -> merge via scene/ui_layout.c's
+// uiMoveStackInto() (tops the destination up to INV_STACK_MAX and leaves the remainder in the
+// source — proved by ui_layout_test.c's testMoveStackIntoConservesUnits); different item ->
+// swap the two (item, count) pairs outright, which is inventory.h's inventorySwapSlots rule
+// for the bag. It cannot go through inventoryMoveUnits()/inventorySwapSlots() themselves
+// because those address BOTH slots by inventory index and a chest slot has none — the same
+// structural fact that sends furnaceDeposit through uiMoveStackInto(). A chest -> bag place
+// builds a one-slot InvSlot VIEW of the chest slot, resolves it exactly as if it were the
+// source, and writes the view back; a chest -> chest place does the same against another
+// chest slot.
+//
+// Nothing here can lose a fraction of a stack: uiMoveStackInto() only ever decrements the
+// source by exactly what it credited, and a swap moves both pairs whole. A place onto a full
+// same-item stack moves nothing and still clears the lift — the identical outcome the overlay
+// gives a bag -> bag drop onto a full stack, and for the same reason: the player put it down
+// where it does not fit, and "still holding it" would need a cue this panel has no room for.
+//
+// ── What is reported to the server ─────────────────────────────────────────────────────
+//
+// NOTHING, on the local path, in either direction. This differs from furnaceWithdraw above,
+// which goes through invBridgeAdd() and so reports a BS_INV_OP_PICKUP. It cannot be reused
+// here: inventoryAdd() picks the bag slot by its own scan, and this gesture's whole point is
+// that the player picked the slot. In single player nothing would be sent anyway. In a
+// session the local path does not run at all: main.c registers the transfer callback below
+// off networldSessionActive(), and the callback path applies nothing — the server answers
+// with BS_APP_CHEST_STATE and BS_APP_INV_STATE snapshots that rewrite both sides. A session
+// against a server WITHOUT BS_CAP_CHESTS therefore has read-only chests (the send refuses,
+// the lift is kept, nothing moves); docs/design-1.9.0-chest-multiplayer.md's open question 2
+// recommends a visible refusal for that case and that is not built here.
+
+// Resolves a lifted stack `src` onto the destination (`dst_item`, `dst_count`). See the block
+// comment above for the three rules and where each comes from.
+static void placeStack(InvSlot* src, ItemId* dst_item, uint8_t* dst_count)
+{
+	if (*dst_item == ITEM_NONE || *dst_item == src->item) {
+		(void)uiMoveStackInto(src, dst_item, dst_count);
+		return;
+	}
+
+	const ItemId  held_item  = *dst_item;
+	const uint8_t held_count = *dst_count;
+	*dst_item  = src->item;
+	*dst_count = src->count;
+	src->item  = held_item;
+	src->count = held_count;
+}
+
+static void dropLifts(UiState* ui)
+{
+	ui->picked_slot  = -1;
+	ui->picked_chest = -1;
+}
+
+// v1.9.0 CHEST-NET. The place tap of a bag<->chest transfer with a callback registered: hand
+// it over and apply nothing, whatever it answers. True means "sent" (the lift is cleared,
+// the server's snapshots will rewrite both sides); false means "refused" (nothing changes and
+// the lift is kept, so the player is still holding it). See ui.h's UiChestTransferFn.
+static void chestTransferViaFn(UiState* ui, uint8_t op, uint8_t a, uint8_t b, uint8_t count)
+{
+	if (ui->chest_fn(ui->chest_ud, op, ui->chest_x, ui->chest_y, ui->chest_z, a, b, count))
+		dropLifts(ui);
+}
+
+// A tap on chest slot `c` (0..CHEST_SLOTS-1): lift, cancel, or place onto it.
+static void handleChestSlotTap(UiState* ui, Inventory* inv, ChestState* cs, int c)
+{
+	if (ui->picked_slot < 0 && ui->picked_chest < 0) {
+		// Nothing lifted: lift this slot, but only if there is something in it — same rule
+		// as handleSlotTap. Read off the item AND the count: a chest slot is unpacked from a
+		// save payload byte by byte, so { item, 0 } is a corrupt state this must not carry.
+		if (cs->item[c] != ITEM_NONE && cs->count[c] != 0) ui->picked_chest = c;
+		return;
+	}
+
+	if (ui->picked_chest == c) {
+		// Same slot again: put it back where it was — the overlay's own cancel gesture.
+		ui->picked_chest = -1;
+		return;
+	}
+
+	if (ui->picked_slot >= 0) {
+		// bag -> chest: a DEPOSIT of the lifted bag slot's item onto chest slot c.
+		InvSlot* src = &inv->slots[ui->picked_slot];
+		if (ui->chest_fn) {
+			// The units on the wire come from the DETACHED lift when there is one (ui.h's
+			// `lift`), and from the bag slot otherwise. Today those two always agree, because
+			// the chest screen can never hold a detached lift: split_enabled is `overlay_open`
+			// alone (uiUpdateDraw, below) and reconcileLift returns the lift to lift_from on
+			// any screen change. So this costs nothing right now and is written the safe way
+			// round on purpose — the day split_enabled grows `|| chest_open`, the bag slot
+			// holds the FLOOR half left behind while the lift holds the CEIL half the player
+			// is actually carrying (net/inv_bridge.c's invBridgeSplitStack), and sending the
+			// left-behind number would deposit the wrong amount on every odd stack. ui.h's
+			// UiChestTransferFn comment states this as a rule; this is that rule obeyed.
+			const InvSlot* held = liftDetached(ui) ? &ui->lift : src;
+			chestTransferViaFn(ui, UI_CHEST_OP_DEPOSIT, (uint8_t)held->item, (uint8_t)c,
+			                   held->count);
+			return;
+		}
+		placeStack(src, &cs->item[c], &cs->count[c]);
+		dropLifts(ui);
+		return;
+	}
+
+	// chest -> chest. No opcode carries this, so with a callback registered it is refused
+	// outright — see the block comment above — and the lift is kept.
+	if (ui->chest_fn) return;
+
+	InvSlot view;
+	view.item  = cs->item[ui->picked_chest];
+	view.count = cs->count[ui->picked_chest];
+	placeStack(&view, &cs->item[c], &cs->count[c]);
+	cs->item[ui->picked_chest]  = view.item;
+	cs->count[ui->picked_chest] = view.count;
+	dropLifts(ui);
+}
+
+// A tap on inventory slot `slot` while the chest screen is up. With a chest slot lifted this
+// is a WITHDRAW onto that bag slot; otherwise it is the overlay's own bag -> bag lift/place.
+static void handleChestInvSlotTap(UiState* ui, Inventory* inv, ChestState* cs, int slot)
+{
+	// v1.9.0 SPLIT: with no chest slot lifted this tap is a bag -> bag lift/place, and that is
+	// the gesture block's in uiUpdateDraw (fed before this chain, with lift_enabled on for
+	// exactly this case) — handling it here too would lift and cancel on the same tap.
+	if (ui->picked_chest < 0) return;
+
+	if (ui->chest_fn) {
+		chestTransferViaFn(ui, UI_CHEST_OP_WITHDRAW, (uint8_t)ui->picked_chest, (uint8_t)slot,
+		                   cs->count[ui->picked_chest]);
+		return;
+	}
+
+	InvSlot view;
+	view.item  = cs->item[ui->picked_chest];
+	view.count = cs->count[ui->picked_chest];
+	placeStack(&view, &inv->slots[slot].item, &inv->slots[slot].count);
+	cs->item[ui->picked_chest]  = view.item;
+	cs->count[ui->picked_chest] = view.count;
+	dropLifts(ui);
+}
+
+// ── v1.9.0 SPLIT: the two key gestures ─────────────────────────────────────────────────
+
+// Y. Detaches the larger half of `slot` into ui->lift — see the detached-lift block above
+// handleSlotTap. Only ever reached on the inventory overlay (uiUpdateDraw passes
+// split_enabled for that screen alone; ui_gesture.h says why).
+static void handleSplit(UiState* ui, Inventory* inv, int slot)
+{
+	if (liftDetached(ui)) return;                          // one half in the air at a time
+	if (!invBridgeSplitStack(inv, slot, &ui->lift)) return;
+	ui->lift_from   = slot;
+	ui->picked_slot = slot;
+}
+
+// The chest slot a quick-move lands `item` in: the first same-item slot with room, else the
+// first empty one — the strip rule invBridgePlanQuickMove applies, restated for a chest. -1
+// when the chest has no room, which is a refusal that changes nothing.
+static int chestQuickSlot(const ChestState* cs, ItemId item)
+{
+	for (int c = 0; c < CHEST_SLOTS; c++)
+		if (cs->item[c] == item && cs->count[c] < INV_STACK_MAX) return c;
+	for (int c = 0; c < CHEST_SLOTS; c++)
+		if (cs->item[c] == ITEM_NONE) return c;
+	return -1;
+}
+
+// X. Sends `slot`'s whole stack to the other container without a second tap: the other strip
+// of the bag, or — with the chest panel up — the open chest, by exactly the deposit path a
+// lift-and-tap takes (placeStack locally; the transfer callback under a session — it gets
+// the count, and picked_slot names the source for the frame of the call, as ui.h says a
+// registrant may read it). Any lift is dropped first: a detached half goes back to its
+// slot, so it is the whole stack that moves, never half of it.
+static void handleQuickMove(UiState* ui, Inventory* inv, ChestState* cs, int slot, bool to_chest)
+{
+	returnLift(ui, inv);
+	dropLifts(ui);
+
+	if (!to_chest || !cs) {
+		(void)invBridgeQuickMove(inv, slot);
+		return;
+	}
+
+	InvSlot* src = &inv->slots[slot];
+	const int c = chestQuickSlot(cs, src->item);
+	if (c < 0) return;                                     // chest full: refused
+
+	if (ui->chest_fn) {
+		ui->picked_slot = slot;
+		chestTransferViaFn(ui, UI_CHEST_OP_DEPOSIT, (uint8_t)src->item, (uint8_t)c, src->count);
+		ui->picked_slot = -1;                              // sent or refused, X holds nothing
+		return;
+	}
+	placeStack(src, &cs->item[c], &cs->count[c]);
+}
+
+// ── Chest panel (v1.9.0 CHEST) ─────────────────────────────────────────────────────────
+
+// Same font-pass shape as drawFurnacePanelFont above, minus the two gauges and the
+// per-slot accept border: a chest has no burn/cook state to read and no slot that would
+// ever refuse an item, so neither has anything to draw here. A lifted chest slot gets the
+// same COL_PICKED border a lifted bag slot gets, from the same drawSlotIcon — one cue for
+// one gesture, whichever side it started on. The two hint lines are what tells the player
+// which half of the screen is which rather than a second label drawn over the grid below.
+static void drawChestPanelFont(const ChestState* cs, int picked_chest, C3D_Tex* icons)
+{
+	const URect cr = chestCloseRect();
+	spriteRect((float)cr.x, (float)cr.y, (float)cr.w, (float)cr.h, COL_PANEL_HI);
+	const char* label = "CHEST - TAP TO CLOSE";
+	const int lw = fontTextWidth(label, 1);
+	fontDraw((float)cr.x + (cr.w - (float)lw) * 0.5f,
+	         (float)cr.y + (cr.h - FONT_GLYPH_H) * 0.5f, 1, COL_TEXT, label);
+
+	for (int i = 0; i < CHEST_SLOTS; i++) {
+		const URect r = chestSlotRect(i);
+		const InvSlot view = furnSlotView(cs->item[i], cs->count[i]);
+		drawSlotIcon(PASS_FONT, r, &view, false, picked_chest == i, icons);
+	}
+
+	fontDraw(6, (float)CHEST_HINT_Y, 1, COL_TEXT_DIM,
+	         "tap a slot to lift it, tap where it goes");
+	fontDraw(6, (float)(CHEST_HINT_Y + CHEST_HINT_STEP), 1, COL_TEXT_DIM,
+	         "CHEST above, BAG below");
+}
+
 // ── Entry points ───────────────────────────────────────────────────────────────────────
 
 void uiInit(UiState* ui)
 {
-	memset(ui, 0, sizeof(*ui));
+	memset(ui, 0, sizeof(*ui));   // also clears chest_fn/chest_ud — register after this
 	ui->screen = UI_SCR_HUD;
-	ui->picked_slot = -1;
+	dropLifts(ui);
 }
 
 void uiOpenFurnace(UiState* ui)
@@ -775,12 +1075,33 @@ void uiOpenFurnace(UiState* ui)
 	// and the crafting close bar already follow in uiUpdateDraw, and it matters more here:
 	// picked_slot indexes inv->slots[], and the furnace screen draws a DIFFERENT set of those
 	// slots in different places, so a stale lift would highlight a cell the player never
-	// touched.
-	ui->picked_slot = -1;
+	// touched. Both lifts, since v1.9.0 CHEST: a chest-slot lift left over from a chest
+	// panel would otherwise index a chest this screen is not showing.
+	dropLifts(ui);
+}
+
+void uiOpenChest(UiState* ui, int x, int y, int z)
+{
+	ui->screen  = UI_SCR_CHEST;
+	ui->chest_x = x;
+	ui->chest_y = y;
+	ui->chest_z = z;
+	// Same reset as uiOpenFurnace above, for the same reason, and one more: a chest-slot lift
+	// pending from a PREVIOUS chest would index a slot of the chest now being opened, which is
+	// not the stack the player lifted. Cancelling a lift never moves anything — the lifted
+	// stack was never taken out of its source — so this is always safe to do.
+	dropLifts(ui);
+}
+
+void uiSetChestTransferFn(UiState* ui, UiChestTransferFn fn, void* ud)
+{
+	ui->chest_fn = fn;
+	ui->chest_ud = ud;
 }
 
 UiResult uiUpdateDraw(UiState* ui, Inventory* inv, C3D_Tex* block_icons,
-                       const UiStats* stats, const UiInput* in, FurnaceState* furnace)
+                       const UiStats* stats, const UiInput* in, FurnaceState* furnace,
+                       ChestState* chest)
 {
 	// Rising edge only, same as title.c's own `tap` — see title.h's TitleInput comment for
 	// why (KEY_TOUCH is never actually set by hidScanInput, so the caller derives
@@ -802,12 +1123,60 @@ UiResult uiUpdateDraw(UiState* ui, Inventory* inv, C3D_Tex* block_icons,
 		ui->picked_slot = -1;
 	}
 
+	// v1.9.0 CHEST. The identical same-frame correction, for the identical reason, with
+	// `chest` standing in for `furnace` — see the comment immediately above for the full
+	// argument; it is not restated here because nothing about it changes for a chest.
+	if (ui->screen == UI_SCR_CHEST && chest == NULL) {
+		ui->screen = UI_SCR_INVENTORY;
+		dropLifts(ui);
+	}
+
 	// Captured once and used for both the tap logic and the draw below, so a tap is always
 	// interpreted against the screen the player actually saw this frame — any screen switch
 	// a handler makes below (opening or closing the overlay) takes effect next frame, the
 	// same "change applies next frame" rule title.c's own ts->screen follows.
 	const bool overlay_open = (ui->screen == UI_SCR_INVENTORY);
 	const bool furnace_open = (ui->screen == UI_SCR_FURNACE);
+	const bool chest_open   = (ui->screen == UI_SCR_CHEST);
+
+	// v1.9.0 SPLIT. A detached half whose origin is no longer the lifted slot — some site
+	// above or in a previous frame dropped the lift — goes back into the bag before anything
+	// reads or draws the bag this frame. See the detached-lift block above handleSlotTap.
+	reconcileLift(ui, inv);
+
+	// v1.9.0 SPLIT. The gestures: bag-slot taps (lift / place / merge), Y (split) and X
+	// (quick-move), classified by scene/ui_gesture.h and acted on here. Fed EVERY frame, HUD
+	// included — the module's edge state must track the buttons continuously (its header says
+	// why) — and BEFORE the tap chain below, so a tap event is classified against the lift
+	// state the player saw. The chain no longer handles bag-slot taps on the overlay or the
+	// furnace screen (those are this block's), and on the chest screen it handles them only
+	// while a CHEST slot is lifted (the withdraw), which is exactly when lift_enabled is off.
+	{
+		int slot_under = -1;
+		if (in->touch_down) {
+			if (furnace_open)      slot_under = hitFurnaceInvSlot(in->touch_x, in->touch_y);
+			else if (chest_open)   slot_under = hitChestInvSlot(in->touch_x, in->touch_y);
+			else if (overlay_open) slot_under = hitInventorySlot(in->touch_x, in->touch_y, true);
+		}
+		const UiGestureInput gin = {
+			.touch_down    = in->touch_down,
+			.slot_under    = slot_under,
+			.keys_held     = in->keys_held,
+			.lifted_slot   = ui->picked_slot,
+			.lift_enabled  = overlay_open || furnace_open || (chest_open && ui->picked_chest < 0),
+			.split_enabled = overlay_open,
+			.chest_open    = chest_open,
+		};
+		const UiGestureEvent ev = uiGestureFeed(&ui->gesture, &gin, inv);
+		switch (ev.kind) {
+		case UI_GESTURE_LIFT:       handleSlotTap(ui, inv, ev.src); break;
+		case UI_GESTURE_PLACE:
+		case UI_GESTURE_MERGE:      handleSlotTap(ui, inv, ev.dst); break;
+		case UI_GESTURE_SPLIT:      handleSplit(ui, inv, ev.src); break;
+		case UI_GESTURE_QUICK_MOVE: handleQuickMove(ui, inv, chest, ev.src, ev.to_chest); break;
+		case UI_GESTURE_NONE:       break;
+		}
+	}
 
 	if (tap && furnace_open) {
 		const int tx = in->touch_x, ty = in->touch_y;
@@ -829,11 +1198,30 @@ UiResult uiUpdateDraw(UiState* ui, Inventory* inv, C3D_Tex* block_icons,
 				else
 					furnaceDeposit(ui, inv, furnace, fslot);
 			} else {
-				// hitFurnaceInvSlot, not hitInventorySlot: the main grid is at FURN_GRID_Y on
-				// this screen. Same two-tap lift/drop as the inventory overlay from here on —
-				// the bag behaves identically whichever screen it is drawn on.
-				const int slot = hitFurnaceInvSlot(tx, ty);
-				if (slot >= 0) handleSlotTap(ui, inv, slot);
+				// v1.9.0 SPLIT: a tap on the main grid (hitFurnaceInvSlot — the grid is at
+				// FURN_GRID_Y on this screen) is the gesture block's above, which hit-tests
+				// the same rect and runs the same two-tap lift/drop. Nothing to do here.
+			}
+		}
+	} else if (tap && chest_open) {
+		const int tx = in->touch_x, ty = in->touch_y;
+
+		if (ptInRect(chestCloseRect(), tx, ty)) {
+			// Back to the HUD, not to the inventory overlay the furnace close bar goes to: a
+			// chest is opened from the world by interacting with the block, so closing it
+			// puts the player back where they were. Any pending lift is cancelled — the
+			// lifted stack was never taken out of its source, so nothing is lost.
+			ui->screen = UI_SCR_HUD;
+			dropLifts(ui);
+		} else {
+			const int cslot = hitChestSlot(tx, ty);
+			if (cslot >= 0) {
+				handleChestSlotTap(ui, inv, chest, cslot);
+			} else {
+				// hitChestInvSlot, not hitInventorySlot: the main grid is at CHEST_GRID_Y on
+				// this screen, the same relocation the furnace screen makes for its own grid.
+				const int slot = hitChestInvSlot(tx, ty);
+				if (slot >= 0) handleChestInvSlotTap(ui, inv, chest, slot);
 			}
 		}
 	} else if (tap) {
@@ -852,10 +1240,10 @@ UiResult uiUpdateDraw(UiState* ui, Inventory* inv, C3D_Tex* block_icons,
 				ui->screen = UI_SCR_HUD;
 				ui->picked_slot = -1;
 			} else {
+				// v1.9.0 SPLIT: a tap on a slot is the gesture block's above; only the craft
+				// rows are still resolved here.
 				const int slot = hitInventorySlot(tx, ty, true);
-				if (slot >= 0) {
-					handleSlotTap(ui, inv, slot);
-				} else {
+				if (slot < 0) {
 					for (int i = 0; i < RECIPE_COUNT; i++) {
 						if (ptInRect(craftRowRect(i), tx, ty)) {
 							handleCraftTap(inv, i);
@@ -870,9 +1258,9 @@ UiResult uiUpdateDraw(UiState* ui, Inventory* inv, C3D_Tex* block_icons,
 	spriteBegin(SCR_W, SCR_H);
 
 	// ── Pass 1: font texture. Every panel, border, label and count badge on the screen,
-	// regardless of which of the three screens is showing — one texture, one flush, one draw
-	// call, batched exactly the way gfx/sprite.h's own file comment describes a whole UI
-	// screen should be.
+	// regardless of which of the four screens is showing (v1.9.0 CHEST added the fourth) —
+	// one texture, one flush, one draw call, batched exactly the way gfx/sprite.h's own
+	// file comment describes a whole UI screen should be.
 	spriteTexture(fontTexture());
 	spriteRect(0, 0, SCR_W, SCR_H, COL_BG);
 
@@ -894,6 +1282,13 @@ UiResult uiUpdateDraw(UiState* ui, Inventory* inv, C3D_Tex* block_icons,
 			             false, ui->picked_slot == slot, block_icons);
 		}
 		drawFurnacePanelFont(furnace, inv, ui->picked_slot, block_icons);
+	} else if (chest_open) {
+		for (int i = 0; i < INV_MAIN_SLOTS; i++) {
+			const int slot = INV_HOTBAR_SLOTS + i;
+			drawSlotIcon(PASS_FONT, chestGridSlotRect(i), &inv->slots[slot],
+			             false, ui->picked_slot == slot, block_icons);
+		}
+		drawChestPanelFont(chest, ui->picked_chest, block_icons);
 	} else if (overlay_open) {
 		for (int i = 0; i < INV_MAIN_SLOTS; i++) {
 			const int slot = INV_HOTBAR_SLOTS + i;
@@ -938,6 +1333,19 @@ UiResult uiUpdateDraw(UiState* ui, Inventory* inv, C3D_Tex* block_icons,
 				}
 				const InvSlot view = furnSlotView(item, count);
 				drawSlotIcon(PASS_ATLAS, furnSlotRect(which), &view, false, false, block_icons);
+			}
+		} else if (chest_open) {
+			for (int i = 0; i < INV_MAIN_SLOTS; i++) {
+				const int slot = INV_HOTBAR_SLOTS + i;
+				drawSlotIcon(PASS_ATLAS, chestGridSlotRect(i), &inv->slots[slot], false, false,
+				             block_icons);
+			}
+
+			// The chest's CHEST_SLOTS cells, in the same pass as every other icon on the
+			// screen — same two-draw-call reasoning as the furnace cells just above.
+			for (int i = 0; i < CHEST_SLOTS; i++) {
+				const InvSlot view = furnSlotView(chest->item[i], chest->count[i]);
+				drawSlotIcon(PASS_ATLAS, chestSlotRect(i), &view, false, false, block_icons);
 			}
 		} else if (overlay_open) {
 			for (int i = 0; i < INV_MAIN_SLOTS; i++) {

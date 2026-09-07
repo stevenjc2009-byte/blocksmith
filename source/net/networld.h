@@ -33,6 +33,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "world/blockstate.h"   // BlockStateTable — networldSetBlockStateTable() below
 #include "world/world.h"
 
 // Registers the World that networldUpdate() writes into and networldOnColumnLoad() drains
@@ -180,6 +181,72 @@ void networldSetInvHook(NetworldInvFn fn, void* userdata);
 // first, is what makes that guarantee actually hold rather than merely being documented. This
 // is the capability probe itself, not a guard in front of it.
 bool networldSendInvAction(uint8_t op, uint8_t a, uint8_t b, uint8_t c);
+
+// ---- chest sync (v1.9.0) -------------------------------------------------------------------
+//
+// docs/design-1.9.0-chest-multiplayer.md. Three opcodes (proto/bs_proto.h): BS_APP_SERVER_CAPS
+// (S->C, once at join), BS_APP_CHEST_STATE (S->C, one whole chest, authoritative) and
+// BS_APP_CHEST_ACTION (C->S, one requested transfer). The client never applies a chest transfer
+// itself while in a session: it sends the request and waits for the snapshot, which is written
+// into the same BlockStateTable single-player uses — so scene/ui.c's chest panel, the break path
+// and the save path read a networked chest exactly the way they read a local one, and none of
+// them had to change.
+
+// Registers (or with NULL, clears) the BlockStateTable a BS_APP_CHEST_STATE snapshot is written
+// into: main.c's own s_blockstate, the table its local place/break paths already use. Same shape
+// and lifetime as networldSetWorld() — not touched by networldInit(), NULL until main.c wires it
+// up, and while it is NULL every snapshot is dropped on the floor. A snapshot inside the world's
+// range is written into the table WITHOUT consulting the registered World: the chest's own
+// BLOCK_EDIT may still be in flight on the unordered transport, and a snapshot refused for
+// arriving first would be lost until the next mutation. A record already there (a chest's, or a
+// stale one of another kind) is overwritten in place; a position with none gets one created,
+// exactly as the local place path would. Never queued: a snapshot is the chest's contents at one
+// instant, not a change to replay later, and a stale copy held back could not answer for what
+// the server holds now.
+void networldSetBlockStateTable(BlockStateTable* t);
+
+// The capability bitfield the server announced in BS_APP_SERVER_CAPS (BS_CAP_* in
+// proto/bs_proto.h): 0 until one has arrived this session, 0 again after networldInit(). A
+// second SERVER_CAPS overwrites the first. Bits this build does not know are kept verbatim and
+// never interpreted — a caller tests the one bit it cares about and nothing else. Latched, not
+// consumed (networldWorldSeed()'s posture, not networldTakeTimeSync()'s): "the server has told
+// us, ever". A server older than the message never sends it at all, which reads as 0, which is
+// exactly the right answer (bs_proto.h's own comment on BS_APP_SERVER_CAPS).
+uint32_t networldServerCaps(void);
+
+// Encodes and sends one chest transfer as BS_APP_CHEST_ACTION. Sends NOTHING, and returns false,
+// unless the transport is NET_TRANSPORT_ESTABLISHED (networldSessionActive()) AND the server
+// announced BS_CAP_CHESTS — the capability probe itself, in the exact sense
+// networldSendInvAction()'s is: a server without the bit kicks any client that sends this
+// opcode (server/game/bsgame.c's handle_app_payload default case), so the check lives here and
+// not in the caller. True means "sent — do NOT apply locally": the server answers an accepted
+// transfer with a BS_APP_CHEST_STATE, which lands in the registered table by itself. False —
+// single player, no session, a server without the bit — means the caller applies the transfer
+// locally, exactly as it did before this existed.
+//
+// Field contract, agreed with the server side for its v1.9.10 (the 17-byte frame has no
+// separate item-id field, and the server cannot know what sits in a client inventory slot):
+//   BS_CHEST_OP_DEPOSIT   a = the ITEM ID (registry id, u8) being deposited, b = the chest slot
+//   BS_CHEST_OP_WITHDRAW  a = the chest slot, b = the inventory slot (unused by the server;
+//                         sent anyway for symmetry)
+//   count                 how many items the transfer asks for. Byte 16.
+// bs_proto.h's own one-line comment on BS_CHEST_OP_DEPOSIT still reads "a = inventory slot";
+// that header is frozen, and the contract above is what the server implements. x, y, z are
+// plain ints, the same shape networldSendBlockEdit() takes.
+//
+// Byte 16 was very nearly a zero pad here, on the reasoning that a transfer moves whatever the
+// lifted stack holds and the server can decide the amount. It is a count. The frozen design
+// (docs/design-1.9.0-chest-multiplayer.md, the BS_APP_CHEST_ACTION line) spells the frame out
+// as {op u8, x i32, y i32, z i32, a u8, b u8, count u8}, and the server's v1.9.10 is written
+// against that same line, so a zero would have been refused by a server that range-checks it
+// with nothing on either side to say why. The count has to travel because the client is the
+// only end that knows it: after a stack split the lift holds part of a stack, and "all of it"
+// is not a quantity a server can infer from an inventory slot it cannot see.
+//
+// Wire layout, 17 bytes, little-endian (BS_CHEST_ACTION_BYTES):
+//   [0] BS_APP_CHEST_ACTION   [1] op   [2..5] x i32   [6..9] y i32   [10..13] z i32
+//   [14] a   [15] b   [16] count
+bool networldSendChestAction(uint8_t op, int x, int y, int z, uint8_t a, uint8_t b, uint8_t count);
 
 // ---- saved player state (v1.5.0) -----------------------------------------------------------
 //

@@ -1005,13 +1005,36 @@ missing, is called out as a required step for this version specifically.
 
 Full research, with sources and licence terms: `docs/research/audio.md`.
 
-### v1.9.0 — Storage and quality of life — planned
+### v1.9.0 — Storage and quality of life — built, not yet released
 
-**Added.** Chests. Stack splitting and merging, shift-move, and the small conveniences a
-game gets tiring without.
+**Added.** Chests — `BLOCK_CHEST = 43` (`source/world/block.h:262`, static-asserted at
+line 299), an 8-slot storage block (`BS_CHEST_SLOTS` = 8, `deps/blocksmith-server/proto/bs_proto.h:598`)
+usable both single-player and over multiplayer. A chest's contents live in the same
+`BlockStateTable` a local furnace already used, so the chest panel, the break path and the
+save path all read a networked chest exactly like a local one; `BLOCKSTATE_SLOTS` was raised
+64 → 256 to give that table headroom (`source/world/blockstate.h:160`). Also added: a
+delete-twice confirm so a stray tap can no longer destroy a world, and renaming a world from
+the list itself without loading it first (`source/scene/worldlist.c:346-430,448-477`); a
+block-name readout under the crosshair naming whatever the reticle is aimed at
+(`source/scene/aimtext.c`, `source/scene/crosshair.c:24`); and inventory gestures for split,
+merge and quick-move, so a stack can move without dragging each item across one at a time
+(`source/scene/ui_gesture.h:83-85`, `source/scene/ui.c:984-1016`).
 
-`docs/ROADMAP.md` gives this version one short paragraph; nothing beyond it has been
-researched or specified yet.
+**Changed.** L and R, which used to step render distance live during play, now cycle the
+hotbar selection instead; render distance moved to its own row on the pause menu's options
+page (`source/scene/hotbar.h`, `source/scene/pausemenu.c:223-234`). Chest transfers travel
+over three new opcodes — `BS_APP_SERVER_CAPS` (`0x11`), `BS_APP_CHEST_STATE` (`0x12`) and
+`BS_APP_CHEST_ACTION` (`0x13`) — capability-gated rather than version-gated at the point of
+use: the client only sends a transfer once the server has announced `BS_CAP_CHESTS`
+(`source/net/networld.c:1433`). The matching server is `blocksmith-server` v1.9.10 or later.
+Against v1.9.9, the join still succeeds and chests can be placed and broken, but the
+capability bit is never announced, so nothing moves in or out — the client falls back to
+client-local chests rather than applying a transfer over the wire. Against anything older
+than v1.9.9, the chest block row changes the registry hash and the join itself is refused
+outright, before chests are ever a question.
+
+Full design and the storage decision behind it: `docs/design-1.9.0-chest-multiplayer.md`
+and `docs/decision-1.9.0-chest-storage.md`.
 
 ### v1.9.1 — The new interface — planned
 

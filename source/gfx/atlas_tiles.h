@@ -113,14 +113,22 @@ enum {
 	TILE_FURNACE_FRONT,      // 46 — unlit
 	TILE_FURNACE_FRONT_LIT,  // 47 — lit
 
+	// v1.9.0 "Storage"'s chest. NOT auto-numbered from TILE_FURNACE_FRONT_LIT: doing so
+	// would give it value 48, which collides with ITEM_ICON_APPLE (source/gfx/item_icons.h)
+	// — the sheet has had no free slot directly after 47 since v1.8.16 painted 48..56 with
+	// item icons. This is a BLOCK FACE (world/registry.c's chest row points FACE_TOP at it
+	// directly, so it is also the inventory icon — no gfx/item_icons.h entry needed), and it
+	// claims the first slot free AFTER the icons: 57. tools/make_atlas.py's TILES list
+	// mirrors this — "chest_top" is appended last, landing at index 57 by the same append-
+	// only discipline as everything above it.
+	TILE_CHEST_TOP = 57,
+
 	// How many slots the list above NAMES. Not the sheet's capacity — that is
-	// ATLAS_TILE_COUNT (64) in world/atlas_uv.h, and these forty-eight are 0..47 of it.
-	// (This sentence said "thirty-two are 0..31" until 2026-09-03; it had been stale since
-	// v1.8.10 added the torch and was a version behind again by v1.8.12. The paragraph below
-	// carries the same figure and stayed correct, so the two disagreed in the same file —
-	// which is exactly how a reader ends up trusting the wrong one.)
+	// ATLAS_TILE_COUNT (64) in world/atlas_uv.h, and these forty-nine are 0..47 plus 57 of
+	// it — no longer a contiguous run, which is why this can no longer be left to auto-
+	// increment from TILE_CHEST_TOP (57 + 1 = 58 would be wrong).
 	//
-	// Nor is it the number of PAINTED slots any more. Since v1.8.16 that is 57, not 48: the
+	// Nor is it the number of PAINTED slots any more. Since v1.9.0 that is 58, not 49: the
 	// sheet also carries nine ITEM ICONS at 48..56 which this enum deliberately does not name.
 	// See the note below TILE_USED_COUNT for why, and source/gfx/item_icons.h for the ids.
 	//
@@ -128,17 +136,19 @@ enum {
 	// asserts that the number of BTEX/TILE assert lines equals this number, which is what
 	// turns "somebody forgot to add the assert" from silence into a build error. Same shape
 	// as BLOCK_FACES in world/block.h, which terminates the face enum for the same reason.
-	TILE_USED_COUNT,
+	TILE_USED_COUNT = 49,
 
-	// Forty-eight of ATLAS_TILE_COUNT (64) addressable slots used, 0..47 — twelve until
-	// v1.8.3 Phase 3 claimed 12..16 for snow, ice, cactus, dead bush and fern, seventeen
-	// until v1.8.8 claimed 17..30 for the birch and spruce materials, the tall grass top,
-	// the four flowers and the apple, thirty-one until v1.8.10 claimed 31 for the torch,
-	// thirty-two until v1.8.12 claimed 32..37 for the six ores, thirty-eight until v1.8.14
-	// claimed 38..41 for the four raw meats, and forty-two until v1.8.15 claimed 42..47 for
-	// the four cooked meats and the furnace's unlit/lit front faces.
+	// Forty-eight of ATLAS_TILE_COUNT (64) addressable slots used as block faces 0..47, plus
+	// TILE_CHEST_TOP at 57 — forty-nine named slots total — twelve until v1.8.3 Phase 3
+	// claimed 12..16 for snow, ice, cactus, dead bush and fern, seventeen until v1.8.8 claimed
+	// 17..30 for the birch and spruce materials, the tall grass top, the four flowers and the
+	// apple, thirty-one until v1.8.10 claimed 31 for the torch, thirty-two until v1.8.12
+	// claimed 32..37 for the six ores, thirty-eight until v1.8.14 claimed 38..41 for the four
+	// raw meats, forty-two until v1.8.15 claimed 42..47 for the four cooked meats and the
+	// furnace's unlit/lit front faces, and forty-eight until v1.9.0 claimed slot 57 for the
+	// chest — the first free slot after the v1.8.16 icon carve-out, not a contiguous append.
 	//
-	// v1.8.16 IMP-ICONS then PAINTED 48..56 without naming them here, and the distinction is
+	// v1.8.16 IMP-ICONS PAINTED 48..56 without naming them here, and the distinction is
 	// the whole point of the change. Those nine are ITEM ICONS — an apple, four raw cuts, four
 	// cooked cuts — with real alpha-0 texels around the item's silhouette, drawn only by
 	// scene/ui.c's inventory quad. They must NEVER be a block face: the opaque terrain pass
@@ -150,11 +160,12 @@ enum {
 	// enum has a name for these. Their ids live in source/gfx/item_icons.h instead, which the
 	// block-face path never includes.
 	//
-	// So TILE_USED_COUNT stays 48 and still means exactly what it says: block-face tiles. The
-	// number that moved is ATLAS_PAINTED_SLOTS in world/atlas_uv_shader_test.c, 48 -> 57,
-	// because that one counts what tools/make_atlas.py actually paints.
+	// So TILE_USED_COUNT stays a count of block-face tiles: 48 -> 49 with the chest, and the
+	// number that moved separately is ATLAS_PAINTED_SLOTS in world/atlas_uv_shader_test.c,
+	// 57 -> 58, because that one counts what tools/make_atlas.py actually paints (block faces
+	// plus item icons together).
 	//
-	// Six free slots remain, 57..62: slot 63 is ATLAS_TILE_MISSING (world/atlas_uv.h)
+	// Five free slots remain, 58..62: slot 63 is ATLAS_TILE_MISSING (world/atlas_uv.h)
 	// and cannot be claimed.
 	//
 	// It was twelve of FIFTEEN until v1.8.2's task 13b. The old ceiling was not the sheet
@@ -165,7 +176,7 @@ enum {
 	// dimension — for 64 slots, all addressable. The vertex is still 8 bytes. See the long
 	// note in world/atlas_uv.h.
 	//
-	// The spares (57..62 as of v1.8.16, and the reserved 63 — this sentence said "32 spares
+	// The spares (58..62 as of v1.9.0, and the reserved 63 — this sentence said "32 spares
 	// (32..62)" and had been stale since v1.8.14) are NOT blank. Since v1.6.0 F7
 	// tools/make_atlas.py paints every slot its TILES list does not cover with the
 	// magenta/black missing-texture marker, and ATLAS_TILE_MISSING (slot 63, world/atlas_uv.h)

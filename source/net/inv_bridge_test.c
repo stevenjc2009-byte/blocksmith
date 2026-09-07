@@ -541,6 +541,335 @@ static void test_registration_without_a_snapshot_leaves_the_inventory_alone(void
     networldSetInvHook(NULL, NULL);
 }
 
+/* ------------------------------------------------- v1.9.0 SPLIT: lift + quick-move --------- */
+
+/* Sets slot `n` by hand; every SPLIT scenario starts from an armed session and writes its own
+ * starting contents, same as the scenarios above. */
+static void setSlot(Inventory *inv, int n, ItemId item, uint8_t count)
+{
+    inv->slots[n].item  = item;
+    inv->slots[n].count = count;
+}
+
+static bool slotIs(const Inventory *inv, int n, ItemId item, uint8_t count)
+{
+    return inv->slots[n].item == item && inv->slots[n].count == count;
+}
+
+/* Packet `n` is MOVE(a, b, c). */
+static bool sentMove(int n, uint8_t a, uint8_t b, uint8_t c)
+{
+    uint8_t op, pa, pb, pc;
+    if (!sentAction(n, &op, &pa, &pb, &pc)) return false;
+    return op == BS_INV_OP_MOVE && pa == a && pb == b && pc == c;
+}
+
+static void test_split_refuses_when_there_is_no_half(void)
+{
+    puts("a split refuses a stack of 1, an empty slot, a bad index and a NULL, writing nothing");
+
+    Inventory inv;
+    armSession(&inv);
+    setSlot(&inv, 0, BLOCK_STONE, 1);
+
+    InvSlot lift = { BLOCK_DIRT, 9 };   /* a sentinel: a refusal must not touch it */
+    check(!invBridgeSplitStack(&inv, 0, &lift),  "a stack of 1 refuses");
+    check(lift.item == BLOCK_DIRT && lift.count == 9, "the lift was not written by the refusal");
+    check(slotIs(&inv, 0, BLOCK_STONE, 1),         "the slot of 1 is unchanged");
+    check(!invBridgeSplitStack(&inv, 5, &lift),  "an empty slot refuses");
+    check(!invBridgeSplitStack(&inv, -1, &lift), "a negative slot refuses");
+    check(!invBridgeSplitStack(&inv, 0, NULL),   "a NULL lift refuses");
+    check(!invBridgeSplitStack(&inv, INV_SLOT_COUNT, &lift), "an out-of-range slot refuses");
+    check(fake_sent_calls == 0,                   "no refusal sent anything");
+}
+
+static void test_split_lifts_the_ceiling_half(void)
+{
+    puts("a split lifts ceil(n/2) and leaves floor(n/2): 2, even, odd, and the cap");
+
+    Inventory inv;
+    armSession(&inv);
+    setSlot(&inv, 0, BLOCK_STONE, 2);
+    setSlot(&inv, 1, BLOCK_STONE, 10);
+    setSlot(&inv, 2, BLOCK_STONE, 7);
+    setSlot(&inv, 3, BLOCK_DIRT,  INV_STACK_MAX);
+
+    InvSlot lift = { ITEM_NONE, 0 };
+    check(invBridgeSplitStack(&inv, 0, &lift) && lift.item == BLOCK_STONE && lift.count == 1,
+          "2 -> lift 1");
+    check(slotIs(&inv, 0, BLOCK_STONE, 1), "2 -> slot keeps 1");
+
+    check(invBridgeSplitStack(&inv, 1, &lift) && lift.item == BLOCK_STONE && lift.count == 5,
+          "10 -> lift 5");
+    check(slotIs(&inv, 1, BLOCK_STONE, 5), "10 -> slot keeps 5");
+
+    check(invBridgeSplitStack(&inv, 2, &lift) && lift.item == BLOCK_STONE && lift.count == 4,
+          "7 -> lift 4 (the lift gets the odd unit)");
+    check(slotIs(&inv, 2, BLOCK_STONE, 3), "7 -> slot keeps 3");
+
+    check(invBridgeSplitStack(&inv, 3, &lift) && lift.item == BLOCK_DIRT && lift.count == 50,
+          "99 -> lift 50");
+    check(slotIs(&inv, 3, BLOCK_DIRT, 49), "99 -> slot keeps 49");
+
+    check(fake_sent_calls == 0, "a split sends nothing: the server's copy has not changed");
+}
+
+static void test_place_lift_exact_fit_reports_a_move_from_the_origin(void)
+{
+    puts("placing a lift into an empty slot takes it whole and sends MOVE(origin, dst, placed)");
+
+    Inventory inv;
+    armSession(&inv);
+    setSlot(&inv, 0, BLOCK_STONE, 10);
+
+    InvSlot lift;
+    check(invBridgeSplitStack(&inv, 0, &lift), "split 10 (lift 5, slot 5)");
+
+    const uint8_t placed = invBridgePlaceLift(&inv, 0, 9, &lift);
+    check(placed == 5,                          "5 units placed");
+    check(slotIs(&inv, 9, BLOCK_STONE, 5),      "slot 9 holds the 5");
+    check(lift.item == ITEM_NONE && lift.count == 0, "the lift is empty and normalised");
+    check(slotIs(&inv, 0, BLOCK_STONE, 5),      "the origin still holds its 5");
+    check(fake_sent_calls == 1,                 "exactly one packet went out");
+    check(sentMove(0, 0, 9, 5),                 "it is MOVE(origin 0, dst 9, 5)");
+}
+
+static void test_place_lift_overflow_keeps_the_remainder_lifted(void)
+{
+    puts("placing a lift onto a nearly-full same-item stack tops it up and keeps the rest lifted");
+
+    Inventory inv;
+    armSession(&inv);
+    setSlot(&inv, 0, BLOCK_STONE, 20);
+    setSlot(&inv, 9, BLOCK_STONE, (uint8_t)(INV_STACK_MAX - 4));
+
+    InvSlot lift;
+    check(invBridgeSplitStack(&inv, 0, &lift) && lift.count == 10, "split 20 (lift 10)");
+
+    check(invBridgePlaceLift(&inv, 0, 9, &lift) == 4, "only the 4 that fit were placed");
+    check(slotIs(&inv, 9, BLOCK_STONE, INV_STACK_MAX), "slot 9 is at the cap");
+    check(lift.item == BLOCK_STONE && lift.count == 6, "6 units are still lifted");
+    check(fake_sent_calls == 1 && sentMove(0, 0, 9, 4), "one packet: MOVE(0, 9, 4), the placed count");
+
+    check(invBridgePlaceLift(&inv, 0, 9, &lift) == 0 && lift.count == 6 && fake_sent_calls == 1,
+          "onto the now-full stack again: nothing placed, lift intact, no packet");
+
+    check(invBridgePlaceLift(&inv, 0, 10, &lift) == 6, "the remainder places whole into an empty slot");
+    check(lift.item == ITEM_NONE && slotIs(&inv, 10, BLOCK_STONE, 6), "lift empty, slot 10 holds 6");
+    check(fake_sent_calls == 2 && sentMove(1, 0, 10, 6), "second packet: MOVE(0, 10, 6)");
+    check(inv.slots[0].count + inv.slots[9].count + inv.slots[10].count == 20 + INV_STACK_MAX - 4,
+          "no unit was created or lost across the split and both places");
+}
+
+static void test_place_lift_onto_a_different_item_refuses(void)
+{
+    puts("placing a lift onto a different item refuses, keeps the lift, sends nothing");
+
+    Inventory inv;
+    armSession(&inv);
+    setSlot(&inv, 0, BLOCK_STONE, 6);
+    setSlot(&inv, 9, BLOCK_DIRT,  2);
+
+    InvSlot lift;
+    check(invBridgeSplitStack(&inv, 0, &lift) && lift.count == 3, "split 6 (lift 3)");
+    check(invBridgePlaceLift(&inv, 0, 9, &lift) == 0, "nothing placed");
+    check(lift.item == BLOCK_STONE && lift.count == 3, "the lift is intact");
+    check(slotIs(&inv, 9, BLOCK_DIRT, 2),              "the dirt is untouched");
+    check(fake_sent_calls == 0,                        "no packet");
+}
+
+static void test_place_lift_back_onto_its_origin_sends_nothing(void)
+{
+    puts("placing a lift back onto the slot it was split from restores it and sends nothing");
+
+    Inventory inv;
+    armSession(&inv);
+    setSlot(&inv, 0, BLOCK_STONE, 7);
+
+    InvSlot lift;
+    check(invBridgeSplitStack(&inv, 0, &lift) && lift.count == 4, "split 7 (lift 4)");
+    check(invBridgePlaceLift(&inv, 0, 0, &lift) == 4, "all 4 go back");
+    check(slotIs(&inv, 0, BLOCK_STONE, 7) && lift.item == ITEM_NONE, "the slot is 7 again, lift empty");
+    check(fake_sent_calls == 0, "the server's copy never changed, so nothing is sent");
+}
+
+static void test_return_lift_goes_to_the_origin_or_anywhere_free(void)
+{
+    puts("returning a lift merges into the origin, or anywhere free if the origin changed under it");
+
+    Inventory inv;
+    armSession(&inv);
+
+    /* The ordinary cancel. */
+    setSlot(&inv, 0, BLOCK_STONE, 7);
+    InvSlot lift;
+    check(invBridgeSplitStack(&inv, 0, &lift), "split 7");
+    check(invBridgeReturnLift(&inv, 0, &lift), "the return reports the lift empty");
+    check(slotIs(&inv, 0, BLOCK_STONE, 7) && lift.item == ITEM_NONE, "the slot is 7 again");
+    check(fake_sent_calls == 0, "a return sends nothing");
+
+    /* A snapshot rewrote the origin while the half was lifted. */
+    setSlot(&inv, 0, BLOCK_STONE, 8);
+    check(invBridgeSplitStack(&inv, 0, &lift) && lift.count == 4, "split 8 (lift 4)");
+    setSlot(&inv, 0, BLOCK_DIRT, 1);
+    check(invBridgeReturnLift(&inv, 0, &lift), "the lift still went somewhere");
+    check(slotIs(&inv, 0, BLOCK_DIRT, 1),   "the dirt in the origin was not disturbed");
+    check(inventoryCount(&inv, BLOCK_STONE) == 4, "the 4 stone are back in the bag elsewhere");
+    check(fake_sent_calls == 0, "and still nothing sent: the server never saw the detach");
+
+    /* Nowhere at all: the only case that can leave units in the lift. */
+    for (int i = 0; i < INV_SLOT_COUNT; i++) setSlot(&inv, i, BLOCK_DIRT, INV_STACK_MAX);
+    lift.item = BLOCK_STONE; lift.count = 3;
+    check(!invBridgeReturnLift(&inv, 0, &lift), "a full bag of another item cannot take it back");
+    check(lift.item == BLOCK_STONE && lift.count == 3, "and the units stay in the lift, not lost");
+}
+
+static void test_quick_move_hotbar_to_main_and_back(void)
+{
+    puts("quick-move sends a hotbar stack to the first free main slot, and a main stack back");
+
+    Inventory inv;
+    armSession(&inv);
+    setSlot(&inv, 0, BLOCK_STONE, 10);
+
+    check(invBridgeQuickMove(&inv, 0) == 10,     "hotbar -> main: 10 moved");
+    check(slotIs(&inv, 0, ITEM_NONE, 0),          "the hotbar slot is empty");
+    check(slotIs(&inv, INV_HOTBAR_SLOTS, BLOCK_STONE, 10), "the first main slot holds the 10");
+    check(fake_sent_calls == 1 && sentMove(0, 0, INV_HOTBAR_SLOTS, 10), "one packet: MOVE(0, 8, 10)");
+
+    fakeTransportReset();
+    check(invBridgeQuickMove(&inv, INV_HOTBAR_SLOTS) == 10, "main -> hotbar: 10 moved");
+    check(slotIs(&inv, 0, BLOCK_STONE, 10),       "the first hotbar slot holds the 10 again");
+    check(fake_sent_calls == 1 && sentMove(0, INV_HOTBAR_SLOTS, 0, 10), "one packet: MOVE(8, 0, 10)");
+}
+
+static void test_quick_move_tops_up_same_item_first_then_spills(void)
+{
+    puts("quick-move tops up every same-item stack in the other strip first, then the first empty");
+
+    Inventory inv;
+    armSession(&inv);
+    setSlot(&inv, 0,  BLOCK_STONE, 30);
+    setSlot(&inv, 9,  BLOCK_STONE, (uint8_t)(INV_STACK_MAX - 4));   /* room for 4 */
+    setSlot(&inv, 10, BLOCK_DIRT,  1);                              /* must be skipped */
+    setSlot(&inv, 11, BLOCK_STONE, (uint8_t)(INV_STACK_MAX - 9));   /* room for 9 */
+    /* slot 8 is the first EMPTY main slot; it must come AFTER the two top-ups */
+
+    check(invBridgeQuickMove(&inv, 0) == 30,      "all 30 moved");
+    check(slotIs(&inv, 0, ITEM_NONE, 0),           "the source emptied");
+    check(slotIs(&inv, 9,  BLOCK_STONE, INV_STACK_MAX), "slot 9 topped up to the cap");
+    check(slotIs(&inv, 11, BLOCK_STONE, INV_STACK_MAX), "slot 11 topped up to the cap");
+    check(slotIs(&inv, 8,  BLOCK_STONE, 17),       "the remaining 17 landed in the first empty slot");
+    check(slotIs(&inv, 10, BLOCK_DIRT, 1),         "the dirt was skipped");
+    check(fake_sent_calls == 3,                    "three pieces, three packets");
+    check(sentMove(0, 0, 9, 4),                    "packet 0: MOVE(0, 9, 4)");
+    check(sentMove(1, 0, 11, 9),                   "packet 1: MOVE(0, 11, 9)");
+    check(sentMove(2, 0, 8, 17),                   "packet 2: MOVE(0, 8, 17)");
+}
+
+static void test_quick_move_to_a_full_strip_refuses(void)
+{
+    puts("quick-move into a strip with no room refuses, changes nothing, sends nothing");
+
+    Inventory inv;
+    armSession(&inv);
+    setSlot(&inv, 0, BLOCK_STONE, 5);
+    for (int i = INV_HOTBAR_SLOTS; i < INV_SLOT_COUNT; i++) setSlot(&inv, i, BLOCK_DIRT, INV_STACK_MAX);
+
+    check(invBridgeQuickMove(&inv, 0) == 0, "a strip full of another item: 0 moved");
+    check(slotIs(&inv, 0, BLOCK_STONE, 5),  "the source is untouched");
+    bool all_dirt = true;
+    for (int i = INV_HOTBAR_SLOTS; i < INV_SLOT_COUNT; i++)
+        all_dirt = all_dirt && slotIs(&inv, i, BLOCK_DIRT, INV_STACK_MAX);
+    check(all_dirt,             "every main slot is untouched");
+    check(fake_sent_calls == 0, "no packet");
+
+    for (int i = INV_HOTBAR_SLOTS; i < INV_SLOT_COUNT; i++) setSlot(&inv, i, BLOCK_STONE, INV_STACK_MAX);
+    check(invBridgeQuickMove(&inv, 0) == 0, "a strip full of the SAME item at the cap: 0 moved");
+    check(fake_sent_calls == 0,             "still no packet");
+}
+
+static void test_quick_move_moves_only_what_fits(void)
+{
+    puts("quick-move into a strip with room for 7 moves 7 and leaves the rest where it was");
+
+    Inventory inv;
+    armSession(&inv);
+    setSlot(&inv, 0, BLOCK_STONE, 20);
+    for (int i = INV_HOTBAR_SLOTS; i < INV_SLOT_COUNT; i++) setSlot(&inv, i, BLOCK_STONE, INV_STACK_MAX);
+    setSlot(&inv, INV_HOTBAR_SLOTS, BLOCK_STONE, (uint8_t)(INV_STACK_MAX - 7));
+
+    check(invBridgeQuickMove(&inv, 0) == 7,   "7 moved");
+    check(slotIs(&inv, 0, BLOCK_STONE, 13),   "13 stayed in the source");
+    check(slotIs(&inv, INV_HOTBAR_SLOTS, BLOCK_STONE, INV_STACK_MAX), "the one slot with room is full");
+    check(fake_sent_calls == 1 && sentMove(0, 0, INV_HOTBAR_SLOTS, 7), "one packet: MOVE(0, 8, 7)");
+}
+
+static void test_plan_quick_move_describes_without_touching(void)
+{
+    puts("the plan describes the moves a quick-move would make, touches nothing, and applies cleanly");
+
+    Inventory inv;
+    armSession(&inv);
+    setSlot(&inv, 0,  BLOCK_STONE, 30);
+    setSlot(&inv, 9,  BLOCK_STONE, (uint8_t)(INV_STACK_MAX - 4));
+    setSlot(&inv, 10, BLOCK_DIRT,  1);
+    setSlot(&inv, 11, BLOCK_STONE, (uint8_t)(INV_STACK_MAX - 9));
+    setSlot(&inv, 12, BLOCK_STONE, INV_STACK_MAX);   /* same item, no room: must describe NO move */
+
+    Inventory before = inv;
+    InvBridgeMove plan[INV_BRIDGE_PLAN_MAX];
+    const int n = invBridgePlanQuickMove(&inv, 0, plan, INV_BRIDGE_PLAN_MAX);
+    check(n == 3,                                     "three moves described");
+    check(memcmp(&before, &inv, sizeof inv) == 0,     "the inventory is byte-identical afterwards");
+    check(plan[0].op == BS_INV_OP_MOVE && plan[0].a == 0 && plan[0].b == 9  && plan[0].c == 4,
+          "move 0 is MOVE(0, 9, 4)");
+    check(plan[1].op == BS_INV_OP_MOVE && plan[1].a == 0 && plan[1].b == 11 && plan[1].c == 9,
+          "move 1 is MOVE(0, 11, 9)");
+    check(plan[2].op == BS_INV_OP_MOVE && plan[2].a == 0 && plan[2].b == 8  && plan[2].c == 17,
+          "move 2 is MOVE(0, 8, 17)");
+    check(fake_sent_calls == 0,                       "planning sends nothing");
+
+    InvBridgeMove one;
+    check(invBridgePlanQuickMove(&inv, 0, &one, 1) == 1 && one.b == 9 && one.c == 4,
+          "a cap of 1 describes the first move only");
+    check(invBridgePlanQuickMove(&inv, 5, plan, INV_BRIDGE_PLAN_MAX) == 0, "an empty slot plans nothing");
+
+    /* The single-player path over the same plan: each applied move reports its described count. */
+    uint8_t total = 0;
+    for (int i = 0; i < n; i++) total = (uint8_t)(total + invBridgeApplyMove(&inv, &plan[i]));
+    check(total == 30 && slotIs(&inv, 8, BLOCK_STONE, 17) && slotIs(&inv, 0, ITEM_NONE, 0),
+          "applying the plan lands exactly what it described");
+    check(fake_sent_calls == 3 && sentMove(2, 0, 8, 17), "and each applied move went out as its own packet");
+
+    /* From a slot that HAS units into an empty one, so a bridge that ignored the op byte and
+     * moved anyway would move 1 and send — a refusal from an empty source proves nothing. */
+    InvBridgeMove bad = { BS_INV_OP_SWAP, 8, 0, 1 };
+    check(invBridgeApplyMove(&inv, &bad) == 0 && fake_sent_calls == 3 && slotIs(&inv, 8, BLOCK_STONE, 17),
+          "an op the bridge does not describe is refused, moves nothing and is not sent");
+}
+
+static void test_lift_and_quick_move_offline_still_mutate(void)
+{
+    puts("with no session, quick-move and place-lift perform their local op and send nothing");
+
+    networldInit();          /* no INV_STATE delivered: the probe stays disarmed */
+    fakeTransportReset();
+
+    Inventory inv;
+    inventoryInit(&inv);
+    setSlot(&inv, 0, BLOCK_STONE, 10);
+    setSlot(&inv, 1, BLOCK_STONE, 8);
+
+    check(invBridgeQuickMove(&inv, 0) == 10 && slotIs(&inv, INV_HOTBAR_SLOTS, BLOCK_STONE, 10),
+          "quick-move still moved locally");
+    InvSlot lift;
+    check(invBridgeSplitStack(&inv, 1, &lift) && invBridgePlaceLift(&inv, 1, 2, &lift) == 4,
+          "split and place still worked locally");
+    check(slotIs(&inv, 2, BLOCK_STONE, 4) && slotIs(&inv, 1, BLOCK_STONE, 4), "4 and 4");
+    check(fake_sent_calls == 0, "nothing was handed to the transport");
+}
+
 int main(void)
 {
     test_snapshot_that_arrived_before_the_hook_is_still_delivered();
@@ -560,6 +889,21 @@ int main(void)
     test_apply_state_rejects_unknown_item_without_touching_anything();
     test_apply_state_clamps_the_selection();
     test_apply_state_sends_nothing();
+
+    /* v1.9.0 SPLIT */
+    test_split_refuses_when_there_is_no_half();
+    test_split_lifts_the_ceiling_half();
+    test_place_lift_exact_fit_reports_a_move_from_the_origin();
+    test_place_lift_overflow_keeps_the_remainder_lifted();
+    test_place_lift_onto_a_different_item_refuses();
+    test_place_lift_back_onto_its_origin_sends_nothing();
+    test_return_lift_goes_to_the_origin_or_anywhere_free();
+    test_quick_move_hotbar_to_main_and_back();
+    test_quick_move_tops_up_same_item_first_then_spills();
+    test_quick_move_to_a_full_strip_refuses();
+    test_quick_move_moves_only_what_fits();
+    test_plan_quick_move_describes_without_touching();
+    test_lift_and_quick_move_offline_still_mutate();
 
     /* ---- check-count guard -----------------------------------------------------------------
      *
@@ -597,7 +941,7 @@ int main(void)
      *   and find out which checks stopped running, and why.
      *
      *   Note the number is the count BEFORE this guard itself, so the summary line prints one
-     *   more than it (62 here, 63 on the PASS line). That off-by-one is deliberate: it means
+     *   more than it (158 here, 159 on the PASS line). That off-by-one is deliberate: it means
      *   blind-pasting the number off the PASS line lands you a red, not a false green.
      *
      *   Latched into `ran` first, and compared through that, so the pin means "checks before
@@ -607,19 +951,19 @@ int main(void)
      *   there silently wants a number one higher. Same latch everywhere, same meaning
      *   everywhere, and it stays correct if this file's check() is ever turned into a macro. */
     const int ran = g_checks;
-    if (ran != 62)
+    if (ran != 158)
         printf("\nCHECK-COUNT GUARD: %d checks ran, %d expected.\n"
                "  %s\n"
                "  This is NOT an ordinary assertion failure.\n"
                "  Read the comment above this guard in net/inv_bridge_test.c before"
                " touching the pinned number.\n",
-               ran, 62,
-               ran < 62
+               ran, 158,
+               ran < 158
                    ? "Checks went MISSING: checks that should have run never ran at all."
                    : "Extra checks appeared: either you added checks and did not update the"
                      " pin, or something is emitting checks it should not.");
-    check(ran == 62,
-          "check-count guard: every check in this suite actually ran (62 before this line)");
+    check(ran == 158,
+          "check-count guard: every check in this suite actually ran (158 before this line)");
 
     printf("\n%s %d checks, %d failed\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;

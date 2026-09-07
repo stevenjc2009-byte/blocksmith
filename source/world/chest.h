@@ -7,7 +7,9 @@
 // The same table the furnace already uses (world/blockstate.h), not a second one. This is
 // "copy the furnace's shape" applied to the storage question specifically: blockstate.h is
 // already generalised to any stateful block keyed by (x, y, z), so a chest is one more block
-// id writing into the same 64-slot table rather than a table of its own. This file owns what
+// id writing into the same shared table rather than a table of its own (BLOCKSTATE_SLOTS,
+// blockstate.h:160 — 256 since v1.9.0; it read 64 when this comment was written, and quoting
+// the number here again is how it went stale). This file owns what
 // the 16 opaque bytes MEAN for a chest and nothing about where they are kept — the identical
 // split world/furnace.h documents for itself, for the identical reason.
 //

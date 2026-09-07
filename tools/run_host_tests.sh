@@ -465,6 +465,34 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 "./$BH/inventory_test"
 
+# world/crafting_test.c orphan gate -- world/crafting.c's RECIPE_PLANKS_TO_CHEST (v1.9.0
+# "Storage"), the chest recipe. crafting.c is already linked into four other host suites (this
+# stanza, ui_chest_test, scene/interact_test.c, scene/craft_torch_e2e_test.c), which is why
+# grepping "crafting" in this file falsely reads as full coverage -- none of those four pin
+# RECIPE_COUNT or assert what CRAFT_RECIPES[RECIPE_PLANKS_TO_CHEST] actually contains; this file
+# does, plus that the runtime bound (crafting.c:169/177) rejects exactly one past the new end.
+# Wired 2026-09-07: the file existed and passed but was referenced by NOTHING in this script, so
+# the chest recipe's own test had never run once. Guarded by #ifndef __3DS__ in the file itself
+# (already present when found -- the console Makefile globs every .c under source/world, so an
+# unguarded second main() here would break the 3DS build; nothing to fix). Link set matches the
+# "Step 8.2" inventory_test.c stanza immediately above -- inventory.c, registry.c, crafting.c,
+# crc32.c -- swapping only the driver file; world/block.h is a header-only dependency here
+# (BLOCK_PLANKS/BLOCK_CHEST enum constants only), so block.c is not in the link, same reasoning
+# as that stanza's own comment gives for skipping it. 22 checks, pinned via
+# CRAFTING_TEST_EXPECTED_CHECKS + checkCountPin() added to the file at the same time (it had no
+# pin, so the running count could have silently shrunk and nothing would have caught it), same
+# NOT-routed-through-CHECK() convention as inventory_test.c's own checkCountPin().
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/inventory.c \
+	source/world/registry.c \
+	source/world/crafting.c \
+	source/world/crc32.c \
+	source/world/crafting_test.c \
+	-o "$BH/crafting_test"
+
+"./$BH/crafting_test"
+
 # Step 8.2's UI hit-testing/layout arithmetic (scene/ui_layout.c), pulled out of
 # scene/ui.c precisely so it could be linked here without <citro3d.h> -- see
 # scene/ui_layout.h's file comment. Fourth binary for the same reason inventory_test
@@ -937,9 +965,40 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g 	-I source 	source/net/blockdiff.c 	so
 # real worldSet -> real waterNotify chain runs here now, with only the world edit hook standing
 # in for main.c's — and that hook body is itself pinned against main.c by source text, so the
 # stand-in cannot drift away from the thing it stands in for.
-gcc -std=c11 -Wall -Wextra -Werror -O1 -g -DBS_CLIENT_HAS_METERS=1	-I source -I deps/blocksmith-server 	source/world/world.c 	source/world/block.c 	source/world/registry.c 	source/world/chunk.c 	source/world/budget.c 	source/net/blockdiff.c 	source/net/networld.c 	source/world/mesher.c 	source/world/visgraph.c 	source/world/scratch.c 	source/world/water.c 	source/app/session.c 	source/net/networld_test.c 	-o "$BH/networld_test"
+#
+# v1.9.0 CHEST-NET added chest state syncing to net/networld.c's applyChestState() --
+# chestStatePack(), blockStateSet() and blockStateCreate() -- so this link now needs
+# world/blockstate.c, world/chest.c and world/crc32.c (blockstate.c's own save/restore
+# checksum) beside it, on top of networld_test.c's own direct blockState*() scenario calls.
+# None of the three were in this link before because nothing here touched chest state.
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g -DBS_CLIENT_HAS_METERS=1	-I source -I deps/blocksmith-server 	source/world/world.c 	source/world/block.c 	source/world/registry.c 	source/world/chunk.c 	source/world/budget.c 	source/net/blockdiff.c 	source/net/networld.c 	source/world/mesher.c 	source/world/visgraph.c 	source/world/scratch.c 	source/world/water.c 	source/app/session.c 	source/world/blockstate.c 	source/world/chest.c 	source/world/crc32.c 	source/net/networld_test.c 	-o "$BH/networld_test"
 
 "./$BH/networld_test"
+
+# ── the STRICT build of the same binary, and why it is a suite stanza now ──────────────────
+#
+# source/net/Makefile.networld-test builds networld_test again under -Wconversion,
+# -Wsign-conversion and -Wcast-qual, which the -Wall -Wextra line above does not have, over
+# net/networld.c -- the decoder for attacker-controlled bytes. That extra coverage is the
+# entire reason the file is kept rather than deleted.
+#
+# It was kept in step with the line above by a COMMENT: "Keep them in step when a file is added
+# here." That has now failed three times, each time the same way and each time silently:
+#
+#   v1.6.0 F2  app/session.c added here, not there    -> undefined reference to `sessionBegin'
+#   v1.9.0     world/{blockstate,chest,crc32}.c added -> caught while landing chest work
+#   v1.9.0     world/water.c added here, not there    -> 17 undefined references, measured
+#
+# The third one is why this stanza exists. Every object still COMPILED clean under the strict
+# set, so nothing warned; only the final link broke -- and a build that never links is a build
+# nobody runs, so the strict coverage had quietly stopped being obtainable at all while its own
+# header still advertised it as the way to run these tests. An invariant that has silently
+# regressed three times is not enforced by the comment asserting it, so it is enforced here.
+#
+# Costs one extra compile of 16 objects. Incremental: the Makefile declares its header
+# dependencies per object, so a warm tree only relinks. Its `test` target runs the binary from
+# the repo root because some scenarios open repo files by root-relative path.
+make -C source/net -f Makefile.networld-test test
 
 # net/inv_bridge.c, the seam between world/inventory.h and the wire (v1.3.0). Eleventh binary,
 # own main(), same reason as every one above it. It links the REAL inventory.c and crafting.c
@@ -948,6 +1007,12 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g -DBS_CLIENT_HAS_METERS=1	-I source -I 
 # only networld.c can encode, so a test that faked either half would be checking its own
 # stand-in rather than the seam. crc32.c is in the link for the same reason inventory_test
 # above needs it — the inventory save file is checksummed the same way a region file is.
+#
+# v1.9.0 CHEST-NET added world/blockstate.c and world/chest.c to the link: net/networld.c's
+# applyChestState() now calls chestStatePack(), blockStateSet() and blockStateCreate(), so the
+# real networld.c linked here drags both in. crc32.c is NOT duplicated — it is already above,
+# for inventory.c's own checksum, and blockstate.c shares that same crc32.c object rather than
+# needing a second copy of it.
 gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	-I source -I deps/blocksmith-server \
 	source/world/world.c \
@@ -963,6 +1028,8 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/world/mesher.c \
 	source/world/visgraph.c \
 	source/world/scratch.c \
+	source/world/blockstate.c \
+	source/world/chest.c \
 	source/net/inv_bridge.c \
 	source/net/inv_bridge_test.c \
 	-o "$BH/inv_bridge_test"
@@ -1160,7 +1227,12 @@ MINGW*|MSYS*|CYGWIN*) echo "skipping interop_test on Windows (Unix sockets unava
 # byte-identically into the client and the dedicated server.
 make -C deps/blocksmith-server/game all
 
-gcc -std=c11 -Wall -Wextra -Werror -O1 -g 	-I source -I deps/blocksmith-server 	source/world/world.c 	source/world/block.c 	source/world/registry.c 	source/world/chunk.c 	source/world/budget.c 	source/net/blockdiff.c 	source/net/networld.c 	source/world/mesher.c 	source/world/visgraph.c 	source/world/scratch.c 	source/net/interop_test.c 	-o "$BH/interop_test"
+# v1.9.0 CHEST-NET added world/blockstate.c and world/chest.c to the link, and world/crc32.c
+# behind blockstate.c's own save/restore checksum — the same three networld_test's stanza
+# above needed, for the same reason: net/networld.c's applyChestState() calls chestStatePack(),
+# blockStateSet() and blockStateCreate(). None of the three were here before because nothing in
+# this stanza touched chest state.
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g 	-I source -I deps/blocksmith-server 	source/world/world.c 	source/world/block.c 	source/world/registry.c 	source/world/chunk.c 	source/world/budget.c 	source/net/blockdiff.c 	source/net/networld.c 	source/world/mesher.c 	source/world/visgraph.c 	source/world/scratch.c 	source/world/blockstate.c 	source/world/chest.c 	source/world/crc32.c 	source/net/interop_test.c 	-o "$BH/interop_test"
 
 "./$BH/interop_test"
 ;;
@@ -1598,10 +1670,28 @@ rm -rf "$BHI"
 # placed directly after the inventory-persistence stanza for that reason -- same on-disk
 # discipline, same failure modes, and if one of them regresses the other is where to look.
 #
-# BLOCKSTATE_TEST_EXPECTED_CHECKS is pinned at 191 inside the test. That pin is not decoration:
-# it was seeded at a placeholder 143 and the first real run reported "CHECK COUNT: 48 check(s)
-# were ADDED - expected 143, ran 191" and exited 1. Watch the count, not just the pass -- a
-# stanza that silently runs fewer checks than it used to looks identical to one that passes.
+# BLOCKSTATE_TEST_EXPECTED_CHECKS is pinned inside the test. That pin is not decoration: it was
+# seeded at a placeholder 143 and the first real run reported "CHECK COUNT: 48 check(s) were
+# ADDED - expected 143, ran 191" and exited 1. Watch the count, not just the pass -- a stanza
+# that silently runs fewer checks than it used to looks identical to one that passes.
+#
+# ---- 2026-09-05, v1.9.0: THE PIN IS NOW 890, NOT 191 ----
+# Everything above this divider is the v1.8.15 history and the 191 figures in it are correct
+# FOR THAT ERA. The current pin is 890, because v1.9.0 raised BLOCKSTATE_SLOTS from 64 to 256
+# (chests share this table with furnaces -- docs/decision-1.9.0-chest-storage.md) and the
+# round-trip test was extended to fill every one of the new slots with a distinct payload.
+#
+# The raise is why the count moved so far, and the count is NOT what proves the test still
+# works. A red arm is: changing this file's load-path check from `count > BLOCKSTATE_SLOTS` to
+# `>=`, so a legally full table is rejected, produced
+#   blockstate self-test: FAIL 1/890  L451 tablesEqual(&out, &in)
+# at exit 1, and restoring it came back cmp-identical. A check count alone could have risen to
+# 890 without a single record beyond the 64th ever being written to disk.
+#
+# sizeof(BlockStateTable) is separately _Static_assert-ed at 8192 (was 2048). That assert is
+# the ABI half of the same change and it has only ever been evaluated by host gcc -- the
+# devkitARM build is the leg that has not run, and -fshort-enums means host sizeof() is not
+# authoritative about the console's struct.
 BHBST="build-host/run-$$-blockstate"
 mkdir -p "$BHBST"
 
@@ -1649,6 +1739,59 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 "./$BHFN/furnace_test"
 
 rm -rf "$BHFN"
+
+# world/chest.c -- v1.9.0 "Storage and quality of life"'s passive item storage. Placed
+# directly after the furnace stanza, itself directly after the blockstate stanza -- the
+# same trio for the same reason: docs/decision-1.9.0-chest-storage.md settled a three-way
+# disagreement between chest.h's own prototype and two separate v1.9.0 plan documents by
+# putting a chest's contents in the SAME BlockStateTable a furnace already uses (raising
+# BLOCKSTATE_SLOTS 64 -> 256 to make room), not a dedicated table. A regression in
+# blockstate.c is therefore the first place to look if either chest.c or furnace.c breaks,
+# and the three stanzas sit together for that reason, in the order the dependency runs.
+#
+# The link mirrors the furnace stanza's exactly and for the identical reason: chest.c needs
+# blockstate.h for BLOCKSTATE_PAYLOAD_BYTES and the ChestState pack/unpack shape, and
+# blockstate.c itself pulls in world/crc32.h, so crc32.c joins the link the same way it does
+# above. No registry.c, no block.c, no world.c -- chest.c takes ItemId as an opaque
+# uint8_t-sized value (world/block.h is included by chest_test.c only for its BLOCK_* id
+# constants) and never asks the registry what an id means; chestStatePack/Unpack validate
+# nothing against it, the same independence blockstate.c itself has from the id space it
+# stores positions for.
+#
+# CHEST_TEST_EXPECTED_CHECKS is pinned at 133 inside the test, seeded the identical way
+# FURNACE_TEST_EXPECTED_CHECKS and BLOCKSTATE_TEST_EXPECTED_CHECKS above were: a placeholder
+# 129 was seeded first, and the first real run reported "CHECK COUNT: 4 check(s) were ADDED -
+# expected 129, ran 133" and exited 1. Watch the count, not just the pass, for the identical
+# reason the blockstate and furnace comments give.
+#
+# Four sabotage arms were run against scratch copies of chest.c (never the real file) before
+# this stanza was trusted, each rebuilt against the real chest_test.c and each red at a
+# distinct line:
+#   * chestStatePack's loop shortened to `i < CHEST_SLOTS - 1` (last slot never written) ->
+#     "chest self-test: FAIL 8/133  L136 back.item[i] == cs.item[i]".
+#   * chestStateUnpack's count read replaced with a hardcoded 0 ->
+#     "chest self-test: FAIL 24/133  L137 back.count[i] == cs.count[i]".
+#   * chestStatePack's item/count swapped in the wire layout (out[i*2]/out[i*2+1] reversed)
+#     -> "chest self-test: FAIL 52/133  L136 back.item[i] == cs.item[i]".
+#   * chestStateUnpack clamping any item id past BLOCK_CHEST to ITEM_NONE instead of
+#     round-tripping the raw byte -> "chest self-test: FAIL 9/133  L266
+#     back.item[1] == (ItemId)(BLOCK_CHEST + 1)".
+# All four rebuilt clean under this same -Werror line; restoring the real chest.c returned
+# "chest self-test: PASS  133 checks" every time.
+BHCH="build-host/run-$$-chest"
+mkdir -p "$BHCH"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/world/blockstate.c \
+	source/world/crc32.c \
+	source/world/chest.c \
+	source/world/chest_test.c \
+	-o "$BHCH/chest_test"
+
+"./$BHCH/chest_test"
+
+rm -rf "$BHCH"
 
 # --- v1.7.1 task 49, install half -------------------------------------------------------
 #
@@ -6491,3 +6634,140 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
     -o "$BHMO/monster_test"
 "./$BHMO/monster_test"
 rm -rf "$BHMO"
+
+# tests/worldlist_ops_test.c -- v1.9.0 item 6.3: scene/worldlist.c's worldlistDelete,
+# worldlistRename, worldlistPathComponentSafe and the world-select screen's delete-confirm
+# latch. Own main(), links the real scene/worldlist.c and nothing else -- the module has no
+# <3ds.h> in it, same carve-out world/worldlist_test.c above already uses. 551 checks, and
+# per the file's own header every one is a WORLD-STATE assertion (stat()/fread() against a real
+# directory tree under this run's own scratch dir), not a return-code check -- the file says why:
+# a red arm elsewhere in this tree left counter/flag assertions green while the thing they were
+# counting had vanished, and only a direct state assertion caught it.
+BHWLO="build-host/run-$$-worldlistops"
+mkdir -p "$BHWLO"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	source/scene/worldlist.c \
+	tests/worldlist_ops_test.c \
+	-o "$BHWLO/worldlist_ops_test"
+
+"./$BHWLO/worldlist_ops_test"
+
+rm -rf "$BHWLO"
+
+# tests/hotbar_test.c -- scene/hotbar.c, the L/R shoulder-button hotbar cycle (v1.9.0
+# HOTBAR-LR): the wrap at each end, the held-to-repeat cadence, and what pressing both
+# shoulders at once does. hotbar.c has no <3ds.h> in it, same carve-out tests/ringorder_test.c
+# and tests/aimtext_test.c made, so the real module links here. hotbarNavStep calls
+# inventoryHotbarStep (world/inventory.h), which is why inventory.c joins the link, which in
+# turn needs registry.c (inventory.h's inline inventoryCanHold calls registryIsDefined() and
+# registryView()) and crc32.c (inventory.c's own save/load checksum) -- established by linking
+# and reading the actual undefined-reference chain, not assumed. 597 checks; the pin constant
+# is 598 because the pin assertion is itself a CHECK and counts its own increment.
+#
+# NOT proved here: that main.c wires hidKeysDown()/hidKeysHeld() into hotbarNavFrame(), or that
+# the bottom-screen highlight moves. Those are the console's.
+BHHB="build-host/run-$$-hotbar"
+mkdir -p "$BHHB"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	tests/hotbar_test.c \
+	source/scene/hotbar.c \
+	source/world/inventory.c \
+	source/world/registry.c \
+	source/world/crc32.c \
+	-o "$BHHB/hotbar_test"
+
+"./$BHHB/hotbar_test"
+
+rm -rf "$BHHB"
+
+# tests/aimtext_test.c -- scene/aimtext.c, the block-name readout under the reticle and its
+# fade (v1.9.0 AIM-TEXT). aimtext.c has no <3ds.h> in it, same carve-out tests/ringorder_test.c
+# made for main.c's ring walk, so the real module links here along with the real
+# world/registry.c behind it -- registry.c alone is enough; it takes no block.c symbols at link
+# time. 895 checks.
+#
+# NOT proved here: that main.c calls aimTextUpdate() from the frame that produces the RayHit,
+# that the pill lands where scene/crosshair.c's comment says, or that the text is legible on a
+# real screen -- the draw itself is unverified visually until someone looks at it.
+BHAI="build-host/run-$$-aimtext"
+mkdir -p "$BHAI"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	tests/aimtext_test.c \
+	source/scene/aimtext.c \
+	source/world/registry.c \
+	-o "$BHAI/aimtext_test"
+
+"./$BHAI/aimtext_test"
+
+rm -rf "$BHAI"
+
+# tests/ui_gesture_test.c -- scene/ui_gesture.c, the inventory overlay's gesture classifier
+# (v1.9.0 SPLIT: lift/place/merge/split/quick-move). scene/ui.c cannot be linked outside
+# devkitARM (it draws), so the part of it that can be wrong in a way a playtest would not show
+# -- which event a frame of touch + button state means, whether a held button fires once or
+# every frame -- was moved into ui_gesture.c, which includes nothing the host cannot compile.
+# This binary links THAT module and nothing else: the Inventory it reads is filled by hand, so
+# world/inventory.c and the registry behind it are not in the link. 103 checks.
+#
+# NOT proved here: that scene/ui.c feeds uiGestureFeed() every frame, that main.c passes
+# hidKeysHeld() through UiInput, or that X/Y are masked out of the world-edit path while the
+# overlay is up. Those are the console's.
+BHUG="build-host/run-$$-uigesture"
+mkdir -p "$BHUG"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I source \
+	tests/ui_gesture_test.c \
+	source/scene/ui_gesture.c \
+	-o "$BHUG/ui_gesture_test"
+
+"./$BHUG/ui_gesture_test"
+
+rm -rf "$BHUG"
+
+# tests/ui_chest_test.c -- the chest panel in scene/ui.c (v1.9.0 CHEST/CHEST-NET): the two-tap
+# lift/place transfer semantics, what the panel draws, and the network transfer callback,
+# driven through the real uiUpdateDraw() with real taps against the real ChestState and the
+# real Inventory. Links the real scene/ui.c, ui_layout.c, inventory.c, crafting.c, furnace.c,
+# chest.c, blockstate.c, crc32.c, world/block.c and registry.c, and net/inv_bridge.c, and stubs
+# only what cannot exist on a host -- the GPU sprite batch, the font, the audio mixer, the
+# transport -- via tests/ui_chest_stub/. 382 checks.
+#
+# source/scene/ui_gesture.c joins the link because ui.c's frame handler calls uiGestureFeed()
+# directly (v1.9.0 SPLIT) -- without it the link dies on an undefined reference to that symbol,
+# not to anything chest-shaped.
+#
+# This stanza links source/scene/ui.c and tests/ui_chest_test.c, both of which another session
+# may be mid-edit on when this runs; a compile failure inside ui.c itself is that work in
+# flight, not a fault in this link line.
+BHUC="build-host/run-$$-uichest"
+mkdir -p "$BHUC"
+
+gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
+	-I tests/ui_chest_stub -I source -I deps/blocksmith-server \
+	tests/ui_chest_stub/ui_chest_stub.c \
+	source/scene/ui.c \
+	source/scene/ui_layout.c \
+	source/scene/ui_gesture.c \
+	source/net/inv_bridge.c \
+	source/world/block.c \
+	source/world/registry.c \
+	source/world/inventory.c \
+	source/world/crafting.c \
+	source/world/furnace.c \
+	source/world/chest.c \
+	source/world/blockstate.c \
+	source/world/crc32.c \
+	tests/ui_chest_test.c \
+	-lm \
+	-o "$BHUC/ui_chest_test"
+
+"./$BHUC/ui_chest_test"
+
+rm -rf "$BHUC"

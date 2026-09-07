@@ -115,6 +115,141 @@ uint8_t invBridgeRemove(Inventory* inv, ItemId item, uint8_t count)
 	return removed;
 }
 
+int invBridgePlanQuickMove(const Inventory* inv, int slot, InvBridgeMove* out, int cap)
+{
+	if (!inv || !out || cap <= 0 || slot < 0 || slot >= INV_SLOT_COUNT) return 0;
+
+	const ItemId item = inv->slots[slot].item;
+	if (item == ITEM_NONE) return 0;
+
+	// The plan is run on a private copy with the REAL inventoryMoveUnits, so every described
+	// count is what that primitive would actually move — the cap, the same-item merge and the
+	// different-item refusal are all its rules, applied by it, not restated here. An Inventory
+	// is INV_SLOT_COUNT two-byte slots plus one byte; the copy is cheap and lives on the stack.
+	Inventory sim = *inv;
+
+	// The other strip, as a half-open index range. invSlotIsHotbar is world/inventory.h's own
+	// definition of the split, so a change to INV_HOTBAR_SLOTS moves this with it.
+	const int lo = invSlotIsHotbar(slot) ? INV_HOTBAR_SLOTS : 0;
+	const int hi = invSlotIsHotbar(slot) ? INV_SLOT_COUNT   : INV_HOTBAR_SLOTS;
+
+	// Pass 0: same-item stacks, lowest index first. Pass 1: the first empty slots take whatever
+	// is left. Both stop the moment the source empties (inventoryMoveUnits clears its item),
+	// which is what `sim.slots[slot].item == item` reads.
+	int n = 0;
+	for (int pass = 0; pass < 2; pass++) {
+		const ItemId want = (pass == 0) ? item : ITEM_NONE;
+		for (int i = lo; i < hi && n < cap && sim.slots[slot].item == item; i++) {
+			if (sim.slots[i].item != want) continue;
+			const uint8_t moved = inventoryMoveUnits(&sim, slot, i, sim.slots[slot].count);
+			if (moved == 0) continue;   // a same-item stack already at the cap
+			out[n].op = BS_INV_OP_MOVE;
+			out[n].a  = (uint8_t)slot;
+			out[n].b  = (uint8_t)i;
+			out[n].c  = moved;
+			n++;
+		}
+	}
+	return n;
+}
+
+uint8_t invBridgeApplyMove(Inventory* inv, const InvBridgeMove* m)
+{
+	if (!inv || !m || m->op != BS_INV_OP_MOVE) return 0;
+	return invBridgeMoveUnits(inv, m->a, m->b, m->c);
+}
+
+uint8_t invBridgeQuickMove(Inventory* inv, int slot)
+{
+	InvBridgeMove plan[INV_BRIDGE_PLAN_MAX];
+	const int n = invBridgePlanQuickMove(inv, slot, plan, INV_BRIDGE_PLAN_MAX);
+
+	// A whole stack is at most INV_STACK_MAX units, so the sum cannot leave a uint8_t.
+	uint8_t moved = 0;
+	for (int i = 0; i < n; i++)
+		moved = (uint8_t)(moved + invBridgeApplyMove(inv, &plan[i]));
+	return moved;
+}
+
+bool invBridgeSplitStack(Inventory* inv, int slot, InvSlot* out_lift)
+{
+	if (!inv || !out_lift || slot < 0 || slot >= INV_SLOT_COUNT) return false;
+
+	InvSlot* s = &inv->slots[slot];
+	if (s->item == ITEM_NONE || s->count < 2) return false;   // there is no half of one
+
+	// ceil(count / 2) to the lift; floor(count / 2), which is at least 1, stays behind — so
+	// the slot never empties and never needs its item cleared.
+	const uint8_t lift = (uint8_t)(s->count - s->count / 2);
+	out_lift->item  = s->item;
+	out_lift->count = lift;
+	s->count = (uint8_t)(s->count - lift);
+	return true;
+}
+
+// How many of `lift` slot `d` will take, and the transfer itself: an empty `d` takes up to the
+// cap, a same-item `d` takes up to the room under it, a different item takes nothing. The lift
+// is normalised to { ITEM_NONE, 0 } when it empties, world/inventory.h's InvSlot invariant. The
+// one arithmetic shared by place and return, written once.
+static uint8_t liftInto(InvSlot* d, InvSlot* lift)
+{
+	if (lift->item == ITEM_NONE || lift->count == 0) return 0;
+	if (d->item != ITEM_NONE && d->item != lift->item) return 0;
+
+	// `d->count >= INV_STACK_MAX` rather than `== `: a count past the cap can only come from
+	// a corrupt snapshot or save, and the subtraction below would wrap on it.
+	uint8_t space;
+	if (d->item == ITEM_NONE)               space = INV_STACK_MAX;
+	else if (d->count >= INV_STACK_MAX)     space = 0;
+	else                                    space = (uint8_t)(INV_STACK_MAX - d->count);
+
+	const uint8_t move = (lift->count < space) ? lift->count : space;
+	if (move == 0) return 0;
+
+	if (d->item == ITEM_NONE) d->item = lift->item;
+	d->count    = (uint8_t)(d->count + move);
+	lift->count = (uint8_t)(lift->count - move);
+	if (lift->count == 0) lift->item = ITEM_NONE;
+	return move;
+}
+
+uint8_t invBridgePlaceLift(Inventory* inv, int origin, int dst, InvSlot* lift)
+{
+	if (!inv || !lift || dst < 0 || dst >= INV_SLOT_COUNT) return 0;
+
+	const uint8_t placed = liftInto(&inv->slots[dst], lift);
+
+	// Reported as a MOVE out of the slot the lift was split from — see the header on why the
+	// server's copy, which never split, ends up identical. Back onto the origin is a no-op on
+	// that copy, so it is not sent.
+	if (placed > 0 && origin != dst && slotFitsWire(origin) && slotFitsWire(dst))
+		(void)networldSendInvAction(BS_INV_OP_MOVE, (uint8_t)origin, (uint8_t)dst, placed);
+
+	return placed;
+}
+
+bool invBridgeReturnLift(Inventory* inv, int origin, InvSlot* lift)
+{
+	if (!inv || !lift) return false;
+	if (lift->item == ITEM_NONE || lift->count == 0) return true;   // nothing carried
+
+	// Onto the origin first: it still holds the same item (or emptied only if a snapshot
+	// rewrote it), and the units came out of it, so in single player this always takes all.
+	if (origin >= 0 && origin < INV_SLOT_COUNT)
+		(void)liftInto(&inv->slots[origin], lift);
+
+	// The origin no longer takes it — a different item sits there now, which only a server
+	// snapshot can have done. inventoryAdd, NOT invBridgeAdd: the server was never told these
+	// units left the bag, so a PICKUP report for them would credit the player twice.
+	if (lift->item != ITEM_NONE) {
+		uint8_t leftover = 0;
+		(void)inventoryAdd(inv, lift->item, lift->count, &leftover);
+		lift->count = leftover;
+		if (lift->count == 0) lift->item = ITEM_NONE;
+	}
+	return lift->item == ITEM_NONE;
+}
+
 bool invBridgeApplyState(Inventory* inv, const NetworldInvState* state)
 {
 	if (!inv || !state) return false;
