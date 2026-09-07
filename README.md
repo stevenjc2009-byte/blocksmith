@@ -20,6 +20,11 @@ writes `sdmc:/blocksmith/hang.txt`, naming the phase the main thread was in.
 
 ## Install
 
+**The v1.9.0 release isn't published on GitHub yet** — the tag exists, but the Release object
+carrying the `.cia` doesn't, so the QR code and the direct link below currently 404. The
+newest version actually downloadable right now is **v1.8.20**; this section starts working
+the moment v1.9.0's release goes up.
+
 **Scan the QR code above with FBI** ("Scan QR Code" → install). It points at the
 `.cia` attached to the v1.9.0 release, so FBI downloads and installs it
 directly.

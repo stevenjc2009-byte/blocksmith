@@ -13,7 +13,10 @@ worktree so nothing still dirty in the main tree could leak into the artifact:
 `blocksmith1.9.0.cia`, 1471424 bytes, md5 `74ccb73a998ff864d4113ae4f20228d4`.
 
 The GitHub Release carrying that file is **not published yet**, so until it is, the in-game
-**Options → Check for Update** and the README's install QR both still resolve to v1.8.20.
+**Options → Check for Update** falls back to v1.8.20 through the `/releases/latest` redirect
+(`source/app/updater.c`'s `checkViaRedirect()`), while the README's install QR — which encodes
+a version-pinned direct asset URL, not that redirect (`tools/make_qr.py`) — simply 404s
+instead.
 
 `docs/ROADMAP.md` calls this version "Storage and quality of life". The bulk of it is chests
 — the first player-facing storage block — plus a set of interface conveniences that had been
@@ -97,18 +100,21 @@ playtest — this entry documents what landed in the working tree, not a fresh b
   `handle_app_payload()`'s unknown-opcode tail and v1.9.10 does ship new opcodes.
 
 - **The `BS_APP_CHEST_ACTION` field contract this client implements** — `a`/`b` meanings for
-  deposit vs. withdraw — was agreed with the server side for v1.9.10. `bs_proto.h`'s own
-  one-line comment on `BS_CHEST_OP_DEPOSIT` is stale ("a = inventory slot") and does not
-  describe what either side actually does (`source/net/networld.h:226-234`).
+  deposit vs. withdraw — was agreed with the server side for v1.9.10, matching `bs_proto.h`'s
+  own comments on `BS_CHEST_OP_DEPOSIT` and `BS_CHEST_OP_WITHDRAW`
+  (`deps/blocksmith-server/proto/bs_proto.h:612-613`); see `source/net/networld.h:226-234` for
+  this client's side of it.
 
 - **Against server v1.9.9** (chest block present, capability opcode not yet sent): join
   succeeds and ordinary chest placing/breaking works, but transfers do not.
   `networldSendChestAction()` returns `false` because `BS_CAP_CHESTS` was never announced
   (`source/net/networld.c:1433`), and the caller keeps the lift and changes nothing rather than
   applying the transfer locally (`source/scene/ui.h:105-148`) — chests are read-only over that
-  connection, not broken and not silently faked. **Against anything older than v1.9.9**, the
+  connection, not broken and not silently faked. **Against v1.6.0 through v1.9.8**, the
   registry hash no longer matches and the join itself is refused before chests are a question
-  (`source/net/networld.c:331,923-945`).
+  (`source/net/networld.c:331,923-945`). **Against anything older than v1.6.0**, the server
+  never sent a registry fingerprint in the first place, so nothing about it can be proved
+  mismatched, and the join still succeeds, degraded exactly as it always was.
 
 ### Fixed
 

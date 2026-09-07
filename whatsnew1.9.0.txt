@@ -14,7 +14,8 @@ Chests: craft an 8-slot storage block and place it to stash items.
 Chests work with friends on a server too, not just solo.
 Multiplayer chest transfers need a server running v1.9.10 or newer.
 A v1.9.9 server lets you join and place or break chests, but not move items in or out.
-Anything older than v1.9.9 refuses the join outright - update your server first.
+Servers on v1.6.0 through v1.9.8 refuse the join outright - update your server first.
+Older servers (pre-v1.6.0) still join fine, without chest sync, exactly as before.
 World list: press delete twice to confirm, so a stray tap cannot wipe a world by accident.
 World list: rename any world right from the list, no need to load it first.
 L and R now cycle your hotbar slot instead of stepping the render distance live.

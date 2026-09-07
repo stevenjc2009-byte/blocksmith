@@ -1029,9 +1029,11 @@ use: the client only sends a transfer once the server has announced `BS_CAP_CHES
 (`source/net/networld.c:1433`). The matching server is `blocksmith-server` v1.9.10 or later.
 Against v1.9.9, the join still succeeds and chests can be placed and broken, but the
 capability bit is never announced, so nothing moves in or out — the client falls back to
-client-local chests rather than applying a transfer over the wire. Against anything older
-than v1.9.9, the chest block row changes the registry hash and the join itself is refused
-outright, before chests are ever a question.
+client-local chests rather than applying a transfer over the wire. Against v1.6.0 through
+v1.9.8, the chest block row changes the registry hash and the join itself is refused
+outright, before chests are ever a question. Against anything older than v1.6.0, the server
+never sent a registry fingerprint at all, so nothing can be proved mismatched, and the join
+still succeeds, degraded exactly as it always was.
 
 Full design and the storage decision behind it: `docs/design-1.9.0-chest-multiplayer.md`
 and `docs/decision-1.9.0-chest-storage.md`.
