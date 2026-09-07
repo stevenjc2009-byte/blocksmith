@@ -30,7 +30,7 @@
 // tap here is two frames: touch down at the point, then touch up, so the next tap is a fresh
 // edge. A transfer is therefore TWO taps: one on the source slot (lift), one on the
 // destination (place). Every point is the CENTRE of a rect from scene/ui_layout.h — the same
-// chestSlotRect()/chestGridSlotRect()/hotbarSlotRect()/chestCloseRect() ui.c hit-tests
+// chestSlotRect()/chestGridSlotRect()/hotbarSlotRect()/barCloseRect() ui.c hit-tests
 // against — so if the layout moves, the taps move with it and this suite keeps testing
 // transfers rather than pixels.
 //
@@ -42,11 +42,28 @@
 // ── The one piece of main.c restated here ─────────────────────────────────────────────────
 //
 // testContentsSurviveCloseAndReopen needs the frame glue main.c wraps around uiUpdateDraw()
-// for a chest — unpack from world/blockstate.c if open, call, pack back, "closed once the
-// screen is no longer UI_SCR_CHEST". main.c cannot be linked (it carries main() and <3ds.h>),
+// for a chest — unpack from world/blockstate.c if open, call, pack back, "closed once
+// UiResult.chest_open comes back false" (v1.9.1's seam S6; it used to be a test against the
+// retired UI_SCR_CHEST enum value). main.c cannot be linked (it carries main() and <3ds.h>),
 // so hostFrame() below restates those four steps and nothing else, in main.c's order, so they
 // can be checked against it by eye. It is the only logic in this file that is a copy rather
 // than a link.
+//
+// ── 2026-09-07, v1.9.1 BAR: what moved, and what did not ─────────────────────────────────
+//
+// UI_SCR_INVENTORY, UI_SCR_CHEST and UI_SCR_FURNACE are GONE. There is one UI_SCR_BAR screen
+// with a tab cursor (scene/barnav.h's BarNav, on UiState.nav), and the three old screens are
+// three TABS of it. So every assertion that used to name a screen now names TWO things — the
+// bar is up, AND which tab is focused — because "the bar is open" on its own no longer says
+// what the player is looking at, and a check that only asserted that would have stopped
+// testing the thing it was written for. onTab() below is how the tab half is asserted.
+//
+// The TRANSFER SEMANTICS this file exists for are unchanged, and so is every rect the chest
+// content is drawn at and hit-tested against (chestSlotRect, chestGridSlotRect, hotbarSlotRect).
+// One control did move: the close bar. chestCloseRect() is (0, 40, 320, 26), which is now
+// exactly the TAB STRIP (barStripRect() is the identical rect) — a tap at its centre lands on
+// a tab and switches category rather than closing anything. The door out is barCloseRect(),
+// the 26 px square at the right end of the strip, so that is what the close taps below use.
 #include "scene/ui.h"
 
 #include <stdio.h>
@@ -83,7 +100,28 @@ static char s_first[160];
 //
 // Seeded at a placeholder 1 first; the first green run's "CHECK COUNT: N check(s) were ADDED"
 // line is what set it — see tools/run_host_tests.sh's ui_chest stanza for the measured line.
-#define UI_CHEST_TEST_EXPECTED_CHECKS 486
+//
+// v1.9.1 BAR re-pin: 486 -> 516, +30. Every one of the 30 is an ADDITION; nothing was dropped.
+//
+// +29 of it was the port itself, predicted by counting the edits BEFORE the first run and
+// measured at exactly 515 on it. The 30th came out of that run: see the last item.
+//   +9   one per screen assertion that became two — `screen == UI_SCR_BAR` plus an onTab()
+//         naming the tab. The six old `== UI_SCR_CHEST` checks, the one `== UI_SCR_INVENTORY`,
+//         and the two `== UI_SCR_FURNACE`.
+//   +18  testChestTransfersNeverFireOffTheChestScreen swept 2 screens (HUD, INVENTORY) at 18
+//         checks each; the non-container states are now 3 (HUD, INVENTORY tab, CRAFT tab),
+//         because CRAFT is a tab a player can reach with a chest still open and the old model
+//         had no equivalent of it.
+//   +1   testPanelDraws... now asserts the close TAB (barCloseRect) as well as the strip; the
+//         strip and the retired chestCloseRect are the same rect, the close tab is new.
+//   +1   the close frame's UiResult went from 2 checks to 3: bar_open is now TRUE on the frame
+//         that closes (the bar is what drew), so !inventory_open could not simply be renamed —
+//         it flipped, and chest_open joins it because that is the flag main.c's S6 gate reads.
+//   +1   testChestTabWithNoChestFallsBackToTheBagTab's one `nothingLifted(&ui)` became two
+//         checks, one per lift, because they no longer agree: the bag one is clear and the
+//         chest one is STALE. That check ran RED on the first green-compiling run and the
+//         defect it found is written up at the check itself — read it before re-pinning.
+#define UI_CHEST_TEST_EXPECTED_CHECKS 516
 
 // gfx/sprite.c's per-frame quad ceiling, restated as a literal for the same reason as the pin
 // above: sprite.c cannot be linked here (it is the GPU batch), and the number is the budget
@@ -133,8 +171,27 @@ static void checkCountPin(void)
 static UiResult frameWithIcons(UiState* ui, Inventory* inv, ChestState* chest, C3D_Tex* icons,
                                const UiStats* stats, bool down, int x, int y)
 {
-	const UiInput in = { down, x, y, 0 };   // v1.9.0 SPLIT: keys_held — no key held in this test
+	// keys_held (v1.9.0 SPLIT) then keys_down (v1.9.1 BAR), both zero: no key held and no press
+	// edge, so neither uiGestureFeed nor barNavInput claims anything on these frames. Spelled
+	// out rather than left to a short initialiser — the stanza builds at -Werror with
+	// -Wmissing-field-initializers, so a field added to UiInput has to be answered here.
+	const UiInput in = { down, x, y, 0, 0 };
 	return uiUpdateDraw(ui, inv, icons, stats, &in, NULL, chest);
+}
+
+// ── Which TAB is focused ──────────────────────────────────────────────────────────────────
+//
+// nav.cat is an INDEX into the live category list, not a kind, so this resolves it the way
+// uiUpdateDraw itself does: barBuildKinds() from the two container pointers, indexed by
+// nav.cat. Asserting the KIND and never the raw index is the point — the container is index 2
+// only because barBuildKinds puts it there, and a check that pinned the number 2 would keep
+// passing if the tab that lived at 2 changed underneath it. An out-of-range cat is false, not
+// a silent fallback to INVENTORY, so a cursor left off the end shows up as a failure here.
+static bool onTab(const UiState* ui, BarKind want, bool has_chest, bool has_furnace)
+{
+	BarKind   kinds[BAR_MAX_TABS];
+	const int n = barBuildKinds(has_chest, has_furnace, kinds);
+	return ui->nav.cat >= 0 && ui->nav.cat < n && kinds[ui->nav.cat] == want;
 }
 
 static UiResult frame(UiState* ui, Inventory* inv, ChestState* chest, bool down, int x, int y)
@@ -295,10 +352,24 @@ static void testPanelDrawsEightChestSlotsAndTheWholeBag(void)
 		CHECK(drewRect(chestSlotRect(i)));
 	for (int s = 0; s < INV_SLOT_COUNT; s++)
 		CHECK(drewRect(bagRectOnChestScreen(s)));
-	// The main grid is drawn at its RELOCATED position and not where the overlay draws it:
-	// the two never coincide (GRID_Y vs CHEST_GRID_Y), so this is a real distinction.
-	CHECK(!drewRect(gridSlotRect(0)));
-	CHECK(drewRect(chestCloseRect()));
+	// The main grid is drawn at its RELOCATED position (CHEST_GRID_Y 160) and not where the
+	// INVENTORY tab draws it (GRID_Y 72).
+	//
+	// The witness is grid slot 8 — the second grid ROW, at y 112 — and not slot 0, which is what
+	// this check named until v1.9.1 and what MEASURED red on the first run of the ported suite.
+	// v1.9.1 moved GRID_Y to BAR_STRIP_Y + BAR_STRIP_H + 6 = 72, which is exactly CHEST_ROW_Y,
+	// so gridSlotRect(0) and chestSlotRect(0) are now the SAME rect and "the bag grid is not
+	// drawn at 72" is no longer a statement the chest tab can satisfy: its own eight chest cells
+	// live there. Nothing on the chest tab draws at y 112, so slot 8 still says the thing this
+	// check was written to say.
+	CHECK(!drewRect(gridSlotRect(8)));
+
+	// v1.9.1 BAR: the band at y 40..66 is the tab strip, not a full-width close bar. Both quads
+	// are asserted — the strip background AND the close tab at its right end — because the strip
+	// alone is the same rect the retired chestCloseRect() named, so checking only that would
+	// pass unchanged on a build that had lost the door out entirely.
+	CHECK(drewRect(barStripRect()));
+	CHECK(drewRect(barCloseRect()));
 }
 
 // ── Deposits (lift a bag slot, place on a chest slot) ─────────────────────────────────────
@@ -324,7 +395,8 @@ static void testDepositLiftBagPlaceOnEmptyChestSlot(void)
 	CHECK(chestSlotIs(&cs, 0, ITEM_NONE, 0));
 	CHECK(nothingLifted(&ui));
 	CHECK(units(&inv, &cs, BLOCK_STONE) == 99);
-	CHECK(ui.screen == UI_SCR_CHEST);        // a transfer does not close the panel
+	CHECK(ui.screen == UI_SCR_BAR);                    // a transfer does not close the bar...
+	CHECK(onTab(&ui, BAR_KIND_CHEST, true, false));    // ...and does not change the tab either
 	CHECK(uiChestStubNet()->calls == 0);     // the chest path never goes through inv_bridge
 }
 
@@ -505,7 +577,8 @@ static void testTapsOnEmptySlotsWithNothingLiftedLiftNothing(void)
 	CHECK(bagEq(&inv, &inv0));
 	CHECK(chestEq(&cs, &cs0));
 	CHECK(uiChestStubNet()->calls == 0);
-	CHECK(ui.screen == UI_SCR_CHEST);
+	CHECK(ui.screen == UI_SCR_BAR);
+	CHECK(onTab(&ui, BAR_KIND_CHEST, true, false));   // and none of those taps changed the tab
 }
 
 static void testPlacingOnNoTargetKeepsTheLift(void)
@@ -637,17 +710,25 @@ static void testCloseReturnsToTheHudAndClearsAnyLift(void)
 
 		tapRect(&ui, &inv, &cs, hotbarSlotRect(0));
 		CHECK(ui.picked_slot == 0);
-		const UiResult r_close = tapRect(&ui, &inv, &cs, chestCloseRect());
+		const UiResult r_close = tapRect(&ui, &inv, &cs, barCloseRect());
 		CHECK(ui.screen == UI_SCR_HUD);
 		CHECK(nothingLifted(&ui));
-		CHECK(!r_close.inventory_open);   // the tap frame DREW the chest screen
+		// The tap frame DREW the bar, so it REPORTS the bar — the close takes effect next frame,
+		// the same "a change applies next frame" rule the old `!inventory_open` here was reading
+		// off a screen enum. That flag flipped rather than being renamed: the chest screen was
+		// never the inventory overlay, but it IS the bar.
+		CHECK(r_close.bar_open);
 		CHECK(!r_close.furnace_open);
+		// ...and it still reports the chest, which is what makes main.c's seam S6
+		// (`if (!ures.chest_open) s_chest_open = false;`) close it on the NEXT frame — the frame
+		// that leaves the bar is the last one handed a chest and the last one that packs back.
+		CHECK(r_close.chest_open);
 		CHECK(bagEq(&inv, &inv0));        // a cancelled lift moved nothing
 		CHECK(chestEq(&cs, &cs0));
 
 		// Next frame the HUD is what draws; the chest pointer still handed in must be inert.
 		const UiResult r_next = frame(&ui, &inv, &cs, false, 0, 0);
-		CHECK(!r_next.inventory_open);
+		CHECK(!r_next.bar_open);
 		CHECK(!drewRect(chestSlotRect(0)));
 		tapRect(&ui, &inv, &cs, chestSlotRect(2));   // on the HUD this pixel is nothing
 		CHECK(chestEq(&cs, &cs0));
@@ -665,7 +746,7 @@ static void testCloseReturnsToTheHudAndClearsAnyLift(void)
 
 		tapRect(&ui, &inv, &cs, chestSlotRect(3));
 		CHECK(ui.picked_chest == 3);
-		tapRect(&ui, &inv, &cs, chestCloseRect());
+		tapRect(&ui, &inv, &cs, barCloseRect());
 		CHECK(ui.screen == UI_SCR_HUD);
 		CHECK(nothingLifted(&ui));
 		CHECK(chestEq(&cs, &cs0));
@@ -679,17 +760,21 @@ static void testOpenChestCancelsAPendingLiftAndRecordsThePosition(void)
 	{
 		UiState ui; Inventory inv; ChestState cs;
 		uiInit(&ui);
-		ui.screen = UI_SCR_INVENTORY;
+		// The bar on its INVENTORY tab: uiInit's memset leaves nav.cat 0, and category 0 is
+		// INVENTORY on every list barBuildKinds produces. Written as a screen assignment because
+		// ui.h still says setting the field directly is legal — it just is not a contract.
+		ui.screen = UI_SCR_BAR;
 		inventoryInit(&inv);
 		chestStateInit(&cs);
 		setBag(&inv, 2, BLOCK_STONE, 5);
 		const Inventory inv0 = inv;
 
-		tapRect(&ui, &inv, NULL, hotbarSlotRect(2));   // lift on the overlay
+		tapRect(&ui, &inv, NULL, hotbarSlotRect(2));   // lift on the bag tab
 		CHECK(ui.picked_slot == 2);
 
 		uiOpenChest(&ui, 9, 64, 3);
-		CHECK(ui.screen == UI_SCR_CHEST);
+		CHECK(ui.screen == UI_SCR_BAR);
+		CHECK(onTab(&ui, BAR_KIND_CHEST, true, false));   // opened ON the container tab
 		CHECK(nothingLifted(&ui));
 		CHECK(ui.chest_x == 9 && ui.chest_y == 64 && ui.chest_z == 3);
 		CHECK(bagEq(&inv, &inv0));
@@ -738,7 +823,7 @@ static void testOpenChestCancelsAPendingLiftAndRecordsThePosition(void)
 	}
 }
 
-static void testChestScreenWithNoChestIsCorrectedToTheOverlayAndDropsBothLifts(void)
+static void testChestTabWithNoChestFallsBackToTheBagTab(void)
 {
 	UiState ui; Inventory inv; ChestState cs;
 	openChest(&ui);
@@ -750,31 +835,69 @@ static void testChestScreenWithNoChestIsCorrectedToTheOverlayAndDropsBothLifts(v
 	tapRect(&ui, &inv, &cs, chestSlotRect(0));   // a chest lift, then the chest goes away
 	CHECK(ui.picked_chest == 0);
 
-	// ui.h: "a UiState left on UI_SCR_CHEST with no chest handed in is corrected to
-	// UI_SCR_INVENTORY on the spot". The tap lands where chest slot 0 was, which on the
-	// overlay is a bag-grid cell — an empty one, so it lifts nothing.
+	// v1.9.1 BAR replaced the old same-frame screen correction with something narrower: the
+	// category list is rebuilt from the two pointers EVERY frame, so a chest that stopped being
+	// handed in simply has no tab, and barNavClamp puts the cursor back on category 0 —
+	// INVENTORY, which always exists. The screen itself never needed correcting; it was already
+	// UI_SCR_BAR. The tap lands where chest slot 0 was, which on the bag tab is a grid cell
+	// (gridSlotRect and chestSlotRect are the same rect at GRID_Y 72) — an empty one, so it
+	// lifts nothing.
 	const URect r = chestSlotRect(0);
 	const UiResult res = tapAt(&ui, &inv, NULL, r.x + r.w / 2, r.y + r.h / 2);
 
-	CHECK(ui.screen == UI_SCR_INVENTORY);
-	CHECK(res.inventory_open);   // corrected BEFORE the frame's flags were read: the overlay drew
-	CHECK(nothingLifted(&ui));
+	CHECK(ui.screen == UI_SCR_BAR);
+	CHECK(onTab(&ui, BAR_KIND_INVENTORY, false, false));   // clamped off the tab that went away
+	CHECK(res.bar_open);         // clamped BEFORE the frame's flags were read: the bar drew
+
+	// FIXED 2026-09-07. This test used to be called ...AndDropsBothLifts, then was renamed and
+	// re-pinned to MEASURE a defect: barNavClamp moved the cursor but nothing in source/scene/
+	// ui.c ever cleared picked_chest when the chest pointer stopped being handed in, so it kept
+	// naming slot 0 of a chest that no longer existed — the next chest opened would have been
+	// read against that stale index (a wrong-chest place/withdraw). uiUpdateDraw now clears
+	// picked_chest at the exact site the tab vanishes (`chest == NULL`, right after the
+	// barBuildCats/barNavClamp pair above) — see the comment there for why picked_slot is left
+	// alone: an ordinary tab switch never touches the bag lift either, so the automatic clamp
+	// forced by the chest vanishing does not treat it differently. This is back to
+	// nothingLifted()'s two components in name only — both still asserted separately, because
+	// they assert two DIFFERENT things (no bag lift was ever taken here; the chest lift is now
+	// correctly gone) and collapsing them would lose that distinction for the next person who
+	// reads this test after a regression.
+	//
+	// This also restores barHasLift()'s answer: picked_chest is -1, so B on the bag tab now
+	// answers BAR_EV_BACK and exits, instead of BAR_EV_CANCEL swallowing a press to clear a lift
+	// the player can no longer see.
+	CHECK(ui.picked_slot == -1);    // the bag lift is clear -- none was taken on this path
+	CHECK(ui.picked_chest == -1);   // the chest lift is CLEARED -- see the block above
 	CHECK(bagUnits(&inv, BLOCK_STONE) == 5);
 	CHECK(chestSlotIs(&cs, 0, BLOCK_DIRT, 1));
 }
 
-// The transfer block is `else if (tap && chest_open)`: no other screen can reach the chest
-// handlers even with a live ChestState handed in. Every chest-panel target is tapped twice
-// (a "lift" then a "place") on the two other screens a caller could plausibly be on with the
-// pointer still set, and the chest must not move.
-static void testChestTransfersNeverFireOffTheChestScreen(void)
+// The chest handlers hang off `case BAR_KIND_CHEST:` in uiUpdateDraw's tap chain, i.e. off the
+// FOCUSED TAB and not off the chest pointer: no other place in the UI can reach them even with
+// a live ChestState handed in every frame. Every chest-panel target is tapped twice (a "lift"
+// then a "place") in each state a caller could plausibly be in with the pointer still set, and
+// the chest must not move.
+//
+// v1.9.1 BAR: three states, not two. The old model's non-chest screens were the HUD and the
+// inventory overlay; the new one's are the HUD and the two non-container TABS, and CRAFT is a
+// tab the player can reach with a chest still open (an L press) that had no equivalent before.
+// Leaving it out would have been a state the old suite covered by construction and the new one
+// did not cover at all.
+static void testChestTransfersNeverFireOffTheChestTab(void)
 {
-	static const UiScreen screens[] = { UI_SCR_HUD, UI_SCR_INVENTORY };
+	// { screen, nav.cat }. Cat is ignored on the HUD. Cat 0 is INVENTORY and cat 1 is CRAFT on
+	// every list barBuildKinds produces, container open or not.
+	static const struct { UiScreen screen; int cat; } states[] = {
+		{ UI_SCR_HUD, 0 },
+		{ UI_SCR_BAR, 0 },
+		{ UI_SCR_BAR, 1 },
+	};
 
-	for (size_t k = 0; k < sizeof(screens) / sizeof(screens[0]); k++) {
+	for (size_t k = 0; k < sizeof(states) / sizeof(states[0]); k++) {
 		UiState ui; Inventory inv; ChestState cs;
 		uiInit(&ui);
-		ui.screen = screens[k];   // ui.h: setting the field directly is legal, it just isn't a contract
+		ui.screen  = states[k].screen;   // ui.h: setting the field directly is legal, it just isn't a contract
+		ui.nav.cat = states[k].cat;
 		inventoryInit(&inv);
 		chestStateInit(&cs);
 		setBag(&inv, 0, BLOCK_STONE, 5);
@@ -791,26 +914,33 @@ static void testChestTransfersNeverFireOffTheChestScreen(void)
 		tapRect(&ui, &inv, &cs, hotbarSlotRect(0));
 		tapRect(&ui, &inv, &cs, chestSlotRect(1));
 		CHECK(chestEq(&cs, &cs0));
-		tapRect(&ui, &inv, &cs, chestCloseRect());
+		tapRect(&ui, &inv, &cs, barCloseRect());
 		CHECK(chestEq(&cs, &cs0));
 	}
 }
 
-// The three hit-tests the chest branch consults — the close bar, hitChestSlot(), and
-// hitChestInvSlot() (hotbar + relocated grid) — must never claim the same pixel, or a tap has
-// two meanings and the dispatch order in ui.c silently picks one. Swept over every pixel of
-// the 320x240 panel. The three area checks are what stop the sweep passing vacuously: a rect
-// that had collapsed to nothing would overlap nothing.
-static void testChestScreenHitTestsNeverOverlap(void)
+// The three hit-tests a tap on the chest tab is dispatched through — the tab strip, then
+// hitChestSlot(), then hitChestInvSlot() (hotbar + relocated grid) — must never claim the same
+// pixel, or a tap has two meanings and the dispatch order in ui.c silently picks one. Swept
+// over every pixel of the 320x240 panel. The three area checks are what stop the sweep passing
+// vacuously: a rect that had collapsed to nothing would overlap nothing.
+//
+// v1.9.1 BAR: the first of the three is hitBarStrip() at THREE tabs (INVENTORY, CRAFT, CHEST —
+// what barBuildKinds produces with a chest open), not the retired full-width chestCloseRect().
+// It is the strip that a tap is now tested against first, and it claims the whole band: the
+// tabs tile 0..294 and the close tab takes 294..320, so the expected area is the same
+// SCR_W * BAR_STRIP_H the old close bar covered — the meaning of those pixels changed, not
+// their extent.
+static void testChestTabHitTestsNeverOverlap(void)
 {
-	int overlaps = 0, close_px = 0, chest_px = 0, bag_px = 0;
+	int overlaps = 0, strip_px = 0, chest_px = 0, bag_px = 0;
 
 	for (int y = 0; y < SCR_H; y++) {
 		for (int x = 0; x < SCR_W; x++) {
-			const int c = ptInRect(chestCloseRect(), x, y) ? 1 : 0;
+			const int c = hitBarStrip(x, y, 3) != BAR_HIT_NONE ? 1 : 0;
 			const int s = hitChestSlot(x, y)    >= 0 ? 1 : 0;
 			const int b = hitChestInvSlot(x, y) >= 0 ? 1 : 0;
-			close_px += c;
+			strip_px += c;
 			chest_px += s;
 			bag_px   += b;
 			if (c + s + b > 1) overlaps++;
@@ -818,7 +948,7 @@ static void testChestScreenHitTestsNeverOverlap(void)
 	}
 
 	CHECK(overlaps == 0);
-	CHECK(close_px == SCR_W * CHEST_CLOSE_H);
+	CHECK(strip_px == SCR_W * BAR_STRIP_H);
 	CHECK(chest_px == CHEST_SLOTS * SLOT_PX * SLOT_PX);
 	CHECK(bag_px   == INV_SLOT_COUNT * SLOT_PX * SLOT_PX);
 }
@@ -895,7 +1025,8 @@ static void testHookDepositSendsTheItemIdAndTheChestSlotAndAppliesNothing(void)
 	CHECK(chestEq(&cs, &cs0));
 	CHECK(nothingLifted(&ui));      // sent: the server owns it, the lift is done
 	CHECK(uiChestStubNet()->calls == 0);
-	CHECK(ui.screen == UI_SCR_CHEST);
+	CHECK(ui.screen == UI_SCR_BAR);
+	CHECK(onTab(&ui, BAR_KIND_CHEST, true, false));
 }
 
 static void testHookWithdrawSendsTheChestSlotAndTheBagSlotAndAppliesNothing(void)
@@ -1038,8 +1169,8 @@ static void testHookIsNotConsultedForLiftsCancelsBagToBagOrTheCloseBar(void)
 	CHECK(bagSlotIs(&inv, INV_HOTBAR_SLOTS, BLOCK_STONE, 3));   // and it DID move, locally
 	CHECK(chestEq(&cs, &cs0));
 
-	tapRect(&ui, &inv, &cs, chestSlotRect(1));      // lift, then the close bar is not a place
-	tapRect(&ui, &inv, &cs, chestCloseRect());
+	tapRect(&ui, &inv, &cs, chestSlotRect(1));      // lift, then the close tab is not a place
+	tapRect(&ui, &inv, &cs, barCloseRect());
 	CHECK(s_spy.calls == 0);
 	CHECK(ui.screen == UI_SCR_HUD);
 	CHECK(chestEq(&cs, &cs0));
@@ -1068,19 +1199,21 @@ static void testHookRefusesChestToChestWithoutBeingCalled(void)
 	CHECK(ui.picked_chest == 0);
 }
 
-static void testHookIsConsultedOnlyOnTheChestScreen(void)
+static void testHookIsConsultedOnlyOnTheChestTab(void)
 {
 	UiState ui; Inventory inv; ChestState cs;
 	uiInit(&ui);
 	armSpy(&ui, true);
-	ui.screen = UI_SCR_INVENTORY;
+	// The bar on the INVENTORY tab with the chest STILL handed in every frame: the chest tab
+	// exists at index 2, it is just not the focused one, which is the whole distinction.
+	ui.screen = UI_SCR_BAR;
 	inventoryInit(&inv);
 	chestStateInit(&cs);
 	setBag(&inv, 0, BLOCK_STONE, 5);
 	setChest(&cs, 0, BLOCK_DIRT, 7);
 
-	tapRect(&ui, &inv, &cs, hotbarSlotRect(0));   // lift on the overlay
-	tapRect(&ui, &inv, &cs, chestSlotRect(0));    // on the overlay this pixel is a grid cell
+	tapRect(&ui, &inv, &cs, hotbarSlotRect(0));   // lift on the bag tab
+	tapRect(&ui, &inv, &cs, chestSlotRect(0));    // on the bag tab this pixel is a grid cell
 
 	CHECK(s_spy.calls == 0);
 	CHECK(chestSlotIs(&cs, 0, BLOCK_DIRT, 7));
@@ -1119,9 +1252,15 @@ typedef struct {
 } Host;
 
 // main.c's per-frame chest glue, restated (see the file comment): unpack if open, call, pack
-// back if a chest was handed in, closed once the screen has left UI_SCR_CHEST. The pack-back
-// is gated on "a chest was handed in" and NOT on "still open", exactly as main.c's is, so a
-// transfer and a close on the same frame would both still land.
+// back if a chest was handed in, closed once UiResult.chest_open comes back false. The
+// pack-back is gated on "a chest was handed in" and NOT on "still open", exactly as main.c's
+// is, so a transfer and a close on the same frame would both still land.
+//
+// v1.9.1 BAR: the close test is main.c's seam S6, `if (!ures.chest_open) s_chest_open = false;`
+// — read off the RESULT, not off ui->screen. The old `screen != UI_SCR_CHEST` cannot be
+// rewritten as `screen != UI_SCR_BAR`: that is true on every frame the bar is up on any tab, so
+// an L press to look at the crafting list would slam the chest shut and take its tab away. The
+// pointer is what owns the container's lifetime and chest_open is what reports it.
 static void hostFrame(Host* h, UiState* ui, Inventory* inv, bool down, int tx, int ty)
 {
 	uint8_t     pay[BLOCKSTATE_PAYLOAD_BYTES];
@@ -1137,14 +1276,14 @@ static void hostFrame(Host* h, UiState* ui, Inventory* inv, bool down, int tx, i
 		}
 	}
 
-	const UiInput in = { down, tx, ty, 0 };   // v1.9.0 SPLIT: keys_held — no key held here
-	(void)uiUpdateDraw(ui, inv, NULL, NULL, &in, NULL, cp);
+	const UiInput in = { down, tx, ty, 0, 0 };   // keys_held, keys_down: neither pressed here
+	const UiResult r = uiUpdateDraw(ui, inv, NULL, NULL, &in, NULL, cp);
 
 	if (cp) {
 		chestStatePack(cp, pay);
 		(void)blockStateSet(&h->table, h->x, h->y, h->z, BLOCK_CHEST, pay);
 	}
-	if (ui->screen != UI_SCR_CHEST) h->open = false;
+	if (!r.chest_open) h->open = false;
 }
 
 static void hostTap(Host* h, UiState* ui, Inventory* inv, URect r)
@@ -1188,7 +1327,8 @@ static void testContentsSurviveCloseAndReopenThroughTheRealBlockstateTable(void)
 	CHECK(chestSlotIs(&cs, 1, BLOCK_APPLE, 4));
 	CHECK(bagTotal(&inv) == 0);
 	CHECK(h.open);
-	CHECK(ui.screen == UI_SCR_CHEST);
+	CHECK(ui.screen == UI_SCR_BAR);
+	CHECK(onTab(&ui, BAR_KIND_CHEST, true, false));
 
 	// The bytes in the table are chest.c's real format — item, count, item, count... — not a
 	// copy this file keeps, so a round trip that "worked" through a broken pack would show here.
@@ -1196,11 +1336,11 @@ static void testContentsSurviveCloseAndReopenThroughTheRealBlockstateTable(void)
 	CHECK(blockStateGet(&h.table, h.x, h.y, h.z, BLOCK_CHEST, raw));
 	CHECK(raw[0] == BLOCK_STONE && raw[1] == 99 && raw[2] == BLOCK_APPLE && raw[3] == 4);
 
-	// Close with a lift pending. main.c's rule: the frame that leaves UI_SCR_CHEST is the last
-	// one handed a chest, and it still packs back — which must be the UNCHANGED chest.
+	// Close with a lift pending. main.c's rule: the frame that leaves the bar is the last one
+	// handed a chest, and it still packs back — which must be the UNCHANGED chest.
 	hostTap(&h, &ui, &inv, chestSlotRect(0));
 	CHECK(ui.picked_chest == 0);
-	hostTap(&h, &ui, &inv, chestCloseRect());
+	hostTap(&h, &ui, &inv, barCloseRect());
 	CHECK(ui.screen == UI_SCR_HUD);
 	CHECK(!h.open);
 	CHECK(nothingLifted(&ui));
@@ -1254,7 +1394,10 @@ static void testContentsSurviveCloseAndReopenThroughTheRealBlockstateTable(void)
 static UiResult frameKeys(UiState* ui, Inventory* inv, FurnaceState* furnace, ChestState* chest,
                           bool down, int x, int y, uint32_t keys)
 {
-	const UiInput in = { down, x, y, keys };
+	// `keys` is keys_HELD — the level word scene/ui_gesture.h reads. keys_down stays 0: these
+	// helpers drive the X/Y gestures, and a press-edge word would additionally hand barNavInput
+	// a BAR_KEY_X/_Y and let the cursor act on the same frame, which is not what is under test.
+	const UiInput in = { down, x, y, keys, 0 };
 	return uiUpdateDraw(ui, inv, NULL, NULL, &in, furnace, chest);
 }
 
@@ -1301,7 +1444,7 @@ static void testYSplitsAnOddStackCeilToTheLiftFloorBehind(void)
 {
 	UiState ui; Inventory inv;
 	uiInit(&ui);
-	ui.screen = UI_SCR_INVENTORY;
+	ui.screen = UI_SCR_BAR;   // nav.cat 0 = the INVENTORY tab, left there by uiInit's memset
 	inventoryInit(&inv);
 	setBag(&inv, 4, BLOCK_STONE, 7);   // odd: ceil(7/2)=4, floor(7/2)=3, genuinely different
 
@@ -1352,7 +1495,8 @@ static void testYIsInertOnFurnaceAndChestScreens(void)
 		CHECK(ui.lift.item == ITEM_NONE);            // nothing detached
 		CHECK(bagSlotIs(&inv, 2, BLOCK_STONE, 7));    // whole stack, untouched
 		CHECK(ui.picked_slot == 2);                   // still just a plain whole-stack lift
-		CHECK(ui.screen == UI_SCR_FURNACE);
+		CHECK(ui.screen == UI_SCR_BAR);
+		CHECK(onTab(&ui, BAR_KIND_FURNACE, false, true));
 	}
 
 	{
@@ -1371,7 +1515,8 @@ static void testYIsInertOnFurnaceAndChestScreens(void)
 		CHECK(bagSlotIs(&inv, 2, BLOCK_STONE, 7));
 		CHECK(ui.picked_slot == 2);
 		CHECK(chestTotal(&cs) == 0);
-		CHECK(ui.screen == UI_SCR_CHEST);
+		CHECK(ui.screen == UI_SCR_BAR);
+		CHECK(onTab(&ui, BAR_KIND_CHEST, true, false));
 	}
 }
 
@@ -1386,7 +1531,7 @@ static void testXQuickMovesTheWholeStackToTheOtherStripOnTheOverlay(void)
 	{
 		UiState ui; Inventory inv;
 		uiInit(&ui);
-		ui.screen = UI_SCR_INVENTORY;
+		ui.screen = UI_SCR_BAR;   // nav.cat 0 = the INVENTORY tab, left there by uiInit's memset
 		inventoryInit(&inv);
 		setBag(&inv, 2, BLOCK_STONE, 50);
 
@@ -1407,7 +1552,7 @@ static void testXQuickMovesTheWholeStackToTheOtherStripOnTheOverlay(void)
 	{
 		UiState ui; Inventory inv;
 		uiInit(&ui);
-		ui.screen = UI_SCR_INVENTORY;
+		ui.screen = UI_SCR_BAR;   // nav.cat 0 = the INVENTORY tab, left there by uiInit's memset
 		inventoryInit(&inv);
 		setBag(&inv, 0, BLOCK_STONE, 90);   // room for 9 before the cap
 		for (int i = 1; i < INV_HOTBAR_SLOTS; i++)
@@ -1452,7 +1597,8 @@ static void testXQuickMoveOnFurnaceScreenMovesWithinTheBagNotIntoTheFurnace(void
 	CHECK(furnaceEq(&furnace, &furnace0));                        // the furnace itself never saw it
 	CHECK(nothingLifted(&ui));
 	CHECK(bagUnits(&inv, BLOCK_STONE) == 12);
-	CHECK(ui.screen == UI_SCR_FURNACE);
+	CHECK(ui.screen == UI_SCR_BAR);
+	CHECK(onTab(&ui, BAR_KIND_FURNACE, false, true));
 }
 
 // X on the chest screen: `to_chest` is true, so the whole lifted stack is sent INTO the chest
@@ -1681,7 +1827,7 @@ static void testSnapshotDuringASplitDropsTheLiftInsteadOfDuplicatingIt(void)
 {
 	UiState ui; Inventory inv;
 	uiInit(&ui);
-	ui.screen = UI_SCR_INVENTORY;
+	ui.screen = UI_SCR_BAR;   // nav.cat 0 = the INVENTORY tab, left there by uiInit's memset
 	inventoryInit(&inv);
 	setBag(&inv, 4, BLOCK_STONE, 80);
 
@@ -1720,7 +1866,7 @@ static void testSnapshotWithNoLiftStillAppliesWholesale(void)
 {
 	UiState ui; Inventory inv;
 	uiInit(&ui);
-	ui.screen = UI_SCR_INVENTORY;
+	ui.screen = UI_SCR_BAR;   // nav.cat 0 = the INVENTORY tab, left there by uiInit's memset
 	inventoryInit(&inv);
 	setBag(&inv, 4, BLOCK_STONE, 12);
 	setBag(&inv, 7, BLOCK_DIRT,  3);
@@ -1759,7 +1905,7 @@ static void testARefusedLiftReturnKeepsItsOriginAndRetriesLater(void)
 {
 	UiState ui; Inventory inv;
 	uiInit(&ui);
-	ui.screen = UI_SCR_INVENTORY;
+	ui.screen = UI_SCR_BAR;   // nav.cat 0 = the INVENTORY tab, left there by uiInit's memset
 	inventoryInit(&inv);
 
 	// Every slot full, so inventoryAdd's fallback inside invBridgeReturnLift has nowhere to
@@ -1821,17 +1967,23 @@ static void testXIsInertOnTheHudScreen(void)
 // ── Quad budget ───────────────────────────────────────────────────────────────────────────
 //
 // gfx/sprite.c holds SPRITE_MAX_QUADS (1024) per frame and its counter wraps silently, so
-// the only place an overrun would ever be seen is here. Worst case for each screen: every
+// the only place an overrun would ever be seen is here. Worst case for each view: every
 // slot full with a two-digit count (a count badge is two glyphs), a dummy atlas texture so
 // the icon pass runs, and for the HUD a UiStats with every optional line present. Two of the
 // three numbers are printed for the record; all three are asserted under the ceiling.
-static int quadsForScreen(UiScreen screen, ChestState* cs, const UiStats* stats)
+//
+// v1.9.1 BAR: what is measured is a TAB, not a screen — the three screens collapsed into one.
+// `tab` is the nav.cat to draw, or -1 for the HUD. The container tab (2) is reached the way
+// main.c reaches it, through uiOpenChest, rather than by writing nav.cat: that call also sets
+// opened_this_frame and drops any lift, and measuring a state main.c cannot produce would be
+// measuring nothing. The strip is drawn on every tab and is part of every bar number here.
+static int quadsForTab(int tab, ChestState* cs, const UiStats* stats)
 {
 	static C3D_Tex dummy_atlas;   // never dereferenced by ui.c (ui.h: it only passes it on)
 	UiState ui; Inventory inv;
 	uiInit(&ui);
-	if (screen == UI_SCR_CHEST) uiOpenChest(&ui, CHEST_X, CHEST_Y, CHEST_Z);
-	else                        ui.screen = screen;
+	if (tab == 2)           uiOpenChest(&ui, CHEST_X, CHEST_Y, CHEST_Z);
+	else if (tab >= 0)    { ui.screen = UI_SCR_BAR; ui.nav.cat = tab; }
 	inventoryInit(&inv);
 	fillBag(&inv, BLOCK_STONE, 99);
 	(void)frameWithIcons(&ui, &inv, cs, &dummy_atlas, stats, false, 0, 0);
@@ -1853,9 +2005,9 @@ static void testEveryScreenFitsTheSpriteQuadBudget(void)
 	stats.timing = "cpu 2.1  wait 14.6  frame 16.7ms  60fps";
 	stats.health = 19; stats.hunger = 19;
 
-	const int hud   = quadsForScreen(UI_SCR_HUD, NULL, &stats);
-	const int inven = quadsForScreen(UI_SCR_INVENTORY, NULL, NULL);
-	const int chest = quadsForScreen(UI_SCR_CHEST, &cs, NULL);
+	const int hud   = quadsForTab(-1, NULL, &stats);   // the HUD
+	const int inven = quadsForTab(0, NULL, NULL);      // the INVENTORY tab
+	const int chest = quadsForTab(2, &cs, NULL);       // the CHEST tab
 	const UiChestStubDraw* d = uiChestStubDraw();   // the chest frame is the last one drawn
 
 	printf("chest_ui quads/frame (worst case): hud %d  inventory %d  chest %d "
@@ -1896,9 +2048,9 @@ int main(void)
 
 	testCloseReturnsToTheHudAndClearsAnyLift();
 	testOpenChestCancelsAPendingLiftAndRecordsThePosition();
-	testChestScreenWithNoChestIsCorrectedToTheOverlayAndDropsBothLifts();
-	testChestTransfersNeverFireOffTheChestScreen();
-	testChestScreenHitTestsNeverOverlap();
+	testChestTabWithNoChestFallsBackToTheBagTab();
+	testChestTransfersNeverFireOffTheChestTab();
+	testChestTabHitTestsNeverOverlap();
 
 	testHookDepositSendsTheItemIdAndTheChestSlotAndAppliesNothing();
 	testHookWithdrawSendsTheChestSlotAndTheBagSlotAndAppliesNothing();
@@ -1906,7 +2058,7 @@ int main(void)
 	testHookRefusingChangesNothingAndKeepsTheLift();
 	testHookIsNotConsultedForLiftsCancelsBagToBagOrTheCloseBar();
 	testHookRefusesChestToChestWithoutBeingCalled();
-	testHookIsConsultedOnlyOnTheChestScreen();
+	testHookIsConsultedOnlyOnTheChestTab();
 	testClearingTheHookRestoresTheLocalApply();
 
 	testContentsSurviveCloseAndReopenThroughTheRealBlockstateTable();

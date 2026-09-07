@@ -6795,11 +6795,17 @@ rm -rf "$BHPB"
 # real Inventory. Links the real scene/ui.c, ui_layout.c, inventory.c, crafting.c, furnace.c,
 # chest.c, blockstate.c, crc32.c, world/block.c and registry.c, and net/inv_bridge.c, and stubs
 # only what cannot exist on a host -- the GPU sprite batch, the font, the audio mixer, the
-# transport -- via tests/ui_chest_stub/. 382 checks.
+# transport -- via tests/ui_chest_stub/. 516 checks (v1.9.1 BAR; it was 486 before the port and
+# the "382" this line carried for two releases before that was already stale).
 #
 # source/scene/ui_gesture.c joins the link because ui.c's frame handler calls uiGestureFeed()
 # directly (v1.9.0 SPLIT) -- without it the link dies on an undefined reference to that symbol,
 # not to anything chest-shaped.
+#
+# source/scene/barnav.c joins it for the same reason under v1.9.1 BAR: ui.c drives the tab
+# cursor directly. Measured by removing the line -- exactly six undefined references, all of
+# them cursor-shaped and none of them chest-shaped: barNavClamp, barNavInput, barNavReset,
+# barNavScrollFor, barNavSetCat, barNavSetCell.
 #
 # This stanza links source/scene/ui.c and tests/ui_chest_test.c, both of which another session
 # may be mid-edit on when this runs; a compile failure inside ui.c itself is that work in
@@ -6813,6 +6819,7 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 	source/scene/ui.c \
 	source/scene/ui_layout.c \
 	source/scene/ui_gesture.c \
+	source/scene/barnav.c \
 	source/net/inv_bridge.c \
 	source/world/block.c \
 	source/world/registry.c \

@@ -108,7 +108,12 @@ const char* pauseBarRowLabel(int tab, int row)
 // Every button this panel answers to, on one line, at the bottom of every tab. L/R is named
 // even on GAME and SYSTEM, where left/right do the same thing, because the shoulder buttons
 // are the only tab control a player can find without discovering that left/right double up.
-const char* pauseBarFooterLabel(void) { return "A SELECT  B RESUME  L/R TAB"; }
+//
+// SELECT is named alongside B because main.c's KEY_SELECT handler calls pauseMenuToggle()
+// unconditionally (source/main.c), so it closes this panel exactly as B does whenever the
+// panel is open — the only place a player would ever see this string. Without it, SELECT's
+// second job (the first being what opens the panel) has no on-screen mention anywhere.
+const char* pauseBarFooterLabel(void) { return "A OK  B/SELECT RESUME  L/R TAB"; }
 
 bool pauseBarRowIsStepper(int tab, int row)
 {

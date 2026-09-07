@@ -6,28 +6,32 @@
 #include "audio/audio.h"
 #include "gfx/font.h"
 #include "gfx/sprite.h"
-#include "scene/ui_layout.h"
+#include "scene/pausebar.h"
 
-// Two pages, not a tree. RESUME/OPTIONS/QUIT on the first, the settings on the second, and
-// B walks back up. Anything deeper would need a navigation stack for a menu with six rows
-// in it.
-typedef enum { PAGE_MAIN = 0, PAGE_OPTIONS } Page;
-
-// Main-page rows, in draw order. The enum is the cursor's value, so the order here is the
-// order on screen and MAIN_ROW_COUNT is what the cursor wraps against.
-enum { ROW_RESUME = 0, ROW_OPTIONS, ROW_QUIT, MAIN_ROW_COUNT };
-
-// Options-page rows. All five are interactive; the memory figures below them are a
-// readout, so the cursor stops at OPT_ROW_COUNT rather than at the end of the list.
+// v1.9.1 INTERFACE (docs/blueprint-1.9.1-interface.md D9). The two stacked pages are gone;
+// three tabs replaced them. Everything this file used to decide for itself — which page,
+// which row, what a key or a tap means, and where every rect is — now lives in
+// scene/pausebar.c, which has no <3ds.h> in it and is gated on the host by
+// tests/pausebar_test.c. What is left here is the drawing, the one audio call the volume row
+// makes, and the memory figures: the parts no host test can reach, and the parts that were
+// never the ones that could be subtly wrong.
 //
-// Sound sits next to 3D because they are the two output settings, with the two rows that
-// open another screen kept together at the bottom.
-enum { OPT_ROW_DIST = 0, OPT_ROW_3D, OPT_ROW_VOLUME, OPT_ROW_REMAP, OPT_ROW_DEBUG,
-       OPT_ROW_COUNT };
+// scene/ui_layout.h is no longer included. It was here only for SCR_W/SCR_H, and
+// scene/pausebar.h carries PB_SCR_W/PB_SCR_H, which pausebar.c static-asserts against
+// ui_layout.h's own pair on the console build — so the numbers are still proven against one
+// source while this file stops depending on a header another lane is editing.
+static PauseBarState s_bar;
 
-static bool s_open;
-static Page s_page;
-static int  s_cursor;
+// At most one action recorded by pauseMenuTouch and consumed by pauseMenuInput on the same
+// frame. A tap and a button press on one frame therefore produce ONE action, the tap's — the
+// same one-event-a-frame rule scene/ui_gesture.h states, and for the same reason.
+//
+// pauseMenuTouch OVERWRITES this rather than only filling it when it has something, so a
+// frame with no tap clears the slot. That is what makes a tap on a frame whose
+// pauseMenuInput is skipped — main.c gates that call behind !s_remap_open && !s_debug_open —
+// get dropped on the next frame instead of firing late against a row the player has since
+// moved off.
+static PauseBarAction s_pending;
 
 // Set when the volume row moves, cleared by pauseMenuTakeVolumeChanged. A flag rather
 // than an immediate save because a held left/right would otherwise rewrite options.ini
@@ -43,25 +47,18 @@ static bool s_volume_changed;
 #define COL_SEL     0xFF4E86C8u
 #define COL_HEAD    0xFFB4E0A0u
 
-#define PANEL_X 26
-#define PANEL_Y 24
-#define PANEL_W (SCR_W - PANEL_X * 2)
-#define PANEL_H (SCR_H - PANEL_Y * 2)
+// The tab strip. Both are the panel's existing palette re-used rather than new colours —
+// blueprint D4: "Colours are ui.c's existing palette; the pause/title keep theirs."
+#define COL_TAB_ON  COL_SEL     // the focused tab's fill
+#define COL_TAB_OFF COL_PANEL   // the other two
 
-#define ROW_H     22
-
-// The options page uses a tighter pitch than the main page's ROW_H. It has to: five rows
-// at 22 px push the memory readout's last line to y=212, past the footer at y=200 and out
-// through the bottom of the panel at y=216. At 20 the last readout line lands at 190,
-// exactly where it sits today with four rows. Measured against PANEL_Y 24 + PANEL_H 192
-// and gfx/font.h's FONT_GLYPH_H of 7, not eyeballed — but nobody has LOOKED at it on a
-// screen, and this project has no way to.
-#define OPT_ROW_H 20
-#define ROW_X     (PANEL_X + 12)
-#define ROW_W     (PANEL_W - 24)
+// The one piece of geometry that is still this file's: how far a label is inset from the
+// left edge of the box it sits in. Every other number — the panel, the strip, the rows, the
+// stepper boxes, the memory block and the footer — comes from scene/pausebar.h, so the rect
+// the hit test owns and the rect the draw paints can never drift apart.
 #define TEXT_PAD  6
 
-bool pauseMenuOpen(void) { return s_open; }
+bool pauseMenuOpen(void) { return pauseBarOpen(&s_bar); }
 
 bool pauseMenuTakeVolumeChanged(void)
 {
@@ -70,235 +67,264 @@ bool pauseMenuTakeVolumeChanged(void)
 	return changed;
 }
 
+static void clearPending(void)
+{
+	s_pending.kind = PAUSEBAR_ACT_NONE;
+	s_pending.arg  = 0;
+}
+
 void pauseMenuClose(void)
 {
-	s_open   = false;
-	s_page   = PAGE_MAIN;
-	s_cursor = ROW_RESUME;
+	pauseBarClose(&s_bar);
+	clearPending();
 }
 
 void pauseMenuToggle(void)
 {
-	if (s_open) {
-		pauseMenuClose();
-		return;
+	pauseBarToggle(&s_bar);
+	clearPending();
+}
+
+// The volume row is APPLIED here rather than reported like the two rows above it, because
+// there is nothing for the caller to do with it: audioSetMasterVolume() is the entire action,
+// main.c holds no audio state that could fall out of step, and the call is a no-op on a
+// console with no DSP firmware. Only persistence is still the caller's, and that is what
+// s_volume_changed is for.
+//
+// Byte-identical arithmetic to what shipped, including the snap back onto the step grid:
+// without it, accumulating 0.1f ten times lands on 0.99999994 rather than 1.0 and the row
+// reads 100% while the maximum is never actually reached — a bug that is invisible on screen.
+static void stepVolume(int dir)
+{
+	float v = audioGetMasterVolume();
+	v += (dir > 0) ? OPTIONS_AUDIO_VOL_STEP : -OPTIONS_AUDIO_VOL_STEP;
+	v = (float)((int)(v / OPTIONS_AUDIO_VOL_STEP + (v < 0.0f ? -0.5f : 0.5f)))
+	    * OPTIONS_AUDIO_VOL_STEP;
+	if (v < OPTIONS_AUDIO_VOL_MIN) v = OPTIONS_AUDIO_VOL_MIN;
+	if (v > OPTIONS_AUDIO_VOL_MAX) v = OPTIONS_AUDIO_VOL_MAX;
+	audioSetMasterVolume(v);
+	s_volume_changed = true;
+}
+
+// One pausebar action, translated into this module's shipped vocabulary. The PAUSE_ACTION_*
+// values are NOT renumbered — main.c switches on PAUSE_ACTION_REMAP (3) and
+// PAUSE_ACTION_DEBUG (4), so a renumbering here would silently open Debug from the Controls
+// row. That is the blueprint's own lane-D red arm 4.
+static PauseAction applyBarAction(PauseBarAction act, int* out_dist_step,
+                                  bool* out_stereo_toggle)
+{
+	switch (act.kind) {
+	case PAUSEBAR_ACT_RESUME: return PAUSE_ACTION_RESUME;
+	case PAUSEBAR_ACT_QUIT:   return PAUSE_ACTION_QUIT;
+	case PAUSEBAR_ACT_REMAP:  return PAUSE_ACTION_REMAP;
+	case PAUSEBAR_ACT_DEBUG:  return PAUSE_ACTION_DEBUG;
+	case PAUSEBAR_ACT_DIST_STEP:
+		if (out_dist_step) *out_dist_step = act.arg;
+		return PAUSE_ACTION_NONE;
+	case PAUSEBAR_ACT_STEREO_TOGGLE:
+		if (out_stereo_toggle) *out_stereo_toggle = true;
+		return PAUSE_ACTION_NONE;
+	case PAUSEBAR_ACT_VOLUME_STEP:
+		stepVolume(act.arg);
+		return PAUSE_ACTION_NONE;
+	default:
+		// NONE, TAB and MOVE. TAB and MOVE are reported by pausebar so a caller can play
+		// SFX_UI_TAP on them (blueprint D13); this module does not own that cue, so they
+		// land here and change nothing the caller can see.
+		return PAUSE_ACTION_NONE;
 	}
-	s_open   = true;
-	s_page   = PAGE_MAIN;
-	s_cursor = ROW_RESUME;
+}
+
+void pauseMenuTouch(bool press, int x, int y)
+{
+	// Unconditional: the answer for a frame with no tap is NONE, and recording that NONE is
+	// what clears a stale action. pauseBarTouch itself refuses a closed panel, a false press
+	// and a point outside the panel, so this needs no guard of its own.
+	s_pending = pauseBarTouch(&s_bar, press, x, y);
 }
 
 PauseAction pauseMenuInput(uint32_t down, int* out_dist_step, bool* out_stereo_toggle)
 {
 	if (out_dist_step)     *out_dist_step = 0;
 	if (out_stereo_toggle) *out_stereo_toggle = false;
-	if (!s_open) return PAUSE_ACTION_NONE;
 
-	// Wrapping rather than clamping at the ends: three rows is short enough that running
-	// off the bottom to reach the top is a shortcut, not a surprise.
-	const int rows = (s_page == PAGE_MAIN) ? MAIN_ROW_COUNT : OPT_ROW_COUNT;
-	if (down & KEY_DUP)   s_cursor = (s_cursor + rows - 1) % rows;
-	if (down & KEY_DDOWN) s_cursor = (s_cursor + 1) % rows;
+	// The tap wins and the key is DROPPED, not queued, so it cannot fire on a later frame
+	// against a row the player has since moved off.
+	PauseBarAction act = s_pending;
+	clearPending();
 
-	if (s_page == PAGE_OPTIONS) {
-		// Left/right step the setting under the cursor. Reported, not applied — see the
-		// note on this function in pausemenu.h.
-		if (s_cursor == OPT_ROW_DIST && out_dist_step) {
-			if (down & KEY_DLEFT)  *out_dist_step = -1;
-			if (down & KEY_DRIGHT) *out_dist_step = +1;
-		}
-		// 3D is a two-state setting, so left, right and A all mean the same thing: flip it.
-		// Accepting A here as well as the arrows matters because this row used to be the
-		// SELECT button — a player reaching for the old behaviour finds it on the first key
-		// they try rather than having to learn that this one row is arrow-only.
-		if (s_cursor == OPT_ROW_3D && out_stereo_toggle &&
-		    (down & (KEY_DLEFT | KEY_DRIGHT | KEY_A)))
-			*out_stereo_toggle = true;
-		// Sound volume is APPLIED here rather than reported like the two rows above it,
-		// because there is nothing for the caller to do with it: audioSetMasterVolume() is
-		// the entire action, main.c holds no audio state that could fall out of step, and
-		// the call is a no-op on a console with no DSP firmware. Only persistence is still
-		// the caller's, and that is what s_volume_changed is for.
-		if (s_cursor == OPT_ROW_VOLUME && (down & (KEY_DLEFT | KEY_DRIGHT))) {
-			float v = audioGetMasterVolume();
-			v += (down & KEY_DRIGHT) ? OPTIONS_AUDIO_VOL_STEP : -OPTIONS_AUDIO_VOL_STEP;
-			// Snapped back onto the step grid every time. Without this, accumulating 0.1f
-			// ten times lands on 0.99999994 rather than 1.0 and the row reads 100% while the
-			// maximum is never actually reached — a bug that is invisible on screen.
-			v = (float)((int)(v / OPTIONS_AUDIO_VOL_STEP + (v < 0.0f ? -0.5f : 0.5f)))
-			    * OPTIONS_AUDIO_VOL_STEP;
-			if (v < OPTIONS_AUDIO_VOL_MIN) v = OPTIONS_AUDIO_VOL_MIN;
-			if (v > OPTIONS_AUDIO_VOL_MAX) v = OPTIONS_AUDIO_VOL_MAX;
-			audioSetMasterVolume(v);
-			s_volume_changed = true;
-		}
-		// The remap and debug rows are plain A-activations, reported to the caller the same
-		// way RESUME and QUIT are: this module cannot open those screens itself without
-		// owning their state, which is main.c's job.
-		if ((down & KEY_A) && s_cursor == OPT_ROW_REMAP) return PAUSE_ACTION_REMAP;
-		if ((down & KEY_A) && s_cursor == OPT_ROW_DEBUG) return PAUSE_ACTION_DEBUG;
-		// B backs out to the main page. It does NOT close the menu: a player who opened
-		// options to try a render distance is mid-comparison, and dumping them back into
-		// the world would undo the reason they are here.
-		if (down & KEY_B) {
-			s_page   = PAGE_MAIN;
-			s_cursor = ROW_OPTIONS;
-		}
-		return PAUSE_ACTION_NONE;
-	}
+	if (act.kind == PAUSEBAR_ACT_NONE) act = pauseBarKey(&s_bar, down);
 
-	// B on the main page is the same as choosing RESUME — the standard "back closes it".
-	if (down & KEY_B) {
-		pauseMenuClose();
-		return PAUSE_ACTION_RESUME;
-	}
-
-	if (down & KEY_A) {
-		switch (s_cursor) {
-		case ROW_RESUME:
-			pauseMenuClose();
-			return PAUSE_ACTION_RESUME;
-		case ROW_OPTIONS:
-			s_page   = PAGE_OPTIONS;
-			s_cursor = OPT_ROW_DIST;
-			return PAUSE_ACTION_NONE;
-		case ROW_QUIT:
-			pauseMenuClose();
-			return PAUSE_ACTION_QUIT;
-		default:
-			break;
-		}
-	}
-	return PAUSE_ACTION_NONE;
+	// pauseBarKey and pauseBarTouch both refuse a closed panel, so the old
+	// `if (!s_open) return PAUSE_ACTION_NONE;` guard is inherited rather than deleted.
+	return applyBarAction(act, out_dist_step, out_stereo_toggle);
 }
 
 // Rounds bytes to whole KB for display. Truncating rather than rounding to nearest, so a
 // figure shown as "16 KB free" is never one the allocator would refuse 16 KB out of.
 static uint32_t kb(uint32_t bytes) { return bytes / 1024u; }
 
-static void drawRow(int index, const char* label, bool selected)
+static void drawRect(PbRect r, uint32_t colour)
 {
-	const float y = (float)(PANEL_Y + 34 + index * ROW_H);
-	if (selected)
-		spriteRect((float)ROW_X, y - 3.0f, (float)ROW_W, (float)(ROW_H - 2), COL_SEL);
-	fontDraw((float)(ROW_X + TEXT_PAD), y, 1, selected ? COL_TEXT : COL_DIM, label);
+	spriteRect((float)r.x, (float)r.y, (float)r.w, (float)r.h, colour);
+}
+
+// The strip: one background, three tab fills, two 1-px dividers, and a 2-px accent under the
+// focused tab. Labels are centred in their own tab, so the widest ("OPTIONS", 42 px at scale
+// 1) sits inside an 89-px tab with 23 px either side. Nothing grows on focus: a tab that
+// changes width moves its neighbours' touch targets, which is the reason blueprint D4 rules
+// scale-2 out for a focused tab.
+static void drawStrip(int focused)
+{
+	drawRect(pauseBarStripRect(), COL_PANEL);
+	for (int i = 0; i < PAUSEBAR_TAB_COUNT; i++) {
+		const PbRect t  = pauseBarTabRect(i);
+		const bool   on = (i == focused);
+		drawRect(t, on ? COL_TAB_ON : COL_TAB_OFF);
+		if (i > 0)
+			spriteRect((float)t.x, (float)t.y, 1.0f, (float)t.h, COL_EDGE);
+		const char* label = pauseBarTabLabel(i);
+		const int   w     = fontTextWidth(label, 1);
+		fontDraw((float)(t.x + (t.w - w) / 2), (float)(t.y + (t.h - FONT_GLYPH_H) / 2),
+		         1, on ? COL_TEXT : COL_DIM, label);
+		if (on)
+			spriteRect((float)t.x, (float)(t.y + t.h - 2), (float)t.w, 2.0f, COL_HEAD);
+	}
+}
+
+// A row's highlight. Returns the y the row's text sits at, vertically centred in the band,
+// so no caller computes that offset twice.
+static float drawRowFrame(int row, bool selected)
+{
+	const PbRect r = pauseBarRowRect(row);
+	if (selected) drawRect(r, COL_SEL);
+	return (float)(r.y + (r.h - FONT_GLYPH_H) / 2);
+}
+
+// The highlight plus the row's label, straight out of pauseBarRowLabel so the string the
+// hit test is documented against is the string on screen. The value half is each caller's,
+// because only they know what the value is.
+static float drawRowLabel(int tab, int row, bool selected, uint32_t colour)
+{
+	const float y = drawRowFrame(row, selected);
+	fontDraw((float)(PB_ROW_X + TEXT_PAD), y, 1, colour, pauseBarRowLabel(tab, row));
+	return y;
+}
+
+// The two stepper glyphs, drawn CENTRED IN THEIR OWN TOUCH BOXES rather than at hand-picked
+// x's, so what the player aims at is what the hit test owns. Greyed at the ends rather than
+// hidden, so the row does not change width when it hits a limit — a control that moves as you
+// use it reads as a glitch.
+static void drawArrows(int tab, int row, bool left_live, bool right_live)
+{
+	const PbRect l = pauseBarArrowRect(tab, row, PB_ARROW_LEFT);
+	const PbRect r = pauseBarArrowRect(tab, row, PB_ARROW_RIGHT);
+	const int    g = (PB_ARROW_W - FONT_GLYPH_W) / 2;
+	fontDraw((float)(l.x + g), (float)(l.y + (l.h - FONT_GLYPH_H) / 2), 1,
+	         left_live ? COL_TEXT : COL_DIM, "<");
+	fontDraw((float)(r.x + g), (float)(r.y + (r.h - FONT_GLYPH_H) / 2), 1,
+	         right_live ? COL_TEXT : COL_DIM, ">");
 }
 
 void pauseMenuDraw(const PauseStats* st)
 {
-	if (!s_open || !st) return;
+	if (!pauseBarOpen(&s_bar) || !st) return;
 
 	// Opens its own sprite pass rather than joining the one scene/ui.c uses, because
-	// uiUpdateDraw closes its pass before returning — this draws after it, on top of the
-	// UI it just finished. spriteTexture is the font's sheet for the same reason ui.c uses
-	// it: spriteRect draws from the font texture's white texel, so a panel and the text on
-	// it come from one binding and cost no flush between them.
-	spriteBegin(SCR_W, SCR_H);
+	// uiUpdateDraw closes its pass before returning — this draws after it, on top of the UI
+	// it just finished. spriteTexture is the font's sheet for the same reason ui.c uses it:
+	// spriteRect draws from the font texture's white texel, so a panel and the text on it
+	// come from one binding and cost no flush between them. Unchanged from what shipped.
+	spriteBegin(PB_SCR_W, PB_SCR_H);
 	spriteTexture(fontTexture());
 
 	// Scrim over the whole bottom screen first, then the panel on top of it. The scrim is
 	// what makes the panel read as *over* the game rather than as another game screen.
-	spriteRect(0.0f, 0.0f, (float)SCR_W, (float)SCR_H, COL_SCRIM);
-	spriteRect((float)(PANEL_X - 1), (float)(PANEL_Y - 1),
-	           (float)(PANEL_W + 2), (float)(PANEL_H + 2), COL_EDGE);
-	spriteRect((float)PANEL_X, (float)PANEL_Y, (float)PANEL_W, (float)PANEL_H, COL_PANEL);
+	spriteRect(0.0f, 0.0f, (float)PB_SCR_W, (float)PB_SCR_H, COL_SCRIM);
+	const PbRect panel = pauseBarPanelRect();
+	spriteRect((float)(panel.x - 1), (float)(panel.y - 1),
+	           (float)(panel.w + 2), (float)(panel.h + 2), COL_EDGE);
+	drawRect(panel, COL_PANEL);
 
-	if (s_page == PAGE_MAIN) {
-		fontDraw((float)ROW_X, (float)(PANEL_Y + 10), 1, COL_HEAD, "PAUSED");
-		drawRow(ROW_RESUME,  "Resume",  s_cursor == ROW_RESUME);
-		drawRow(ROW_OPTIONS, "Options", s_cursor == ROW_OPTIONS);
+	const int tab = s_bar.tab;
+	const int row = s_bar.row;
+	drawStrip(tab);
+
+	if (tab == PAUSEBAR_TAB_GAME) {
+		drawRowLabel(tab, PB_GAME_RESUME, row == PB_GAME_RESUME,
+		             row == PB_GAME_RESUME ? COL_TEXT : COL_DIM);
 		// "Quit to title", not "Quit": the row leaves the world and lands on the title
 		// screen, which is where the app's own quit lives. Saying just "Quit" next to a
 		// Resume would read as quitting the game outright, and a player who wanted another
-		// world would never press it.
-		drawRow(ROW_QUIT,    "Quit to title", s_cursor == ROW_QUIT);
-		fontDraw((float)ROW_X, (float)(PANEL_Y + PANEL_H - 16), 1, COL_DIM,
-		         "A choose   B/SELECT resume");
-		spriteEnd();
-		return;
+		// world would never press it. The wording lives in pauseBarRowLabel now.
+		drawRowLabel(tab, PB_GAME_QUIT, row == PB_GAME_QUIT,
+		             row == PB_GAME_QUIT ? COL_TEXT : COL_DIM);
+	} else if (tab == PAUSEBAR_TAB_OPTIONS) {
+		float y = drawRowLabel(tab, PB_OPT_DIST, row == PB_OPT_DIST, COL_TEXT);
+		fontDrawf((float)PB_VALUE_X, y, 1, COL_TEXT, "%d", st->render_dist);
+		drawArrows(tab, PB_OPT_DIST, st->render_dist > st->dist_min,
+		           st->render_dist < st->dist_max);
+
+		// 3D lived on SELECT until SELECT became the button that opens this menu; it is a
+		// setting, so a settings tab is where it belongs. Both arrows are live because there
+		// are two states and either one flips between them — which is also what A does.
+		y = drawRowLabel(tab, PB_OPT_3D, row == PB_OPT_3D, COL_TEXT);
+		fontDraw((float)PB_VALUE_X, y, 1, st->stereo ? COL_HEAD : COL_DIM,
+		         st->stereo ? "On" : "Off");
+		drawArrows(tab, PB_OPT_3D, true, true);
+
+		// Sound. The value is read live out of the audio system rather than passed in through
+		// PauseStats, so there is exactly one copy of the current volume in the process and no
+		// way for the row to disagree with what the DSP was told.
+		//
+		// The label greys out when there is no audio at all — a console whose DSP firmware was
+		// never dumped. The row still works and still saves, because the setting is a
+		// preference about the game and not a property of this console; greying it is the only
+		// honest signal that moving it will not change anything the player can hear.
+		//
+		// %3d%% rather than %d%%: a fixed four-character field means the number does not shift
+		// left and right under the cursor as it crosses 9% and 100%.
+		{
+			const int pct = (int)(audioGetMasterVolume() * 100.0f + 0.5f);
+			y = drawRowLabel(tab, PB_OPT_VOLUME, row == PB_OPT_VOLUME,
+			                 audioAvailable() ? COL_TEXT : COL_DIM);
+			fontDrawf((float)PB_VALUE_X, y, 1, COL_TEXT, "%3d%%", pct);
+			drawArrows(tab, PB_OPT_VOLUME, pct > 0, pct < 100);
+		}
+	} else if (tab == PAUSEBAR_TAB_SYSTEM) {
+		float y = drawRowLabel(tab, PB_SYS_CONTROLS, row == PB_SYS_CONTROLS, COL_TEXT);
+		fontDraw((float)PB_VALUE_X, y, 1, COL_DIM, ">");
+		y = drawRowLabel(tab, PB_SYS_DEBUG, row == PB_SYS_DEBUG, COL_TEXT);
+		fontDraw((float)PB_VALUE_X, y, 1, COL_DIM, ">");
 	}
 
-	fontDraw((float)ROW_X, (float)(PANEL_Y + 10), 1, COL_HEAD, "OPTIONS");
-
-	// Render distance. Arrows are drawn greyed at the ends rather than hidden, so the row
-	// does not change width when it hits a limit — a control that moves as you use it reads
-	// as a glitch.
-	float y = (float)(PANEL_Y + 34);
-	if (s_cursor == OPT_ROW_DIST)
-		spriteRect((float)ROW_X, y - 3.0f, (float)ROW_W, (float)(OPT_ROW_H - 2), COL_SEL);
-	fontDraw((float)(ROW_X + TEXT_PAD), y, 1, COL_TEXT, "Render dist");
-	fontDrawf((float)(ROW_X + ROW_W - 58), y, 1,
-	          st->render_dist > st->dist_min ? COL_TEXT : COL_DIM, "<");
-	fontDrawf((float)(ROW_X + ROW_W - 44), y, 1, COL_TEXT, "%d", st->render_dist);
-	fontDrawf((float)(ROW_X + ROW_W - 26), y, 1,
-	          st->render_dist < st->dist_max ? COL_TEXT : COL_DIM, ">");
-
-	// 3D. This lived on SELECT until SELECT became the button that opens this menu; it is a
-	// setting, so a settings page is where it belongs, but it is here mainly so the feature
-	// did not simply vanish when its button was reused.
-	y += (float)OPT_ROW_H;
-	if (s_cursor == OPT_ROW_3D)
-		spriteRect((float)ROW_X, y - 3.0f, (float)ROW_W, (float)(OPT_ROW_H - 2), COL_SEL);
-	fontDraw((float)(ROW_X + TEXT_PAD), y, 1, COL_TEXT, "3D");
-	fontDraw((float)(ROW_X + ROW_W - 44), y, 1,
-	         st->stereo ? COL_HEAD : COL_DIM, st->stereo ? "On" : "Off");
-
-	// Sound. The value is read live out of the audio system rather than passed in through
-	// PauseStats, so there is exactly one copy of the current volume in the process and no
-	// way for the row to disagree with what the DSP was told.
-	//
-	// The label greys out when there is no audio at all — a console whose DSP firmware was
-	// never dumped. The row still works and still saves, because the setting is a
-	// preference about the game and not a property of this console; greying it is the
-	// only honest signal that moving it will not change anything the player can hear.
-	//
-	// %3d%% rather than %d%%: a fixed four-character field means the number does not shift
-	// left and right under the cursor as it crosses 9% and 100%.
-	y += (float)OPT_ROW_H;
-	if (s_cursor == OPT_ROW_VOLUME)
-		spriteRect((float)ROW_X, y - 3.0f, (float)ROW_W, (float)(OPT_ROW_H - 2), COL_SEL);
-	{
-		const float vol = audioGetMasterVolume();
-		const int   pct = (int)(vol * 100.0f + 0.5f);
-		fontDraw((float)(ROW_X + TEXT_PAD), y, 1,
-		         audioAvailable() ? COL_TEXT : COL_DIM, "Sound");
-		fontDraw((float)(ROW_X + ROW_W - 66), y, 1,
-		         pct > 0 ? COL_TEXT : COL_DIM, "<");
-		fontDrawf((float)(ROW_X + ROW_W - 52), y, 1, COL_TEXT, "%3d%%", pct);
-		fontDraw((float)(ROW_X + ROW_W - 24), y, 1,
-		         pct < 100 ? COL_TEXT : COL_DIM, ">");
-	}
-
-	y += (float)OPT_ROW_H;
-	if (s_cursor == OPT_ROW_REMAP)
-		spriteRect((float)ROW_X, y - 3.0f, (float)ROW_W, (float)(OPT_ROW_H - 2), COL_SEL);
-	fontDraw((float)(ROW_X + TEXT_PAD), y, 1, COL_TEXT, "Controls");
-	fontDraw((float)(ROW_X + ROW_W - 44), y, 1, COL_DIM, ">");
-
-	y += (float)OPT_ROW_H;
-	if (s_cursor == OPT_ROW_DEBUG)
-		spriteRect((float)ROW_X, y - 3.0f, (float)ROW_W, (float)(OPT_ROW_H - 2), COL_SEL);
-	fontDraw((float)(ROW_X + TEXT_PAD), y, 1, COL_TEXT, "Debug");
-	fontDraw((float)(ROW_X + ROW_W - 44), y, 1, COL_DIM, ">");
-
-	// Memory. Three numbers because they answer three different questions and are drawn
-	// from three different pools — a single "free RAM" figure would be a fiction on this
-	// console. World is the one the player's own building moves; linear is what the mesh
+	// Memory, on SYSTEM ONLY. Three numbers because they answer three different questions and
+	// are drawn from three different pools — a single "free RAM" figure would be a fiction on
+	// this console. World is the one the player's own building moves; linear is what the mesh
 	// pool came out of and therefore what render distance actually spends; VRAM holds the
 	// atlas and the framebuffers and barely moves at all.
-	float ly = y + (float)OPT_ROW_H - 2.0f;
-	fontDrawf((float)(ROW_X + TEXT_PAD), ly, 1, COL_HEAD, "MEMORY");
-	ly += 12.0f;
-	fontDrawf((float)(ROW_X + TEXT_PAD), ly, 1, COL_TEXT, "World  %lu / %lu KB",
-	          (unsigned long)kb(st->world_used), (unsigned long)kb(st->world_budget));
-	ly += 11.0f;
-	fontDrawf((float)(ROW_X + TEXT_PAD), ly, 1, COL_TEXT, "Linear %lu KB free",
-	          (unsigned long)kb(st->linear_free));
-	ly += 11.0f;
-	fontDrawf((float)(ROW_X + TEXT_PAD), ly, 1, COL_TEXT, "VRAM   %lu KB free",
-	          (unsigned long)kb(st->vram_free));
+	//
+	// Gated on pauseBarTabShowsMemory rather than on "the tab happens to be 2", so the
+	// condition is the one the host suite checks: the blueprint's lane-D red arm 2 is a
+	// readout drawn on every tab.
+	if (pauseBarTabShowsMemory(tab)) {
+		float ly = (float)PB_MEM_Y0;
+		fontDraw((float)(PB_ROW_X + TEXT_PAD), ly, 1, COL_HEAD, "MEMORY");
+		ly += (float)PB_MEM_STEP;
+		fontDrawf((float)(PB_ROW_X + TEXT_PAD), ly, 1, COL_TEXT, "World  %lu / %lu KB",
+		          (unsigned long)kb(st->world_used), (unsigned long)kb(st->world_budget));
+		ly += (float)PB_MEM_STEP;
+		fontDrawf((float)(PB_ROW_X + TEXT_PAD), ly, 1, COL_TEXT, "Linear %lu KB free",
+		          (unsigned long)kb(st->linear_free));
+		ly += (float)PB_MEM_STEP;
+		fontDrawf((float)(PB_ROW_X + TEXT_PAD), ly, 1, COL_TEXT, "VRAM   %lu KB free",
+		          (unsigned long)kb(st->vram_free));
+	}
 
-	fontDraw((float)ROW_X, (float)(PANEL_Y + PANEL_H - 16), 1, COL_DIM,
-	         "left/right change   B back");
+	// One footer on every tab, so the panel's bottom line never moves. The string is
+	// pausebar's, and it names L/R even on GAME and SYSTEM — where left/right do the same
+	// thing — because the shoulder buttons are the only tab control a player can find without
+	// discovering that left/right double up.
+	fontDraw((float)PB_ROW_X, (float)PB_FOOTER_Y, 1, COL_DIM, pauseBarFooterLabel());
 	spriteEnd();
 }

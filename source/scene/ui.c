@@ -18,6 +18,24 @@
 #include "world/crafting.h"
 #include "world/furnace.h"   // furnaceRecipeForInput / furnaceIsFuel, for the accept rules
 
+// ── v1.9.1 BAR: the key-bit mirror, proved where a real pad word arrives ────────────────
+//
+// scene/barnav.h mirrors libctru's KEY_* bits so it can be host-tested without <3ds.h>, the
+// same carve-out scene/hotbar.h and scene/ui_gesture.h already make. barnav.c asserts the
+// mirror for its own half; THIS file is where a real hidKeysDown() word (main.c seam S1,
+// UiInput.keys_down) is handed to barNavInput, so the claim has to hold here too — a caller
+// that passed the raw word while the mirror had drifted would get silently wrong buttons, with
+// nothing anywhere to say so. Guarded because the host stanzas that link this file
+// (tests/ui_chest_test.c) have no libctru to compare against; the console build is what proves
+// it, exactly as blueprint §6.3's S13 says.
+#ifdef __3DS__
+#include <3ds.h>
+_Static_assert(BAR_KEY_A == KEY_A && BAR_KEY_B == KEY_B && BAR_KEY_L == KEY_L &&
+               BAR_KEY_R == KEY_R && BAR_KEY_DUP == KEY_DUP && BAR_KEY_DDOWN == KEY_DDOWN &&
+               BAR_KEY_DLEFT == KEY_DLEFT && BAR_KEY_DRIGHT == KEY_DRIGHT,
+               "barnav key bits mirror libctru");
+#endif
+
 // ── Interaction model: tap to pick up, tap again to drop ─────────────────────────────────
 //
 // inventory.h's own primitives (inventorySwapSlots / inventoryMoveUnits) are built around
@@ -141,10 +159,10 @@
 
 // ── Small shared helpers ──────────────────────────────────────────────────────────────
 //
-// URect, ptInRect, hotbarSlotRect, gridSlotRect, craftCloseRect, craftRowRect,
-// hudToggleRect and hitInventorySlot all moved to scene/ui_layout.h/.c — see that header's
-// file comment for why (host-testability) and its own comments for what each one does.
-// This file now only calls into them.
+// URect, ptInRect, hotbarSlotRect, gridSlotRect, hudToggleRect, hitInventorySlot and the
+// v1.9.1 bar geometry (barStripRect, barTabRect, barCellRect and the rest) all live in
+// scene/ui_layout.h/.c — see that header's file comment for why (host-testability) and its own
+// comments for what each one does. This file now only calls into them.
 
 // ── Mutating gesture handlers ─────────────────────────────────────────────────────────
 //
@@ -593,11 +611,16 @@ static void drawHudVitals(const UiStats* stats)
 
 static void drawHudFont(const UiStats* stats)
 {
-	const URect tr = hudToggleRect();
+	// v1.9.1 BAR. "INVENTORY   B", not "OPEN INVENTORY": the strip is the same band as the
+	// bar's own strip (HUD_TOGGLE_Y/H == BAR_STRIP_Y/H), so it reads as the bar's first tab
+	// with the button that opens it named on the end — which is the one thing a player cannot
+	// discover by looking, B being unbindable and therefore unlabelled anywhere else.
+	const URect  tr    = hudToggleRect();
+	const char*  label = "INVENTORY   B";
 	spriteRect((float)tr.x, (float)tr.y, (float)tr.w, (float)tr.h, COL_PANEL);
-	const int tw = fontTextWidth("OPEN INVENTORY", 1);
+	const int tw = fontTextWidth(label, 1);
 	fontDraw((float)tr.x + (tr.w - (float)tw) * 0.5f,
-	         (float)tr.y + (tr.h - FONT_GLYPH_H) * 0.5f, 1, COL_TEXT, "OPEN INVENTORY");
+	         (float)tr.y + (tr.h - FONT_GLYPH_H) * 0.5f, 1, COL_TEXT, label);
 
 	if (!stats) return;
 
@@ -681,24 +704,93 @@ static void drawHudFont(const UiStats* stats)
 	drawHudVitals(stats);
 }
 
-// ── Inventory overlay (font pass) ─────────────────────────────────────────────────────
+// ── The CRAFT tab's recipe list (v1.9.1 BAR) ───────────────────────────────────────────
+//
+// What was here before: drawCraftPanelFont, a fixed 120-px band with its own "TAP TO CLOSE"
+// bar and RECIPE_COUNT rows of CRAFT_ROW_H each. At RECIPE_COUNT 7 that was 13-px rows for a
+// 7-px font — below the readable floor scene/ui_layout.h's own CRAFT_ROW_H comment set, and
+// not a touch target at all. Those constants and their two rect constructors are retired; the
+// rows are now a fixed 24 px in a window that scrolls (barListRowRect), so the row height
+// stops depending on how many recipes exist, and the close bar is gone because the bar's own
+// close tab is the one door off every tab.
+//
+// The row now says what the recipe DOES rather than only naming it: the output item's icon and
+// "NAME xN" on the left, and on the right what it costs and whether the player has it — "xK
+// (have)" ending at x 292 with the input item's icon at 296. The two icons are atlas art and
+// so are drawn by drawBarCraftIcons below, in the frame's single atlas pass; everything here
+// is font-pass work, which is what keeps the whole screen at two draw calls (see uiUpdateDraw).
+#define CRAFT_ICON_PX  16
+#define CRAFT_ICON_Y   3     // a 16-px icon centred in a 22-px row
+#define CRAFT_OUT_X    8
+#define CRAFT_LABEL_X  30
+#define CRAFT_COST_END 292   // the cost text's RIGHT edge, clear of the input icon at 296
+#define CRAFT_IN_X     296
 
-static void drawCraftPanelFont(const Inventory* inv)
+// The cost readout for recipe `i`: how many of the input it takes, and how many the bag holds.
+// Built into the caller's buffer rather than returned, the same shape debugBiomeRow uses, so
+// the draw pass and the width measurement read one string and cannot disagree about it.
+static void craftCostText(const Inventory* inv, int i, char* buf, size_t cap)
 {
-	const URect cr = craftCloseRect();
-	spriteRect((float)cr.x, (float)cr.y, (float)cr.w, (float)cr.h, COL_PANEL_HI);
-	const char* label = "CRAFTING - TAP TO CLOSE";
-	const int lw = fontTextWidth(label, 1);
-	fontDraw((float)cr.x + (cr.w - (float)lw) * 0.5f,
-	         (float)cr.y + (cr.h - FONT_GLYPH_H) * 0.5f, 1, COL_TEXT, label);
+	const CraftRecipe* r = &CRAFT_RECIPES[i];
+	snprintf(buf, cap, "x%u (%lu)", (unsigned)r->input_count,
+	         (unsigned long)inventoryCount(inv, r->input_item));
+}
 
-	for (int i = 0; i < RECIPE_COUNT; i++) {
-		const URect rr = craftRowRect(i);
+static void drawBarCraftList(const Inventory* inv, int scroll, int focused_row)
+{
+	for (int v = 0; v < BAR_LIST_VISIBLE; v++) {
+		const int i = scroll + v;
+		if (i >= RECIPE_COUNT) break;
+
+		const URect rr = barListRowRect(v);
+		const CraftRecipe* rec = &CRAFT_RECIPES[i];
 		const bool makeable = craftCanMake(inv, i);
+		const bool focused  = (i == focused_row);
+
+		// The fill carries the MAKEABLE cue and the focus cue carries focus, rather than the
+		// focused row being repainted COL_PANEL_HI outright: a green row that turns grey the
+		// moment the cursor lands on it would have hidden the one thing the row exists to say.
+		// So a focused row that is not makeable lifts to COL_PANEL_HI (which is what the
+		// blueprint's "focused adds COL_PANEL_HI" buys on the rows where it costs nothing), and
+		// every focused row gets the 3-px accent left edge, which reads at a glance on either.
 		spriteRect((float)rr.x, (float)rr.y, (float)rr.w, (float)rr.h,
-		           makeable ? COL_CRAFT_OK : COL_PANEL);
-		fontDraw((float)rr.x + 6, (float)rr.y + (rr.h - FONT_GLYPH_H) * 0.5f, 1,
-		         makeable ? COL_TEXT : COL_TEXT_DIM, CRAFT_RECIPES[i].name);
+		           makeable ? COL_CRAFT_OK : (focused ? COL_PANEL_HI : COL_PANEL));
+		if (focused)
+			spriteRect((float)rr.x, (float)rr.y, 3, (float)rr.h, COL_ACCENT);
+
+		const float ty = (float)rr.y + (rr.h - FONT_GLYPH_H) * 0.5f;
+		const uint32_t col = makeable ? COL_TEXT : COL_TEXT_DIM;
+
+		fontDrawf((float)(rr.x + CRAFT_LABEL_X), ty, 1, col, "%s x%u",
+		          rec->name, (unsigned)rec->output_count);
+
+		char cost[24];
+		craftCostText(inv, i, cost, sizeof(cost));
+		fontDraw((float)(CRAFT_COST_END - fontTextWidth(cost, 1)), ty, 1, COL_TEXT_DIM, cost);
+	}
+}
+
+// The two icons a recipe row carries, in the frame's atlas pass. Split from the row above for
+// the same reason drawSlotIcon is called once per pass and not once per slot: interleaving the
+// font and atlas textures would cost a batch flush per row (see gfx/sprite.h) instead of one
+// for the whole screen.
+static void drawBarCraftIcons(int scroll)
+{
+	for (int v = 0; v < BAR_LIST_VISIBLE; v++) {
+		const int i = scroll + v;
+		if (i >= RECIPE_COUNT) break;
+
+		const URect rr = barListRowRect(v);
+		const CraftRecipe* rec = &CRAFT_RECIPES[i];
+
+		float u0, v0, u1, v1;
+		iconUv(rec->output_item, &u0, &v0, &u1, &v1);
+		spriteQuad((float)(rr.x + CRAFT_OUT_X), (float)(rr.y + CRAFT_ICON_Y),
+		           (float)CRAFT_ICON_PX, (float)CRAFT_ICON_PX, u0, v0, u1, v1, SPRITE_WHITE);
+
+		iconUv(rec->input_item, &u0, &v0, &u1, &v1);
+		spriteQuad((float)CRAFT_IN_X, (float)(rr.y + CRAFT_ICON_Y),
+		           (float)CRAFT_ICON_PX, (float)CRAFT_ICON_PX, u0, v0, u1, v1, SPRITE_WHITE);
 	}
 }
 
@@ -763,12 +855,12 @@ static void drawFurnaceBar(URect r, int fill_px, uint32_t col)
 static void drawFurnacePanelFont(const FurnaceState* fs, const Inventory* inv, int picked_slot,
                                   C3D_Tex* icons)
 {
-	const URect cr = furnCloseRect();
-	spriteRect((float)cr.x, (float)cr.y, (float)cr.w, (float)cr.h, COL_PANEL_HI);
-	const char* label = "FURNACE - TAP TO CLOSE";
-	const int lw = fontTextWidth(label, 1);
-	fontDraw((float)cr.x + (cr.w - (float)lw) * 0.5f,
-	         (float)cr.y + (cr.h - FONT_GLYPH_H) * 0.5f, 1, COL_TEXT, label);
+	// v1.9.1 BAR. The "FURNACE - TAP TO CLOSE" bar that used to open this function is GONE:
+	// furnCloseRect() and the bar's own strip are the same band (FURN_CLOSE_Y/H are aliases of
+	// BAR_STRIP_Y/H), the strip already names the tab and already carries the close tab, and
+	// two panels stacked in one 26-px band would draw one over the other. Everything below is
+	// byte-identical to what this panel shipped — blueprint D5: "only the close bar becomes
+	// the strip".
 
 	// What the player is carrying right now, so each slot can advertise whether it would take
 	// it. ITEM_NONE when nothing is lifted, which furnaceAccepts() already answers false for,
@@ -837,9 +929,12 @@ static void drawFurnacePanelFont(const FurnaceState* fs, const Inventory* inv, i
 // A lifted CHEST slot cannot live in ui->picked_slot (an inventory.h slot INDEX, and the
 // furnace block above says why that matters), so it has its own field, ui->picked_chest. At
 // most one of the two is ever >= 0: a lift only starts when nothing is lifted on either side,
-// and every place clears whichever one it consumed. Closing the panel, opening another panel,
-// or the NULL-chest correction in uiUpdateDraw clears both, so nothing is ever "in the air"
-// — the lifted stack is never removed from its source until the place tap resolves it.
+// and every place clears whichever one it consumed. Closing the panel or opening another panel
+// clears both (dropLifts()). The NULL-chest correction in uiUpdateDraw clears picked_chest
+// ALONE — see that site for why picked_slot is deliberately left out of it — so nothing chest-
+// side is ever "in the air" once the chest is gone, while a bag lift in progress survives
+// exactly as it would across any other tab switch. Either way, the lifted stack is never
+// removed from its source until the place tap resolves it.
 //
 // ── The place rules, and why this does not hand-write a second copy of them ───────────
 //
@@ -1063,12 +1158,8 @@ static void handleQuickMove(UiState* ui, Inventory* inv, ChestState* cs, int slo
 // which half of the screen is which rather than a second label drawn over the grid below.
 static void drawChestPanelFont(const ChestState* cs, int picked_chest, C3D_Tex* icons)
 {
-	const URect cr = chestCloseRect();
-	spriteRect((float)cr.x, (float)cr.y, (float)cr.w, (float)cr.h, COL_PANEL_HI);
-	const char* label = "CHEST - TAP TO CLOSE";
-	const int lw = fontTextWidth(label, 1);
-	fontDraw((float)cr.x + (cr.w - (float)lw) * 0.5f,
-	         (float)cr.y + (cr.h - FONT_GLYPH_H) * 0.5f, 1, COL_TEXT, label);
+	// v1.9.1 BAR. The "CHEST - TAP TO CLOSE" bar is gone for the reason the furnace panel's is
+	// — see drawFurnacePanelFont above; chestCloseRect() and the strip are the same band.
 
 	for (int i = 0; i < CHEST_SLOTS; i++) {
 		const URect r = chestSlotRect(i);
@@ -1082,6 +1173,229 @@ static void drawChestPanelFont(const ChestState* cs, int picked_chest, C3D_Tex* 
 	         "CHEST above, BAG below");
 }
 
+// ── The bar (v1.9.1 BAR) ───────────────────────────────────────────────────────────────
+//
+// Three screens became three tabs of one. What each tab CONTAINS is unchanged — the bag grid,
+// the recipe list, the chest's row of eight, the furnace's three slots and two gauges — and so
+// is every gesture that acts on them: the mutating handlers above are called from exactly the
+// places they were called from before, just switched on the focused category instead of on the
+// screen. What is new is the strip, the d-pad/A/B cursor, and one rule that makes those two
+// impossible to get out of step with the stylus:
+//
+//   A COMMIT IS A SYNTHETIC TAP. barNavInput answering BAR_EV_COMMIT does not run a second
+//   copy of the tap logic; it produces a touch point at the focused cell's CENTRE and feeds it
+//   into the same hit-test chain a stylus tap goes through (blueprint D8). There is therefore
+//   no controller path to keep in sync with the touch path, because there is only one path.
+//
+// The centre and not the origin, deliberately: the three panels' hit tests were written
+// independently and disagree about which side of a cell border belongs to which cell, and the
+// origin is exactly the pixel where they disagree. The centre of a cell is the one point every
+// one of them answers the same way.
+
+// The hint line under the INVENTORY tab's detail band. Only that tab draws it: CHEST and
+// FURNACE already carry their own hint lines at 118/130 and 136/148 and put the relocated bag
+// grid across 160..240, and CRAFT's seventh list row ends on 240 — on any of the three, a line
+// at 228 would land on top of content that is already there.
+#define BAR_HINT_Y 228
+
+// The live category list for one frame: the tab order barBuildKinds fixes, plus the same list
+// described to scene/barnav.h so a cursor can walk it. A stack local on uiUpdateDraw's frame
+// (~100 bytes at BAR_MAX_TABS 4), which is inside the blueprint's 3DS stack rule that anything
+// over 1 KB has to be static.
+typedef struct {
+	BarKind    kinds[BAR_MAX_TABS];
+	BarCatSpec specs[BAR_MAX_TABS];
+	int        count;
+} BarCats;
+
+// One category's shape, read out of scene/ui_layout.h's tables rather than restated here. The
+// uniform/per-row choice is DERIVED (do all this kind's rows have the same width?) instead of
+// hardcoded per kind, so a kind whose row widths change in ui_layout.c cannot leave a stale
+// table in this file disagreeing with it.
+static BarCatSpec barSpecFor(BarKind k, int list_len)
+{
+	BarCatSpec s;
+	memset(&s, 0, sizeof(s));
+	s.rows                  = barKindRows(k, list_len);
+	s.horizontal_is_content = barKindHorizontalIsContent(k);
+	if (s.rows <= 0) return s;
+
+	const int c0 = barKindCols(k, 0);
+	bool uniform = true;
+	for (int r = 1; r < s.rows; r++) {
+		if (barKindCols(k, r) != c0) { uniform = false; break; }
+	}
+
+	// cols[] is only BARNAV_MAX_ROWS long, so a category with more rows than that MUST use the
+	// uniform escape hatch. Today only CRAFT can exceed it and CRAFT is uniformly one column
+	// wide, so the two conditions never disagree; written as an `||` rather than an assumption
+	// because the day a recipe list grows past 8 rows is not the day to discover this.
+	if (uniform || s.rows > BARNAV_MAX_ROWS) {
+		s.uniform_cols = (c0 > 0) ? c0 : 1;
+	} else {
+		// The loop counts to the ARRAY bound and leaves on the row count, rather than the other
+		// way round, because of the compiler rather than because of the logic. Reaching here
+		// already means s.rows <= BARNAV_MAX_ROWS, so every shape of this loop writes the same
+		// bytes; only this one builds.
+		//
+		// devkitARM's gcc inlines barSpecFor into uiUpdateDraw with list_len fixed at
+		// RECIPE_COUNT, loses the correlation between `uniform` and `s.rows` across the `||`
+		// above, and store-merges the whole loop into one write sized by s.rows — which it then
+		// reports as -Werror=stringop-overflow= "writing 1 byte into a region of size 0 ... at
+		// offset 8 into destination object 'cols' of size 8". Two narrower bounds were tried
+		// against the real compiler first and BOTH still gave offset 8, because neither changes
+		// the merged store's size: `for (r = 0; r < s.rows && r < BARNAV_MAX_ROWS; r++)`, and a
+		// hoisted `const int n = min(s.rows, BARNAV_MAX_ROWS)`. A constant trip count does clear
+		// it, because the merged store is then 8 bytes into an 8-byte object.
+		//
+		// The clamp is real either way: the day a kind gains a ninth non-uniform row this
+		// truncates to eight instead of scribbling past cols[].
+		for (int r = 0; r < BARNAV_MAX_ROWS; r++) {
+			if (r >= s.rows) break;
+			const int c = barKindCols(k, r);
+			s.cols[r] = (uint8_t)((c > 0) ? c : 1);
+		}
+	}
+	return s;
+}
+
+// Rebuilt EVERY frame from the two container pointers, never cached on the UiState. That is
+// what replaces the two same-frame screen corrections the container screens used to carry: a
+// container whose state stopped being handed in simply has no tab this frame, and the caller
+// does not have to have remembered to close anything.
+static void barBuildCats(BarCats* c, bool has_chest, bool has_furnace)
+{
+	c->count = barBuildKinds(has_chest, has_furnace, c->kinds);
+	for (int i = 0; i < c->count; i++)
+		c->specs[i] = barSpecFor(c->kinds[i], RECIPE_COUNT);
+}
+
+// Anything in the air, on either side, whole or split. barNavInput needs this for the one rule
+// that turns on it: B with a lift is CANCEL and never BACK, so a player holding a stack cannot
+// close the bar out from under it.
+static bool barHasLift(const UiState* ui)
+{
+	return ui->picked_slot >= 0 || ui->picked_chest >= 0 || liftDetached(ui);
+}
+
+// Put everything back down. returnLift first, then the two indices: a detached half belongs in
+// lift_from, and dropLifts alone would strand it (reconcileLift would then have to notice next
+// frame). The same prologue handleQuickMove already uses, for the same reason.
+static void barCancelLift(UiState* ui, Inventory* inv)
+{
+	returnLift(ui, inv);
+	dropLifts(ui);
+}
+
+static void closeBar(UiState* ui, Inventory* inv)
+{
+	barCancelLift(ui, inv);
+	ui->screen = UI_SCR_HUD;
+}
+
+// B on the HUD, or a tap on the HUD strip. The cursor starts on the IN-HAND hotbar slot: row 0
+// is the hotbar on every grid kind, and the column the player is holding is the one they were
+// already thinking about — blueprint 1B.1 is written as an observation about exactly this.
+//
+// opened_this_frame is deliberately NOT set here, unlike uiOpenChest/uiOpenFurnace. This runs
+// inside uiUpdateDraw, after the frame's `bar_open` was captured, so the bar does not read the
+// pad until the next frame and the B that opened it is long gone by then (hidKeysDown is an
+// edge). Setting it here would cost the player one whole frame of d-pad on every open and buy
+// nothing.
+static void openBar(UiState* ui, const Inventory* inv)
+{
+	ui->screen      = UI_SCR_BAR;
+	ui->list_scroll = 0;
+	barNavReset(&ui->nav, 0, 0, (int)inv->selected_hotbar);
+}
+
+// ── The strip ──────────────────────────────────────────────────────────────────────────
+
+static void drawBarStrip(const BarCats* cats, int focused)
+{
+	const URect sr = barStripRect();
+	spriteRect((float)sr.x, (float)sr.y, (float)sr.w, (float)sr.h, COL_BG);
+
+	for (int i = 0; i < cats->count; i++) {
+		const URect t = barTabRect(i, cats->count);
+		const bool  f = (i == focused);
+
+		// One pixel narrower than the tab it fills, so the strip's own background shows through
+		// as the divider. barTabRect TILES — it leaves no gap for a divider to sit in, by
+		// design — so the alternative is a quad per seam for a 1-px line, and this is the same
+		// "draw the track, then the fill on top" trick drawPipRow and drawFurnaceBar already
+		// use. The HIT box is the full tab: the divider is a drawn pixel, not a dead one.
+		spriteRect((float)t.x, (float)t.y, (float)(t.w - 1), (float)t.h,
+		           f ? COL_PANEL_HI : COL_PANEL);
+		if (f)
+			spriteRect((float)t.x, (float)(t.y + t.h - 2), (float)(t.w - 1), 2, COL_ACCENT);
+
+		// Scale 1 on the focused tab too, not scale 2. "INVENTORY" is 108 px at scale 2 and a
+		// three-tab tab is 98; and a label that grew on focus would move its neighbours'
+		// centres, which pausemenu.c's own comment already names as reading like a glitch.
+		const char* label = barKindLabel(cats->kinds[i]);
+		const int   lw    = fontTextWidth(label, 1);
+		fontDraw((float)t.x + ((float)(t.w - 1) - (float)lw) * 0.5f,
+		         (float)t.y + (t.h - FONT_GLYPH_H) * 0.5f, 1,
+		         f ? COL_TEXT : COL_TEXT_DIM, label);
+	}
+
+	const URect cr = barCloseRect();
+	spriteRect((float)cr.x, (float)cr.y, (float)cr.w, (float)cr.h, COL_PANEL);
+	const int xw = fontTextWidth("X", 1);
+	fontDraw((float)cr.x + (cr.w - (float)xw) * 0.5f,
+	         (float)cr.y + (cr.h - FONT_GLYPH_H) * 0.5f, 1, COL_TEXT, "X");
+}
+
+// The focused cell's outline, drawn over the finished cell. One pixel and COL_ACCENT: the
+// hotbar's "in hand" cue is a 2-px top stripe in the same colour and the lifted-slot cue is a
+// 2-px full border in COL_PICKED, so this is a third weight inside a family the player already
+// reads rather than a fourth colour to learn. A zero rect (an off-window list row, or a cell
+// that does not exist) draws nothing.
+static void drawFocusRing(URect r)
+{
+	if (r.w <= 0 || r.h <= 0) return;
+	spriteRect((float)r.x, (float)r.y, (float)r.w, 1, COL_ACCENT);
+	spriteRect((float)r.x, (float)(r.y + r.h - 1), (float)r.w, 1, COL_ACCENT);
+	spriteRect((float)r.x, (float)r.y, 1, (float)r.h, COL_ACCENT);
+	spriteRect((float)(r.x + r.w - 1), (float)r.y, 1, (float)r.h, COL_ACCENT);
+}
+
+// The INVENTORY tab's detail band: what the cursor is on, or what is in the air. The lift wins
+// when there is one, because that is the stack the player is currently deciding about and the
+// cursor has already moved off it by the time they are looking for somewhere to put it.
+//
+// The focused cell is resolved back to a bag slot through the SAME hit test a stylus tap uses,
+// against the centre of barCellRect — not by arithmetic on (row, col). Two ways of turning a
+// cursor into a slot index is exactly how the readout ends up naming a different slot from the
+// one A would act on.
+static void drawBarDetail(const UiState* ui, const Inventory* inv)
+{
+	InvSlot show = { .item = ITEM_NONE, .count = 0 };
+
+	if (liftDetached(ui)) {
+		show = ui->lift;
+	} else if (ui->picked_slot >= 0) {
+		show = inv->slots[ui->picked_slot];
+	} else {
+		const URect r = barCellRect(BAR_KIND_INVENTORY, ui->nav.row, ui->nav.col, 0);
+		if (r.w > 0) {
+			const int slot = hitInventorySlot(r.x + r.w / 2, r.y + r.h / 2, true);
+			if (slot >= 0) show = inv->slots[slot];
+		}
+	}
+
+	if (show.item == ITEM_NONE) {
+		fontDraw(6, (float)(BAR_DETAIL_Y + 4), 1, COL_TEXT_DIM, "EMPTY");
+		return;
+	}
+
+	// T1 (scale 2) for the name, T2 (scale 1) for the count — the whole of the type scale this
+	// font supports (gfx/font.h is 5x7 with integer scales only), see blueprint D4.
+	fontDraw(6, (float)(BAR_DETAIL_Y + 4), 2, COL_TEXT, blockInfo(show.item)->name);
+	fontDrawf(6, (float)(BAR_DETAIL_Y + 26), 1, COL_TEXT_DIM, "x %u", (unsigned)show.count);
+}
+
 // ── Entry points ───────────────────────────────────────────────────────────────────────
 
 void uiInit(UiState* ui)
@@ -1089,23 +1403,48 @@ void uiInit(UiState* ui)
 	memset(ui, 0, sizeof(*ui));   // also clears chest_fn/chest_ud — register after this
 	ui->screen = UI_SCR_HUD;
 	dropLifts(ui);
+
+	// A memset-zero BarNav is already the correct initial state (scene/barnav.h says so). Reset
+	// anyway, so the one place a reader looks for "what does a fresh UiState's cursor hold"
+	// answers it out loud instead of by reference to another header's promise.
+	barNavReset(&ui->nav, 0, 0, 0);
+	ui->list_scroll       = 0;
+	ui->opened_this_frame = false;
 }
 
 void uiOpenFurnace(UiState* ui)
 {
-	ui->screen = UI_SCR_FURNACE;
-	// Never carry a lift across a screen boundary — the same rule the OPEN INVENTORY toggle
-	// and the crafting close bar already follow in uiUpdateDraw, and it matters more here:
-	// picked_slot indexes inv->slots[], and the furnace screen draws a DIFFERENT set of those
-	// slots in different places, so a stale lift would highlight a cell the player never
-	// touched. Both lifts, since v1.9.0 CHEST: a chest-slot lift left over from a chest
-	// panel would otherwise index a chest this screen is not showing.
+	ui->screen = UI_SCR_BAR;
+
+	// The container is always tab 2 — barBuildKinds fixes that order and ui_layout.h's own
+	// comment says why a caller may rely on it. Written straight into nav.cat rather than
+	// through barNavSetCat because the category list is built inside uiUpdateDraw out of the
+	// two pointers the caller has not handed in yet; the next frame's barNavClamp is what makes
+	// this real, and it is also what puts the cursor back on tab 0 if the caller opened a
+	// container it then never passed in.
+	ui->nav.cat = 2;
+
+	// This runs BETWEEN frames, from main.c's world-interact path, and the button that got the
+	// player here is still a press edge in the keys_down word uiUpdateDraw is about to be
+	// handed. options.h lets ACTION_PLACE be bound to A, and A on the bar is COMMIT — so
+	// without this, opening a chest would lift or drop on whatever cell the cursor landed on,
+	// in the same frame, before the player saw the panel. See UiState.opened_this_frame.
+	ui->opened_this_frame = true;
+
+	// Never carry a lift across a screen boundary — the same rule the HUD toggle and the
+	// container close bars already followed, and it matters more here: picked_slot indexes
+	// inv->slots[], and the furnace tab draws a DIFFERENT set of those slots in different
+	// places, so a stale lift would highlight a cell the player never touched. Both lifts,
+	// since v1.9.0 CHEST: a chest-slot lift left over from a chest panel would otherwise index
+	// a chest this tab is not showing.
 	dropLifts(ui);
 }
 
 void uiOpenChest(UiState* ui, int x, int y, int z)
 {
-	ui->screen  = UI_SCR_CHEST;
+	ui->screen            = UI_SCR_BAR;
+	ui->nav.cat           = 2;              // see uiOpenFurnace above for both of these
+	ui->opened_this_frame = true;
 	ui->chest_x = x;
 	ui->chest_y = y;
 	ui->chest_z = z;
@@ -1153,62 +1492,160 @@ UiResult uiUpdateDraw(UiState* ui, Inventory* inv, C3D_Tex* block_icons,
 	ui->touch_prev = in->touch_down;
 	if (tap) audioPlay(audioSfxId(SFX_UI_TAP), AUDIO_PRIO_UI, 1.0f);
 
-	// v1.8.15 FURNACE. The one same-frame screen correction in this file, and the only one:
-	// UI_SCR_FURNACE with no FurnaceState behind it is a caller contract violation (ui.h says
-	// the two travel together), and every alternative to correcting it here is worse. Drawing
-	// the furnace panel would mean dereferencing the NULL this function was told not to touch;
-	// drawing nothing would leave the player on a dead screen with no close bar to tap and no
-	// way back. Falling back to the inventory overlay is the one outcome that is both safe and
-	// escapable, and it happens BEFORE the two flags below are read so the rest of this
-	// function never sees the inconsistent state at all.
-	if (ui->screen == UI_SCR_FURNACE && furnace == NULL) {
-		ui->screen = UI_SCR_INVENTORY;
-		ui->picked_slot = -1;
-	}
+	// v1.9.1 BAR. The frame the bar became visible ignores this frame's press edges — read and
+	// cleared here, before anything below can set it again, so it is a one-frame flag and not a
+	// mode. See UiState.opened_this_frame for the button that makes it necessary.
+	const bool fresh_open = ui->opened_this_frame;
+	ui->opened_this_frame = false;
 
-	// v1.9.0 CHEST. The identical same-frame correction, for the identical reason, with
-	// `chest` standing in for `furnace` — see the comment immediately above for the full
-	// argument; it is not restated here because nothing about it changes for a chest.
-	if (ui->screen == UI_SCR_CHEST && chest == NULL) {
-		ui->screen = UI_SCR_INVENTORY;
-		dropLifts(ui);
-	}
+	// v1.9.1 BAR. The live category list, rebuilt from the two container pointers every frame.
+	// This is what REPLACES the two same-frame screen corrections that used to sit here: a
+	// container whose state is no longer being handed in simply has no tab, so there is no
+	// screen to correct and no pointer that could be dereferenced while NULL. barNavClamp then
+	// puts a cursor that was sitting on that tab back onto a real cell — category 0 is
+	// INVENTORY, which always exists — which is the same "safe and escapable" outcome the old
+	// fallback produced, reached without a special case.
+	//
+	// Clamped HERE and not left to barNavInput's own leading clamp, because everything below —
+	// the tap chain, the detail band, the focus ring, the draw — indexes cats.kinds[nav.cat],
+	// and a frame where the bar draws but no key is pressed never reaches barNavInput at all.
+	BarCats cats;
+	barBuildCats(&cats, chest != NULL, furnace != NULL);
+	barNavClamp(&ui->nav, cats.specs, cats.count);
 
-	// Captured once and used for both the tap logic and the draw below, so a tap is always
-	// interpreted against the screen the player actually saw this frame — any screen switch
-	// a handler makes below (opening or closing the overlay) takes effect next frame, the
-	// same "change applies next frame" rule title.c's own ts->screen follows.
-	const bool overlay_open = (ui->screen == UI_SCR_INVENTORY);
-	const bool furnace_open = (ui->screen == UI_SCR_FURNACE);
-	const bool chest_open   = (ui->screen == UI_SCR_CHEST);
+	// v1.9.1 BAR fix (2026-09-07). barNavClamp above moves the CURSOR off the vanished chest
+	// tab, but a cursor position was never what ui->picked_chest is — it is a slot INDEX into
+	// the ChestState the caller is no longer handing in, and clamping the nav never touched it.
+	// Left alone, it keeps its old value across however many chests get opened after this one:
+	// handleChestSlotTap's "nothing lifted" branch is gated on `picked_chest < 0`, so the very
+	// next chest tap is read as a place/cancel against a DIFFERENT chest's slot at that same
+	// stale index — a wrong-chest write, the shape of bug this fix exists to close. This is the
+	// vanish path itself (barBuildCats/barNavClamp is where the tab actually disappears, not
+	// some call site nearby), so this is where the index that only made sense on that tab has
+	// to go with it: `chest == NULL` is precisely "no ChestState exists for picked_chest to
+	// name" regardless of which tab the cursor lands on.
+	//
+	// Deliberately NOT dropLifts(): that also clears ui->picked_slot, the BAG lift, and an
+	// ordinary tab switch (BAR_EV_CAT, handled below) never touches picked_slot — a bag lift
+	// survives moving from the chest tab to the inventory tab by hand, so an automatic clamp
+	// forced by the chest vanishing must not treat it any differently, or picking up a bag item
+	// then having the chest close under you (out of range, broken by another player) would
+	// silently drop what you were holding. Only the chest-side index is meaningless here.
+	if (!chest && ui->picked_chest >= 0)
+		ui->picked_chest = -1;
+
+	// Captured once and used for both the input logic and the draw below, so a tap is always
+	// interpreted against the screen the player actually saw this frame — any screen switch a
+	// handler makes below (opening or closing the bar) takes effect next frame, the same
+	// "change applies next frame" rule title.c's own ts->screen follows. The focused TAB is
+	// different and is read after the key phase: a tab change is a move inside one screen, and
+	// making L/R wait a frame would read as lag rather than as a rule.
+	const bool bar_open = (ui->screen == UI_SCR_BAR);
 
 	// v1.9.0 SPLIT. A detached half whose origin is no longer the lifted slot — some site
 	// above or in a previous frame dropped the lift — goes back into the bag before anything
 	// reads or draws the bag this frame. See the detached-lift block above handleSlotTap.
 	reconcileLift(ui, inv);
 
+	// ── The controller phase. Runs BEFORE the tab is read and before the gesture block, because
+	// a COMMIT has to become a touch point that the rest of this frame then processes exactly as
+	// if the stylus had produced it (blueprint D8) — the whole reason there is only ONE hit-test
+	// chain below and not a parallel controller one that could drift away from it.
+	//
+	// Skipped on the frame the bar opened (see fresh_open), and skipped entirely on the HUD:
+	// barNavInput would move a cursor nobody can see, and B on the HUD is the OPEN button
+	// handled after the tap chain.
+	bool synth_tap = false;
+	int  synth_x = 0, synth_y = 0;
+	if (bar_open && !fresh_open) {
+		const BarEvent ev = barNavInput(&ui->nav, in->keys_down, cats.specs, cats.count,
+		                                barHasLift(ui));
+		switch (ev) {
+		case BAR_EV_BACK:
+			closeBar(ui, inv);
+			break;
+		case BAR_EV_CANCEL:
+			// B with something in the air puts it down and leaves the bar up. barnav.h states
+			// the rule; this is the whole of acting on it.
+			barCancelLift(ui, inv);
+			break;
+		case BAR_EV_COMMIT: {
+			// The CENTRE of the focused cell, never its origin: barCellRect's origin is the
+			// top-left CORNER, which on every one of these rects is a border pixel, and the hit
+			// tests below reject a border pixel the same way they reject a gutter. A commit
+			// aimed at the origin would silently do nothing on the cells whose rects abut.
+			const URect r = barCellRect(cats.kinds[ui->nav.cat], ui->nav.row, ui->nav.col,
+			                            ui->list_scroll);
+			if (r.w > 0 && r.h > 0) {
+				synth_tap = true;
+				synth_x   = r.x + r.w / 2;
+				synth_y   = r.y + r.h / 2;
+			}
+			break;
+		}
+		case BAR_EV_CAT:
+		case BAR_EV_MOVE:
+		case BAR_EV_ALT:
+		case BAR_EV_STEP_LEFT:
+		case BAR_EV_STEP_RIGHT:
+			// Movement and the reserved X. barnav has already updated the cursor; there is
+			// nothing for this file to do but say it happened. STEP_* cannot occur on any v1.9.1
+			// category (no kind sets horizontal_is_content on a one-column row) and ALT has no
+			// caller until the split gesture gets a button — both are listed rather than folded
+			// into a default so adding one later is a compile-visible edit here.
+			break;
+		case BAR_EV_NONE:
+			break;
+		}
+		if (ev != BAR_EV_NONE) audioPlay(audioSfxId(SFX_UI_TAP), AUDIO_PRIO_UI, 1.0f);
+	}
+
+	// Read AFTER the key phase, so an L/R tab change is visible on the frame it happens rather
+	// than a frame later — see the bar_open comment above for why the SCREEN does not work that
+	// way and a tab does.
+	const BarKind kind = bar_open ? cats.kinds[ui->nav.cat] : BAR_KIND_INVENTORY;
+	const bool inv_tab   = bar_open && kind == BAR_KIND_INVENTORY;
+	const bool craft_tab = bar_open && kind == BAR_KIND_CRAFT;
+	const bool chest_tab = bar_open && kind == BAR_KIND_CHEST;
+	const bool furn_tab  = bar_open && kind == BAR_KIND_FURNACE;
+
+	// The recipe list is the one category taller than its window. Followed here, after the
+	// cursor has moved and before anything converts a cell to a rect, so the scroll the hit
+	// tests use is the same one the draw uses.
+	if (craft_tab)
+		ui->list_scroll = barNavScrollFor(ui->nav.row, ui->list_scroll, BAR_LIST_VISIBLE,
+		                                  RECIPE_COUNT);
+
+	// The effective touch point for the rest of the frame: the stylus, or the synthetic tap a
+	// COMMIT produced. One point, one chain — a controller cannot reach a slot the stylus
+	// cannot, and it cannot miss one the stylus hits.
+	const bool eff_tap  = tap || synth_tap;
+	const bool eff_down = in->touch_down || synth_tap;
+	const int  eff_x    = synth_tap ? synth_x : in->touch_x;
+	const int  eff_y    = synth_tap ? synth_y : in->touch_y;
+
 	// v1.9.0 SPLIT. The gestures: bag-slot taps (lift / place / merge), Y (split) and X
 	// (quick-move), classified by scene/ui_gesture.h and acted on here. Fed EVERY frame, HUD
 	// included — the module's edge state must track the buttons continuously (its header says
 	// why) — and BEFORE the tap chain below, so a tap event is classified against the lift
-	// state the player saw. The chain no longer handles bag-slot taps on the overlay or the
-	// furnace screen (those are this block's), and on the chest screen it handles them only
-	// while a CHEST slot is lifted (the withdraw), which is exactly when lift_enabled is off.
+	// state the player saw. The chain no longer handles bag-slot taps on the INVENTORY or
+	// FURNACE tabs (those are this block's), and on the CHEST tab it handles them only while a
+	// CHEST slot is lifted (the withdraw), which is exactly when lift_enabled is off.
 	{
 		int slot_under = -1;
-		if (in->touch_down) {
-			if (furnace_open)      slot_under = hitFurnaceInvSlot(in->touch_x, in->touch_y);
-			else if (chest_open)   slot_under = hitChestInvSlot(in->touch_x, in->touch_y);
-			else if (overlay_open) slot_under = hitInventorySlot(in->touch_x, in->touch_y, true);
+		if (eff_down) {
+			if (furn_tab)       slot_under = hitFurnaceInvSlot(eff_x, eff_y);
+			else if (chest_tab) slot_under = hitChestInvSlot(eff_x, eff_y);
+			else if (inv_tab)   slot_under = hitInventorySlot(eff_x, eff_y, true);
 		}
 		const UiGestureInput gin = {
-			.touch_down    = in->touch_down,
+			.touch_down    = eff_down,
 			.slot_under    = slot_under,
 			.keys_held     = in->keys_held,
 			.lifted_slot   = ui->picked_slot,
-			.lift_enabled  = overlay_open || furnace_open || (chest_open && ui->picked_chest < 0),
-			.split_enabled = overlay_open,
-			.chest_open    = chest_open,
+			.lift_enabled  = inv_tab || furn_tab || (chest_tab && ui->picked_chest < 0),
+			.split_enabled = inv_tab,
+			.chest_open    = chest_tab,
 		};
 		const UiGestureEvent ev = uiGestureFeed(&ui->gesture, &gin, inv);
 		switch (ev.kind) {
@@ -1221,124 +1658,149 @@ UiResult uiUpdateDraw(UiState* ui, Inventory* inv, C3D_Tex* block_icons,
 		}
 	}
 
-	if (tap && furnace_open) {
-		const int tx = in->touch_x, ty = in->touch_y;
+	if (eff_tap && bar_open) {
+		const int tx = eff_x, ty = eff_y;
 
-		if (ptInRect(furnCloseRect(), tx, ty)) {
-			// Back to the inventory overlay rather than to the HUD: the player opened this
-			// panel to move things around, and the bag is where the rest of their things are.
-			// Closing all the way out to the world would make "put the leftovers away" a
-			// second trip through the OPEN INVENTORY toggle.
-			ui->screen = UI_SCR_INVENTORY;
-			ui->picked_slot = -1;
+		// The strip first, on every tab: it is the one control that means the same thing
+		// everywhere, and it sits above every content area, so nothing below can shadow it.
+		const int hit = hitBarStrip(tx, ty, cats.count);
+		if (hit == BAR_HIT_CLOSE) {
+			closeBar(ui, inv);
+		} else if (hit != BAR_HIT_NONE) {
+			barNavSetCat(&ui->nav, hit, cats.specs, cats.count);
 		} else {
-			const int fslot = hitFurnaceSlot(tx, ty);
-			if (fslot != FURN_HIT_NONE) {
-				// The output slot is a withdrawal either way — see the gesture block above
-				// furnaceDeposit for why it needs no lifted/not-lifted branch.
-				if (fslot == FURN_HIT_OUTPUT || ui->picked_slot < 0)
-					furnaceWithdraw(inv, furnace, fslot);
-				else
-					furnaceDeposit(ui, inv, furnace, fslot);
-			} else {
-				// v1.9.0 SPLIT: a tap on the main grid (hitFurnaceInvSlot — the grid is at
-				// FURN_GRID_Y on this screen) is the gesture block's above, which hit-tests
-				// the same rect and runs the same two-tap lift/drop. Nothing to do here.
-			}
-		}
-	} else if (tap && chest_open) {
-		const int tx = in->touch_x, ty = in->touch_y;
+			// A tap inside the content area moves the CURSOR to the cell it landed on before
+			// that cell is acted on, so the focus ring never trails the stylus and a player who
+			// mixes the two input methods finds the cursor where they last touched. Failing the
+			// hit test (a gutter, the detail band) leaves the cursor alone.
+			int row = 0, col = 0;
+			if (barCellFromPoint(kind, tx, ty, ui->list_scroll, &row, &col))
+				barNavSetCell(&ui->nav, row, col, cats.specs, cats.count);
 
-		if (ptInRect(chestCloseRect(), tx, ty)) {
-			// Back to the HUD, not to the inventory overlay the furnace close bar goes to: a
-			// chest is opened from the world by interacting with the block, so closing it
-			// puts the player back where they were. Any pending lift is cancelled — the
-			// lifted stack was never taken out of its source, so nothing is lost.
-			ui->screen = UI_SCR_HUD;
-			dropLifts(ui);
-		} else {
-			const int cslot = hitChestSlot(tx, ty);
-			if (cslot >= 0) {
-				handleChestSlotTap(ui, inv, chest, cslot);
-			} else {
-				// hitChestInvSlot, not hitInventorySlot: the main grid is at CHEST_GRID_Y on
-				// this screen, the same relocation the furnace screen makes for its own grid.
-				const int slot = hitChestInvSlot(tx, ty);
-				if (slot >= 0) handleChestInvSlotTap(ui, inv, chest, slot);
-			}
-		}
-	} else if (tap) {
-		const int tx = in->touch_x, ty = in->touch_y;
-
-		if (!overlay_open) {
-			if (ptInRect(hudToggleRect(), tx, ty)) {
-				ui->screen = UI_SCR_INVENTORY;
-				ui->picked_slot = -1;   // never carry a lift across the screen boundary
-			} else {
-				const int slot = hitInventorySlot(tx, ty, false);
-				if (slot >= 0) handleHotbarSelect(inv, slot);
-			}
-		} else {
-			if (ptInRect(craftCloseRect(), tx, ty)) {
-				ui->screen = UI_SCR_HUD;
-				ui->picked_slot = -1;
-			} else {
-				// v1.9.0 SPLIT: a tap on a slot is the gesture block's above; only the craft
-				// rows are still resolved here.
-				const int slot = hitInventorySlot(tx, ty, true);
-				if (slot < 0) {
-					for (int i = 0; i < RECIPE_COUNT; i++) {
-						if (ptInRect(craftRowRect(i), tx, ty)) {
-							handleCraftTap(inv, i);
-							break;
-						}
-					}
+			switch (kind) {
+			case BAR_KIND_CRAFT: {
+				// Walked over the VISIBLE rows and offset by the scroll, not over all
+				// RECIPE_COUNT rows: barListRowRect answers in screen space for a window row,
+				// so a recipe scrolled off the top has no rect here and cannot be tapped.
+				for (int v = 0; v < BAR_LIST_VISIBLE; v++) {
+					const int r = ui->list_scroll + v;
+					if (r >= RECIPE_COUNT) break;
+					if (ptInRect(barListRowRect(v), tx, ty)) { handleCraftTap(inv, r); break; }
 				}
+				break;
 			}
+			case BAR_KIND_FURNACE: {
+				const int fslot = hitFurnaceSlot(tx, ty);
+				if (fslot != FURN_HIT_NONE) {
+					// The output slot is a withdrawal either way — see the comment above
+					// furnaceDeposit for why it needs no lifted/not-lifted branch.
+					if (fslot == FURN_HIT_OUTPUT || ui->picked_slot < 0)
+						furnaceWithdraw(inv, furnace, fslot);
+					else
+						furnaceDeposit(ui, inv, furnace, fslot);
+				}
+				// A tap on the bag grid (hitFurnaceInvSlot) is the gesture block's above, which
+				// hit-tests the same rect and runs the same two-tap lift/drop.
+				break;
+			}
+			case BAR_KIND_CHEST: {
+				const int cslot = hitChestSlot(tx, ty);
+				if (cslot >= 0) {
+					handleChestSlotTap(ui, inv, chest, cslot);
+				} else {
+					// hitChestInvSlot, not hitInventorySlot: the bag grid is at CHEST_GRID_Y on
+					// this tab, the same relocation the furnace tab makes for its own grid.
+					const int slot = hitChestInvSlot(tx, ty);
+					if (slot >= 0) handleChestInvSlotTap(ui, inv, chest, slot);
+				}
+				break;
+			}
+			case BAR_KIND_INVENTORY:
+			default:
+				// Every bag tap on this tab is the gesture block's — it is the only tab where
+				// split and quick-move are live, and routing the tap twice would run the lift
+				// again on top of the gesture's.
+				break;
+			}
+		}
+	} else if (eff_tap) {
+		// The HUD. Two controls: the toggle strip and the hotbar.
+		const int tx = eff_x, ty = eff_y;
+		if (ptInRect(hudToggleRect(), tx, ty)) {
+			openBar(ui, inv);
+		} else {
+			const int slot = hitInventorySlot(tx, ty, false);
+			if (slot >= 0) handleHotbarSelect(inv, slot);
 		}
 	}
+
+	// v1.9.1 BAR, blueprint D7. B opens the bar from the HUD. Read here rather than in the key
+	// phase above, which only runs while the bar is already up. B is the one button options.h
+	// never lets the player rebind, so this cannot collide with a world action.
+	if (!bar_open && (in->keys_down & BAR_KEY_B)) openBar(ui, inv);
 
 	spriteBegin(SCR_W, SCR_H);
 
 	// ── Pass 1: font texture. Every panel, border, label and count badge on the screen,
-	// regardless of which of the four screens is showing (v1.9.0 CHEST added the fourth) —
-	// one texture, one flush, one draw call, batched exactly the way gfx/sprite.h's own
-	// file comment describes a whole UI screen should be.
+	// regardless of which tab is showing — one texture, one flush, one draw call, batched
+	// exactly the way gfx/sprite.h's own file comment describes a whole UI screen should be.
 	spriteTexture(fontTexture());
 	spriteRect(0, 0, SCR_W, SCR_H, COL_BG);
 
-	// The hotbar is the one strip drawn on every screen, at the same rects, always — the
-	// standing rule that the player must be able to see what they are holding. The furnace
-	// screen changed nothing about this loop, including the "in hand" accent, which stays
-	// visible on all three screens exactly as it already did on two: it answers "what is in
-	// your hand", which remains true and worth knowing while the player is loading a furnace,
-	// even though a tap on that same cell means pick-up rather than select while a storage
-	// screen is up.
+	// The hotbar is the one strip drawn on every tab, at the same rects, always — the standing
+	// rule that the player must be able to see what they are holding. That includes the "in
+	// hand" accent: it answers "what is in your hand", which remains true and worth knowing
+	// while the player is loading a furnace, even though a tap on that same cell means pick-up
+	// rather than select while a container tab is up.
 	for (int i = 0; i < INV_HOTBAR_SLOTS; i++)
 		drawSlotIcon(PASS_FONT, hotbarSlotRect(i), &inv->slots[i],
 		             inv->selected_hotbar == i, ui->picked_slot == i, block_icons);
 
-	if (furnace_open) {
-		for (int i = 0; i < INV_MAIN_SLOTS; i++) {
-			const int slot = INV_HOTBAR_SLOTS + i;
-			drawSlotIcon(PASS_FONT, furnGridSlotRect(i), &inv->slots[slot],
-			             false, ui->picked_slot == slot, block_icons);
+	if (bar_open) {
+		drawBarStrip(&cats, ui->nav.cat);
+
+		switch (kind) {
+		case BAR_KIND_CRAFT:
+			drawBarCraftList(inv, ui->list_scroll, ui->nav.row);
+			break;
+		case BAR_KIND_FURNACE:
+			for (int i = 0; i < INV_MAIN_SLOTS; i++) {
+				const int slot = INV_HOTBAR_SLOTS + i;
+				drawSlotIcon(PASS_FONT, furnGridSlotRect(i), &inv->slots[slot],
+				             false, ui->picked_slot == slot, block_icons);
+			}
+			drawFurnacePanelFont(furnace, inv, ui->picked_slot, block_icons);
+			break;
+		case BAR_KIND_CHEST:
+			for (int i = 0; i < INV_MAIN_SLOTS; i++) {
+				const int slot = INV_HOTBAR_SLOTS + i;
+				drawSlotIcon(PASS_FONT, chestGridSlotRect(i), &inv->slots[slot],
+				             false, ui->picked_slot == slot, block_icons);
+			}
+			drawChestPanelFont(chest, ui->picked_chest, block_icons);
+			break;
+		case BAR_KIND_INVENTORY:
+		default:
+			for (int i = 0; i < INV_MAIN_SLOTS; i++) {
+				const int slot = INV_HOTBAR_SLOTS + i;
+				drawSlotIcon(PASS_FONT, gridSlotRect(i), &inv->slots[slot],
+				             false, ui->picked_slot == slot, block_icons);
+			}
+			drawBarDetail(ui, inv);
+
+			// The vitals move onto this tab rather than off the screen: the INVENTORY tab is
+			// the one with room below the bag grid, and a player deciding what to eat should not
+			// have to close the bar to see how hungry they are.
+			if (stats) drawHudVitals(stats);
+			fontDraw(6, (float)BAR_HINT_Y, 1, COL_TEXT_DIM, "A LIFT/DROP  B CLOSE  L/R TAB");
+			break;
 		}
-		drawFurnacePanelFont(furnace, inv, ui->picked_slot, block_icons);
-	} else if (chest_open) {
-		for (int i = 0; i < INV_MAIN_SLOTS; i++) {
-			const int slot = INV_HOTBAR_SLOTS + i;
-			drawSlotIcon(PASS_FONT, chestGridSlotRect(i), &inv->slots[slot],
-			             false, ui->picked_slot == slot, block_icons);
-		}
-		drawChestPanelFont(chest, ui->picked_chest, block_icons);
-	} else if (overlay_open) {
-		for (int i = 0; i < INV_MAIN_SLOTS; i++) {
-			const int slot = INV_HOTBAR_SLOTS + i;
-			drawSlotIcon(PASS_FONT, gridSlotRect(i), &inv->slots[slot],
-			             false, ui->picked_slot == slot, block_icons);
-		}
-		drawCraftPanelFont(inv);
+
+		// Last in the font pass, so it outlines a cell that is already finished. CRAFT is
+		// excluded because drawBarCraftList already highlights its focused row across the full
+		// width — a ring on top of that would be two cues for one thing.
+		if (kind != BAR_KIND_CRAFT)
+			drawFocusRing(barCellRect(kind, ui->nav.row, ui->nav.col, ui->list_scroll));
 	} else {
 		drawHudFont(stats);
 	}
@@ -1356,53 +1818,68 @@ UiResult uiUpdateDraw(UiState* ui, Inventory* inv, C3D_Tex* block_icons,
 			drawSlotIcon(PASS_ATLAS, hotbarSlotRect(i), &inv->slots[i], false, false,
 			             block_icons);
 
-		if (furnace_open) {
-			for (int i = 0; i < INV_MAIN_SLOTS; i++) {
-				const int slot = INV_HOTBAR_SLOTS + i;
-				drawSlotIcon(PASS_ATLAS, furnGridSlotRect(i), &inv->slots[slot], false, false,
-				             block_icons);
-			}
-
-			// The three furnace cells, in the same pass as every other icon on the screen, so
-			// adding this panel costs no third draw call — the whole point of the two-pass
-			// split described above.
-			for (int which = FURN_HIT_INPUT; which <= FURN_HIT_OUTPUT; which++) {
-				ItemId  item  = ITEM_NONE;
-				uint8_t count = 0;
-				switch (which) {
-				case FURN_HIT_INPUT:  item = furnace->input_item;  count = furnace->input_count;  break;
-				case FURN_HIT_FUEL:   item = furnace->fuel_item;   count = furnace->fuel_count;   break;
-				default:              item = furnace->output_item; count = furnace->output_count; break;
+		if (bar_open) {
+			switch (kind) {
+			case BAR_KIND_CRAFT:
+				drawBarCraftIcons(ui->list_scroll);
+				break;
+			case BAR_KIND_FURNACE:
+				for (int i = 0; i < INV_MAIN_SLOTS; i++) {
+					const int slot = INV_HOTBAR_SLOTS + i;
+					drawSlotIcon(PASS_ATLAS, furnGridSlotRect(i), &inv->slots[slot], false, false,
+					             block_icons);
 				}
-				const InvSlot view = furnSlotView(item, count);
-				drawSlotIcon(PASS_ATLAS, furnSlotRect(which), &view, false, false, block_icons);
-			}
-		} else if (chest_open) {
-			for (int i = 0; i < INV_MAIN_SLOTS; i++) {
-				const int slot = INV_HOTBAR_SLOTS + i;
-				drawSlotIcon(PASS_ATLAS, chestGridSlotRect(i), &inv->slots[slot], false, false,
-				             block_icons);
-			}
 
-			// The chest's CHEST_SLOTS cells, in the same pass as every other icon on the
-			// screen — same two-draw-call reasoning as the furnace cells just above.
-			for (int i = 0; i < CHEST_SLOTS; i++) {
-				const InvSlot view = furnSlotView(chest->item[i], chest->count[i]);
-				drawSlotIcon(PASS_ATLAS, chestSlotRect(i), &view, false, false, block_icons);
-			}
-		} else if (overlay_open) {
-			for (int i = 0; i < INV_MAIN_SLOTS; i++) {
-				const int slot = INV_HOTBAR_SLOTS + i;
-				drawSlotIcon(PASS_ATLAS, gridSlotRect(i), &inv->slots[slot], false, false,
-				             block_icons);
+				// The three furnace cells, in the same pass as every other icon on the screen, so
+				// adding this panel costs no third draw call — the whole point of the two-pass
+				// split described above.
+				for (int which = FURN_HIT_INPUT; which <= FURN_HIT_OUTPUT; which++) {
+					ItemId  item  = ITEM_NONE;
+					uint8_t count = 0;
+					switch (which) {
+					case FURN_HIT_INPUT:  item = furnace->input_item;  count = furnace->input_count;  break;
+					case FURN_HIT_FUEL:   item = furnace->fuel_item;   count = furnace->fuel_count;   break;
+					default:              item = furnace->output_item; count = furnace->output_count; break;
+					}
+					const InvSlot view = furnSlotView(item, count);
+					drawSlotIcon(PASS_ATLAS, furnSlotRect(which), &view, false, false, block_icons);
+				}
+				break;
+			case BAR_KIND_CHEST:
+				for (int i = 0; i < INV_MAIN_SLOTS; i++) {
+					const int slot = INV_HOTBAR_SLOTS + i;
+					drawSlotIcon(PASS_ATLAS, chestGridSlotRect(i), &inv->slots[slot], false, false,
+					             block_icons);
+				}
+
+				// The chest's CHEST_SLOTS cells, in the same pass as every other icon on the
+				// screen — same two-draw-call reasoning as the furnace cells just above.
+				for (int i = 0; i < CHEST_SLOTS; i++) {
+					const InvSlot view = furnSlotView(chest->item[i], chest->count[i]);
+					drawSlotIcon(PASS_ATLAS, chestSlotRect(i), &view, false, false, block_icons);
+				}
+				break;
+			case BAR_KIND_INVENTORY:
+			default:
+				for (int i = 0; i < INV_MAIN_SLOTS; i++) {
+					const int slot = INV_HOTBAR_SLOTS + i;
+					drawSlotIcon(PASS_ATLAS, gridSlotRect(i), &inv->slots[slot], false, false,
+					             block_icons);
+				}
+				break;
 			}
 		}
 	}
 
 	spriteEnd();
 
+	// Derived from the POINTERS, never from nav.cat. The caller asks these to decide whether to
+	// keep feeding this furnace/chest in, and answering "a container tab is focused" would make
+	// that circular: the tab exists because the pointer was passed, so reporting the tab back
+	// would let one frame on a different tab tear the container down under the player.
 	UiResult out;
-	out.inventory_open = overlay_open;
-	out.furnace_open   = furnace_open;
+	out.bar_open     = bar_open;
+	out.furnace_open = bar_open && furnace != NULL;
+	out.chest_open   = bar_open && chest != NULL;
 	return out;
 }

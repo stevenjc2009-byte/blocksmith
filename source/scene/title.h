@@ -30,6 +30,7 @@
 #include "app/options.h"
 #include "app/version_history.h"
 #include "app/whatsnew.h"
+#include "scene/barnav.h"      // v1.9.1: the four-tab bar's cursor lives in TitleState below
 #include "scene/worldlist.h"
 
 // Where the options file lives. Public so main.c can load it once at boot with the same
@@ -62,13 +63,24 @@ typedef struct {
 	char world_name[WORLDLIST_NAME_MAX];
 } TitleResult;
 
+// v1.9.1 (blueprint D10). TITLE_SCR_MAIN is now the four-tab BAR — PLAY / MULTIPLAYER /
+// OPTIONS / SYSTEM — rather than a list of four buttons, and three of the values below stopped
+// being screens the moment their content became a tab of it: WORLD_SELECT, OPTIONS_GENERAL and
+// MULTIPLAYER. They are kept, with their original numbering, because a caller may still ASK for
+// one — main.c writes TITLE_SCR_MULTIPLAYER into a freshly-inited TitleState to land the player
+// back on multiplayer after a server session — and title.c's titleUpdateDraw turns any of the
+// three into TITLE_SCR_MAIN focused on the matching tab on the frame it sees it. Writing one of
+// them is therefore still exactly the request it always was; it just resolves to a tab.
+//
+// The remaining three are real screens still, unchanged in layout (blueprint D1: leaf screens
+// keep their layouts and are reached from bar rows).
 typedef enum {
-	TITLE_SCR_MAIN,
-	TITLE_SCR_WORLD_SELECT,
-	TITLE_SCR_OPTIONS_GENERAL,
+	TITLE_SCR_MAIN,            // v1.9.1: the four-tab bar
+	TITLE_SCR_WORLD_SELECT,    // v1.9.1: resolves to the PLAY tab
+	TITLE_SCR_OPTIONS_GENERAL, // v1.9.1: resolves to the OPTIONS tab
 	TITLE_SCR_OPTIONS_BINDINGS,
-	TITLE_SCR_MULTIPLAYER,
-	TITLE_SCR_UPDATE,          // Options' "CHECK FOR UPDATE" button - see title.c's drawUpdate
+	TITLE_SCR_MULTIPLAYER,     // v1.9.1: resolves to the MULTIPLAYER tab
+	TITLE_SCR_UPDATE,          // SYSTEM's "CHECK FOR UPDATE" row - see title.c's drawUpdate
 	// The update screen's top-left "VERSION HISTORY" button - see title.c's
 	// drawVersionHistory/drawVersionHistoryTop and app/version_history.h.
 	TITLE_SCR_VERSION_HISTORY,
@@ -79,19 +91,19 @@ typedef struct {
 	int           cursor;        // focused item index on the current screen
 	bool          touch_prev;    // last frame's touch_down, so a tap fires once on the edge
 
-	// World select's cache of worldlistScan's result, filled once on *entering* the screen
-	// rather than every frame — a directory listing is a real SD-card cost, the same reason
-	// region.h avoids a file per column. See title.c's titleEnterWorldSelect.
+	// The PLAY tab's cache of worldlistScan's result, filled once on *entering* the tab rather
+	// than every frame — a directory listing is a real SD-card cost, the same reason
+	// region.h avoids a file per column. See title.c's titleEnterPlayTab.
 	WorldEntry worlds[WORLDLIST_MAX];
 	int        world_count;
 	bool       world_list_truncated;
 	int        world_scroll;     // index of the first visible row in the world list
 
-	// World select's "press Y again to delete" latch (v1.9.0 item 6.3) — armed, disarmed,
+	// The PLAY tab's "press Y again to delete" latch (v1.9.0 item 6.3) — armed, disarmed,
 	// expired and consumed entirely by scene/worldlist.h's worldlistUiStep; this file only
 	// draws off it. Its all-zero value is "off" by construction (worldlist.h stores the row
 	// PLUS ONE for exactly that reason), so titleInit's memset already disarms it; titleInit
-	// and titleEnterWorldSelect still call worldlistConfirmReset on it so the disarm is
+	// and titleEnterPlayTab still call worldlistConfirmReset on it so the disarm is
 	// visible at the two places it has to hold rather than an accident of the encoding.
 	WorldDeleteConfirm world_confirm;
 
@@ -116,23 +128,49 @@ typedef struct {
 	// first - row 0 is an update the check already found but the player has not installed
 	// yet, when there is one (see app/version_history.h's file comment), then every baked
 	// app/version_history.c entry. `vh_scroll` is the first visible row of that list on the
-	// bottom screen, same auto-follow idea drawWorldSelect's world_scroll already uses above.
+	// bottom screen, same auto-follow idea the PLAY tab's world_scroll already uses above.
 	// The notes body the selected row shows on the TOP screen reuses notes_scroll/
 	// notes_rep_up/notes_rep_down above rather than duplicating them, because this screen and
 	// the update screen are never open at the same time.
 	int vh_cursor;
 	int vh_scroll;
+
+	// v1.9.1 (blueprint D10). Which of the four tabs is focused and which row inside it — the
+	// whole of the bar's cursor. A memset-zero BarNav is cat 0 / row 0, i.e. PLAY focused on
+	// NEW WORLD, which is exactly the state titleInit wants, so this needs no initialiser of
+	// its own (scene/barnav.h, "Zero is a valid state"). `world_scroll` above is the PLAY
+	// tab's scroll window as well as world select's; the other three tabs are shorter than the
+	// six-row window and never scroll.
+	BarNav nav;
+
+	// Version history was opened from the UPDATE screen's own small button (true) rather than
+	// straight off the SYSTEM tab (false). B on that leaf goes back to whichever one it was,
+	// so a player who never opened the update screen is never dropped onto it on the way out.
+	bool vh_from_update;
 } TitleState;
 
-// Zeroes `ts` and puts it on the main screen. Call once, before the first titleUpdateDraw.
+// Zeroes `ts` and puts it on the bar with the PLAY tab focused. Call once, before the first
+// titleUpdateDraw.
+//
+// v1.9.1: this also does the one worldlistScan the PLAY tab needs, because PLAY is now the
+// tab the menu opens on and its rows are the world list — there is no longer a "navigate to
+// world select" moment to hang the scan off. It is still one directory listing per visit to
+// the menu, not one a frame; the tab re-scans only when the player tabs back onto it, or
+// after a world is created, renamed or deleted (see title.c's titleEnterPlayTab).
 void titleInit(TitleState* ts);
 
 // One frame's worth of input, read by the caller and handed in — see the file comment for
 // why this file never reads HID itself.
 //
-//   keys_down  hidKeysDown() this frame. D-pad Up/Down move the focused item, Left/Right
-//              adjust a focused stepper, A activates the focused item, B goes back a screen
-//              (in addition to the on-screen Back button every non-main screen also has).
+//   keys_down  hidKeysDown() this frame. On the bar (v1.9.1, blueprint D6/D10): L/R switch
+//              tab, D-pad Up/Down move the focused row, D-pad Left/Right step a focused
+//              stepper on OPTIONS and switch tab on every other tab, A activates the focused
+//              row, B leaves a tab for PLAY (and, on PLAY, cancels an armed delete first).
+//              On the three leaf screens it means exactly what it always did: Up/Down move
+//              the focused item, Left/Right adjust a stepper, A activates, B goes back.
+//              The caller may OR barStickEdge()'s answer into this word so the circle pad
+//              drives the same paths as the D-pad (blueprint seam S8); nothing here can tell
+//              the difference, which is the point.
 //   touch_down true while the stylus/finger is on the bottom screen this frame. libctru's
 //              KEY_TOUCH is never actually set by hidScanInput — hid.h says so on the enum
 //              value itself ("Not actually provided by HID") — so the caller has to derive

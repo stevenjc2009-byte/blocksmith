@@ -83,7 +83,7 @@ typedef enum {
 // the seven above, B is the universal menu cancel, SELECT opens the pause menu, START quits,
 // and L/R stepped the render distance live in-game. (v1.9.0 HOTBAR-LR retired that: L/R now
 // step the hotbar selection instead, source/scene/hotbar.h; render distance moved to the
-// pause menu's OPT_ROW_DIST row, scene/pausemenu.c.) The shoulder Z buttons were the only
+// pause menu's PB_OPT_DIST row, scene/pausemenu.c.) The shoulder Z buttons were the only
 // bits nothing in source/ referenced at all.
 //
 //   KEY_ZL      BIT(14)  = 0x00004000

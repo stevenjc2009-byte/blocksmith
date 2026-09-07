@@ -64,44 +64,41 @@
 
 #include "net/networld.h"      // NetworldInvState — v1.9.1, see uiApplyInvSnapshot. The type is
                                // an anonymous-struct typedef, so it cannot be forward-declared.
+#include "scene/barnav.h"      // BarNav — v1.9.1 BAR, see UiState.nav
 #include "scene/ui_gesture.h"  // UiGesture — v1.9.0 SPLIT, see UiState.gesture
 #include "world/chest.h"       // ChestState — see uiUpdateDraw's `chest` parameter
 #include "world/furnace.h"     // FurnaceState — see uiUpdateDraw's `furnace` parameter
 #include "world/inventory.h"
 
-// Which of the three screens this frame is drawing. UI_SCR_HUD is the default: just the
-// hotbar (always visible, per inventory.h's own INV_HOTBAR_SLOTS comment) plus the engine
-// status text main.c already computes. UI_SCR_INVENTORY adds the main grid and the crafting
-// list, covering the rest of the screen — see ui.c's layout block for the exact pixels.
+// ── v1.9.1 BAR: four screens became two ────────────────────────────────────────────────
 //
-// v1.8.15 FURNACE. UI_SCR_FURNACE is an open furnace: its input, fuel and output slots, a
-// burn-time readout, a cook-progress readout, the hotbar (still, always) and the main grid
-// moved down to make room — see scene/ui_layout.h's furnace block for the pixels and for why
-// the grid moves on this screen only.
+// The separate inventory, furnace and chest screens are GONE, enum values and all. They were
+// three screens with one layout each, three close bars in the same band, and three separate
+// answers to "where is the bag". They are now three TABS of one screen — UI_SCR_BAR — whose
+// focused category is
+// `UiState.nav.cat` and whose live category list is scene/ui_layout.h's barBuildKinds():
+// INVENTORY, CRAFT, and the container (CHEST or FURNACE, never both, because main.c opens one
+// per PLACE press) at index 2 while one is open. See docs/blueprint-1.9.1-interface.md §D1-D8.
 //
-// ⚠ UI_SCR_FURNACE is only ever entered or drawn while uiUpdateDraw's `furnace` parameter is
-// non-NULL. A UiState left on this screen with no furnace handed in is not an error the
-// caller has to avoid — uiUpdateDraw corrects it to UI_SCR_INVENTORY on the spot, drops any
-// lifted stack, and draws the inventory overlay instead. That is the ONE place in this file
-// where a screen change takes effect on the same frame rather than the next one, and it is
-// deliberate: the alternative is a frame that draws a furnace panel out of a pointer it has
-// been told not to dereference.
+// UI_SCR_HUD is unchanged and is still the default: the hotbar (always visible, per
+// inventory.h's own INV_HOTBAR_SLOTS comment), the engine status text main.c already computes,
+// the vitals pips, and the strip under the hotbar that opens the bar.
 //
-// v1.9.0 CHEST. UI_SCR_CHEST is an open chest: its eight slots, the hotbar (still, always)
-// and the main grid moved down exactly the way the furnace screen moves it — see
-// scene/ui_layout.h's chest panel block for the pixels. It follows the identical NULL-guard
-// rule stated above for UI_SCR_FURNACE, with `chest` standing in for `furnace`: entered or
-// drawn only while uiUpdateDraw's `chest` parameter is non-NULL, corrected to
-// UI_SCR_INVENTORY on the spot otherwise. Its gesture is the SAME two-tap lift/place the
-// inventory overlay uses (see ui.c's file comment), extended across the two containers: a
-// lifted stack lives in `picked_slot` when it came from the bag and in `picked_chest` when
-// it came from the chest, and both are cleared by the close bar, by uiOpenChest/uiOpenFurnace,
-// and by the NULL-guard correction above, so nothing is ever left "in the air".
+// ⚠ The NULL-pointer contract the two container screens carried is UNCHANGED in substance and
+// now reads off the pointers instead of off the screen: uiUpdateDraw builds the category list
+// from `chest != NULL` / `furnace != NULL` EVERY frame, so a container tab exists exactly
+// while its state is being handed in. A chest closing takes tab 2 away mid-frame, and
+// barNavClamp (scene/barnav.h) puts the cursor back on a real cell — which is what replaces
+// the old "corrected back to the inventory screen on the spot" same-frame screen fix. Neither
+// pointer is ever dereferenced while it is NULL, exactly as before.
+//
+// The gestures are unchanged, tab for screen: the bag and the chest keep the two-tap
+// lift/place (a bag lift in `picked_slot`, a chest lift in `picked_chest`, never both), the
+// furnace keeps its one-tap carry-and-resolve, and CRAFT keeps its one-tap row. What is new is
+// that a d-pad/A/B cursor can reach every one of them — see UiInput.keys_down.
 typedef enum {
 	UI_SCR_HUD,
-	UI_SCR_INVENTORY,
-	UI_SCR_FURNACE,
-	UI_SCR_CHEST,
+	UI_SCR_BAR,
 } UiScreen;
 
 // ── v1.9.0 CHEST-NET: who applies a chest transfer ──────────────────────────────────────
@@ -172,7 +169,7 @@ typedef struct {
 	                         // -1 when none. Never >= 0 at the same time as picked_slot: a
 	                         // lift only starts when nothing is lifted on either side.
 	int      chest_x, chest_y, chest_z;   // the open chest's world position, from uiOpenChest;
-	                                       // meaningful only while screen == UI_SCR_CHEST
+	                                       // meaningful only while a chest is being handed in
 	UiChestTransferFn chest_fn;   // see the block above; NULL = apply locally
 	void*             chest_ud;
 
@@ -188,13 +185,41 @@ typedef struct {
 	UiGesture gesture;
 	InvSlot   lift;
 	int       lift_from;
+
+	// ── v1.9.1 BAR ─────────────────────────────────────────────────────────────────────
+	//
+	// `nav` is the cursor: which tab, which cell, and the two pieces of memory that make the
+	// bar feel like it remembers where you were (scene/barnav.h). It is the ONLY copy — this
+	// file does not keep a second "focused tab" int beside it, for the same reason
+	// UiGesture takes `lifted_slot` in rather than keeping one. A memset-zero BarNav is cat 0,
+	// row 0, col 0, which is the correct initial state, so uiInit's memset does the work.
+	//
+	// `list_scroll` is the first visible row of the CRAFT tab's recipe list, recomputed from
+	// the cursor every frame by barNavScrollFor(). It is stored rather than derived at each
+	// use so the draw pass and the hit test cannot disagree about which rows are on screen —
+	// a stylus tap resolving against a different window than the one that was drawn is a tap
+	// on the wrong recipe. At RECIPE_COUNT 7 and BAR_LIST_VISIBLE 7 it is always 0 today; the
+	// field exists because the list is the one tab whose length is free to grow.
+	//
+	// `opened_this_frame` is set by uiOpenChest/uiOpenFurnace and by the HUD's own open, and
+	// makes the first frame the bar draws ignore that frame's keys_down. Without it the button
+	// that opened the bar is still a press edge when the bar first reads the pad: main.c opens
+	// a container on ACTION_PLACE, which options.h allows to be bound to A, and A on the bar
+	// is COMMIT — so opening a chest would immediately lift or drop on whatever cell the
+	// cursor landed on. Cleared by uiUpdateDraw on the frame it is read.
+	BarNav nav;
+	int    list_scroll;
+	bool   opened_this_frame;
 } UiState;
 
 // Zeroes `ui` and puts it on the HUD screen with nothing picked up. Call once, before the
 // first uiUpdateDraw.
 void uiInit(UiState* ui);
 
-// v1.8.15 FURNACE. Switches to UI_SCR_FURNACE and drops any lifted stack. This is what the
+// v1.8.15 FURNACE. v1.9.1 BAR: opens the bar on its container tab (screen = UI_SCR_BAR,
+// nav.cat = 2 — the index barBuildKinds always puts the container at) and drops any lifted
+// stack. The NAME is unchanged on purpose: main.c's call site is "the player interacted with a
+// furnace", which is still exactly what this means. This is what the
 // caller calls when the player interacts with a BLOCK_FURNACE in the world; from the next
 // uiUpdateDraw onward it must pass that furnace's unpacked FurnaceState as the `furnace`
 // parameter, and keep passing it until UiResult.furnace_open comes back false.
@@ -208,12 +233,12 @@ void uiInit(UiState* ui);
 // contract.
 void uiOpenFurnace(UiState* ui);
 
-// v1.9.0 CHEST. Switches to UI_SCR_CHEST, records the chest's world position (x, y, z — what
-// the transfer callback above is handed), and drops any lifted stack on EITHER side — same
-// contract as uiOpenFurnace above, with `chest` standing in for `furnace`: from the next
-// uiUpdateDraw onward the caller must pass that chest's unpacked ChestState as the `chest`
-// parameter, and keep passing it until ui->screen has left UI_SCR_CHEST (UiResult has no
-// chest_open field — see UiResult below). Calling it while a lift is pending, from any
+// v1.9.0 CHEST. v1.9.1 BAR: opens the bar on its container tab (screen = UI_SCR_BAR,
+// nav.cat = 2), records the chest's world position (x, y, z — what the transfer callback above
+// is handed), and drops any lifted stack on EITHER side — same contract as uiOpenFurnace
+// above, with `chest` standing in for `furnace`: from the next uiUpdateDraw onward the caller
+// must pass that chest's unpacked ChestState as the `chest` parameter, and keep passing it
+// until UiResult.chest_open comes back false. Calling it while a lift is pending, from any
 // screen, cancels that lift first: the lifted stack stays exactly where it was.
 void uiOpenChest(UiState* ui, int x, int y, int z);
 
@@ -263,10 +288,23 @@ void uiApplyInvSnapshot(UiState* ui, Inventory* inv, const NetworldInvState* sta
 //   keys_held   v1.9.0 SPLIT: hidKeysHeld(), the LEVEL word. scene/ui_gesture.h finds the
 //               press edge itself, so a held X or Y is one gesture, and a button already down
 //               when the overlay opens is none. Only KEY_X and KEY_Y are read.
+//   keys_down   v1.9.1 BAR: hidKeysDown(), the PRESS-EDGE word, optionally OR-ed with
+//               barStickEdge()'s answer so the circle pad drives the same paths as the d-pad
+//               (main.c seam S1/S2). Read by scene/barnav.h's barNavInput for B/A/X/L/R and
+//               the four d-pad bits, and by nothing else here. `blank` frames (main.c passes a
+//               zeroed UiInput while the pause menu is up) leave it 0, which barNavInput
+//               answers BAR_EV_NONE for — feeding it every frame is therefore correct.
+//
+//               Two words, not one, and this is the whole reason: keys_held is a LEVEL and
+//               keys_down is an EDGE. Handing barNavInput a level word would step the cursor
+//               once per frame for as long as the d-pad was pushed, and handing uiGestureFeed
+//               an edge word would make a held Y fire on the frame it was pressed instead of
+//               the frame the module decides — each module already documents which it needs.
 typedef struct {
 	bool     touch_down;
 	int      touch_x, touch_y;
 	uint32_t keys_held;
+	uint32_t keys_down;
 } UiInput;
 
 // The world/engine numbers this screen keeps showing in HUD mode — exactly what step 8.3's
@@ -326,29 +364,31 @@ typedef struct {
 // the overlay this frame is still reported as closed here, because the HUD screen is what
 // was drawn this frame.
 typedef struct {
-	bool inventory_open;
+	// v1.9.1 BAR. True exactly when UI_SCR_BAR is what this frame drew — the rename of what
+	// was `inventory_open`, because the bar is no longer "the inventory screen": the bag is
+	// one of its tabs. This is the flag main.c gates world input on (blueprint seam S3): with
+	// the bar up the player does not walk, jump, break, place, eat or look, and the world
+	// keeps ticking regardless.
+	bool bar_open;
 
-	// v1.8.15 FURNACE. True exactly when UI_SCR_FURNACE is what this frame drew — same
-	// "reflects the screen this frame actually drew" rule as inventory_open above, including
-	// the frame a tap opens or closes the panel on.
+	// v1.8.15 FURNACE / v1.9.0 CHEST, restated for the bar. True exactly when this frame drew
+	// the bar WITH that container's state handed in — i.e. `furnace != NULL` (respectively
+	// `chest != NULL`) and screen == UI_SCR_BAR. Read off the POINTER, not off nav.cat, and
+	// that distinction is load-bearing: main.c closes its open container when the flag goes
+	// false, so deriving it from the focused tab would slam a chest shut the moment the player
+	// pressed L to look at the crafting list, and take its tab away underneath them.
 	//
-	// The two are MUTUALLY EXCLUSIVE, never both true: they name two different screens, and
-	// a frame draws one screen. A caller gating world interaction on "is the player visibly
-	// managing storage" therefore wants `inventory_open || furnace_open`, not either alone —
-	// stated here because inventory_open's own comment describes exactly that use and was
-	// written when it was the only answer to it.
+	// The two are MUTUALLY EXCLUSIVE, never both true, for the reason barBuildKinds states:
+	// main.c opens one container per PLACE press. `bar_open` is true whenever either is.
 	bool furnace_open;
 
-	// v1.9.0 CHEST does NOT add a `chest_open` here, even though UI_SCR_CHEST is a third
-	// screen with exactly the same "is the player visibly managing storage" question the
-	// comment above already answers for the other two. That omission is deliberate scope,
-	// not an oversight: this struct's shape was fixed as part of the task contract this
-	// change landed under, specifically so main.c's wiring — done in parallel, against this
-	// exact signature — would not need to change; main.c closes its chest off ui->screen
-	// instead. The practical gap it leaves: a caller gating on `inventory_open ||
-	// furnace_open` reads a frame where UI_SCR_CHEST is what actually drew as neither open,
-	// which is wrong for that gate. Flagged rather than fixed; adding the field is a
-	// one-line change whenever whoever owns that gate wants it.
+	// v1.9.1 BAR adds the field v1.9.0 CHEST deliberately left out (that omission was a scope
+	// cut to keep main.c's wiring frozen while it was being written in parallel; the note it
+	// carried said adding the field was a one-line change whenever whoever owned the gate
+	// wanted it). main.c's seam S6 is that gate: `if (!ures.chest_open) s_chest_open = false;`
+	// replaces the old test against the retired chest-screen enum value, which no longer
+	// compiles — which is the point: main.c cannot silently keep the stale wiring.
+	bool chest_open;
 } UiResult;
 
 // One frame: advances `ui`, edits `inv` in place (slot moves, hotbar selection, crafting),
@@ -361,9 +401,10 @@ typedef struct {
 // ── `furnace` (v1.8.15 FURNACE) ────────────────────────────────────────────────────────
 //
 // NULL whenever no furnace is open, and a pointer to the caller's UNPACKED live FurnaceState
-// whenever one is. When it is NULL, UI_SCR_FURNACE is never entered and never drawn and this
-// pointer is never dereferenced — see UiScreen above for what happens if the screen is
-// somehow set anyway.
+// whenever one is. v1.9.1 BAR: this pointer is now what DECIDES whether the furnace tab exists
+// at all — barBuildKinds is fed `furnace != NULL` every frame — so when it is NULL there is no
+// furnace tab to focus, no furnace content is drawn, and this pointer is never dereferenced.
+// See UiScreen above for the whole of the rule.
 //
 // When it is non-NULL, this function EDITS IT IN PLACE: moving a stack into the input or fuel
 // slot writes input_item/input_count or fuel_item/fuel_count, and taking the output clears
@@ -377,10 +418,10 @@ typedef struct {
 //
 // NULL whenever no chest is open, and a pointer to the caller's UNPACKED live ChestState
 // whenever one is — same NULL contract as `furnace` above, restated for CHEST_SLOTS
-// (world/chest.h) slots instead of three named ones: when it is NULL, UI_SCR_CHEST is
-// never entered and never drawn and this pointer is never dereferenced (see UiScreen
-// above), and a UiState left on UI_SCR_CHEST with no chest handed in is corrected to
-// UI_SCR_INVENTORY on the spot, the identical same-frame correction furnace gets.
+// (world/chest.h) slots instead of three named ones: when it is NULL there is no chest tab,
+// no chest content is drawn, and this pointer is never dereferenced. A cursor left sitting on
+// the container tab when it goes away is put back on a real cell by barNavClamp, which is the
+// same-frame correction the two container screens used to get by falling back to the bag.
 //
 // When it is non-NULL, this function EDITS IT IN PLACE, by the two-tap gesture ui.c's file
 // comment describes: the first tap on a non-empty slot on EITHER side lifts its whole stack

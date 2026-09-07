@@ -19,17 +19,9 @@ URect gridSlotRect(int i)
 	return r;
 }
 
-URect craftCloseRect(void)
-{
-	URect r = { 0, CRAFT_Y, SCR_W, CRAFT_CLOSE_H };
-	return r;
-}
-
-URect craftRowRect(int i)
-{
-	URect r = { 10, CRAFT_ROW_Y0 + i * CRAFT_ROW_H, SCR_W - 20, CRAFT_ROW_H - 2 };
-	return r;
-}
+// craftCloseRect() and craftRowRect() were here, between gridSlotRect() and hudToggleRect().
+// Retired with the fixed crafting split they measured — see scene/ui_layout.h's BAR_LIST_Y0
+// block. barListRowRect() below is what replaced them.
 
 URect hudToggleRect(void)
 {
@@ -173,6 +165,263 @@ int hitChestInvSlot(int x, int y)
 		if (ptInRect(chestGridSlotRect(i), x, y)) return INV_HOTBAR_SLOTS + i;
 
 	return -1;
+}
+
+// ── The bar (v1.9.1 INTERFACE) ──────────────────────────────────────────────────────────
+//
+// See scene/ui_layout.h's bar blocks for the layout and for why every number is what it is.
+// Nothing here re-derives or re-justifies them. The two things this file decides on its own,
+// because they are arithmetic rather than layout, are barTabRect()'s running-edge split and
+// barCellFromPoint()'s route through the shipped hit tests — both are argued below.
+
+URect barStripRect(void)
+{
+	URect r = { 0, BAR_STRIP_Y, SCR_W, BAR_STRIP_H };
+	return r;
+}
+
+URect barTabRect(int i, int count)
+{
+	if (count < 1 || i < 0 || i >= count) {
+		// Zero width and height, so ptInRect() misses it for every point — the same shape
+		// furnSlotRect() uses for an index outside its three.
+		URect none = { 0, 0, 0, 0 };
+		return none;
+	}
+
+	// Two running edges, subtracted — NOT i * (BAR_TABS_W / count). The inner division
+	// truncates, and the truncation is not cosmetic: at count 4 the even share is 294/4 = 73,
+	// four of those tile only 292, and the strip's last two pixel columns then belong to no tab
+	// at all. Computing each edge from the full width instead pushes the remainder into
+	// whichever tabs the rounding lands in, so widths differ by at most one pixel and the last
+	// edge is exactly BAR_TABS_W by construction.
+	//
+	// It matters at 4 and not at 3 (294 = 3 * 98 exactly), which is why ui_layout_test.c sweeps
+	// every pixel column at every count from 1 to BAR_MAX_TABS rather than checking the count
+	// this version happens to produce.
+	const int x0 = (i * BAR_TABS_W) / count;
+	const int x1 = ((i + 1) * BAR_TABS_W) / count;
+
+	URect r = { x0, BAR_STRIP_Y, x1 - x0, BAR_STRIP_H };
+	return r;
+}
+
+URect barCloseRect(void)
+{
+	URect r = { BAR_TABS_W, BAR_STRIP_Y, BAR_CLOSE_W, BAR_STRIP_H };
+	return r;
+}
+
+int hitBarStrip(int x, int y, int count)
+{
+	// Close first. The two regions are disjoint by construction (the tabs stop at BAR_TABS_W,
+	// which is where the close tab starts), so the order cannot change an answer today — it is
+	// written this way so that if a future strip ever overlapped them, the door out wins rather
+	// than a tab silently swallowing the tap that was meant to leave.
+	if (ptInRect(barCloseRect(), x, y)) return BAR_HIT_CLOSE;
+
+	for (int i = 0; i < count; i++)
+		if (ptInRect(barTabRect(i, count), x, y)) return i;
+
+	return BAR_HIT_NONE;
+}
+
+URect barListRowRect(int visible_row)
+{
+	if (visible_row < 0 || visible_row >= BAR_LIST_VISIBLE) {
+		URect none = { 0, 0, 0, 0 };
+		return none;
+	}
+
+	// 4 px of margin either side and 2 px shorter than the pitch, written as literals here
+	// rather than as two more macros in the header: they are this constructor's own inset, no
+	// other rect is placed against them, and the header's pinned list is what four other lanes
+	// are coding against.
+	URect r = { 4, BAR_LIST_Y0 + visible_row * BAR_LIST_ROW_H,
+	            SCR_W - 8, BAR_LIST_ROW_H - 2 };
+	return r;
+}
+
+int barBuildKinds(bool has_chest, bool has_furnace, BarKind out[BAR_MAX_TABS])
+{
+	out[0] = BAR_KIND_INVENTORY;
+	out[1] = BAR_KIND_CRAFT;
+
+	// has_chest wins if both are set. That state cannot happen — main.c opens one container per
+	// PLACE press — so this is not a policy choice between two legitimate inputs, it is a
+	// refusal to invent a fourth tab out of a state that means something has already gone wrong
+	// upstream. Two container tabs would give the navigation model a category the cursor could
+	// sit on while the world holds no such container.
+	if (has_chest)   { out[2] = BAR_KIND_CHEST;   return 3; }
+	if (has_furnace) { out[2] = BAR_KIND_FURNACE; return 3; }
+
+	return 2;
+}
+
+const char* barKindLabel(BarKind k)
+{
+	switch (k) {
+	case BAR_KIND_INVENTORY: return "INVENTORY";
+	case BAR_KIND_CRAFT:     return "CRAFT";
+	case BAR_KIND_CHEST:     return "CHEST";
+	case BAR_KIND_FURNACE:   return "FURNACE";
+	}
+
+	// An unlabelled tab, not a "?" — see the header for why a placeholder is worse.
+	return "";
+}
+
+int barKindRows(BarKind k, int list_len)
+{
+	switch (k) {
+	case BAR_KIND_INVENTORY: return 1 + INV_MAIN_ROWS;       // hotbar + the bag
+	case BAR_KIND_CRAFT:     return list_len;                // however many recipes there are
+	case BAR_KIND_CHEST:     return 1 + 1 + INV_MAIN_ROWS;   // hotbar + the chest + the bag
+	case BAR_KIND_FURNACE:   return 1 + 1 + INV_MAIN_ROWS;   // hotbar + in/fuel/out + the bag
+	}
+
+	return 0;
+}
+
+int barKindCols(BarKind k, int row)
+{
+	if (row < 0) return 0;
+
+	// A list is one cell wide at every row, however long it is — checked before the row bound
+	// below, because this is the one kind whose row count is not knowable from `k` alone.
+	if (k == BAR_KIND_CRAFT) return 1;
+
+	if (row >= barKindRows(k, 0)) return 0;
+
+	switch (k) {
+	case BAR_KIND_INVENTORY:
+		return INV_HOTBAR_SLOTS;
+	case BAR_KIND_CHEST:
+		// CHEST_SLOTS rather than INV_HOTBAR_SLOTS for the chest's own row, even though the two
+		// are both 8 today: the chest row is world/chest.h's width and the bag rows are
+		// world/inventory.h's, and writing whichever one happened to be equal is how a table
+		// stops being a statement about the layout.
+		return (row == 1) ? CHEST_SLOTS : INV_HOTBAR_SLOTS;
+	case BAR_KIND_FURNACE:
+		// Input, fuel, output — the one row on the whole bar that is not eight cells wide, and
+		// the reason barKindCols() takes a row at all rather than being a per-kind constant.
+		return (row == 1) ? 3 : INV_HOTBAR_SLOTS;
+	case BAR_KIND_CRAFT:
+		break;   // handled above
+	}
+
+	return 0;
+}
+
+bool barKindHorizontalIsContent(BarKind k)
+{
+	switch (k) {
+	case BAR_KIND_INVENTORY:
+	case BAR_KIND_CHEST:
+	case BAR_KIND_FURNACE:
+		return true;    // left/right is the only way to reach column 7 of a grid row
+	case BAR_KIND_CRAFT:
+		return false;   // one cell wide, so left/right belongs to the tabs
+	}
+
+	// An unknown kind gets the tab behaviour, not the cell behaviour: moving a cursor sideways
+	// inside a category that does not exist is the answer that cannot be recovered from.
+	return false;
+}
+
+URect barCellRect(BarKind k, int row, int col, int scroll)
+{
+	const URect none = { 0, 0, 0, 0 };
+
+	// One bound check for every kind, asked of the same table the navigation model uses. A cell
+	// this rejects is a cell barKindRows()/barKindCols() say does not exist, so the two can
+	// never disagree about how big a category is.
+	if (row < 0 || col < 0 || col >= barKindCols(k, row)) return none;
+
+	switch (k) {
+	case BAR_KIND_INVENTORY:
+		if (row == 0) return hotbarSlotRect(col);
+		return gridSlotRect((row - 1) * INV_MAIN_COLS + col);
+
+	case BAR_KIND_CRAFT:
+		// Off the top or bottom of the window is a zero rect, so a caller that draws every
+		// recipe without clipping draws nothing for the scrolled-off ones — see barListRowRect.
+		return barListRowRect(row - scroll);
+
+	case BAR_KIND_CHEST:
+		if (row == 0) return hotbarSlotRect(col);
+		if (row == 1) return chestSlotRect(col);
+		return chestGridSlotRect((row - 2) * INV_MAIN_COLS + col);
+
+	case BAR_KIND_FURNACE:
+		if (row == 0) return hotbarSlotRect(col);
+		if (row == 1) return furnSlotRect(col);   // col is FURN_HIT_INPUT/_FUEL/_OUTPUT
+		return furnGridSlotRect((row - 2) * INV_MAIN_COLS + col);
+	}
+
+	return none;
+}
+
+bool barCellFromPoint(BarKind k, int x, int y, int scroll, int* row, int* col)
+{
+	// Routed through the hit tests the three panels already shipped and NOT through
+	// barCellRect(), so the rect side and the hit side stay two independent paths — see the
+	// header for what that buys and what it costs. The conversions below are the only place
+	// the (row, col) addressing meets the flat slot indices those hit tests speak.
+	switch (k) {
+	case BAR_KIND_INVENTORY: {
+		const int s = hitInventorySlot(x, y, true);
+		if (s < 0) return false;
+		if (s < INV_HOTBAR_SLOTS) { *row = 0; *col = s; return true; }
+
+		const int i = s - INV_HOTBAR_SLOTS;
+		*row = 1 + i / INV_MAIN_COLS;
+		*col = i % INV_MAIN_COLS;
+		return true;
+	}
+
+	case BAR_KIND_CRAFT:
+		// The one kind with no shipped hit test to reuse. Walks the window rather than dividing
+		// by the pitch, because the rows have a 2 px gap between them and a division would
+		// resolve a point in the gap to the row above it.
+		for (int v = 0; v < BAR_LIST_VISIBLE; v++)
+			if (ptInRect(barListRowRect(v), x, y)) {
+				*row = scroll + v;
+				*col = 0;
+				return true;
+			}
+		return false;
+
+	case BAR_KIND_CHEST: {
+		const int cs = hitChestSlot(x, y);
+		if (cs >= 0) { *row = 1; *col = cs; return true; }
+
+		const int s = hitChestInvSlot(x, y);
+		if (s < 0) return false;
+		if (s < INV_HOTBAR_SLOTS) { *row = 0; *col = s; return true; }
+
+		const int i = s - INV_HOTBAR_SLOTS;
+		*row = 2 + i / INV_MAIN_COLS;
+		*col = i % INV_MAIN_COLS;
+		return true;
+	}
+
+	case BAR_KIND_FURNACE: {
+		const int fs = hitFurnaceSlot(x, y);
+		if (fs != FURN_HIT_NONE) { *row = 1; *col = fs; return true; }
+
+		const int s = hitFurnaceInvSlot(x, y);
+		if (s < 0) return false;
+		if (s < INV_HOTBAR_SLOTS) { *row = 0; *col = s; return true; }
+
+		const int i = s - INV_HOTBAR_SLOTS;
+		*row = 2 + i / INV_MAIN_COLS;
+		*col = i % INV_MAIN_COLS;
+		return true;
+	}
+	}
+
+	return false;
 }
 
 int furnBarFill(int total_px, int num, int den)

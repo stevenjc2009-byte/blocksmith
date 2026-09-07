@@ -13,11 +13,17 @@
 //
 // No <3ds.h>, no <citro3d.h>, no gfx/*.h — only <stdbool.h>/<stdint.h> and three data
 // headers (world/inventory.h for INV_HOTBAR_SLOTS/INV_MAIN_COLS/INV_MAIN_ROWS, world/
-// crafting.h for RECIPE_COUNT, which CRAFT_ROW_H below divides the crafting panel's height
-// by, and — since v1.9.0 CHEST — world/chest.h for CHEST_SLOTS, which the chest panel
-// block below divides the bottom screen's width by the same way). All three are already
-// pure C themselves — see their own file comments — so pulling them in here does not
-// reintroduce the console dependency this split exists to remove.
+// crafting.h for RECIPE_COUNT, and — since v1.9.0 CHEST — world/chest.h for CHEST_SLOTS,
+// which the chest panel block below divides the bottom screen's width by). All three are
+// already pure C themselves — see their own file comments — so pulling them in here does
+// not reintroduce the console dependency this split exists to remove.
+//
+// world/crafting.h is KEPT as an include even though v1.9.1's bar retired the one macro that
+// used it (CRAFT_ROW_H divided the crafting panel's height by RECIPE_COUNT; the recipe list is
+// now a scrolling list whose length its caller passes in as `list_len`). Retained deliberately
+// rather than tidied away: scene/ui.c reaches RECIPE_COUNT through this header, and dropping
+// the include here would remove that symbol from ui.c's translation unit as a side effect of a
+// layout change — a compile break in a file this one does not own, for no gain.
 #pragma once
 
 #include <stdbool.h>
@@ -42,46 +48,94 @@
 #define HOTBAR_Y 0
 #define HOTBAR_H SLOT_PX                          // 40 px
 
-#define GRID_Y   (HOTBAR_Y + HOTBAR_H)             // 40
-#define GRID_H   (INV_MAIN_ROWS * SLOT_PX)         // 80 (2 rows of 40)
+// ── The bar strip (v1.9.1 INTERFACE) ───────────────────────────────────────────────────
+//
+// One band under the hotbar, on every bottom-screen surface, carrying the category tabs and
+// the close tab. It replaces three separate screens' three separate close bars (the inventory
+// overlay's crafting-panel close strip, FURN_CLOSE_*, CHEST_CLOSE_*) with the same 26 px of
+// screen those bars already used, so the band under the hotbar is the SAME band whether the
+// bar is open or shut and nothing under it has to move when a container tab appears.
+//
+// 26 px, not 22 and not 32: 26 is exactly what the furnace and chest close bars already
+// shipped at, so FURN_ROW_Y / CHEST_ROW_Y (72) keep the 6 px gap they were laid out with and
+// those two panels are byte-identical below the strip. Picking any other height would have
+// re-laid out two shipped screens to save nothing.
+//
+// The horizontal split is 294 + 26, not an even share of 320. The close tab is a fixed 26 px
+// square at the right edge — a target whose size must not shrink as tabs are added, because it
+// is the stylus door out of the bar and the one control that is in the same place on every
+// screen. Everything left of it is tab space, split evenly among however many categories are
+// live. At the widest (2 tabs) that is 147 px and at the narrowest this version can produce
+// (3 tabs) it is 98 px, against a 54 px "INVENTORY" at font scale 1.
+//
+// BAR_HIT_NONE and BAR_HIT_CLOSE are negative for the reason FURN_HIT_NONE is: a tab index is
+// 0-based and a caller that forgets to test the result reads a miss as tab 0. Two distinct
+// negatives rather than one, because "the player tapped nothing" and "the player tapped close"
+// are different actions and collapsing them would close the bar on a tap in the gutter.
+#define BAR_STRIP_Y   40                      // directly under the hotbar
+#define BAR_STRIP_H   26
+#define BAR_CLOSE_W   26                      // the close tab, square, at the right edge
+#define BAR_TABS_W    (SCR_W - BAR_CLOSE_W)   // 294 — the span the category tabs tile
+#define BAR_MAX_TABS  4                       // INVENTORY, CRAFT, one container, one spare
 
-#define CRAFT_Y  (GRID_Y + GRID_H)                 // 120
-#define CRAFT_H  (SCR_H - CRAFT_Y)                 // 120
+#define BAR_HIT_NONE  (-1)
+#define BAR_HIT_CLOSE (-2)
 
-#define CRAFT_CLOSE_H 28
-#define CRAFT_ROW_Y0  (CRAFT_Y + CRAFT_CLOSE_H)              // 148
-// Divides the panel evenly among however many recipes crafting.h declares, so adding one
-// costs no layout edit here. 30 px a row at RECIPE_COUNT 3, 23 at 4, and 18 at 5.
-// The floor is the 7 px font (gfx/font.h FONT_GLYPH_H) plus enough slop to stay a usable
-// touch target.
-//
-// 2026-09-03, v1.8.12's RECIPE_COAL_ORE_TO_TORCH: two claims that were true at 4 recipes are
-// no longer true at 5, and both are worth correcting rather than deleting.
-//
-// "92 divides exactly by 4, leaving no dead strip" — it does not divide by 5. 92/5 = 18 with
-// 2 px left over, so there IS now a 2 px dead strip at the bottom of the panel. Two pixels
-// below the last row is cosmetic, not a hit-testing bug: craftRowRect() derives every row from
-// CRAFT_ROW_Y0 + i * CRAFT_ROW_H, so the rows stay contiguous and correctly sized and the
-// leftover simply sits under the last one, inside the panel and outside every row. Nothing
-// lands in it and nothing is clipped by it.
-//
-// "room for two or three more recipes" — that estimate was made against a 23 px row and it
-// has now spent one of its own headroom steps. At 6 recipes this is 15 px, at 7 it is 13, and
-// 13 px for a 7 px font is a row with 3 px of clearance above and below the glyphs. So the
-// real remaining budget is ONE more recipe at a comfortable size and two at a cramped one,
-// after which this has to become a scroll list rather than a fixed split. Written as a number
-// rather than as "two or three more" because the previous phrasing is what let a fifth recipe
-// land without anyone noticing the row shrank by 5 px.
-//
-// NOT verified on hardware: whether an 18 px row is comfortable to hit with a stylus on a real
-// bottom screen, and whether the longest recipe label still fits. Both are playtest questions,
-// and neither is settled by the layout suite, which checks that the rects tile correctly — not
-// that a finger can hit them.
-#define CRAFT_ROW_H   ((CRAFT_H - CRAFT_CLOSE_H) / RECIPE_COUNT)   // (120-28)/5 = 18
+// The grid moved down by the strip's height plus the same 6 px gap the furnace and chest rows
+// already sit at, so the bag lands at 72 on EVERY tab rather than at 40 on one and 72 on the
+// others. 72 + 80 = 152, which leaves the detail band below it (BAR_DETAIL_Y) clear.
+#define GRID_Y   (BAR_STRIP_Y + BAR_STRIP_H + 6)   // 72
+#define GRID_H   (INV_MAIN_ROWS * SLOT_PX)         // 80 (2 rows of 40) — the grid is 72..152
 
-#define HUD_TOGGLE_Y  GRID_Y                       // 40, directly under the hotbar
-#define HUD_TOGGLE_H  32
-#define HUD_STATUS_Y0 (HUD_TOGGLE_Y + HUD_TOGGLE_H + 6)   // 78
+// ── The bar's content bands (v1.9.1 INTERFACE) ──────────────────────────────────────────
+//
+// ── What was here before, and why it is gone ────────────────────────────────────────────
+//
+// CRAFT_Y / CRAFT_H / CRAFT_CLOSE_H / CRAFT_ROW_Y0 / CRAFT_ROW_H and their two rect
+// constructors (craftCloseRect, craftRowRect) are RETIRED. They split a fixed 120 px panel
+// evenly among RECIPE_COUNT recipes, and CRAFT_ROW_H's own comment set the floor that ended
+// them: "at 6 recipes this is 15 px, at 7 it is 13, ... after which this has to become a
+// scroll list rather than a fixed split." RECIPE_COUNT reached 7. The rows were 13 px for a
+// 7 px font, which is not a touch target, and the panel had no headroom left at all.
+//
+// So the recipe list is a LIST: fixed 24 px rows in a window that scrolls, rather than a fixed
+// band divided by a count that keeps growing. The row height stops depending on how many
+// recipes exist, which is the property the old split could never have.
+//
+// BAR_LIST_VISIBLE is derived, not written as 7, so it stays correct if the band moves — it is
+// how many whole rows fit between the top of the content band and the bottom of the screen,
+// and it is what a caller compares its recipe count against to decide whether to scroll at all.
+//
+// BAR_LIST_Y0 is written as the literal 72 rather than as GRID_Y so that the two are checked
+// against each other in ui_layout_test.c instead of one silently following the other: the claim
+// that every tab's content starts in the same band is a claim about the DESIGN, and a constant
+// defined as another constant cannot state it.
+#define BAR_LIST_Y0      72
+#define BAR_LIST_ROW_H   24
+#define BAR_LIST_VISIBLE ((SCR_H - BAR_LIST_Y0) / BAR_LIST_ROW_H)   // 7
+
+// The INVENTORY tab's detail band: the focused or lifted item's name and count, drawn under
+// the bag grid (which ends at 152) and above the vitals pips (which start at HUD_PIPS_Y0, 200).
+//
+// Deliberately the same y as FURN_GRID_Y / CHEST_GRID_Y. Those are the RELOCATED bag on the two
+// container tabs; this is the detail readout on the inventory tab. They are never on screen at
+// the same time, so sharing the band is not a collision — it is the same 80 px of screen doing
+// the one job each tab has for it, which is why ui_layout_test.c pins them equal rather than
+// pinning them disjoint.
+#define BAR_DETAIL_Y 160
+
+// The HUD's "open the bar" strip is the SAME band as the bar's own strip, at the same y and
+// the same height, so pressing it does not make anything under it jump. That is the whole
+// point of shrinking it from 32 to 26: at 32 the closed HUD's band was 40..72 and the open
+// bar's would have been 40..66, and a 6 px shift on every open/close is the kind of one-frame
+// jolt pausemenu.c's own comment already names as reading like a glitch.
+//
+// NOT tracked to BAR_STRIP_Y by an alias on purpose — see BAR_LIST_Y0's comment for the same
+// reasoning: ui_layout_test.c asserts hudToggleRect() and barStripRect() are the identical
+// rect, which is a claim two aliases could not make.
+#define HUD_TOGGLE_Y  40                           // directly under the hotbar
+#define HUD_TOGGLE_H  26                           // was 32 before v1.9.1's bar
+#define HUD_STATUS_Y0 (HUD_TOGGLE_Y + HUD_TOGGLE_H + 6)   // 72
 
 // The vertical extent the HUD screen's status text can reach, as a constant, so the vitals
 // strip below can be checked against it instead of against a number somebody remembered.
@@ -89,10 +143,15 @@
 // ui.c's drawHudFont draws its rows at HUD_STATUS_Y0 + k * 12 and there are at most seven of
 // them (cols/chunks, meshes/tris/cull, blocks/peak, `status`, `net`, biome, and the optional
 // `timing` row), after which it adds a 2 px gap and draws the "tap a hotbar slot to select it"
-// hint. Worst case — every optional row present — the hint sits at 164 and its glyphs end at
-// 171 (FONT_GLYPH_H is 7). HUD_STATUS_BOTTOM budgets one whole extra row on top of that, so it
-// is 174: a deliberate over-estimate, because the point of the constant is to be a floor the
+// hint. Worst case — every optional row present — the hint sits at 158 and its glyphs end at
+// 165 (FONT_GLYPH_H is 7). HUD_STATUS_BOTTOM budgets one whole extra row on top of that, so it
+// is 168: a deliberate over-estimate, because the point of the constant is to be a floor the
 // vitals strip stays below, not a tight measurement.
+//
+// v1.9.1's bar moved this band up 6 px as a consequence, not as a decision: HUD_STATUS_Y0 is
+// "6 px under the toggle strip", the toggle strip shrank from 32 to 26 to match the bar's own
+// strip, so the status rows follow it from 78 to 72 and this floor from 174 to 168. The gap
+// between the strip and the first status row is unchanged; only the strip above it is shorter.
 //
 // Deliberately NOT wired into drawHudFont's own `y += 12` steps. Those literals are what
 // shipped, three separate comments in that function assert the rows above them are unchanged
@@ -101,32 +160,34 @@
 // ui_layout_test.c's testPipsClearTheStatusRows), and it goes red if either side moves.
 #define HUD_STATUS_STEP     12
 #define HUD_STATUS_MAX_ROWS  7
-#define HUD_STATUS_BOTTOM   (HUD_STATUS_Y0 + (HUD_STATUS_MAX_ROWS + 1) * HUD_STATUS_STEP)  // 174
+#define HUD_STATUS_BOTTOM   (HUD_STATUS_Y0 + (HUD_STATUS_MAX_ROWS + 1) * HUD_STATUS_STEP)  // 168
 
 // ── Vitals strip (health + hunger pips) ────────────────────────────────────────────────
 //
 // Where these can actually go on a 320x240 bottom screen, which is the whole reason they are
 // down here at y=200 and not tucked under the hotbar where a first sketch put them:
 //
-//   HUD screen (overlay closed)      hotbar        y   0..40   (HOTBAR_Y/HOTBAR_H)
-//                                    OPEN INVENTORY y  40..72   (HUD_TOGGLE_Y/_H)
-//                                    status text    y  78..171  (see HUD_STATUS_BOTTOM)
-//                                    FREE           y 172..240
-//   INVENTORY screen (overlay open)  hotbar        y   0..40
-//                                    main grid      y  40..120  (GRID_Y/GRID_H)
-//                                    crafting panel y 120..240  (CRAFT_Y/CRAFT_H)
-//                                    FREE           nothing
+//   HUD screen (bar closed)          hotbar        y   0..40   (HOTBAR_Y/HOTBAR_H)
+//                                    INVENTORY   B y  40..66   (HUD_TOGGLE_Y/_H)
+//                                    status text    y  72..165  (see HUD_STATUS_BOTTOM)
+//                                    FREE           y 166..240
+//   BAR, INVENTORY tab (bar open)    hotbar        y   0..40
+//                                    strip          y  40..66   (BAR_STRIP_Y/_H)
+//                                    main grid      y  72..152  (GRID_Y/GRID_H)
+//                                    detail band    y 160..200  (BAR_DETAIL_Y)
+//                                    vitals         y 200..220  — see below
 //
-// So the only unoccupied band on the whole panel is the bottom ~68 px of the HUD screen, and
-// it is unoccupied *only* on that screen. Anything at y=2/y=10 lands inside the 40 px hotbar
-// band; anything between 40 and 72 lands on the inventory toggle; anything from 78 down to
-// ~171 lands on the debug/status rows. Nothing moved to make room — HOTBAR_Y, HUD_TOGGLE_Y and
-// HUD_STATUS_Y0 are all byte-identical to what shipped — because nothing needed to.
+// The band this strip sits in is therefore free on the HUD and deliberately given to it on the
+// bar's inventory tab as well: v1.9.1 draws the pips on BOTH, which is what "vitals visible
+// here and on the HUD" in the interface blueprint's D5 means. Anything at y=2/y=10 lands inside
+// the 40 px hotbar band; anything between 40 and 66 lands on the strip; anything from 72 down
+// to ~165 lands on the debug/status rows on the HUD, or on the grid and detail band on the bar.
 //
-// The consequence, and it is a real one rather than an oversight: ui.c draws this strip from
-// drawHudFont only, so the vitals are visible on the HUD and not while the inventory overlay
-// is open. On the overlay screen every pixel from y=40 down belongs to the grid or the
-// crafting panel, and a vitals row there would have to sit on top of a crafting row.
+// Before v1.9.1 this said the vitals were visible on the HUD and NOT on the inventory overlay,
+// because that overlay's every pixel from y=40 down belonged to the grid or the crafting panel.
+// The crafting panel is retired (see BAR_LIST_Y0's block) and the band from 160 is now the
+// detail readout, which ends where the pips begin — so the exclusion that comment recorded no
+// longer holds and the strip is drawn on both surfaces.
 //
 // HUD_PIPS_Y0 is written as SCR_H - 40 rather than as 200 so it stays pinned to the bottom of
 // the panel if SCR_H ever changes, which is the edge it is actually anchored to. The two rows
@@ -145,13 +206,14 @@
 
 // ── Furnace panel (v1.8.15 FURNACE) ────────────────────────────────────────────────────
 //
-// A THIRD screen (ui.h's UI_SCR_FURNACE), not a fourth region bolted onto the inventory
-// overlay. The overlay's own 240 px are fully spoken for — hotbar 0..40, main grid 40..120,
-// crafting panel 120..240, with the crafting panel already down to an 18 px row and one
-// recipe of headroom left (see CRAFT_ROW_H's own note above). There is no band on that
-// screen a furnace's three slots and two indicators could take without evicting the
-// crafting list, so the furnace gets its own screen and reuses the vertical budget from
-// scratch.
+// A THIRD screen, not a fourth region bolted onto the inventory overlay. The overlay's own
+// 240 px were fully spoken for — hotbar 0..40, main grid 40..120, crafting panel 120..240,
+// with the crafting panel already down to an 18 px row and one recipe of headroom left. That
+// is the layout as it stood in v1.8.15, and it is why these rects exist; v1.9.1 turned the
+// three screens into one bar's three tabs and everything below the strip here is unchanged
+// (see the bar strip block above). There was no band on that screen a furnace's three slots
+// and two indicators could take without evicting the crafting list, so the furnace got its
+// own screen and reused the vertical budget from scratch.
 //
 // ── Why the main grid MOVES on this screen ─────────────────────────────────────────────
 //
@@ -162,11 +224,12 @@
 // that the player must always see what they are holding), the furnace itself, AND the 8x2
 // main grid.
 //
-// The grid cannot stay at GRID_Y (40) here: that band is where the furnace's own slots have
-// to go, directly under the close bar, or the furnace ends up below the fold. So this screen
-// draws the grid at FURN_GRID_Y (160) instead, through furnGridSlotRect() rather than
-// gridSlotRect(). gridSlotRect() and GRID_Y are NOT touched — the inventory overlay is
-// byte-identical to what shipped — and the two grids are separate functions rather than one
+// The grid cannot stay at GRID_Y here: that band is where the furnace's own slots have to go,
+// directly under the close bar, or the furnace ends up below the fold. So this screen draws
+// the grid at FURN_GRID_Y (160) instead, through furnGridSlotRect() rather than
+// gridSlotRect(). (GRID_Y was 40 when this was written and is 72 since v1.9.1's strip; the
+// two grids are still in different bands, which is all this paragraph ever claimed.) The two
+// grids are separate functions rather than one
 // function taking a y, because a single "which screen am I on" parameter threaded through
 // gridSlotRect() would put the furnace's existence inside the inventory screen's own hit
 // test, which is exactly the coupling hitInventorySlot()'s `overlay_open` flag already shows
@@ -176,6 +239,7 @@
 //
 //   hotbar          y   0..40    HOTBAR_Y / HOTBAR_H, unchanged and always visible
 //   close bar       y  40..66    FURN_CLOSE_Y / _H — 26 px, comfortably over the 7 px font
+//                                 (since v1.9.1 this band is the bar's tab strip, same rect)
 //   slot row        y  72..112   input, fuel and output, all three at the full SLOT_PX (40)
 //   burn bar        y 116..130   under the FUEL slot, because it reads how much of THAT
 //                                 item's burn time is left
@@ -186,8 +250,11 @@
 // against a 7 px font — the floor the task set. The burn bar and the cook arrow are
 // deliberately NOT touch targets at all: they are readouts, they sit in the gaps, and
 // hitFurnaceSlot() below returns FURN_HIT_NONE for a point on either.
-#define FURN_CLOSE_Y  GRID_Y            // 40 — directly under the hotbar, like HUD_TOGGLE_Y
-#define FURN_CLOSE_H  26
+// Aliases of the bar strip since v1.9.1, and the same numbers they always were (40 and 26).
+// They were written against GRID_Y, which has since moved to 72, so tracking the strip is what
+// keeps them where they were rather than what moves them.
+#define FURN_CLOSE_Y  BAR_STRIP_Y       // 40 — directly under the hotbar, like HUD_TOGGLE_Y
+#define FURN_CLOSE_H  BAR_STRIP_H       // 26
 
 #define FURN_SLOT_PX  SLOT_PX           // 40 — same cell size as every other slot on the panel
 #define FURN_ROW_Y    72                // top of the three-slot row
@@ -243,7 +310,13 @@
 
 // ── Chest panel (v1.9.0 CHEST) ─────────────────────────────────────────────────────────
 //
-// A THIRD storage screen, same reason UI_SCR_FURNACE got one of its own instead of a
+// v1.9.1: the reasoning below is unchanged and the constants are unchanged, but the noun is.
+// There is no longer a separate chest SCREEN — chest, furnace, craft and inventory are tabs
+// on one bar (see BarKind above), and what used to be "the chest screen's 240px" is now the
+// CHEST tab's share of the same 240. Every rectangle here still lands where it landed, which
+// is the whole reason the tab rework could reuse this block instead of renumbering it.
+//
+// A THIRD storage screen, same reason the furnace got one of its own instead of a
 // fourth region on the inventory overlay: that overlay's 240px are already fully spoken
 // for (see the furnace block above), so a chest reuses the vertical budget from scratch
 // the same way the furnace does, and reuses FURN_GRID_Y's own relocated-grid trick outright
@@ -277,8 +350,10 @@
 // not a measured floor the way FURN_HINT_Y's own comment checks one — there is no third
 // hint row here that could grow into it, so nothing currently depends on the gap being
 // exactly that size.
-#define CHEST_CLOSE_Y  GRID_Y            // 40 — directly under the hotbar, like FURN_CLOSE_Y
-#define CHEST_CLOSE_H  26                // same close-bar height as the furnace panel
+// Aliases of the bar strip since v1.9.1 — see FURN_CLOSE_Y's note for why tracking the strip
+// rather than GRID_Y is what leaves these two at the numbers they shipped with.
+#define CHEST_CLOSE_Y  BAR_STRIP_Y       // 40 — directly under the hotbar, like FURN_CLOSE_Y
+#define CHEST_CLOSE_H  BAR_STRIP_H       // 26 — same close-bar height as the furnace panel
 
 #define CHEST_SLOT_PX  SLOT_PX           // 40 — same cell size as every other slot on the panel
 #define CHEST_ROW_Y    72                // top of the chest's one-row-of-eight, same offset
@@ -305,8 +380,10 @@ URect hotbarSlotRect(int i);
 // INV_HOTBAR_SLOTS, not an inventory.h slot index itself).
 URect gridSlotRect(int i);
 
-URect craftCloseRect(void);
-URect craftRowRect(int i);
+// craftCloseRect() and craftRowRect() were here. They are RETIRED — see the BAR_LIST_Y0 block
+// above for why the fixed crafting split became a scrolling list. Their replacements are
+// barListRowRect() and the CRAFT arm of barCellRect() at the bottom of this header; there is
+// no close bar to replace, because the bar's own close tab is the one door off every tab.
 URect hudToggleRect(void);
 
 // The one function that turns a raw touch point into "which inventory.h slot (if any) was
@@ -385,6 +462,111 @@ int hitChestSlot(int x, int y);
 // reason hitFurnaceInvSlot() is not a third mode on hitInventorySlot()'s own flag: see that
 // function's own comment.
 int hitChestInvSlot(int x, int y);
+
+// ── The bar: strip, tabs, list rows and cells (v1.9.1 INTERFACE) ───────────────────────
+//
+// Everything below is the geometry of ONE screen with several tabs, replacing three screens
+// with one layout each. The rects underneath the strip are not new — barCellRect() hands back
+// exactly the rects the three panels already shipped (hotbarSlotRect, gridSlotRect,
+// chestSlotRect, chestGridSlotRect, furnInputRect/furnFuelRect/furnOutputRect,
+// furnGridSlotRect). What is new is the (row, col) ADDRESSING on top of them, which is what a
+// d-pad needs and a stylus never did.
+//
+// The kinds are in tab order and the order is load-bearing: INVENTORY and CRAFT are always
+// present and always first, and the container — chest or furnace, never both, because main.c
+// opens one per PLACE press — is always index 2 when it exists. A caller that has just closed
+// a container can therefore clamp a cursor by comparing against the count and nothing else.
+typedef enum {
+	BAR_KIND_INVENTORY = 0,
+	BAR_KIND_CRAFT     = 1,
+	BAR_KIND_CHEST     = 2,
+	BAR_KIND_FURNACE   = 3,
+} BarKind;
+
+// The whole strip band, full screen width: tabs on the left, the close tab on the right. Drawn
+// as one fill before the tabs go on top of it, so the dividers between tabs are the background
+// showing through rather than three more quads.
+URect barStripRect(void);
+
+// Tab `i` of `count`, tiling [0, BAR_TABS_W) with no gap and no overlap.
+//
+// The width is (i+1)*BAR_TABS_W/count - i*BAR_TABS_W/count and NOT BAR_TABS_W/count. The
+// division truncates: at 4 tabs the even share is 73 px and four of those leave the last two
+// columns of the strip belonging to no tab at all — a 2 px dead strip a stylus can land in and
+// get nothing from. Taking the difference of two running edges spreads the remainder across
+// the tabs instead, so the tabs differ by at most one pixel and the last one always ends
+// exactly on BAR_TABS_W. ui_layout_test.c sweeps every pixel column to prove it.
+//
+// An out-of-range `i`, or a `count` below 1, is a zero rect — the same "cannot be mistaken for
+// a real answer" shape furnSlotRect() uses for a bad index.
+URect barTabRect(int i, int count);
+
+// The close tab: BAR_CLOSE_W square at the right edge of the strip, x 294..320. Fixed width,
+// so it does not shrink as categories are added — see the bar strip block above.
+URect barCloseRect(void);
+
+// Which tab a point on the strip belongs to: a 0-based tab index, BAR_HIT_CLOSE, or
+// BAR_HIT_NONE. Knows about the strip and nothing else — a point on the hotbar, on a cell or
+// on a list row answers BAR_HIT_NONE here, the same way hitFurnaceSlot() knows about three
+// rects and leaves the dispatch order to its caller.
+int hitBarStrip(int x, int y, int count);
+
+// Row `visible_row` (0..BAR_LIST_VISIBLE-1) of a list category, in SCREEN space — the caller
+// has already subtracted its scroll. 4 px of margin either side and a 2 px gap under each row,
+// so a 24 px pitch draws a 22 px row: enough clearance for the 7 px font at both ends and a
+// visible seam between rows without a divider quad.
+//
+// A row outside the window is a zero rect, so a caller that draws the whole recipe list without
+// clipping draws nothing for the rows that are scrolled off rather than drawing them on top of
+// the hotbar.
+URect barListRowRect(int visible_row);
+
+// Fills `out` with the live categories in tab order and returns how many there are: 2 with no
+// container open, 3 with one. Never 4 — `has_chest` wins if both are somehow set, because a
+// chest and a furnace cannot be open at once and producing two container tabs would be a
+// layout that no navigation state could describe.
+int barBuildKinds(bool has_chest, bool has_furnace, BarKind out[BAR_MAX_TABS]);
+
+// The tab label. An unknown kind answers "" rather than a placeholder: an empty tab is visibly
+// wrong on screen, where a "?" reads like a deliberate category.
+const char* barKindLabel(BarKind k);
+
+// How many cursor rows a kind has. The grids ignore `list_len` (INVENTORY is hotbar + 2 grid
+// rows = 3; CHEST and FURNACE are hotbar + their own row + 2 grid rows = 4); CRAFT is exactly
+// `list_len`, because a recipe list's height is however many recipes there are.
+int barKindRows(BarKind k, int list_len);
+
+// How many columns row `row` of a kind has. Everything is INV_HOTBAR_SLOTS (8) wide except the
+// furnace's own row (input, fuel, output — 3) and a list (1). An out-of-range row answers 0.
+int barKindCols(BarKind k, int row);
+
+// Whether d-pad left/right moves WITHIN the row or switches category. True for the grids, where
+// left/right is the only way to reach column 7; false for CRAFT, whose rows are one cell wide
+// and whose left/right would otherwise be dead — a list with dead left/right feels broken.
+bool barKindHorizontalIsContent(BarKind k);
+
+// The pixel rect of cell (row, col) on a kind's content area, or a zero rect if that cell does
+// not exist. `scroll` is the list window's first row and is ignored by every grid kind.
+//
+// Row order, top to bottom: row 0 is the hotbar on every grid kind; INVENTORY rows 1-2 are the
+// bag; CHEST row 1 is the chest, rows 2-3 the bag; FURNACE row 1 is input/fuel/output, rows 2-3
+// the bag; CRAFT row r is list row r - scroll.
+URect barCellRect(BarKind k, int row, int col, int scroll);
+
+// The inverse: which cell a touch point lands in, or false for a point on the strip, in a
+// gutter, or off the panel. `row` and `col` are only written when it returns true.
+//
+// Deliberately NOT implemented by walking barCellRect() and testing ptInRect on each. It routes
+// through the hit tests the three panels already shipped (hitInventorySlot, hitChestSlot,
+// hitChestInvSlot, hitFurnaceSlot, hitFurnaceInvSlot) and converts their slot index into a
+// (row, col). That costs a second mapping to keep right, and buys the only thing that makes the
+// round-trip test in ui_layout_test.c worth running: the rect side and the hit side are two
+// independent paths, so swapping two columns in barCellRect() makes the round trip FAIL. Derive
+// one from the other and that test passes by construction and can never go red.
+//
+// The one place the two paths do share code is CRAFT, whose rows have no pre-existing hit test
+// to reuse — one rect constructor, walked. Stated here rather than left to be discovered.
+bool barCellFromPoint(BarKind k, int x, int y, int scroll, int* row, int* col);
 
 // How many pixels of a `total_px`-wide bar are filled at progress `num`/`den`.
 //

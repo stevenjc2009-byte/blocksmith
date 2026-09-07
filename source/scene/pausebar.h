@@ -110,7 +110,7 @@
 #define PB_OPT_ROWS   3
 
 // SYSTEM. The memory readout is drawn under these two and is NOT a row: the cursor stops at
-// PB_SYS_ROWS, exactly as scene/pausemenu.c's OPT_ROW_COUNT already stops short of it.
+// PB_SYS_ROWS and never reaches it.
 #define PB_SYS_CONTROLS 0
 #define PB_SYS_DEBUG    1
 #define PB_SYS_ROWS     2
@@ -370,9 +370,16 @@ PauseBarAction pauseBarTouch(PauseBarState* s, bool press, int x, int y);
 // against the real header on the console build.
 int pauseBarTextWidth(const char* text, int scale);
 
-// The widest label this panel can draw, in pixels at scale 1. The footer, at 162 px — see
+// The widest label this panel can draw, in pixels at scale 1. The footer, at 180 px — see
 // tests/pausebar_test.c's testLabelsFitTheirBoxes, which checks every label against the box
 // it is drawn in rather than against this one number.
-#define PAUSEBAR_WIDEST_LABEL_PX 162
+//
+// v1.9.1: 162 -> 180. DERIVED from the footer string, not chosen. The footer gained the word
+// SELECT — it now reads "A OK  B/SELECT RESUME  L/R TAB", 30 chars x 6 px advance = 180 —
+// because SELECT still toggles this panel (main.c:6039, `if (down & KEY_SELECT)
+// pauseMenuToggle();`) and the old wording never said so. The panel's real budget from the
+// row inset is 42 columns, so 30 fits with 12 to spare: PB_ROW_X 38 + 180 = 218, against a
+// panel right edge of PB_PANEL_X + PB_PANEL_W = 294.
+#define PAUSEBAR_WIDEST_LABEL_PX 180
 
 #endif

@@ -416,10 +416,17 @@ static void testLabelsFitTheirBoxes(void)
 	CHECK(pauseBarTextWidth("Quit to title", 1) == 78);   // the widest row label
 
 	// The footer is the widest thing on the panel, and it fits the panel's width from the
-	// row inset. 27 characters at advance 6.
-	CHECK(strcmp(pauseBarFooterLabel(), "A SELECT  B RESUME  L/R TAB") == 0);
+	// row inset. 30 characters at advance 6.
+	//
+	// v1.9.1: was "A SELECT  B RESUME  L/R TAB" (27 chars / 162 px). SELECT still toggles the
+	// panel — main.c:6039 is an unconditional `if (down & KEY_SELECT) pauseMenuToggle();`, so
+	// while this footer is on screen SELECT closes the panel exactly as B does — and the old
+	// wording never said so, leaving a working control undiscoverable. A's label moved SELECT
+	// -> OK in the same change so the word SELECT does not appear twice in one line meaning two
+	// different things: the physical button next to B, and "confirm this row".
+	CHECK(strcmp(pauseBarFooterLabel(), "A OK  B/SELECT RESUME  L/R TAB") == 0);
 	CHECK(pauseBarTextWidth(pauseBarFooterLabel(), 1) == PAUSEBAR_WIDEST_LABEL_PX);
-	CHECK(PAUSEBAR_WIDEST_LABEL_PX == 162);
+	CHECK(PAUSEBAR_WIDEST_LABEL_PX == 180);
 	CHECK(PB_ROW_X + PAUSEBAR_WIDEST_LABEL_PX <= PB_PANEL_X + PB_PANEL_W);
 	// Nothing else this module names is wider than the footer.
 	for (int t = 0; t < PAUSEBAR_TAB_COUNT; t++) {
@@ -428,7 +435,7 @@ static void testLabelsFitTheirBoxes(void)
 			CHECK(pauseBarTextWidth(pauseBarRowLabel(t, r), 1) <= PAUSEBAR_WIDEST_LABEL_PX);
 	}
 	// The character budget: at the row inset, the panel's remaining width is 42 characters
-	// at scale 1. The footer spends 27 of them.
+	// at scale 1. The footer spends 30 of them.
 	CHECK((PB_PANEL_X + PB_PANEL_W - PB_ROW_X) / PAUSEBAR_FONT_ADVANCE == 42);
 }
 

@@ -36,12 +36,37 @@
 // grows a second entry point.
 void inputMapSet(const Options* o);
 
+// v1.9.1. While a modal menu owns the pad, every action answers 0 — see inputKey below.
+//
+// This is the guard, rather than a playerSetInputEnabled/cameraSetInputEnabled pair, because
+// the three readers named at the top of this file each ask for their own verbs by calling
+// inputKey. Zeroing the answer here disables move, jump, break, place and eat in one place;
+// adding an enable flag to each reader would be three new APIs, three call sites in main.c,
+// and three chances for one of them to be missed and leave the player walking around behind
+// an open menu.
+//
+// Deliberately NOT sticky across a mode change: main.c sets it every frame from the current
+// screen, so a menu that closes without an explicit false still returns control on the very
+// next frame. A latched flag would leave the pad dead until something remembered to clear it.
+void inputMapSetMenuOwnsPad(bool owns);
+
 // The raw key bit bound to `a`, ready to be tested against hidKeysHeld()/hidKeysDown(). An
 // action outside the enum answers 0, which tests false against every key state — a verb that
 // does nothing rather than a verb that fires on every button.
+//
+// Answers 0 for every action while inputMapSetMenuOwnsPad(true) is in force. Note this gates
+// the *bound verbs* only: main.c reads raw KEY_ bits directly in a few places (the pause
+// button, the render-distance L/R lines) and those are unaffected, by design — a menu that
+// swallowed the pause button could not be escaped.
 uint32_t inputKey(OptionsAction a);
 
 // Multiplier on scene/camera.c's LOOK_SPEED. 1.0 is the pre-8.4 feel exactly.
+//
+// v1.9.1: answers 0 while inputMapSetMenuOwnsPad(true) is in force, which freezes the camera
+// for as long as a modal menu is up. That is deliberate and is the ONLY thing stopping the
+// circle pad from turning the player while it also walks a menu cursor: cameraLook reads the
+// pad directly rather than through inputKey, so the action gate above cannot reach it. See the
+// long note at the definition in input_map.c for what was rejected in its place.
 float inputLookScale(void);
 
 // True when the player has asked for inverted pitch: stick up looks down.

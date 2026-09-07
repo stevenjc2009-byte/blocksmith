@@ -60,6 +60,8 @@ static int      s_base;           // first quad slot this frame's pending batch 
 static int      s_quads;          // pending, not yet submitted, counted from s_base
 static C3D_Tex* s_tex;            // currently bound
 
+static int s_frame_quads;         // total for the whole frame, not just the pending batch — see spriteFrameQuads
+
 static C3D_Mtx s_projection;
 
 bool spriteInit(void)
@@ -151,6 +153,7 @@ static void flush(void)
 void spriteFrameBegin(void)
 {
 	s_base = 0;
+	s_frame_quads = 0;
 }
 
 void spriteBegin(int w, int h)
@@ -257,6 +260,12 @@ void spriteQuad(float x, float y, float w, float h,
 	v[3] = (SpriteVertex){x,  y1, 0.0f, u0, v1, colour};
 
 	s_quads++;
+	s_frame_quads++;  // whole-frame total; counted here so a wrap above still counts, not just the common case
+}
+
+int spriteFrameQuads(void)
+{
+	return s_frame_quads;
 }
 
 void spriteRect(float x, float y, float w, float h, uint32_t colour)

@@ -29,25 +29,64 @@
 
 #define TITLE_BAR_H  20   // a label only, never tapped — not held to the finger-size budget below
 
-// Title screen's primary actions: the buttons a thumb has to land on cold, with nothing
-// smaller nearby to fall back on. This used to be a literal 48 px for three buttons (7.9 mm,
-// inside the 7-10 mm fingertip target range general touch-UI guidance converges on — Apple's
-// HIG cites roughly 7 mm, Android's Material roughly 9 mm). Adding Multiplayer as a fourth
-// pushed three-buttons-at-48px past the 240 px budget, so this is now a formula for the same
-// reason BIND_ROW_H below is one: it recomputes instead of silently overlapping rows if a
-// fifth item is ever added, rather than a number that quietly stops being true.
+// ── v1.9.1: the four-tab bar (blueprint D10) ───────────────────────────────────────────
 //
-//   240 = MAIN_TOP_Y(44) + items*MAIN_BTN_H + (items-1)*MAIN_GAP + margin(8)
+// The four stacked buttons this screen opened with (PLAY / MULTIPLAYER / OPTIONS / QUIT) and
+// the three screens behind three of them are one surface now: a wordmark, a tab strip, the
+// focused tab's content, and a footer hint. Every number below is D10's, and every one of
+// them is checked against the same 6.04 px/mm the rest of this file is.
 //
-// With 4 items and a 12 px gap that is 44 + 4*38 + 3*12 = 232, 8 px of slack (the "margin(8)"
-// above) — the same slack the old three-item budget had. 38 px (6.3 mm) is under the
-// original 48, but still
-// above LIST_BTN_H's 36 px (6.0 mm), which this file already uses elsewhere for buttons
-// reached less often than the title screen's own (see the comment above LIST_BTN_H).
-#define MAIN_ITEM_COUNT 4   // Play, Multiplayer, Options, Quit
-#define MAIN_TOP_Y   44
-#define MAIN_GAP     12
-#define MAIN_BTN_H   ((SCR_H - MAIN_TOP_Y - (MAIN_ITEM_COUNT - 1) * MAIN_GAP - 8) / MAIN_ITEM_COUNT)
+//   4..18    wordmark, scale 2 ("BLOCKSMITH" is 10 glyphs * FONT_ADVANCE 6 * 2 = 120 px)
+//   22..48   the tab strip
+//   52..220  content: six rows of TITLE_ROW_H
+//   228..235 footer hint / status line
+//
+// A tab is SCR_W/4 = 80 px wide exactly, so the four of them tile [0,320) with no gap and no
+// overlap and no truncation to reason about — unlike the in-game bar, which has to divide 294
+// by three and therefore needs ui_layout.c's per-index formula. 80x26 is 13.2 x 4.3 mm, which
+// is over the 22-px minimum this project already ships for a tappable row and comfortably the
+// widest class of target on the screen; the longest label, "MULTIPLAYER", is 11 glyphs = 66 px
+// at scale 1 and fits inside one with 7 px either side.
+//
+// 28 px rows (4.6 mm) over the old MAIN_BTN_H's 38: six of them have to fit where four buttons
+// used to, because the PLAY tab's rows are the world list and OPTIONS' are five settings plus
+// CONTROLS. It is above BIND_ROW_H's 24 px, which this file already ships, and the row is the
+// full 300 px wide — area, not height, is what a touch target is scored on (LIST_ROW_H's
+// comment makes the same argument for the same reason).
+//
+//   52 + 6*28 = 220, then 8 px to the footer baseline at 228, whose glyphs end at 235 and
+//   leave the same 5 px bottom margin the old layout had.
+#define TITLE_WORDMARK_Y   4
+#define TITLE_STRIP_Y      22
+#define TITLE_STRIP_H      26
+#define TITLE_TAB_COUNT    4
+#define TITLE_TAB_W        (SCR_W / TITLE_TAB_COUNT)   // 80, and 4*80 == SCR_W exactly
+#define TITLE_ROW_Y0       52
+#define TITLE_ROW_H        28
+#define TITLE_ROWS_VISIBLE 6
+#define TITLE_FOOTER_Y     228
+
+// The tabs, in strip order. Also the index into the BarCatSpec array titleBuildCats fills and
+// into BarNav.row_mem, so the order is the one thing here that is not free to change.
+enum {
+	TITLE_CAT_PLAY = 0,
+	TITLE_CAT_MULTIPLAYER,
+	TITLE_CAT_OPTIONS,
+	TITLE_CAT_SYSTEM,
+	TITLE_CAT_COUNT,
+};
+
+// Rows per tab, where the count is fixed. PLAY's is 1 + world_count and MULTIPLAYER's depends
+// on whether there is a session, so those two are computed in titleBuildCats instead.
+#define OPT_ROW_COUNT  6   // render dist, 3D depth, invert look, look sens, shading, CONTROLS >
+#define SYS_ROW_COUNT  3   // check for update, version history, quit
+
+_Static_assert(TITLE_TAB_W * TITLE_TAB_COUNT == SCR_W,
+               "the four title tabs must tile the screen exactly");
+_Static_assert(TITLE_ROW_Y0 >= TITLE_STRIP_Y + TITLE_STRIP_H,
+               "content rows must not overlap the tab strip");
+_Static_assert(TITLE_ROW_Y0 + TITLE_ROWS_VISIBLE * TITLE_ROW_H <= TITLE_FOOTER_Y,
+               "the six content rows must clear the footer");
 
 // The shared shape behind world-select and options-general: a handful of content rows,
 // then two buttons pinned to the bottom of the screen. Solved once, algebraically, rather
@@ -88,45 +127,17 @@
 #define BIND_ROW_H   ((SCR_H - LIST_TOP_Y - 6 - LIST_BTN_H - 6) / ACTION_COUNT)
 #define BIND_BACK_Y  (BIND_ROW_Y + ACTION_COUNT * BIND_ROW_H + 6)
 
-// Options-general gained a third pinned button — "CHECK FOR UPDATE", reached about as
-// rarely as "CONTROLS >" is — so it no longer fits the two-button shape LIST_BTN1_Y/
-// LIST_BTN2_Y above was solved for. This is the same move MAIN_ITEM_COUNT's comment already
-// made once, for the title screen, when Multiplayer became a fourth item there: recompute
-// the shared height instead of shrinking anything already on screen.
+// v1.9.1: the options page's own Y budget is gone, and this is the redesign the block that
+// used to be here asked for in its own words — "CONTROLS/UPDATE/BACK on their own screen, or
+// a scrolling list ... is still the right answer if a SIXTH setting row ever arrives". It
+// arrived as CONTROLS >, and the answer taken is the first of the two: the OPTIONS tab is the
+// five settings rows plus CONTROLS > on the shared TITLE_ROW_* grid (six rows, exactly the
+// window), CHECK FOR UPDATE moved to the SYSTEM tab, and BACK is the tab strip and B.
 //
-//   240 = LIST_TOP_Y(24) + 5*OPT_ROW_H(26) + gap(6) + 3*OPT_BTN_H(22) + 2*gap(4) + margin(6)
-//
-// The "5" is drawOptionsGeneral's own five setting rows (render dist, 3D depth, invert
-// look, look sensitivity, and — v1.8.10 — SHADING). A genuinely new setting row grows the
-// "4" rather than being squeezed into it, which is the same move MAIN_ITEM_COUNT's comment
-// made for the title screen. What is new here is WHERE the 26 px the fifth row costs is
-// taken from.
-//
-// v1.8.10: this page no longer reuses LIST_ROW_H for its setting rows. It cannot. Holding
-// the rows at 32 px leaves 240 = 204 + 3*OPT_BTN_H, i.e. OPT_BTN_H = 12 px (2.0 mm) — below
-// BIND_ROW_H's 24 px, and below VH_ENTRY_BTN_H's 16 px, which this file calls "the smallest
-// this file gives any tappable target". Adding one toggle would have shrunk three buttons
-// that were already here past the floor the file sets for itself, which is the wrong way
-// round: the cost of a new row should not land on what is already shipping.
-//
-// So OPT_ROW_H is 26 rather than LIST_ROW_H's 32, and the three pinned buttons keep the
-// 22 px they had. That trade is the right way round on this file's own Fitts's-law
-// reasoning (see LIST_ROW_H's comment: "area, not height, is what a touch target is scored
-// on"). A setting row is a full 300 px wide and 26 px tall — 7,800 px^2, comfortably the
-// largest class of target on the screen — while a 12 px button would have been the smallest
-// this file has ever shipped. Five rows lose 6 px each; nothing drops below any floor.
-//
-//   24 + 5*26 + 6 + 3*22 + 2*4 + 6 = 24 + 130 + 6 + 66 + 8 + 6 = 240, exactly, 0 px spare.
-//
-// The redesign that would remove the trade-off entirely — CONTROLS/UPDATE/BACK on their own
-// screen, or a scrolling list — is still the right answer if a SIXTH setting row ever
-// arrives, because 6*26 = 156 leaves only 14 px a button and the same problem returns one
-// row later. It was not done here: it is a layout redesign, not part of adding a toggle.
-#define OPT_ROW_H   26
-#define OPT_BTN_H   ((SCR_H - LIST_TOP_Y - 5 * OPT_ROW_H - 6 - 2 * 4 - 6) / 3)
-#define OPT_BTN1_Y  (LIST_TOP_Y + 5 * OPT_ROW_H + 6)
-#define OPT_BTN2_Y  (OPT_BTN1_Y + OPT_BTN_H + 4)
-#define OPT_BTN3_Y  (OPT_BTN2_Y + OPT_BTN_H + 4)
+// Nothing squeezes anything any more. The old page solved 240 px for five 26-px rows over
+// three 22-px buttons with 0 px spare; the tab solves 168 px for six 28-px rows with 0 px
+// spare and no pinned buttons at all, so a seventh settings row costs a scroll rather than a
+// shrink — TITLE_ROWS_VISIBLE and barNavScrollFor already handle that for the PLAY tab.
 
 // The update screen's "VERSION HISTORY" button (v1.8.8) - steve's brief in his own words:
 // "a small little button ... in the top left". It sits in the same 20 px title-bar strip the
@@ -318,20 +329,142 @@ static const char* keyBitLabel(uint32_t bit)
 	}
 }
 
-// ── World select ───────────────────────────────────────────────────────────────────────
+// ── The bar: chrome, geometry and the category table (v1.9.1) ──────────────────────────
+//
+// Geometry stays here rather than going into scene/ui_layout.h the way the in-game bar's
+// does, for the same reason pausemenu.c keeps its own: ui_layout.h is solved for the 320x240
+// bottom screen *of a running game*, whose strip sits under a hotbar at y 40 and gives up
+// 26 px to a close tab. This bar owns the whole surface, has no hotbar above it and no close
+// tab (there is nothing to close a title screen back to), so it shares the strip's visual
+// grammar and none of its numbers. Two bars, one chrome — blueprint D1's own words.
 
-// Re-scans REGION_ROOT and puts `ts` on the world-select screen. Called only when the
-// player actually navigates here (from the main screen, or back out of world creation) —
-// never once per frame. A directory listing is a real SD-card cost the same way opening a
-// region file is (see world/region.h's own file comment on why files-per-column was
-// rejected for exactly this reason); redoing it 60 times a second for a screen nothing on
-// disk changes while it is open would be that mistake again, one layer up.
-static void titleEnterWorldSelect(TitleState* ts)
+static const char* titleCatLabel(int cat)
+{
+	switch (cat) {
+	case TITLE_CAT_PLAY:        return "PLAY";
+	case TITLE_CAT_MULTIPLAYER: return "MULTIPLAYER";
+	case TITLE_CAT_OPTIONS:     return "OPTIONS";
+	case TITLE_CAT_SYSTEM:      return "SYSTEM";
+	default:                    return "?";
+	}
+}
+
+static TRect titleTabRect(int i)
+{
+	TRect r = {(float)(i * TITLE_TAB_W), TITLE_STRIP_Y, TITLE_TAB_W, TITLE_STRIP_H};
+	return r;
+}
+
+// `visible_row` is the row's position in the six-row window, not its index in the tab's list —
+// the caller adds the scroll offset. Full width less the same 10 px margin every other row in
+// this file uses, and 2 px shorter than the pitch so consecutive rows read as separate rows.
+static TRect titleRowRect(int visible_row)
+{
+	TRect r = {10, (float)(TITLE_ROW_Y0 + visible_row * TITLE_ROW_H), SCR_W - 20,
+	           TITLE_ROW_H - 2};
+	return r;
+}
+
+// Which tab a point is in, or -1. The strip and the content rows are disjoint bands (the
+// _Static_assert above holds TITLE_ROW_Y0 at or below the strip's bottom edge), so one tap can
+// never be both a tab and a row and neither caller has to guard against the other.
+static int titleHitStrip(int x, int y)
+{
+	if (y < TITLE_STRIP_Y || y >= TITLE_STRIP_Y + TITLE_STRIP_H) return -1;
+	if (x < 0 || x >= SCR_W) return -1;
+	return x / TITLE_TAB_W;
+}
+
+// Which of the six visible rows a point is in, or -1. Tests against titleRowRect itself rather
+// than dividing by the pitch, so the 2-px gap between rows is a miss here exactly as it looks
+// like one on screen.
+static int titleRowFromPoint(int x, int y)
+{
+	for (int v = 0; v < TITLE_ROWS_VISIBLE; v++)
+		if (ptIn(titleRowRect(v), x, y)) return v;
+	return -1;
+}
+
+// The live shape of all four tabs, rebuilt every frame because two of them change size under
+// the player: PLAY grows and shrinks with the world list, and MULTIPLAYER loses its invite row
+// the moment a session comes up. scene/barnav.c reads this and nothing else to decide where a
+// press may move the cursor, so a tab that shrank underneath the cursor is corrected by
+// barNavInput's own leading barNavClamp rather than by anything here.
+//
+// horizontal_is_content is true on OPTIONS alone (blueprint D10: "steppers consume
+// left/right"). On the other three there is nothing inside a one-column row for left/right to
+// do, so they switch tabs there instead — a list with dead left/right feels broken (D6).
+static void titleBuildCats(const TitleState* ts, BarCatSpec cats[TITLE_CAT_COUNT])
+{
+	memset(cats, 0, sizeof(BarCatSpec) * TITLE_CAT_COUNT);
+
+	// Row 0 is NEW WORLD, then one row per world. NEW WORLD leads rather than trails so the
+	// cursor's home position on a fresh card — where there is nothing else — is the one thing
+	// the player can actually do.
+	cats[TITLE_CAT_PLAY].rows                  = 1 + ts->world_count;
+	cats[TITLE_CAT_PLAY].uniform_cols          = 1;
+	cats[TITLE_CAT_PLAY].horizontal_is_content = false;
+
+	// CONNECT/DISCONNECT, then "Have an invite code?" while there is no session to protect —
+	// the same disappearing item drawMultiplayer has offered since enrolment landed, and for
+	// the reason its own comment gives. CONNECT stays row 0 in both shapes.
+	cats[TITLE_CAT_MULTIPLAYER].rows                  = (netStatus() == NET_CONNECTED) ? 1 : 2;
+	cats[TITLE_CAT_MULTIPLAYER].uniform_cols          = 1;
+	cats[TITLE_CAT_MULTIPLAYER].horizontal_is_content = false;
+
+	cats[TITLE_CAT_OPTIONS].rows                  = OPT_ROW_COUNT;
+	cats[TITLE_CAT_OPTIONS].uniform_cols          = 1;
+	cats[TITLE_CAT_OPTIONS].horizontal_is_content = true;
+
+	cats[TITLE_CAT_SYSTEM].rows                  = SYS_ROW_COUNT;
+	cats[TITLE_CAT_SYSTEM].uniform_cols          = 1;
+	cats[TITLE_CAT_SYSTEM].horizontal_is_content = false;
+}
+
+// Wordmark and tab strip. Focused tab: COL_PANEL_HI fill, a 2-px COL_ACCENT underline on its
+// bottom edge and a full-brightness label; the others COL_PANEL and COL_TEXT_DIM. The label
+// never changes size with focus — a tab that grows on focus moves its neighbours' touch
+// targets, which is the glitch blueprint D4 rules out.
+static void drawTitleChrome(const TitleState* ts)
+{
+	const int wm = fontTextWidth("BLOCKSMITH", 2);
+	fontDraw((SCR_W - (float)wm) * 0.5f, TITLE_WORDMARK_Y, 2, COL_ACCENT, "BLOCKSMITH");
+
+	for (int i = 0; i < TITLE_CAT_COUNT; i++) {
+		const TRect t       = titleTabRect(i);
+		const bool  focused = (ts->nav.cat == i);
+
+		spriteRect(t.x, t.y, t.w, t.h, focused ? COL_PANEL_HI : COL_PANEL);
+		if (focused) spriteRect(t.x, t.y + t.h - 2, t.w, 2, COL_ACCENT);
+		if (i > 0)   spriteRect(t.x, t.y, 1, t.h, COL_BG);   // 1-px divider
+
+		const char* label = titleCatLabel(i);
+		const int   lw    = fontTextWidth(label, 1);
+		fontDraw(t.x + (t.w - (float)lw) * 0.5f, t.y + (t.h - FONT_GLYPH_H) * 0.5f, 1,
+		         focused ? COL_TEXT : COL_TEXT_DIM, label);
+	}
+}
+
+// One line at the bottom of the bar. The status line wins it whenever there is one, because
+// every message this file writes is something the player has to act on; otherwise the focused
+// tab's own hint. There is exactly one such line, so nothing here can push a row off screen.
+static void drawTitleFooter(const TitleState* ts, const char* hint)
+{
+	if (ts->status_ttl > 0) fontDraw(8, TITLE_FOOTER_Y, 1, COL_WARN, ts->status);
+	else if (hint)          fontDraw(8, TITLE_FOOTER_Y, 1, COL_TEXT_DIM, hint);
+}
+
+// ── World select, now the PLAY tab ─────────────────────────────────────────────────────
+
+// Re-scans REGION_ROOT for the PLAY tab. Called when the player tabs onto PLAY, at titleInit,
+// and after a create — never once per frame. A directory listing is a real SD-card cost the
+// same way opening a region file is (see world/region.h's own file comment on why
+// files-per-column was rejected for exactly this reason); redoing it 60 times a second for a
+// list nothing on disk changes while it is on screen would be that mistake again, one layer up.
+static void titleEnterPlayTab(TitleState* ts)
 {
 	ts->world_count = worldlistScan(REGION_ROOT, ts->worlds, WORLDLIST_MAX,
 	                                 &ts->world_list_truncated);
-	ts->screen = TITLE_SCR_WORLD_SELECT;
-	ts->cursor = 0;
 	ts->world_scroll = 0;
 	ts->status[0] = '\0';
 	ts->status_ttl = 0;
@@ -344,7 +477,7 @@ static void titleEnterWorldSelect(TitleState* ts)
 }
 
 // Every failure branch below is something the player must actually act on — retype the
-// name, or notice the SD card write is failing — unlike titleEnterWorldSelect's truncation
+// name, or notice the SD card write is failing — unlike titleEnterPlayTab's truncation
 // notice above, which is only ever informational. That one keeps the 180-frame (~3 s at the
 // project's measured 59.83 fps, see main.c) budget; these get roughly double, because a
 // message the player has to read *and* respond to before it clears itself needs longer than
@@ -504,184 +637,108 @@ static void titleDeleteSelectedWorld(TitleState* ts)
 	}
 
 	// world_count can move on EITHER outcome now that a failed delete also rescans, so the
-	// scroll window is reclamped either way rather than only after a clean delete.
-	const int max_scroll = ts->world_count > LIST_VISIBLE_ROWS ? ts->world_count - LIST_VISIBLE_ROWS : 0;
-	if (ts->world_scroll > max_scroll) ts->world_scroll = max_scroll;
+	// scroll window is reclamped either way rather than only after a clean delete. v1.9.1:
+	// against the bar's six-row window and its 1 + world_count rows (row 0 is NEW WORLD, so
+	// the world at ts->cursor is bar row ts->cursor + 1), through the same barNavScrollFor
+	// the tab uses every frame rather than a second hand-rolled clamp that could disagree
+	// with it about where the window is allowed to sit.
+	ts->world_scroll = barNavScrollFor(ts->cursor + 1, ts->world_scroll, TITLE_ROWS_VISIBLE,
+	                                    1 + ts->world_count);
 }
 
-static TitleResult drawWorldSelect(TitleState* ts, const TitleInput* in, bool tap)
+// The PLAY tab. Row 0 is NEW WORLD, rows 1..world_count are the worlds; six rows are visible
+// and ts->world_scroll is the window, which the caller has already moved to follow the cursor.
+//
+// `commit` is this frame's BAR_EV_COMMIT (A on the focused row), and `ui` is worldlistUiStep's
+// answer, both decided by the caller — see drawBar for why X, Y and B are taken out of the word
+// barnav sees before it sees it, and why the world verbs run after the cursor has moved.
+//
+// ts->cursor holds the focused WORLD index (nav.row - 1, so -1 while NEW WORLD is focused)
+// throughout this tab: worldlistUiStep, worldlistRenameAt and worldlistDeleteAt all deal in
+// world indices, and giving them a bar row that is one out would delete the wrong world.
+static TitleResult drawPlayTab(TitleState* ts, const TitleInput* in, bool tap, bool commit,
+                               WorldlistUiAction ui)
 {
 	TitleResult r = {TITLE_STAY, {0}};
-	const int total = ts->world_count + 2;   // the world rows, then NEW WORLD, then BACK
 
-	if (in->keys_down & KEY_DDOWN) ts->cursor = (ts->cursor + 1) % total;
-	if (in->keys_down & KEY_DUP)   ts->cursor = (ts->cursor + total - 1) % total;
+	// A frame on which X/Y/B did something does not also load a row: the row under the cursor
+	// may no longer be the one the player was looking at when they pressed.
+	//
+	// v1.9.1: the SAME gate now applies to the touch half. uiButton fires on
+	// `tapped_here || (focused && a_down)` and only the second half took the gate before, so a
+	// frame carrying both a stylus tap on a world row and a Y press armed the delete AND loaded
+	// the world — a rename prompt or a delete confirmation opening on top of a world that is
+	// already loading. Rare (it needs a finger and a face button on one frame) but it is the
+	// destructive direction, and it is one word to close. The cursor still MOVES on a tap
+	// regardless: drawBar's row-tap handler runs off the ungated tap, so nothing about where
+	// the highlight goes changes here — only whether the row also activates.
+	const bool row_live = ui == WORLDLIST_UI_NONE;
+	const bool a        = commit && row_live;
+	tap                 = tap && row_live;
 
-	// v1.9.0 item 6.3: X renames the focused world, Y deletes it — pressed twice — and B
-	// cancels an armed delete before it is allowed to mean "back". Which of those a frame
-	// gets is worldlistUiStep's decision (scene/worldlist.h), scripted through on the host by
-	// tests/worldlist_ops_test.c; this file reads the bits and does what it is told. X and Y
-	// are the two face buttons nothing on this screen reads (options' bindings map in-game
-	// actions only, and main.c hands the raw hidKeysDown() word in), and Y sits opposite A on
-	// the diamond: the destructive press is never on, or next to, the one that loads a world.
-	const WorldlistUiAction ui = worldlistUiStep(&ts->world_confirm, ts->cursor, ts->world_count,
-	                                             (in->keys_down & KEY_X) != 0,
-	                                             (in->keys_down & KEY_Y) != 0,
-	                                             (in->keys_down & KEY_B) != 0);
-	if (ui == WORLDLIST_UI_RENAME_PROMPT) titleRenameWorldFlow(ts);
-	if (ui == WORLDLIST_UI_DELETE_FIRE)   titleDeleteSelectedWorld(ts);
-
-	// Both AFTER the step: a delete just shortened the list, and a rename re-sorted it.
-	const int new_world_idx = ts->world_count;
-	const int back_idx      = ts->world_count + 1;
-	// A frame on which X/Y/B did something does not also load a row: the row under the
-	// cursor may no longer be the one the player was looking at when they pressed.
-	const bool a = (in->keys_down & KEY_A) != 0 && ui == WORLDLIST_UI_NONE;
-
-	// Scroll the minimum needed to keep the cursor's row on screen, rather than
-	// re-centring on every move — a re-centring list jumps under a thumb mid-scroll, the
-	// same "rows reshuffle" problem worldlistScan's own alphabetical sort exists to avoid
-	// one layer down (see worldlist.h).
-	if (ts->cursor < ts->world_count) {
-		if (ts->cursor < ts->world_scroll) ts->world_scroll = ts->cursor;
-		if (ts->cursor >= ts->world_scroll + LIST_VISIBLE_ROWS)
-			ts->world_scroll = ts->cursor - LIST_VISIBLE_ROWS + 1;
-	}
-
-	// Title bar. While a delete is armed for the focused row the prompt takes the whole strip
-	// and names the world, and it is drawn off the SAME predicate the next Y press goes
-	// through (worldlistConfirmArmedFor), so the text and the behaviour cannot disagree about
-	// which world. The strip is 312 px from x=8, 52 chars at FONT_ADVANCE 6; the 24-char
-	// prefix leaves 27 for the name, so a 28..31-char name is cut in the PROMPT only — the
-	// highlighted row directly under it still shows it in full. It drops on its own after
-	// WORLDLIST_CONFIRM_FRAMES (worldlistConfirmTrack, inside worldlistUiStep above), on B, or
-	// when the cursor moves. Otherwise the header as before, with the X/Y hint in the status
-	// slot whenever nothing is being reported there and there is a world to act on.
-	if (ts->cursor < ts->world_count && worldlistConfirmArmedFor(&ts->world_confirm, ts->cursor)) {
-		char prompt[24 + WORLDLIST_NAME_MAX];
-		snprintf(prompt, sizeof(prompt), "PRESS Y AGAIN TO DELETE %.27s", ts->worlds[ts->cursor].name);
-		fontDraw(8, 4, 1, COL_WARN, prompt);
-	} else {
-		fontDraw(8, 4, 1, COL_TEXT_DIM, "SELECT WORLD");
-		if (ts->status_ttl > 0)       fontDraw(120, 4, 1, COL_WARN, ts->status);
-		else if (ts->world_count > 0) fontDraw(120, 4, 1, COL_TEXT_DIM, "X RENAME  Y DELETE");
-	}
+	const int rows = 1 + ts->world_count;
 
 	if (ts->world_count == 0)
-		fontDraw(10, LIST_TOP_Y + 10, 1, COL_TEXT_DIM, "No worlds yet - tap New World");
+		fontDraw(10, TITLE_ROW_Y0 + TITLE_ROW_H + 10, 1, COL_TEXT_DIM,
+		         "No worlds yet - pick NEW WORLD");
 
-	for (int row = 0; row < LIST_VISIBLE_ROWS; row++) {
-		const int i = ts->world_scroll + row;
-		if (i >= ts->world_count) break;
-		const TRect rr = {10, (float)(LIST_TOP_Y + row * LIST_ROW_H), SCR_W - 20, LIST_ROW_H - 2};
-		if (uiButton(rr, ts->worlds[i].name, ts->cursor == i, tap, in->touch_x, in->touch_y, a)) {
+	for (int v = 0; v < TITLE_ROWS_VISIBLE; v++) {
+		const int i = ts->world_scroll + v;
+		if (i >= rows) break;
+
+		const TRect rr      = titleRowRect(v);
+		const bool  focused = (ts->nav.row == i);
+
+		if (i == 0) {
+			if (uiButton(rr, "NEW WORLD", focused, tap, in->touch_x, in->touch_y, a))
+				titleCreateWorldFlow(ts, &r);
+		} else if (uiButton(rr, ts->worlds[i - 1].name, focused, tap, in->touch_x, in->touch_y,
+		                     a)) {
 			r.action = TITLE_START_WORLD;
-			snprintf(r.world_name, sizeof(r.world_name), "%s", ts->worlds[i].name);
+			snprintf(r.world_name, sizeof(r.world_name), "%s", ts->worlds[i - 1].name);
 		}
 	}
 
-	const TRect new_r  = {10, (float)LIST_BTN1_Y, SCR_W - 20, LIST_BTN_H};
-	const TRect back_r = {10, (float)LIST_BTN2_Y, SCR_W - 20, LIST_BTN_H};
-
-	if (uiButton(new_r, "NEW WORLD", ts->cursor == new_world_idx, tap, in->touch_x, in->touch_y, a))
-		titleCreateWorldFlow(ts, &r);
-
-	// B that just cancelled an armed delete is consumed by that (WORLDLIST_UI_DELETE_CANCELLED)
-	// and must not also leave the screen.
-	if (uiButton(back_r, "BACK", ts->cursor == back_idx, tap, in->touch_x, in->touch_y, a)
-	    || ((in->keys_down & KEY_B) && ui != WORLDLIST_UI_DELETE_CANCELLED)) {
-		ts->screen = TITLE_SCR_MAIN;
-		ts->cursor = 0;
+	// While a delete is armed for the focused row the prompt takes the whole footer and names
+	// the world, and it is drawn off the SAME predicate the next Y press goes through
+	// (worldlistConfirmArmedFor), so the text and the behaviour cannot disagree about which
+	// world. The footer is 312 px from x=8, 52 chars at FONT_ADVANCE 6; the 24-char prefix
+	// leaves 27 for the name, so a 28..31-char name is cut in the PROMPT only — the highlighted
+	// row above it still shows it in full. It drops on its own after WORLDLIST_CONFIRM_FRAMES
+	// (worldlistConfirmTrack, inside worldlistUiStep), on B, or when the cursor moves.
+	if (ts->cursor >= 0 && ts->cursor < ts->world_count &&
+	    worldlistConfirmArmedFor(&ts->world_confirm, ts->cursor)) {
+		char prompt[24 + WORLDLIST_NAME_MAX];
+		snprintf(prompt, sizeof(prompt), "PRESS Y AGAIN TO DELETE %.27s",
+		         ts->worlds[ts->cursor].name);
+		fontDraw(8, TITLE_FOOTER_Y, 1, COL_WARN, prompt);
+	} else {
+		drawTitleFooter(ts, (ts->cursor >= 0) ? "A PLAY  X RENAME  Y DELETE  L/R TAB"
+		                                      : "A CREATE A WORLD  L/R TAB");
 	}
 
 	return r;
 }
 
-// ── Main screen ────────────────────────────────────────────────────────────────────────
-
-static TitleResult drawMain(TitleState* ts, const TitleInput* in, bool tap)
+// The OPTIONS tab: the five settings rows plus CONTROLS >, on the shared six-row grid.
+//
+// `commit` is BAR_EV_COMMIT and `left`/`right` are BAR_EV_STEP_LEFT/_RIGHT — this is the one
+// tab whose horizontal_is_content is true, so barnav turns D-pad left/right into a STEP here
+// instead of a tab change (blueprint D10). settingRowStepper's own `focused` test is what
+// decides which row a step lands on, and barnav guarantees exactly one row is focused, so the
+// two cannot disagree about which value moved.
+//
+// There is no BACK row and no save button. Leaving the tab is what saves — see drawBar's one
+// optionsSave call — so a change made here reaches the card whether the player leaves by L/R,
+// by B, by a tab tap or by walking off to PLAY and loading a world.
+static void drawOptionsTab(TitleState* ts, Options* opts, const TitleInput* in, bool tap,
+                            bool commit, bool left, bool right)
 {
-	TitleResult r = {TITLE_STAY, {0}};
-
-	if (in->keys_down & KEY_DDOWN) ts->cursor = (ts->cursor + 1) % MAIN_ITEM_COUNT;
-	if (in->keys_down & KEY_DUP)   ts->cursor = (ts->cursor + MAIN_ITEM_COUNT - 1) % MAIN_ITEM_COUNT;
-	const bool a = (in->keys_down & KEY_A) != 0;
-
-	const int tw = fontTextWidth("BLOCKSMITH", 2);
-	fontDraw((SCR_W - (float)tw) * 0.5f, 6, 2, COL_ACCENT, "BLOCKSMITH");
-
-	// v1.8.3. The same status line world select has had since v1.6.0 (drawWorldSelect above),
-	// drawn here too because this screen is now where the player lands after a world refuses to
-	// open: main.c's genStart() returns false for a generator this build cannot honour, and the
-	// menu is what tells them why — see world/genrefuse.h for the three sentences. Without this
-	// the refusal reached TitleState.status and was never painted, which is the same defect as
-	// not having a message at all.
-	//
-	// Centred, and between the wordmark and the first button rather than beside either. The
-	// wordmark is scale 2, so it occupies y 6..19 (FONT_GLYPH_H 7, doubled); MAIN_TOP_Y is 44;
-	// a scale-1 line at 28 sits 7 px tall in the middle of that gap and moves nothing. It is
-	// never wider than the screen: TitleState.status is char[48], and at gfx/font.h's
-	// FONT_ADVANCE of 6 the 320 px bottom screen holds 53 characters.
-	//
-	// No layout is reserved for it. The line only exists while status_ttl is counting down
-	// (titleUpdateDraw decrements it), and the four buttons below start below where it ends, so
-	// a frame with a message and a frame without one place every touch target identically.
-	if (ts->status_ttl > 0) {
-		const int sw = fontTextWidth(ts->status, 1);
-		fontDraw((SCR_W - (float)sw) * 0.5f, 28, 1, COL_WARN, ts->status);
-	}
-
-	float y = MAIN_TOP_Y;
-	const TRect play_r  = {10, y, SCR_W - 20, MAIN_BTN_H}; y += MAIN_BTN_H + MAIN_GAP;
-	const TRect mp_r    = {10, y, SCR_W - 20, MAIN_BTN_H}; y += MAIN_BTN_H + MAIN_GAP;
-	const TRect opts_r  = {10, y, SCR_W - 20, MAIN_BTN_H}; y += MAIN_BTN_H + MAIN_GAP;
-	const TRect quit_r  = {10, y, SCR_W - 20, MAIN_BTN_H};
-
-	if (uiButton(play_r, "PLAY", ts->cursor == 0, tap, in->touch_x, in->touch_y, a))
-		titleEnterWorldSelect(ts);
-
-	if (uiButton(mp_r, "MULTIPLAYER", ts->cursor == 1, tap, in->touch_x, in->touch_y, a)) {
-		ts->screen = TITLE_SCR_MULTIPLAYER;
-		ts->cursor = 0;
-	}
-
-	if (uiButton(opts_r, "OPTIONS", ts->cursor == 2, tap, in->touch_x, in->touch_y, a)) {
-		ts->screen = TITLE_SCR_OPTIONS_GENERAL;
-		ts->cursor = 0;
-	}
-
-	if (uiButton(quit_r, "QUIT", ts->cursor == 3, tap, in->touch_x, in->touch_y, a))
-		r.action = TITLE_QUIT;
-
-	return r;
-}
-
-// ── Options: general settings ─────────────────────────────────────────────────────────
-
-#define GEN_ITEM_COUNT 8   // 5 settings + "Controls >" + "Check for Update" + Back
-
-static TRect optRowRect(int i)
-{
-	TRect r = {10, (float)(LIST_TOP_Y + i * OPT_ROW_H), SCR_W - 20, OPT_ROW_H - 2};
-	return r;
-}
-
-static void drawOptionsGeneral(TitleState* ts, Options* opts, const TitleInput* in, bool tap)
-{
-	const bool a     = (in->keys_down & KEY_A) != 0;
-	const bool left  = (in->keys_down & KEY_DLEFT)  != 0;
-	const bool right = (in->keys_down & KEY_DRIGHT) != 0;
-
-	if (in->keys_down & KEY_DDOWN) ts->cursor = (ts->cursor + 1) % GEN_ITEM_COUNT;
-	if (in->keys_down & KEY_DUP)   ts->cursor = (ts->cursor + GEN_ITEM_COUNT - 1) % GEN_ITEM_COUNT;
-
-	fontDraw(8, 4, 1, COL_TEXT_DIM, "OPTIONS");
-
 	char buf[32];
-	int step;
+	int  step;
 
 	snprintf(buf, sizeof(buf), "%d", opts->render_dist);
-	step = settingRowStepper(optRowRect(0), "RENDER DIST", buf, ts->cursor == 0,
+	step = settingRowStepper(titleRowRect(0), "RENDER DIST", buf, ts->nav.row == 0,
 	                          tap, in->touch_x, in->touch_y, left, right);
 	// v1.8.5: per-console ceiling. Without this the stepper refuses at 3 on a New 3DS while
 	// the pause-menu slider and the ini clamp both allow 5 — the setting would look raisable
@@ -689,59 +746,98 @@ static void drawOptionsGeneral(TitleState* ts, Options* opts, const TitleInput* 
 	if (step) opts->render_dist = renderDistClampFor(opts->render_dist + step, hwIsNew3ds());
 
 	snprintf(buf, sizeof(buf), "%.1f", (double)opts->slider_3d);
-	step = settingRowStepper(optRowRect(1), "3D DEPTH", buf, ts->cursor == 1,
+	step = settingRowStepper(titleRowRect(1), "3D DEPTH", buf, ts->nav.row == 1,
 	                          tap, in->touch_x, in->touch_y, left, right);
 	if (step) opts->slider_3d = clampF(opts->slider_3d + (float)step * 0.1f,
 	                                    OPTIONS_SLIDER_MIN, OPTIONS_SLIDER_MAX);
 
-	const bool toggled = settingRowToggle(optRowRect(2), "INVERT LOOK", opts->invert_look,
-	                                       ts->cursor == 2, tap, in->touch_x, in->touch_y);
-	if (toggled || (ts->cursor == 2 && a)) opts->invert_look = !opts->invert_look;
+	// v1.9.1: `left || right` as well as `commit`. A two-value setting IS a stepper with two
+	// stops, so either direction lands on the other one — there is no direction in which a
+	// boolean can be stepped "further". Without this, D-pad Left/Right were dead on this row
+	// while the footer two lines below promised "LEFT/RIGHT ADJUST" for the whole tab.
+	//
+	// The dead direction was NOT barnav's doing: barnav.c:197-198 fires BAR_EV_STEP_LEFT/RIGHT
+	// for every 1-column row in a horizontal_is_content category, this row included, and
+	// title.c:1772 forwards it. The event arrived and had nowhere to go, because
+	// settingRowToggle has no left/right parameter to hand it to. Fixed here at the one call
+	// site rather than by giving settingRowToggle two more parameters it would ignore.
+	const bool toggled = settingRowToggle(titleRowRect(2), "INVERT LOOK", opts->invert_look,
+	                                       ts->nav.row == 2, tap, in->touch_x, in->touch_y);
+	if (toggled || (ts->nav.row == 2 && (commit || left || right)))
+		opts->invert_look = !opts->invert_look;
 
 	snprintf(buf, sizeof(buf), "%.2f", (double)opts->look_sensitivity);
-	step = settingRowStepper(optRowRect(3), "LOOK SENS", buf, ts->cursor == 3,
+	step = settingRowStepper(titleRowRect(3), "LOOK SENS", buf, ts->nav.row == 3,
 	                          tap, in->touch_x, in->touch_y, left, right);
 	if (step) opts->look_sensitivity = clampF(opts->look_sensitivity + (float)step * 0.25f,
 	                                           OPTIONS_SENS_MIN, OPTIONS_SENS_MAX);
 
 	// v1.8.10 shaders option: fake directional lighting, off by default (see
-	// chunk_render.c's chunkRenderSetFakeShading for what this actually turns on). Placed as
-	// a 5th settings row rather than on the pause menu's options subset — see OPT_BTN_H's
-	// comment just above for the pixel-budget trade-off that entailed.
-	const bool shading_toggled = settingRowToggle(optRowRect(4), "SHADING", opts->fake_shading,
-	                                               ts->cursor == 4, tap, in->touch_x, in->touch_y);
-	if (shading_toggled || (ts->cursor == 4 && a)) opts->fake_shading = !opts->fake_shading;
+	// chunk_render.c's chunkRenderSetFakeShading for what this actually turns on).
+	const bool shading_toggled = settingRowToggle(titleRowRect(4), "SHADING", opts->fake_shading,
+	                                               ts->nav.row == 4, tap, in->touch_x,
+	                                               in->touch_y);
+	// v1.9.1: same as INVERT LOOK above — either direction flips a two-stop setting.
+	if (shading_toggled || (ts->nav.row == 4 && (commit || left || right)))
+		opts->fake_shading = !opts->fake_shading;
 
-	const TRect controls_r = {10, (float)OPT_BTN1_Y, SCR_W - 20, OPT_BTN_H};
-	if (uiButton(controls_r, "CONTROLS >", ts->cursor == 5, tap, in->touch_x, in->touch_y, a)) {
+	// v1.9.1: RIGHT opens the bindings screen, LEFT deliberately does not. This is the one place
+	// this pass did NOT make both directions live, and the reason is the row's own label: the
+	// ">" is a direction, and a leftward press opening a screen the label points rightwards to
+	// would be a worse surprise than a press that does nothing. A is still the primary way in
+	// and the footer still leads with "A SELECT".
+	//
+	// uiButton ANDs its a_down against `focused` itself (title.c:230), and `focused` here is
+	// `ts->nav.row == 5`, so `right` needs no second row test — the same reason `commit` never
+	// carried one.
+	if (uiButton(titleRowRect(5), "CONTROLS >", ts->nav.row == 5, tap, in->touch_x, in->touch_y,
+	             commit || right)) {
 		ts->screen = TITLE_SCR_OPTIONS_BINDINGS;
 		ts->cursor = 0;
 	}
 
-	const TRect update_r = {10, (float)OPT_BTN2_Y, SCR_W - 20, OPT_BTN_H};
-	if (uiButton(update_r, "CHECK FOR UPDATE", ts->cursor == 6, tap, in->touch_x, in->touch_y, a)) {
+	drawTitleFooter(ts, "A SELECT  LEFT/RIGHT ADJUST  L/R TAB");
+}
+
+// The SYSTEM tab: the two update screens and Quit — everything that is about the build rather
+// than about a world or a setting. CHECK FOR UPDATE and VERSION HISTORY were both one level
+// deeper before (options-general's third pinned button, and a small button on the screen behind
+// it); both are now one tab press and one A away, which is the ≤ 2 inputs blueprint 1B.7 asks
+// for.
+static TitleResult drawSystemTab(TitleState* ts, const TitleInput* in, bool tap, bool commit)
+{
+	TitleResult r = {TITLE_STAY, {0}};
+
+	// The updater's state survives a trip out of these screens and back, so notes from a
+	// previous visit can still be there; the scroll position that went with them must not be.
+	// Starting anywhere but the top of a changelog reads as a missing first line.
+	if (uiButton(titleRowRect(0), "CHECK FOR UPDATE", ts->nav.row == 0, tap, in->touch_x,
+	             in->touch_y, commit)) {
 		ts->screen = TITLE_SCR_UPDATE;
 		ts->cursor = 0;
-		// The updater's state survives a trip out of this screen and back, so notes from a
-		// previous visit can still be there; the scroll position that went with them must
-		// not be. Starting anywhere but the top of a changelog reads as a missing first line.
 		ts->notes_scroll               = 0;
 		ts->notes_rep_up.held_frames   = 0;
 		ts->notes_rep_down.held_frames = 0;
 	}
 
-	const TRect back_r = {10, (float)OPT_BTN3_Y, SCR_W - 20, OPT_BTN_H};
-	if (uiButton(back_r, "BACK", ts->cursor == 7, tap, in->touch_x, in->touch_y, a)
-	    || (in->keys_down & KEY_B)) {
-		// The one point either options screen ever writes to disk — see title.h's file
-		// comment for why this is the whole of this file's crash exposure: at worst a
-		// battery pull loses whatever was changed since the *previous* time this screen
-		// was left, never a whole session's worth.
-		optionsSave(opts, TITLE_OPTIONS_PATH);
-		ts->screen = TITLE_SCR_MAIN;
-		ts->cursor = 2;   // land back on the OPTIONS button, not PLAY (index 2 now that
-		                  // Multiplayer sits between Play and Options in the main menu)
+	if (uiButton(titleRowRect(1), "VERSION HISTORY", ts->nav.row == 1, tap, in->touch_x,
+	             in->touch_y, commit)) {
+		ts->screen         = TITLE_SCR_VERSION_HISTORY;
+		ts->vh_from_update = false;   // B on that leaf comes back HERE, not to a screen never opened
+		ts->cursor    = 0;
+		ts->vh_cursor = 0;
+		ts->vh_scroll = 0;
+		ts->notes_scroll               = 0;
+		ts->notes_rep_up.held_frames   = 0;
+		ts->notes_rep_down.held_frames = 0;
 	}
+
+	if (uiButton(titleRowRect(2), "QUIT", ts->nav.row == 2, tap, in->touch_x, in->touch_y,
+	             commit))
+		r.action = TITLE_QUIT;
+
+	drawTitleFooter(ts, "A SELECT  L/R TAB");
+	return r;
 }
 
 // ── Options: key bindings ─────────────────────────────────────────────────────────────
@@ -798,59 +894,66 @@ static void drawOptionsBindings(TitleState* ts, Options* opts, const TitleInput*
 	const TRect back_r = {10, (float)BIND_BACK_Y, SCR_W - 20, LIST_BTN_H};
 	if (uiButton(back_r, "BACK", ts->cursor == ACTION_COUNT, tap, in->touch_x, in->touch_y, a)
 	    || (in->keys_down & KEY_B)) {
-		// Back to options-general, not to the title screen — that screen's own Back button
-		// is the one save point (see drawOptionsGeneral), so a binding change survives a
-		// battery pull exactly as soon as a general-settings change does, no sooner.
-		ts->screen = TITLE_SCR_OPTIONS_GENERAL;
-		ts->cursor = 4;   // the "CONTROLS >" button, where this screen was entered from
+		// Back to the bar, which is still focused on the OPTIONS tab's CONTROLS > row: this
+		// leaf never touched ts->nav, so the cursor is exactly where it was left and nothing
+		// here has to name a row index. (Before v1.9.1 this wrote ts->cursor = 4 with a
+		// comment claiming that was "CONTROLS >"; on the eight-item options page CONTROLS >
+		// was item 5 and item 4 was SHADING, so B out of this screen landed one row high.)
+		//
+		// Not a save point. Leaving the OPTIONS *tab* is what writes the file (drawBar), and
+		// this returns to that tab rather than leaving it — so a binding change survives a
+		// battery pull exactly as soon as a general-settings change does, no sooner, which is
+		// the rule options-general's own Back button held before.
+		ts->screen = TITLE_SCR_MAIN;
 	}
 }
 
 // ── Multiplayer ────────────────────────────────────────────────────────────────────────
 //
-// Unlike world-select/options-general this is not a 4-row list, so it does not reuse
-// LIST_BTN1_Y/LIST_BTN2_Y — those are solved for exactly four LIST_ROW_H rows above two
-// pinned buttons, and this screen's content (address, status, error, key, hint, player
-// list) is a different shape. Same pinned-button idiom, its own Y budget:
+// Unlike PLAY/OPTIONS/SYSTEM this tab is not a list of rows on the shared TITLE_ROW_* grid,
+// so it does not use titleRowRect: its content (address, status, error, key, hint, player
+// list) is prose, and its two actions are pinned buttons under it. Same pinned-button idiom
+// it has always had, re-solved for the bar's chrome:
 //
-//   240 = MP_BTN2_Y + MP_BTN_H(36) + margin(6)
-//   MP_BTN1_Y = MP_BTN2_Y - MP_BTN_H(36) - gap(4)
+//   MP_BTN2_Y = TITLE_FOOTER_Y(228) - gap(6) - MP_BTN_H(36) = 186
+//   MP_BTN1_Y = MP_BTN2_Y - gap(4) - MP_BTN_H(36)           = 146
 //
-// which leaves LIST_TOP_Y(24)..MP_BTN1_Y-6 = 24..152, 128 px, for everything above the
-// two buttons. Every row Y below is a literal rather than another formula, the same way
-// drawWorldSelect's and drawOptionsGeneral's row content is literal per-row code — only
-// the *count*-driven layouts (BIND_ROW_H, MAIN_BTN_H) earn a formula.
+// which leaves TITLE_ROW_Y0(52)..MP_BTN1_Y-6 = 52..140 for the body. v1.9.1 (blueprint D10):
+// "existing body shifted to y >= 52, BACK button removed (B/tabs)". Both halves of that are
+// visible in the arithmetic — every MP_ROW_* below is EXACTLY its old value plus 28, and the
+// 40 px the removed BACK slot gives back is exactly what pays for the 28 px of tab strip
+// above and the 12 px of footer below. The content band is 94 px either way: it was 24..118
+// (above the old third slot) and it is now 52..146, the same height, moved down by 28.
+//
+// Every row Y below is a literal rather than a formula, the same way drawPlayTab's and
+// drawOptionsTab's row content is literal per-row code — only the *count*-driven layouts
+// (BIND_ROW_H, TITLE_TAB_W) earn one.
 #define MP_BTN_H            36
-#define MP_BTN2_Y           (SCR_H - 6 - MP_BTN_H)
+#define MP_BTN2_Y           (TITLE_FOOTER_Y - 6 - MP_BTN_H)
 #define MP_BTN1_Y           (MP_BTN2_Y - 4 - MP_BTN_H)
 
-// Invite enrolment (net/bsnet.h's netConnectWithInvite) needs a third pinned button, so
-// there is a third slot above the other two. Extending the same upward recursion MP_BTN1_Y
-// already uses, rather than shrinking MP_BTN_H the way OPT_BTN_H's comment above had to
-// when a third *options* button landed, means BACK and the connected screen's DISCONNECT
-// stay at exactly the Y they have always been at; only the slot is new.
-//
-// It lands at 118, and 118 overlaps where a 3rd-to-5th player row would draw. That is safe
-// rather than lucky: this slot is only ever occupied while !connected, and netPlayerCount()
-// is documented in bsnet.h as 0 whenever not connected, so there is no state in which a
-// player row and this button are both on screen.
-#define MP_BTN0_Y           (MP_BTN1_Y - 4 - MP_BTN_H)
-
-#define MP_ROW_SERVER        24
-#define MP_ROW_STATUS        33
-#define MP_ROW_ERROR         42
-#define MP_ROW_KEY_LABEL     54
-#define MP_ROW_KEY_HEX       63   // + a second line at +FONT_LINE(9) via fontDraw's own '\n'
-#define MP_ROW_HINT          84
-#define MP_ROW_PLAYERS_HDR   93
-#define MP_ROW_PLAYERS_TOP  102
+#define MP_ROW_SERVER        52
+#define MP_ROW_STATUS        61
+#define MP_ROW_ERROR         70
+#define MP_ROW_KEY_LABEL     82
+#define MP_ROW_KEY_HEX       91   // + a second line at +FONT_LINE(9) via fontDraw's own '\n'
+#define MP_ROW_HINT         112
+#define MP_ROW_PLAYERS_HDR  121
+#define MP_ROW_PLAYERS_TOP  130
 #define MP_ROW_STEP           9
 
-// How many player rows fit between MP_ROW_PLAYERS_TOP and the content bottom (152): the
-// 5th row's glyphs (102 + 4*9 = 138, +FONT_GLYPH_H(7) = 145) still clear it with 7 px to
-// spare; a 6th would not. NET_MAX_PLAYERS (bsnet.h) is 16, so this can genuinely be fewer
+_Static_assert(MP_ROW_SERVER >= TITLE_ROW_Y0, "the multiplayer body must clear the tab strip");
+
+// How many player rows fit under MP_ROW_PLAYERS_TOP: the 5th row's glyphs (130 + 4*9 = 166,
+// +FONT_GLYPH_H(7) = 173) clear the only button that can be on screen at the same time —
+// DISCONNECT, at MP_BTN2_Y(186) — with 13 px to spare; a 6th (182..189) would not. The upper
+// button slot at MP_BTN1_Y(146) does overlap where a 3rd-to-5th player row would draw, and
+// that is safe rather than lucky for exactly the reason it always was: that slot is only ever
+// occupied by "Have an invite code?" while !connected, and netPlayerCount() is documented in
+// bsnet.h as 0 whenever not connected, so there is no state in which a player row and that
+// button are both on screen. NET_MAX_PLAYERS (bsnet.h) is 16, so this can genuinely be fewer
 // rows than the room holds — see the "+N more" fallback below, the same honesty
-// titleEnterWorldSelect's own truncation flag applies to a directory listing.
+// titleEnterPlayTab's own truncation flag applies to a directory listing.
 #define MP_PLAYERS_VISIBLE    5
 
 // The software keyboard applet for the "Have an invite code?" item below — same modal-
@@ -896,7 +999,17 @@ static void titleInviteCodeFlow(TitleState* ts)
 	netConnectWithInvite(code);
 }
 
-static TitleResult drawMultiplayer(TitleState* ts, const TitleInput* in, bool tap)
+// The MULTIPLAYER tab. `commit` is BAR_EV_COMMIT and `back_press` is BAR_EV_BACK — see drawBar
+// for why the B that produces `back_press` is applied to the tab strip only AFTER this function
+// has run, which is what keeps it a live input to titleMpNav rather than a hard-coded false.
+//
+// *leave_to_play is set when titleMpNav says the player asked to leave, and drawBar is what
+// acts on it by focusing the PLAY tab. The decision stays inside titleMpNav rather than being
+// re-derived from back_press in the caller for the reason titleMpNav exists at all: leaving and
+// the server-entry gate are not independent, and this is the one function that is allowed to
+// answer both.
+static TitleResult drawMultiplayer(TitleState* ts, const TitleInput* in, bool tap, bool commit,
+                                    bool back_press, bool* leave_to_play)
 {
 	TitleResult r = {TITLE_STAY, {0}};
 
@@ -906,27 +1019,24 @@ static TitleResult drawMultiplayer(TitleState* ts, const TitleInput* in, bool ta
 	// The invite item only makes sense when this console has no session to protect —
 	// offering "Have an invite code?" while already connected could only ever be tapped by
 	// mistake, so it disappears from the list entirely rather than sitting there disabled,
-	// the same convention drawUpdate's action_label/action_idx uses above for a verb that
-	// does not apply yet: each slot keeps a fixed Y, but the index and item_count shrink to
-	// skip whatever is not offered right now.
+	// the same convention drawUpdate's action_label/action_idx uses below for a verb that
+	// does not apply yet: each slot keeps a fixed Y, but the index and row count shrink to
+	// skip whatever is not offered right now. titleBuildCats holds the matching row count
+	// (1 connected, 2 not), so barnav cannot leave the cursor on a row this frame does not
+	// draw.
 	//
-	// CONNECT stays index 0 in both layouts. Stacking the new button on top and letting the
+	// CONNECT stays row 0 in both layouts. Stacking the new button on top and letting the
 	// others slide down would have been the obvious arrangement, but the cursor starts at 0
 	// and reads top-to-bottom everywhere in this file, so it would also have moved the
-	// default focus off CONNECT — what nearly every visit to this screen is for — and onto a
-	// button that matters once in a console's life. The new slot goes in the middle: the
-	// disconnected screen reads CONNECT / invite / BACK, and the connected screen is left
-	// exactly as it was before enrolment existed.
+	// default focus off CONNECT — what nearly every visit to this tab is for — and onto a
+	// button that matters once in a console's life.
+	//
+	// v1.9.1: BACK is gone (blueprint D10 — the tab strip and B are the way out), so the
+	// disconnected tab reads CONNECT / invite and the connected one is DISCONNECT alone,
+	// pinned to the same bottom slot the old screen's bottom button always sat in.
 	const int conn_idx   = 0;
 	const int invite_idx = connected ? -1 : 1;
-	const int back_idx   = connected ? 1  : 2;
-	const int item_count = connected ? 2  : 3;
-
-	if (in->keys_down & KEY_DDOWN) ts->cursor = (ts->cursor + 1) % item_count;
-	if (in->keys_down & KEY_DUP)   ts->cursor = (ts->cursor + item_count - 1) % item_count;
-	const bool a = (in->keys_down & KEY_A) != 0;
-
-	fontDraw(8, 4, 1, COL_TEXT_DIM, "MULTIPLAYER");
+	const bool a = commit;
 
 	char addr_line[8 + NET_ADDR_MAX];
 	snprintf(addr_line, sizeof(addr_line), "Server: %s", netServerAddress());
@@ -1003,27 +1113,31 @@ static TitleResult drawMultiplayer(TitleState* ts, const TitleInput* in, bool ta
 		fontDraw(8, row_y, 1, netPlayerIsLocal(i) ? COL_ACCENT : COL_TEXT, name);
 	}
 
-	// Drawn in the order they are stacked. CONNECT rises into the extra slot only when the
-	// invite button is present to fill the one below it, so the connected screen keeps its
-	// two buttons pinned to the bottom the way it always has rather than leaving a gap.
-	const TRect conn_r = {10, (float)(connected ? MP_BTN1_Y : MP_BTN0_Y), SCR_W - 20, MP_BTN_H};
-	if (uiButton(conn_r, connected ? "DISCONNECT" : "CONNECT", ts->cursor == conn_idx, tap,
+	// Drawn in the order they are stacked. CONNECT rises into the upper slot only when the
+	// invite button is present to fill the one below it, so the connected tab keeps its one
+	// button pinned to the bottom the way the old screen's bottom button always was rather
+	// than leaving a gap between it and the footer.
+	const TRect conn_r = {10, (float)(connected ? MP_BTN2_Y : MP_BTN1_Y), SCR_W - 20, MP_BTN_H};
+	if (uiButton(conn_r, connected ? "DISCONNECT" : "CONNECT", ts->nav.row == conn_idx, tap,
 	             in->touch_x, in->touch_y, a)) {
 		if (connected) netDisconnect(); else netConnect();
 	}
 
 	if (!connected) {
-		const TRect invite_r = {10, (float)MP_BTN1_Y, SCR_W - 20, MP_BTN_H};
-		if (uiButton(invite_r, "Have an invite code?", ts->cursor == invite_idx, tap,
+		const TRect invite_r = {10, (float)MP_BTN2_Y, SCR_W - 20, MP_BTN_H};
+		if (uiButton(invite_r, "Have an invite code?", ts->nav.row == invite_idx, tap,
 		             in->touch_x, in->touch_y, a)) {
 			titleInviteCodeFlow(ts);
 		}
 	}
 
-	const TRect back_r = {10, (float)MP_BTN2_Y, SCR_W - 20, MP_BTN_H};
-	const bool back =
-		uiButton(back_r, "BACK", ts->cursor == back_idx, tap, in->touch_x, in->touch_y, a)
-		|| (in->keys_down & KEY_B) != 0;
+	drawTitleFooter(ts, "A SELECT  B BACK  L/R TAB");
+
+	// v1.9.1: BACK the button is gone, so the only thing that still means "leave" on this tab
+	// is B — barnav's BAR_EV_BACK, handed in as back_press. It is still gathered here, and
+	// still fed through titleMpNav below, because that is exactly the frame the gate has to be
+	// suppressed on; drawBar applies the tab move it causes only after this function returns.
+	const bool back = back_press;
 
 	// A server hosts the world, so joining one *is* entering it. This is the only place that
 	// happens: there is deliberately no name prompt, no NEW WORLD and no trip through world
@@ -1075,10 +1189,10 @@ static TitleResult drawMultiplayer(TitleState* ts, const TitleInput* in, bool ta
 	};
 	const TitleMpNavOut nav_out = titleMpNav(nav);
 
-	if (nav_out.leave_to_main) {
-		ts->screen = TITLE_SCR_MAIN;
-		ts->cursor = 1;   // land back on the MULTIPLAYER button
-	}
+	// v1.9.1: leaving means focusing the PLAY tab — the bar IS the title screen now, so there
+	// is no TITLE_SCR_MAIN to go back to and no main-menu row to land the cursor on. drawBar
+	// does the move (it owns nav and the one optionsSave that a category leave triggers).
+	if (leave_to_play) *leave_to_play = nav_out.leave_to_main;
 	if (nav_out.start_server) r.action = TITLE_START_SERVER;
 
 	return r;
@@ -1182,6 +1296,10 @@ static TitleResult drawUpdate(TitleState* ts, const TitleInput* in, bool tap)
 	const TRect vh_btn_r = {VH_ENTRY_BTN_X, VH_ENTRY_BTN_Y, VH_ENTRY_BTN_W, VH_ENTRY_BTN_H};
 	if (uiButton(vh_btn_r, "VERSION HISTORY", false, tap, in->touch_x, in->touch_y, false)) {
 		ts->screen    = TITLE_SCR_VERSION_HISTORY;
+		// v1.9.1: version history is also a SYSTEM tab row now, so it has two ways in and B out
+		// of it has to come back to whichever one was used. Recorded here rather than inferred
+		// afterwards — by the time that leaf runs, nothing distinguishes the two paths.
+		ts->vh_from_update = true;
 		ts->cursor    = 0;
 		ts->vh_cursor = 0;
 		ts->vh_scroll = 0;
@@ -1273,8 +1391,11 @@ static TitleResult drawUpdate(TitleState* ts, const TitleInput* in, bool tap)
 		const TRect back_r = {10, (float)LIST_BTN2_Y, SCR_W - 20, LIST_BTN_H};
 		if (uiButton(back_r, "BACK", ts->cursor == back_idx, tap, in->touch_x, in->touch_y, a)
 		    || (in->keys_down & KEY_B)) {
-			ts->screen = TITLE_SCR_OPTIONS_GENERAL;
-			ts->cursor = 5;   // the "CHECK FOR UPDATE" button, where this screen was entered from
+			// v1.9.1: back to the bar. nav still holds SYSTEM row 0 ("CHECK FOR UPDATE"), the
+			// row this screen was entered from, so the focus lands where the player left it
+			// without this having to name an index. (Before v1.9.1 this wrote cursor = 5 on the
+			// options screen, which was off by one anyway — index 5 there was "CONTROLS >".)
+			ts->screen = TITLE_SCR_MAIN;
 		}
 	}
 
@@ -1422,7 +1543,11 @@ static TitleResult drawVersionHistory(TitleState* ts, const TitleInput* in, bool
 	const TRect back_r = {10, (float)LIST_BTN1_Y, SCR_W - 20, LIST_BTN_H};
 	if (uiButton(back_r, "BACK", false, tap, in->touch_x, in->touch_y, false)
 	    || (in->keys_down & KEY_B)) {
-		ts->screen = TITLE_SCR_UPDATE;
+		// v1.9.1: two ways in, so B has to go back to whichever one was used — the update
+		// screen's small VERSION HISTORY button (vh_from_update) or the SYSTEM tab's own row.
+		// Landing an off-the-tab visit on the update screen would put the player somewhere they
+		// never went, and B again from there would then dump them on the tab anyway.
+		ts->screen = ts->vh_from_update ? TITLE_SCR_UPDATE : TITLE_SCR_MAIN;
 		ts->cursor = 0;
 		ts->notes_scroll               = 0;
 		ts->notes_rep_up.held_frames   = 0;
@@ -1545,6 +1670,160 @@ void titleDrawTop(TitleState* ts)
 	spriteEnd();
 }
 
+// ── The bar itself ─────────────────────────────────────────────────────────────────────
+//
+// One frame of the four-tab title screen (blueprint D10). Everything that decides WHERE the
+// cursor is lives here; the four draw* functions above only read ts->nav and paint.
+//
+// The order below is load-bearing and is written out in full because three of the steps exist
+// solely to keep two consumers of the same input from both eating it — the "one hidKeysDown
+// word read by two UI layers" bug this project has shipped twice:
+//
+//   1. A tab tap is applied BEFORE barNavInput, so the keys read this frame are read against
+//      the tab the player just touched, not the one they left.
+//   2. On PLAY, X/Y/B are masked out of the word barnav sees, because worldlistUiStep owns all
+//      three there (rename, delete, cancel-the-armed-delete). Without the mask a B that
+//      disarms a delete would ALSO leave the tab, and a Y that armed one would be an ALT event
+//      nothing consumes. The mask is PLAY-only: on the other three tabs B really does mean
+//      "leave", and there is no X/Y verb to collide with.
+//   3. The world verbs run AFTER barNavInput, on the post-move row. worldlistRenameAt and
+//      worldlistDeleteAt take a WORLD index; handing them a row the player had already moved
+//      off would rename or delete the wrong world.
+//   4. BAR_EV_BACK's tab move is applied AFTER the content dispatch, never before it. On
+//      MULTIPLAYER, titleMpNav is the one function allowed to answer both "leave" and "enter
+//      the server's world" (scene/title_nav.h) and it needs the B press as an input; moving
+//      the tab first would mean drawMultiplayer never ran on the frame that mattered, and
+//      titleMpNav's .back would be permanently false.
+static TitleResult drawBar(TitleState* ts, Options* opts, const TitleInput* in, bool tap)
+{
+	TitleResult r = {TITLE_STAY, {0}};
+
+	BarCatSpec cats[TITLE_CAT_COUNT];
+	titleBuildCats(ts, cats);
+
+	const int cat_before = ts->nav.cat;
+
+	// Step 1: a tab tap. `tab_tapped` then suppresses this frame's content taps — the strip and
+	// the rows are disjoint bands so one point cannot be both, but a tap that switched tabs must
+	// not also be offered to the tab it switched TO, which is now drawing rows under a finger
+	// that was never aimed at them.
+	bool tab_tapped = false;
+	if (tap) {
+		const int t = titleHitStrip(in->touch_x, in->touch_y);
+		if (t >= 0) {
+			barNavSetCat(&ts->nav, t, cats, TITLE_CAT_COUNT);
+			tab_tapped = true;
+		}
+	}
+
+	// Step 2: the mask, then the one barNavInput call. has_lift is false: no tab of this bar has
+	// a second row band for L/R to lift into (barnav.h) — L/R here always mean "switch tab".
+	uint32_t nav_keys = in->keys_down;
+	if (ts->nav.cat == TITLE_CAT_PLAY) nav_keys &= ~(uint32_t)(KEY_X | KEY_Y | KEY_B);
+	const BarEvent ev = barNavInput(&ts->nav, nav_keys, cats, TITLE_CAT_COUNT, false);
+
+	// Arriving on PLAY re-lists the card. Only on arrival — see titleEnterPlayTab. The world
+	// count it just changed is a row count, so cats is stale from here and is rebuilt.
+	if (ts->nav.cat == TITLE_CAT_PLAY && cat_before != TITLE_CAT_PLAY) {
+		titleEnterPlayTab(ts);
+		titleBuildCats(ts, cats);
+		barNavClamp(&ts->nav, cats, TITLE_CAT_COUNT);
+	}
+
+	// Step 3a: a content-row tap moves the cursor to that row. MULTIPLAYER is excluded on
+	// purpose: its content is prose and two pinned buttons, not rows on this grid (see
+	// drawMultiplayer), and its taps go through uiButton exactly as they always have.
+	if (tap && !tab_tapped && ts->nav.cat != TITLE_CAT_MULTIPLAYER) {
+		const int v = titleRowFromPoint(in->touch_x, in->touch_y);
+		if (v >= 0) {
+			const int scroll = (ts->nav.cat == TITLE_CAT_PLAY) ? ts->world_scroll : 0;
+			const int row    = scroll + v;
+			// Only a row that is actually DRAWN moves the cursor. titleRowFromPoint tests all six
+			// rect slots whether or not the tab has six rows, and barNavSetCell would clamp a tap
+			// on the empty space under a two-world list up to the last real row — a cursor jump
+			// with nothing under the finger to explain it. A tab with fewer rows than the window
+			// simply has dead space below it.
+			if (row < cats[ts->nav.cat].rows)
+				barNavSetCell(&ts->nav, row, 0, cats, TITLE_CAT_COUNT);
+		}
+	}
+
+	// Step 3b: PLAY's world verbs, on the post-move row. ts->cursor is the WORLD index — bar row
+	// minus the NEW WORLD row — and is -1 while NEW WORLD itself is focused, which is exactly the
+	// "no world selected" value worldlistUiStep's own gates are written against.
+	WorldlistUiAction ui = WORLDLIST_UI_NONE;
+	if (ts->nav.cat == TITLE_CAT_PLAY) {
+		ts->cursor = ts->nav.row - 1;
+		ui = worldlistUiStep(&ts->world_confirm, ts->cursor, ts->world_count,
+		                     (in->keys_down & KEY_X) != 0,
+		                     (in->keys_down & KEY_Y) != 0,
+		                     (in->keys_down & KEY_B) != 0);
+		if (ui == WORLDLIST_UI_RENAME_PROMPT)    titleRenameWorldFlow(ts);
+		else if (ui == WORLDLIST_UI_DELETE_FIRE) titleDeleteSelectedWorld(ts);
+
+		// Both of those move ts->cursor themselves (worldlist.h owns where the cursor lands
+		// after its own edit) and can change world_count, so the row count and the cursor are
+		// both re-derived rather than assumed to have survived.
+		if (ui == WORLDLIST_UI_RENAME_PROMPT || ui == WORLDLIST_UI_DELETE_FIRE) {
+			titleBuildCats(ts, cats);
+			barNavSetCell(&ts->nav, ts->cursor + 1, 0, cats, TITLE_CAT_COUNT);
+		}
+
+		// Blueprint §7 red arm 2: the scroll window follows the cursor. Without this the 7th
+		// world is unreachable — the cursor moves onto it and the window does not, so the row
+		// under focus is off screen.
+		ts->world_scroll = barNavScrollFor(ts->nav.row, ts->world_scroll, TITLE_ROWS_VISIBLE,
+		                                    1 + ts->world_count);
+	}
+
+	drawTitleChrome(ts);
+
+	// Step 4: content. `tap && !tab_tapped` for the reason step 1 gives.
+	const bool content_tap = tap && !tab_tapped;
+	bool leave_to_play = false;
+
+	switch (ts->nav.cat) {
+	case TITLE_CAT_PLAY:
+		r = drawPlayTab(ts, in, content_tap, ev == BAR_EV_COMMIT, ui);
+		break;
+	case TITLE_CAT_MULTIPLAYER:
+		r = drawMultiplayer(ts, in, content_tap, ev == BAR_EV_COMMIT, ev == BAR_EV_BACK,
+		                    &leave_to_play);
+		break;
+	case TITLE_CAT_OPTIONS:
+		drawOptionsTab(ts, opts, in, content_tap, ev == BAR_EV_COMMIT,
+		               ev == BAR_EV_STEP_LEFT, ev == BAR_EV_STEP_RIGHT);
+		break;
+	case TITLE_CAT_SYSTEM:
+		r = drawSystemTab(ts, in, content_tap, ev == BAR_EV_COMMIT);
+		break;
+	default:
+		break;
+	}
+
+	// Step 5: B leaves for PLAY, applied last. On MULTIPLAYER the answer is titleMpNav's, not
+	// this frame's raw event — see drawMultiplayer. On PLAY, B was masked out above and never
+	// reached barnav, so BAR_EV_BACK cannot fire there and "leave PLAY for PLAY" is not a case.
+	const bool leaving = (ts->nav.cat == TITLE_CAT_MULTIPLAYER) ? leave_to_play
+	                                                            : (ev == BAR_EV_BACK);
+	if (leaving && ts->nav.cat != TITLE_CAT_PLAY) {
+		barNavSetCat(&ts->nav, TITLE_CAT_PLAY, cats, TITLE_CAT_COUNT);
+		titleEnterPlayTab(ts);          // same arrival rescan step 2's L/R path does
+		titleBuildCats(ts, cats);
+		barNavClamp(&ts->nav, cats, TITLE_CAT_COUNT);
+	}
+
+	// Blueprint §7 red arm 1, and D10's "optionsSave on leaving the category": the one disk
+	// write. Tested against cat_before rather than against any single way of leaving, so L/R, a
+	// tab tap and B all save — the bug the red arm names is a save wired to one of the three.
+	// A trip into the bindings leaf is NOT a leave (cat is still OPTIONS while that screen is
+	// up), which is why drawOptionsBindings has no save of its own.
+	if (cat_before == TITLE_CAT_OPTIONS && ts->nav.cat != TITLE_CAT_OPTIONS)
+		optionsSave(opts, TITLE_OPTIONS_PATH);
+
+	return r;
+}
+
 // ── Entry points ───────────────────────────────────────────────────────────────────────
 
 void titleInit(TitleState* ts)
@@ -1553,6 +1832,12 @@ void titleInit(TitleState* ts)
 	ts->screen = TITLE_SCR_MAIN;
 	ts->rebind_action = -1;
 	worldlistConfirmReset(&ts->world_confirm);   // already zero == off; explicit anyway (title.h)
+
+	// v1.9.1: the menu opens ON the PLAY tab and PLAY's rows are the world list, so the scan
+	// that used to hang off "the player navigated to world select" has to happen here instead.
+	// memset already left nav at cat 0 / row 0 — PLAY, NEW WORLD — which is the state this wants
+	// (barnav.h: "Zero is a valid state"), so there is no barNavReset call to go with it.
+	titleEnterPlayTab(ts);
 }
 
 TitleResult titleUpdateDraw(TitleState* ts, Options* opts, const TitleInput* in)
@@ -1567,18 +1852,39 @@ TitleResult titleUpdateDraw(TitleState* ts, Options* opts, const TitleInput* in)
 
 	if (ts->status_ttl > 0) ts->status_ttl--;
 
+	// v1.9.1: three of the TitleScreenId values stopped being screens when their content became
+	// a tab, but a caller may still ask for one — main.c writes TITLE_SCR_MULTIPLAYER into a
+	// fresh TitleState to put the player back on multiplayer after a server session. Each
+	// resolves here, on the frame it is seen, to the bar focused on the matching tab, so the
+	// request means exactly what it always meant. See title.h's comment on the enum.
+	//
+	// The row is deliberately not touched: barNavSetCat restores that tab's remembered row, and
+	// on a freshly-inited TitleState that is row 0 anyway.
+	if (ts->screen == TITLE_SCR_WORLD_SELECT || ts->screen == TITLE_SCR_OPTIONS_GENERAL ||
+	    ts->screen == TITLE_SCR_MULTIPLAYER) {
+		const int cat = (ts->screen == TITLE_SCR_WORLD_SELECT)    ? TITLE_CAT_PLAY
+		              : (ts->screen == TITLE_SCR_OPTIONS_GENERAL) ? TITLE_CAT_OPTIONS
+		                                                          : TITLE_CAT_MULTIPLAYER;
+		BarCatSpec cats[TITLE_CAT_COUNT];
+		titleBuildCats(ts, cats);
+		barNavSetCat(&ts->nav, cat, cats, TITLE_CAT_COUNT);
+		ts->screen = TITLE_SCR_MAIN;
+	}
+
 	spriteBegin(SCR_W, SCR_H);
 	spriteTexture(fontTexture());
 	spriteRect(0, 0, SCR_W, SCR_H, COL_BG);
 
 	switch (ts->screen) {
-	case TITLE_SCR_MAIN:             r = drawMain(ts, in, tap);              break;
-	case TITLE_SCR_WORLD_SELECT:     r = drawWorldSelect(ts, in, tap);       break;
-	case TITLE_SCR_OPTIONS_GENERAL:  drawOptionsGeneral(ts, opts, in, tap);  break;
+	case TITLE_SCR_MAIN:             r = drawBar(ts, opts, in, tap);         break;
 	case TITLE_SCR_OPTIONS_BINDINGS: drawOptionsBindings(ts, opts, in, tap); break;
-	case TITLE_SCR_MULTIPLAYER:      r = drawMultiplayer(ts, in, tap);      break;
-	case TITLE_SCR_UPDATE:           r = drawUpdate(ts, in, tap);           break;
-	case TITLE_SCR_VERSION_HISTORY:  r = drawVersionHistory(ts, in, tap);   break;
+	case TITLE_SCR_UPDATE:           r = drawUpdate(ts, in, tap);            break;
+	case TITLE_SCR_VERSION_HISTORY:  r = drawVersionHistory(ts, in, tap);    break;
+	// Resolved to TITLE_SCR_MAIN above, so unreachable here. Listed rather than defaulted so a
+	// future value added to TitleScreenId is a -Wswitch error instead of a silently blank screen.
+	case TITLE_SCR_WORLD_SELECT:
+	case TITLE_SCR_OPTIONS_GENERAL:
+	case TITLE_SCR_MULTIPLAYER:      break;
 	}
 
 	spriteEnd();

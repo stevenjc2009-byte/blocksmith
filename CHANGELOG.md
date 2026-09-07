@@ -4,6 +4,87 @@ All notable changes to Blocksmith. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.9.1] - 2026-09-07
+
+**Not released, not committed.** This entry documents what is in the working tree. The host
+suite is green (`SUITE_EXIT=0`) and both console arms compile clean, but a compile is not a
+playtest and none of the visual claims below have been looked at on hardware.
+
+`docs/ROADMAP.md` calls this version "The new interface". The inventory, crafting, chest and
+furnace screens stop being four separate screens and become **tabs on one bar**. Only the tabs
+that apply are present — the chest tab exists while a chest is open and not otherwise — so the
+same-frame "you are on a screen that no longer applies" corrections the old model needed are
+gone: a container that stops being handed in simply has no tab that frame.
+
+### Changed
+
+- **`UiScreen` collapses from four screens to two**, `UI_SCR_HUD` and `UI_SCR_BAR`. The retired
+  `UI_SCR_INVENTORY` / `UI_SCR_CRAFT` / `UI_SCR_CHEST` / `UI_SCR_FURNACE` are deleted rather
+  than deprecated, so nothing can still be reaching for one.
+- **A shared cursor model, `source/scene/barnav.{h,c}`**, walks tabs and rows for the bar, the
+  pause panel and the title screen alike. Its key bits mirror libctru's `KEY_*` exactly, asserted
+  at compile time by a `_Static_assert` in `source/scene/ui.c` that only the console build
+  proves — the host suite cannot see `<3ds.h>`.
+- The pause menu is rebuilt on `source/scene/pausebar.c`, and the title screen on four tabs.
+- **While the bar is open it owns the pad.** `inputMapSetMenuOwnsPad()` makes `inputKey()`
+  answer 0 for every bound verb and `inputLookScale()` return `0.0f`, so the player neither
+  walks nor turns while the cursor moves. The raw `KEY_START` and `KEY_SELECT` reads are
+  deliberately not gated — a menu that swallowed the pause button could not be escaped.
+- The bottom-screen timing row gains a live per-frame quad count (`spriteFrameQuads()`),
+  against `SPRITE_MAX_QUADS` 1024.
+- Pause footer: `A SELECT  B RESUME  L/R TAB` becomes `A OK  B/SELECT RESUME  L/R TAB`.
+  SELECT has always toggled the panel (`main.c`'s unconditional
+  `if (down & KEY_SELECT) pauseMenuToggle();`) and the old wording never said so, leaving a
+  working control undiscoverable. 30 characters at `PAUSEBAR_FONT_ADVANCE` 6 is 180px, so
+  `PAUSEBAR_WIDEST_LABEL_PX` went 162 → 180 against a 42-column budget.
+- Debug overlay legend: `SELECT 3D` becomes `SELECT pause`, stale since the 3D-depth setting
+  moved to the pause menu's `PB_OPT_3D` row.
+
+### Fixed
+
+- **A held chest stack survived its own chest.** When a caller stopped handing in a chest,
+  `barNavClamp` moved the cursor off the vanished tab but nothing cleared `ui->picked_chest`;
+  it kept its old value (measured: 0). The next chest opened would read a tap against slot 0 of
+  a *different* chest — an item-loss shape of bug. It is now cleared where the tab actually
+  disappears. `dropLifts()` was rejected as the tool because it also drops the bag lift, which
+  no other tab transition does, and would throw away an item the player was mid-deposit with.
+- **D-pad Left/Right were dead on three of the six title OPTIONS rows** (INVERT LOOK, SHADING,
+  CONTROLS) while the footer promised "LEFT/RIGHT ADJUST" for the whole tab. Not a `barnav`
+  fault — it fired the step events correctly and they arrived at helpers with no parameter to
+  receive them. Either direction now flips the two toggles; RIGHT opens CONTROLS and LEFT
+  deliberately does not, because the row's own `>` points one way.
+- **`barSpecFor` could write past `cols[8]`.** Caught only by the console compiler, as a
+  store-merged `-Werror=stringop-overflow=` at offset 8. Two narrower loop bounds were tried
+  against the real compiler first and both still reported offset 8; only a constant trip count
+  with an inner `break` clears it.
+- **`bar_open` was unused under `BS_BOTTOM_UI=0`**, failing `-Werror=unused-variable` on the
+  probe build `gfx/screen.h:30` requires.
+
+### Tests
+
+- `barnav` 3306 checks and `pausebar` 34082 checks are new self-tests.
+- `chest_ui` 486 → 516, ported from screens to tabs. Every screen assertion kept its "which
+  tab" half, resolved through `barBuildKinds()` rather than a raw index.
+- `ui_layout` → 12013. The last five of those close a real hole: the status band's constants
+  moved 78 → 72 and 174 → 168 as a side effect of `HUD_TOGGLE_H` 32 → 26, and the only check
+  touching them tolerated about 32px of drift. The new pins are literals, not derivations, and
+  go 5/5 red in both perturbation directions (`HUD_TOGGLE_H` 26 → 20 and 26 → 32).
+- `framesync_guard`'s `MAX_LINES` 8192 → 16384. `source/main.c` crossed the old cap mid-version
+  (8110 → 8269) and the guard correctly refused to reason about a truncated file rather than
+  reporting a false green — but everything after it in the suite then never ran at all. Its
+  "main.c runs to ~5800 lines" comment had been badly stale.
+
+### Known, not fixed
+
+- The top-screen notes panel can ask for roughly 1281 quads against `SPRITE_MAX_QUADS` 1024 on
+  its own. Pre-existing, and only on the UPDATE and VERSION HISTORY leaves, which never share a
+  frame with the bar.
+- `source/world/atlas_uv_shader_test.c` and `source/world/water_alpha_test.c` read
+  `source/scene/chunk_render.c` (3557 lines) under an unguarded `MAX_LINES` 4096. Not yet
+  wrong, but it is the same silent-truncation shape the framesync guard just caught.
+- Nothing verifies the OPTIONS d-pad fix automatically: `source/scene/title.c` needs `<3ds.h>`
+  and cannot be host-linked, and there is no `title_test.c`. Playtest only.
+
 ## [1.9.0] - 2026-09-07
 
 Committed and tagged. `refs/heads/v1.9.0` and the annotated tag `refs/tags/v1.9.0` are both on

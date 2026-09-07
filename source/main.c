@@ -59,6 +59,7 @@
 #include "net/inv_bridge.h"
 #include "net/networld.h"
 #include "scene/aimtext.h"
+#include "scene/barnav.h"   // v1.9.1: BarStick / barStickEdge for the title and bar loops (S2, S8)
 #include "scene/camera.h"
 #include "scene/chunk_render.h"
 #include "scene/crackoverlay.h"
@@ -2995,6 +2996,12 @@ static void survivalRespawn(Player* p, Survival* s, FallTrack* ft,
 
 static UiState s_ui;
 
+// v1.9.1 S2. Circle-pad edge state for the in-game bar, the twin of s_title_stick and separate
+// from it for the reason given there: one detector shared between the title loop and this one
+// would carry an edge across the boundary between them. Under BS_BOTTOM_UI only, because a
+// console build has no bar for the pad to drive.
+static BarStick s_bar_stick;
+
 // v1.8.15 FURNACE. WHICH furnace the bottom-screen panel is currently showing, as a cell
 // address rather than as a FurnaceState. That distinction is the whole design of this wiring
 // and is worth stating, because holding the state here instead would be the obvious shape and
@@ -3239,13 +3246,36 @@ static void drawBottomUi(bool ok, const char* status, const char* netline, const
 	// Derived from the averaged frame rather than metricsFrameMs(): an fps computed from the
 	// instantaneous frame and printed beside an averaged frame time would disagree with it on
 	// screen, and the two disagreeing is exactly what makes a readout untrustworthy.
-	char timing[64];
+	//
+	// v1.9.1 S10. A fifth figure, `q` — quads submitted this frame, from gfx/sprite.c's
+	// spriteFrameQuads(). The quads-per-frame budget documented at SPRITE_MAX_QUADS (1024) has
+	// only ever been arithmetic over the draw sites, never a measurement, and the v1.9.1 bar
+	// and three-tab pause panel both add draw sites to it. Read here rather than estimated.
+	//
+	// It reads the count SO FAR this frame, and this row is built before scene/ui.c draws the
+	// panel itself, so the figure excludes the panel — it is the world-plus-HUD cost, which is
+	// the part the budget is actually about. A frame that wrapped shows q pinned at 1024.
+	//
+	// Buffer raised 64 -> 80 with the fifth figure, and the separator before `q` is ONE space,
+	// not the two between the other fields. Both are width arithmetic, not taste. This row is
+	// drawn by scene/ui.c:268 through `fontDrawf(6, y, 1, ...)` at FONT_ADVANCE 6
+	// (gfx/font.h:39) on the 320px bottom screen, so 52 characters are visible — counted at
+	// main.c:7370, not assumed. MEASURED by formatting this exact literal, not counted by eye:
+	// a normal frame ("cpu 16.7  wait 3.2  frame 16.7 ms  60 fps q653") is 46 columns, and the
+	// worst reachable row ("cpu 100.0  wait 100.0  frame 100.0 ms  10 fps q1024") is 51. A
+	// second space before `q` puts that at 52 with nothing left, so one space it is. Four-digit
+	// figures would reach 56 and clip, but cannot co-occur: fps is derived from the same
+	// averaged frame time three fields to its left, so a 1000 ms frame prints 1 fps, not 1000.
+	// The buffer clears 51 plus its terminator with room to spare because what snprintf drops
+	// on overflow is the LAST field — the new one — and a readout that truncates exactly when
+	// the numbers get interesting is worse than no readout.
+	char timing[80];
 	timing[0] = '\0';
 	if (metricsRowEnabled()) {
 		const float f = metricsFrameAvgMs();
-		snprintf(timing, sizeof timing, "cpu %.1f  wait %.1f  frame %.1f ms  %.0f fps",
+		snprintf(timing, sizeof timing, "cpu %.1f  wait %.1f  frame %.1f ms  %.0f fps q%d",
 		         (double)metricsCpuAvgMs(), (double)metricsWaitAvgMs(), (double)f,
-		         (f > 0.0f) ? (double)(1000.0f / f) : 0.0);
+		         (f > 0.0f) ? (double)(1000.0f / f) : 0.0, spriteFrameQuads());
 	}
 
 	const UiStats stats = {
@@ -3278,10 +3308,11 @@ static void drawBottomUi(bool ok, const char* status, const char* netline, const
 	// dirt block reads exactly like a cell that became nothing, and both close the panel rather
 	// than editing whatever happens to occupy the slot now.
 	//
-	// `fp` stays NULL in that case and ui.h's contract takes over: uiUpdateDraw corrects
-	// UI_SCR_FURNACE to UI_SCR_INVENTORY on the spot and drops any lifted stack, so the player
-	// is put back in their bag holding their items rather than looking at a panel for a block
-	// that is gone.
+	// `fp` stays NULL in that case and ui.h's contract takes over: uiUpdateDraw drops the
+	// furnace tab from the bar on the spot and drops any lifted stack, so the player is put back
+	// in their bag holding their items rather than looking at a panel for a block that is gone.
+	// (Before v1.9.1 that was phrased as correcting UI_SCR_FURNACE to UI_SCR_INVENTORY; the
+	// per-panel screens are gone, and the cursor is re-clamped onto a surviving tab instead.)
 	FurnaceState  fs;
 	FurnaceState* fp = NULL;
 	uint8_t       fpay[BLOCKSTATE_PAYLOAD_BYTES];
@@ -3309,9 +3340,9 @@ static void drawBottomUi(bool ok, const char* status, const char* netline, const
 	// than editing whatever occupies the slot now.
 	//
 	// `cp` stays NULL in that case and ui.h's contract takes over exactly as it does for the
-	// furnace: uiUpdateDraw corrects UI_SCR_CHEST to UI_SCR_INVENTORY on the spot and drops any
-	// lifted stack, so the player is put back in their bag holding their items rather than
-	// looking at a panel for a block that is gone.
+	// furnace: uiUpdateDraw drops the chest tab from the bar on the spot and drops any lifted
+	// stack, so the player is put back in their bag holding their items rather than looking at a
+	// panel for a block that is gone.
 	ChestState  cs;
 	ChestState* cp = NULL;
 	uint8_t     cpay[BLOCKSTATE_PAYLOAD_BYTES];
@@ -3358,23 +3389,22 @@ static void drawBottomUi(bool ok, const char* status, const char* netline, const
 	}
 	if (!ures.furnace_open) s_furnace_open = false;
 
-	// v1.9.0 CHEST. The close test, and the ONE place this wiring does not mirror the furnace
-	// line above it. The furnace reads UiResult.furnace_open; UiResult has no chest_open twin
-	// in scene/ui.h's v1.9.0 contract, so this reads the screen the UiState is now on instead.
+	// v1.9.1 S6. The close test, now the exact twin of the furnace line above it.
 	//
-	// That is a real difference in WHEN, not just in spelling, and it is the safe direction.
-	// UiResult reports the screen this frame DREW (ui.h says so of both its fields), whereas
-	// s_ui.screen after the call is the screen the next frame will draw -- so this closes one
-	// frame EARLIER than a UiResult field would. Closing early costs nothing: the write-back
-	// above has already run for this frame, so nothing the player did on the closing tap is
-	// lost, and a chest that is closed a frame early simply stops being unpacked a frame early.
-	// Closing late would be the dangerous direction, because that is the frame on which a panel
-	// nobody is looking at could still be written back.
+	// v1.9.0 wrote this as `if (s_ui.screen != UI_SCR_CHEST)` and its comment said, in as many
+	// words, that it should become `if (!ures.chest_open)` the day scene/ui.h grew that field —
+	// it was reading the screen only because UiResult had no chest_open to read. v1.9.1's
+	// UiResult has one, so this is that day. The old spelling no longer compiles either, since
+	// UI_SCR_CHEST is gone, which is the good kind of breakage: it could not be left behind by
+	// accident.
 	//
-	// If scene/ui.h ever grows UiResult.chest_open, this should become `if (!ures.chest_open)`
-	// so the two panels read the same way; it is written like this only because that field does
-	// not exist, not because the screen is the better source.
-	if (s_ui.screen != UI_SCR_CHEST) s_chest_open = false;
+	// The behaviour shifts by one frame and that shift is toward the furnace's, not away from
+	// it. UiResult reports the panel this frame DREW; s_ui.screen after the call is what the
+	// NEXT frame will draw, so the old test closed a frame earlier than this one does. Nothing
+	// is at risk in either direction, for the reason the write-back above already gives: the
+	// pack-back is guarded on `cp`, not on this test, so it has already run for this frame and
+	// the closing tap's withdrawal is saved before anything here is consulted.
+	if (!ures.chest_open) s_chest_open = false;
 }
 
 #endif   // BS_BOTTOM_UI
@@ -3766,6 +3796,23 @@ _Static_assert(UI_GESTURE_KEY_Y == KEY_Y, "UI_GESTURE_KEY_Y drifted from libctru
 // it. Landing on the main menu instead would tell the player their world had vanished and
 // nothing else. The cursor is left where titleInit put it, which is CONNECT — the one button
 // they are most likely to want next.
+// v1.9.1 S8. Circle-pad edge state for the title loop below. File scope rather than a local in
+// runTitleScreen, because the title screen is entered more than once per boot (quit a world,
+// come back from a server) and a local would be zeroed on each entry — an edge detector that
+// starts from "at rest" reports the first frame as a press, so arriving at the menu with the pad
+// still pushed would move the cursor once on its own.
+//
+// The cost of persisting it instead, stated rather than left to be found: the state is only
+// stepped while this loop runs, so a direction that was pushed on the frame the player started a
+// world is still recorded as pushed when they come back, and holding that same direction on
+// arrival fires nothing until they let go. That is the better of the two — a missing repeat the
+// player fixes by releasing, against a cursor that moves when nobody touched it.
+//
+// Separate from the game loop's bar stick on purpose. Two loops, two independent notions of
+// where the pad is resting; one shared detector would leak an edge across the boundary between
+// them in whichever direction was held at the time.
+static BarStick s_title_stick;
+
 static bool runTitleScreen(Options* opts, bool returning_from_server)
 {
 	C3D_RenderTarget* const bottom = screenBottom();
@@ -3786,7 +3833,15 @@ static bool runTitleScreen(Options* opts, bool returning_from_server)
 	// zeroed, the same way the screen above it is: scene/title.c owns the status line's layout
 	// and its countdown, and this is the one caller that has something to put on it before the
 	// first frame is drawn. It lands on the MAIN screen, which is where the menu opens from here,
-	// and scene/title.c's drawMain draws it there.
+	// and scene/title.c's drawPlayTab draws it there (drawMain, which this comment named until
+	// v1.9.1, was one of the two screens the four-tab title replaced).
+	//
+	// v1.9.1: titleInit now does the world scan itself, through titleEnterPlayTab, so it can
+	// already have written "showing first 32 worlds" into ts.status by the time this runs. This
+	// overwrite is therefore live and is the intended precedence — a world that refused to open
+	// is the more urgent of the two, and there is one status line. The cost, stated so it is not
+	// rediscovered as a bug: on a card holding more than 32 worlds AND coming back from a refusal,
+	// the truncation notice is lost for that one trip to the menu. It returns on the next.
 	//
 	// Consumed, not just read: cleared so the next trip back to the menu — after a world that
 	// opened fine, or after a server session — does not repeat a refusal the player has already
@@ -3821,8 +3876,24 @@ static bool runTitleScreen(Options* opts, bool returning_from_server)
 		// one read twice).
 		const u32 held = hidKeysHeld();
 
+		// v1.9.1 S8. The circle pad drives the four-tab title through exactly the same paths
+		// the D-pad does, by turning a stick reading into D-pad PRESS EDGES and OR-ing them
+		// into keys_down — scene/barnav.h:229-239. Doing it here rather than inside title.c
+		// keeps the one place that reads HID for this loop as the one place that reads HID.
+		//
+		// The BAR_KEY_* bits barStickEdge answers in are the libctru KEY_* bits (barnav.h:90-99),
+		// which is what makes this OR legal rather than a coincidence; scene/ui.c static-asserts
+		// that pairing so a libctru change breaks the build instead of the controls.
+		//
+		// s_title_stick holds the hysteresis state that stops a stick resting near the threshold
+		// from firing every frame. Static, not a local: an edge detector reset each frame detects
+		// every frame as an edge, which is the bug it exists to prevent.
+		circlePosition title_cp = {0};
+		hidCircleRead(&title_cp);
+		const u32 title_stick = barStickEdge(&s_title_stick, title_cp.dx, title_cp.dy);
+
 		const TitleInput in = {
-			.keys_down  = hidKeysDown(),
+			.keys_down  = hidKeysDown() | title_stick,
 			.keys_held  = held,
 			.touch_down = (held & KEY_TOUCH) != 0 || tp.px != 0 || tp.py != 0,
 			.touch_x    = tp.px,
@@ -5864,6 +5935,49 @@ session_start:
 		// a timed break needs: the edge only says the button went down, not that it is still
 		// down two seconds later.
 		u32 held = hidKeysHeld();
+
+		// v1.9.1 S2 + S3. The bar's two input facts, both derived here so every read of HID for
+		// this frame still happens in one place.
+		//
+		// S2, menu_down: the frame's press edges with the circle pad's edges OR-ed in, so the
+		// pad walks the bar through exactly the same code the D-pad does (scene/barnav.h:229-239).
+		// It is a SEPARATE word from `down` on purpose — `down` drives jumping, breaking, placing
+		// and the pause button, and a stick nudge must not fire any of those. Only the UI reads
+		// menu_down.
+		//
+		// S3, bar_open: while the bar owns the screen it owns the pad, so inputKey() answers 0 for
+		// every bound verb (app/input_map.h). Set EVERY frame from the current screen rather than
+		// latched on open and cleared on close — a latch that missed its clear would leave the
+		// player unable to move with no menu on screen and nothing to point at.
+		//
+		// Set before anything reads inputKey. The bound verbs are read by playerUpdate,
+		// interactEdit and cameraUpdate, all far below this line; the raw KEY_ tests between here
+		// and there (START and SELECT) are deliberately NOT gated by it — a menu that swallowed
+		// the pause button could not be escaped.
+		//
+		// The blueprint's S5 asked for the same exemption on "the raw L/R render-distance lines
+		// at main.c:5870-5871". There are none: `grep -n "KEY_L\|KEY_R" source/main.c` returns
+		// nothing in the whole file, because render distance moves only through the pause menu's
+		// dist_step and the debug menu, neither of which reads the pad directly. S5 is void and
+		// nothing was written for it.
+#if BS_BOTTOM_UI
+		circlePosition bar_cp = {0};
+		hidCircleRead(&bar_cp);
+		const u32  menu_down = down | barStickEdge(&s_bar_stick, bar_cp.dx, bar_cp.dy);
+		const bool bar_open  = (s_ui.screen == UI_SCR_BAR);
+		inputMapSetMenuOwnsPad(bar_open);
+#else
+		// A console build has no bar at all — scene/ui.c is what the bar is — so nothing can own
+		// the pad and the S4 guard below folds away. Still declared rather than #if'd out at its
+		// use site: the S4 guard sits inside `#if BS_FLY`, so bar_open has to exist in all four
+		// combinations of the two flags, and BS_BOTTOM_UI=0 with BS_FLY=0 is the one where it
+		// then has no reader at all. That combination is a real build — it is what
+		// EXTRA_CFLAGS=-DBS_BOTTOM_UI=0 produces, which gfx/screen.h:30 requires probe builds to
+		// pass — and -Werror=unused-variable failed it until this line existed.
+		const bool bar_open  = false;
+		(void)bar_open;
+#endif
+
 		// quit_requested comes from the loading screen (a stalled load the player gave up on,
 		// or the system closing us while it was up). Taken here rather than skipping the loop
 		// entirely so the exit runs exactly the path a START quit runs — inventory saved, dirty
@@ -5903,6 +6017,11 @@ session_start:
 			.touch_x    = tp.px,
 			.touch_y    = tp.py,
 			.keys_held  = hidKeysHeld(),   // v1.9.0 SPLIT: X / Y for scene/ui_gesture.h
+			// v1.9.1 S1. The bar's key phase — D-pad, A, B, L/R, and the circle pad through
+			// menu_down's stick edges (S2). Press edges, not held: barNavInput's contract
+			// (scene/barnav.h:185) is that `keys` is one frame's edges, and feeding it a held
+			// word would walk the cursor once per frame for as long as a direction was pushed.
+			.keys_down  = menu_down,
 		};
 		// The rising edge of the above, for the remap screen and the debug menu — see
 		// touch_prev's declaration before the loop. One press is one true, however long the
@@ -5923,6 +6042,23 @@ session_start:
 		bool stereo_toggle = false;
 		PauseAction pause_action = PAUSE_ACTION_NONE;
 #if BS_BOTTOM_UI
+		// v1.9.1 S7. The stylus half of the pause panel, recorded here and consumed by
+		// pauseMenuInput immediately below — that order is what makes a tap and a button press
+		// landing on the same frame produce one action, the tap's.
+		//
+		// Deliberately OUTSIDE the remap/debug gate below, unlike pauseMenuInput. pausemenu.c
+		// overwrites its one-action slot on every call, so calling it every frame is what
+		// clears the slot on a frame with no tap; calling it only when the gate is open would
+		// let a tap taken while the remap screen was up sit in the slot and fire late, against
+		// whatever row the player had moved to by then. A tap that lands while the gate is
+		// shut is therefore dropped on the next frame rather than deferred — see the comment
+		// on s_pending at scene/pausemenu.c:25-33, which this call site is the other half of.
+		//
+		// Reading it while the panel is shut costs nothing: pauseBarTouch refuses a closed
+		// panel and answers NONE, so this is not a second path by which the pause menu can
+		// see the world's taps.
+		pauseMenuTouch(touch_press, touch.touch_x, touch.touch_y);
+
 		// While the remap screen or the debug menu owns the frame, the pause menu underneath
 		// must not also read the pad — D-pad would move its cursor invisibly.
 		if (!s_remap_open && !s_debug_open)
@@ -6026,7 +6162,7 @@ session_start:
 		//
 		// They stepped the render distance live from step 7.7 until now. That setting has
 		// exactly one control, the pause menu's "Render dist" row (scene/pausemenu.c
-		// OPT_ROW_DIST, applied by the `if (dist_step != 0)` block above), and this is not the
+		// PB_OPT_DIST, applied by the `if (dist_step != 0)` block above), and this is not the
 		// place to grow it a second one.
 		//
 		// !BS_FLY because the free-fly camera reads the same two buttons for up and down
@@ -6157,7 +6293,13 @@ session_start:
 
 		C3D_Mtx view;
 #if BS_FLY
-		if (!paused) cameraUpdate(&player.cam, metricsFrameMs());
+		// v1.9.1 S4. `!bar_open` matches the shipped path's behaviour in the one build that takes
+		// this branch. It is NOT what freezes the look in the build the player runs — this call
+		// only exists under BS_FLY, and the shipped !BS_FLY branch below looks through
+		// playerUpdate -> cameraLook instead. inputLookScale() answering 0 while the bar is open
+		// is what does that job for both; see app/input_map.c. This line stops the free-fly
+		// camera's own MOVEMENT, which cameraUpdate does and cameraLook does not.
+		if (!paused && !bar_open) cameraUpdate(&player.cam, metricsFrameMs());
 #else
 		if (!paused) {
 			playerUpdate(&player, &s_world, metricsFrameMs());
@@ -7740,7 +7882,24 @@ session_start:
 					.dist_max     = renderDistMaxFor(hwIsNew3ds()),
 					.stereo       = s_stereo,
 				};
-				pauseMenuDraw(&pstats);
+				// v1.9.1 S9. Skipped while the remap screen or the debug menu is up, matching
+				// the input gate below — those two already cover the panel completely and
+				// drawing it underneath them only spends quads.
+				//
+				// "Completely" is arithmetic, not an assumption, and it was checked before this
+				// guard went in: both screens fill the whole 320x240 with COL_SCRIM 0xC0100C08
+				// (alpha 0xC0, so 75% coverage) and then fill PANEL_X/Y/W/H = 26,24,268,192
+				// with COL_PANEL 0xF0201A14 (alpha 0xF0) — app/remap_ui.c:25-28,210-213 and
+				// app/debugmenu_ui.c:51-54,306-309. The pause panel is at PB_PANEL_X/Y/W/H =
+				// 26,24,268,192 (scene/pausebar.h:176-179): the same rect, to the pixel, so
+				// nothing of it falls outside their panel. What could still show through it is
+				// (1 - 0.94) * (1 - 0.75), under 2%, and only where the two panels' own fills
+				// differ — which at an identical rect they do not.
+				//
+				// Worth up to 127 quads on a SYSTEM-tab frame, measured against SPRITE_MAX_QUADS
+				// 1024 by walking the real pausebar.c draw tables.
+				if (!s_remap_open && !s_debug_open)
+					pauseMenuDraw(&pstats);
 
 			// v1.4.0. The remap screen and the debug menu draw over the pause panel and take
 			// the frame's input themselves (their update calls draw internally, which is why

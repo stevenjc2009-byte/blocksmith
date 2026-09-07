@@ -643,6 +643,14 @@ and the UI gesture — not the mechanic.
 the shape the legacy console crafting menu and the PS3 system menu share. Referenced,
 not copied: none of their art, none of their layout metrics, none of their icons.
 
+> **[2026-09-07] Status: built, not released, not committed.** The work is in the working
+> tree at `source/scene/barnav.{h,c}`, `source/scene/pausebar.{h,c}` and a rewritten
+> `source/scene/ui.c`; `source/version.h`, `README.md` and `CHANGELOG.md` all read 1.9.1 and
+> `tools/check_readme_current.sh` passes. The host suite is green and both console arms
+> (default and `BS_BOTTOM_UI=0`) compile clean. **No tick, for the same reason v1.9.0 has
+> none** (see the note at the top of this file): nothing here has run on a console, and
+> v1.9.0's own GitHub Release is still unpublished, so v1.9.1 cannot ship ahead of it.
+
 ---
 
 ## v1.9.2 — Redstone

@@ -562,12 +562,16 @@ void metricsDrawOverlay(const char* status)
 	// Walking-mode controls, which is what a playtest build boots into. v1.9.0 HOTBAR-LR
 	// (source/scene/hotbar.h) moved L/R off render distance: they now step the hotbar
 	// selection, wrapping, with press-then-hold repeat. Render distance moved to the pause
-	// menu's OPT_ROW_DIST row (scene/pausemenu.c) instead. In a BS_FLY build L/R are still
+	// menu's PB_OPT_DIST row (scene/pausemenu.c) instead. In a BS_FLY build L/R are still
 	// the camera's up and down (source/scene/camera.c reads them directly, independent of
 	// this build's hotbar/render-dist wiring), which is a developer knob and is why the
 	// legend does not mention it.
 	printf("pad look  D-pad walk  A jump   \n");
-	printf("X break  Y place  SELECT 3D    \n");
+	// v1.9.1: "SELECT 3D" -> "SELECT pause". SELECT stopped being the 3D-depth toggle when that
+	// setting moved to the pause menu's PB_OPT_3D row; main.c:6039 is now an unconditional
+	// `if (down & KEY_SELECT) pauseMenuToggle();`. Kept at the same 31 columns as the old
+	// string so the three legend lines still line up under each other.
+	printf("X break  Y place  SELECT pause \n");
 	printf("L/R hotbar  START exit         \n");
 }
 

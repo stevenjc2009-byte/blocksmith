@@ -1,11 +1,27 @@
-// The in-game pause menu: SELECT opens RESUME / OPTIONS / QUIT.
+// The in-game pause menu: SELECT opens a three-tab panel.
+//
+//     GAME     Resume, Quit to title
+//     OPTIONS  Render dist ±, 3D on/off, Sound ±
+//     SYSTEM   Controls >, Debug >, and the memory readout under the rows
 //
 // Until this existed the only way to change a setting was to leave the world entirely and
 // use the title screen's options page (scene/title.c), which meant unloading the world to
 // adjust the render distance and loading it again to see what the change did — the one
-// comparison the setting exists to let a player make. The options page here is deliberately
+// comparison the setting exists to let a player make. The OPTIONS tab here is deliberately
 // a *subset* of that one: the settings that are worth changing while looking at the world,
 // plus the memory readout that says what changing them costs.
+//
+// v1.9.1 INTERFACE (docs/blueprint-1.9.1-interface.md D9) replaced the two stacked pages
+// this shipped with — main: Resume/Options/Quit, then an options page behind it — with the
+// three tabs above, inside the same scrim and the same panel. L/R switch tab; the d-pad and
+// the stylus both work; every function below keeps the signature it shipped with and every
+// PauseAction keeps its value, because main.c switches on them.
+//
+// The MODEL — which tab and row the cursor is on after any key or any stylus press, which
+// action that produces, and where every rect is — lives in scene/pausebar.h / .c, which has
+// no <3ds.h> in it and is gated on the host by tests/pausebar_test.c. This pair keeps the
+// drawing, the one audio call the volume row makes, and the three memory figures: the parts
+// no host test can reach and the parts that were never the ones that could be subtly wrong.
 //
 // State lives here rather than in main.c because main.c's play loop is already long and
 // this is self-contained: it owns nothing but its own cursor and a bool, reads the world's
@@ -51,15 +67,19 @@ typedef struct {
 bool pauseMenuOpen(void);
 
 // SELECT. Opens the menu if it is closed, closes it if it is open, and always returns to
-// the top page so reopening never lands mid-way down the options list.
+// the GAME tab's first row so reopening never lands mid-way down a tab. The per-tab row
+// memory goes with it: it is a memory of THIS visit, not of the last one.
 void pauseMenuToggle(void);
 
 // Closes the menu without choosing anything. For the caller's own paths — leaving a server
 // session, say — so the menu can never be left up over a world that is no longer there.
 void pauseMenuClose(void);
 
-// One frame of input. `down` is hidKeysDown(). Returns what the player chose, and reports
-// the two settings changes the options page can produce:
+// One frame of input. `down` is hidKeysDown() — the PRESS EDGE word, not the level: nothing
+// in here repeats, and feeding the level would step a value once per frame while a direction
+// is held. It also consumes whatever pauseMenuTouch recorded this frame, and the tap wins.
+// Returns what the player chose, and reports the two settings changes the OPTIONS tab can
+// produce:
 //   *out_dist_step        -1, 0 or +1 — a render-distance change to apply
 //   *out_stereo_toggle    true once on the frame the player flipped 3D
 //
@@ -83,6 +103,26 @@ PauseAction pauseMenuInput(uint32_t down, int* out_dist_step, bool* out_stereo_t
 // not own. Ignoring this function entirely is a supported outcome: the volume still
 // works for the session, it just does not survive a reboot.
 bool pauseMenuTakeVolumeChanged(void);
+
+// One stylus press on the pause panel. `press` is the RISING EDGE — main.c's `touch_press`,
+// not `touch.touch_down` — because a stylus held still on a stepper arrow must step once,
+// not once a frame.
+//
+// Call it IMMEDIATELY BEFORE pauseMenuInput each frame, unconditionally, exactly as
+// hidKeysDown() is read unconditionally. It records at most one action and OVERWRITES what
+// the previous frame recorded, so a frame with no tap clears the slot; pauseMenuInput
+// consumes it and reports it through its own return value and out-params. A tap and a button
+// press on the same frame therefore produce ONE action, the tap's, and a tap on a frame whose
+// pauseMenuInput is skipped (the remap/debug gate in main.c) is dropped rather than fired
+// late against a row the player has since moved off.
+//
+// Safe when the menu is closed and on a press outside the panel: it records nothing. A tap
+// outside the panel does NOT close it — the panel is modal and a mis-aimed stylus must not
+// drop the player back into the world.
+//
+// A separate entry point rather than three more parameters on pauseMenuInput because that
+// signature is called from main.c and the blueprint pins it unchanged (§6.3).
+void pauseMenuTouch(bool press, int x, int y);
 
 // Draws the menu over the bottom screen. Call inside the sprite batch, after the ordinary
 // bottom-screen UI, so it lands on top of it. A no-op when the menu is closed.

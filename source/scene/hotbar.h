@@ -10,7 +10,7 @@
 // this module on the host, the carve-out scene/ringorder.c and scene/aimtext.c already made.
 //
 // Until this change L and R stepped the render distance live (main.c step 7.7). That control
-// now lives ONLY on the pause menu's OPT_ROW_DIST row (scene/pausemenu.c) — a settled
+// now lives ONLY on the pause menu's PB_OPT_DIST row (scene/pausemenu.c) — a settled
 // decision, not one to re-open here.
 #ifndef SCENE_HOTBAR_H
 #define SCENE_HOTBAR_H

@@ -1,0 +1,17 @@
+# Release notes shown on the 3DS top screen before the update downloads.
+#
+# Two sections, both optional, one item per line. Plain English, no markdown: this is read
+# by a player on a 400 px screen, not by a developer. A leading "- " is optional.
+#
+# Long lines wrap on their own, so write a sentence rather than fighting the width.
+
+[features]
+Your bag, the crafting grid, chests and the furnace are one bar now, not four separate screens.
+Only the tabs that apply are there — the chest tab shows up while a chest is open.
+L and R change tab, the D-pad or circle pad moves the cursor, A takes and B puts down.
+The pause menu and title screen use the same bar, so everything moves the same way.
+While the bar is open you stop walking, so you cannot wander off while sorting your bag.
+
+[fixes]
+A stack you were holding no longer follows you out of a chest that closed under you.
+Left and Right now work on every row of the Options screen, not just the sliders.

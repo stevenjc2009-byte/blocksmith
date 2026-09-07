@@ -659,8 +659,10 @@ static void testConfirmExpires(void)
 	CHECK(worldlistConfirmArmedFor(&c, 0) == false);
 }
 
-// Criterion 6. The exact verb sequence title.c's drawWorldSelect acts on, scripted with three
-// worlds (rows 0..2), NEW WORLD at row 3 and BACK at row 4.
+// Criterion 6. The exact verb sequence title.c's drawPlayTab acts on, scripted with three
+// worlds (world indices 0..2). NEW WORLD is its own bar row (index -1, ts->cursor's "nothing
+// selected" value) rather than a trailing row after the worlds, and there is no BACK row at
+// all in the current layout — leaving PLAY is a tab switch, not a row.
 static void testUiStep(void)
 {
 	enum { N = 3 };

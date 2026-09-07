@@ -91,9 +91,20 @@ static int  s_fails;
 
 // ── Reading main.c as lines ──────────────────────────────────────────────────────────────
 
-// main.c runs to ~5800 lines; sized with headroom rather than to the measured count so a
-// normal amount of future growth does not need this file touched.
-#define MAX_LINES 8192
+// Sized with headroom rather than to the measured count so a normal amount of future growth
+// does not need this file touched.
+//
+// MEASURED 2026-09-07 (v1.9.1): source/main.c is 8269 lines. The "~5800 lines" this comment
+// used to claim was badly stale, and the 8192 cap that came with it went red during the
+// v1.9.1 interface work — main.c crossed it mid-session (8110 at the branch point, 8269 after
+// the integrator seam comments), so loadLines() stopped at 8192 and the CHECK at the bottom of
+// this file refused the run rather than let the guard reason about a truncated main.c. That
+// refusal is the entire reason the check exists and it did its job; 16384 is the new headroom,
+// chosen as a doubling rather than a fit so the next several releases need not come back here.
+//
+// The cost is a static [MAX_LINES][MAX_LINE] of 8 MB. That is BSS in a host-only test binary
+// which never runs on the console, so the headroom costs the 3DS nothing.
+#define MAX_LINES 16384
 #define MAX_LINE  512
 
 static char s_lines[MAX_LINES][MAX_LINE];

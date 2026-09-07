@@ -98,13 +98,28 @@ void spriteRect(float x, float y, float w, float h, uint32_t colour);
 // simply lost.
 void spriteEnd(void);
 
+// Quads submitted so far in the current frame. Reset to zero by spriteFrameBegin and
+// incremented once per spriteQuad call, including a call that triggers the wrap-around
+// described there — the wrap is exactly the condition SPRITE_MAX_QUADS exists to catch, so a
+// counter that stopped at the wrap would hide the worst case instead of reporting it.
+//
+// v1.9.1: main.c's debug timing row (drawBottomUi) appends this, so the quads-per-frame
+// budget documented at SPRITE_MAX_QUADS in sprite.c — arithmetic over the draw sites, never
+// measured — can be read off the console instead of estimated.
+int spriteFrameQuads(void);
+
 // v1.8.7: spriteDrawCount(), spriteQuadCount() and spriteOverflowCount() were here and are
 // gone. All three were grep-proven to have no caller anywhere in the tree — not in source/,
 // tests/, tools/, server/ or the vendored deps/ — so the three counters behind them were
 // maintained every frame and read by nothing. Their increments went with them.
 //
 // What that costs, said plainly rather than left to be discovered: the buffer-wrap condition
-// described at spriteFrameBegin above is now UNOBSERVABLE. It was already unobservable in
+// described at spriteFrameBegin above was UNOBSERVABLE. It was already unobservable in
 // practice, because nothing called the accessor, but a future reader should know the number
-// is not merely hidden — it is not being counted. If a wrap is ever suspected, put back a
+// was not merely hidden — it was not being counted. If a wrap is ever suspected, put back a
 // counter and a reader together, not a counter alone.
+//
+// v1.9.1 did exactly that: spriteFrameQuads() above is the counter, main.c's timing row is
+// the reader. It reports total quads for the frame, not a separate wrap/overflow count, so a
+// wrap is visible only as the total pinning at SPRITE_MAX_QUADS rather than as its own signal
+// — the finer-grained overflow count this paragraph originally warned about is still gone.
