@@ -8,21 +8,44 @@ and, for most versions from v1.8.7 onward, in that version's own `docs/plan-*.md
 (for example `docs/plan-1.8.11-caves.md`); run `ls docs/plan-*.md` for the current set,
 which now covers nearly every version through v1.9.1.
 
-**Newest published version: 1.8.17** (released 2026-09-03; tag `v1.8.17`, `whatsnew1.8.17.txt`
-and `CHANGELOG.md`'s `[1.8.17]` entry all agree, and steve has installed and run it on his own
-console). Unlike the v1.8.16 line below, the `releases/latest` redirect has **not** been
-re-followed for v1.8.17 and the published `.cia` has **not** been downloaded and md5-matched
-against the built artefact — say so rather than implying a verification that was not done.
+**Newest published version: 1.8.20** (released 2026-09-05; tag `v1.8.20` dereferences to commit
+`d3ab9de`, `whatsnew1.8.20.txt` and `CHANGELOG.md`'s `[1.8.20]` entry all agree). Nobody has
+re-run the download-and-md5-match check against the `releases/latest` redirect for v1.8.20
+itself, so that specific verification has not been done — but `CHANGELOG.md`'s own `[1.9.0]`
+entry says v1.9.0's GitHub Release "is not published yet" and that, until it is, **Options →
+Check for Update** "falls back to v1.8.20 through the `/releases/latest` redirect", which is
+independent evidence the redirect currently does resolve to v1.8.20, not merely that the tag
+exists locally.
 
 The previous entry, kept because its verification really was performed: **1.8.16** (released
 2026-09-03; the `releases/latest` redirect was followed and resolved to `v1.8.16`, and the
 published `blocksmith1.8.16.cia` was downloaded and md5-matched against the built artefact at
 `07937de620b5b1d7701b2b1567fb417e` — 1,360,832 bytes, `cmp` reporting byte-identical).
 
-Everything from `v0.1.0` up to and including `v1.8.17` is released and published on GitHub.
-`v1.8.18` is the branch currently checked out and is a build in progress, not a release.
-Everything after `v1.8.18` is a plan, not a build; order, scope, and whether a given version
-ships at all can still change before it does.
+**[2026-09-07] Status of everything after v1.8.18** (see the new v1.8.19 and v1.8.20 entries
+below, and the updated v1.9.0/v1.9.1 entries, for the detail). `v1.8.19` has a `chore(release)`
+commit, a pushed branch (`origin/v1.8.19`), a `CHANGELOG.md` `[1.8.19]` entry and a prepared
+`whatsnew1.8.19.txt` — but, unlike every other version this file tracks, **no git tag
+`v1.8.19` exists** (checked both `git tag -l` and `git branch -a`: the branch is there, the tag
+is not), so it was never cut as a GitHub Release. `v1.8.20` **is** tagged, and per the redirect
+evidence above is what the update checker currently serves — it is the version this header now
+calls newest published. `v1.9.0` is also tagged (`v1.9.0` → `02f3954d`) and its `.cia` is built
+and md5'd (`74ccb73a998ff864d4113ae4f20228d4`, 1,471,424 bytes), but `CHANGELOG.md`'s own words
+are that the GitHub Release "is not published yet". `v1.9.1` — the version `source/version.h`,
+`README.md` and `CHANGELOG.md` now all agree on, and what `tools/check_readme_current.sh`
+currently checks against — is the branch presently checked out (`ddd7b59`), with no `origin/
+v1.9.1` remote and no tag. One note for whoever reads `CHANGELOG.md` next to this file: its own
+`[1.9.1]` entry still opens "Not released, not committed" — true when that prose was written,
+but `ddd7b59` (`feat(ui): v1.9.1 the new interface`) is now exactly that entry's own commit, so
+the "not committed" half has since gone stale. That line lives in `CHANGELOG.md`, which this
+file does not own, so it is flagged here rather than edited there.
+
+Everything from `v0.1.0` up to and including `v1.8.18` is released, tagged, and (per each entry
+below) has had a real publish-and-verify pass. `v1.8.19` is committed and branched but not
+tagged or released. `v1.8.20` is tagged, built, and is what the update redirect currently
+serves. `v1.9.0` is tagged and built but its GitHub Release is not published. `v1.9.1` is the
+branch currently checked out and is a build in progress, not a release. Order, scope, and
+whether a version still ahead ships at all can still change before it does.
 
 That parenthetical is deliberately about the *redirect* and not about the GitHub API. The
 in-game updater cannot use the API: it is rate limited to 60 requests an hour **per IP**, and
@@ -957,7 +980,7 @@ the updater's free-heap diagnostic, the third mutator added to the frame-sync or
 guard, and several measured-but-negative freeze investigations. See `CHANGELOG.md` and the
 code-vault log for those; this entry stays about the feature.
 
-### v1.8.19 — Sound — planned
+### v1.8.19 — Sound — built and committed, never tagged
 
 **Added.** A real audio system — footsteps that know what surface they're on, block
 breaking and placing per material, water entry/exit, crafting, UI feedback, sourced under
@@ -1005,6 +1028,57 @@ missing, is called out as a required step for this version specifically.
 
 Full research, with sources and licence terms: `docs/research/audio.md`.
 
+**[2026-09-07] Status and what actually shipped.** The entry above is the pre-build research
+proposal. v1.8.19 was in fact built and committed (`chore(release): v1.8.19 notes, changelog
+and baked version history`, `86324e9`, dated 2026-09-05) with a `CHANGELOG.md` `[1.8.19]` entry
+and a `whatsnew1.8.19.txt` in the repo root. **It was never tagged** — `git tag -l` has no
+`v1.8.19` (compare `git branch -a`, which does have `origin/v1.8.19`) — so unlike every other
+version in this document it is not a GitHub Release. What actually shipped, per `CHANGELOG.md`'s
+`[1.8.19]` entry: per-material footsteps/break/place sound (`sfxMaterialOfBlock()` in the new
+`source/audio/audio_material.c`), nine new effects synthesized by `tools/make_sfx_synth.py`
+(no new downloaded recordings), and a fix for animal hits/deaths being completely silent —
+`animalHurt()`'s kill/hurt return value was being discarded with a `(void)` cast in
+`source/main.c`, so the death cue was unreachable — plus an unrelated multiplayer fix for a
+rejoining player's own water vanishing. The "'animals' ... have no hook to trigger them yet"
+line a few paragraphs up was already wrong by the time this version shipped: the animal-hit/
+death fix above is in this same version's own changelog entry, and animals themselves have
+existed since v1.8.14. Not run on real hardware, same as everything since v1.8.17.
+
+### v1.8.20 — Server time sync — released and published
+
+Not a `docs/ROADMAP.md` version — inserted between v1.8.19 "Sound" and v1.9.0 because the
+multiplayer audit that followed v1.8.19 found the day/night clock was never synchronised at
+all: every client ran its own counter from its own join time, so two players in one world could
+be hours apart, changing light level, mob spawning window, moon phase and weather between them.
+
+**Added.** A server-authoritative day/night clock: the server broadcasts its tick counter as
+`BS_APP_TIME_SYNC` (opcode `0x10`, one little-endian `uint64`) once at join and once a second
+after, and the client pins its own clock to it in `source/main.c`. The **whole** counter
+travels, not just a time-of-day, so the day number and moon phase agree too, not only the light
+level. Weather agrees for free once the tick does, since `weatherAt()` is a pure function of
+`(seed, tick, x, z)` with no state of its own to drift. The date now survives a server restart,
+persisted to `day_time.txt` in the server's `--state-dir`.
+
+**Changed.** `PROTO_COMMIT` bumped to server v1.9.8 — purely additive and one-directional: an
+old client ignores the new opcode, a new client against an old server just keeps running its
+own clock; nothing new travels client-to-server, since that direction disconnects players on an
+older server.
+
+**Verified.** Server suite `PASS 337 checks, 0 failed` (307 before), with a red/green control
+(commenting out the broadcast call gives `FAIL 336, 1 failed` on exactly the new check). Client
+host suite `PASS 488 checks, 0 failed`, check-count guard raised 470 → 487. Clean devkitARM
+build, 0 warnings/errors, all four drift guards passing; `blocksmith.3dsx` +1,860 bytes (+280 of
+it the time-sync code itself, the rest this release's own notes baked into the in-app version
+history).
+
+**Not verified.** Nothing has run on a console — "two players see the same sunset" has only
+been demonstrated between a host test process and a host daemon.
+
+**Status.** Tagged `v1.8.20` (dereferences to `d3ab9de`); `whatsnew1.8.20.txt` and
+`CHANGELOG.md`'s `[1.8.20]` entry agree. This is the version the header at the top of this file
+now calls newest published — see that header for why (`v1.9.0`'s own changelog entry says the
+updater currently falls back to it).
+
 ### v1.9.0 — Storage and quality of life — built, not yet released
 
 **Added.** Chests — `BLOCK_CHEST = 43` (`source/world/block.h:262`, static-asserted at
@@ -1038,7 +1112,14 @@ still succeeds, degraded exactly as it always was.
 Full design and the storage decision behind it: `docs/design-1.9.0-chest-multiplayer.md`
 and `docs/decision-1.9.0-chest-storage.md`.
 
-### v1.9.1 — The new interface — planned
+**[2026-09-07] Confirmed tagged, still not GitHub-published.** `v1.9.0` is tagged (`v1.9.0` →
+`02f3954d`, matching `CHANGELOG.md`'s own `[1.9.0]` entry), and the built `blocksmith1.9.0.cia`
+(1,471,424 bytes, md5 `74ccb73a998ff864d4113ae4f20228d4`) is recorded there — but that same
+entry says the GitHub Release carrying it "is not published yet", so **Options → Check for
+Update** still falls back to v1.8.20 and the README's install QR still 404s. That has not
+changed as of this pass.
+
+### v1.9.1 — The new interface — built, not tagged, not released
 
 **Changed.** The menus and inventory redrawn around a long horizontal bar of categories,
 with the focused category's items descending in a list below it — the interaction shape
@@ -1070,6 +1151,32 @@ design, a quad-cost budget, and a recommended six-phase build order starting wit
 already-built battery blink and the debug-menu biome readout/neon toggle before the bar
 itself is touched. Treat `ui-skin.md` as the authoritative source for this version; read
 `interface.md` only for its Part A/B reference analysis.
+
+**[2026-09-07] Correction — the proposal above is not what shipped.** The three-tab starting
+bar proposed here (Craft / Blocks / Inventory) was reconsidered during design and replaced:
+`docs/blueprint-1.9.1-interface.md`'s own §3 **D2** explicitly *rejects* a Blocks category
+("it has no commit action in survival... it stays in the debug menu untouched"). What actually
+shipped, per `CHANGELOG.md`'s `[1.9.1]` entry and `whatsnew1.9.1.txt`: the bag, crafting grid,
+chest and furnace screens collapse into **one** bar (`UiScreen` goes from four values to two,
+`UI_SCR_HUD` and `UI_SCR_BAR` — confirmed in `source/scene/ui.h`), with only the tabs that
+currently apply shown — the chest tab exists only while a chest is open. A shared cursor model,
+`source/scene/barnav.{h,c}`, drives the bar, the pause panel (rebuilt on
+`source/scene/pausebar.c`, alongside the existing `pausemenu.c`/`.h`, which kept its public
+functions — `pauseMenuTouch()` is a new one of them, called from `main.c:6065`) and the title
+screen alike. While the bar is open it owns the pad (`inputMapSetMenuOwnsPad()`, confirmed in
+`source/main.c`), so the player stops moving and looking without the world itself pausing.
+`barnav` (3306 checks) and `pausebar` (34082 checks) are new self-tests; `ui_layout` grew to
+12013 checks.
+
+**Status.** Committed at `ddd7b59` (`feat(ui): v1.9.1 the new interface -- four screens become
+one tab bar`) on the branch checked out for this pass (`v1.9.1`) — not tagged, not pushed to
+`origin` (no `remotes/origin/v1.9.1`), not released. `source/version.h`, `README.md` and
+`CHANGELOG.md` all already read `1.9.1`, and `tools/check_readme_current.sh` passes against
+that number, but per `CHANGELOG.md`'s own `[1.9.1]` entry **none of it has been playtested on
+real hardware** — only the host suite and a clean console compile. `docs/research/interface.md`
+and `docs/research/ui-skin.md`, named above, were early research; the design that actually
+shipped, with its own corrections against reality, is recorded in
+`docs/blueprint-1.9.1-interface.md`.
 
 ### v1.9.2 — Redstone — planned
 

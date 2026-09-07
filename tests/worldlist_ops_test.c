@@ -13,8 +13,11 @@
 //      missing cannot pass), a missing name, and a name that is a file.
 //   3. After worldlistRename(root, "alpha", "gamma"), root/gamma holds alpha's file with
 //      alpha's CONTENT and root/alpha is gone; and when the destination already exists —
-//      including the empty-directory case POSIX rename() would silently replace — the rename
-//      is refused with BOTH directories and both their contents untouched.
+//      including the empty-directory case POSIX rename() would silently replace, and a name
+//      that collides with an existing world by CASE ONLY on this project's own (case-insensitive
+//      drvfs-mounted) host build — the rename is refused with EEXIST and BOTH directories and
+//      both their contents untouched; a name that merely resembles an existing world without
+//      case-folding to it must still succeed.
 //   4. The confirm latch never lets a selection change carry an armed confirm onto a different
 //      world: arm on A, move to B, and B is still two presses from deletion, not one.
 //   5. An all-zero WorldDeleteConfirm — a memset TitleState with no worldlistConfirmReset — is
@@ -113,7 +116,21 @@ static char s_first[160];
 // that a failed delete rescans instead of freezing the list. That run printed:
 //
 //   CHECK COUNT: 27 check(s) were ADDED - expected 551, ran 578.
-#define WORLDLIST_OPS_TEST_EXPECTED_CHECKS 578
+//
+// Re-pinned again for the case-only collision coverage gap: nothing exercised worldlistRename's
+// destination check (lines 335-338 of scene/worldlist.c) against a name that collides with an
+// existing world by case only rather than by exact match. testRenameRefusesCaseOnlyCollision
+// added 17 checks -- the refusal, its errno, the untouched state of both existing worlds, a
+// rescan proving no third entry appeared, and the "Homer" near miss proving the same check does
+// not simply refuse every name that starts with "home". "home" is left EMPTY on purpose (the
+// same reason testRenameRefusesExistingDestination's "dstempty" is): an empty destination is
+// the one case a bare rename() would silently replace instead of refuse, so it is the only
+// construction that actually exercises line 335's stat() check rather than being refused for a
+// different reason (ENOTEMPTY) if the sabotage below ever regresses this guard. That run
+// printed:
+//
+//   CHECK COUNT: 17 check(s) were ADDED - expected 578, ran 595.
+#define WORLDLIST_OPS_TEST_EXPECTED_CHECKS 595
 
 // Deliberately NOT routed through CHECK(): it must not perturb the number it is testing.
 static void checkCountPin(void)
@@ -516,6 +533,77 @@ static void testRenameRefusesExistingDestination(void)
 	hostRmTree(src);
 	hostRmTree(dst_empty);
 	hostRmTree(dst_full);
+}
+
+// Criterion 3, the case-only half. worldlistRename's own destination check (source/scene/
+// worldlist.c lines 335-338) is a bare `stat(to, &st) == 0` -- no case-folding logic of its
+// own -- so whether "office" -> "HOME" collides with an existing "home" depends entirely on
+// what the filesystem underneath stat() considers the same path. This project's own host build
+// runs under WSL against a drvfs-mounted NTFS volume (see testDeleteStopsOnFirstFailure's
+// comment for the same fact established for readdir() order), and that mount was measured, on
+// this machine, to be case-insensitive: build-host/x/HOME and build-host/x/home stat() to the
+// same inode. So on THIS project's own test environment, line 335's plain existence check is
+// exactly the case-only collision guard -- not because it says so anywhere, but because that is
+// what stat() does here. The near-miss half exists so this cannot pass by refusing every rename
+// that merely starts with "home": a name that differs by more than case -- "Homer" is not
+// "home" under any case fold, on a case-insensitive filesystem or otherwise -- must still
+// succeed, moving the whole tree exactly like testRenameMovesTheWholeTree already proves for an
+// ordinary name.
+static void testRenameRefusesCaseOnlyCollision(void)
+{
+	char home[320], office[320], office_file[384], homer[320], homer_file[384], moved[448];
+	WorldEntry worlds[WORLDLIST_MAX];
+	int count;
+	bool truncated = true;
+
+	// "home" is deliberately left EMPTY, the same way testRenameRefusesExistingDestination's
+	// "dstempty" is: an empty destination is the one case a bare rename() would silently
+	// replace instead of refuse, so it is also the one case that proves line 335's stat() check
+	// is what is doing the refusing here, rather than rename()'s own ENOTEMPTY failing on a
+	// non-empty destination for an unrelated reason.
+	makeWorld(home, sizeof(home), "home");
+
+	makeWorld(office, sizeof(office), "office");
+	pathJoin(office_file, sizeof(office_file), office, "o.txt");
+	hostWriteFile(office_file, "office-data");
+
+	// Preconditions. Without these the "untouched" checks below could pass on worlds that were
+	// never really there.
+	CHECK(hostIsDir(home));
+	CHECK(hostIsDir(office));
+	CHECK(hostFileHas(office_file, "office-data"));
+
+	errno = 0;
+	CHECK(worldlistRename(s_root, "office", "HOME") == false);
+	CHECK(errno == EEXIST);   // the exact refusal code line 336 sets
+
+	// Nothing moved: office is exactly as it was, home is exactly as it was (still a directory,
+	// still empty -- office's file did NOT land inside it), and a fresh scan of the directory
+	// shows only the original two entries, not a third "HOME" a half-finished rename could have
+	// left behind.
+	CHECK(hostIsDir(office));
+	CHECK(hostFileHas(office_file, "office-data"));
+	CHECK(hostIsDir(home));
+	pathJoin(moved, sizeof(moved), home, "o.txt");
+	CHECK(!hostExists(moved));
+
+	count = worldlistScan(s_root, worlds, WORLDLIST_MAX, &truncated);
+	CHECK(count == 2);
+	CHECK(!strcmp(worlds[0].name, "home"));
+	CHECK(!strcmp(worlds[1].name, "office"));
+
+	// The near miss: "Homer" is not "home" under a case fold either, so this rename must go
+	// through exactly like any other, taking office's content with it and leaving "home" alone.
+	CHECK(worldlistRename(s_root, "office", "Homer") == true);
+	CHECK(!hostExists(office));
+	pathJoin(homer, sizeof(homer), s_root, "Homer");
+	CHECK(hostIsDir(homer));
+	pathJoin(homer_file, sizeof(homer_file), homer, "o.txt");
+	CHECK(hostFileHas(homer_file, "office-data"));
+	CHECK(hostIsDir(home));
+
+	hostRmTree(home);
+	hostRmTree(homer);
 }
 
 static void testRenameRefusesBadNames(void)
@@ -1037,6 +1125,7 @@ int main(void)
 
 	testRenameMovesTheWholeTree();
 	testRenameRefusesExistingDestination();
+	testRenameRefusesCaseOnlyCollision();
 	testRenameRefusesBadNames();
 
 	testConfirmNeedsTwoPresses();

@@ -445,6 +445,14 @@ static void testRendererOwnsBlendState(void)
 	CHECK(n >= 0, "%s opens and reads", RENDERER_PATH);
 	if (n < 0) return;
 
+	// Loud, not silent: a truncated read would make every check below (and every other read of
+	// RENDERER_PATH in this file — the cap and the file are the same for all of them within one
+	// run) reason about a partial copy of chunk_render.c rather than the real one. Same rule and
+	// same reason as world/framesync_guard_test.c's own cap check on source/main.c.
+	CHECK(n < MAX_LINES,
+	      "%s is %d lines, under the %d-line MAX_LINES cap (a file at or over the cap would "
+	      "have been silently truncated)", RENDERER_PATH, n, MAX_LINES);
+
 	int off_first = -1, on_first = -1;
 	const int total = countLines("C3D_AlphaBlend(", NULL);
 	const int offs  = countLines(BLEND_OFF_NEEDLE, &off_first);

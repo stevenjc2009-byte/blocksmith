@@ -3143,13 +3143,18 @@ static int mainStatefulBrokeContents(BlockId id, int x, int y, int z,
 	// The loop is bounded by INTERACT_BROKE_EXTRA_MAX and NOT by CHEST_SLOTS alone, and that is
 	// the load-bearing line rather than defensive padding. The two constants live in different
 	// headers owned by different concerns — scene/interact.h sizes Interact's out-arrays,
-	// world/chest.h sizes the chest — and there is nothing in the build that makes one follow
-	// the other. Writing eight entries into a three-entry array is a stack smash on a console
-	// whose default thread stack is 32 KB and which does not fault on the way past the end; it
-	// would show up as some unrelated local changing value, which is the hardest possible way
-	// to find this. Bounding by the array's own constant makes the code correct for any value
-	// the constant takes, including the 3 it holds until scene/interact.h is raised to 8, where
-	// the honest outcome is that the last few stacks are simply not reported.
+	// world/chest.h sizes the chest. As of the v1.9.0 raise, interact.h's own _Static_assert
+	// (INTERACT_BROKE_EXTRA_MAX >= CHEST_SLOTS) is the one thing in the build that ties them, and
+	// that assert is a floor, not an equality — nothing stops a future INTERACT_BROKE_EXTRA_MAX
+	// from being wider than CHEST_SLOTS again, so this loop still checks its own bound rather than
+	// trusting the header to match. Writing more entries than the array holds is a stack smash on
+	// a console whose default thread stack is 32 KB and which does not fault on the way past the
+	// end; it would show up as some unrelated local changing value, which is the hardest possible
+	// way to find this. Bounding by the array's own constant makes the code correct for any value
+	// the constant takes. It already holds 8 (interact.h has been raised; CHEST_SLOTS is also 8,
+	// so every chest slot is reported today) — but if the two constants were ever narrower here
+	// than there again, despite the assert, the honest outcome is that the last few stacks are
+	// simply not reported, not a crash.
 	if (id == BLOCK_CHEST) {
 		if (!blockStateGet(&s_blockstate, x, y, z, BLOCK_CHEST, payload)) return 0;
 

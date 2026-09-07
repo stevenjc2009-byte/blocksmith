@@ -6708,10 +6708,13 @@ gcc -std=c11 -Wall -Wextra -Werror -O1 -g \
 rm -rf "$BHAI"
 
 # tests/ui_gesture_test.c -- scene/ui_gesture.c, the inventory overlay's gesture classifier
-# (v1.9.0 SPLIT: lift/place/merge/split/quick-move). scene/ui.c cannot be linked outside
-# devkitARM (it draws), so the part of it that can be wrong in a way a playtest would not show
-# -- which event a frame of touch + button state means, whether a held button fires once or
-# every frame -- was moved into ui_gesture.c, which includes nothing the host cannot compile.
+# (v1.9.0 SPLIT: lift/place/merge/split/quick-move). scene/ui.c CAN be host-linked as of v1.9.1
+# -- the tests/ui_chest_test.c stanza further down does exactly that, with tests/ui_chest_stub/
+# standing in for the GPU sprite batch, the font, the audio mixer and the transport (chest_ui
+# self-test: PASS 516 checks) -- but only by carrying that whole stub apparatus. The part of
+# ui.c that can be wrong in a way a playtest would not show -- which event a frame of touch +
+# button state means, whether a held button fires once or every frame -- was moved into
+# ui_gesture.c instead, which includes nothing the host cannot compile and needs no stubs at all.
 # This binary links THAT module and nothing else: the Inventory it reads is filled by hand, so
 # world/inventory.c and the registry behind it are not in the link. 103 checks.
 #
@@ -6774,7 +6777,7 @@ rm -rf "$BHBN"
 # printed PASS count reads one less than the pin constant -- see the file's own comment).
 #
 # NOT proved here: that scene/pausemenu.c wires real hidKeysDown()/hidKeysHeld() and real touch
-# state into pauseBarInput()/pauseBarTouch(), or that the panel draws where this model says it
+# state into pauseBarKey()/pauseBarTouch(), or that the panel draws where this model says it
 # should. Those are the console's.
 BHPB="build-host/run-$$-pausebar"
 mkdir -p "$BHPB"

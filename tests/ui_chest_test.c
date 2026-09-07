@@ -121,7 +121,10 @@ static char s_first[160];
 //         checks, one per lift, because they no longer agree: the bag one is clear and the
 //         chest one is STALE. That check ran RED on the first green-compiling run and the
 //         defect it found is written up at the check itself — read it before re-pinning.
-#define UI_CHEST_TEST_EXPECTED_CHECKS 516
+// 2026-09-07: 516 -> 521, +5. testBagToBagOnChestScreenOntoAFullSameStackMovesNothingAndClears-
+// TheLift, added to lock in source/scene/ui.c:257's discarded invBridgeMoveUnits() return —
+// see that call site's comment and net/inv_bridge.h. All 5 are additions; nothing was dropped.
+#define UI_CHEST_TEST_EXPECTED_CHECKS 521
 
 // gfx/sprite.c's per-frame quad ceiling, restated as a literal for the same reason as the pin
 // above: sprite.c cannot be linked here (it is the GPU batch), and the number is the budget
@@ -654,6 +657,38 @@ static void testBagToBagOnTheChestScreenIsTheOverlaysOwnMove(void)
 	CHECK(uiChestStubNet()->op == BS_INV_OP_MOVE);
 	CHECK(uiChestStubNet()->a == 0);
 	CHECK(uiChestStubNet()->b == INV_HOTBAR_SLOTS + 3);
+}
+
+// 2026-09-07. source/scene/ui.c:257 discards invBridgeMoveUnits()'s return (units actually
+// moved) rather than checking it — net/inv_bridge.h documents that return as "exactly what
+// inventoryMoveUnits returned", never a success/failure signal, and the call site clears the
+// lift unconditionally right after regardless of what came back. This is the witness for the
+// zero case: a bag -> bag drop (still routed through handleSlotTap, same as the test above,
+// just onto a FULL same-item stack this time) must move nothing on either slot and still end
+// the gesture, exactly like the chest panel's own analogous case
+// (testPlaceOnAFullSameStackMovesNothingAndClearsTheLift). uiChestStubNet()->calls == 0 on top
+// of that proves invBridgeMoveUnits() itself took the moved-into-zero branch and skipped the
+// wire report (net/inv_bridge.c: "if (moved > 0 ...)") — not merely that the slots happen to
+// look unchanged some other way.
+static void testBagToBagOnChestScreenOntoAFullSameStackMovesNothingAndClearsTheLift(void)
+{
+	UiState ui; Inventory inv; ChestState cs;
+	openChest(&ui);
+	inventoryInit(&inv);
+	chestStateInit(&cs);
+	setBag(&inv, 0, BLOCK_STONE, 5);
+	setBag(&inv, INV_HOTBAR_SLOTS + 3, BLOCK_STONE, INV_STACK_MAX);   // the drop target: full
+	const Inventory inv0 = inv;
+	uiChestStubResetNet();
+
+	tapRect(&ui, &inv, &cs, hotbarSlotRect(0));
+	CHECK(ui.picked_slot == 0);
+	tapRect(&ui, &inv, &cs, chestGridSlotRect(3));   // relocated bag grid: slot INV_HOTBAR_SLOTS+3
+
+	CHECK(bagEq(&inv, &inv0));                  // moved == 0: neither slot changed
+	CHECK(nothingLifted(&ui));                  // the lift still clears on a zero-unit move
+	CHECK(bagUnits(&inv, BLOCK_STONE) == 5 + INV_STACK_MAX);   // conservation
+	CHECK(uiChestStubNet()->calls == 0);        // moved == 0: invBridgeMoveUnits sent nothing
 }
 
 // Every one of the 24 bag cells deposits ITSELF and every one of the 8 chest cells withdraws
@@ -2044,6 +2079,7 @@ int main(void)
 	testPlacingOnNoTargetKeepsTheLift();
 	testChestToChestMergesAndSwapsLocally();
 	testBagToBagOnTheChestScreenIsTheOverlaysOwnMove();
+	testBagToBagOnChestScreenOntoAFullSameStackMovesNothingAndClearsTheLift();
 	testEveryBagCellDepositsItselfAndEveryChestCellWithdrawsItself();
 
 	testCloseReturnsToTheHudAndClearsAnyLift();

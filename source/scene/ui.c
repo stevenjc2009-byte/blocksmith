@@ -254,7 +254,18 @@ static void handleSlotTap(UiState* ui, Inventory* inv, int slot)
 		// whole lifted stack, leaving any overflow behind in the source slot exactly the
 		// way dropping onto a nearly-full stack of the same item should (see
 		// inventory.h's own comment on inventoryMoveUnits).
-		invBridgeMoveUnits(inv, ui->picked_slot, slot, src->count);
+		//
+		// The return is discarded on purpose. net/inv_bridge.h: "Returns exactly what
+		// inventoryMoveUnits returned" — units actually moved, not a success/failure signal
+		// — and every value it can take ends this gesture the same way: the lift clears
+		// unconditionally below regardless of whether the destination took all of it, some
+		// of it, or none. A full same-item destination (moved == 0) is the same "put it down
+		// where it does not fit, stop holding it" outcome placeStack's own comment documents
+		// for the chest panel's identical case, not a refusal this caller needs to react to.
+		// invBridgeMoveUnits() has already sent the wire report for whatever landed (it
+		// sends nothing when moved is 0), so there is nothing left for this call site to do
+		// with the number.
+		(void)invBridgeMoveUnits(inv, ui->picked_slot, slot, src->count);
 	} else {
 		// A different item already sits there: swap the two stacks outright. This is
 		// inventory.h's inventorySwapSlots, described in its own comment as "what a plain

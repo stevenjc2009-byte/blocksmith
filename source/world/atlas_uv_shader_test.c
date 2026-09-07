@@ -657,6 +657,13 @@ static void checkBoundShaderIsTheDynamicOne(void)
 	CHECK(n >= 0, "cannot open %s to find out which shader program is bound", RENDERER_PATH);
 	if (n < 0) return;
 
+	// Loud, not silent: a truncated read would make every check below reason about a partial
+	// copy of chunk_render.c rather than the real one — same rule and same reason as
+	// world/framesync_guard_test.c's own cap check on source/main.c.
+	CHECK(n < MAX_LINES,
+	      "%s is %d lines, under the %d-line MAX_LINES cap (a file at or over the cap would "
+	      "have been silently truncated)", RENDERER_PATH, n, MAX_LINES);
+
 	const int dyn  = countLines("DVLB_ParseFile((u32*)world_dynamic_shbin", NULL);
 	const int baked = countLines("DVLB_ParseFile((u32*)world_shbin", NULL);
 
